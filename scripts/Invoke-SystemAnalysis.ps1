@@ -329,6 +329,73 @@ function Format-Number {
     try { return ([math]::Round([double]$Value, $Decimals)).ToString() } catch { return [string]$Value }
 }
 
+function Format-ByteSize {
+    param(
+        $Value,
+        [switch]$PerSecond
+    )
+    if ($null -eq $Value) { return '' }
+    try { $bytes = [double]$Value } catch { return [string]$Value }
+    $abs = [math]::Abs($bytes)
+    $rate = ''
+    $rawUnit = ' bytes'
+    if ($PerSecond) {
+        $rate = '/s'
+        $rawUnit = ' bytes/sec'
+    }
+
+    $human = $null
+    if ($abs -ge 1TB)      { $human = '{0:N2} TB{1}' -f ($bytes / 1TB), $rate }
+    elseif ($abs -ge 1GB)  { $human = '{0:N2} GB{1}' -f ($bytes / 1GB), $rate }
+    elseif ($abs -ge 1MB)  { $human = '{0:N2} MB{1}' -f ($bytes / 1MB), $rate }
+    elseif ($abs -ge 1KB)  { $human = '{0:N1} KB{1}' -f ($bytes / 1KB), $rate }
+    else                   { $human = '{0:N0}{1}' -f $bytes, $rawUnit }
+
+    if ($abs -ge 1KB) {
+        $raw = '{0:N0}{1}' -f [math]::Round($bytes), $rawUnit
+        return "$human ($raw)"
+    }
+    return $human
+}
+
+function Format-CounterAverage {
+    param(
+        [string]$Name,
+        $Value
+    )
+    if ($null -eq $Value) { return '' }
+    $n = [string]$Name
+
+    if ($n -match '%|hit ratio') {
+        return "$(Format-Number $Value 2)%"
+    }
+    if ($n -match 'Bytes/sec|Bytes Total/sec') {
+        return (Format-ByteSize -Value $Value -PerSecond)
+    }
+    if ($n -match 'MBytes|Megabytes') {
+        try {
+            $mb = [double]$Value
+            if ([math]::Abs($mb) -ge 1024) {
+                return ('{0:N0} MB ({1:N2} GB)' -f $mb, ($mb / 1024.0))
+            }
+            return ('{0:N0} MB' -f $mb)
+        } catch { return "$(Format-Number $Value) MB" }
+    }
+    if ($n -match 'Bytes') {
+        return (Format-ByteSize -Value $Value)
+    }
+    if ($n -match 'Page life expectancy') {
+        return "$(Format-Number $Value 0) sec"
+    }
+    if ($n -match 'sec/Read|sec/Write|Avg\. Disk sec') {
+        try { return ('{0:N2} ms' -f ([double]$Value * 1000.0)) } catch { return (Format-Number $Value 4) }
+    }
+    if ($n -match '/sec') {
+        return "$(Format-Number $Value 2)/sec"
+    }
+    return (Format-Number $Value 2)
+}
+
 function Test-PendingReboot {
     # Returns a plain-language reboot status.
     # CBS / Windows Update / Server Manager / domain-join are real restart requests.
@@ -638,9 +705,9 @@ if (Test-SectionEnabled 'CPU') {
                 $status = 'Warning'
                 $rec = 'High interrupt time. Check NIC offload, storage drivers, or excessive hardware interrupts.'
             }
-            Add-CheckRow -List $cpuRows -Section 'CPU' -Status $status -Recommendation $rec -Check $name -Value (Format-Number $avg) -Properties @{
+            Add-CheckRow -List $cpuRows -Section 'CPU' -Status $status -Recommendation $rec -Check $name -Value (Format-CounterAverage -Name $name -Value $avg) -Properties @{
                 Counter        = $name
-                Average        = Format-Number $avg
+                Average        = (Format-CounterAverage -Name $name -Value $avg)
                 Status         = $status
                 Recommendation = $rec
             }
@@ -675,13 +742,13 @@ if (Test-SectionEnabled 'Memory') {
             $rec     = ''
             $name    = $item.Counter
             $avg     = $item.Average
-            $display = Format-Number $avg
+            $display = Format-CounterAverage -Name $name -Value $avg
 
             if ($name -eq 'Available MBytes') {
                 $pctFree = if ($totalMB -gt 0) { [math]::Round(($avg / $totalMB) * 100, 1) } else { 100 }
                 if ($pctFree -lt 8) { $status = 'Critical'; $rec = 'Less than 8% RAM free. Paging and allocation failures are likely.' }
                 elseif ($pctFree -lt 15) { $status = 'Warning'; $rec = 'Less than 15% RAM free. Watch working sets and consider adding memory.' }
-                $display = "$([math]::Round($avg, 0)) MB ($pctFree% free)"
+                $display = "$(Format-CounterAverage -Name $name -Value $avg) ($pctFree% of RAM free)"
             }
             if ($name -eq 'Pages/sec' -and $avg -gt 100) {
                 $status = 'Warning'; $rec = 'High paging. Confirm this is hard page faults (not just cache activity) and check RAM pressure.'
@@ -725,7 +792,7 @@ if (Test-SectionEnabled 'Disk') {
             $rec     = ''
             $name    = $item.Counter
             $avg     = $item.Average
-            $display = Format-Number $avg 4
+            $display = Format-CounterAverage -Name $name -Value $avg
 
             if ($name -eq '% Disk Time' -and $avg -gt 85) {
                 $status = 'Warning'; $rec = 'Disk busy time above 85%. Check for an IO bottleneck (this counter is less meaningful on RAID/SSDs).'
@@ -820,10 +887,10 @@ if (Test-SectionEnabled 'Network') {
                 $status = 'Warning'
                 $rec = 'Output queue elevated. Possible bandwidth saturation or a paused adapter.'
             }
-            Add-CheckRow -List $netRows -Section 'Network' -Status $status -Recommendation $rec -Check "$($item.Instance) - $name" -Value (Format-Number $avg 4) -Properties @{
+            Add-CheckRow -List $netRows -Section 'Network' -Status $status -Recommendation $rec -Check "$($item.Instance) - $name" -Value (Format-CounterAverage -Name $name -Value $avg) -Properties @{
                 NIC            = $item.Instance
                 Counter        = $name
-                Average        = Format-Number $avg 4
+                Average        = (Format-CounterAverage -Name $name -Value $avg)
                 Status         = $status
                 Recommendation = $rec
             }
@@ -1299,10 +1366,10 @@ if (Test-SectionEnabled 'SQL') {
                 if ($name -eq 'SQL Re-Compilations/sec' -and $avg -gt 10) {
                     $status = 'Warning'; $rec = 'High recompile rate. Review ad-hoc SQL, sniffed parameters, and plan cache hygiene.'
                 }
-                Add-CheckRow -List $sqlCounterRows -Section 'SQLServer-Perf' -Status $status -Recommendation $rec -Check "$inst - $name" -Value (Format-Number $avg 4) -Properties @{
+                Add-CheckRow -List $sqlCounterRows -Section 'SQLServer-Perf' -Status $status -Recommendation $rec -Check "$inst - $name" -Value (Format-CounterAverage -Name $name -Value $avg) -Properties @{
                     Instance       = $inst
                     Counter        = $name
-                    Average        = Format-Number $avg 4
+                    Average        = (Format-CounterAverage -Name $name -Value $avg)
                     Status         = $status
                     Recommendation = $rec
                 }
