@@ -151,6 +151,11 @@ $PS_PROP_MAP = @{
     TrustedForDelegation   = @{ Kind = "UAC"; Bit = 524288 }                     # TRUSTED_FOR_DELEGATION
     LockedOut              = @{ Kind = "Lockout" }
     EmailAddress           = @{ Kind = "Alias"; Ldap = "mail" }
+    Office                 = @{ Kind = "Alias"; Ldap = "physicalDeliveryOfficeName" }
+    Surname                = @{ Kind = "Alias"; Ldap = "sn" }
+    # Enum / computed — not valid as raw LDAP assertion values
+    GroupScope             = @{ Kind = "ClientOnly"; PsProp = "GroupScope" }
+    GroupCategory          = @{ Kind = "ClientOnly"; PsProp = "GroupCategory" }
     IPv4Address            = @{ Kind = "ClientOnly"; PsProp = "IPv4Address" }
     CannotChangePassword   = @{ Kind = "ClientOnly"; PsProp = "CannotChangePassword" }
     PasswordExpired        = @{ Kind = "ClientOnly"; PsProp = "PasswordExpired" }
@@ -298,7 +303,11 @@ function Get-UacLdapClause ([int]$Bit, [bool]$WantSet, [bool]$InvertMeaning = $f
 # HELPER: attr list / operator list for current object type
 # ---------------------------------------------------------------------------
 function Get-AttrList  { $ATTR[$script:CurrentObjType].Keys | ForEach-Object { $_ } }
-function Get-LDAPAttr  ([string]$Label) { $ATTR[$script:CurrentObjType][$Label] }
+function Get-LDAPAttr  ([string]$Label) {
+    $map = $ATTR[$script:CurrentObjType]
+    if (-not $Label -or -not $map.Contains($Label)) { return $null }
+    return $map[$Label]
+}
 
 function Test-IsDateAttr ([string]$LDAPAttr) {
     if ($DATE_ATTRS -contains $LDAPAttr) { return $true }
@@ -1122,26 +1131,59 @@ $btnAddGroup.Add_Click({
 # ===========================================================================
 # BUILD LDAP FILTER  (grouped + client-side post-filters for regex / computed)
 # ===========================================================================
+# Ops that need a non-empty value. Blank values must NOT become LDAP `(attr=)` —
+# Active Directory rejects empty equality assertions with
+# "The search filter cannot be recognized".
+$VALUE_REQUIRED_OPS = @("equals","not equals","contains","not contains","starts with","ends with","in list","regex match","on","before","after","on or before","on or after","in last N days")
+
+function Test-LdapFilterSyntax ([string]$Filter) {
+    if ([string]::IsNullOrWhiteSpace($Filter)) { return $false }
+    # ADSI rejects empty equality assertions like (mail=)
+    if ($Filter -match '\([A-Za-z0-9.;-]+=\)') { return $false }
+    $depth = 0
+    foreach ($ch in $Filter.ToCharArray()) {
+        if ($ch -eq '(') { $depth++ }
+        elseif ($ch -eq ')') {
+            $depth--
+            if ($depth -lt 0) { return $false }
+        }
+    }
+    return ($depth -eq 0 -and $Filter.StartsWith('(') -and $Filter.EndsWith(')'))
+}
+
 function Build-StringClause ([string]$la, [string]$op, [string]$valT) {
+    # Presence-only operators (no value)
+    switch ($op) {
+        "is set"     { return "($la=*)" }
+        "is not set" { return "(!($la=*))" }
+        # AD does not store empty strings; treat "is empty" as not present.
+        # Do NOT emit ($la=) — ADSI returns "search filter cannot be recognized".
+        "is empty"   { return "(!($la=*))" }
+    }
+
+    # Value-required ops with blank input → skip (caller omits clause)
+    if (($VALUE_REQUIRED_OPS -contains $op) -and [string]::IsNullOrWhiteSpace($valT) -and $op -ne "in list") {
+        return ""
+    }
+
     $esc = Escape-LdapFilterValue $valT
     switch ($op) {
-        "equals"       { return "($la=$esc)" }
-        "not equals"   { return "(!($la=$esc))" }
-        "contains"     { return "($la=*$esc*)" }
-        "not contains" { return "(!($la=*$esc*))" }
-        "starts with"  { return "($la=$esc*)" }
-        "ends with"    { return "($la=*$esc)" }
-        "is set"       { return "($la=*)" }
-        "is not set"   { return "(!($la=*))" }
-        # Empty string present vs attribute absent
-        "is empty"     { return "(|(!($la=*))($la=))" }
+        "equals"       { if ($esc -eq "") { return "" }; return "($la=$esc)" }
+        "not equals"   { if ($esc -eq "") { return "" }; return "(!($la=$esc))" }
+        "contains"     { if ($esc -eq "") { return "" }; return "($la=*$esc*)" }
+        "not contains" { if ($esc -eq "") { return "" }; return "(!($la=*$esc*))" }
+        "starts with"  { if ($esc -eq "") { return "" }; return "($la=$esc*)" }
+        "ends with"    { if ($esc -eq "") { return "" }; return "($la=*$esc)" }
         "in list" {
             $items = @($valT -split '[;,]' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
-            if ($items.Count -eq 0) { return "($la=*)" }
+            if ($items.Count -eq 0) { return "" }
             $ors = ($items | ForEach-Object { "($la=$(Escape-LdapFilterValue $_))" }) -join ""
             if ($items.Count -eq 1) { return $ors } else { return "(|$ors)" }
         }
-        default { return "($la=*$esc*)" }
+        default {
+            if ($esc -eq "") { return "" }
+            return "($la=*$esc*)"
+        }
     }
 }
 
@@ -1152,10 +1194,17 @@ function Build-ConditionClause ([hashtable]$row) {
     if (-not $la) { return @{ Ldap = ""; Post = $null } }
     $op     = $row.Operator
     $val     = if ($null -ne $row.Value) { [string]$row.Value } else { "" }
-    $valT    = $val.Trim()
+    # Strip CRs/LFs — they break LDAP filter parsing
+    $valT    = ($val -replace '[\r\n]+', ' ').Trim()
     $negate = [bool]$row.Negate
     $post   = $null
     $clause = ""
+
+    # Skip incomplete value-required conditions (blank text / date / list)
+    if (($VALUE_REQUIRED_OPS -contains $op) -and [string]::IsNullOrWhiteSpace($valT) -and $op -ne "in last N days") {
+        # in last N days has a numeric default; other value ops with blank → no clause
+        if ($op -ne "in list") { return @{ Ldap = ""; Post = $null } }
+    }
 
     # ---- Computed / alias PowerShell properties ----
     if ($PS_PROP_MAP.ContainsKey($la)) {
@@ -1175,23 +1224,26 @@ function Build-ConditionClause ([hashtable]$row) {
             "Alias" {
                 $real = $map.Ldap
                 if ($op -eq "regex match") {
+                    if ($valT -eq "") { return @{ Ldap = ""; Post = $null } }
                     $clause = "($real=*)"
-                    if ($valT -ne "") {
-                        $post = @{ Kind = "Regex"; PsProp = $la; Pattern = $valT; Negate = $negate }
-                    }
+                    $post = @{ Kind = "Regex"; PsProp = $la; Pattern = $valT; Negate = $negate }
                 } else {
                     $clause = Build-StringClause $real $op $valT
                 }
             }
             "ClientOnly" {
-                # No reliable LDAP equivalent — fetch broadly and filter client-side.
-                $clause = "(objectClass=*)"
+                # No LDAP clause (avoid (objectClass=*) blowing out OR groups).
+                # Filter entirely client-side after the query returns.
+                if (($VALUE_REQUIRED_OPS -contains $op) -and [string]::IsNullOrWhiteSpace($valT)) {
+                    return @{ Ldap = ""; Post = $null }
+                }
+                $clause = ""
                 $post = @{
-                    Kind    = "BoolOrString"
-                    PsProp  = $map.PsProp
+                    Kind     = "BoolOrString"
+                    PsProp   = $map.PsProp
                     Operator = $op
-                    Value   = $valT
-                    Negate  = $negate
+                    Value    = $valT
+                    Negate   = $negate
                 }
             }
         }
@@ -1210,12 +1262,14 @@ function Build-ConditionClause ([hashtable]$row) {
             "is not set" { $clause = "(!($real=*))" }
             "in last N days" {
                 $n = 30; [void][int]::TryParse($valT, [ref]$n)
+                if ($n -lt 1) { $n = 30 }
                 $cut = (Get-Date).AddDays(-$n)
                 $clause = "($real>=$(ConvertTo-LdapDate $cut $kind))"
             }
             default {
+                if ([string]::IsNullOrWhiteSpace($valT)) { return @{ Ldap = ""; Post = $null } }
                 $dt = [datetime]::Now
-                if (-not [datetime]::TryParse($valT, [ref]$dt)) { $dt = [datetime]::Now }
+                if (-not [datetime]::TryParse($valT, [ref]$dt)) { return @{ Ldap = ""; Post = $null } }
                 $start = $dt.Date
                 $endOfDay = $start.AddDays(1).AddSeconds(-1)
                 $nextDay  = $start.AddDays(1)
@@ -1237,12 +1291,11 @@ function Build-ConditionClause ([hashtable]$row) {
             "is true"      { $clause = "($la=TRUE)" }
             "is false"     { $clause = "($la=FALSE)" }
             "regex match" {
+                if ($valT -eq "") { return @{ Ldap = ""; Post = $null } }
                 # LDAP cannot do regex — require the attribute to exist, then
                 # filter client-side against the PS property.
                 $clause = "($la=*)"
-                if ($valT -ne "") {
-                    $post = @{ Kind = "Regex"; PsProp = $la; Pattern = $valT; Negate = $negate }
-                }
+                $post = @{ Kind = "Regex"; PsProp = $la; Pattern = $valT; Negate = $negate }
             }
             default { $clause = Build-StringClause $la $op $valT }
         }
@@ -1564,6 +1617,7 @@ function Invoke-Query {
         }
 
         $ldap    = Build-LDAPFilter
+        if ([string]::IsNullOrWhiteSpace($ldap)) { $ldap = "(objectClass=*)" }
         $objType = $script:CurrentObjType
         $useOU   = $rdoOU.Checked
         $ouDN    = $cmbOU.Text.Trim()
@@ -1596,16 +1650,26 @@ function Invoke-Query {
 
         $props = @($neededProps | Where-Object { $_ })
 
-        $queryParams = @{ LDAPFilter = $ldap; Properties = $props; ResultSetSize = $null; ErrorAction = "Stop" }
-        if ($useOU -and $ouDN -ne "") { $queryParams.SearchBase = $ouDN }
-
+        $finalLdap = $ldap
         if ($gbStatus.Visible) {
             if ($chkEnabled.Checked -and -not $chkDisabled.Checked) {
-                $queryParams.LDAPFilter = "(&$($queryParams.LDAPFilter)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
+                $finalLdap = "(&{0}(!(userAccountControl:1.2.840.113556.1.4.803:=2)))" -f $ldap
             } elseif ($chkDisabled.Checked -and -not $chkEnabled.Checked) {
-                $queryParams.LDAPFilter = "(&$($queryParams.LDAPFilter)(userAccountControl:1.2.840.113556.1.4.803:=2))"
+                $finalLdap = "(&{0}(userAccountControl:1.2.840.113556.1.4.803:=2))" -f $ldap
             }
         }
+
+        if (-not (Test-LdapFilterSyntax $finalLdap)) {
+            throw "Generated LDAP filter is invalid:`r`n$finalLdap"
+        }
+        # Keep preview textbox in sync with the exact filter we send
+        $txtLdap.Text = $finalLdap
+        if ($script:PostFilters.Count -gt 0) {
+            $txtLdap.Text += "`r`n+ $($script:PostFilters.Count) client-side post-filter(s)"
+        }
+
+        $queryParams = @{ LDAPFilter = $finalLdap; Properties = $props; ResultSetSize = $null; ErrorAction = "Stop" }
+        if ($useOU -and $ouDN -ne "") { $queryParams.SearchBase = $ouDN }
 
         Start-Progress "Querying AD..."
         $streamCount = 0
@@ -1716,7 +1780,13 @@ function Invoke-Query {
         Set-Status "Done - $total result(s)" $total $enabled $disabled
     } catch {
         Stop-Progress
-        [System.Windows.Forms.MessageBox]::Show("Query failed:`n$_","Error",
+        $filterHint = ""
+        try {
+            if ($txtLdap -and $txtLdap.Text) {
+                $filterHint = "`r`n`r`nLDAP filter:`r`n$($txtLdap.Text)"
+            }
+        } catch { }
+        [System.Windows.Forms.MessageBox]::Show("Query failed:`r`n$_$filterHint","Error",
             [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
         Set-Status "Error"
     } finally {
