@@ -210,11 +210,15 @@ function Register-Status {
 
 function Add-CheckRow {
     param(
+        # Empty Generic.List is a valid "start adding rows" target. PowerShell
+        # otherwise rejects Mandatory collection parameters when Count is 0.
         [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
         [System.Collections.Generic.List[PSObject]]$List,
         [Parameter(Mandatory)]
         [string]$Section,
         [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
         [hashtable]$Properties,
         [string]$Status = 'Info',
         [string]$Recommendation = '',
@@ -496,17 +500,20 @@ function New-SectionPanel {
 
 function Invoke-Section {
     param(
-        [string]$Name,
+        [string]$SectionLabel,
         [int]$Percent,
         [scriptblock]$Script
     )
-    Write-Progress -Activity "System Analysis ($hostname)" -Status $Name -PercentComplete $Percent
+    # Copy the label before dot-sourcing. Collector scriptblocks assign $name
+    # (case-insensitive with $Name) which used to overwrite the section title.
+    $savedLabel = "$SectionLabel"
+    Write-Progress -Activity "System Analysis ($hostname)" -Status $savedLabel -PercentComplete $Percent
     try {
         . $Script
     } catch {
-        Write-StepWarn "$Name failed: $($_.Exception.Message)"
-        Add-CsvRow -Section $Name -Check 'Section error' -Value $_.Exception.Message -Status 'Warning' -Recommendation 'This section failed. Re-run elevated and review the console output.'
-        Register-Status -Status 'Warning' -Section $Name -Check 'Section error' -Value $_.Exception.Message -Recommendation 'This section failed. Re-run elevated and review the console output.'
+        Write-StepWarn "$savedLabel failed: $($_.Exception.Message)"
+        Add-CsvRow -Section $savedLabel -Check 'Section error' -Value $_.Exception.Message -Status 'Warning' -Recommendation 'This section failed. Re-run elevated and review the console output.'
+        Register-Status -Status 'Warning' -Section $savedLabel -Check 'Section error' -Value $_.Exception.Message -Recommendation 'This section failed. Re-run elevated and review the console output.'
     }
 }
 
@@ -569,7 +576,7 @@ if ($osInfoArr.Count -gt 0) { $osInfo = $osInfoArr[0] }
 
 if (Test-SectionEnabled 'CPU') {
     Write-Step 'CPU analysis' 'Sampling processor counters...'
-    Invoke-Section -Name 'CPU' -Percent 6 -Script {
+    Invoke-Section -SectionLabel 'CPU' -Percent 6 -Script {
         $cpuCounters = @(
             '\Processor(_Total)\% Processor Time',
             '\Processor(_Total)\% Privileged Time',
@@ -630,7 +637,7 @@ if (Test-SectionEnabled 'CPU') {
 
 if (Test-SectionEnabled 'Memory') {
     Write-Step 'Memory analysis' 'Sampling memory counters...'
-    Invoke-Section -Name 'Memory' -Percent 12 -Script {
+    Invoke-Section -SectionLabel 'Memory' -Percent 12 -Script {
         $memCounters = @(
             '\Memory\Available MBytes',
             '\Memory\% Committed Bytes In Use',
@@ -685,7 +692,7 @@ if (Test-SectionEnabled 'Memory') {
 
 if (Test-SectionEnabled 'Disk') {
     Write-Step 'Disk analysis' 'Sampling disk counters and volume free space...'
-    Invoke-Section -Name 'Disk' -Percent 18 -Script {
+    Invoke-Section -SectionLabel 'Disk' -Percent 18 -Script {
         $diskCounters = @(
             '\PhysicalDisk(_Total)\Avg. Disk sec/Read',
             '\PhysicalDisk(_Total)\Avg. Disk sec/Write',
@@ -754,7 +761,7 @@ if (Test-SectionEnabled 'Disk') {
 
 if (Test-SectionEnabled 'Network') {
     Write-Step 'Network analysis' 'Sampling NIC counters...'
-    Invoke-Section -Name 'Network' -Percent 24 -Script {
+    Invoke-Section -SectionLabel 'Network' -Percent 24 -Script {
         $skipPattern = 'isatap|Teredo|Loopback|6TO4|VPN|Pseudo'
         $nicNames = @()
         try {
@@ -813,7 +820,7 @@ if (Test-SectionEnabled 'Network') {
 
 if (Test-SectionEnabled 'Software') {
     Write-Step 'Software, roles, services, scheduled tasks'
-    Invoke-Section -Name 'Software' -Percent 32 -Script {
+    Invoke-Section -SectionLabel 'Software' -Percent 32 -Script {
         if (-not $SkipSoftware) {
             $seen = @{}
             $regPaths = @(
@@ -929,7 +936,7 @@ if (Test-SectionEnabled 'Software') {
 
 if (Test-SectionEnabled 'Events') {
     Write-Step 'Event log analysis' "Last $EventLogHours hour(s), grouped by provider + ID..."
-    Invoke-Section -Name 'Events' -Percent 40 -Script {
+    Invoke-Section -SectionLabel 'Events' -Percent 40 -Script {
         $since = (Get-Date).AddHours(-$EventLogHours)
         $logs  = @('System', 'Application')
         if ($IncludeSecurityLog) { $logs += 'Security' }
@@ -977,7 +984,7 @@ if (Test-SectionEnabled 'Events') {
 
 if (Test-SectionEnabled 'Health') {
     Write-Step 'Windows health' 'Uptime, patches, pending reboot...'
-    Invoke-Section -Name 'Health' -Percent 46 -Script {
+    Invoke-Section -SectionLabel 'Health' -Percent 46 -Script {
         if ($osInfo) {
             $boot = Convert-CimTime $osInfo.LastBootUpTime
             if ($boot) {
@@ -1061,7 +1068,7 @@ if (Test-SectionEnabled 'Health') {
 
 if (Test-SectionEnabled 'Security') {
     Write-Step 'Security, IIS, Windows Time'
-    Invoke-Section -Name 'Security' -Percent 52 -Script {
+    Invoke-Section -SectionLabel 'Security' -Percent 52 -Script {
         $adminNames = @()
         try {
             $adminNames = @(Get-LocalGroupMember -Group 'Administrators' -ErrorAction Stop | ForEach-Object { $_.Name })
@@ -1213,7 +1220,7 @@ if (Test-SectionEnabled 'Security') {
 
 if (Test-SectionEnabled 'SQL') {
     Write-Step 'SQL Server' 'Auto-detect instances and sample counters...'
-    Invoke-Section -Name 'SQL' -Percent 58 -Script {
+    Invoke-Section -SectionLabel 'SQL' -Percent 58 -Script {
         $regSql = 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL'
         if (Test-Path $regSql) {
             $props = Get-ItemProperty $regSql -ErrorAction SilentlyContinue
@@ -1297,7 +1304,7 @@ if (Test-SectionEnabled 'SQL') {
 
 if (Test-SectionEnabled 'Hardware') {
     Write-Step 'Hardware / firmware'
-    Invoke-Section -Name 'Hardware' -Percent 64 -Script {
+    Invoke-Section -SectionLabel 'Hardware' -Percent 64 -Script {
         $csArr = Get-CimOrWmi -Class Win32_ComputerSystem
         if ($csArr.Count -gt 0) {
             $cs = $csArr[0]
@@ -1377,7 +1384,7 @@ if (Test-SectionEnabled 'Hardware') {
 
 if (Test-SectionEnabled 'MemoryDeep') {
     Write-Step 'Memory deep dive' 'Top processes and page file...'
-    Invoke-Section -Name 'MemoryDeep' -Percent 70 -Script {
+    Invoke-Section -SectionLabel 'MemoryDeep' -Percent 70 -Script {
         $topProcs = Get-Process -ErrorAction SilentlyContinue | Sort-Object WorkingSet64 -Descending | Select-Object -First 20
         foreach ($p in $topProcs) {
             $wsMB = 0
@@ -1436,7 +1443,7 @@ if (Test-SectionEnabled 'MemoryDeep') {
 
 if (Test-SectionEnabled 'StorageDeep') {
     Write-Step 'Storage deep dive'
-    Invoke-Section -Name 'StorageDeep' -Percent 76 -Script {
+    Invoke-Section -SectionLabel 'StorageDeep' -Percent 76 -Script {
         foreach ($pt in (Get-CimOrWmi -Class Win32_DiskPartition)) {
             $storDeepRows.Add([PSCustomObject]@{
                 Disk             = $pt.DiskIndex
@@ -1494,7 +1501,7 @@ if (Test-SectionEnabled 'StorageDeep') {
 
 if (Test-SectionEnabled 'NetworkDeep') {
     Write-Step 'Network deep dive' 'TCP states, DNS, listeners...'
-    Invoke-Section -Name 'NetworkDeep' -Percent 82 -Script {
+    Invoke-Section -SectionLabel 'NetworkDeep' -Percent 82 -Script {
         $tcpConns = @()
         try { $tcpConns = @(Get-NetTCPConnection -ErrorAction Stop) } catch { Write-StepWarn "TCP connections: $($_.Exception.Message)" }
         if ($tcpConns.Count -gt 0) {
@@ -1567,7 +1574,7 @@ if (Test-SectionEnabled 'NetworkDeep') {
 
 if (Test-SectionEnabled 'AD') {
     Write-Step 'Active Directory, Kerberos, BPA'
-    Invoke-Section -Name 'AD' -Percent 88 -Script {
+    Invoke-Section -SectionLabel 'AD' -Percent 88 -Script {
         $htmlOut = New-Object System.Text.StringBuilder
         $adRows  = New-RowList
         $kerbRows = New-RowList
@@ -1744,7 +1751,7 @@ if (Test-SectionEnabled 'AD') {
 
 if (Test-SectionEnabled 'HyperV') {
     Write-Step 'Hyper-V'
-    Invoke-Section -Name 'HyperV' -Percent 94 -Script {
+    Invoke-Section -SectionLabel 'HyperV' -Percent 94 -Script {
         $hvInstalled = $false
         try {
             $vmms = Get-Service -Name vmms -ErrorAction Stop
@@ -1802,7 +1809,7 @@ if (Test-SectionEnabled 'HyperV') {
 
 if (Test-SectionEnabled 'Certificates') {
     Write-Step 'Certificates' 'Personal / WebHosting stores (Root/CA optional)...'
-    Invoke-Section -Name 'Certificates' -Percent 97 -Script {
+    Invoke-Section -SectionLabel 'Certificates' -Percent 97 -Script {
         $stores = New-Object 'System.Collections.Generic.List[string]'
         [void]$stores.Add('LocalMachine\My')
         if (Test-Path 'Cert:\LocalMachine\WebHosting') { [void]$stores.Add('LocalMachine\WebHosting') }
