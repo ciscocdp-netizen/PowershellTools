@@ -1763,7 +1763,18 @@ $totalCritical = @($script:statuses | Where-Object { $_ -eq 'Critical' }).Count
 $totalWarning  = @($script:statuses | Where-Object { $_ -eq 'Warning' }).Count
 $totalOK       = @($script:statuses | Where-Object { $_ -eq 'OK' }).Count
 $overallStatus = if ($totalCritical -gt 0) { 'Critical' } elseif ($totalWarning -gt 0) { 'Warning' } else { 'OK' }
-$healthScore   = [math]::Max(0, [math]::Min(100, 100 - ($totalCritical * 12) - ($totalWarning * 4)))
+$scoredChecks  = $totalOK + $totalWarning + $totalCritical
+if ($scoredChecks -le 0) {
+    $healthScore = 100
+} else {
+    # Weighted pass rate: OK counts 1, Warning 2, Critical 3.
+    # A machine with mostly passing checks cannot collapse to 0 just because
+    # a handful of unique issues exist (the old 100-12*crit-4*warn formula did).
+    $weighted = [double]$totalOK + (2.0 * $totalWarning) + (3.0 * $totalCritical)
+    $healthScore = [int][math]::Round(100.0 * $totalOK / $weighted)
+    if ($healthScore -lt 0) { $healthScore = 0 }
+    if ($healthScore -gt 100) { $healthScore = 100 }
+}
 $uptimeStr = ''
 if ($osInfo) {
     $boot2 = Convert-CimTime $osInfo.LastBootUpTime
@@ -1774,7 +1785,7 @@ if ($osInfo) {
 }
 $runtimeSec = [math]::Round(((Get-Date) - $startTime).TotalSeconds, 1)
 $genTime    = Get-TimeStamp
-$scoreBarColor = if ($totalCritical -gt 0) { '#fb7185' } elseif ($totalWarning -gt 0) { '#fbbf24' } else { '#34d399' }
+$scoreBarColor = if ($healthScore -ge 80) { '#34d399' } elseif ($healthScore -ge 60) { '#fbbf24' } else { '#fb7185' }
 
 $osCaption = ''
 if ($osInfo) { $osCaption = [string]$osInfo.Caption }
@@ -1859,6 +1870,7 @@ a:hover{text-decoration:underline}
 .score-lbl{font-size:10px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);margin-top:4px}
 .score-counts{display:flex;justify-content:center;gap:12px;font-size:11px;color:var(--muted2)}
 .score-counts span{display:flex;align-items:center;gap:5px}
+.score-hint{margin-top:8px;font-size:10px;color:var(--muted);line-height:1.35}
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block}
 .dot-crit{background:var(--crit)} .dot-warn{background:var(--warn)} .dot-ok{background:var(--ok)}
 .sidebar-nav{padding:8px 10px 18px;flex:1}
@@ -2074,7 +2086,7 @@ $navDefs = @(
 
 [void]$sb.AppendLine('<div class="sidebar-score">')
 [void]$sb.AppendLine('<div class="score-ring-wrap">')
-[void]$sb.AppendLine("<svg viewBox=`"0 0 36 36`" role=`"img`" aria-label=`"Health score $healthScore out of 100`">")
+[void]$sb.AppendLine("<svg viewBox=`"0 0 36 36`" role=`"img`" aria-label=`"Health score $healthScore out of 100. $totalOK of $scoredChecks checks passed.`">")
 [void]$sb.AppendLine('<path class="score-ring-bg" d="M18 2.2 a 15.8 15.8 0 1 1 0 31.6 a 15.8 15.8 0 1 1 0 -31.6"/>')
 [void]$sb.AppendLine("<path class=`"score-ring-fg`" stroke=`"$scoreBarColor`" stroke-dasharray=`"$healthScore, 100`" d=`"M18 2.2 a 15.8 15.8 0 1 1 0 31.6 a 15.8 15.8 0 1 1 0 -31.6`"/>")
 [void]$sb.AppendLine('</svg>')
@@ -2084,7 +2096,9 @@ $navDefs = @(
 [void]$sb.AppendLine("<span><span class=`"dot dot-crit`"></span>$totalCritical Crit</span>")
 [void]$sb.AppendLine("<span><span class=`"dot dot-warn`"></span>$totalWarning Warn</span>")
 [void]$sb.AppendLine("<span><span class=`"dot dot-ok`"></span>$totalOK OK</span>")
-[void]$sb.AppendLine('</div></div>')
+[void]$sb.AppendLine('</div>')
+[void]$sb.AppendLine("<div class=`"score-hint`">$totalOK of $scoredChecks checks passed. Critical findings count 3&times;, warnings 2&times;.</div>")
+[void]$sb.AppendLine('</div>')
 
 [void]$sb.AppendLine('<div class="sidebar-nav">')
 $navIdx = 1
@@ -2255,7 +2269,7 @@ if ($osEnc) { [void]$sb.AppendLine(" &bull; $osEnc") }
 [void]$sb.AppendLine('<div class="content" id="content">')
 [void]$sb.AppendLine('<div class="summary-strip">')
 [void]$sb.AppendLine("<div class=`"stat-card`"><div class=`"sc-label`">Hostname</div><div class=`"sc-value`" style=`"font-size:18px`">$hostEnc</div><div class=`"sc-sub`">$osEnc</div></div>")
-[void]$sb.AppendLine("<div class=`"stat-card $overallStatClass`"><div class=`"sc-label`">Overall</div><div class=`"sc-value`" style=`"font-size:22px`">$overallStatus</div><div class=`"sc-sub`">score $healthScore / 100</div></div>")
+[void]$sb.AppendLine("<div class=`"stat-card $overallStatClass`"><div class=`"sc-label`">Overall</div><div class=`"sc-value`" style=`"font-size:22px`">$overallStatus</div><div class=`"sc-sub`">score $healthScore / 100 &bull; $totalOK of $scoredChecks passed</div></div>")
 [void]$sb.AppendLine("<div class=`"stat-card stat-crit`"><div class=`"sc-label`">Critical</div><div class=`"sc-value`">$totalCritical</div><div class=`"sc-sub`">unique checks</div></div>")
 [void]$sb.AppendLine("<div class=`"stat-card stat-warn`"><div class=`"sc-label`">Warnings</div><div class=`"sc-value`">$totalWarning</div><div class=`"sc-sub`">unique checks</div></div>")
 [void]$sb.AppendLine("<div class=`"stat-card stat-ok`"><div class=`"sc-label`">OK</div><div class=`"sc-value`">$totalOK</div><div class=`"sc-sub`">checks passed</div></div>")
