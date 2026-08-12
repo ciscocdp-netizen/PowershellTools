@@ -330,37 +330,64 @@ function Format-Number {
 }
 
 function Test-PendingReboot {
-    $reasons = New-Object 'System.Collections.Generic.List[string]'
+    # Returns a plain-language reboot status.
+    # CBS / Windows Update / Server Manager / domain-join are real restart requests.
+    # PendingFileRenameOperations is leftover "replace this file at next boot" data and
+    # is extremely common on healthy machines — it is not treated as a reboot request.
+    $required = New-Object 'System.Collections.Generic.List[string]'
+    $notes    = New-Object 'System.Collections.Generic.List[string]'
+    $fileOps  = 0
 
     if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') {
-        [void]$reasons.Add('Component Based Servicing')
+        [void]$required.Add('Windows servicing (CBS) has updates that only finish after a restart')
     }
     if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') {
-        [void]$reasons.Add('Windows Update')
-    }
-    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\PostRebootReporting') {
-        [void]$reasons.Add('Post-reboot reporting')
+        [void]$required.Add('Windows Update has patches that only finish after a restart')
     }
     if (Test-Path 'HKLM:\SOFTWARE\Microsoft\ServerManager\CurrentRebootAttempts') {
-        [void]$reasons.Add('Server Manager')
+        [void]$required.Add('Server Manager is waiting to finish a restart')
     }
-
-    try {
-        $sm = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction Stop
-        $pfro = $sm.PendingFileRenameOperations
-        if ($pfro -and @($pfro | Where-Object { $_ -and $_.ToString().Trim() }).Count -gt 0) {
-            [void]$reasons.Add('Pending file rename')
-        }
-    } catch { }
 
     try {
         $cd = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon' -Name JoinDomain, AvoidSpnSet -ErrorAction SilentlyContinue
         if ($cd -and ($cd.JoinDomain -or $cd.AvoidSpnSet)) {
-            [void]$reasons.Add('Domain join')
+            [void]$required.Add('A domain join is waiting to complete after a restart')
         }
     } catch { }
 
-    return $reasons
+    try {
+        $sm = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction Stop
+        $fileOps = @($sm.PendingFileRenameOperations | Where-Object { $_ -and $_.ToString().Trim() }).Count
+        if ($fileOps -gt 0) {
+            [void]$notes.Add("$fileOps leftover file-replace operation(s) are queued for the next boot. That is common leftover installer data, not a Windows restart request.")
+        }
+    } catch { }
+
+    $rebootRequired = $required.Count -gt 0
+    $summary = if ($rebootRequired) {
+        ($required -join '; ')
+    } else {
+        'No'
+    }
+
+    $recommendation = ''
+    $status = 'OK'
+    if ($rebootRequired) {
+        $status = 'Warning'
+        $recommendation = 'A restart is required to finish updates or servicing. Schedule a maintenance window.'
+    } elseif ($fileOps -gt 0) {
+        $status = 'Info'
+        $summary = "No restart requested ($fileOps leftover file-replace entries)"
+        $recommendation = 'Windows has not asked for a reboot. Installers sometimes leave file-replace entries in the registry; you can ignore this unless Windows Update or servicing also reports a restart.'
+    }
+
+    return [PSCustomObject]@{
+        RebootRequired = $rebootRequired
+        Status         = $status
+        Summary        = $summary
+        Recommendation = $recommendation
+        Notes          = $notes
+    }
 }
 
 function Get-HtmlTable {
@@ -1025,13 +1052,9 @@ if (Test-SectionEnabled 'Health') {
             }
         }
 
-        $rebootReasons = Test-PendingReboot
-        $pending = $rebootReasons.Count -gt 0
-        $rbStatus = if ($pending) { 'Warning' } else { 'OK' }
-        $rbValue  = if ($pending) { ($rebootReasons -join ', ') } else { 'False' }
-        $rbRec    = if ($pending) { "Pending reboot: $rbValue. Schedule a maintenance window." } else { '' }
-        Add-CheckRow -List $winHealthRows -Section 'WindowsHealth' -Status $rbStatus -Recommendation $rbRec -Check 'Pending Reboot' -Value $rbValue -Properties @{
-            Check = 'Pending Reboot'; Value = $rbValue; Status = $rbStatus; Recommendation = $rbRec
+        $reboot = Test-PendingReboot
+        Add-CheckRow -List $winHealthRows -Section 'WindowsHealth' -Status $reboot.Status -Recommendation $reboot.Recommendation -Check 'Restart needed?' -Value $reboot.Summary -NoScore:($reboot.Status -eq 'Info') -Properties @{
+            Check = 'Restart needed?'; Value = $reboot.Summary; Status = $reboot.Status; Recommendation = $reboot.Recommendation
         }
 
         try {
