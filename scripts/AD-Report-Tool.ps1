@@ -177,6 +177,10 @@ $script:FilterGroups   = [System.Collections.Generic.List[hashtable]]::new()
 # Client-side predicates applied after the LDAP query returns.
 $script:PostFilters    = [System.Collections.Generic.List[hashtable]]::new()
 $script:VisibleColumns = [System.Collections.Generic.List[string]]::new()
+# Properties actually retrieved from AD for the current result set. Used by the
+# column chooser — ADUser's property adapter exposes many names even when the
+# values were never loaded, so a null check on the sample object is unreliable.
+$script:LoadedProperties = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 $script:CurrentObjType = "Users"
 $script:IsRunning      = $false
 
@@ -1473,6 +1477,8 @@ function Switch-ObjectType ([string]$ObjType) {
     Rebuild-FilterContainer
     $script:VisibleColumns.Clear()
     $DEFAULT_COLS[$ObjType] | ForEach-Object { $script:VisibleColumns.Add($_) }
+    $script:LoadedProperties.Clear()
+    $script:Results = @()
 }
 foreach ($kv in $script:ObjTypeButtons.GetEnumerator()) {
     $kv.Value.Add_Click({ Switch-ObjectType $this.Tag })
@@ -1610,6 +1616,7 @@ function Invoke-Query {
         # Account status: neither box checked → empty result set (explicit choice)
         if ($gbStatus.Visible -and -not $chkEnabled.Checked -and -not $chkDisabled.Checked) {
             $script:Results = @()
+            $script:LoadedProperties.Clear()
             Populate-Grid $script:Results
             Stop-Progress
             Set-Status "Done - 0 result(s) (no account status selected)" 0 0 0
@@ -1767,6 +1774,10 @@ function Invoke-Query {
         }
 
         $script:Results = @($rawResults)
+        # Record what AD actually returned so the column chooser can re-hydrate later
+        $script:LoadedProperties.Clear()
+        foreach ($p in $props) { if ($p) { [void]$script:LoadedProperties.Add($p) } }
+
         $total    = $script:Results.Count
         $enabled  = @($script:Results | Where-Object { (Get-ObjectPropValue -Object $_ -Name 'Enabled') -eq $true }).Count
         $disabled = @($script:Results | Where-Object { (Get-ObjectPropValue -Object $_ -Name 'Enabled') -eq $false }).Count
@@ -1820,6 +1831,7 @@ function Clear-Form {
     $txtGroupSearch.Text = "Search groups..."; $txtGroupSearch.ForeColor = $Theme.TextMuted
     $Grid.Rows.Clear(); $Grid.Columns.Clear()
     $script:Results = @()
+    $script:LoadedProperties.Clear()
     Set-Status "Ready"
     Update-FilterPreview
 }
@@ -1906,8 +1918,78 @@ $btnSummary.Add_Click({
 })
 
 # ===========================================================================
-# COLUMN CHOOSER
+# COLUMN CHOOSER / RESULT RE-HYDRATION
 # ===========================================================================
+# AD cmdlet objects use a property adapter: names like PasswordLastSet often
+# appear on PSObject even when never requested (value stays $null), and
+# Add-Member cannot override them. Track LoadedProperties and REPLACE each
+# result object with a fresh Get-AD* call that requests the full property set.
+function Update-ResultsWithProperties {
+    param([Parameter(Mandatory)][string[]]$NeededProps)
+
+    if ($script:Results.Count -eq 0) { return }
+
+    $missing = @($NeededProps | Where-Object { $_ -and -not $script:LoadedProperties.Contains($_) })
+    if ($missing.Count -eq 0) { return }
+
+    $fetchSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($p in $script:LoadedProperties) { [void]$fetchSet.Add($p) }
+    foreach ($p in $NeededProps) { if ($p) { [void]$fetchSet.Add($p) } }
+    [void]$fetchSet.Add("DistinguishedName")
+    # Ensure alias LDAP names are also requested when the PS name is needed
+    foreach ($p in @($NeededProps)) {
+        if ($p -and $PS_PROP_MAP.ContainsKey($p) -and $PS_PROP_MAP[$p].Kind -eq "Alias") {
+            [void]$fetchSet.Add($PS_PROP_MAP[$p].Ldap)
+        }
+    }
+    # Date convenience props need their underlying LDAP attrs too
+    foreach ($p in @($NeededProps)) {
+        if ($p -and $DATE_LDAP_MAP.ContainsKey($p)) { [void]$fetchSet.Add($DATE_LDAP_MAP[$p].Ldap) }
+    }
+
+    $fetchAttrs = @($fetchSet)
+    $fetchCmd = switch ($script:CurrentObjType) {
+        "Users"     { { param($dn,$p) Get-ADUser     -Identity $dn -Properties $p -ErrorAction Stop } }
+        "Computers" { { param($dn,$p) Get-ADComputer -Identity $dn -Properties $p -ErrorAction Stop } }
+        "Groups"    { { param($dn,$p) Get-ADGroup    -Identity $dn -Properties $p -ErrorAction Stop } }
+        default     { { param($dn,$p) Get-ADObject   -Identity $dn -Properties $p -ErrorAction Stop } }
+    }
+
+    Start-Progress "Fetching $($missing.Count) attribute(s) for $($script:Results.Count) object(s)..."
+    $Form.Refresh()
+
+    $newResults = [System.Collections.Generic.List[object]]::new()
+    $fetched = 0
+    $errors  = 0
+    foreach ($r in $script:Results) {
+        $dn = Get-ObjectPropValue -Object $r -Name 'DistinguishedName'
+        if (-not $dn) {
+            $newResults.Add($r)
+            $fetched++
+            continue
+        }
+        try {
+            # Replace the whole object — do NOT Add-Member onto AD* instances
+            $fresh = & $fetchCmd $dn $fetchAttrs
+            $newResults.Add($fresh)
+        } catch {
+            $newResults.Add($r)
+            $errors++
+        }
+        $fetched++
+        if ($fetched % 25 -eq 0) {
+            Update-Progress "Fetching attributes: $fetched / $($script:Results.Count)..."
+        }
+    }
+
+    $script:Results = @($newResults)
+    foreach ($p in $fetchAttrs) { if ($p) { [void]$script:LoadedProperties.Add($p) } }
+    Stop-Progress
+    if ($errors -gt 0) {
+        Set-Status "Columns updated ($errors object(s) failed to refresh)"
+    }
+}
+
 $btnColumns.Add_Click({
     $allCols = @($ATTR[$script:CurrentObjType].Values)
 
@@ -1946,35 +2028,11 @@ $btnColumns.Add_Click({
             if ($clb.GetItemChecked($i)) { $script:VisibleColumns.Add($clb.Items[$i].ToString()) }
         }
         if ($script:Results.Count -gt 0) {
-            $sample = $script:Results[0]
-            $missingAttrs = @($script:VisibleColumns | Where-Object {
-                -not (Test-ObjectHasProp -Object $sample -Name $_)
-            })
-            if ($missingAttrs.Count -gt 0) {
-                Start-Progress "Fetching $($missingAttrs.Count) attribute(s) for $($script:Results.Count) object(s)..."
-                $Form.Refresh()
-                $fetchAttrs = @($missingAttrs) + @("DistinguishedName")
-                $fetchCmd = switch ($script:CurrentObjType) {
-                    "Users"     { { param($dn,$p) Get-ADUser     -Identity $dn -Properties $p -ErrorAction Stop } }
-                    "Computers" { { param($dn,$p) Get-ADComputer -Identity $dn -Properties $p -ErrorAction Stop } }
-                    "Groups"    { { param($dn,$p) Get-ADGroup    -Identity $dn -Properties $p -ErrorAction Stop } }
-                    default     { { param($dn,$p) Get-ADObject   -Identity $dn -Properties $p -ErrorAction Stop } }
-                }
-                $fetched = 0
-                foreach ($r in $script:Results) {
-                    $dn = Get-ObjectPropValue -Object $r -Name 'DistinguishedName'
-                    if (-not $dn) { $fetched++; continue }
-                    try {
-                        $fresh = & $fetchCmd $dn $fetchAttrs
-                        foreach ($attr in $missingAttrs) {
-                            $val = Get-ObjectPropValue -Object $fresh -Name $attr
-                            $r | Add-Member -NotePropertyName $attr -NotePropertyValue $val -Force
-                        }
-                    } catch { }
-                    $fetched++
-                    if ($fetched % 50 -eq 0) { Update-Progress "Fetching attributes: $fetched / $($script:Results.Count)..." }
-                }
-                Stop-Progress
+            try {
+                Update-ResultsWithProperties -NeededProps @($script:VisibleColumns)
+            } catch {
+                [System.Windows.Forms.MessageBox]::Show("Failed to load column data:`r`n$_","Columns",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
             }
             Apply-ResultsSearch
         }
