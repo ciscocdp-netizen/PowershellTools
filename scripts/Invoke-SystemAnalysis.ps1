@@ -3,9 +3,8 @@
     Comprehensive Windows Server Health & Performance Analysis.
 
 .DESCRIPTION
-    Collects CPU, memory, disk, network, SQL Server, Active Directory, Hyper-V,
-    certificate, and security metrics, then writes a self-contained HTML report
-    and a CSV export.
+    Collects CPU, memory, disk, network, SQL Server, Hyper-V, certificate, and
+    security metrics, then writes a self-contained HTML report and a CSV export.
 
     Designed for Windows PowerShell 5.1 (also runs on PowerShell 7 on Windows).
     Run elevated. Individual sections are isolated so one failure cannot abort
@@ -27,14 +26,8 @@
 .PARAMETER EventLogMaxPerLog
     Maximum events retrieved per log before grouping. Default: 80.
 
-.PARAMETER BpaTimeoutSeconds
-    Per-model timeout for Best Practices Analyzer jobs. Default: 45.
-
 .PARAMETER Sections
     Subset of sections to run. Default: All.
-
-.PARAMETER SkipBpa
-    Skip Windows Best Practices Analyzer (recommended on most servers; BPA can hang).
 
 .PARAMETER SkipSoftware
     Skip installed-software inventory (faster on servers with large Add/Remove lists).
@@ -52,7 +45,7 @@
     .\Invoke-SystemAnalysis.ps1
 
 .EXAMPLE
-    .\Invoke-SystemAnalysis.ps1 -OutputPath D:\Reports -SkipBpa -NoBrowser
+    .\Invoke-SystemAnalysis.ps1 -OutputPath D:\Reports -NoBrowser
 
 .NOTES
     Author: Anthony Blake (Anthony.Blake@cdw.com)
@@ -72,15 +65,12 @@ param(
     [int]$EventLogHours = 24,
     [ValidateRange(10, 500)]
     [int]$EventLogMaxPerLog = 80,
-    [ValidateRange(10, 300)]
-    [int]$BpaTimeoutSeconds = 45,
     [ValidateSet(
         'All', 'CPU', 'Memory', 'Disk', 'Network', 'Software', 'Events',
         'Health', 'Security', 'SQL', 'Hardware', 'MemoryDeep', 'StorageDeep',
-        'NetworkDeep', 'AD', 'HyperV', 'Certificates'
+        'NetworkDeep', 'HyperV', 'Certificates'
     )]
     [string[]]$Sections = @('All'),
-    [switch]$SkipBpa,
     [switch]$SkipSoftware,
     [switch]$IncludeRootCertificates,
     [switch]$IncludeSecurityLog,
@@ -523,6 +513,8 @@ function Invoke-Section {
 
 $hostname  = $env:COMPUTERNAME
 $startTime = Get-Date
+$script:ReportAuthorName  = 'Anthony Blake'
+$script:ReportAuthorEmail = 'Anthony.Blake@cdw.com'
 $script:tableSeq = 0
 $script:statuses = New-Object 'System.Collections.Generic.List[string]'
 $script:csvRows = New-RowList
@@ -560,8 +552,6 @@ $hwRows = New-RowList; $physDiskRows = New-RowList; $nicRows = New-RowList; $nic
 $memDeepRows = New-RowList; $pfRows = New-RowList
 $storDeepRows = New-RowList; $vssRows = New-RowList; $fsHealthRows = New-RowList
 $netDeepRows = New-RowList; $dnsRows = New-RowList; $listenRows = New-RowList
-$adKerbBpaHtml = '<p class="no-data">AD / Kerberos / BPA section was skipped.</p>'
-$adWorst = 'Info'; $adCheckCount = 0
 $hvRows = New-RowList
 $certRows = New-RowList
 $osInfo = $null
@@ -1570,184 +1560,7 @@ if (Test-SectionEnabled 'NetworkDeep') {
 
 #endregion
 
-#region ── Section 14: AD / Kerberos / BPA ────────────────────────────────────
-
-if (Test-SectionEnabled 'AD') {
-    Write-Step 'Active Directory, Kerberos, BPA'
-    Invoke-Section -SectionLabel 'AD' -Percent 88 -Script {
-        $htmlOut = New-Object System.Text.StringBuilder
-        $adRows  = New-RowList
-        $kerbRows = New-RowList
-        $bpaRows = New-RowList
-
-        $adModule = Get-Module -ListAvailable -Name ActiveDirectory -ErrorAction SilentlyContinue
-        if ($adModule) {
-            Import-Module ActiveDirectory -ErrorAction SilentlyContinue
-
-            $dcdiagText = ''
-            try { $dcdiagText = ((dcdiag /test:replications /test:netlogons /test:services /test:fsmocheck 2>&1) | Out-String) } catch { }
-            $dcHits = 0
-            foreach ($line in ($dcdiagText -split "`r?`n")) {
-                $trim = $line.Trim()
-                if ($trim -match 'passed test|failed test|warning') {
-                    $dcHits++
-                    $status = if ($trim -match 'failed test') { 'Critical' } elseif ($trim -match 'warning') { 'Warning' } else { 'OK' }
-                    $rec = if ($status -ne 'OK') { 'Review DCDiag output and remediate the failing test.' } else { '' }
-                    Add-CheckRow -List $adRows -Section 'AD-DCDiag' -Status $status -Recommendation $rec -Check 'DCDiag' -Value (Get-Truncated $trim 200) -Properties @{
-                        Check = 'DCDiag'; Value = (Get-Truncated $trim 200); Status = $status; Recommendation = $rec
-                    }
-                }
-            }
-            if ($dcHits -eq 0 -and $dcdiagText) {
-                $adRows.Add([PSCustomObject]@{
-                    Check = 'DCDiag'; Value = 'DCDiag ran but no pass/fail lines were parsed. The host may not be a domain controller.'; Status = 'Info'; Recommendation = ''
-                })
-            }
-
-            try {
-                $replText = ((repadmin /replsummary 2>&1) | Out-String)
-                foreach ($line in ($replText -split "`r?`n")) {
-                    $trim = $line.Trim()
-                    if ($trim -and $trim -match '(?i)\berror\b|\bfail') {
-                        Add-CheckRow -List $adRows -Section 'AD-Replication' -Status 'Critical' -Recommendation 'AD replication errors detected. Run repadmin /showrepl for details.' -Check 'Replication' -Value (Get-Truncated $trim 200) -Properties @{
-                            Check = 'Replication'; Value = (Get-Truncated $trim 200); Status = 'Critical'; Recommendation = 'AD replication errors detected. Run repadmin /showrepl for details.'
-                        }
-                    }
-                }
-            } catch { }
-
-            try {
-                $domain = Get-ADDomain -ErrorAction Stop
-                $forest = Get-ADForest -ErrorAction Stop
-                $fsmoRoles = @{
-                    'PDC Emulator'          = $domain.PDCEmulator
-                    'RID Master'            = $domain.RIDMaster
-                    'Infrastructure Master' = $domain.InfrastructureMaster
-                    'Schema Master'         = $forest.SchemaMaster
-                    'Domain Naming Master'  = $forest.DomainNamingMaster
-                }
-                foreach ($role in $fsmoRoles.GetEnumerator()) {
-                    $adRows.Add([PSCustomObject]@{
-                        Check = "FSMO: $($role.Key)"; Value = $role.Value; Status = 'Info'; Recommendation = ''
-                    })
-                }
-                $adRows.Add([PSCustomObject]@{ Check = 'Domain Functional Level'; Value = $domain.DomainMode; Status = 'Info'; Recommendation = '' })
-                $adRows.Add([PSCustomObject]@{ Check = 'Forest Functional Level'; Value = $forest.ForestMode; Status = 'Info'; Recommendation = '' })
-            } catch { }
-
-            try {
-                foreach ($dc in @(Get-ADDomainController -Filter * -ErrorAction Stop)) {
-                    $roles = @($dc.OperationMasterRoles) -join ', '
-                    $adRows.Add([PSCustomObject]@{
-                        Check = 'Domain Controller'
-                        Value = "$($dc.HostName) | Site: $($dc.Site) | OS: $($dc.OperatingSystem) | FSMO: $roles"
-                        Status = 'Info'
-                        Recommendation = ''
-                    })
-                }
-            } catch { }
-        } else {
-            $adRows.Add([PSCustomObject]@{
-                Check = 'AD Module'
-                Value = 'ActiveDirectory module not installed. Skipping DC/FSMO checks.'
-                Status = 'Info'
-                Recommendation = 'Install RSAT AD tools for full AD analysis.'
-            })
-        }
-
-        [void]$htmlOut.AppendLine((New-SubTitle 'Active Directory Health'))
-        [void]$htmlOut.AppendLine((Get-HtmlTable -SectionName 'AD' -Rows $adRows -Headers @('Check', 'Value', 'Status', 'Recommendation')))
-
-        $klistText = ''
-        try { $klistText = ((klist tickets 2>&1) | Out-String) } catch { $klistText = $_.Exception.Message }
-        if ($klistText -match '(?i)cached tickets' -and $klistText -notmatch '(?i)no tickets') {
-            $kerbRows.Add([PSCustomObject]@{ Check = 'Kerberos Tickets'; Value = 'Tickets present in the current session.'; Status = 'OK'; Recommendation = '' })
-            Register-Status -Status 'OK' -Section 'Kerberos' -Check 'Kerberos Tickets' -Value 'Present'
-        } else {
-            $kerbRows.Add([PSCustomObject]@{ Check = 'Kerberos Tickets'; Value = 'No Kerberos tickets found in the current session.'; Status = 'Info'; Recommendation = '' })
-        }
-
-        try {
-            $kerbEvents = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Security-Kerberos'; Level = 2, 3 } -MaxEvents 20 -ErrorAction Stop)
-            foreach ($ke in $kerbEvents) {
-                $kst = if ($ke.LevelDisplayName -eq 'Error' -or $ke.LevelDisplayName -eq 'Critical') { 'Critical' } else { 'Warning' }
-                $msg = Get-Truncated -Text $ke.Message -Max 200
-                Add-CheckRow -List $kerbRows -Section 'Kerberos' -Status $kst -Recommendation 'Investigate Kerberos errors. Check time sync, SPNs, and KDC availability.' -Check "Kerberos EventID $($ke.Id)" -Value $msg -Properties @{
-                    Check = "Kerberos EventID $($ke.Id)"; Value = $msg; Status = $kst; Recommendation = 'Investigate Kerberos errors. Check time sync, SPNs, and KDC availability.'
-                }
-            }
-        } catch {
-            $kerbRows.Add([PSCustomObject]@{ Check = 'Kerberos Events'; Value = 'No Kerberos errors/warnings retrieved from the System log.'; Status = 'OK'; Recommendation = '' })
-            Register-Status -Status 'OK' -Section 'Kerberos' -Check 'Kerberos Events' -Value 'None'
-        }
-
-        [void]$htmlOut.AppendLine((New-SubTitle 'Kerberos'))
-        [void]$htmlOut.AppendLine((Get-HtmlTable -SectionName 'Kerberos' -Rows $kerbRows -Headers @('Check', 'Value', 'Status', 'Recommendation')))
-
-        [void]$htmlOut.AppendLine((New-SubTitle 'Windows Best Practices Analyzer'))
-        if ($SkipBpa) {
-            [void]$htmlOut.AppendLine('<p class="no-data">BPA skipped (-SkipBpa). BPA is optional because some models hang on EngineReport.xml generation.</p>')
-        } else {
-            $bpaModels = $null
-            try { $bpaModels = @(Get-BpaModel -ErrorAction Stop) } catch { }
-            if ($bpaModels) {
-                foreach ($model in $bpaModels) {
-                    $job = $null
-                    try {
-                        $job = Start-Job -ScriptBlock {
-                            param($modelId)
-                            Invoke-BpaModel -ModelId $modelId -ErrorAction Stop 2>&1
-                        } -ArgumentList $model.Id
-                        $completed = Wait-Job -Job $job -Timeout $BpaTimeoutSeconds
-                        if (-not $completed) {
-                            Stop-Job -Job $job -ErrorAction SilentlyContinue
-                            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
-                            $bpaRows.Add([PSCustomObject]@{
-                                Model = $model.Name; Title = 'Timed out'; Problem = "BPA model $($model.Id) exceeded $BpaTimeoutSeconds seconds."; Resolution = 'Re-run this model manually or increase -BpaTimeoutSeconds.'; Status = 'Info'
-                            })
-                            continue
-                        }
-                        $jobOut = Receive-Job -Job $job 2>&1 | Out-String
-                        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
-                        if ($jobOut -match 'EngineReport\.xml|Result\.xml') { continue }
-
-                        $bpaResults = Get-BpaResult -ModelId $model.Id -ErrorAction Stop |
-                            Where-Object { $_.Severity -ne 'Information' -and $null -ne $_.Problem }
-                        foreach ($r in @($bpaResults)) {
-                            $bpaStatus = switch ($r.Severity) {
-                                'Error'   { 'Critical' }
-                                'Warning' { 'Warning' }
-                                default   { 'Info' }
-                            }
-                            Add-CheckRow -List $bpaRows -Section "BPA - $($model.Name)" -Status $bpaStatus -Recommendation $r.Resolution -Check $r.Title -Value $r.Problem -Properties @{
-                                Model      = $model.Name
-                                Title      = $r.Title
-                                Problem    = $r.Problem
-                                Resolution = $r.Resolution
-                                Status     = $bpaStatus
-                            }
-                        }
-                    } catch {
-                        if ($job) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
-                    }
-                }
-            }
-            if ($bpaRows.Count -gt 0) {
-                [void]$htmlOut.AppendLine((Get-HtmlTable -SectionName 'BPA' -Rows $bpaRows -Headers @('Model', 'Title', 'Problem', 'Resolution', 'Status')))
-            } else {
-                [void]$htmlOut.AppendLine('<p class="no-data">No BPA models found, or all models passed without warnings/errors.</p>')
-            }
-        }
-
-        $script:adKerbBpaHtml = $htmlOut.ToString()
-        $script:adWorst = Get-WorstStatus (@($adRows) + @($kerbRows) + @($bpaRows))
-        $script:adCheckCount = $adRows.Count + $kerbRows.Count + $bpaRows.Count
-    }
-}
-
-#endregion
-
-#region ── Section 15: Hyper-V ────────────────────────────────────────────────
+#region ── Section 14: Hyper-V ────────────────────────────────────────────────
 
 if (Test-SectionEnabled 'HyperV') {
     Write-Step 'Hyper-V'
@@ -1805,7 +1618,7 @@ if (Test-SectionEnabled 'HyperV') {
 
 #endregion
 
-#region ── Section 16: Certificates ───────────────────────────────────────────
+#region ── Section 15: Certificates ───────────────────────────────────────────
 
 if (Test-SectionEnabled 'Certificates') {
     Write-Step 'Certificates' 'Personal / WebHosting stores (Root/CA optional)...'
@@ -1968,7 +1781,12 @@ a:hover{text-decoration:underline}
 .nav-item.active{background:var(--accent-dim);color:var(--accent)}
 .nav-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
 .nav-num{font-size:10px;color:var(--muted);margin-left:auto;font-variant-numeric:tabular-nums}
-.sidebar-foot{padding:12px 16px 18px;border-top:1px solid var(--border);display:flex;gap:8px}
+.sidebar-foot{padding:12px 16px 18px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:12px}
+.report-author{display:flex;flex-direction:column;gap:2px}
+.author-label{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);font-weight:700}
+.author-name{font-size:12.5px;font-weight:700;color:var(--text)}
+.author-email{font-size:11px;color:var(--accent);text-decoration:none;word-break:break-all}
+.author-email:hover{text-decoration:underline}
 .sidebar-toggle{
   display:none;position:fixed;top:14px;left:14px;z-index:200;
   background:var(--card);border:1px solid var(--border);border-radius:8px;
@@ -2100,6 +1918,7 @@ tr.hidden-row{display:none}
 .meter-fill{display:block;height:100%;border-radius:99px}
 .meter-label{font-variant-numeric:tabular-nums}
 footer{text-align:center;padding:18px;font-size:11px;color:var(--muted);border-top:1px solid var(--border)}
+footer .author-email{color:var(--accent)}
 .back-top{
   position:fixed;right:22px;bottom:22px;z-index:70;display:none;
   background:var(--accent);color:#042f2e;border:0;border-radius:999px;padding:10px 14px;
@@ -2153,7 +1972,6 @@ $navDefs = @(
     @{ T = 'Memory Deep Dive';    I = 'Memory-Deep-Dive';    W = (Get-WorstStatus $memDeepRows) }
     @{ T = 'Storage Deep Dive';   I = 'Storage-Deep-Dive';   W = (Get-WorstStatus $fsHealthRows) }
     @{ T = 'Network Deep Dive';   I = 'Network-Deep-Dive';   W = (Get-WorstStatus (@($netDeepRows) + @($dnsRows))) }
-    @{ T = 'AD / Kerberos / BPA'; I = 'AD-Kerberos-BPA';     W = $adWorst }
     @{ T = 'Hyper-V';             I = 'Hyper-V';             W = (Get-WorstStatus $hvRows) }
     @{ T = 'Certificates';        I = 'Certificates';        W = (Get-WorstStatus $certRows) }
 )
@@ -2195,7 +2013,12 @@ foreach ($nav in $navDefs) {
 }
 [void]$sb.AppendLine('</div>')
 [void]$sb.AppendLine('<div class="sidebar-foot">')
-[void]$sb.AppendLine('<button type="button" class="btn" id="btn-theme" style="flex:1">Light mode</button>')
+[void]$sb.AppendLine('<div class="report-author">')
+[void]$sb.AppendLine('<div class="author-label">Prepared by</div>')
+[void]$sb.AppendLine("<div class=`"author-name`">$(ConvertTo-HtmlEncoded $script:ReportAuthorName)</div>")
+[void]$sb.AppendLine("<a class=`"author-email`" href=`"mailto:$(ConvertTo-HtmlEncoded $script:ReportAuthorEmail)`">$(ConvertTo-HtmlEncoded $script:ReportAuthorEmail)</a>")
+[void]$sb.AppendLine('</div>')
+[void]$sb.AppendLine('<button type="button" class="btn" id="btn-theme" style="width:100%">Light mode</button>')
 [void]$sb.AppendLine('</div></nav>')
 
 # Section bodies
@@ -2337,7 +2160,7 @@ $genEnc  = ConvertTo-HtmlEncoded $genTime
 [void]$sb.AppendLine("<div class=`"topbar-meta`">Generated $genEnc &bull; Runtime ${runtimeSec}s")
 if ($uptimeStr) { [void]$sb.AppendLine(" &bull; Uptime $uptimeStr") }
 if ($osEnc) { [void]$sb.AppendLine(" &bull; $osEnc") }
-[void]$sb.AppendLine(' &bull; <span class="kbd">/</span> search</div></div>')
+[void]$sb.AppendLine(" &bull; <span class=`"kbd`">/</span> search &bull; Prepared by $(ConvertTo-HtmlEncoded $script:ReportAuthorName)</div></div>")
 
 [void]$sb.AppendLine('<div class="content" id="content">')
 [void]$sb.AppendLine('<div class="summary-strip">')
@@ -2381,12 +2204,11 @@ function Open-IfIssue {
 [void]$sb.AppendLine((New-SectionPanel -Id 'Memory-Deep-Dive' -Title 'Memory Deep Dive' -WorstStatus (Get-WorstStatus $memDeepRows) -CheckCount ($memDeepRows.Count + $pfRows.Count) -BodyHtml $body11.ToString() -StartOpen (Open-IfIssue $memDeepRows)))
 [void]$sb.AppendLine((New-SectionPanel -Id 'Storage-Deep-Dive' -Title 'Storage Deep Dive' -WorstStatus (Get-WorstStatus $fsHealthRows) -CheckCount ($storDeepRows.Count + $fsHealthRows.Count + $vssRows.Count) -BodyHtml $body12.ToString() -StartOpen (Open-IfIssue $fsHealthRows)))
 [void]$sb.AppendLine((New-SectionPanel -Id 'Network-Deep-Dive' -Title 'Network Deep Dive' -WorstStatus (Get-WorstStatus (@($netDeepRows)+@($dnsRows))) -CheckCount ($netDeepRows.Count + $dnsRows.Count + $listenRows.Count) -BodyHtml $body13.ToString() -StartOpen (Open-IfIssue (@($netDeepRows)+@($dnsRows)))))
-[void]$sb.AppendLine((New-SectionPanel -Id 'AD-Kerberos-BPA' -Title 'AD / Kerberos / BPA' -WorstStatus $adWorst -CheckCount $adCheckCount -BodyHtml $adKerbBpaHtml -StartOpen ($adWorst -eq 'Critical' -or $adWorst -eq 'Warning')))
 [void]$sb.AppendLine((New-SectionPanel -Id 'Hyper-V' -Title 'Hyper-V' -WorstStatus (Get-WorstStatus $hvRows) -CheckCount $hvRows.Count -BodyHtml $body15.ToString() -StartOpen (Open-IfIssue $hvRows)))
 [void]$sb.AppendLine((New-SectionPanel -Id 'Certificates' -Title 'Certificates' -WorstStatus (Get-WorstStatus $certRows) -CheckCount $certRows.Count -BodyHtml $body16.ToString() -StartOpen (Open-IfIssue $certRows)))
 
 [void]$sb.AppendLine('</div>')
-[void]$sb.AppendLine("<footer>System Analysis Report &bull; $hostEnc &bull; $genEnc &bull; Score $healthScore/100</footer>")
+[void]$sb.AppendLine("<footer>System Analysis Report &bull; $hostEnc &bull; $genEnc &bull; Score $healthScore/100<br>Prepared by $(ConvertTo-HtmlEncoded $script:ReportAuthorName) &bull; <a class=`"author-email`" href=`"mailto:$(ConvertTo-HtmlEncoded $script:ReportAuthorEmail)`">$(ConvertTo-HtmlEncoded $script:ReportAuthorEmail)</a></footer>")
 [void]$sb.AppendLine('</div>')
 [void]$sb.AppendLine('<button type="button" class="back-top" id="back-top">Back to top</button>')
 

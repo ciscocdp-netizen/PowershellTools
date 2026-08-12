@@ -84,7 +84,12 @@ a:hover{text-decoration:underline}
 .nav-item.active{background:var(--accent-dim);color:var(--accent)}
 .nav-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
 .nav-num{font-size:10px;color:var(--muted);margin-left:auto;font-variant-numeric:tabular-nums}
-.sidebar-foot{padding:12px 16px 18px;border-top:1px solid var(--border);display:flex;gap:8px}
+.sidebar-foot{padding:12px 16px 18px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:12px}
+.report-author{display:flex;flex-direction:column;gap:2px}
+.author-label{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);font-weight:700}
+.author-name{font-size:12.5px;font-weight:700;color:var(--text)}
+.author-email{font-size:11px;color:var(--accent);text-decoration:none;word-break:break-all}
+.author-email:hover{text-decoration:underline}
 .sidebar-toggle{
   display:none;position:fixed;top:14px;left:14px;z-index:200;
   background:var(--card);border:1px solid var(--border);border-radius:8px;
@@ -270,8 +275,8 @@ footer{text-align:center;padding:18px;font-size:11px;color:var(--muted);border-t
 <span><span class="dot dot-warn"></span>3 Warn</span>
 <span><span class="dot dot-ok"></span>18 OK</span>
 </div></div>
-<div class="sidebar-nav"><button type="button" class="nav-item" data-target="CPU-Analysis"><span class="nav-dot" style="background:var(--warn)"></span><span>CPU Analysis</span><span class="nav-num">1</span></button><button type="button" class="nav-item" data-target="Memory-Analysis"><span class="nav-dot" style="background:var(--warn)"></span><span>Memory Analysis</span><span class="nav-num">2</span></button><button type="button" class="nav-item" data-target="Disk-Analysis"><span class="nav-dot" style="background:var(--crit)"></span><span>Disk Analysis</span><span class="nav-num">3</span></button><button type="button" class="nav-item" data-target="Network-Analysis"><span class="nav-dot" style="background:var(--ok)"></span><span>Network Analysis</span><span class="nav-num">4</span></button><button type="button" class="nav-item" data-target="Software-Services"><span class="nav-dot" style="background:var(--info)"></span><span>Software & Services</span><span class="nav-num">5</span></button><button type="button" class="nav-item" data-target="Event-Logs"><span class="nav-dot" style="background:var(--warn)"></span><span>Event Logs</span><span class="nav-num">6</span></button><button type="button" class="nav-item" data-target="Windows-Health"><span class="nav-dot" style="background:var(--ok)"></span><span>Windows Health</span><span class="nav-num">7</span></button><button type="button" class="nav-item" data-target="Security-IIS"><span class="nav-dot" style="background:var(--warn)"></span><span>Security & IIS</span><span class="nav-num">8</span></button><button type="button" class="nav-item" data-target="SQL-Server"><span class="nav-dot" style="background:var(--ok)"></span><span>SQL Server</span><span class="nav-num">9</span></button><button type="button" class="nav-item" data-target="Hardware"><span class="nav-dot" style="background:var(--info)"></span><span>Hardware</span><span class="nav-num">10</span></button><button type="button" class="nav-item" data-target="Memory-Deep-Dive"><span class="nav-dot" style="background:var(--ok)"></span><span>Memory Deep Dive</span><span class="nav-num">11</span></button><button type="button" class="nav-item" data-target="Storage-Deep-Dive"><span class="nav-dot" style="background:var(--ok)"></span><span>Storage Deep Dive</span><span class="nav-num">12</span></button><button type="button" class="nav-item" data-target="Network-Deep-Dive"><span class="nav-dot" style="background:var(--ok)"></span><span>Network Deep Dive</span><span class="nav-num">13</span></button><button type="button" class="nav-item" data-target="AD-Kerberos-BPA"><span class="nav-dot" style="background:var(--info)"></span><span>AD / Kerberos / BPA</span><span class="nav-num">14</span></button><button type="button" class="nav-item" data-target="Hyper-V"><span class="nav-dot" style="background:var(--info)"></span><span>Hyper-V</span><span class="nav-num">15</span></button><button type="button" class="nav-item" data-target="Certificates"><span class="nav-dot" style="background:var(--crit)"></span><span>Certificates</span><span class="nav-num">16</span></button></div>
-<div class="sidebar-foot"><button type="button" class="btn" id="btn-theme" style="flex:1">Light mode</button></div>
+<div class="sidebar-nav"><button type="button" class="nav-item" data-target="CPU-Analysis"><span class="nav-dot" style="background:var(--warn)"></span><span>CPU Analysis</span><span class="nav-num">1</span></button><button type="button" class="nav-item" data-target="Memory-Analysis"><span class="nav-dot" style="background:var(--warn)"></span><span>Memory Analysis</span><span class="nav-num">2</span></button><button type="button" class="nav-item" data-target="Disk-Analysis"><span class="nav-dot" style="background:var(--crit)"></span><span>Disk Analysis</span><span class="nav-num">3</span></button><button type="button" class="nav-item" data-target="Network-Analysis"><span class="nav-dot" style="background:var(--ok)"></span><span>Network Analysis</span><span class="nav-num">4</span></button><button type="button" class="nav-item" data-target="Software-Services"><span class="nav-dot" style="background:var(--info)"></span><span>Software & Services</span><span class="nav-num">5</span></button><button type="button" class="nav-item" data-target="Event-Logs"><span class="nav-dot" style="background:var(--warn)"></span><span>Event Logs</span><span class="nav-num">6</span></button><button type="button" class="nav-item" data-target="Windows-Health"><span class="nav-dot" style="background:var(--ok)"></span><span>Windows Health</span><span class="nav-num">7</span></button><button type="button" class="nav-item" data-target="Security-IIS"><span class="nav-dot" style="background:var(--warn)"></span><span>Security & IIS</span><span class="nav-num">8</span></button><button type="button" class="nav-item" data-target="SQL-Server"><span class="nav-dot" style="background:var(--ok)"></span><span>SQL Server</span><span class="nav-num">9</span></button><button type="button" class="nav-item" data-target="Hardware"><span class="nav-dot" style="background:var(--info)"></span><span>Hardware</span><span class="nav-num">10</span></button><button type="button" class="nav-item" data-target="Memory-Deep-Dive"><span class="nav-dot" style="background:var(--ok)"></span><span>Memory Deep Dive</span><span class="nav-num">11</span></button><button type="button" class="nav-item" data-target="Storage-Deep-Dive"><span class="nav-dot" style="background:var(--ok)"></span><span>Storage Deep Dive</span><span class="nav-num">12</span></button><button type="button" class="nav-item" data-target="Network-Deep-Dive"><span class="nav-dot" style="background:var(--ok)"></span><span>Network Deep Dive</span><span class="nav-num">13</span></button><button type="button" class="nav-item" data-target="Hyper-V"><span class="nav-dot" style="background:var(--info)"></span><span>Hyper-V</span><span class="nav-num">14</span></button><button type="button" class="nav-item" data-target="Certificates"><span class="nav-dot" style="background:var(--crit)"></span><span>Certificates</span><span class="nav-num">15</span></button></div>
+<div class="sidebar-foot"><div class="report-author"><div class="author-label">Prepared by</div><div class="author-name">Anthony Blake</div><a class="author-email" href="mailto:Anthony.Blake@cdw.com">Anthony.Blake@cdw.com</a></div><button type="button" class="btn" id="btn-theme" style="width:100%">Light mode</button></div>
 </nav>
 <div id="main">
 <div id="topbar">
@@ -452,15 +457,6 @@ footer{text-align:center;padding:18px;font-size:11px;color:var(--muted);border-t
 </div>
 <div class="section-body"><p class="no-data">Sample preview — TCP/DNS omitted.</p></div>
 </section>
-<section class="section-panel" id="AD-Kerberos-BPA" data-status="Info">
-<div class="section-header" role="button" tabindex="0" aria-expanded="false">
-<span class="section-chevron">▶</span>
-<span class="section-title">AD / Kerberos / BPA</span>
-<span class="section-badge badge-info">Info</span>
-<span class="section-count">3 checks</span>
-</div>
-<div class="section-body"><p class="no-data">ActiveDirectory module not installed. Skipping DC/FSMO checks.</p></div>
-</section>
 <section class="section-panel" id="Hyper-V" data-status="Info">
 <div class="section-header" role="button" tabindex="0" aria-expanded="false">
 <span class="section-chevron">▶</span>
@@ -487,7 +483,7 @@ footer{text-align:center;padding:18px;font-size:11px;color:var(--muted);border-t
 </tbody></table></div></div>
 </section>
 </div>
-<footer>System Analysis Report • SRV-APP-01 • 2026-08-12 14:32:10 • Score 52/100 • UI preview with sample data</footer>
+<footer>System Analysis Report • SRV-APP-01 • 2026-08-12 14:32:10 • Score 52/100<br>Prepared by Anthony Blake • <a class="author-email" href="mailto:Anthony.Blake@cdw.com">Anthony.Blake@cdw.com</a></footer>
 </div>
 <button type="button" class="back-top" id="back-top">Back to top</button>
 <script>window.REPORT_CSV_NAME = 'SystemAnalysis_SRV-APP-01.csv';</script>
