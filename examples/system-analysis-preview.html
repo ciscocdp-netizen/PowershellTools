@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta name="color-scheme" content="dark light"/>
+<title>System Analysis Report — Preview</title>
+<style>
+:root{
+  --bg:#070b14;--bg-2:#0c1220;--sidebar:#0a101c;--card:#121a2b;--card-2:#182234;
+  --border:rgba(148,163,184,.14);--glow:rgba(45,212,191,.16);
+  --accent:#2dd4bf;--accent-2:#38bdf8;--accent-hover:#5eead4;--accent-dim:rgba(45,212,191,.14);
+  --ok:#34d399;--ok-bg:rgba(52,211,153,.14);
+  --warn:#fbbf24;--warn-bg:rgba(251,191,36,.14);
+  --crit:#fb7185;--crit-bg:rgba(251,113,133,.14);
+  --info:#7b8ba3;--info-bg:rgba(123,139,163,.12);
+  --text:#e8eef7;--muted:#8b9cb3;--muted2:#a8b6c8;
+  --font:"Segoe UI",system-ui,-apple-system,sans-serif;
+  --mono:"Cascadia Code","Consolas",ui-monospace,monospace;
+  --radius:12px;--sidebar-w:280px;--shadow:0 18px 50px rgba(0,0,0,.35);
+  --topbar-h:64px;
+}
+html[data-theme="light"]{
+  --bg:#eef2f6;--bg-2:#e6ebf2;--sidebar:#ffffff;--card:#ffffff;--card-2:#f5f7fb;
+  --border:rgba(15,23,42,.1);--glow:rgba(15,118,110,.08);
+  --accent:#0f766e;--accent-2:#0369a1;--accent-hover:#0d9488;--accent-dim:rgba(15,118,110,.1);
+  --ok:#047857;--ok-bg:rgba(4,120,87,.1);
+  --warn:#b45309;--warn-bg:rgba(180,83,9,.1);
+  --crit:#be123c;--crit-bg:rgba(190,18,60,.1);
+  --info:#64748b;--info-bg:rgba(100,116,139,.1);
+  --text:#0f172a;--muted:#64748b;--muted2:#475569;
+  --shadow:0 12px 32px rgba(15,23,42,.08);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{min-height:100%}
+body{
+  font-family:var(--font);background:var(--bg);color:var(--text);font-size:14px;
+  display:flex;line-height:1.45;
+  background-image:
+    radial-gradient(1200px 500px at 90% -10%, var(--glow), transparent 55%),
+    linear-gradient(180deg, var(--bg) 0%, var(--bg-2) 100%);
+}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.skip-link{
+  position:absolute;left:-999px;top:8px;background:var(--accent);color:#042f2e;
+  padding:8px 12px;border-radius:8px;z-index:400;font-weight:700;
+}
+.skip-link:focus{left:12px}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);border:0}
+
+#sidebar{
+  width:var(--sidebar-w);flex-shrink:0;background:var(--sidebar);
+  border-right:1px solid var(--border);position:fixed;top:0;left:0;
+  height:100vh;overflow-y:auto;display:flex;flex-direction:column;z-index:100;
+  transition:transform .25s ease;
+}
+#sidebar::-webkit-scrollbar{width:6px}
+#sidebar::-webkit-scrollbar-thumb{background:var(--border);border-radius:8px}
+.sidebar-header{padding:20px 18px 14px;border-bottom:1px solid var(--border)}
+.sidebar-logo{display:flex;align-items:center;gap:12px}
+.sidebar-title{font-size:14px;font-weight:750;letter-spacing:.01em}
+.sidebar-sub{font-size:11px;color:var(--muted);margin-top:2px;font-family:var(--mono)}
+.sidebar-score{margin:16px 16px 8px;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px;text-align:center}
+.score-ring-wrap{position:relative;width:118px;height:118px;margin:0 auto 10px}
+.score-ring-wrap svg{transform:rotate(-90deg)}
+.score-ring-bg{fill:none;stroke:var(--border);stroke-width:3.2}
+.score-ring-fg{fill:none;stroke-width:3.2;stroke-linecap:round;transition:stroke-dasharray .8s ease}
+.score-center{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.score-num{font-size:28px;font-weight:800;letter-spacing:-.04em;line-height:1}
+.score-lbl{font-size:10px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);margin-top:4px}
+.score-counts{display:flex;justify-content:center;gap:12px;font-size:11px;color:var(--muted2)}
+.score-counts span{display:flex;align-items:center;gap:5px}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+.dot-crit{background:var(--crit)} .dot-warn{background:var(--warn)} .dot-ok{background:var(--ok)}
+.sidebar-nav{padding:8px 10px 18px;flex:1}
+.nav-item{
+  display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;
+  cursor:pointer;font-size:12.5px;color:var(--muted2);margin-bottom:2px;
+  transition:background .15s,color .15s;border:0;background:none;width:100%;text-align:left;
+}
+.nav-item:hover{background:var(--card);color:var(--text)}
+.nav-item.active{background:var(--accent-dim);color:var(--accent)}
+.nav-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.nav-num{font-size:10px;color:var(--muted);margin-left:auto;font-variant-numeric:tabular-nums}
+.sidebar-foot{padding:12px 16px 18px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:12px}
+.report-author{display:flex;flex-direction:column;gap:2px}
+.author-label{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);font-weight:700}
+.author-name{font-size:12.5px;font-weight:700;color:var(--text)}
+.author-email{font-size:11px;color:var(--accent);text-decoration:none;word-break:break-all}
+.author-email:hover{text-decoration:underline}
+.sidebar-toggle{
+  display:none;position:fixed;top:14px;left:14px;z-index:200;
+  background:var(--card);border:1px solid var(--border);border-radius:8px;
+  padding:7px 10px;cursor:pointer;color:var(--text);font-size:18px;line-height:1;
+}
+.sidebar-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:90}
+.sidebar-backdrop.show{display:block}
+
+#main{margin-left:var(--sidebar-w);flex:1;min-width:0;display:flex;flex-direction:column}
+#topbar{
+  position:sticky;top:0;z-index:80;min-height:var(--topbar-h);
+  background:var(--bg);
+  background:color-mix(in srgb, var(--bg) 84%, transparent);
+  backdrop-filter:blur(14px);border-bottom:1px solid var(--border);
+  padding:12px 28px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+}
+.topbar-title{font-size:16px;font-weight:750;flex:1;min-width:180px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.topbar-meta{font-size:11px;color:var(--muted);width:100%;order:5}
+.topbar-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.btn{
+  padding:7px 12px;border-radius:8px;border:1px solid var(--border);
+  background:var(--card-2);color:var(--text);font-size:12px;cursor:pointer;
+  transition:background .15s,border-color .15s,transform .1s;white-space:nowrap;
+}
+.btn:hover{border-color:var(--accent);color:var(--accent)}
+.btn-primary{background:var(--accent);border-color:var(--accent);color:#042f2e;font-weight:700}
+.btn-primary:hover{background:var(--accent-hover);color:#042f2e}
+#search-global{
+  background:var(--card-2);border:1px solid var(--border);border-radius:8px;
+  color:var(--text);padding:7px 12px;font-size:12px;width:220px;
+}
+#search-global:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-dim)}
+.content{padding:24px 28px 48px}
+
+.summary-strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px}
+.stat-card{
+  background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
+  padding:16px 16px 14px;display:flex;flex-direction:column;gap:6px;box-shadow:var(--shadow);
+}
+.stat-card .sc-label{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:700}
+.stat-card .sc-value{font-size:26px;font-weight:800;letter-spacing:-.03em;line-height:1;font-variant-numeric:tabular-nums}
+.stat-card .sc-sub{font-size:11px;color:var(--muted2)}
+.stat-crit .sc-value{color:var(--crit)} .stat-warn .sc-value{color:var(--warn)}
+.stat-ok .sc-value{color:var(--ok)} .stat-info .sc-value{color:var(--muted2)}
+
+.alert-banner{
+  display:flex;align-items:center;gap:12px;padding:12px 16px;border-radius:var(--radius);
+  margin-bottom:18px;font-size:13px;border:1px solid var(--border);border-left:4px solid;
+}
+.alert-crit{background:var(--crit-bg);border-left-color:var(--crit)}
+.alert-warn{background:var(--warn-bg);border-left-color:var(--warn)}
+.alert-ok{background:var(--ok-bg);border-left-color:var(--ok)}
+.alert-icon{font-size:18px}
+.alert-text{flex:1}
+.alert-text strong{color:inherit}
+
+.attention-panel{
+  background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
+  margin-bottom:18px;overflow:hidden;box-shadow:var(--shadow);
+}
+.attention-head{
+  display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--border);
+}
+.attention-head h2{font-size:14px;font-weight:750;flex:1}
+.attention-head .count{font-size:11px;color:var(--muted)}
+.attention-body{padding:12px 16px 16px}
+
+.section-panel{
+  background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
+  margin-bottom:12px;overflow:hidden;
+}
+.section-header{
+  display:flex;align-items:center;gap:10px;padding:13px 16px;cursor:pointer;user-select:none;
+}
+.section-header:hover{background:var(--card-2)}
+.section-chevron{color:var(--muted);font-size:11px;transition:transform .2s;width:16px;text-align:center}
+.section-panel.open .section-chevron{transform:rotate(90deg)}
+.section-title{font-size:13px;font-weight:700;flex:1}
+.section-badge{font-size:10px;font-weight:700;padding:3px 8px;border-radius:999px;text-transform:uppercase;letter-spacing:.04em}
+.badge-crit{background:var(--crit-bg);color:var(--crit)} .badge-warn{background:var(--warn-bg);color:var(--warn)}
+.badge-ok{background:var(--ok-bg);color:var(--ok)} .badge-info{background:var(--info-bg);color:var(--muted2)}
+.section-count{font-size:11px;color:var(--muted)}
+.section-body{padding:0 16px 16px;display:none}
+.section-panel.open .section-body{display:block}
+.subsection-title{
+  font-size:11px;font-weight:750;color:var(--muted2);text-transform:uppercase;
+  letter-spacing:.08em;padding:16px 0 8px;border-bottom:1px solid var(--border);margin-bottom:10px;
+}
+.table-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:10px 0}
+.filter-pills{display:flex;gap:4px;flex-wrap:wrap}
+.pill{
+  padding:4px 10px;border-radius:999px;font-size:11px;font-weight:650;cursor:pointer;
+  border:1px solid var(--border);background:transparent;color:var(--muted2);
+}
+.pill:hover,.pill.active{color:#fff;border-color:transparent}
+.pill-all.active{background:var(--accent);color:#042f2e}
+.pill-crit.active{background:var(--crit)} .pill-warn.active{background:var(--warn);color:#1c1403}
+.pill-ok.active{background:var(--ok);color:#042f2e} .pill-info.active{background:var(--info)}
+.tbl-search{
+  background:var(--card-2);border:1px solid var(--border);border-radius:8px;color:var(--text);
+  padding:5px 8px;font-size:11px;margin-left:auto;width:170px;
+}
+.tbl-count{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
+.table-wrapper{overflow-x:auto;border-radius:10px;border:1px solid var(--border)}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+thead tr{background:var(--card-2)}
+th{
+  padding:9px 10px;text-align:left;border-bottom:1px solid var(--border);font-weight:700;
+  white-space:nowrap;color:var(--muted2);font-size:11px;text-transform:uppercase;letter-spacing:.04em;
+  cursor:pointer;user-select:none;
+}
+th:hover{color:var(--text)}
+th .sort-icon{margin-left:4px;opacity:.35;font-size:9px}
+th.sort-asc .sort-icon,th.sort-desc .sort-icon{opacity:1;color:var(--accent)}
+th.sort-desc .sort-icon{transform:scaleY(-1);display:inline-block}
+td{padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:top;color:var(--muted2)}
+td:first-child{color:var(--text);font-weight:600}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover td{background:var(--accent-dim)}
+.row-crit td{background:var(--crit-bg)}
+.row-warn td{background:var(--warn-bg)}
+.status-pill{display:inline-flex;padding:2px 8px;border-radius:999px;font-size:10px;font-weight:750;text-transform:uppercase;letter-spacing:.03em}
+.sp-crit{background:var(--crit-bg);color:var(--crit)} .sp-warn{background:var(--warn-bg);color:var(--warn)}
+.sp-ok{background:var(--ok-bg);color:var(--ok)} .sp-info{background:var(--info-bg);color:var(--muted2)}
+tr.hidden-row{display:none}
+.no-data{color:var(--muted);font-style:italic;padding:12px 0;font-size:13px}
+.rec-cell{font-size:12px;max-width:340px}
+.meter{height:7px;background:var(--border);border-radius:99px;overflow:hidden;width:88px;display:inline-block;vertical-align:middle;margin-right:8px}
+.meter-fill{display:block;height:100%;border-radius:99px}
+.meter-label{font-variant-numeric:tabular-nums}
+footer{text-align:center;padding:18px;font-size:11px;color:var(--muted);border-top:1px solid var(--border)}
+.back-top{
+  position:fixed;right:22px;bottom:22px;z-index:70;display:none;
+  background:var(--accent);color:#042f2e;border:0;border-radius:999px;padding:10px 14px;
+  font-size:12px;font-weight:750;cursor:pointer;box-shadow:var(--shadow);
+}
+.back-top.show{display:block}
+.kbd{font-family:var(--mono);font-size:10px;border:1px solid var(--border);padding:1px 5px;border-radius:4px;color:var(--muted)}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:8px}
+
+@media(max-width:960px){
+  #sidebar{transform:translateX(-100%)}
+  #sidebar.mob-open{transform:translateX(0)}
+  #main{margin-left:0}
+  #topbar{padding:12px 16px 12px 56px}
+  .sidebar-toggle{display:block}
+  .content{padding:16px 14px 40px}
+  #search-global{width:140px}
+}
+@media(prefers-reduced-motion:reduce){
+  *{transition:none!important;scroll-behavior:auto!important}
+}
+@media print{
+  #sidebar,.sidebar-toggle,#topbar,.table-controls,.back-top,.sidebar-backdrop{display:none!important}
+  #main{margin-left:0}
+  .section-body{display:block!important}
+  .section-panel{break-inside:avoid;box-shadow:none}
+  body{background:#fff;color:#111}
+  .stat-card,.section-panel,.attention-panel{border-color:#d0d5dd}
+}
+</style>
+</head>
+<body>
+<a class="skip-link" href="#content">Skip to report</a>
+<button class="sidebar-toggle" id="mob-toggle" type="button" aria-label="Open section menu">☰</button>
+<div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+<nav id="sidebar" aria-label="Report sections">
+<div class="sidebar-header"><div class="sidebar-logo">
+<svg width="32" height="32" viewBox="0 0 32 32" fill="none" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#2dd4bf"/><path d="M8 20.5V11.5L16 8l8 3.5v9L16 24l-8-3.5z" stroke="#042f2e" stroke-width="1.6" fill="none"/><path d="M16 12v8M12.5 14.2l7 3.6" stroke="#042f2e" stroke-width="1.6" stroke-linecap="round"/></svg>
+<div><div class="sidebar-title">System Analysis</div><div class="sidebar-sub">SRV-APP-01</div></div>
+</div></div>
+<div class="sidebar-score">
+<div class="score-ring-wrap">
+<svg viewBox="0 0 36 36" role="img" aria-label="Health score 52 out of 100">
+<path class="score-ring-bg" d="M18 2.2 a 15.8 15.8 0 1 1 0 31.6 a 15.8 15.8 0 1 1 0 -31.6"/>
+<path class="score-ring-fg" stroke="#fb7185" stroke-dasharray="52, 100" d="M18 2.2 a 15.8 15.8 0 1 1 0 31.6 a 15.8 15.8 0 1 1 0 -31.6"/>
+</svg>
+<div class="score-center"><div class="score-num" style="color:#fb7185">52</div><div class="score-lbl">Score</div></div>
+</div>
+<div class="score-counts">
+<span><span class="dot dot-crit"></span>2 Crit</span>
+<span><span class="dot dot-warn"></span>3 Warn</span>
+<span><span class="dot dot-ok"></span>18 OK</span>
+</div></div>
+<div class="sidebar-nav"><button type="button" class="nav-item" data-target="CPU-Analysis"><span class="nav-dot" style="background:var(--warn)"></span><span>CPU Analysis</span><span class="nav-num">1</span></button><button type="button" class="nav-item" data-target="Memory-Analysis"><span class="nav-dot" style="background:var(--warn)"></span><span>Memory Analysis</span><span class="nav-num">2</span></button><button type="button" class="nav-item" data-target="Disk-Analysis"><span class="nav-dot" style="background:var(--crit)"></span><span>Disk Analysis</span><span class="nav-num">3</span></button><button type="button" class="nav-item" data-target="Network-Analysis"><span class="nav-dot" style="background:var(--ok)"></span><span>Network Analysis</span><span class="nav-num">4</span></button><button type="button" class="nav-item" data-target="Software-Services"><span class="nav-dot" style="background:var(--info)"></span><span>Software & Services</span><span class="nav-num">5</span></button><button type="button" class="nav-item" data-target="Event-Logs"><span class="nav-dot" style="background:var(--warn)"></span><span>Event Logs</span><span class="nav-num">6</span></button><button type="button" class="nav-item" data-target="Windows-Health"><span class="nav-dot" style="background:var(--ok)"></span><span>Windows Health</span><span class="nav-num">7</span></button><button type="button" class="nav-item" data-target="Security-IIS"><span class="nav-dot" style="background:var(--warn)"></span><span>Security & IIS</span><span class="nav-num">8</span></button><button type="button" class="nav-item" data-target="SQL-Server"><span class="nav-dot" style="background:var(--ok)"></span><span>SQL Server</span><span class="nav-num">9</span></button><button type="button" class="nav-item" data-target="Hardware"><span class="nav-dot" style="background:var(--info)"></span><span>Hardware</span><span class="nav-num">10</span></button><button type="button" class="nav-item" data-target="Memory-Deep-Dive"><span class="nav-dot" style="background:var(--ok)"></span><span>Memory Deep Dive</span><span class="nav-num">11</span></button><button type="button" class="nav-item" data-target="Storage-Deep-Dive"><span class="nav-dot" style="background:var(--ok)"></span><span>Storage Deep Dive</span><span class="nav-num">12</span></button><button type="button" class="nav-item" data-target="Network-Deep-Dive"><span class="nav-dot" style="background:var(--ok)"></span><span>Network Deep Dive</span><span class="nav-num">13</span></button><button type="button" class="nav-item" data-target="Hyper-V"><span class="nav-dot" style="background:var(--info)"></span><span>Hyper-V</span><span class="nav-num">14</span></button><button type="button" class="nav-item" data-target="Certificates"><span class="nav-dot" style="background:var(--crit)"></span><span>Certificates</span><span class="nav-num">15</span></button></div>
+<div class="sidebar-foot"><div class="report-author"><div class="author-label">Prepared by</div><div class="author-name">Anthony Blake</div><a class="author-email" href="mailto:Anthony.Blake@cdw.com">Anthony.Blake@cdw.com</a></div><button type="button" class="btn" id="btn-theme" style="width:100%">Light mode</button></div>
+</nav>
+<div id="main">
+<div id="topbar">
+<div class="topbar-title">System Analysis — SRV-APP-01</div>
+<div class="topbar-actions">
+<input type="search" id="search-global" placeholder="Search report  /" aria-label="Search the whole report" autocomplete="off">
+<button type="button" class="btn" id="btn-issues">Issues only</button>
+<button type="button" class="btn" id="btn-expand-all">Expand all</button>
+<button type="button" class="btn" id="btn-collapse-all">Collapse all</button>
+<button type="button" class="btn" id="btn-csv">Download CSV</button>
+<button type="button" class="btn btn-primary" onclick="window.print()">Print / PDF</button>
+</div>
+<div class="topbar-meta">Generated 2026-08-12 14:32:10 • Runtime 47.2s • Uptime 18d 4h 12m • Windows Server 2022 Standard • <span class="kbd">/</span> search</div>
+</div>
+<div class="content" id="content">
+<div class="summary-strip">
+<div class="stat-card"><div class="sc-label">Hostname</div><div class="sc-value" style="font-size:18px">SRV-APP-01</div><div class="sc-sub">Windows Server 2022 Standard</div></div>
+<div class="stat-card stat-crit"><div class="sc-label">Overall</div><div class="sc-value" style="font-size:22px">Critical</div><div class="sc-sub">score 52 / 100</div></div>
+<div class="stat-card stat-crit"><div class="sc-label">Critical</div><div class="sc-value">2</div><div class="sc-sub">unique checks</div></div>
+<div class="stat-card stat-warn"><div class="sc-label">Warnings</div><div class="sc-value">3</div><div class="sc-sub">unique checks</div></div>
+<div class="stat-card stat-ok"><div class="sc-label">OK</div><div class="sc-value">18</div><div class="sc-sub">checks passed</div></div>
+<div class="stat-card stat-info"><div class="sc-label">Uptime</div><div class="sc-value" style="font-size:18px">18d 4h 12m</div><div class="sc-sub">since last boot</div></div>
+</div>
+<div class="alert-banner alert-crit"><span class="alert-icon">⚠</span><span class="alert-text"><strong>2 critical issue(s)</strong> need attention, plus 3 warning(s).</span></div>
+<div class="attention-panel" id="attention">
+<div class="attention-head"><h2>Action required</h2><span class="count">5 item(s)</span></div>
+<div class="attention-body"><div class="table-controls" data-for="tbl-att">
+<div class="filter-pills"><button type="button" class="pill pill-all active" data-filter="all">All</button><button type="button" class="pill pill-crit" data-filter="Critical">Critical</button><button type="button" class="pill pill-warn" data-filter="Warning">Warning</button></div>
+<input type="search" class="tbl-search" placeholder="Filter rows..." aria-label="Filter table">
+<span class="tbl-count" data-total="5">5</span>
+</div>
+<div class="table-wrapper"><table id="tbl-att"><thead><tr><th scope="col" data-col="0">Section <span class="sort-icon">▲</span></th><th scope="col" data-col="1">Check <span class="sort-icon">▲</span></th><th scope="col" data-col="2">Value <span class="sort-icon">▲</span></th><th scope="col" data-col="3">Status <span class="sort-icon">▲</span></th><th scope="col" data-col="4">Recommendation <span class="sort-icon">▲</span></th></tr></thead><tbody>
+<tr class="row-crit" data-status="Critical"><td>Disk-Volume</td><td>C:</td><td>9.1 GB free (7.1%)</td><td class="status-cell"><span class="status-pill sp-crit">Critical</span></td><td class="rec-cell">Critical: C: has less than 8% free.</td></tr><tr class="row-warn" data-status="Warning"><td>CPU</td><td>% Processor Time</td><td>81.4</td><td class="status-cell"><span class="status-pill sp-warn">Warning</span></td><td class="rec-cell">CPU above 75%. Monitor for sustained spikes.</td></tr><tr class="row-warn" data-status="Warning"><td>Memory</td><td>Available MBytes</td><td>1842 MB (11.2% free)</td><td class="status-cell"><span class="status-pill sp-warn">Warning</span></td><td class="rec-cell">Less than 15% RAM free.</td></tr><tr class="row-crit" data-status="Critical"><td>Certificates</td><td>CN=app.contoso.local</td><td>Expires 2026-08-28 (16 d)</td><td class="status-cell"><span class="status-pill sp-crit">Critical</span></td><td class="rec-cell">Renew before 2026-08-28.</td></tr><tr class="row-warn" data-status="Warning"><td>Security</td><td>Firewall (Public)</td><td>Disabled</td><td class="status-cell"><span class="status-pill sp-warn">Warning</span></td><td class="rec-cell">Firewall Public profile is Disabled.</td></tr>
+</tbody></table></div></div>
+</div>
+<section class="section-panel open" id="CPU-Analysis" data-status="Warning">
+<div class="section-header" role="button" tabindex="0" aria-expanded="true">
+<span class="section-chevron">▶</span>
+<span class="section-title">CPU Analysis</span>
+<span class="section-badge badge-warn">Warning</span>
+<span class="section-count">4 checks</span>
+</div>
+<div class="section-body"><div class="subsection-title">Performance counters</div><div class="table-controls" data-for="tbl-cpu">
+<div class="filter-pills"><button type="button" class="pill pill-all active" data-filter="all">All</button><button type="button" class="pill pill-warn" data-filter="Warning">Warning</button><button type="button" class="pill pill-ok" data-filter="OK">OK</button></div>
+<input type="search" class="tbl-search" placeholder="Filter rows..." aria-label="Filter table">
+<span class="tbl-count" data-total="3">3</span>
+</div>
+<div class="table-wrapper"><table id="tbl-cpu"><thead><tr><th scope="col" data-col="0">Counter <span class="sort-icon">▲</span></th><th scope="col" data-col="1">Average <span class="sort-icon">▲</span></th><th scope="col" data-col="2">Status <span class="sort-icon">▲</span></th><th scope="col" data-col="3">Recommendation <span class="sort-icon">▲</span></th></tr></thead><tbody>
+<tr class="row-warn" data-status="Warning"><td>% Processor Time</td><td>81.4</td><td class="status-cell"><span class="status-pill sp-warn">Warning</span></td><td class="rec-cell">CPU above 75%. Monitor for sustained spikes.</td></tr><tr class="row-ok" data-status="OK"><td>% Privileged Time</td><td>12.1</td><td class="status-cell"><span class="status-pill sp-ok">OK</span></td><td class="rec-cell"></td></tr><tr class="row-ok" data-status="OK"><td>Processor Queue Length</td><td>1.2</td><td class="status-cell"><span class="status-pill sp-ok">OK</span></td><td class="rec-cell"></td></tr>
+</tbody></table></div></div>
+</section>
+<section class="section-panel open" id="Memory-Analysis" data-status="Warning">
+<div class="section-header" role="button" tabindex="0" aria-expanded="true">
+<span class="section-chevron">▶</span>
+<span class="section-title">Memory Analysis</span>
+<span class="section-badge badge-warn">Warning</span>
+<span class="section-count">3 checks</span>
+</div>
+<div class="section-body"><div class="table-controls" data-for="tbl-mem">
+<div class="filter-pills"><button type="button" class="pill pill-all active" data-filter="all">All</button><button type="button" class="pill pill-warn" data-filter="Warning">Warning</button><button type="button" class="pill pill-ok" data-filter="OK">OK</button></div>
+<input type="search" class="tbl-search" placeholder="Filter rows..." aria-label="Filter table">
+<span class="tbl-count" data-total="3">3</span>
+</div>
+<div class="table-wrapper"><table id="tbl-mem"><thead><tr><th scope="col" data-col="0">Counter <span class="sort-icon">▲</span></th><th scope="col" data-col="1">Average <span class="sort-icon">▲</span></th><th scope="col" data-col="2">Status <span class="sort-icon">▲</span></th><th scope="col" data-col="3">Recommendation <span class="sort-icon">▲</span></th></tr></thead><tbody>
+<tr class="row-warn" data-status="Warning"><td>Available MBytes</td><td>1842 MB (11.2% free)</td><td class="status-cell"><span class="status-pill sp-warn">Warning</span></td><td class="rec-cell">Less than 15% RAM free. Watch working sets.</td></tr><tr class="row-ok" data-status="OK"><td>% Committed Bytes In Use</td><td>64.0</td><td class="status-cell"><span class="status-pill sp-ok">OK</span></td><td class="rec-cell"></td></tr><tr class="row-ok" data-status="OK"><td>Pages/sec</td><td>18.4</td><td class="status-cell"><span class="status-pill sp-ok">OK</span></td><td class="rec-cell"></td></tr>
+</tbody></table></div></div>
+</section>
+<section class="section-panel open" id="Disk-Analysis" data-status="Critical">
+<div class="section-header" role="button" tabindex="0" aria-expanded="true">
+<span class="section-chevron">▶</span>
+<span class="section-title">Disk Analysis</span>
+<span class="section-badge badge-crit">Critical</span>
+<span class="section-count">2 checks</span>
+</div>
+<div class="section-body"><div class="subsection-title">Volume free space</div><div class="table-controls" data-for="tbl-vol">
+<div class="filter-pills"><button type="button" class="pill pill-all active" data-filter="all">All</button><button type="button" class="pill pill-crit" data-filter="Critical">Critical</button><button type="button" class="pill pill-ok" data-filter="OK">OK</button></div>
+<input type="search" class="tbl-search" placeholder="Filter rows..." aria-label="Filter table">
+<span class="tbl-count" data-total="2">2</span>
+</div>
+<div class="table-wrapper"><table id="tbl-vol"><thead><tr><th scope="col" data-col="0">Drive <span class="sort-icon">▲</span></th><th scope="col" data-col="1">Label <span class="sort-icon">▲</span></th><th scope="col" data-col="2">TotalGB <span class="sort-icon">▲</span></th><th scope="col" data-col="3">FreeGB <span class="sort-icon">▲</span></th><th scope="col" data-col="4">PctFree <span class="sort-icon">▲</span></th><th scope="col" data-col="5">FileSystem <span class="sort-icon">▲</span></th><th scope="col" data-col="6">Status <span class="sort-icon">▲</span></th><th scope="col" data-col="7">Recommendation <span class="sort-icon">▲</span></th></tr></thead><tbody>
+<tr class="row-crit" data-status="Critical"><td>C:</td><td>OS</td><td>127.5</td><td>9.1</td><td><div class="meter" title="7.1%"><span class="meter-fill" style="width:7.1%;background:var(--crit)"></span></div><span class="meter-label">7.1%</span></td><td>NTFS</td><td class="status-cell"><span class="status-pill sp-crit">Critical</span></td><td class="rec-cell">Critical: C: has less than 8% free.</td></tr><tr class="row-ok" data-status="OK"><td>D:</td><td>Data</td><td>500.0</td><td>188.2</td><td><div class="meter" title="37.6%"><span class="meter-fill" style="width:37.6%;background:var(--ok)"></span></div><span class="meter-label">37.6%</span></td><td>NTFS</td><td class="status-cell"><span class="status-pill sp-ok">OK</span></td><td class="rec-cell"></td></tr>
+</tbody></table></div></div>
+</section>
+<section class="section-panel" id="Network-Analysis" data-status="OK">
+<div class="section-header" role="button" tabindex="0" aria-expanded="false">
+<span class="section-chevron">▶</span>
+<span class="section-title">Network Analysis</span>
+<span class="section-badge badge-ok">OK</span>
+<span class="section-count">4 checks</span>
+</div>
+<div class="section-body"><p class="no-data">Sample preview — network counters omitted.</p></div>
+</section>
+<section class="section-panel" id="Software-Services" data-status="Info">
+<div class="section-header" role="button" tabindex="0" aria-expanded="false">
+<span class="section-chevron">▶</span>
+<span class="section-title">Software & Services</span>
+<span class="section-badge badge-info">Info</span>
+<span class="section-count">12 checks</span>
+</div>
+<div class="section-body"><p class="no-data">Sample preview — software inventory omitted.</p></div>
+</section>
+<section class="section-panel" id="Event-Logs" data-status="Warning">
+<div class="section-header" role="button" tabindex="0" aria-expanded="false">
+<span class="section-chevron">▶</span>
+<span class="section-title">Event Logs</span>
+<span class="section-badge badge-warn">Warning</span>
+<span class="section-count">6 checks</span>
+</div>
+<div class="section-body"><p class="no-data">Sample preview — event groups omitted.</p></div>
+</section>
+<section class="section-panel" id="Windows-Health" data-status="OK">
+<div class="section-header" role="button" tabindex="0" aria-expanded="false">
+<span class="section-chevron">▶</span>
+<span class="section-title">Windows Health</span>
+<span class="section-badge badge-ok">OK</span>
+<span class="section-count">5 checks</span>
+</div>
+<div class="section-body"><p class="no-data">Sample preview — health checks omitted.</p></div>
+</section>
+<section class="section-panel open" id="Security-IIS" data-status="Warning">
+<div class="section-header" role="button" tabindex="0" aria-expanded="true">
+<span class="section-chevron">▶</span>
+<span class="section-title">Security & IIS</span>
+<span class="section-badge badge-warn">Warning</span>
+<span class="section-count">8 checks</span>
+</div>
+<div class="section-body"><div class="subsection-title">Security checks</div><div class="table-controls" data-for="tbl-sec">
+<div class="filter-pills"><button type="button" class="pill pill-all active" data-filter="all">All</button><button type="button" class="pill pill-warn" data-filter="Warning">Warning</button><button type="button" class="pill pill-ok" data-filter="OK">OK</button></div>
+<input type="search" class="tbl-search" placeholder="Filter rows..." aria-label="Filter table">
+<span class="tbl-count" data-total="4">4</span>
+</div>
+<div class="table-wrapper"><table id="tbl-sec"><thead><tr><th scope="col" data-col="0">Check <span class="sort-icon">▲</span></th><th scope="col" data-col="1">Value <span class="sort-icon">▲</span></th><th scope="col" data-col="2">Status <span class="sort-icon">▲</span></th><th scope="col" data-col="3">Recommendation <span class="sort-icon">▲</span></th></tr></thead><tbody>
+<tr class="row-ok" data-status="OK"><td>Firewall (Domain)</td><td>Enabled</td><td class="status-cell"><span class="status-pill sp-ok">OK</span></td><td class="rec-cell"></td></tr><tr class="row-warn" data-status="Warning"><td>Firewall (Public)</td><td>Disabled</td><td class="status-cell"><span class="status-pill sp-warn">Warning</span></td><td class="rec-cell">Confirm this matches the security baseline.</td></tr><tr class="row-ok" data-status="OK"><td>Defender AV Enabled</td><td>True</td><td class="status-cell"><span class="status-pill sp-ok">OK</span></td><td class="rec-cell"></td></tr><tr class="row-ok" data-status="OK"><td>SMBv1</td><td>Disabled</td><td class="status-cell"><span class="status-pill sp-ok">OK</span></td><td class="rec-cell"></td></tr>
+</tbody></table></div></div>
+</section>
+<section class="section-panel" id="SQL-Server" data-status="OK">
+<div class="section-header" role="button" tabindex="0" aria-expanded="false">
+<span class="section-chevron">▶</span>
+<span class="section-title">SQL Server</span>
+<span class="section-badge badge-ok">OK</span>
+<span class="section-count">2 checks</span>
+</div>
+<div class="section-body"><p class="no-data">No SQL Server instances detected on this server.</p></div>
+</section>
+<section class="section-panel" id="Hardware" data-status="Info">
+<div class="section-header" role="button" tabindex="0" aria-expanded="false">
+<span class="section-chevron">▶</span>
+<span class="section-title">Hardware</span>
+<span class="section-badge badge-info">Info</span>
+<span class="section-count">9 checks</span>
+</div>
+<div class="section-body"><p class="no-data">Sample preview — hardware omitted.</p></div>
+</section>
+<section class="section-panel" id="Memory-Deep-Dive" data-status="OK">
+<div class="section-header" role="button" tabindex="0" aria-expanded="false">
+<span class="section-chevron">▶</span>
+<span class="section-title">Memory Deep Dive</span>
+<span class="section-badge badge-ok">OK</span>
+<span class="section-count">20 checks</span>
+</div>
+<div class="section-body"><p class="no-data">Sample preview — process list omitted.</p></div>
+</section>
+<section class="section-panel" id="Storage-Deep-Dive" data-status="OK">
+<div class="section-header" role="button" tabindex="0" aria-expanded="false">
+<span class="section-chevron">▶</span>
+<span class="section-title">Storage Deep Dive</span>
+<span class="section-badge badge-ok">OK</span>
+<span class="section-count">6 checks</span>
+</div>
+<div class="section-body"><p class="no-data">Sample preview — partitions omitted.</p></div>
+</section>
+<section class="section-panel" id="Network-Deep-Dive" data-status="OK">
+<div class="section-header" role="button" tabindex="0" aria-expanded="false">
+<span class="section-chevron">▶</span>
+<span class="section-title">Network Deep Dive</span>
+<span class="section-badge badge-ok">OK</span>
+<span class="section-count">8 checks</span>
+</div>
+<div class="section-body"><p class="no-data">Sample preview — TCP/DNS omitted.</p></div>
+</section>
+<section class="section-panel" id="Hyper-V" data-status="Info">
+<div class="section-header" role="button" tabindex="0" aria-expanded="false">
+<span class="section-chevron">▶</span>
+<span class="section-title">Hyper-V</span>
+<span class="section-badge badge-info">Info</span>
+<span class="section-count">1 checks</span>
+</div>
+<div class="section-body"><p class="no-data">Hyper-V not installed.</p></div>
+</section>
+<section class="section-panel open" id="Certificates" data-status="Critical">
+<div class="section-header" role="button" tabindex="0" aria-expanded="true">
+<span class="section-chevron">▶</span>
+<span class="section-title">Certificates</span>
+<span class="section-badge badge-crit">Critical</span>
+<span class="section-count">2 checks</span>
+</div>
+<div class="section-body"><div class="table-controls" data-for="tbl-certs">
+<div class="filter-pills"><button type="button" class="pill pill-all active" data-filter="all">All</button><button type="button" class="pill pill-crit" data-filter="Critical">Critical</button><button type="button" class="pill pill-ok" data-filter="OK">OK</button></div>
+<input type="search" class="tbl-search" placeholder="Filter rows..." aria-label="Filter table">
+<span class="tbl-count" data-total="2">2</span>
+</div>
+<div class="table-wrapper"><table id="tbl-certs"><thead><tr><th scope="col" data-col="0">Store <span class="sort-icon">▲</span></th><th scope="col" data-col="1">Subject <span class="sort-icon">▲</span></th><th scope="col" data-col="2">Thumbprint <span class="sort-icon">▲</span></th><th scope="col" data-col="3">NotAfter <span class="sort-icon">▲</span></th><th scope="col" data-col="4">DaysRemaining <span class="sort-icon">▲</span></th><th scope="col" data-col="5">Issuer <span class="sort-icon">▲</span></th><th scope="col" data-col="6">Status <span class="sort-icon">▲</span></th><th scope="col" data-col="7">Recommendation <span class="sort-icon">▲</span></th></tr></thead><tbody>
+<tr class="row-crit" data-status="Critical"><td>LocalMachine\My</td><td>CN=app.contoso.local</td><td>A1B2C3D4</td><td>2026-08-28</td><td>16</td><td>CN=Contoso-CA</td><td class="status-cell"><span class="status-pill sp-crit">Critical</span></td><td class="rec-cell">Renew before 2026-08-28.</td></tr><tr class="row-ok" data-status="OK"><td>LocalMachine\My</td><td>CN=SRV01</td><td>E5F6A7B8</td><td>2027-01-12</td><td>153</td><td>CN=Contoso-CA</td><td class="status-cell"><span class="status-pill sp-ok">OK</span></td><td class="rec-cell"></td></tr>
+</tbody></table></div></div>
+</section>
+</div>
+<footer>System Analysis Report • SRV-APP-01 • 2026-08-12 14:32:10 • Score 52/100<br>Prepared by Anthony Blake • <a class="author-email" href="mailto:Anthony.Blake@cdw.com">Anthony.Blake@cdw.com</a></footer>
+</div>
+<button type="button" class="back-top" id="back-top">Back to top</button>
+<script>window.REPORT_CSV_NAME = 'SystemAnalysis_SRV-APP-01.csv';</script>
+<script>
+(function(){
+  function togglePanel(panel, force) {
+    if (!panel) return;
+    var isOpen = panel.classList.contains('open');
+    var open = (force !== undefined) ? force : !isOpen;
+    var header = panel.querySelector('.section-header');
+    var body = panel.querySelector('.section-body');
+    if (open) {
+      panel.classList.add('open');
+      if (header) header.setAttribute('aria-expanded', 'true');
+      if (body) body.style.display = 'block';
+    } else {
+      panel.classList.remove('open');
+      if (header) header.setAttribute('aria-expanded', 'false');
+      if (body) body.style.display = 'none';
+    }
+  }
+
+  document.querySelectorAll('.section-header').forEach(function(h) {
+    h.addEventListener('click', function() { togglePanel(h.closest('.section-panel')); });
+    h.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        togglePanel(h.closest('.section-panel'));
+      }
+    });
+  });
+
+  document.querySelectorAll('.section-panel').forEach(function(p) {
+    var body = p.querySelector('.section-body');
+    if (body && !p.classList.contains('open')) body.style.display = 'none';
+  });
+
+  var expandBtn = document.getElementById('btn-expand-all');
+  var collapseBtn = document.getElementById('btn-collapse-all');
+  if (expandBtn) expandBtn.addEventListener('click', function() {
+    document.querySelectorAll('.section-panel').forEach(function(p) { togglePanel(p, true); });
+  });
+  if (collapseBtn) collapseBtn.addEventListener('click', function() {
+    document.querySelectorAll('.section-panel').forEach(function(p) { togglePanel(p, false); });
+  });
+
+  function closeMobileNav() {
+    var side = document.getElementById('sidebar');
+    var back = document.getElementById('sidebar-backdrop');
+    if (side) side.classList.remove('mob-open');
+    if (back) back.classList.remove('show');
+  }
+
+  document.querySelectorAll('.nav-item').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var id = btn.getAttribute('data-target');
+      var el = document.getElementById(id);
+      if (!el) return;
+      if (!el.classList.contains('open')) togglePanel(el, true);
+      setTimeout(function() { el.scrollIntoView({ behavior: 'smooth', block: 'start' }); }, 40);
+      document.querySelectorAll('.nav-item').forEach(function(b) { b.classList.remove('active'); });
+      btn.classList.add('active');
+      closeMobileNav();
+    });
+  });
+
+  var mobToggle = document.getElementById('mob-toggle');
+  var backdrop = document.getElementById('sidebar-backdrop');
+  if (mobToggle) {
+    mobToggle.addEventListener('click', function() {
+      var side = document.getElementById('sidebar');
+      side.classList.toggle('mob-open');
+      if (backdrop) backdrop.classList.toggle('show', side.classList.contains('mob-open'));
+    });
+  }
+  if (backdrop) backdrop.addEventListener('click', closeMobileNav);
+
+  function applyTableFilter(controls) {
+    var tableId = controls.getAttribute('data-for');
+    var table = document.getElementById(tableId);
+    if (!table) return;
+    var activeFilter = 'all';
+    var searchVal = '';
+    var pill = controls.querySelector('.pill.active');
+    if (pill) activeFilter = pill.getAttribute('data-filter');
+    var searchEl = controls.querySelector('.tbl-search');
+    if (searchEl) searchVal = searchEl.value.toLowerCase().trim();
+    var visible = 0;
+    table.querySelectorAll('tbody tr').forEach(function(row) {
+      var statusMatch = (activeFilter === 'all') || (row.getAttribute('data-status') === activeFilter);
+      var searchMatch = true;
+      if (searchVal) searchMatch = row.textContent.toLowerCase().indexOf(searchVal) !== -1;
+      var hide = !(statusMatch && searchMatch);
+      row.classList.toggle('hidden-filter', hide);
+      syncRowVisibility(row);
+      if (!row.classList.contains('hidden-row')) visible++;
+    });
+    var count = controls.querySelector('.tbl-count');
+    if (count) {
+      var total = count.getAttribute('data-total') || '';
+      count.textContent = visible + (total ? '/' + total : '');
+    }
+  }
+
+  function syncRowVisibility(row) {
+    var hide = row.classList.contains('hidden-filter') ||
+               row.classList.contains('hidden-global') ||
+               row.classList.contains('hidden-issues');
+    row.classList.toggle('hidden-row', hide);
+  }
+
+  document.querySelectorAll('.table-controls').forEach(function(controls) {
+    controls.querySelectorAll('.pill').forEach(function(pill) {
+      pill.addEventListener('click', function() {
+        controls.querySelectorAll('.pill').forEach(function(p) { p.classList.remove('active'); });
+        pill.classList.add('active');
+        applyTableFilter(controls);
+      });
+    });
+    var search = controls.querySelector('.tbl-search');
+    if (search) search.addEventListener('input', function() { applyTableFilter(controls); });
+  });
+
+  document.querySelectorAll('th[data-col]').forEach(function(th) {
+    th.addEventListener('click', function() {
+      var table = th.closest('table');
+      var colIdx = parseInt(th.getAttribute('data-col'), 10);
+      var asc = !th.classList.contains('sort-asc');
+      table.querySelectorAll('th').forEach(function(t) { t.classList.remove('sort-asc', 'sort-desc'); });
+      th.classList.add(asc ? 'sort-asc' : 'sort-desc');
+      var tbody = table.querySelector('tbody');
+      var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
+      rows.sort(function(a, b) {
+        var aText = (a.cells[colIdx] ? a.cells[colIdx].textContent.trim() : '');
+        var bText = (b.cells[colIdx] ? b.cells[colIdx].textContent.trim() : '');
+        var aNum = parseFloat(aText.replace(/,/g, ''));
+        var bNum = parseFloat(bText.replace(/,/g, ''));
+        if (!isNaN(aNum) && !isNaN(bNum) && /^-?[\d.,]+/.test(aText) && /^-?[\d.,]+/.test(bText)) {
+          return asc ? aNum - bNum : bNum - aNum;
+        }
+        return asc ? aText.localeCompare(bText) : bText.localeCompare(aText);
+      });
+      rows.forEach(function(r) { tbody.appendChild(r); });
+    });
+  });
+
+  var globalSearch = document.getElementById('search-global');
+  function applyGlobalSearch() {
+    var val = globalSearch ? globalSearch.value.toLowerCase().trim() : '';
+    document.querySelectorAll('tbody tr').forEach(function(row) {
+      if (!val) {
+        row.classList.remove('hidden-global');
+      } else {
+        row.classList.toggle('hidden-global', row.textContent.toLowerCase().indexOf(val) === -1);
+      }
+      syncRowVisibility(row);
+    });
+    if (val) {
+      document.querySelectorAll('.section-panel').forEach(function(p) { togglePanel(p, true); });
+    }
+  }
+  if (globalSearch) globalSearch.addEventListener('input', applyGlobalSearch);
+
+  var issuesOnly = false;
+  var issuesBtn = document.getElementById('btn-issues');
+  if (issuesBtn) {
+    issuesBtn.addEventListener('click', function() {
+      issuesOnly = !issuesOnly;
+      issuesBtn.classList.toggle('btn-primary', issuesOnly);
+      document.querySelectorAll('.section-panel').forEach(function(p) {
+        var st = p.getAttribute('data-status');
+        var keep = !issuesOnly || st === 'Critical' || st === 'Warning';
+        p.style.display = keep ? '' : 'none';
+        if (keep && issuesOnly) togglePanel(p, true);
+      });
+      document.querySelectorAll('tbody tr').forEach(function(row) {
+        var st = row.getAttribute('data-status');
+        row.classList.toggle('hidden-issues', issuesOnly && st !== 'Critical' && st !== 'Warning');
+        syncRowVisibility(row);
+      });
+    });
+  }
+
+  var themeBtn = document.getElementById('btn-theme');
+  function setTheme(theme) {
+    document.documentElement.setAttribute('data-theme', theme);
+    try { localStorage.setItem('sysanalysis-theme', theme); } catch (e) {}
+    if (themeBtn) themeBtn.textContent = (theme === 'dark') ? 'Light mode' : 'Dark mode';
+  }
+  var saved = null;
+  try { saved = localStorage.getItem('sysanalysis-theme'); } catch (e) {}
+  if (saved === 'light' || saved === 'dark') setTheme(saved);
+  else setTheme('dark');
+  if (themeBtn) themeBtn.addEventListener('click', function() {
+    var cur = document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+    setTheme(cur);
+  });
+
+  var csvBtn = document.getElementById('btn-csv');
+  if (csvBtn) {
+    csvBtn.addEventListener('click', function() {
+      var lines = [];
+      document.querySelectorAll('table').forEach(function(table) {
+        var headers = Array.prototype.map.call(table.querySelectorAll('thead th'), function(th) {
+          return '"' + th.textContent.replace(/▲|▼/g, '').trim().replace(/"/g, '""') + '"';
+        });
+        if (!headers.length) return;
+        table.querySelectorAll('tbody tr').forEach(function(row) {
+          if (row.classList.contains('hidden-row')) return;
+          var cells = Array.prototype.map.call(row.cells, function(td) {
+            return '"' + td.textContent.trim().replace(/"/g, '""') + '"';
+          });
+          lines.push(cells.join(','));
+        });
+      });
+      if (!lines.length) return;
+      var blob = new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = window.REPORT_CSV_NAME || 'SystemAnalysis.csv';
+      a.click();
+      URL.revokeObjectURL(a.href);
+    });
+  }
+
+  var backTop = document.getElementById('back-top');
+  window.addEventListener('scroll', function() {
+    if (backTop) backTop.classList.toggle('show', window.scrollY > 600);
+  });
+  if (backTop) backTop.addEventListener('click', function() {
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  });
+
+  document.addEventListener('keydown', function(e) {
+    var tag = (e.target && e.target.tagName) ? e.target.tagName.toLowerCase() : '';
+    if (tag === 'input' || tag === 'textarea') return;
+    if (e.key === '/') {
+      e.preventDefault();
+      if (globalSearch) globalSearch.focus();
+    }
+  });
+
+  if ('IntersectionObserver' in window) {
+    var obs = new IntersectionObserver(function(entries) {
+      var vis = entries.filter(function(en) { return en.isIntersecting; });
+      if (!vis.length) return;
+      vis.sort(function(a, b) { return b.intersectionRatio - a.intersectionRatio; });
+      var id = vis[0].target.id;
+      document.querySelectorAll('.nav-item').forEach(function(btn) {
+        btn.classList.toggle('active', btn.getAttribute('data-target') === id);
+      });
+    }, { rootMargin: '-20% 0px -55% 0px', threshold: [0.1, 0.25] });
+    document.querySelectorAll('.section-panel').forEach(function(p) { obs.observe(p); });
+  }
+})();
+</script>
