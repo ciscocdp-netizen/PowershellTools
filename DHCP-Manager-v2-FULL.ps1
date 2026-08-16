@@ -25,10 +25,11 @@
     ✓ Server statistics
     ✓ Audit log viewer
     ✓ Action log with export
+    ✓ Multi-server comparison (scopes, options, leases, reservations)
     
 .NOTES
     File Name      : DHCP-Manager-v2-FULL.ps1
-    Version        : 2.0.0 (Complete Production Release)
+    Version        : 2.1.0 (Multi-Server Compare)
     Date           : 2026-08-16
     Author         : Enhanced with All Bug Fixes
     Prerequisite   : PowerShell 5.1+
@@ -75,10 +76,10 @@ $banner = @"
 
 ╔══════════════════════════════════════════════════════════════════════════╗
 ║                                                                          ║
-║         DHCP Manager v2.0 - Complete Production Edition                 ║
-║                      Full GUI + All Features                             ║
+║         DHCP Manager v2.1 - Multi-Server Compare Edition                ║
+║                      Full GUI + Server Comparison                        ║
 ║                                                                          ║
-║  ✓ Bug Fixes    ✓ Real-Time Logging    ✓ Complete Functionality        ║
+║  ✓ Bug Fixes  ✓ Real-Time Logging  ✓ Compare Scopes/Options/Leases    ║
 ║                                                                          ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 
@@ -87,10 +88,13 @@ Write-Host $banner -ForegroundColor Cyan
 #endregion
 
 #region Global State Variables
-$Global:DHCPServer    = $null
-$Global:SelectedScope = $null
-$Global:ActionLog     = [System.Collections.Generic.List[string]]::new()
-$Global:Credential    = $null
+$Global:DHCPServer       = $null
+$Global:CompareServer    = $null
+$Global:SelectedScope    = $null
+$Global:ActionLog        = [System.Collections.Generic.List[string]]::new()
+$Global:Credential       = $null
+$Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
+$Global:CompareFilter    = 'All'
 #endregion
 
 #region Core Logging Functions
@@ -147,7 +151,7 @@ function Update-LogDisplay {
     } catch {}
 }
 
-Write-ActionLog "DHCP Manager v2.0 (Full Version) initializing..." "INFO"
+Write-ActionLog "DHCP Manager v2.1 (Multi-Server Compare) initializing..." "INFO"
 Write-ActionLog "PowerShell Version: $($PSVersionTable.PSVersion)" "INFO"
 Write-ActionLog "OS: $([Environment]::OSVersion.VersionString)" "INFO"
 #endregion
@@ -159,7 +163,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
 <Window
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    Title="DHCP Manager v2.0 - Production"
+    Title="DHCP Manager v2.1 - Multi-Server Compare"
     Height="780" Width="1260"
     MinHeight="600" MinWidth="900"
     WindowStartupLocation="CenterScreen"
@@ -429,6 +433,8 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
 
         <!-- Quick Action Buttons -->
         <StackPanel Grid.Column="2" Orientation="Horizontal" HorizontalAlignment="Right">
+          <Button x:Name="BtnViewCompare" Content="🔀 Compare" Margin="0,0,8,0"
+                  Style="{StaticResource BtnSecondary}" ToolTip="Compare two DHCP servers"/>
           <Button x:Name="BtnViewLog" Content="📋 View Log" Margin="0,0,8,0"
                   Style="{StaticResource BtnSecondary}" ToolTip="View action log"/>
           <Button x:Name="BtnSettings" Content="⚙️ Settings" Margin="0,0,8,0"
@@ -459,7 +465,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                    HorizontalAlignment="Center"/>
         
         <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-          <Run Text="Version 2.0.0  |  "/>
+          <Run Text="Version 2.1.0  |  "/>
           <Run x:Name="StatusTime" Text=""/>
         </TextBlock>
       </Grid>
@@ -846,6 +852,126 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
             </ScrollViewer>
           </TabItem>
 
+          <!-- TAB: Compare Servers (NEW) -->
+          <TabItem x:Name="TabCompare" Header="🔀 Compare">
+            <Grid Background="{StaticResource BgPanel}">
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+              </Grid.RowDefinitions>
+
+              <!-- Compare Server Connection -->
+              <Border Grid.Row="0" Background="{StaticResource BgCard}"
+                      BorderThickness="0,0,0,1" BorderBrush="{StaticResource Border}" Padding="12,10">
+                <Grid>
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="*"/>
+                  </Grid.ColumnDefinitions>
+
+                  <StackPanel Grid.Column="0" Orientation="Horizontal">
+                    <TextBlock Text="Server A (Primary):" Style="{StaticResource FormLabel}"
+                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                    <TextBlock x:Name="TxtCompareServerA" Text="Not Connected"
+                               Foreground="{StaticResource Warning}" FontWeight="SemiBold"
+                               VerticalAlignment="Center" Margin="0,0,16,0"/>
+                  </StackPanel>
+
+                  <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right">
+                    <TextBlock Text="Server B (Compare):" Style="{StaticResource FormLabel}"
+                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                    <TextBox x:Name="TxtCompareServer" Width="180" Style="{StaticResource DarkTextBox}"
+                             ToolTip="Second DHCP server hostname or IP"/>
+                    <Button x:Name="BtnCompareConnect" Content="🔌 Connect B" Margin="8,0,0,0"
+                            Style="{StaticResource BtnSuccess}" ToolTip="Connect compare server"/>
+                    <Button x:Name="BtnCompareDisconnect" Content="Disconnect B" Margin="8,0,0,0"
+                            Style="{StaticResource BtnSecondary}" IsEnabled="False"/>
+                  </StackPanel>
+                </Grid>
+              </Border>
+
+              <!-- Compare Controls -->
+              <Border Grid.Row="1" Background="{StaticResource BgCard}"
+                      BorderThickness="0,0,0,1" BorderBrush="{StaticResource Border}" Padding="12,10">
+                <StackPanel Orientation="Horizontal">
+                  <TextBlock Text="Compare:" Style="{StaticResource FormLabel}"
+                             VerticalAlignment="Center" Margin="0,0,8,0"/>
+                  <ComboBox x:Name="CboCompareCategory" Width="140" Height="26" Margin="0,0,12,0"
+                            Background="{StaticResource BgDeep}" Foreground="{StaticResource TextPrimary}"
+                            BorderBrush="{StaticResource Border}">
+                    <ComboBoxItem Content="Scopes" IsSelected="True"/>
+                    <ComboBoxItem Content="Options"/>
+                    <ComboBoxItem Content="Leases"/>
+                    <ComboBoxItem Content="Reservations"/>
+                  </ComboBox>
+
+                  <TextBlock Text="Show:" Style="{StaticResource FormLabel}"
+                             VerticalAlignment="Center" Margin="0,0,8,0"/>
+                  <ComboBox x:Name="CboCompareFilter" Width="130" Height="26" Margin="0,0,12,0"
+                            Background="{StaticResource BgDeep}" Foreground="{StaticResource TextPrimary}"
+                            BorderBrush="{StaticResource Border}">
+                    <ComboBoxItem Content="All" IsSelected="True"/>
+                    <ComboBoxItem Content="Only on A"/>
+                    <ComboBoxItem Content="Only on B"/>
+                    <ComboBoxItem Content="Matching"/>
+                    <ComboBoxItem Content="Different"/>
+                  </ComboBox>
+
+                  <Button x:Name="BtnRunCompare" Content="▶️ Run Compare" Margin="0,0,8,0"
+                          Style="{StaticResource BtnPrimary}" IsEnabled="False"/>
+                  <Button x:Name="BtnCompareExport" Content="💾 Export Results" Margin="0,0,8,0"
+                          Style="{StaticResource BtnSecondary}" IsEnabled="False"/>
+                </StackPanel>
+              </Border>
+
+              <!-- Compare Summary -->
+              <Border Grid.Row="2" Background="{StaticResource BgPanel}" Padding="12,8">
+                <StackPanel Orientation="Horizontal">
+                  <Border Background="{StaticResource BgCard}" CornerRadius="4" Padding="12,6" Margin="0,0,8,0">
+                    <TextBlock>
+                      <Run Text="Only A: " Foreground="#9AA3B2"/>
+                      <Run x:Name="CmpOnlyA" Text="0" Foreground="#FF9800" FontWeight="Bold"/>
+                    </TextBlock>
+                  </Border>
+                  <Border Background="{StaticResource BgCard}" CornerRadius="4" Padding="12,6" Margin="0,0,8,0">
+                    <TextBlock>
+                      <Run Text="Only B: " Foreground="#9AA3B2"/>
+                      <Run x:Name="CmpOnlyB" Text="0" Foreground="#2196F3" FontWeight="Bold"/>
+                    </TextBlock>
+                  </Border>
+                  <Border Background="{StaticResource BgCard}" CornerRadius="4" Padding="12,6" Margin="0,0,8,0">
+                    <TextBlock>
+                      <Run Text="Matching: " Foreground="#9AA3B2"/>
+                      <Run x:Name="CmpMatch" Text="0" Foreground="#4CAF50" FontWeight="Bold"/>
+                    </TextBlock>
+                  </Border>
+                  <Border Background="{StaticResource BgCard}" CornerRadius="4" Padding="12,6" Margin="0,0,8,0">
+                    <TextBlock>
+                      <Run Text="Different: " Foreground="#9AA3B2"/>
+                      <Run x:Name="CmpDiff" Text="0" Foreground="#F44336" FontWeight="Bold"/>
+                    </TextBlock>
+                  </Border>
+                  <TextBlock x:Name="TxtCompareStatus" Text="Connect both servers, then run compare"
+                             Foreground="{StaticResource TextSecond}" VerticalAlignment="Center" Margin="12,0,0,0"/>
+                </StackPanel>
+              </Border>
+
+              <!-- Compare Results Grid -->
+              <DataGrid Grid.Row="3" x:Name="GridCompare" Style="{StaticResource DarkGrid}" Margin="8">
+                <DataGrid.Columns>
+                  <DataGridTextColumn Header="Status" Binding="{Binding Status}" Width="100"/>
+                  <DataGridTextColumn Header="Key" Binding="{Binding Key}" Width="160"/>
+                  <DataGridTextColumn Header="Name / Label" Binding="{Binding Label}" Width="160"/>
+                  <DataGridTextColumn Header="Server A" Binding="{Binding ValueA}" Width="220"/>
+                  <DataGridTextColumn Header="Server B" Binding="{Binding ValueB}" Width="220"/>
+                  <DataGridTextColumn Header="Details" Binding="{Binding Details}" Width="*"/>
+                </DataGrid.Columns>
+              </DataGrid>
+            </Grid>
+          </TabItem>
+
           <!-- TAB: Action Log (NEW) -->
           <TabItem x:Name="TabLog" Header="📋 Action Log">
             <Grid Background="{StaticResource BgPanel}">
@@ -921,6 +1047,7 @@ try {
     $script:BtnSettings      = $Window.FindName("BtnSettings")
     $script:BtnAbout         = $Window.FindName("BtnAbout")
     $script:BtnViewLog       = $Window.FindName("BtnViewLog")
+    $script:BtnViewCompare   = $Window.FindName("BtnViewCompare")
     
     # Status Bar
     $script:StatusServer     = $Window.FindName("StatusServer")
@@ -940,6 +1067,7 @@ try {
     $script:TabFilters       = $Window.FindName("TabFilters")
     $script:TabPolicies      = $Window.FindName("TabPolicies")
     $script:TabStats         = $Window.FindName("TabStats")
+    $script:TabCompare       = $Window.FindName("TabCompare")
     $script:TabLog           = $Window.FindName("TabLog")
     
     # Scopes Tab
@@ -1003,6 +1131,22 @@ try {
     $script:BtnLogClear      = $Window.FindName("BtnLogClear")
     $script:BtnLogExport     = $Window.FindName("BtnLogExport")
     $script:CboLogLevel      = $Window.FindName("CboLogLevel")
+    
+    # Compare Tab
+    $script:TxtCompareServerA    = $Window.FindName("TxtCompareServerA")
+    $script:TxtCompareServer     = $Window.FindName("TxtCompareServer")
+    $script:BtnCompareConnect    = $Window.FindName("BtnCompareConnect")
+    $script:BtnCompareDisconnect = $Window.FindName("BtnCompareDisconnect")
+    $script:CboCompareCategory   = $Window.FindName("CboCompareCategory")
+    $script:CboCompareFilter     = $Window.FindName("CboCompareFilter")
+    $script:BtnRunCompare        = $Window.FindName("BtnRunCompare")
+    $script:BtnCompareExport     = $Window.FindName("BtnCompareExport")
+    $script:GridCompare          = $Window.FindName("GridCompare")
+    $script:CmpOnlyA             = $Window.FindName("CmpOnlyA")
+    $script:CmpOnlyB             = $Window.FindName("CmpOnlyB")
+    $script:CmpMatch             = $Window.FindName("CmpMatch")
+    $script:CmpDiff              = $Window.FindName("CmpDiff")
+    $script:TxtCompareStatus     = $Window.FindName("TxtCompareStatus")
     
     Write-ActionLog "All UI controls bound successfully" "SUCCESS"
     
@@ -1558,6 +1702,473 @@ function Load-Statistics {
 }
 #endregion
 
+#region Multi-Server Comparison Engine
+function Update-CompareReadyState {
+    <#
+    .SYNOPSIS
+        Enables compare controls when both servers are connected
+    #>
+    $bothReady = (-not [string]::IsNullOrWhiteSpace($Global:DHCPServer)) -and `
+                 (-not [string]::IsNullOrWhiteSpace($Global:CompareServer))
+    
+    try {
+        $script:Window.Dispatcher.Invoke([action]{
+            $script:BtnRunCompare.IsEnabled = $bothReady
+            $script:BtnCompareExport.IsEnabled = ($Global:CompareResults.Count -gt 0)
+            
+            if ($Global:DHCPServer) {
+                $script:TxtCompareServerA.Text = $Global:DHCPServer
+                $script:TxtCompareServerA.Foreground = [System.Windows.Media.Brushes]::LimeGreen
+            } else {
+                $script:TxtCompareServerA.Text = "Not Connected"
+                $script:TxtCompareServerA.Foreground = [System.Windows.Media.Brushes]::Orange
+            }
+            
+            if ($bothReady) {
+                $script:TxtCompareStatus.Text = "Ready — select category and click Run Compare"
+            } elseif ($Global:DHCPServer -and -not $Global:CompareServer) {
+                $script:TxtCompareStatus.Text = "Connect Server B to enable comparison"
+            } elseif (-not $Global:DHCPServer) {
+                $script:TxtCompareStatus.Text = "Connect primary Server A first, then Server B"
+            }
+        }, [System.Windows.Threading.DispatcherPriority]::Normal)
+    } catch {}
+}
+
+function New-CompareRow {
+    param(
+        [string]$Status,
+        [string]$Key,
+        [string]$Label = '',
+        [string]$ValueA = '',
+        [string]$ValueB = '',
+        [string]$Details = ''
+    )
+    
+    return [PSCustomObject]@{
+        Status  = $Status
+        Key     = $Key
+        Label   = $Label
+        ValueA  = $ValueA
+        ValueB  = $ValueB
+        Details = $Details
+    }
+}
+
+function Get-DhcpCompareScopes {
+    param([string]$ServerA, [string]$ServerB)
+    
+    Write-ActionLog "Fetching scopes from $ServerA and $ServerB..." "INFO"
+    
+    $scopesA = @(Get-DhcpServerv4Scope -ComputerName $ServerA -ErrorAction Stop)
+    $scopesB = @(Get-DhcpServerv4Scope -ComputerName $ServerB -ErrorAction Stop)
+    
+    $mapA = @{}
+    foreach ($s in $scopesA) { $mapA["$($s.ScopeId)"] = $s }
+    
+    $mapB = @{}
+    foreach ($s in $scopesB) { $mapB["$($s.ScopeId)"] = $s }
+    
+    $results = [System.Collections.Generic.List[object]]::new()
+    $allKeys = @($mapA.Keys + $mapB.Keys) | Sort-Object -Unique
+    
+    foreach ($key in $allKeys) {
+        $a = $mapA[$key]
+        $b = $mapB[$key]
+        
+        if ($a -and -not $b) {
+            $results.Add((New-CompareRow -Status 'Only on A' -Key $key -Label $a.Name `
+                -ValueA "$($a.StartRange)-$($a.EndRange) [$($a.State)]" -ValueB '' `
+                -Details "Mask=$($a.SubnetMask)"))
+        }
+        elseif ($b -and -not $a) {
+            $results.Add((New-CompareRow -Status 'Only on B' -Key $key -Label $b.Name `
+                -ValueA '' -ValueB "$($b.StartRange)-$($b.EndRange) [$($b.State)]" `
+                -Details "Mask=$($b.SubnetMask)"))
+        }
+        else {
+            $valA = "$($a.Name)|$($a.StartRange)|$($a.EndRange)|$($a.SubnetMask)|$($a.State)"
+            $valB = "$($b.Name)|$($b.StartRange)|$($b.EndRange)|$($b.SubnetMask)|$($b.State)"
+            $diffs = @()
+            if ($a.Name -ne $b.Name) { $diffs += "Name" }
+            if ("$($a.StartRange)" -ne "$($b.StartRange)") { $diffs += "Start" }
+            if ("$($a.EndRange)" -ne "$($b.EndRange)") { $diffs += "End" }
+            if ("$($a.SubnetMask)" -ne "$($b.SubnetMask)") { $diffs += "Mask" }
+            if ("$($a.State)" -ne "$($b.State)") { $diffs += "State" }
+            
+            if ($diffs.Count -eq 0) {
+                $results.Add((New-CompareRow -Status 'Matching' -Key $key -Label $a.Name `
+                    -ValueA "$($a.StartRange)-$($a.EndRange) [$($a.State)]" `
+                    -ValueB "$($b.StartRange)-$($b.EndRange) [$($b.State)]" `
+                    -Details "Identical"))
+            } else {
+                $results.Add((New-CompareRow -Status 'Different' -Key $key -Label $a.Name `
+                    -ValueA "$($a.StartRange)-$($a.EndRange) [$($a.State)] Name=$($a.Name)" `
+                    -ValueB "$($b.StartRange)-$($b.EndRange) [$($b.State)] Name=$($b.Name)" `
+                    -Details ("Differs: " + ($diffs -join ', '))))
+            }
+        }
+    }
+    
+    return $results
+}
+
+function Get-DhcpCompareOptions {
+    param([string]$ServerA, [string]$ServerB)
+    
+    Write-ActionLog "Fetching options from $ServerA and $ServerB..." "INFO"
+    
+    # Server-level options
+    $optsA = @(Get-DhcpServerv4OptionValue -ComputerName $ServerA -ErrorAction SilentlyContinue)
+    $optsB = @(Get-DhcpServerv4OptionValue -ComputerName $ServerB -ErrorAction SilentlyContinue)
+    
+    # Also include scope-level options for all scopes on each server
+    try {
+        foreach ($scope in @(Get-DhcpServerv4Scope -ComputerName $ServerA -ErrorAction SilentlyContinue)) {
+            $scopeOpts = @(Get-DhcpServerv4OptionValue -ComputerName $ServerA -ScopeId $scope.ScopeId -ErrorAction SilentlyContinue)
+            foreach ($o in $scopeOpts) {
+                $o | Add-Member -NotePropertyName '_ScopeId' -NotePropertyValue "$($scope.ScopeId)" -Force
+                $optsA += $o
+            }
+        }
+    } catch {}
+    
+    try {
+        foreach ($scope in @(Get-DhcpServerv4Scope -ComputerName $ServerB -ErrorAction SilentlyContinue)) {
+            $scopeOpts = @(Get-DhcpServerv4OptionValue -ComputerName $ServerB -ScopeId $scope.ScopeId -ErrorAction SilentlyContinue)
+            foreach ($o in $scopeOpts) {
+                $o | Add-Member -NotePropertyName '_ScopeId' -NotePropertyValue "$($scope.ScopeId)" -Force
+                $optsB += $o
+            }
+        }
+    } catch {}
+    
+    $mapA = @{}
+    foreach ($o in $optsA) {
+        $scopePart = if ($o.PSObject.Properties.Name -contains '_ScopeId' -and $o._ScopeId) { $o._ScopeId } else { 'Server' }
+        $key = "$scopePart|Opt$($o.OptionId)"
+        $mapA[$key] = $o
+    }
+    
+    $mapB = @{}
+    foreach ($o in $optsB) {
+        $scopePart = if ($o.PSObject.Properties.Name -contains '_ScopeId' -and $o._ScopeId) { $o._ScopeId } else { 'Server' }
+        $key = "$scopePart|Opt$($o.OptionId)"
+        $mapB[$key] = $o
+    }
+    
+    $results = [System.Collections.Generic.List[object]]::new()
+    $allKeys = @($mapA.Keys + $mapB.Keys) | Sort-Object -Unique
+    
+    foreach ($key in $allKeys) {
+        $a = $mapA[$key]
+        $b = $mapB[$key]
+        $label = if ($a) { $a.Name } elseif ($b) { $b.Name } else { $key }
+        
+        $valA = if ($a) { ($a.Value -join ', ') } else { '' }
+        $valB = if ($b) { ($b.Value -join ', ') } else { '' }
+        
+        if ($a -and -not $b) {
+            $results.Add((New-CompareRow -Status 'Only on A' -Key $key -Label $label -ValueA $valA -ValueB '' -Details 'Missing on B'))
+        }
+        elseif ($b -and -not $a) {
+            $results.Add((New-CompareRow -Status 'Only on B' -Key $key -Label $label -ValueA '' -ValueB $valB -Details 'Missing on A'))
+        }
+        elseif ($valA -eq $valB) {
+            $results.Add((New-CompareRow -Status 'Matching' -Key $key -Label $label -ValueA $valA -ValueB $valB -Details 'Identical'))
+        }
+        else {
+            $results.Add((New-CompareRow -Status 'Different' -Key $key -Label $label -ValueA $valA -ValueB $valB -Details 'Value mismatch'))
+        }
+    }
+    
+    return $results
+}
+
+function Get-DhcpCompareLeases {
+    param([string]$ServerA, [string]$ServerB)
+    
+    Write-ActionLog "Fetching leases from $ServerA and $ServerB..." "INFO"
+    
+    $leasesA = [System.Collections.Generic.List[object]]::new()
+    $leasesB = [System.Collections.Generic.List[object]]::new()
+    
+    foreach ($scope in @(Get-DhcpServerv4Scope -ComputerName $ServerA -ErrorAction Stop)) {
+        try {
+            $items = @(Get-DhcpServerv4Lease -ComputerName $ServerA -ScopeId $scope.ScopeId -ErrorAction SilentlyContinue)
+            foreach ($item in $items) { $leasesA.Add($item) }
+        } catch {}
+    }
+    
+    foreach ($scope in @(Get-DhcpServerv4Scope -ComputerName $ServerB -ErrorAction Stop)) {
+        try {
+            $items = @(Get-DhcpServerv4Lease -ComputerName $ServerB -ScopeId $scope.ScopeId -ErrorAction SilentlyContinue)
+            foreach ($item in $items) { $leasesB.Add($item) }
+        } catch {}
+    }
+    
+    $mapA = @{}
+    foreach ($l in $leasesA) {
+        $mac = if ($l.ClientId) { "$($l.ClientId)".ToUpper() } else { '' }
+        $key = if ($mac) { "MAC:$mac" } else { "IP:$($l.IPAddress)" }
+        $mapA[$key] = $l
+    }
+    
+    $mapB = @{}
+    foreach ($l in $leasesB) {
+        $mac = if ($l.ClientId) { "$($l.ClientId)".ToUpper() } else { '' }
+        $key = if ($mac) { "MAC:$mac" } else { "IP:$($l.IPAddress)" }
+        $mapB[$key] = $l
+    }
+    
+    $results = [System.Collections.Generic.List[object]]::new()
+    $allKeys = @($mapA.Keys + $mapB.Keys) | Sort-Object -Unique
+    
+    foreach ($key in $allKeys) {
+        $a = $mapA[$key]
+        $b = $mapB[$key]
+        
+        if ($a -and -not $b) {
+            $results.Add((New-CompareRow -Status 'Only on A' -Key $key -Label $a.HostName `
+                -ValueA "$($a.IPAddress) [$($a.AddressState)] Scope=$($a.ScopeId)" -ValueB '' `
+                -Details "Expiry=$($a.LeaseExpiryTime)"))
+        }
+        elseif ($b -and -not $a) {
+            $results.Add((New-CompareRow -Status 'Only on B' -Key $key -Label $b.HostName `
+                -ValueA '' -ValueB "$($b.IPAddress) [$($b.AddressState)] Scope=$($b.ScopeId)" `
+                -Details "Expiry=$($b.LeaseExpiryTime)"))
+        }
+        else {
+            $diffs = @()
+            if ("$($a.IPAddress)" -ne "$($b.IPAddress)") { $diffs += 'IP' }
+            if ("$($a.HostName)" -ne "$($b.HostName)") { $diffs += 'Hostname' }
+            if ("$($a.ScopeId)" -ne "$($b.ScopeId)") { $diffs += 'Scope' }
+            if ("$($a.AddressState)" -ne "$($b.AddressState)") { $diffs += 'State' }
+            
+            $valA = "$($a.IPAddress) [$($a.AddressState)] Host=$($a.HostName)"
+            $valB = "$($b.IPAddress) [$($b.AddressState)] Host=$($b.HostName)"
+            
+            if ($diffs.Count -eq 0) {
+                $results.Add((New-CompareRow -Status 'Matching' -Key $key -Label $a.HostName `
+                    -ValueA $valA -ValueB $valB -Details 'Identical'))
+            } else {
+                $results.Add((New-CompareRow -Status 'Different' -Key $key -Label $a.HostName `
+                    -ValueA $valA -ValueB $valB -Details ("Differs: " + ($diffs -join ', '))))
+            }
+        }
+    }
+    
+    return $results
+}
+
+function Get-DhcpCompareReservations {
+    param([string]$ServerA, [string]$ServerB)
+    
+    Write-ActionLog "Fetching reservations from $ServerA and $ServerB..." "INFO"
+    
+    $resA = [System.Collections.Generic.List[object]]::new()
+    $resB = [System.Collections.Generic.List[object]]::new()
+    
+    foreach ($scope in @(Get-DhcpServerv4Scope -ComputerName $ServerA -ErrorAction Stop)) {
+        try {
+            $items = @(Get-DhcpServerv4Reservation -ComputerName $ServerA -ScopeId $scope.ScopeId -ErrorAction SilentlyContinue)
+            foreach ($item in $items) { $resA.Add($item) }
+        } catch {}
+    }
+    
+    foreach ($scope in @(Get-DhcpServerv4Scope -ComputerName $ServerB -ErrorAction Stop)) {
+        try {
+            $items = @(Get-DhcpServerv4Reservation -ComputerName $ServerB -ScopeId $scope.ScopeId -ErrorAction SilentlyContinue)
+            foreach ($item in $items) { $resB.Add($item) }
+        } catch {}
+    }
+    
+    $mapA = @{}
+    foreach ($r in $resA) {
+        $mac = if ($r.ClientId) { "$($r.ClientId)".ToUpper() } else { '' }
+        $key = if ($mac) { "MAC:$mac" } else { "IP:$($r.IPAddress)" }
+        $mapA[$key] = $r
+    }
+    
+    $mapB = @{}
+    foreach ($r in $resB) {
+        $mac = if ($r.ClientId) { "$($r.ClientId)".ToUpper() } else { '' }
+        $key = if ($mac) { "MAC:$mac" } else { "IP:$($r.IPAddress)" }
+        $mapB[$key] = $r
+    }
+    
+    $results = [System.Collections.Generic.List[object]]::new()
+    $allKeys = @($mapA.Keys + $mapB.Keys) | Sort-Object -Unique
+    
+    foreach ($key in $allKeys) {
+        $a = $mapA[$key]
+        $b = $mapB[$key]
+        
+        if ($a -and -not $b) {
+            $results.Add((New-CompareRow -Status 'Only on A' -Key $key -Label $a.Name `
+                -ValueA "$($a.IPAddress) Scope=$($a.ScopeId)" -ValueB '' `
+                -Details "Type=$($a.Type)"))
+        }
+        elseif ($b -and -not $a) {
+            $results.Add((New-CompareRow -Status 'Only on B' -Key $key -Label $b.Name `
+                -ValueA '' -ValueB "$($b.IPAddress) Scope=$($b.ScopeId)" `
+                -Details "Type=$($b.Type)"))
+        }
+        else {
+            $diffs = @()
+            if ("$($a.IPAddress)" -ne "$($b.IPAddress)") { $diffs += 'IP' }
+            if ("$($a.Name)" -ne "$($b.Name)") { $diffs += 'Name' }
+            if ("$($a.ScopeId)" -ne "$($b.ScopeId)") { $diffs += 'Scope' }
+            if ("$($a.ClientId)".ToUpper() -ne "$($b.ClientId)".ToUpper()) { $diffs += 'MAC' }
+            
+            $valA = "$($a.IPAddress) Name=$($a.Name) Scope=$($a.ScopeId)"
+            $valB = "$($b.IPAddress) Name=$($b.Name) Scope=$($b.ScopeId)"
+            
+            if ($diffs.Count -eq 0) {
+                $results.Add((New-CompareRow -Status 'Matching' -Key $key -Label $a.Name `
+                    -ValueA $valA -ValueB $valB -Details 'Identical'))
+            } else {
+                $results.Add((New-CompareRow -Status 'Different' -Key $key -Label $a.Name `
+                    -ValueA $valA -ValueB $valB -Details ("Differs: " + ($diffs -join ', '))))
+            }
+        }
+    }
+    
+    return $results
+}
+
+function Show-CompareResults {
+    <#
+    .SYNOPSIS
+        Applies filter and updates compare grid + summary counters
+    #>
+    param(
+        [System.Collections.IEnumerable]$Results
+    )
+    
+    $filter = 'All'
+    try {
+        if ($null -ne $script:CboCompareFilter -and $null -ne $script:CboCompareFilter.SelectedItem) {
+            $filter = $script:CboCompareFilter.SelectedItem.Content
+        }
+    } catch {}
+    
+    $all = @($Results)
+    $onlyA = @($all | Where-Object { $_.Status -eq 'Only on A' })
+    $onlyB = @($all | Where-Object { $_.Status -eq 'Only on B' })
+    $match = @($all | Where-Object { $_.Status -eq 'Matching' })
+    $diff  = @($all | Where-Object { $_.Status -eq 'Different' })
+    
+    $filtered = switch ($filter) {
+        'Only on A' { $onlyA }
+        'Only on B' { $onlyB }
+        'Matching'  { $match }
+        'Different' { $diff }
+        default     { $all }
+    }
+    
+    $script:Window.Dispatcher.Invoke([action]{
+        $script:CmpOnlyA.Text = "$($onlyA.Count)"
+        $script:CmpOnlyB.Text = "$($onlyB.Count)"
+        $script:CmpMatch.Text = "$($match.Count)"
+        $script:CmpDiff.Text  = "$($diff.Count)"
+        $script:GridCompare.ItemsSource = $filtered
+        $script:BtnCompareExport.IsEnabled = ($all.Count -gt 0)
+        $script:TxtCompareStatus.Text = "Showing $($filtered.Count) of $($all.Count) results (filter: $filter)"
+    }, [System.Windows.Threading.DispatcherPriority]::Normal)
+}
+
+function Invoke-DhcpServerCompare {
+    <#
+    .SYNOPSIS
+        Runs comparison between primary and compare DHCP servers
+    #>
+    
+    if ([string]::IsNullOrWhiteSpace($Global:DHCPServer)) {
+        Show-MessageBox "Connect to primary Server A first." "Compare" OK Warning
+        return
+    }
+    
+    if ([string]::IsNullOrWhiteSpace($Global:CompareServer)) {
+        Show-MessageBox "Connect to compare Server B first." "Compare" OK Warning
+        return
+    }
+    
+    $category = 'Scopes'
+    try {
+        if ($null -ne $script:CboCompareCategory.SelectedItem) {
+            $category = $script:CboCompareCategory.SelectedItem.Content
+        }
+    } catch {}
+    
+    Write-ActionLog "Running compare: $category — A=$($Global:DHCPServer) vs B=$($Global:CompareServer)" "INFO"
+    Set-Status "Comparing $category..."
+    
+    try {
+        $script:TxtCompareStatus.Text = "Comparing $category..."
+        
+        $results = switch ($category) {
+            'Scopes'       { Get-DhcpCompareScopes -ServerA $Global:DHCPServer -ServerB $Global:CompareServer }
+            'Options'      { Get-DhcpCompareOptions -ServerA $Global:DHCPServer -ServerB $Global:CompareServer }
+            'Leases'       { Get-DhcpCompareLeases -ServerA $Global:DHCPServer -ServerB $Global:CompareServer }
+            'Reservations' { Get-DhcpCompareReservations -ServerA $Global:DHCPServer -ServerB $Global:CompareServer }
+            default        { throw "Unknown compare category: $category" }
+        }
+        
+        $Global:CompareResults.Clear()
+        foreach ($row in $results) { $Global:CompareResults.Add($row) }
+        
+        Show-CompareResults -Results $Global:CompareResults
+        
+        $diffCount = @($Global:CompareResults | Where-Object { $_.Status -ne 'Matching' }).Count
+        Write-ActionLog "Compare complete: $($Global:CompareResults.Count) items, $diffCount non-matching" "SUCCESS"
+        Set-Status "Compare complete — $($Global:CompareResults.Count) items"
+        Update-LogDisplay
+        
+    } catch {
+        $errMsg = "Compare failed: $_"
+        Write-ActionLog $errMsg "ERROR"
+        Set-Status $errMsg
+        Show-MessageBox $errMsg "Compare Error" OK Error
+        Update-LogDisplay
+    }
+}
+
+function Export-CompareResults {
+    <#
+    .SYNOPSIS
+        Exports comparison results to CSV
+    #>
+    
+    if ($Global:CompareResults.Count -eq 0) {
+        Show-MessageBox "No comparison results to export. Run a compare first." "Export" OK Warning
+        return
+    }
+    
+    try {
+        $saveDialog = New-Object System.Windows.Forms.SaveFileDialog
+        $saveDialog.Filter = "CSV Files (*.csv)|*.csv|Text Files (*.txt)|*.txt|All Files (*.*)|*.*"
+        $category = 'Compare'
+        try { $category = $script:CboCompareCategory.SelectedItem.Content } catch {}
+        $saveDialog.FileName = "DHCP-Compare-$category-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
+        $saveDialog.Title = "Export Compare Results"
+        
+        if ($saveDialog.ShowDialog() -eq 'OK') {
+            $Global:CompareResults | Select-Object Status, Key, Label, ValueA, ValueB, Details |
+                Export-Csv -Path $saveDialog.FileName -NoTypeInformation -Encoding UTF8
+            
+            Write-ActionLog "Compare results exported to: $($saveDialog.FileName)" "SUCCESS"
+            Show-MessageBox "Results exported to:`n$($saveDialog.FileName)" "Export Complete" OK Information
+            Update-LogDisplay
+        }
+    } catch {
+        $errMsg = "Failed to export compare results: $_"
+        Write-ActionLog $errMsg "ERROR"
+        Show-MessageBox $errMsg "Export Error" OK Error
+    }
+}
+#endregion
+
 #region Dialog Functions
 function Show-AddScopeDialog {
     <#
@@ -1917,6 +2528,7 @@ $BtnConnect.add_Click({
         # Load initial data
         Build-NavTree
         Load-Scopes
+        Update-CompareReadyState
         
         Update-LogDisplay
         
@@ -1950,11 +2562,13 @@ $BtnDisconnect.add_Click({
         $script:GridOptions.ItemsSource = $null
         $script:GridFilters.ItemsSource = $null
         $script:GridPolicies.ItemsSource = $null
+        $script:GridCompare.ItemsSource = $null
         
         $script:NavTree.Items.Clear()
         
         Set-Status "Disconnected" "Not Connected"
         $script:StatusServer.Foreground = [System.Windows.Media.Brushes]::Orange
+        Update-CompareReadyState
         
         Write-ActionLog "Disconnected successfully" "SUCCESS"
         Update-LogDisplay
@@ -1977,6 +2591,7 @@ $BtnRefresh.add_Click({
         "TabFilters"      { Load-Filters }
         "TabPolicies"     { Load-Policies }
         "TabStats"        { Load-Statistics }
+        "TabCompare"      { Invoke-DhcpServerCompare }
         default           { Write-ActionLog "No refresh action for this tab" "INFO" }
     }
 })
@@ -2421,6 +3036,105 @@ $BtnRefreshStats.add_Click({
 })
 #endregion
 
+#region Event Handlers - Compare Servers
+$BtnViewCompare.add_Click({
+    Write-ActionLog "Switching to Compare tab..." "INFO"
+    $script:MainTabs.SelectedItem = $script:TabCompare
+    Update-CompareReadyState
+})
+
+$BtnCompareConnect.add_Click({
+    Write-ActionLog "Compare server connect clicked" "INFO"
+    
+    $serverName = $script:TxtCompareServer.Text.Trim()
+    
+    if ([string]::IsNullOrWhiteSpace($serverName)) {
+        Show-MessageBox "Enter a compare server hostname or IP address." "Validation Error" OK Warning
+        return
+    }
+    
+    if ([string]::IsNullOrWhiteSpace($Global:DHCPServer)) {
+        Show-MessageBox "Connect to primary Server A first, then connect Server B." "Compare" OK Warning
+        return
+    }
+    
+    if ($serverName -eq $Global:DHCPServer) {
+        Show-MessageBox "Server B must be different from Server A." "Validation Error" OK Warning
+        return
+    }
+    
+    Set-Status "Connecting compare server $serverName..."
+    
+    try {
+        if (!(Get-Module -Name DhcpServer -ListAvailable)) {
+            throw "DhcpServer module not installed. Please install RSAT-DHCP feature."
+        }
+        
+        Import-Module DhcpServer -ErrorAction Stop
+        
+        $null = Get-DhcpServerv4Scope -ComputerName $serverName -ErrorAction Stop
+        
+        $Global:CompareServer = $serverName
+        Write-ActionLog "Connected compare Server B: $serverName" "SUCCESS"
+        
+        $script:BtnCompareConnect.IsEnabled = $false
+        $script:TxtCompareServer.IsEnabled = $false
+        $script:BtnCompareDisconnect.IsEnabled = $true
+        
+        Update-CompareReadyState
+        Set-Status "Compare server connected: $serverName"
+        Update-LogDisplay
+        
+    } catch {
+        $errMsg = "Failed to connect compare server $serverName : $_"
+        Write-ActionLog $errMsg "ERROR"
+        Set-Status "Compare connection failed"
+        Show-MessageBox $errMsg "Connection Error" OK Error
+        Update-LogDisplay
+    }
+})
+
+$BtnCompareDisconnect.add_Click({
+    Write-ActionLog "Disconnecting compare Server B..." "INFO"
+    
+    $Global:CompareServer = $null
+    $Global:CompareResults.Clear()
+    
+    $script:BtnCompareConnect.IsEnabled = $true
+    $script:TxtCompareServer.IsEnabled = $true
+    $script:BtnCompareDisconnect.IsEnabled = $false
+    $script:GridCompare.ItemsSource = $null
+    $script:CmpOnlyA.Text = "0"
+    $script:CmpOnlyB.Text = "0"
+    $script:CmpMatch.Text = "0"
+    $script:CmpDiff.Text = "0"
+    
+    Update-CompareReadyState
+    Write-ActionLog "Compare Server B disconnected" "SUCCESS"
+    Update-LogDisplay
+})
+
+$BtnRunCompare.add_Click({
+    Invoke-DhcpServerCompare
+})
+
+$BtnCompareExport.add_Click({
+    Export-CompareResults
+})
+
+$CboCompareFilter.add_SelectionChanged({
+    if ($Global:CompareResults.Count -gt 0) {
+        Show-CompareResults -Results $Global:CompareResults
+    }
+})
+
+$CboCompareCategory.add_SelectionChanged({
+    if ($Global:CompareResults.Count -gt 0) {
+        Write-ActionLog "Compare category changed — re-run compare for new category" "INFO"
+    }
+})
+#endregion
+
 #region Event Handlers - Action Log Tab
 $BtnViewLog.add_Click({
     Write-ActionLog "Switching to Action Log tab..." "INFO"
@@ -2494,17 +3208,19 @@ $BtnSettings.add_Click({
     Write-ActionLog "Settings button clicked" "INFO"
     
     $settingsMsg = @"
-DHCP Manager v2.0 - Settings
+DHCP Manager v2.1 - Settings
 
 Current Configuration:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 PowerShell Version: $($PSVersionTable.PSVersion)
 DhcpServer Module: $(if (Get-Module DhcpServer) { 'Loaded' } else { 'Not Loaded' })
-Connected Server: $(if ($Global:DHCPServer) { $Global:DHCPServer } else { 'None' })
+Server A (Primary): $(if ($Global:DHCPServer) { $Global:DHCPServer } else { 'None' })
+Server B (Compare): $(if ($Global:CompareServer) { $Global:CompareServer } else { 'None' })
 Selected Scope: $(if ($Global:SelectedScope) { $Global:SelectedScope } else { 'None' })
+Compare Results: $($Global:CompareResults.Count)
 Log Entries: $($Global:ActionLog.Count)
 
-Note: Advanced settings configuration coming soon
+Note: Use the Compare tab to diff scopes, options, leases, and reservations
 "@
     
     Show-MessageBox $settingsMsg "Settings" OK Information
@@ -2516,12 +3232,12 @@ $BtnAbout.add_Click({
     $aboutMsg = @"
 ╔══════════════════════════════════════════════════════════════════╗
 ║                                                                  ║
-║              DHCP Manager v2.0 - Production Edition             ║
+║         DHCP Manager v2.1 - Multi-Server Compare Edition        ║
 ║                     Complete & Fully Functional                  ║
 ║                                                                  ║
 ╚══════════════════════════════════════════════════════════════════╝
 
-🎯 Version: 2.0.0 (Full Release)
+🎯 Version: 2.1.0 (Multi-Server Compare)
 📅 Date: August 16, 2026
 🏢 Repository: ciscocdp-netizen/PowershellTools
 
@@ -2537,6 +3253,9 @@ $BtnAbout.add_Click({
   • MAC address filtering (Allow/Deny lists)
   • Policy management
   • Server statistics dashboard
+  • Multi-server comparison (scopes, options, leases, reservations)
+  • Compare filters: Only A / Only B / Matching / Different
+  • Export compare results to CSV
   • Export functionality
   • Fixed scope selection tracking
   • Thread-safe UI updates via Dispatcher
@@ -2581,8 +3300,8 @@ $Window.add_Loaded({
     Update-LogDisplay
     
     Write-Host "`n═══════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
-    Write-Host "  DHCP Manager v2.0 is ready!" -ForegroundColor Green
-    Write-Host "  Enter a server name and click Connect to begin" -ForegroundColor Cyan
+    Write-Host "  DHCP Manager v2.1 is ready!" -ForegroundColor Green
+    Write-Host "  Connect Server A, then use Compare tab for Server B" -ForegroundColor Cyan
     Write-Host "═══════════════════════════════════════════════════════════════════`n" -ForegroundColor Cyan
 })
 
@@ -2594,10 +3313,10 @@ $Window.add_Closing({
     }
     
     Write-ActionLog "Total log entries: $($Global:ActionLog.Count)" "INFO"
-    Write-ActionLog "DHCP Manager v2.0 shutdown complete" "SUCCESS"
+    Write-ActionLog "DHCP Manager v2.1 shutdown complete" "SUCCESS"
     
     Write-Host "`n═══════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
-    Write-Host "  DHCP Manager v2.0 closed" -ForegroundColor Yellow
+    Write-Host "  DHCP Manager v2.1 closed" -ForegroundColor Yellow
     Write-Host "  Thank you for using DHCP Manager!" -ForegroundColor Cyan
     Write-Host "═══════════════════════════════════════════════════════════════════`n" -ForegroundColor Cyan
 })
