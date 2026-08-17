@@ -26,12 +26,14 @@
     ✓ Audit log viewer
     ✓ Action log with export
     ✓ Multi-server comparison (scopes, options, leases, reservations)
+    ✓ DHCP audit log ingest (local + remote)
+    ✓ Real-time DHCP event watching on local and remote servers
     
 .NOTES
     File Name      : DHCP-Manager-v2-FULL.ps1
-    Version        : 2.1.0 (Multi-Server Compare)
-    Date           : 2026-08-16
-    Author         : Enhanced with All Bug Fixes
+    Version        : 2.2.0 (Live Events + Author Stamp)
+    Date           : 2026-08-17
+    Author         : Anthony Blake
     Prerequisite   : PowerShell 5.1+
     Required Module: DhcpServer (Install-WindowsFeature RSAT-DHCP)
     
@@ -76,10 +78,10 @@ $banner = @"
 
 ╔══════════════════════════════════════════════════════════════════════════╗
 ║                                                                          ║
-║         DHCP Manager v2.1 - Multi-Server Compare Edition                ║
-║                      Full GUI + Server Comparison                        ║
+║         DHCP Manager v2.2 - Live Events + Multi-Server Compare          ║
+║                      Built by Anthony Blake                              ║
 ║                                                                          ║
-║  ✓ Bug Fixes  ✓ Real-Time Logging  ✓ Compare Scopes/Options/Leases    ║
+║  ✓ Compare Servers  ✓ Log Ingest  ✓ Real-Time DHCP Event Watch         ║
 ║                                                                          ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 
@@ -95,6 +97,15 @@ $Global:ActionLog        = [System.Collections.Generic.List[string]]::new()
 $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
+$Global:AppAuthor        = 'Anthony Blake'
+$Global:AppVersion       = '2.2.0'
+$Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
+$Global:LogWatchState    = @{
+    Local = @{ Enabled = $false; Path = $null; Offset = 0L }
+    A     = @{ Enabled = $false; Path = $null; Offset = 0L }
+    B     = @{ Enabled = $false; Path = $null; Offset = 0L }
+}
+$Global:EventWatchActive = $false
 #endregion
 
 #region Core Logging Functions
@@ -151,7 +162,7 @@ function Update-LogDisplay {
     } catch {}
 }
 
-Write-ActionLog "DHCP Manager v2.1 (Multi-Server Compare) initializing..." "INFO"
+Write-ActionLog "DHCP Manager v2.2 (Anthony Blake) initializing..." "INFO"
 Write-ActionLog "PowerShell Version: $($PSVersionTable.PSVersion)" "INFO"
 Write-ActionLog "OS: $([Environment]::OSVersion.VersionString)" "INFO"
 #endregion
@@ -163,7 +174,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
 <Window
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    Title="DHCP Manager v2.1 - Multi-Server Compare"
+    Title="DHCP Manager v2.2 - Anthony Blake"
     Height="780" Width="1260"
     MinHeight="600" MinWidth="900"
     WindowStartupLocation="CenterScreen"
@@ -433,6 +444,8 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
 
         <!-- Quick Action Buttons -->
         <StackPanel Grid.Column="2" Orientation="Horizontal" HorizontalAlignment="Right">
+          <Button x:Name="BtnViewEvents" Content="📡 Events" Margin="0,0,8,0"
+                  Style="{StaticResource BtnSecondary}" ToolTip="DHCP audit logs and live events"/>
           <Button x:Name="BtnViewCompare" Content="🔀 Compare" Margin="0,0,8,0"
                   Style="{StaticResource BtnSecondary}" ToolTip="Compare two DHCP servers"/>
           <Button x:Name="BtnViewLog" Content="📋 View Log" Margin="0,0,8,0"
@@ -465,7 +478,8 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                    HorizontalAlignment="Center"/>
         
         <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-          <Run Text="Version 2.1.0  |  "/>
+          <Run Text="v2.2.0  |  "/>
+          <Run Text="Anthony Blake  |  " Foreground="#90CAF9"/>
           <Run x:Name="StatusTime" Text=""/>
         </TextBlock>
       </Grid>
@@ -972,6 +986,102 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
             </Grid>
           </TabItem>
 
+          <!-- TAB: DHCP Events / Live Watch (NEW) -->
+          <TabItem x:Name="TabEvents" Header="📡 Events">
+            <Grid Background="{StaticResource BgPanel}">
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+              </Grid.RowDefinitions>
+
+              <!-- Source / Path -->
+              <Border Grid.Row="0" Background="{StaticResource BgCard}"
+                      BorderThickness="0,0,0,1" BorderBrush="{StaticResource Border}" Padding="12,10">
+                <Grid>
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                  </Grid.ColumnDefinitions>
+                  <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock Text="Ingest Source:" Style="{StaticResource FormLabel}"
+                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                    <ComboBox x:Name="CboEventSource" Width="150" Height="26" Margin="0,0,12,0"
+                              Background="{StaticResource BgDeep}" Foreground="{StaticResource TextPrimary}"
+                              BorderBrush="{StaticResource Border}">
+                      <ComboBoxItem Content="Local Server" IsSelected="True"/>
+                      <ComboBoxItem Content="Server A"/>
+                      <ComboBoxItem Content="Server B"/>
+                      <ComboBoxItem Content="Custom Path"/>
+                    </ComboBox>
+                  </StackPanel>
+                  <TextBox Grid.Column="1" x:Name="TxtEventLogPath" Style="{StaticResource DarkTextBox}"
+                           Margin="0,0,8,0"
+                           ToolTip="Path to DhcpSrvLog file or folder (local or UNC)"/>
+                  <StackPanel Grid.Column="2" Orientation="Horizontal">
+                    <Button x:Name="BtnEventBrowse" Content="📁 Browse" Margin="0,0,8,0"
+                            Style="{StaticResource BtnSecondary}"/>
+                    <Button x:Name="BtnEventDetect" Content="🔎 Detect" Margin="0,0,8,0"
+                            Style="{StaticResource BtnSecondary}"
+                            ToolTip="Auto-detect DHCP audit log path"/>
+                    <Button x:Name="BtnEventIngest" Content="📥 Ingest Log" Margin="0,0,0,0"
+                            Style="{StaticResource BtnPrimary}"/>
+                  </StackPanel>
+                </Grid>
+              </Border>
+
+              <!-- Live Watch Controls -->
+              <Border Grid.Row="1" Background="{StaticResource BgCard}"
+                      BorderThickness="0,0,0,1" BorderBrush="{StaticResource Border}" Padding="12,10">
+                <StackPanel Orientation="Horizontal">
+                  <TextBlock Text="Live Watch:" Style="{StaticResource FormLabel}"
+                             VerticalAlignment="Center" Margin="0,0,12,0"/>
+                  <CheckBox x:Name="ChkWatchLocal" Content="Local" Margin="0,0,12,0"
+                            VerticalAlignment="Center"/>
+                  <CheckBox x:Name="ChkWatchA" Content="Server A" Margin="0,0,12,0"
+                            VerticalAlignment="Center"/>
+                  <CheckBox x:Name="ChkWatchB" Content="Server B" Margin="0,0,16,0"
+                            VerticalAlignment="Center"/>
+                  <Button x:Name="BtnEventWatchStart" Content="▶️ Start Watch" Margin="0,0,8,0"
+                          Style="{StaticResource BtnSuccess}"/>
+                  <Button x:Name="BtnEventWatchStop" Content="⏹️ Stop" Margin="0,0,8,0"
+                          Style="{StaticResource BtnDanger}" IsEnabled="False"/>
+                  <Separator Width="1" Background="{StaticResource Border}" Margin="8,0"/>
+                  <Button x:Name="BtnEventClear" Content="🗑️ Clear" Margin="8,0,8,0"
+                          Style="{StaticResource BtnSecondary}"/>
+                  <Button x:Name="BtnEventExport" Content="💾 Export" Margin="0,0,8,0"
+                          Style="{StaticResource BtnSecondary}"/>
+                  <TextBlock Text="Filter:" Style="{StaticResource FormLabel}"
+                             VerticalAlignment="Center" Margin="8,0,8,0"/>
+                  <TextBox x:Name="TxtEventFilter" Width="180" Style="{StaticResource DarkTextBox}"
+                           ToolTip="Filter by IP, MAC, hostname, or event text"/>
+                </StackPanel>
+              </Border>
+
+              <!-- Status line -->
+              <Border Grid.Row="2" Background="{StaticResource BgPanel}" Padding="12,6">
+                <TextBlock x:Name="TxtEventStatus" Text="Ingest a DHCP audit log or start live watch on Local / Server A / Server B"
+                           Foreground="{StaticResource TextSecond}" FontSize="11"/>
+              </Border>
+
+              <!-- Events Grid -->
+              <DataGrid Grid.Row="3" x:Name="GridEvents" Style="{StaticResource DarkGrid}" Margin="8">
+                <DataGrid.Columns>
+                  <DataGridTextColumn Header="Server" Binding="{Binding Server}" Width="110"/>
+                  <DataGridTextColumn Header="Time" Binding="{Binding Time}" Width="140"/>
+                  <DataGridTextColumn Header="ID" Binding="{Binding EventId}" Width="50"/>
+                  <DataGridTextColumn Header="Event" Binding="{Binding Description}" Width="140"/>
+                  <DataGridTextColumn Header="IP Address" Binding="{Binding IPAddress}" Width="120"/>
+                  <DataGridTextColumn Header="MAC" Binding="{Binding MacAddress}" Width="130"/>
+                  <DataGridTextColumn Header="Hostname" Binding="{Binding HostName}" Width="140"/>
+                  <DataGridTextColumn Header="Details" Binding="{Binding Details}" Width="*"/>
+                </DataGrid.Columns>
+              </DataGrid>
+            </Grid>
+          </TabItem>
+
           <!-- TAB: Action Log (NEW) -->
           <TabItem x:Name="TabLog" Header="📋 Action Log">
             <Grid Background="{StaticResource BgPanel}">
@@ -1048,6 +1158,7 @@ try {
     $script:BtnAbout         = $Window.FindName("BtnAbout")
     $script:BtnViewLog       = $Window.FindName("BtnViewLog")
     $script:BtnViewCompare   = $Window.FindName("BtnViewCompare")
+    $script:BtnViewEvents    = $Window.FindName("BtnViewEvents")
     
     # Status Bar
     $script:StatusServer     = $Window.FindName("StatusServer")
@@ -1068,6 +1179,7 @@ try {
     $script:TabPolicies      = $Window.FindName("TabPolicies")
     $script:TabStats         = $Window.FindName("TabStats")
     $script:TabCompare       = $Window.FindName("TabCompare")
+    $script:TabEvents        = $Window.FindName("TabEvents")
     $script:TabLog           = $Window.FindName("TabLog")
     
     # Scopes Tab
@@ -1147,6 +1259,23 @@ try {
     $script:CmpMatch             = $Window.FindName("CmpMatch")
     $script:CmpDiff              = $Window.FindName("CmpDiff")
     $script:TxtCompareStatus     = $Window.FindName("TxtCompareStatus")
+    
+    # Events Tab
+    $script:CboEventSource       = $Window.FindName("CboEventSource")
+    $script:TxtEventLogPath      = $Window.FindName("TxtEventLogPath")
+    $script:BtnEventBrowse       = $Window.FindName("BtnEventBrowse")
+    $script:BtnEventDetect       = $Window.FindName("BtnEventDetect")
+    $script:BtnEventIngest       = $Window.FindName("BtnEventIngest")
+    $script:ChkWatchLocal        = $Window.FindName("ChkWatchLocal")
+    $script:ChkWatchA            = $Window.FindName("ChkWatchA")
+    $script:ChkWatchB            = $Window.FindName("ChkWatchB")
+    $script:BtnEventWatchStart   = $Window.FindName("BtnEventWatchStart")
+    $script:BtnEventWatchStop    = $Window.FindName("BtnEventWatchStop")
+    $script:BtnEventClear        = $Window.FindName("BtnEventClear")
+    $script:BtnEventExport       = $Window.FindName("BtnEventExport")
+    $script:TxtEventFilter       = $Window.FindName("TxtEventFilter")
+    $script:TxtEventStatus       = $Window.FindName("TxtEventStatus")
+    $script:GridEvents           = $Window.FindName("GridEvents")
     
     Write-ActionLog "All UI controls bound successfully" "SUCCESS"
     
@@ -2169,6 +2298,435 @@ function Export-CompareResults {
 }
 #endregion
 
+#region DHCP Audit Log Ingest + Live Event Watch
+function Get-DhcpEventDescription {
+    param([string]$EventId)
+    
+    switch ($EventId) {
+        '00' { 'Started' }
+        '01' { 'Stopped' }
+        '02' { 'Log paused' }
+        '10' { 'Assign' }
+        '11' { 'Renew' }
+        '12' { 'Release' }
+        '13' { 'Conflict detected' }
+        '14' { 'Lease deleted' }
+        '15' { 'NACK' }
+        '16' { 'Decline' }
+        '17' { 'Auth failed' }
+        '20' { 'BootP' }
+        '21' { 'DynBOOTp' }
+        '30' { 'DNS update request' }
+        '31' { 'DNS update failed' }
+        '32' { 'DNS update successful' }
+        '50' { 'Unreachable domain' }
+        '51' { 'Authorization succeeded' }
+        '52' { 'Upgraded to Windows' }
+        '53' { 'Cached auth' }
+        '54' { 'Authorization failed' }
+        '55' { 'Server found in DS' }
+        '56' { 'Server not in DS' }
+        '57' { 'Server changed domain' }
+        '58' { 'Server changed IP' }
+        '59' { 'Network failure' }
+        '60' { 'No domain' }
+        '61' { 'Another server online' }
+        '62' { 'Stopping rogue detection' }
+        '63' { 'Restarting rogue detection' }
+        default { "Event $EventId" }
+    }
+}
+
+function Get-DhcpAuditLogPath {
+    <#
+    .SYNOPSIS
+        Resolves the newest DHCP audit log for local or remote server
+    #>
+    param(
+        [ValidateSet('Local','A','B','Custom')]
+        [string]$Source = 'Local',
+        [string]$CustomPath = ''
+    )
+    
+    if ($Source -eq 'Custom') {
+        if ([string]::IsNullOrWhiteSpace($CustomPath)) { return $null }
+        if (Test-Path -LiteralPath $CustomPath) { return $CustomPath }
+        return $null
+    }
+    
+    $root = $null
+    switch ($Source) {
+        'Local' {
+            $root = Join-Path $env:SystemRoot 'System32\dhcp'
+        }
+        'A' {
+            if ([string]::IsNullOrWhiteSpace($Global:DHCPServer)) { return $null }
+            if ($Global:DHCPServer -match '^(localhost|127\.0\.0\.1|\.)$') {
+                $root = Join-Path $env:SystemRoot 'System32\dhcp'
+            } else {
+                $root = "\\$($Global:DHCPServer)\admin$\System32\dhcp"
+            }
+        }
+        'B' {
+            if ([string]::IsNullOrWhiteSpace($Global:CompareServer)) { return $null }
+            if ($Global:CompareServer -match '^(localhost|127\.0\.0\.1|\.)$') {
+                $root = Join-Path $env:SystemRoot 'System32\dhcp'
+            } else {
+                $root = "\\$($Global:CompareServer)\admin$\System32\dhcp"
+            }
+        }
+    }
+    
+    if (-not $root -or -not (Test-Path -LiteralPath $root)) {
+        # Fallback common UNC form
+        if ($Source -eq 'A' -and $Global:DHCPServer) {
+            $root = "\\$($Global:DHCPServer)\C$\Windows\System32\dhcp"
+        }
+        elseif ($Source -eq 'B' -and $Global:CompareServer) {
+            $root = "\\$($Global:CompareServer)\C$\Windows\System32\dhcp"
+        }
+    }
+    
+    if (-not $root -or -not (Test-Path -LiteralPath $root)) {
+        return $null
+    }
+    
+    $candidates = @(Get-ChildItem -LiteralPath $root -Filter 'DhcpSrvLog*' -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending)
+    
+    if ($candidates.Count -eq 0) { return $root }
+    return $candidates[0].FullName
+}
+
+function ConvertFrom-DhcpAuditLine {
+    param(
+        [string]$Line,
+        [string]$ServerLabel
+    )
+    
+    if ([string]::IsNullOrWhiteSpace($Line)) { return $null }
+    if ($Line -match '^\s*#') { return $null }
+    if ($Line -match '^(ID|Microsoft)') { return $null }
+    
+    # Classic CSV: ID,Date,Time,Description,IP,HostName,MAC,...
+    $parts = $Line.Split(',')
+    if ($parts.Count -lt 3) { return $null }
+    
+    $eventId = $parts[0].Trim()
+    if ($eventId -notmatch '^\d{1,3}$') { return $null }
+    
+    $date = if ($parts.Count -gt 1) { $parts[1].Trim() } else { '' }
+    $time = if ($parts.Count -gt 2) { $parts[2].Trim() } else { '' }
+    $desc = if ($parts.Count -gt 3 -and $parts[3].Trim()) { $parts[3].Trim() } else { Get-DhcpEventDescription $eventId }
+    $ip   = if ($parts.Count -gt 4) { $parts[4].Trim() } else { '' }
+    $hostName = if ($parts.Count -gt 5) { $parts[5].Trim() } else { '' }
+    $mac  = if ($parts.Count -gt 6) { $parts[6].Trim() } else { '' }
+    
+    $stamp = ("$date $time").Trim()
+    if (-not $stamp) { $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss' }
+    
+    $details = if ($parts.Count -gt 7) { ($parts[7..($parts.Count-1)] -join ',').Trim() } else { '' }
+    
+    return [PSCustomObject]@{
+        Server      = $ServerLabel
+        Time        = $stamp
+        EventId     = $eventId
+        Description = $desc
+        IPAddress   = $ip
+        MacAddress  = $mac
+        HostName    = $hostName
+        Details     = $details
+        Raw         = $Line
+    }
+}
+
+function Add-DhcpEventEntry {
+    param([object]$Entry)
+    
+    if ($null -eq $Entry) { return }
+    
+    $filter = ''
+    try { $filter = $script:TxtEventFilter.Text } catch {}
+    
+    if (-not [string]::IsNullOrWhiteSpace($filter)) {
+        $blob = "$($Entry.Server) $($Entry.Time) $($Entry.EventId) $($Entry.Description) $($Entry.IPAddress) $($Entry.MacAddress) $($Entry.HostName) $($Entry.Details)"
+        if ($blob -notlike "*$filter*") { return }
+    }
+    
+    try {
+        $script:Window.Dispatcher.Invoke([action]{
+            $Global:DhcpEventEntries.Insert(0, $Entry)
+            while ($Global:DhcpEventEntries.Count -gt 5000) {
+                $Global:DhcpEventEntries.RemoveAt($Global:DhcpEventEntries.Count - 1)
+            }
+            if ($null -eq $script:GridEvents.ItemsSource) {
+                $script:GridEvents.ItemsSource = $Global:DhcpEventEntries
+            }
+        }, [System.Windows.Threading.DispatcherPriority]::Background)
+    } catch {
+        try {
+            $Global:DhcpEventEntries.Insert(0, $Entry)
+        } catch {}
+    }
+}
+
+function Import-DhcpAuditLogFile {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+        [string]$ServerLabel = 'Local',
+        [switch]$TailOnly
+    )
+    
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "Log path not found: $Path"
+    }
+    
+    $item = Get-Item -LiteralPath $Path
+    if ($item.PSIsContainer) {
+        $newest = @(Get-ChildItem -LiteralPath $Path -Filter 'DhcpSrvLog*' -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending)
+        if ($newest.Count -eq 0) { throw "No DhcpSrvLog* files in $Path" }
+        $Path = $newest[0].FullName
+    }
+    
+    Write-ActionLog "Ingesting DHCP audit log: $Path ($ServerLabel)" "INFO"
+    
+    $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    try {
+        if ($TailOnly) {
+            $fs.Seek(0, [System.IO.SeekOrigin]::End) | Out-Null
+            return @{ Path = $Path; Offset = $fs.Position }
+        }
+        
+        $reader = New-Object System.IO.StreamReader($fs)
+        $count = 0
+        while ($null -ne ($line = $reader.ReadLine())) {
+            $entry = ConvertFrom-DhcpAuditLine -Line $line -ServerLabel $ServerLabel
+            if ($entry) {
+                Add-DhcpEventEntry -Entry $entry
+                $count++
+            }
+        }
+        $offset = $fs.Position
+        Write-ActionLog "Ingested $count events from $ServerLabel" "SUCCESS"
+        return @{ Path = $Path; Offset = $offset; Count = $count }
+    } finally {
+        $fs.Dispose()
+    }
+}
+
+function Read-DhcpAuditLogDelta {
+    param(
+        [string]$Path,
+        [long]$Offset,
+        [string]$ServerLabel
+    )
+    
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return @{ Offset = $Offset; Count = 0 }
+    }
+    
+    $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    try {
+        $length = $fs.Length
+        if ($Offset -gt $length) { $Offset = 0L }  # log rotated
+        
+        $fs.Seek($Offset, [System.IO.SeekOrigin]::Begin) | Out-Null
+        $reader = New-Object System.IO.StreamReader($fs)
+        $count = 0
+        while ($null -ne ($line = $reader.ReadLine())) {
+            $entry = ConvertFrom-DhcpAuditLine -Line $line -ServerLabel $ServerLabel
+            if ($entry) {
+                Add-DhcpEventEntry -Entry $entry
+                $count++
+            }
+        }
+        return @{ Offset = $fs.Position; Count = $count }
+    } finally {
+        $fs.Dispose()
+    }
+}
+
+function Get-SelectedEventSourceKey {
+    $label = 'Local Server'
+    try {
+        if ($null -ne $script:CboEventSource.SelectedItem) {
+            $label = $script:CboEventSource.SelectedItem.Content
+        }
+    } catch {}
+    
+    switch ($label) {
+        'Server A'     { return 'A' }
+        'Server B'     { return 'B' }
+        'Custom Path'  { return 'Custom' }
+        default        { return 'Local' }
+    }
+}
+
+function Get-EventServerLabel {
+    param([string]$SourceKey)
+    switch ($SourceKey) {
+        'A' { if ($Global:DHCPServer) { "A:$($Global:DHCPServer)" } else { 'Server A' } }
+        'B' { if ($Global:CompareServer) { "B:$($Global:CompareServer)" } else { 'Server B' } }
+        'Custom' { 'Custom' }
+        default { 'Local' }
+    }
+}
+
+function Update-EventWatchStatus {
+    $parts = @()
+    if ($Global:EventWatchActive) {
+        if ($Global:LogWatchState.Local.Enabled) { $parts += "Local→$([IO.Path]::GetFileName($Global:LogWatchState.Local.Path))" }
+        if ($Global:LogWatchState.A.Enabled)     { $parts += "A→$([IO.Path]::GetFileName($Global:LogWatchState.A.Path))" }
+        if ($Global:LogWatchState.B.Enabled)     { $parts += "B→$([IO.Path]::GetFileName($Global:LogWatchState.B.Path))" }
+        $msg = if ($parts.Count) { "LIVE watching: " + ($parts -join '  |  ') } else { 'Watch running (no sources enabled)' }
+    } else {
+        $msg = "Idle — $($Global:DhcpEventEntries.Count) events loaded. Built by $($Global:AppAuthor)."
+    }
+    
+    try {
+        $script:TxtEventStatus.Dispatcher.Invoke([action]{
+            $script:TxtEventStatus.Text = $msg
+        }, [System.Windows.Threading.DispatcherPriority]::Background)
+    } catch {
+        try { $script:TxtEventStatus.Text = $msg } catch {}
+    }
+}
+
+function Start-DhcpEventWatch {
+    $watchLocal = [bool]$script:ChkWatchLocal.IsChecked
+    $watchA     = [bool]$script:ChkWatchA.IsChecked
+    $watchB     = [bool]$script:ChkWatchB.IsChecked
+    
+    if (-not ($watchLocal -or $watchA -or $watchB)) {
+        Show-MessageBox "Select at least one live watch target: Local, Server A, and/or Server B." "Live Watch" OK Warning
+        return
+    }
+    
+    if ($watchA -and [string]::IsNullOrWhiteSpace($Global:DHCPServer)) {
+        Show-MessageBox "Connect Server A before watching it." "Live Watch" OK Warning
+        return
+    }
+    
+    if ($watchB -and [string]::IsNullOrWhiteSpace($Global:CompareServer)) {
+        Show-MessageBox "Connect Server B (Compare tab) before watching it." "Live Watch" OK Warning
+        return
+    }
+    
+    Write-ActionLog "Starting DHCP live event watch..." "INFO"
+    
+    foreach ($key in @('Local','A','B')) {
+        $Global:LogWatchState[$key].Enabled = $false
+        $Global:LogWatchState[$key].Path = $null
+        $Global:LogWatchState[$key].Offset = 0L
+    }
+    
+    $started = @()
+    
+    if ($watchLocal) {
+        $path = Get-DhcpAuditLogPath -Source Local
+        if (-not $path) { throw "Could not detect local DHCP audit log under $($env:SystemRoot)\System32\dhcp" }
+        $info = Import-DhcpAuditLogFile -Path $path -ServerLabel 'Local' -TailOnly
+        $Global:LogWatchState.Local.Enabled = $true
+        $Global:LogWatchState.Local.Path = $info.Path
+        $Global:LogWatchState.Local.Offset = [long]$info.Offset
+        $started += "Local ($($info.Path))"
+    }
+    
+    if ($watchA) {
+        $path = Get-DhcpAuditLogPath -Source A
+        if (-not $path) { throw "Could not detect DHCP audit log for Server A ($($Global:DHCPServer)). Ensure admin$ or C$ share is reachable." }
+        $label = Get-EventServerLabel -SourceKey 'A'
+        $info = Import-DhcpAuditLogFile -Path $path -ServerLabel $label -TailOnly
+        $Global:LogWatchState.A.Enabled = $true
+        $Global:LogWatchState.A.Path = $info.Path
+        $Global:LogWatchState.A.Offset = [long]$info.Offset
+        $started += "A ($($info.Path))"
+    }
+    
+    if ($watchB) {
+        $path = Get-DhcpAuditLogPath -Source B
+        if (-not $path) { throw "Could not detect DHCP audit log for Server B ($($Global:CompareServer)). Ensure admin$ or C$ share is reachable." }
+        $label = Get-EventServerLabel -SourceKey 'B'
+        $info = Import-DhcpAuditLogFile -Path $path -ServerLabel $label -TailOnly
+        $Global:LogWatchState.B.Enabled = $true
+        $Global:LogWatchState.B.Path = $info.Path
+        $Global:LogWatchState.B.Offset = [long]$info.Offset
+        $started += "B ($($info.Path))"
+    }
+    
+    if ($null -eq $script:EventWatchTimer) {
+        $script:EventWatchTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $script:EventWatchTimer.Interval = [TimeSpan]::FromSeconds(2)
+        $script:EventWatchTimer.Add_Tick({
+            if (-not $Global:EventWatchActive) { return }
+            
+            $newTotal = 0
+            foreach ($key in @('Local','A','B')) {
+                $st = $Global:LogWatchState[$key]
+                if (-not $st.Enabled -or -not $st.Path) { continue }
+                
+                $label = switch ($key) {
+                    'A' { Get-EventServerLabel -SourceKey 'A' }
+                    'B' { Get-EventServerLabel -SourceKey 'B' }
+                    default { 'Local' }
+                }
+                
+                try {
+                    $delta = Read-DhcpAuditLogDelta -Path $st.Path -Offset ([long]$st.Offset) -ServerLabel $label
+                    $st.Offset = [long]$delta.Offset
+                    $newTotal += [int]$delta.Count
+                } catch {
+                    Write-ActionLog "Watch poll failed for $key : $_" "WARN"
+                }
+            }
+            
+            if ($newTotal -gt 0) {
+                Set-Status "Live DHCP events: +$newTotal"
+            }
+            Update-EventWatchStatus
+        })
+    }
+    
+    $Global:EventWatchActive = $true
+    $script:EventWatchTimer.Start()
+    
+    $script:BtnEventWatchStart.IsEnabled = $false
+    $script:BtnEventWatchStop.IsEnabled = $true
+    $script:ChkWatchLocal.IsEnabled = $false
+    $script:ChkWatchA.IsEnabled = $false
+    $script:ChkWatchB.IsEnabled = $false
+    
+    Write-ActionLog ("Live watch started: " + ($started -join '; ')) "SUCCESS"
+    Update-EventWatchStatus
+    Update-LogDisplay
+    Set-Status "Live DHCP event watch active"
+}
+
+function Stop-DhcpEventWatch {
+    Write-ActionLog "Stopping DHCP live event watch..." "INFO"
+    
+    $Global:EventWatchActive = $false
+    try { if ($script:EventWatchTimer) { $script:EventWatchTimer.Stop() } } catch {}
+    
+    foreach ($key in @('Local','A','B')) {
+        $Global:LogWatchState[$key].Enabled = $false
+    }
+    
+    $script:BtnEventWatchStart.IsEnabled = $true
+    $script:BtnEventWatchStop.IsEnabled = $false
+    $script:ChkWatchLocal.IsEnabled = $true
+    $script:ChkWatchA.IsEnabled = $true
+    $script:ChkWatchB.IsEnabled = $true
+    
+    Update-EventWatchStatus
+    Write-ActionLog "Live watch stopped" "SUCCESS"
+    Set-Status "Live watch stopped"
+    Update-LogDisplay
+}
+#endregion
+
 #region Dialog Functions
 function Show-AddScopeDialog {
     <#
@@ -2592,6 +3150,12 @@ $BtnRefresh.add_Click({
         "TabPolicies"     { Load-Policies }
         "TabStats"        { Load-Statistics }
         "TabCompare"      { Invoke-DhcpServerCompare }
+        "TabEvents"       {
+            if ($null -eq $script:GridEvents.ItemsSource) {
+                $script:GridEvents.ItemsSource = $Global:DhcpEventEntries
+            }
+            Update-EventWatchStatus
+        }
         default           { Write-ActionLog "No refresh action for this tab" "INFO" }
     }
 })
@@ -3135,6 +3699,161 @@ $CboCompareCategory.add_SelectionChanged({
 })
 #endregion
 
+#region Event Handlers - DHCP Events / Live Watch
+$BtnViewEvents.add_Click({
+    Write-ActionLog "Switching to DHCP Events tab..." "INFO"
+    $script:MainTabs.SelectedItem = $script:TabEvents
+    if ($null -eq $script:GridEvents.ItemsSource) {
+        $script:GridEvents.ItemsSource = $Global:DhcpEventEntries
+    }
+    Update-EventWatchStatus
+})
+
+$BtnEventBrowse.add_Click({
+    try {
+        $dlg = New-Object System.Windows.Forms.OpenFileDialog
+        $dlg.Filter = "DHCP Logs (DhcpSrvLog*.*)|DhcpSrvLog*.*|Log Files (*.log)|*.log|All Files (*.*)|*.*"
+        $dlg.Title = "Select DHCP Audit Log"
+        if ($dlg.ShowDialog() -eq 'OK') {
+            $script:TxtEventLogPath.Text = $dlg.FileName
+            $script:CboEventSource.SelectedIndex = 3  # Custom Path
+            Write-ActionLog "Selected log file: $($dlg.FileName)" "INFO"
+        }
+    } catch {
+        Write-ActionLog "Browse failed: $_" "ERROR"
+    }
+})
+
+$BtnEventDetect.add_Click({
+    try {
+        $src = Get-SelectedEventSourceKey
+        if ($src -eq 'Custom') {
+            Show-MessageBox "Detect works for Local / Server A / Server B. For Custom, use Browse." "Detect" OK Information
+            return
+        }
+        
+        if ($src -eq 'A' -and -not $Global:DHCPServer) {
+            Show-MessageBox "Connect Server A first." "Detect" OK Warning
+            return
+        }
+        if ($src -eq 'B' -and -not $Global:CompareServer) {
+            Show-MessageBox "Connect Server B first (Compare tab)." "Detect" OK Warning
+            return
+        }
+        
+        $path = Get-DhcpAuditLogPath -Source $src
+        if (-not $path) {
+            Show-MessageBox "Could not detect DHCP audit log for $src.`nTried admin`$ / C`$ System32\dhcp." "Detect" OK Warning
+            return
+        }
+        
+        $script:TxtEventLogPath.Text = $path
+        Write-ActionLog "Detected DHCP audit path ($src): $path" "SUCCESS"
+        $script:TxtEventStatus.Text = "Detected: $path"
+        Update-LogDisplay
+    } catch {
+        Write-ActionLog "Detect failed: $_" "ERROR"
+        Show-MessageBox "Detect failed: $_" "Detect" OK Error
+    }
+})
+
+$BtnEventIngest.add_Click({
+    try {
+        $src = Get-SelectedEventSourceKey
+        $path = $script:TxtEventLogPath.Text.Trim()
+        
+        if ([string]::IsNullOrWhiteSpace($path)) {
+            $path = Get-DhcpAuditLogPath -Source $(if ($src -eq 'Custom') { 'Local' } else { $src }) -CustomPath $path
+            if ($path) { $script:TxtEventLogPath.Text = $path }
+        }
+        
+        if ([string]::IsNullOrWhiteSpace($path)) {
+            Show-MessageBox "Provide a log path (or click Detect / Browse)." "Ingest" OK Warning
+            return
+        }
+        
+        $label = Get-EventServerLabel -SourceKey $src
+        Set-Status "Ingesting DHCP log..."
+        $info = Import-DhcpAuditLogFile -Path $path -ServerLabel $label
+        $script:TxtEventStatus.Text = "Ingested $($info.Count) events from $label ($($info.Path))"
+        Set-Status "Ingested $($info.Count) DHCP events"
+        Update-LogDisplay
+    } catch {
+        $errMsg = "Ingest failed: $_"
+        Write-ActionLog $errMsg "ERROR"
+        Show-MessageBox $errMsg "Ingest Error" OK Error
+        Update-LogDisplay
+    }
+})
+
+$BtnEventWatchStart.add_Click({
+    try {
+        Start-DhcpEventWatch
+    } catch {
+        $errMsg = "Failed to start live watch: $_"
+        Write-ActionLog $errMsg "ERROR"
+        Show-MessageBox $errMsg "Live Watch" OK Error
+        Stop-DhcpEventWatch
+        Update-LogDisplay
+    }
+})
+
+$BtnEventWatchStop.add_Click({
+    Stop-DhcpEventWatch
+})
+
+$BtnEventClear.add_Click({
+    $result = Show-MessageBox "Clear all loaded DHCP events from the grid?" "Confirm Clear" YesNo Question
+    if ($result -eq 'Yes') {
+        $script:Window.Dispatcher.Invoke([action]{
+            $Global:DhcpEventEntries.Clear()
+        }, [System.Windows.Threading.DispatcherPriority]::Normal)
+        Write-ActionLog "DHCP event grid cleared" "WARN"
+        Update-EventWatchStatus
+        Update-LogDisplay
+    }
+})
+
+$BtnEventExport.add_Click({
+    if ($Global:DhcpEventEntries.Count -eq 0) {
+        Show-MessageBox "No DHCP events to export." "Export" OK Warning
+        return
+    }
+    
+    try {
+        $saveDialog = New-Object System.Windows.Forms.SaveFileDialog
+        $saveDialog.Filter = "CSV Files (*.csv)|*.csv|All Files (*.*)|*.*"
+        $saveDialog.FileName = "DHCP-Events-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
+        $saveDialog.Title = "Export DHCP Events"
+        
+        if ($saveDialog.ShowDialog() -eq 'OK') {
+            $Global:DhcpEventEntries |
+                Select-Object Server, Time, EventId, Description, IPAddress, MacAddress, HostName, Details |
+                Export-Csv -Path $saveDialog.FileName -NoTypeInformation -Encoding UTF8
+            
+            Write-ActionLog "DHCP events exported: $($saveDialog.FileName)" "SUCCESS"
+            Show-MessageBox "Exported to:`n$($saveDialog.FileName)" "Export Complete" OK Information
+            Update-LogDisplay
+        }
+    } catch {
+        Write-ActionLog "Event export failed: $_" "ERROR"
+        Show-MessageBox "Export failed: $_" "Export Error" OK Error
+    }
+})
+
+$TxtEventFilter.add_TextChanged({
+    # Filter applies to newly arriving live events; re-binding full filter would be expensive.
+    # Status note only.
+    try {
+        if ($script:TxtEventFilter.Text) {
+            $script:TxtEventStatus.Text = "Live filter active: '$($script:TxtEventFilter.Text)' (applies to new events)"
+        } else {
+            Update-EventWatchStatus
+        }
+    } catch {}
+})
+#endregion
+
 #region Event Handlers - Action Log Tab
 $BtnViewLog.add_Click({
     Write-ActionLog "Switching to Action Log tab..." "INFO"
@@ -3172,7 +3891,7 @@ $BtnLogExport.add_Click({
             
             $header = @"
 ═══════════════════════════════════════════════════════════════════════
-DHCP Manager v2.0 - Action Log Export
+DHCP Manager v2.2 - Action Log Export (Anthony Blake)
 ═══════════════════════════════════════════════════════════════════════
 Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
 Server: $Global:DHCPServer
@@ -3208,7 +3927,10 @@ $BtnSettings.add_Click({
     Write-ActionLog "Settings button clicked" "INFO"
     
     $settingsMsg = @"
-DHCP Manager v2.1 - Settings
+DHCP Manager v2.2 - Settings
+
+Author: $($Global:AppAuthor)
+Version: $($Global:AppVersion)
 
 Current Configuration:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -3218,9 +3940,13 @@ Server A (Primary): $(if ($Global:DHCPServer) { $Global:DHCPServer } else { 'Non
 Server B (Compare): $(if ($Global:CompareServer) { $Global:CompareServer } else { 'None' })
 Selected Scope: $(if ($Global:SelectedScope) { $Global:SelectedScope } else { 'None' })
 Compare Results: $($Global:CompareResults.Count)
+DHCP Events Loaded: $($Global:DhcpEventEntries.Count)
+Live Watch Active: $($Global:EventWatchActive)
 Log Entries: $($Global:ActionLog.Count)
 
-Note: Use the Compare tab to diff scopes, options, leases, and reservations
+DHCP audit logs typically live under:
+  Local:  %SystemRoot%\System32\dhcp\DhcpSrvLog*
+  Remote: \\server\admin$\System32\dhcp\  (or C$)
 "@
     
     Show-MessageBox $settingsMsg "Settings" OK Information
@@ -3232,13 +3958,14 @@ $BtnAbout.add_Click({
     $aboutMsg = @"
 ╔══════════════════════════════════════════════════════════════════╗
 ║                                                                  ║
-║         DHCP Manager v2.1 - Multi-Server Compare Edition        ║
-║                     Complete & Fully Functional                  ║
+║              DHCP Manager v2.2                                   ║
+║                  Built by Anthony Blake                          ║
 ║                                                                  ║
 ╚══════════════════════════════════════════════════════════════════╝
 
-🎯 Version: 2.1.0 (Multi-Server Compare)
-📅 Date: August 16, 2026
+🎯 Version: $($Global:AppVersion)
+👤 Author: $($Global:AppAuthor)
+📅 Date: August 17, 2026
 🏢 Repository: ciscocdp-netizen/PowershellTools
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -3246,38 +3973,17 @@ $BtnAbout.add_Click({
 ✓ Features Included:
 
   • Full WPF GUI with dark modern theme
-  • Complete DHCP scope management
-  • Real-time action logging with millisecond timestamps
-  • Lease, reservation, and exclusion management
-  • DHCP options configuration (Server/Scope/Reservation)
-  • MAC address filtering (Allow/Deny lists)
-  • Policy management
-  • Server statistics dashboard
+  • Complete DHCP scope / lease / reservation management
   • Multi-server comparison (scopes, options, leases, reservations)
-  • Compare filters: Only A / Only B / Matching / Different
-  • Export compare results to CSV
-  • Export functionality
-  • Fixed scope selection tracking
+  • DHCP audit log ingest (local + remote UNC)
+  • Real-time DHCP event watching (Local / Server A / Server B)
+  • Action logging with millisecond timestamps
+  • CSV export for compare results and DHCP events
   • Thread-safe UI updates via Dispatcher
-  • Comprehensive error handling
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-📚 Requirements:
-
-  • PowerShell 5.1 or later
-  • DhcpServer module (RSAT-DHCP)
-  • Windows Server with DHCP role
-  • Appropriate administrative permissions
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-🔗 Documentation & Support:
-   https://github.com/ciscocdp-netizen/PowershellTools
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Built with ❤️ for Network Engineers
+Built by Anthony Blake for Network Engineers
 
 "@
     
@@ -3288,6 +3994,12 @@ Built with ❤️ for Network Engineers
 #region Window Events
 $Window.add_Loaded({
     Write-ActionLog "Main window loaded successfully" "SUCCESS"
+    
+    # Stamp author in status and bind events grid
+    try {
+        $script:GridEvents.ItemsSource = $Global:DhcpEventEntries
+        Update-EventWatchStatus
+    } catch {}
     
     # Start status time updater
     $timer = New-Object System.Windows.Threading.DispatcherTimer
@@ -3300,23 +4012,25 @@ $Window.add_Loaded({
     Update-LogDisplay
     
     Write-Host "`n═══════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
-    Write-Host "  DHCP Manager v2.1 is ready!" -ForegroundColor Green
-    Write-Host "  Connect Server A, then use Compare tab for Server B" -ForegroundColor Cyan
+    Write-Host "  DHCP Manager v2.2 — Built by Anthony Blake" -ForegroundColor Green
+    Write-Host "  Connect servers, compare configs, watch live DHCP events" -ForegroundColor Cyan
     Write-Host "═══════════════════════════════════════════════════════════════════`n" -ForegroundColor Cyan
 })
 
 $Window.add_Closing({
     Write-ActionLog "Application closing..." "INFO"
     
+    try { Stop-DhcpEventWatch } catch {}
+    
     if ($Global:DHCPServer) {
         Write-ActionLog "Session ended. Server: $Global:DHCPServer" "INFO"
     }
     
     Write-ActionLog "Total log entries: $($Global:ActionLog.Count)" "INFO"
-    Write-ActionLog "DHCP Manager v2.1 shutdown complete" "SUCCESS"
+    Write-ActionLog "DHCP Manager v2.2 shutdown complete — $($Global:AppAuthor)" "SUCCESS"
     
     Write-Host "`n═══════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
-    Write-Host "  DHCP Manager v2.1 closed" -ForegroundColor Yellow
+    Write-Host "  DHCP Manager v2.2 closed — Anthony Blake" -ForegroundColor Yellow
     Write-Host "  Thank you for using DHCP Manager!" -ForegroundColor Cyan
     Write-Host "═══════════════════════════════════════════════════════════════════`n" -ForegroundColor Cyan
 })
