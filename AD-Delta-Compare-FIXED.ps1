@@ -24,7 +24,7 @@
     powershell -ExecutionPolicy Bypass -STA -File .\AD-Delta-Compare-FIXED.ps1
 
 .NOTES
-    Version: 1.5
+    Version: 1.6
     - Removed SetCompatibleTextRenderingDefault (throws when another WinForms
       window already exists in the process, e.g. DHCPManager still open)
     - Fonts use Segoe UI + Bold (Segoe UI Semibold is missing on Server 2016)
@@ -262,11 +262,12 @@ $script:Handle     = $null
 function Escape-LdapFilter {
     param([string]$Value)
     if ([string]::IsNullOrEmpty($Value)) { return $Value }
+    # Use string Replace overloads only — Char Replace('\00') throws on PS 5.1
     $Value = $Value.Replace('\', '\5c')
     $Value = $Value.Replace('*', '\2a')
     $Value = $Value.Replace('(', '\28')
     $Value = $Value.Replace(')', '\29')
-    $Value = $Value.Replace([char]0x00, '\00')
+    $Value = $Value.Replace([string][char]0, '\00')
     $Value = $Value.Replace('/', '\2f')
     return $Value
 }
@@ -342,11 +343,12 @@ $script:CompareScript = {
     function Escape-LdapFilterInternal {
         param([string]$Value)
         if ([string]::IsNullOrEmpty($Value)) { return $Value }
+        # String overloads only — Char Replace('\00') throws on PS 5.1
         $Value = $Value.Replace('\', '\5c')
         $Value = $Value.Replace('*', '\2a')
         $Value = $Value.Replace('(', '\28')
         $Value = $Value.Replace(')', '\29')
-        $Value = $Value.Replace([char]0x00, '\00')
+        $Value = $Value.Replace([string][char]0, '\00')
         $Value = $Value.Replace('/', '\2f')
         return $Value
     }
@@ -374,8 +376,18 @@ $script:CompareScript = {
 
                 $nameClause = ''
                 if ($Filter) {
-                    $escapedFilter = Escape-LdapFilterInternal $Filter
-                    $nameClause = "(|(sAMAccountName=*$escapedFilter*)(cn=*$escapedFilter*)(displayName=*$escapedFilter*)(name=*$escapedFilter*))"
+                    $raw = $Filter.Trim()
+                    $escapedFilter = Escape-LdapFilterInternal $raw
+                    # UPN (contains @): match UPN exactly or as substring; also try sAMAccountName left of @
+                    if ($raw -match '@') {
+                        $samPart = ($raw -split '@', 2)[0]
+                        $escapedSam = Escape-LdapFilterInternal $samPart
+                        $nameClause = "(|(userPrincipalName=$escapedFilter)(userPrincipalName=*$escapedFilter*)(sAMAccountName=$escapedSam)(sAMAccountName=*$escapedSam*))"
+                    }
+                    else {
+                        # sAMAccountName / UPN / common name fields (substring)
+                        $nameClause = "(|(sAMAccountName=$escapedFilter)(sAMAccountName=*$escapedFilter*)(userPrincipalName=$escapedFilter)(userPrincipalName=*$escapedFilter*)(cn=*$escapedFilter*)(displayName=*$escapedFilter*)(name=*$escapedFilter*))"
+                    }
                 }
                 $ldap = "(&$catFilter$nameClause)"
 
@@ -905,7 +917,7 @@ $qCols.Controls.Add($pnlFilterHost, 1, 0)
 $qCols.SetRowSpan($pnlFilterHost, 2)
 
 $lblFilter = New-Object System.Windows.Forms.Label
-$lblFilter.Text = 'Name filter'
+$lblFilter.Text = 'sAMAccountName / UPN'
 $lblFilter.Font = $script:Theme.FontUi
 $lblFilter.ForeColor = $script:Theme.TextMuted
 $lblFilter.Location = New-Object System.Drawing.Point(4, 0)
