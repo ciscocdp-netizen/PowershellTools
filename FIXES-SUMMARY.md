@@ -393,6 +393,12 @@ Install-WindowsFeature RSAT-AD-PowerShell
 
 ## Version History
 
+### Version 1.4 (Startup + layout harden) - 2026-08-18
+- Removed `SetCompatibleTextRenderingDefault` (fails when DHCPManager/other WinForms already ran in same process)
+- Replaced `Segoe UI Semibold` with `Segoe UI` + Bold (missing font family on Server 2016)
+- `AutoScaleMode = None` + simple Dock layout to stop clipped/misplaced controls
+- Also ships as `AD_Recovery.ps1` (filename commonly used on the server)
+
 ### Version 1.3 (Layout + replication times) - 2026-08-18
 - Renamed UI to **Active Directory Recovery**
 - Rebuilt layout with TableLayoutPanel (fixes clipped header/overlapping panels)
