@@ -184,11 +184,13 @@ function Add-GridColumns {
 }
 
 function New-GridColumn {
-    param([string]$Header, [string]$Name, [int]$Width, [switch]$Hidden)
+    param([string]$Header, [string]$Name, [int]$Width, [int]$FillWeight = 100, [switch]$Hidden)
     $col = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $col.HeaderText = $Header
     $col.Name = $Name
     $col.Width = $Width
+    $col.FillWeight = $FillWeight
+    $col.MinimumWidth = 50
     if ($Hidden) { $col.Visible = $false }
     return $col
 }
@@ -205,7 +207,8 @@ function Set-ModernGridStyle {
     $Grid.ColumnHeadersDefaultCellStyle.ForeColor = $script:Theme.TextOnDark
     $Grid.ColumnHeadersDefaultCellStyle.Font = $script:Theme.FontUiBold
     $Grid.ColumnHeadersDefaultCellStyle.SelectionBackColor = $script:Theme.BgHeader
-    $Grid.ColumnHeadersHeight = 36
+    $Grid.ColumnHeadersDefaultCellStyle.WrapMode = 'False'
+    $Grid.ColumnHeadersHeight = 34
     $Grid.ColumnHeadersHeightSizeMode = 'DisableResizing'
     $Grid.DefaultCellStyle.BackColor = $script:Theme.BgPanel
     $Grid.DefaultCellStyle.ForeColor = $script:Theme.TextPrimary
@@ -213,15 +216,22 @@ function Set-ModernGridStyle {
     $Grid.DefaultCellStyle.SelectionBackColor = [System.Drawing.Color]::FromArgb(200, 230, 232)
     $Grid.DefaultCellStyle.SelectionForeColor = $script:Theme.TextPrimary
     $Grid.AlternatingRowsDefaultCellStyle.BackColor = $script:Theme.GridAlt
-    $Grid.RowTemplate.Height = 28
+    $Grid.RowTemplate.Height = 26
     $Grid.AllowUserToAddRows = $false
     $Grid.AllowUserToDeleteRows = $false
     $Grid.AllowUserToResizeRows = $false
     $Grid.ReadOnly = $true
     $Grid.SelectionMode = 'FullRowSelect'
     $Grid.MultiSelect = $true
-    $Grid.AutoSizeColumnsMode = 'None'
+    $Grid.AutoSizeColumnsMode = 'Fill'
     $Grid.RowHeadersVisible = $false
+    $Grid.ScrollBars = 'Both'
+    # Reduce black-flash / paint artifacts on resize
+    try {
+        $flags = [System.Reflection.BindingFlags]'Instance, NonPublic'
+        $prop = $Grid.GetType().GetProperty('DoubleBuffered', $flags)
+        if ($prop) { $prop.SetValue($Grid, $true, $null) }
+    } catch { }
 }
 
 # ---------------------------------------------------------------------------
@@ -703,15 +713,32 @@ $lblTagline.TextAlign = 'MiddleLeft'
 $lblTagline.BackColor = [System.Drawing.Color]::Transparent
 $hdrLayout.Controls.Add($lblTagline, 0, 1)
 
-# --- Status (bottom) ---
+# --- Main split: work area (grows) / activity log (draggable) ---
+$splitMain = New-Object System.Windows.Forms.SplitContainer
+$splitMain.Dock = 'Fill'
+$splitMain.Orientation = 'Horizontal'
+$splitMain.BackColor = $script:Theme.Border
+$splitMain.SplitterWidth = 6
+$splitMain.Panel1MinSize = 280
+$splitMain.Panel2MinSize = 70
+$splitMain.FixedPanel = 'None'
+
+# Work panel (top of split)
+$pnlWork = New-Object System.Windows.Forms.Panel
+$pnlWork.Dock = 'Fill'
+$pnlWork.BackColor = $script:Theme.BgApp
+$pnlWork.Padding = New-Object System.Windows.Forms.Padding(12, 10, 12, 6)
+$splitMain.Panel1.Controls.Add($pnlWork)
+
+# Activity panel (bottom of split) — user can drag splitter
 $pnlStatus = New-Object System.Windows.Forms.Panel
-$pnlStatus.Height = 110
-$pnlStatus.Dock = 'Bottom'
+$pnlStatus.Dock = 'Fill'
 $pnlStatus.BackColor = $script:Theme.BgStatus
-$pnlStatus.Padding = New-Object System.Windows.Forms.Padding(16, 8, 16, 10)
+$pnlStatus.Padding = New-Object System.Windows.Forms.Padding(14, 6, 14, 8)
+$splitMain.Panel2.Controls.Add($pnlStatus)
 
 $lblStatusTitle = New-Object System.Windows.Forms.Label
-$lblStatusTitle.Text = 'ACTIVITY'
+$lblStatusTitle.Text = 'ACTIVITY  (drag the bar above to resize)'
 $lblStatusTitle.Font = $script:Theme.FontSection
 $lblStatusTitle.ForeColor = [System.Drawing.Color]::FromArgb(140, 190, 196)
 $lblStatusTitle.Dock = 'Top'
@@ -732,36 +759,46 @@ $script:StatusBox.Dock = 'Fill'
 $pnlStatus.Controls.Add($script:StatusBox)
 $script:StatusBox.BringToFront()
 
-# --- Body ---
-$pnlBody = New-Object System.Windows.Forms.Panel
-$pnlBody.Dock = 'Fill'
-$pnlBody.BackColor = $script:Theme.BgApp
-$pnlBody.Padding = New-Object System.Windows.Forms.Padding(14)
-
-$form.Controls.Add($pnlBody)
+# Form control order: Fill first, then Top header
+$form.Controls.Add($splitMain)
 $form.Controls.Add($pnlHeader)
-$form.Controls.Add($pnlStatus)
 
-$bodyStack = New-Object System.Windows.Forms.TableLayoutPanel
-$bodyStack.Dock = 'Fill'
-$bodyStack.ColumnCount = 1
-$bodyStack.RowCount = 4
-$bodyStack.BackColor = $script:Theme.BgApp
-[void]$bodyStack.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-[void]$bodyStack.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 160))) # DCs
-[void]$bodyStack.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 110))) # Query
-[void]$bodyStack.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))  # Results
-[void]$bodyStack.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 48)))  # Actions
-$pnlBody.Controls.Add($bodyStack)
+# Work area uses Dock Top / Fill / Bottom so Results expands with the window
+# Add Fill control first, then Bottom, then Tops (WinForms dock order)
+$pnlResults = New-Object System.Windows.Forms.Panel
+$pnlResults.Dock = 'Fill'
+$pnlResults.BackColor = $script:Theme.BgPanel
+$pnlResults.Padding = New-Object System.Windows.Forms.Padding(10, 6, 10, 8)
+$pnlWork.Controls.Add($pnlResults)
+
+$pnlActions = New-Object System.Windows.Forms.Panel
+$pnlActions.Dock = 'Bottom'
+$pnlActions.Height = 46
+$pnlActions.BackColor = $script:Theme.BgApp
+$pnlWork.Controls.Add($pnlActions)
+
+$pnlQ = New-Object System.Windows.Forms.Panel
+$pnlQ.Dock = 'Top'
+$pnlQ.Height = 98
+$pnlQ.BackColor = $script:Theme.BgPanel
+$pnlQ.Padding = New-Object System.Windows.Forms.Padding(10, 6, 10, 6)
+$pnlQ.Margin = New-Object System.Windows.Forms.Padding(0)
+$pnlWork.Controls.Add($pnlQ)
+
+$gapQ = New-Object System.Windows.Forms.Panel
+$gapQ.Dock = 'Top'
+$gapQ.Height = 10
+$gapQ.BackColor = $script:Theme.BgApp
+$pnlWork.Controls.Add($gapQ)
+
+$pnlDc = New-Object System.Windows.Forms.Panel
+$pnlDc.Dock = 'Top'
+$pnlDc.Height = 138
+$pnlDc.BackColor = $script:Theme.BgPanel
+$pnlDc.Padding = New-Object System.Windows.Forms.Padding(10, 6, 10, 6)
+$pnlWork.Controls.Add($pnlDc)
 
 # ========== DOMAIN CONTROLLERS ==========
-$pnlDc = New-Object System.Windows.Forms.Panel
-$pnlDc.Dock = 'Fill'
-$pnlDc.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 10)
-$pnlDc.BackColor = $script:Theme.BgPanel
-$pnlDc.Padding = New-Object System.Windows.Forms.Padding(12, 8, 12, 8)
-$bodyStack.Controls.Add($pnlDc, 0, 0)
-
 $bar1 = New-Object System.Windows.Forms.Panel
 $bar1.Dock = 'Left'
 $bar1.Width = 4
@@ -774,7 +811,7 @@ $dcInner.ColumnCount = 1
 $dcInner.RowCount = 2
 $dcInner.BackColor = $script:Theme.BgPanel
 [void]$dcInner.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-[void]$dcInner.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 26)))
+[void]$dcInner.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 22)))
 [void]$dcInner.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
 $pnlDc.Controls.Add($dcInner)
 $dcInner.BringToFront()
@@ -847,13 +884,6 @@ $pnlDcBtns.Controls.Add($spacerBtn)
 $pnlDcBtns.Controls.Add($btnDiscover)     # top
 
 # ========== COMPARISON TARGET ==========
-$pnlQ = New-Object System.Windows.Forms.Panel
-$pnlQ.Dock = 'Fill'
-$pnlQ.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 10)
-$pnlQ.BackColor = $script:Theme.BgPanel
-$pnlQ.Padding = New-Object System.Windows.Forms.Padding(12, 8, 12, 8)
-$bodyStack.Controls.Add($pnlQ, 0, 1)
-
 $bar2 = New-Object System.Windows.Forms.Panel
 $bar2.Dock = 'Left'
 $bar2.Width = 4
@@ -866,7 +896,7 @@ $qInner.ColumnCount = 1
 $qInner.RowCount = 2
 $qInner.BackColor = $script:Theme.BgPanel
 [void]$qInner.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-[void]$qInner.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 24)))
+[void]$qInner.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 22)))
 [void]$qInner.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
 $pnlQ.Controls.Add($qInner)
 $qInner.BringToFront()
@@ -1017,13 +1047,6 @@ $pnlBaseHost.Add_Resize({
 })
 
 # ========== RESULTS ==========
-$pnlResults = New-Object System.Windows.Forms.Panel
-$pnlResults.Dock = 'Fill'
-$pnlResults.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 8)
-$pnlResults.BackColor = $script:Theme.BgPanel
-$pnlResults.Padding = New-Object System.Windows.Forms.Padding(12, 8, 12, 12)
-$bodyStack.Controls.Add($pnlResults, 0, 2)
-
 $resInner = New-Object System.Windows.Forms.TableLayoutPanel
 $resInner.Dock = 'Fill'
 $resInner.ColumnCount = 1
@@ -1063,22 +1086,18 @@ Set-ModernGridStyle -Grid $grid
 $resInner.Controls.Add($grid, 0, 1)
 
 Add-GridColumns -Grid $grid -Columns @(
-    (New-GridColumn -Header 'Object'     -Name 'Object'     -Width 180),
-    (New-GridColumn -Header 'Attribute'  -Name 'Attribute'  -Width 140),
-    (New-GridColumn -Header 'PDC'        -Name 'PDC'        -Width 230),
-    (New-GridColumn -Header 'Replica 1'  -Name 'Replica1'   -Width 230),
-    (New-GridColumn -Header 'Replica 2'  -Name 'Replica2'   -Width 230),
-    (New-GridColumn -Header 'Status'     -Name 'Status'     -Width 100),
-    (New-GridColumn -Header 'GUID'       -Name 'ObjectGUID' -Width 80 -Hidden),
-    (New-GridColumn -Header 'DN'         -Name 'DN'         -Width 80 -Hidden),
-    (New-GridColumn -Header 'Restorable' -Name 'Restorable' -Width 80 -Hidden)
+    (New-GridColumn -Header 'Object'     -Name 'Object'     -Width 160 -FillWeight 18),
+    (New-GridColumn -Header 'Attribute'  -Name 'Attribute'  -Width 120 -FillWeight 14),
+    (New-GridColumn -Header 'PDC'        -Name 'PDC'        -Width 200 -FillWeight 22),
+    (New-GridColumn -Header 'Replica 1'  -Name 'Replica1'   -Width 200 -FillWeight 22),
+    (New-GridColumn -Header 'Replica 2'  -Name 'Replica2'   -Width 200 -FillWeight 22),
+    (New-GridColumn -Header 'Status'     -Name 'Status'     -Width 90  -FillWeight 10),
+    (New-GridColumn -Header 'GUID'       -Name 'ObjectGUID' -Width 80  -FillWeight 1 -Hidden),
+    (New-GridColumn -Header 'DN'         -Name 'DN'         -Width 80  -FillWeight 1 -Hidden),
+    (New-GridColumn -Header 'Restorable' -Name 'Restorable' -Width 80  -FillWeight 1 -Hidden)
 )
 
 # ========== ACTIONS ==========
-$pnlActions = New-Object System.Windows.Forms.Panel
-$pnlActions.Dock = 'Fill'
-$pnlActions.BackColor = $script:Theme.BgApp
-$bodyStack.Controls.Add($pnlActions, 0, 3)
 
 $btnRestore = New-FlatButton -Text 'Restore Selected  →  PDC' -Location (New-Object System.Drawing.Point(0, 8)) `
     -Size (New-Object System.Drawing.Size(220, 32)) -BackColor $script:Theme.Accent -ForeColor ([System.Drawing.Color]::White)
@@ -1127,6 +1146,32 @@ $pnlActions.Controls.Add($lblLeg3)
 
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 300
+
+function Update-SplitLayout {
+    if ($form.IsDisposed -or $splitMain.IsDisposed) { return }
+    try {
+        # Keep ~18% for activity, rest for results/work — scales with window height
+        $h = $splitMain.ClientSize.Height
+        if ($h -lt 200) { return }
+        $activity = [Math]::Max(80, [Math]::Min(220, [int]($h * 0.18)))
+        $desired = $h - $activity - $splitMain.SplitterWidth
+        if ($desired -lt $splitMain.Panel1MinSize) { $desired = $splitMain.Panel1MinSize }
+        if ($desired -gt ($h - $splitMain.Panel2MinSize - $splitMain.SplitterWidth)) {
+            $desired = $h - $splitMain.Panel2MinSize - $splitMain.SplitterWidth
+        }
+        # Only auto-adjust when user hasn't dragged far from the ratio (or on first show)
+        if (-not $script:SplitUserAdjusted) {
+            $splitMain.SplitterDistance = $desired
+        }
+    } catch { }
+}
+
+$script:SplitUserAdjusted = $false
+$splitMain.Add_SplitterMoved({ $script:SplitUserAdjusted = $true })
+$form.Add_Resize({
+    # Re-apply proportional split only until the user drags the splitter once
+    if (-not $script:SplitUserAdjusted) { Update-SplitLayout }
+})
 
 $form.ResumeLayout($true)
 
