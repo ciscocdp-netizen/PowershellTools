@@ -3051,18 +3051,25 @@ function Invoke-DhcpScopeMigration {
     $modeLabel = if ($DryRun) { 'DRY RUN' } else { 'MIGRATE' }
     
     if (-not $DryRun) {
-        $confirm = Show-MessageBox (
-            "Migrate $($selected.Count) scope(s) from`n$($Global:DHCPServer)`nto`n$($Global:CompareServer)?`n`n" +
-            "Include: " + (@(
-                $(if ($opts.MigrateScope) { 'Scope' }),
-                $(if ($opts.MigrateOptions) { 'Options' }),
-                $(if ($opts.MigrateReservations) { 'Reservations' }),
-                $(if ($opts.MigrateExclusions) { 'Exclusions' }),
-                $(if ($opts.MigrateLeasesAsRes) { 'Leases→Reservations' })
-            ) | Where-Object { $_ }) -join ', ') +
-            "`nConflict mode: $($opts.ConflictMode)"
-        ) "Confirm Scope Migration" YesNo Warning
+        $includeParts = [System.Collections.Generic.List[string]]::new()
+        if ($opts.MigrateScope)        { [void]$includeParts.Add('Scope') }
+        if ($opts.MigrateOptions)      { [void]$includeParts.Add('Options') }
+        if ($opts.MigrateReservations) { [void]$includeParts.Add('Reservations') }
+        if ($opts.MigrateExclusions)   { [void]$includeParts.Add('Exclusions') }
+        if ($opts.MigrateLeasesAsRes)  { [void]$includeParts.Add('Leases→Reservations') }
         
+        $includeText = $includeParts -join ', '
+        $confirmMsg = @(
+            "Migrate $($selected.Count) scope(s) from"
+            $Global:DHCPServer
+            "to"
+            $Global:CompareServer
+            ""
+            "Include: $includeText"
+            "Conflict mode: $($opts.ConflictMode)"
+        ) -join "`n"
+        
+        $confirm = Show-MessageBox $confirmMsg "Confirm Scope Migration" YesNo Warning
         if ($confirm -ne 'Yes') { return }
     }
     
