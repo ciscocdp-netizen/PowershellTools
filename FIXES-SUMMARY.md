@@ -393,6 +393,12 @@ Install-WindowsFeature RSAT-AD-PowerShell
 
 ## Version History
 
+### Version 1.5 (Non-overlapping DC layout) - 2026-08-18
+- Domain Controllers row uses a 4-column TableLayout (3 fields + fixed button column)
+- Discover / Refresh Sync can no longer cover Replica 2
+- Comparison Target uses column layout for aligned labels/fields/buttons
+- Activity log supports horizontal scroll for long paths
+
 ### Version 1.4 (Startup + layout harden) - 2026-08-18
 - Removed `SetCompatibleTextRenderingDefault` (fails when DHCPManager/other WinForms already ran in same process)
 - Replaced `Segoe UI Semibold` with `Segoe UI` + Bold (missing font family on Server 2016)

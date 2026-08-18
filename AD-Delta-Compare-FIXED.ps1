@@ -24,7 +24,7 @@
     powershell -ExecutionPolicy Bypass -STA -File .\AD-Delta-Compare-FIXED.ps1
 
 .NOTES
-    Version: 1.4
+    Version: 1.5
     - Removed SetCompatibleTextRenderingDefault (throws when another WinForms
       window already exists in the process, e.g. DHCPManager still open)
     - Fonts use Segoe UI + Bold (Segoe UI Semibold is missing on Server 2016)
@@ -597,13 +597,12 @@ function Update-ReplicationLabels {
 }
 
 # ---------------------------------------------------------------------------
-# Main form — simple Dock layout (no TableLayout / no Font autoscaling)
-# AutoScaleMode=None keeps pixel positions stable on Server 2016.
+# Main form — TableLayout columns so buttons NEVER overlap DC fields
 # ---------------------------------------------------------------------------
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'Active Directory Recovery'
-$form.Size = New-Object System.Drawing.Size(1200, 820)
-$form.MinimumSize = New-Object System.Drawing.Size(1100, 720)
+$form.Size = New-Object System.Drawing.Size(1280, 860)
+$form.MinimumSize = New-Object System.Drawing.Size(1180, 760)
 $form.StartPosition = 'CenterScreen'
 $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
 $form.BackColor = $script:Theme.BgApp
@@ -611,247 +610,445 @@ $form.Font = $script:Theme.FontUi
 $form.ForeColor = $script:Theme.TextPrimary
 $form.SuspendLayout()
 
+function New-StackedField {
+    param(
+        [string]$Caption,
+        [System.Windows.Forms.Control]$InputControl,
+        [System.Windows.Forms.Label]$SyncLabel
+    )
+    $p = New-Object System.Windows.Forms.Panel
+    $p.Dock = 'Fill'
+    $p.Padding = New-Object System.Windows.Forms.Padding(8, 4, 8, 4)
+    $p.BackColor = $script:Theme.BgPanel
+
+    $cap = New-Object System.Windows.Forms.Label
+    $cap.Text = $Caption
+    $cap.Font = $script:Theme.FontUi
+    $cap.ForeColor = $script:Theme.TextMuted
+    $cap.Dock = 'Top'
+    $cap.Height = 20
+    $cap.BackColor = [System.Drawing.Color]::Transparent
+
+    $InputControl.Dock = 'Top'
+    $InputControl.Height = 24
+
+    $SyncLabel.Dock = 'Fill'
+    $SyncLabel.Font = $script:Theme.FontSync
+    $SyncLabel.ForeColor = $script:Theme.Accent
+    $SyncLabel.BackColor = [System.Drawing.Color]::Transparent
+    $SyncLabel.Padding = New-Object System.Windows.Forms.Padding(0, 6, 0, 0)
+
+    # Add in reverse dock order: Fill first, then Top controls (last Top is highest)
+    $p.Controls.Add($SyncLabel)
+    $p.Controls.Add($InputControl)
+    $p.Controls.Add($cap)
+    return $p
+}
+
 # --- Header ---
 $pnlHeader = New-Object System.Windows.Forms.Panel
-$pnlHeader.Height = 86
+$pnlHeader.Height = 80
 $pnlHeader.Dock = 'Top'
 $pnlHeader.BackColor = $script:Theme.BgHeader
+$pnlHeader.Padding = New-Object System.Windows.Forms.Padding(20, 12, 20, 10)
+
+$hdrLayout = New-Object System.Windows.Forms.TableLayoutPanel
+$hdrLayout.Dock = 'Fill'
+$hdrLayout.ColumnCount = 2
+$hdrLayout.RowCount = 2
+$hdrLayout.BackColor = $script:Theme.BgHeader
+[void]$hdrLayout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 70)))
+[void]$hdrLayout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 30)))
+[void]$hdrLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 30)))
+[void]$hdrLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 24)))
+$pnlHeader.Controls.Add($hdrLayout)
 
 $lblBrand = New-Object System.Windows.Forms.Label
 $lblBrand.Text = 'Active Directory Recovery'
 $lblBrand.Font = $script:Theme.FontTitle
 $lblBrand.ForeColor = $script:Theme.TextOnDark
-$lblBrand.Location = New-Object System.Drawing.Point(20, 14)
-$lblBrand.Size = New-Object System.Drawing.Size(620, 28)
+$lblBrand.Dock = 'Fill'
+$lblBrand.TextAlign = 'MiddleLeft'
 $lblBrand.BackColor = [System.Drawing.Color]::Transparent
-$pnlHeader.Controls.Add($lblBrand)
-
-$lblTagline = New-Object System.Windows.Forms.Label
-$lblTagline.Text = 'Compare delayed replicas and restore attributes to the PDC'
-$lblTagline.Font = $script:Theme.FontSub
-$lblTagline.ForeColor = [System.Drawing.Color]::FromArgb(160, 176, 190)
-$lblTagline.Location = New-Object System.Drawing.Point(22, 48)
-$lblTagline.Size = New-Object System.Drawing.Size(620, 22)
-$lblTagline.BackColor = [System.Drawing.Color]::Transparent
-$pnlHeader.Controls.Add($lblTagline)
+$hdrLayout.Controls.Add($lblBrand, 0, 0)
 
 $lblDom = New-Object System.Windows.Forms.Label
 $lblDom.Text = 'Domain not discovered'
 $lblDom.Font = $script:Theme.FontUi
 $lblDom.ForeColor = [System.Drawing.Color]::FromArgb(140, 190, 196)
+$lblDom.Dock = 'Fill'
 $lblDom.TextAlign = 'MiddleRight'
-$lblDom.Anchor = 'Top,Right'
-$lblDom.Size = New-Object System.Drawing.Size(400, 40)
-$lblDom.Location = New-Object System.Drawing.Point(760, 24)
 $lblDom.BackColor = [System.Drawing.Color]::Transparent
-$pnlHeader.Controls.Add($lblDom)
+$hdrLayout.Controls.Add($lblDom, 1, 0)
+$hdrLayout.SetRowSpan($lblDom, 2)
+
+$lblTagline = New-Object System.Windows.Forms.Label
+$lblTagline.Text = 'Compare delayed replicas and restore attributes to the PDC'
+$lblTagline.Font = $script:Theme.FontSub
+$lblTagline.ForeColor = [System.Drawing.Color]::FromArgb(160, 176, 190)
+$lblTagline.Dock = 'Fill'
+$lblTagline.TextAlign = 'MiddleLeft'
+$lblTagline.BackColor = [System.Drawing.Color]::Transparent
+$hdrLayout.Controls.Add($lblTagline, 0, 1)
 
 # --- Status (bottom) ---
 $pnlStatus = New-Object System.Windows.Forms.Panel
-$pnlStatus.Height = 100
+$pnlStatus.Height = 110
 $pnlStatus.Dock = 'Bottom'
 $pnlStatus.BackColor = $script:Theme.BgStatus
+$pnlStatus.Padding = New-Object System.Windows.Forms.Padding(16, 8, 16, 10)
 
 $lblStatusTitle = New-Object System.Windows.Forms.Label
 $lblStatusTitle.Text = 'ACTIVITY'
 $lblStatusTitle.Font = $script:Theme.FontSection
 $lblStatusTitle.ForeColor = [System.Drawing.Color]::FromArgb(140, 190, 196)
-$lblStatusTitle.Location = New-Object System.Drawing.Point(16, 6)
-$lblStatusTitle.Size = New-Object System.Drawing.Size(200, 18)
+$lblStatusTitle.Dock = 'Top'
+$lblStatusTitle.Height = 20
 $lblStatusTitle.BackColor = [System.Drawing.Color]::Transparent
 $pnlStatus.Controls.Add($lblStatusTitle)
 
 $script:StatusBox = New-Object System.Windows.Forms.TextBox
 $script:StatusBox.Multiline = $true
-$script:StatusBox.ScrollBars = 'Vertical'
+$script:StatusBox.ScrollBars = 'Both'
+$script:StatusBox.WordWrap = $false
 $script:StatusBox.ReadOnly = $true
 $script:StatusBox.BorderStyle = 'None'
 $script:StatusBox.BackColor = $script:Theme.BgStatus
 $script:StatusBox.ForeColor = [System.Drawing.Color]::FromArgb(200, 214, 224)
 $script:StatusBox.Font = $script:Theme.FontMono
-$script:StatusBox.Location = New-Object System.Drawing.Point(16, 28)
-$script:StatusBox.Size = New-Object System.Drawing.Size(1150, 62)
-$script:StatusBox.Anchor = 'Top,Bottom,Left,Right'
+$script:StatusBox.Dock = 'Fill'
 $pnlStatus.Controls.Add($script:StatusBox)
+$script:StatusBox.BringToFront()
 
 # --- Body ---
 $pnlBody = New-Object System.Windows.Forms.Panel
 $pnlBody.Dock = 'Fill'
 $pnlBody.BackColor = $script:Theme.BgApp
-$pnlBody.Padding = New-Object System.Windows.Forms.Padding(12)
+$pnlBody.Padding = New-Object System.Windows.Forms.Padding(14)
 
-# Dock order: Fill first, then Top, then Bottom (remaining space recalculates correctly)
 $form.Controls.Add($pnlBody)
 $form.Controls.Add($pnlHeader)
 $form.Controls.Add($pnlStatus)
 
-# --- DC card ---
+$bodyStack = New-Object System.Windows.Forms.TableLayoutPanel
+$bodyStack.Dock = 'Fill'
+$bodyStack.ColumnCount = 1
+$bodyStack.RowCount = 4
+$bodyStack.BackColor = $script:Theme.BgApp
+[void]$bodyStack.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+[void]$bodyStack.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 160))) # DCs
+[void]$bodyStack.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 110))) # Query
+[void]$bodyStack.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))  # Results
+[void]$bodyStack.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 48)))  # Actions
+$pnlBody.Controls.Add($bodyStack)
+
+# ========== DOMAIN CONTROLLERS ==========
 $pnlDc = New-Object System.Windows.Forms.Panel
-$pnlDc.Location = New-Object System.Drawing.Point(12, 12)
-$pnlDc.Size = New-Object System.Drawing.Size(1160, 148)
-$pnlDc.Anchor = 'Top,Left,Right'
+$pnlDc.Dock = 'Fill'
+$pnlDc.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 10)
 $pnlDc.BackColor = $script:Theme.BgPanel
-$pnlBody.Controls.Add($pnlDc)
+$pnlDc.Padding = New-Object System.Windows.Forms.Padding(12, 8, 12, 8)
+$bodyStack.Controls.Add($pnlDc, 0, 0)
 
 $bar1 = New-Object System.Windows.Forms.Panel
-$bar1.Location = New-Object System.Drawing.Point(0, 0)
-$bar1.Size = New-Object System.Drawing.Size(4, 148)
+$bar1.Dock = 'Left'
+$bar1.Width = 4
 $bar1.BackColor = $script:Theme.Accent
-$bar1.Anchor = 'Top,Bottom,Left'
 $pnlDc.Controls.Add($bar1)
 
-$lblDcSection = New-ThemedLabel -Text 'DOMAIN CONTROLLERS' -Location (New-Object System.Drawing.Point(16, 10)) -Section
-$pnlDc.Controls.Add($lblDcSection)
+$dcInner = New-Object System.Windows.Forms.TableLayoutPanel
+$dcInner.Dock = 'Fill'
+$dcInner.ColumnCount = 1
+$dcInner.RowCount = 2
+$dcInner.BackColor = $script:Theme.BgPanel
+[void]$dcInner.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+[void]$dcInner.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 26)))
+[void]$dcInner.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+$pnlDc.Controls.Add($dcInner)
+$dcInner.BringToFront()
 
-# Three equal columns for PDC / R1 / R2
-$yLbl = 38; $yBox = 56; $ySync = 88
-$wCol = 280; $gap = 24; $x0 = 16; $x1 = $x0 + $wCol + $gap; $x2 = $x1 + $wCol + $gap
+$lblDcSection = New-Object System.Windows.Forms.Label
+$lblDcSection.Text = 'DOMAIN CONTROLLERS'
+$lblDcSection.Font = $script:Theme.FontSection
+$lblDcSection.ForeColor = $script:Theme.TextPrimary
+$lblDcSection.Dock = 'Fill'
+$lblDcSection.TextAlign = 'MiddleLeft'
+$lblDcSection.BackColor = [System.Drawing.Color]::Transparent
+$dcInner.Controls.Add($lblDcSection, 0, 0)
 
-$lblPdc = New-ThemedLabel -Text 'PDC Emulator' -Location (New-Object System.Drawing.Point($x0, $yLbl)) -Muted
-$pnlDc.Controls.Add($lblPdc)
-$txtPdc = New-ThemedTextBox -Location (New-Object System.Drawing.Point($x0, $yBox)) -Size (New-Object System.Drawing.Size($wCol, 24)) -ReadOnly
-$pnlDc.Controls.Add($txtPdc)
+# 3 field columns + 1 button column (fixed) — buttons cannot cover fields
+$dcCols = New-Object System.Windows.Forms.TableLayoutPanel
+$dcCols.Dock = 'Fill'
+$dcCols.ColumnCount = 4
+$dcCols.RowCount = 1
+$dcCols.BackColor = $script:Theme.BgPanel
+[void]$dcCols.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 33.33)))
+[void]$dcCols.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 33.33)))
+[void]$dcCols.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 33.34)))
+[void]$dcCols.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 150)))
+[void]$dcCols.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+$dcInner.Controls.Add($dcCols, 0, 1)
+
+$txtPdc = New-ThemedTextBox -Location (New-Object System.Drawing.Point(0, 0)) -Size (New-Object System.Drawing.Size(100, 24)) -ReadOnly
 $lblPdcSync = New-Object System.Windows.Forms.Label
 $lblPdcSync.Text = 'Last sync: —'
-$lblPdcSync.Font = $script:Theme.FontSync
-$lblPdcSync.ForeColor = $script:Theme.Accent
-$lblPdcSync.Location = New-Object System.Drawing.Point($x0, $ySync)
-$lblPdcSync.Size = New-Object System.Drawing.Size($wCol, 48)
-$lblPdcSync.BackColor = [System.Drawing.Color]::Transparent
-$pnlDc.Controls.Add($lblPdcSync)
+$dcCols.Controls.Add((New-StackedField -Caption 'PDC Emulator' -InputControl $txtPdc -SyncLabel $lblPdcSync), 0, 0)
 
-$lblR1 = New-ThemedLabel -Text 'Delayed Replica 1' -Location (New-Object System.Drawing.Point($x1, $yLbl)) -Muted
-$pnlDc.Controls.Add($lblR1)
-$cmbR1 = New-ThemedCombo -Location (New-Object System.Drawing.Point($x1, $yBox)) -Size (New-Object System.Drawing.Size($wCol, 24))
-$pnlDc.Controls.Add($cmbR1)
+$cmbR1 = New-ThemedCombo -Location (New-Object System.Drawing.Point(0, 0)) -Size (New-Object System.Drawing.Size(100, 24))
 $lblR1Sync = New-Object System.Windows.Forms.Label
 $lblR1Sync.Text = 'Last sync: —'
-$lblR1Sync.Font = $script:Theme.FontSync
-$lblR1Sync.ForeColor = $script:Theme.Accent
-$lblR1Sync.Location = New-Object System.Drawing.Point($x1, $ySync)
-$lblR1Sync.Size = New-Object System.Drawing.Size($wCol, 48)
-$lblR1Sync.BackColor = [System.Drawing.Color]::Transparent
-$pnlDc.Controls.Add($lblR1Sync)
+$dcCols.Controls.Add((New-StackedField -Caption 'Delayed Replica 1' -InputControl $cmbR1 -SyncLabel $lblR1Sync), 1, 0)
 
-$lblR2 = New-ThemedLabel -Text 'Delayed Replica 2' -Location (New-Object System.Drawing.Point($x2, $yLbl)) -Muted
-$pnlDc.Controls.Add($lblR2)
-$cmbR2 = New-ThemedCombo -Location (New-Object System.Drawing.Point($x2, $yBox)) -Size (New-Object System.Drawing.Size($wCol, 24))
-$pnlDc.Controls.Add($cmbR2)
+$cmbR2 = New-ThemedCombo -Location (New-Object System.Drawing.Point(0, 0)) -Size (New-Object System.Drawing.Size(100, 24))
 $lblR2Sync = New-Object System.Windows.Forms.Label
 $lblR2Sync.Text = 'Last sync: —'
-$lblR2Sync.Font = $script:Theme.FontSync
-$lblR2Sync.ForeColor = $script:Theme.Accent
-$lblR2Sync.Location = New-Object System.Drawing.Point($x2, $ySync)
-$lblR2Sync.Size = New-Object System.Drawing.Size($wCol, 48)
-$lblR2Sync.BackColor = [System.Drawing.Color]::Transparent
-$pnlDc.Controls.Add($lblR2Sync)
+$dcCols.Controls.Add((New-StackedField -Caption 'Delayed Replica 2' -InputControl $cmbR2 -SyncLabel $lblR2Sync), 2, 0)
 
-$btnDiscover = New-FlatButton -Text 'Discover DCs' -Location (New-Object System.Drawing.Point(1000, 52)) `
+$pnlDcBtns = New-Object System.Windows.Forms.Panel
+$pnlDcBtns.Dock = 'Fill'
+$pnlDcBtns.Padding = New-Object System.Windows.Forms.Padding(8, 22, 4, 4)
+$pnlDcBtns.BackColor = $script:Theme.BgPanel
+$dcCols.Controls.Add($pnlDcBtns, 3, 0)
+
+$btnDiscover = New-FlatButton -Text 'Discover DCs' -Location (New-Object System.Drawing.Point(8, 22)) `
     -Size (New-Object System.Drawing.Size(130, 32)) -BackColor $script:Theme.Accent -ForeColor ([System.Drawing.Color]::White)
-$btnDiscover.Anchor = 'Top,Right'
-$pnlDc.Controls.Add($btnDiscover)
+$btnDiscover.Dock = 'Top'
+$btnDiscover.Height = 32
+$pnlDcBtns.Controls.Add($btnDiscover)
 
-$btnRefreshSync = New-FlatButton -Text 'Refresh Sync' -Location (New-Object System.Drawing.Point(1000, 92)) `
+$spacerBtn = New-Object System.Windows.Forms.Panel
+$spacerBtn.Dock = 'Top'
+$spacerBtn.Height = 8
+$spacerBtn.BackColor = $script:Theme.BgPanel
+$pnlDcBtns.Controls.Add($spacerBtn)
+
+$btnRefreshSync = New-FlatButton -Text 'Refresh Sync' -Location (New-Object System.Drawing.Point(8, 62)) `
     -Size (New-Object System.Drawing.Size(130, 28)) -Secondary
-$btnRefreshSync.Anchor = 'Top,Right'
-$pnlDc.Controls.Add($btnRefreshSync)
+$btnRefreshSync.Dock = 'Top'
+$btnRefreshSync.Height = 28
+$pnlDcBtns.Controls.Add($btnRefreshSync)
 
-# --- Query card ---
+# Dock Top order: last added appears at top — add Refresh, spacer, Discover so Discover is on top
+$pnlDcBtns.Controls.Clear()
+$pnlDcBtns.Controls.Add($btnRefreshSync)  # bottom
+$pnlDcBtns.Controls.Add($spacerBtn)
+$pnlDcBtns.Controls.Add($btnDiscover)     # top
+
+# ========== COMPARISON TARGET ==========
 $pnlQ = New-Object System.Windows.Forms.Panel
-$pnlQ.Location = New-Object System.Drawing.Point(12, 172)
-$pnlQ.Size = New-Object System.Drawing.Size(1160, 96)
-$pnlQ.Anchor = 'Top,Left,Right'
+$pnlQ.Dock = 'Fill'
+$pnlQ.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 10)
 $pnlQ.BackColor = $script:Theme.BgPanel
-$pnlBody.Controls.Add($pnlQ)
+$pnlQ.Padding = New-Object System.Windows.Forms.Padding(12, 8, 12, 8)
+$bodyStack.Controls.Add($pnlQ, 0, 1)
 
 $bar2 = New-Object System.Windows.Forms.Panel
-$bar2.Location = New-Object System.Drawing.Point(0, 0)
-$bar2.Size = New-Object System.Drawing.Size(4, 96)
+$bar2.Dock = 'Left'
+$bar2.Width = 4
 $bar2.BackColor = $script:Theme.Accent
-$bar2.Anchor = 'Top,Bottom,Left'
 $pnlQ.Controls.Add($bar2)
 
-$lblQSection = New-ThemedLabel -Text 'COMPARISON TARGET' -Location (New-Object System.Drawing.Point(16, 8)) -Section
-$pnlQ.Controls.Add($lblQSection)
+$qInner = New-Object System.Windows.Forms.TableLayoutPanel
+$qInner.Dock = 'Fill'
+$qInner.ColumnCount = 1
+$qInner.RowCount = 2
+$qInner.BackColor = $script:Theme.BgPanel
+[void]$qInner.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+[void]$qInner.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 24)))
+[void]$qInner.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+$pnlQ.Controls.Add($qInner)
+$qInner.BringToFront()
 
-$lblType = New-ThemedLabel -Text 'Target' -Location (New-Object System.Drawing.Point(16, 34)) -Muted
-$pnlQ.Controls.Add($lblType)
-$cmbType = New-ThemedCombo -Location (New-Object System.Drawing.Point(16, 52)) -Size (New-Object System.Drawing.Size(150, 24))
+$lblQSection = New-Object System.Windows.Forms.Label
+$lblQSection.Text = 'COMPARISON TARGET'
+$lblQSection.Font = $script:Theme.FontSection
+$lblQSection.ForeColor = $script:Theme.TextPrimary
+$lblQSection.Dock = 'Fill'
+$lblQSection.TextAlign = 'MiddleLeft'
+$lblQSection.BackColor = [System.Drawing.Color]::Transparent
+$qInner.Controls.Add($lblQSection, 0, 0)
+
+$qCols = New-Object System.Windows.Forms.TableLayoutPanel
+$qCols.Dock = 'Fill'
+$qCols.ColumnCount = 6
+$qCols.RowCount = 2
+$qCols.BackColor = $script:Theme.BgPanel
+[void]$qCols.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 160))) # Target
+[void]$qCols.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 25)))   # Filter/Zone/DN
+[void]$qCols.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 35)))   # SearchBase / Load Zones
+[void]$qCols.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 140))) # Diff checkbox
+[void]$qCols.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 120))) # Compare
+[void]$qCols.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 100))) # Cancel
+[void]$qCols.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 20)))
+[void]$qCols.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 30)))
+$qInner.Controls.Add($qCols, 0, 1)
+
+$lblType = New-Object System.Windows.Forms.Label
+$lblType.Text = 'Target'
+$lblType.Font = $script:Theme.FontUi
+$lblType.ForeColor = $script:Theme.TextMuted
+$lblType.Dock = 'Fill'
+$lblType.TextAlign = 'BottomLeft'
+$qCols.Controls.Add($lblType, 0, 0)
+
+$cmbType = New-ThemedCombo -Location (New-Object System.Drawing.Point(0, 0)) -Size (New-Object System.Drawing.Size(150, 24))
+$cmbType.Dock = 'Fill'
 [void]$cmbType.Items.AddRange([string[]]@('Users','Computers','Groups','DNS','GroupPolicy','Replication Metadata'))
 $cmbType.SelectedIndex = 0
-$pnlQ.Controls.Add($cmbType)
+$qCols.Controls.Add($cmbType, 0, 1)
 
-$lblFilter = New-ThemedLabel -Text 'Name filter' -Location (New-Object System.Drawing.Point(182, 34)) -Muted
-$pnlQ.Controls.Add($lblFilter)
-$txtFilter = New-ThemedTextBox -Location (New-Object System.Drawing.Point(182, 52)) -Size (New-Object System.Drawing.Size(160, 24))
-$pnlQ.Controls.Add($txtFilter)
+# Filter column hosts Name filter OR Zone OR DN depending on target
+$pnlFilterHost = New-Object System.Windows.Forms.Panel
+$pnlFilterHost.Dock = 'Fill'
+$pnlFilterHost.BackColor = $script:Theme.BgPanel
+$qCols.Controls.Add($pnlFilterHost, 1, 0)
+$qCols.SetRowSpan($pnlFilterHost, 2)
 
-$lblBase = New-ThemedLabel -Text 'SearchBase (optional)' -Location (New-Object System.Drawing.Point(358, 34)) -Muted
-$pnlQ.Controls.Add($lblBase)
-$txtBase = New-ThemedTextBox -Location (New-Object System.Drawing.Point(358, 52)) -Size (New-Object System.Drawing.Size(250, 24))
-$pnlQ.Controls.Add($txtBase)
+$lblFilter = New-Object System.Windows.Forms.Label
+$lblFilter.Text = 'Name filter'
+$lblFilter.Font = $script:Theme.FontUi
+$lblFilter.ForeColor = $script:Theme.TextMuted
+$lblFilter.Location = New-Object System.Drawing.Point(4, 0)
+$lblFilter.Size = New-Object System.Drawing.Size(200, 20)
+$pnlFilterHost.Controls.Add($lblFilter)
 
-$lblZone = New-ThemedLabel -Text 'DNS Zone' -Location (New-Object System.Drawing.Point(182, 34)) -Muted
-$pnlQ.Controls.Add($lblZone)
-$cmbZone = New-ThemedCombo -Location (New-Object System.Drawing.Point(182, 52)) -Size (New-Object System.Drawing.Size(190, 24))
-$pnlQ.Controls.Add($cmbZone)
-$btnZones = New-FlatButton -Text 'Load Zones' -Location (New-Object System.Drawing.Point(382, 48)) `
-    -Size (New-Object System.Drawing.Size(100, 30)) -Secondary
-$pnlQ.Controls.Add($btnZones)
+$txtFilter = New-ThemedTextBox -Location (New-Object System.Drawing.Point(4, 22)) -Size (New-Object System.Drawing.Size(200, 24))
+$txtFilter.Anchor = 'Top,Left,Right'
+$pnlFilterHost.Controls.Add($txtFilter)
 
-$lblDn = New-ThemedLabel -Text 'Object DN (metadata)' -Location (New-Object System.Drawing.Point(182, 34)) -Muted
-$pnlQ.Controls.Add($lblDn)
-$txtDn = New-ThemedTextBox -Location (New-Object System.Drawing.Point(182, 52)) -Size (New-Object System.Drawing.Size(300, 24))
-$pnlQ.Controls.Add($txtDn)
+$lblZone = New-Object System.Windows.Forms.Label
+$lblZone.Text = 'DNS Zone'
+$lblZone.Font = $script:Theme.FontUi
+$lblZone.ForeColor = $script:Theme.TextMuted
+$lblZone.Location = New-Object System.Drawing.Point(4, 0)
+$lblZone.Size = New-Object System.Drawing.Size(200, 20)
+$lblZone.Visible = $false
+$pnlFilterHost.Controls.Add($lblZone)
+
+$cmbZone = New-ThemedCombo -Location (New-Object System.Drawing.Point(4, 22)) -Size (New-Object System.Drawing.Size(200, 24))
+$cmbZone.Anchor = 'Top,Left,Right'
+$cmbZone.Visible = $false
+$pnlFilterHost.Controls.Add($cmbZone)
+
+$lblDn = New-Object System.Windows.Forms.Label
+$lblDn.Text = 'Object DN (metadata)'
+$lblDn.Font = $script:Theme.FontUi
+$lblDn.ForeColor = $script:Theme.TextMuted
+$lblDn.Location = New-Object System.Drawing.Point(4, 0)
+$lblDn.Size = New-Object System.Drawing.Size(200, 20)
+$lblDn.Visible = $false
+$pnlFilterHost.Controls.Add($lblDn)
+
+$txtDn = New-ThemedTextBox -Location (New-Object System.Drawing.Point(4, 22)) -Size (New-Object System.Drawing.Size(200, 24))
+$txtDn.Anchor = 'Top,Left,Right'
+$txtDn.Visible = $false
+$pnlFilterHost.Controls.Add($txtDn)
+
+# SearchBase / Load Zones host
+$pnlBaseHost = New-Object System.Windows.Forms.Panel
+$pnlBaseHost.Dock = 'Fill'
+$pnlBaseHost.BackColor = $script:Theme.BgPanel
+$qCols.Controls.Add($pnlBaseHost, 2, 0)
+$qCols.SetRowSpan($pnlBaseHost, 2)
+
+$lblBase = New-Object System.Windows.Forms.Label
+$lblBase.Text = 'SearchBase (optional)'
+$lblBase.Font = $script:Theme.FontUi
+$lblBase.ForeColor = $script:Theme.TextMuted
+$lblBase.Location = New-Object System.Drawing.Point(4, 0)
+$lblBase.Size = New-Object System.Drawing.Size(260, 20)
+$pnlBaseHost.Controls.Add($lblBase)
+
+$txtBase = New-ThemedTextBox -Location (New-Object System.Drawing.Point(4, 22)) -Size (New-Object System.Drawing.Size(260, 24))
+$txtBase.Anchor = 'Top,Left,Right'
+$pnlBaseHost.Controls.Add($txtBase)
+
+$btnZones = New-FlatButton -Text 'Load Zones' -Location (New-Object System.Drawing.Point(4, 20)) `
+    -Size (New-Object System.Drawing.Size(110, 28)) -Secondary
+$btnZones.Visible = $false
+$pnlBaseHost.Controls.Add($btnZones)
 
 $chkDiff = New-Object System.Windows.Forms.CheckBox
 $chkDiff.Text = 'Differences only'
-$chkDiff.Location = New-Object System.Drawing.Point(640, 54)
-$chkDiff.AutoSize = $true
+$chkDiff.Dock = 'Fill'
 $chkDiff.Checked = $true
 $chkDiff.Font = $script:Theme.FontUi
 $chkDiff.ForeColor = $script:Theme.TextPrimary
 $chkDiff.BackColor = [System.Drawing.Color]::Transparent
-$pnlQ.Controls.Add($chkDiff)
+$chkDiff.Padding = New-Object System.Windows.Forms.Padding(4, 18, 0, 0)
+$qCols.Controls.Add($chkDiff, 3, 0)
+$qCols.SetRowSpan($chkDiff, 2)
 
-$btnCancel = New-FlatButton -Text 'Cancel' -Location (New-Object System.Drawing.Point(1040, 48)) `
-    -Size (New-Object System.Drawing.Size(90, 32)) -Secondary
-$btnCancel.Enabled = $false
-$btnCancel.Anchor = 'Top,Right'
-$pnlQ.Controls.Add($btnCancel)
-
-$btnCompare = New-FlatButton -Text 'Compare' -Location (New-Object System.Drawing.Point(920, 48)) `
+$btnCompare = New-FlatButton -Text 'Compare' -Location (New-Object System.Drawing.Point(0, 0)) `
     -Size (New-Object System.Drawing.Size(110, 32)) -BackColor $script:Theme.Accent -ForeColor ([System.Drawing.Color]::White)
 $btnCompare.Enabled = $false
-$btnCompare.Anchor = 'Top,Right'
-$pnlQ.Controls.Add($btnCompare)
+$btnCompare.Dock = 'Bottom'
+$btnCompare.Height = 32
+$qCols.Controls.Add($btnCompare, 4, 1)
 
-# --- Results card ---
+$btnCancel = New-FlatButton -Text 'Cancel' -Location (New-Object System.Drawing.Point(0, 0)) `
+    -Size (New-Object System.Drawing.Size(90, 32)) -Secondary
+$btnCancel.Enabled = $false
+$btnCancel.Dock = 'Bottom'
+$btnCancel.Height = 32
+$qCols.Controls.Add($btnCancel, 5, 1)
+
+$pnlFilterHost.Add_Resize({
+    $rw = [Math]::Max(80, $pnlFilterHost.ClientSize.Width - 8)
+    $txtFilter.Width = $rw
+    $cmbZone.Width = $rw
+    $txtDn.Width = $rw
+})
+$pnlBaseHost.Add_Resize({
+    $rw = [Math]::Max(80, $pnlBaseHost.ClientSize.Width - 8)
+    $txtBase.Width = $rw
+})
+
+# ========== RESULTS ==========
 $pnlResults = New-Object System.Windows.Forms.Panel
-$pnlResults.Location = New-Object System.Drawing.Point(12, 280)
-$pnlResults.Size = New-Object System.Drawing.Size(1160, 300)
-$pnlResults.Anchor = 'Top,Bottom,Left,Right'
+$pnlResults.Dock = 'Fill'
+$pnlResults.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 8)
 $pnlResults.BackColor = $script:Theme.BgPanel
-$pnlBody.Controls.Add($pnlResults)
+$pnlResults.Padding = New-Object System.Windows.Forms.Padding(12, 8, 12, 12)
+$bodyStack.Controls.Add($pnlResults, 0, 2)
 
-$lblResults = New-ThemedLabel -Text 'RESULTS' -Location (New-Object System.Drawing.Point(16, 10)) -Section
-$pnlResults.Controls.Add($lblResults)
+$resInner = New-Object System.Windows.Forms.TableLayoutPanel
+$resInner.Dock = 'Fill'
+$resInner.ColumnCount = 1
+$resInner.RowCount = 2
+$resInner.BackColor = $script:Theme.BgPanel
+[void]$resInner.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+[void]$resInner.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 26)))
+[void]$resInner.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+$pnlResults.Controls.Add($resInner)
+
+$hdrResults = New-Object System.Windows.Forms.FlowLayoutPanel
+$hdrResults.Dock = 'Fill'
+$hdrResults.FlowDirection = 'LeftToRight'
+$hdrResults.WrapContents = $false
+$hdrResults.BackColor = $script:Theme.BgPanel
+$resInner.Controls.Add($hdrResults, 0, 0)
+
+$lblResults = New-Object System.Windows.Forms.Label
+$lblResults.Text = 'RESULTS'
+$lblResults.Font = $script:Theme.FontSection
+$lblResults.ForeColor = $script:Theme.TextPrimary
+$lblResults.AutoSize = $true
+$lblResults.Margin = New-Object System.Windows.Forms.Padding(0, 4, 12, 0)
+$hdrResults.Controls.Add($lblResults)
 
 $lblCount = New-Object System.Windows.Forms.Label
 $lblCount.Text = '0 rows'
 $lblCount.Font = $script:Theme.FontUi
 $lblCount.ForeColor = $script:Theme.TextMuted
-$lblCount.Location = New-Object System.Drawing.Point(100, 12)
 $lblCount.AutoSize = $true
-$lblCount.BackColor = [System.Drawing.Color]::Transparent
-$pnlResults.Controls.Add($lblCount)
+$lblCount.Margin = New-Object System.Windows.Forms.Padding(0, 5, 0, 0)
+$hdrResults.Controls.Add($lblCount)
 
 $grid = New-Object System.Windows.Forms.DataGridView
-$grid.Location = New-Object System.Drawing.Point(12, 36)
-$grid.Size = New-Object System.Drawing.Size(1136, 252)
-$grid.Anchor = 'Top,Bottom,Left,Right'
+$grid.Dock = 'Fill'
 Set-ModernGridStyle -Grid $grid
-$pnlResults.Controls.Add($grid)
+$resInner.Controls.Add($grid, 0, 1)
 
 Add-GridColumns -Grid $grid -Columns @(
     (New-GridColumn -Header 'Object'     -Name 'Object'     -Width 180),
@@ -865,20 +1062,18 @@ Add-GridColumns -Grid $grid -Columns @(
     (New-GridColumn -Header 'Restorable' -Name 'Restorable' -Width 80 -Hidden)
 )
 
-# --- Action bar ---
+# ========== ACTIONS ==========
 $pnlActions = New-Object System.Windows.Forms.Panel
-$pnlActions.Location = New-Object System.Drawing.Point(12, 590)
-$pnlActions.Size = New-Object System.Drawing.Size(1160, 44)
-$pnlActions.Anchor = 'Bottom,Left,Right'
+$pnlActions.Dock = 'Fill'
 $pnlActions.BackColor = $script:Theme.BgApp
-$pnlBody.Controls.Add($pnlActions)
+$bodyStack.Controls.Add($pnlActions, 0, 3)
 
-$btnRestore = New-FlatButton -Text 'Restore Selected  →  PDC' -Location (New-Object System.Drawing.Point(0, 6)) `
+$btnRestore = New-FlatButton -Text 'Restore Selected  →  PDC' -Location (New-Object System.Drawing.Point(0, 8)) `
     -Size (New-Object System.Drawing.Size(220, 32)) -BackColor $script:Theme.Accent -ForeColor ([System.Drawing.Color]::White)
 $btnRestore.Enabled = $false
 $pnlActions.Controls.Add($btnRestore)
 
-$btnExport = New-FlatButton -Text 'Export CSV' -Location (New-Object System.Drawing.Point(232, 6)) `
+$btnExport = New-FlatButton -Text 'Export CSV' -Location (New-Object System.Drawing.Point(232, 8)) `
     -Size (New-Object System.Drawing.Size(110, 32)) -Secondary
 $pnlActions.Controls.Add($btnExport)
 
@@ -921,35 +1116,6 @@ $pnlActions.Controls.Add($lblLeg3)
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 300
 
-# Keep cards sized to the body on resize
-function Update-UiLayout {
-    if ($form.IsDisposed -or $pnlBody.IsDisposed) { return }
-    $pad = 12
-    $w = $pnlBody.ClientSize.Width - ($pad * 2)
-    if ($w -lt 900) { $w = 900 }
-    $pnlDc.Width = $w
-    $pnlQ.Width = $w
-    $pnlResults.Width = $w
-    $pnlActions.Width = $w
-    $btnDiscover.Left = $w - 146
-    $btnRefreshSync.Left = $w - 146
-    $btnCancel.Left = $w - 106
-    $btnCompare.Left = $btnCancel.Left - 120
-    if ($chkDiff.Left + 140 -gt $btnCompare.Left) {
-        $chkDiff.Left = [Math]::Max(620, $btnCompare.Left - 150)
-    }
-    $avail = $pnlBody.ClientSize.Height - $pnlDc.Height - $pnlQ.Height - $pnlActions.Height - 48
-    if ($avail -lt 140) { $avail = 140 }
-    $pnlResults.Height = $avail
-    $pnlResults.Top = $pnlQ.Bottom + 12
-    $pnlActions.Top = $pnlResults.Bottom + 8
-    $grid.Width = $pnlResults.Width - 24
-    $grid.Height = $pnlResults.Height - 48
-    $lblDom.Left = [Math]::Max(500, $pnlHeader.ClientSize.Width - $lblDom.Width - 16)
-}
-$form.Add_Resize({ Update-UiLayout })
-$pnlBody.Add_Resize({ Update-UiLayout })
-
 $form.ResumeLayout($true)
 
 # ---------------------------------------------------------------------------
@@ -958,10 +1124,14 @@ $form.ResumeLayout($true)
 function Update-ContextControls {
     $t = $cmbType.SelectedItem
     $isObj = $t -in @('Users','Computers','Groups')
+    $isDns = ($t -eq 'DNS')
+    $isMeta = ($t -eq 'Replication Metadata')
+
     $lblFilter.Visible = $isObj; $txtFilter.Visible = $isObj
     $lblBase.Visible = $isObj;   $txtBase.Visible = $isObj
-    $lblZone.Visible = ($t -eq 'DNS'); $cmbZone.Visible = ($t -eq 'DNS'); $btnZones.Visible = ($t -eq 'DNS')
-    $lblDn.Visible = ($t -eq 'Replication Metadata'); $txtDn.Visible = ($t -eq 'Replication Metadata')
+    $lblZone.Visible = $isDns;   $cmbZone.Visible = $isDns; $btnZones.Visible = $isDns
+    $lblDn.Visible = $isMeta;    $txtDn.Visible = $isMeta
+
     $btnRestore.Enabled = $false
     $btnRestore.Text = 'Restore Selected  →  PDC'
 }
@@ -1486,10 +1656,8 @@ $btnExport.Add_Click({
 # ---------------------------------------------------------------------------
 $form.Add_Shown({
     Update-ContextControls
-    Update-UiLayout
     Write-Status 'Ready. Click Discover DCs to begin.'
     Write-Status ("Audit log: {0}" -f $script:AuditLog)
-    Write-Status 'Tip: Close DHCPManager (or use a fresh powershell.exe) before running this tool.'
 })
 
 $form.Add_FormClosing({
