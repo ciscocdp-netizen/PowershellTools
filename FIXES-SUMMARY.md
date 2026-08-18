@@ -393,6 +393,14 @@ Install-WindowsFeature RSAT-AD-PowerShell
 
 ## Version History
 
+### Version 1.3 (Layout + replication times) - 2026-08-18
+- Renamed UI to **Active Directory Recovery**
+- Rebuilt layout with TableLayoutPanel (fixes clipped header/overlapping panels)
+- Buttons pin to the right edge on resize
+- Shows last successful inbound replication time under each DC
+- Refresh Sync button to re-query partner metadata
+- UI mockup: `docs/ad-recovery-ui-mockup.png`
+
 ### Version 1.2 (UI + AddRange fix) - 2026-08-18
 - Fixed DataGridView.Columns.AddRange Object[] cast crash on PowerShell 5.1 / Server 2016
 - Modern flat UI: slate header, teal accent, card panels, styled grid, dark activity log
