@@ -24,13 +24,10 @@
     powershell -ExecutionPolicy Bypass -STA -File .\AD-Delta-Compare-FIXED.ps1
 
 .NOTES
-    Version: 1.6
-    - Removed SetCompatibleTextRenderingDefault (throws when another WinForms
-      window already exists in the process, e.g. DHCPManager still open)
-    - Fonts use Segoe UI + Bold (Segoe UI Semibold is missing on Server 2016)
-    - Simplified Dock layout with AutoScaleMode=None for stable placement
-    - Renamed to Active Directory Recovery; last-sync labels per DC
-    - Fixed DataGridView.Columns.AddRange Object[] cast (PS 5.1)
+    Version: 1.7
+    - Dynamic resize: SplitContainer + Dock Fill results; columns AutoSize Fill
+    - Activity log is draggable; results grow when the window is maximized
+    - Fixed LDAP NUL escape; sAMAccountName / UPN filter
 #>
 
 # ---------------------------------------------------------------------------
@@ -1104,42 +1101,47 @@ $btnRestore = New-FlatButton -Text 'Restore Selected  →  PDC' -Location (New-O
 $btnRestore.Enabled = $false
 $pnlActions.Controls.Add($btnRestore)
 
-$btnExport = New-FlatButton -Text 'Export CSV' -Location (New-Object System.Drawing.Point(232, 8)) `
+$btnDetails = New-FlatButton -Text 'View Details' -Location (New-Object System.Drawing.Point(232, 8)) `
+    -Size (New-Object System.Drawing.Size(120, 32)) -Secondary
+$btnDetails.Enabled = $false
+$pnlActions.Controls.Add($btnDetails)
+
+$btnExport = New-FlatButton -Text 'Export CSV' -Location (New-Object System.Drawing.Point(364, 8)) `
     -Size (New-Object System.Drawing.Size(110, 32)) -Secondary
 $pnlActions.Controls.Add($btnExport)
 
 $swDiff = New-Object System.Windows.Forms.Panel
-$swDiff.Location = New-Object System.Drawing.Point(370, 16)
+$swDiff.Location = New-Object System.Drawing.Point(500, 16)
 $swDiff.Size = New-Object System.Drawing.Size(12, 12)
 $swDiff.BackColor = $script:Theme.DiffBg
 $pnlActions.Controls.Add($swDiff)
 $lblLeg1 = New-Object System.Windows.Forms.Label
 $lblLeg1.Text = 'Different'
-$lblLeg1.Location = New-Object System.Drawing.Point(386, 13)
+$lblLeg1.Location = New-Object System.Drawing.Point(516, 13)
 $lblLeg1.AutoSize = $true
 $lblLeg1.ForeColor = $script:Theme.TextMuted
 $pnlActions.Controls.Add($lblLeg1)
 
 $swMiss = New-Object System.Windows.Forms.Panel
-$swMiss.Location = New-Object System.Drawing.Point(460, 16)
+$swMiss.Location = New-Object System.Drawing.Point(590, 16)
 $swMiss.Size = New-Object System.Drawing.Size(12, 12)
 $swMiss.BackColor = $script:Theme.MissingBg
 $pnlActions.Controls.Add($swMiss)
 $lblLeg2 = New-Object System.Windows.Forms.Label
 $lblLeg2.Text = 'Missing object'
-$lblLeg2.Location = New-Object System.Drawing.Point(476, 13)
+$lblLeg2.Location = New-Object System.Drawing.Point(606, 13)
 $lblLeg2.AutoSize = $true
 $lblLeg2.ForeColor = $script:Theme.TextMuted
 $pnlActions.Controls.Add($lblLeg2)
 
 $swMatch = New-Object System.Windows.Forms.Panel
-$swMatch.Location = New-Object System.Drawing.Point(590, 16)
+$swMatch.Location = New-Object System.Drawing.Point(720, 16)
 $swMatch.Size = New-Object System.Drawing.Size(12, 12)
 $swMatch.BackColor = $script:Theme.MatchBg
 $pnlActions.Controls.Add($swMatch)
 $lblLeg3 = New-Object System.Windows.Forms.Label
 $lblLeg3.Text = 'Match'
-$lblLeg3.Location = New-Object System.Drawing.Point(606, 13)
+$lblLeg3.Location = New-Object System.Drawing.Point(736, 13)
 $lblLeg3.AutoSize = $true
 $lblLeg3.ForeColor = $script:Theme.TextMuted
 $pnlActions.Controls.Add($lblLeg3)
@@ -1399,6 +1401,8 @@ $btnCancel.Add_Click({
 $grid.Add_SelectionChanged({
     $btnRestore.Enabled = $false
     $btnRestore.Text = 'Restore Selected  →  PDC'
+    $btnDetails.Enabled = ($grid.SelectedRows.Count -eq 1)
+
     $t = $cmbType.SelectedItem
     if ($t -notin @('Users','Computers','Groups')) { return }
     if ($grid.SelectedRows.Count -lt 1) { return }
@@ -1415,6 +1419,303 @@ $grid.Add_SelectionChanged({
     } else {
         $btnRestore.Text = ("Restore {0} Selected  →  PDC" -f $restCount)
     }
+})
+
+# ---------------------------------------------------------------------------
+# Difference detail dialog (double-click or View Details)
+# ---------------------------------------------------------------------------
+function Get-ValueTokens {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return @() }
+    if ($Value -in @('<object missing>','<missing>')) { return @($Value) }
+    # Multi-valued AD attrs are joined with '; ' in Convert-AdValueToString
+    $parts = @($Value -split ';\s*' | Where-Object { $_ -ne '' } | ForEach-Object { $_.Trim() })
+    if ($parts.Count -le 1) { return @($Value) }
+    return ($parts | Sort-Object -Unique)
+}
+
+function Get-DiffSummaryText {
+    param([string]$PdcVal, [string]$R1Val, [string]$R2Val, [string]$R1Name, [string]$R2Name, [string]$Status)
+
+    $lines = New-Object System.Collections.ArrayList
+    [void]$lines.Add("Status: $Status")
+    [void]$lines.Add('')
+
+    $samePR1 = ($PdcVal -eq $R1Val)
+    $samePR2 = ($PdcVal -eq $R2Val)
+    $sameR12 = ($R1Val -eq $R2Val)
+
+    if ($Status -eq 'Match') {
+        [void]$lines.Add('All three domain controllers report the same value for this attribute.')
+    }
+    elseif ($Status -eq 'ObjectMissing') {
+        [void]$lines.Add('The object is missing on at least one domain controller (see values marked <object missing>).')
+    }
+    else {
+        if (-not $samePR1) { [void]$lines.Add("PDC differs from Replica 1 ($R1Name).") }
+        else { [void]$lines.Add("PDC matches Replica 1 ($R1Name).") }
+        if (-not $samePR2) { [void]$lines.Add("PDC differs from Replica 2 ($R2Name).") }
+        else { [void]$lines.Add("PDC matches Replica 2 ($R2Name).") }
+        if ($sameR12) { [void]$lines.Add("Replica 1 and Replica 2 match each other (both differ from PDC, or all three match).") }
+        else { [void]$lines.Add("Replica 1 and Replica 2 also differ from each other.") }
+    }
+
+    $pTokens = @(Get-ValueTokens $PdcVal)
+    $r1Tokens = @(Get-ValueTokens $R1Val)
+    $r2Tokens = @(Get-ValueTokens $R2Val)
+    $isMulti = ($pTokens.Count -gt 1) -or ($r1Tokens.Count -gt 1) -or ($r2Tokens.Count -gt 1)
+
+    if ($isMulti -and $Status -eq 'Different') {
+        [void]$lines.Add('')
+        [void]$lines.Add('--- Multi-value breakdown ---')
+
+        $onlyPdcVsR1 = @($pTokens | Where-Object { $_ -notin $r1Tokens })
+        $onlyR1VsPdc = @($r1Tokens | Where-Object { $_ -notin $pTokens })
+        $onlyPdcVsR2 = @($pTokens | Where-Object { $_ -notin $r2Tokens })
+        $onlyR2VsPdc = @($r2Tokens | Where-Object { $_ -notin $pTokens })
+
+        if ($onlyPdcVsR1.Count -gt 0) {
+            [void]$lines.Add(("On PDC but not Replica 1 ({0}):" -f $onlyPdcVsR1.Count))
+            foreach ($x in ($onlyPdcVsR1 | Select-Object -First 40)) { [void]$lines.Add("  + $x") }
+            if ($onlyPdcVsR1.Count -gt 40) { [void]$lines.Add(("  ... and {0} more" -f ($onlyPdcVsR1.Count - 40))) }
+        }
+        if ($onlyR1VsPdc.Count -gt 0) {
+            [void]$lines.Add(("On Replica 1 but not PDC ({0}):" -f $onlyR1VsPdc.Count))
+            foreach ($x in ($onlyR1VsPdc | Select-Object -First 40)) { [void]$lines.Add("  + $x") }
+            if ($onlyR1VsPdc.Count -gt 40) { [void]$lines.Add(("  ... and {0} more" -f ($onlyR1VsPdc.Count - 40))) }
+        }
+        if ($onlyPdcVsR2.Count -gt 0) {
+            [void]$lines.Add(("On PDC but not Replica 2 ({0}):" -f $onlyPdcVsR2.Count))
+            foreach ($x in ($onlyPdcVsR2 | Select-Object -First 40)) { [void]$lines.Add("  + $x") }
+            if ($onlyPdcVsR2.Count -gt 40) { [void]$lines.Add(("  ... and {0} more" -f ($onlyPdcVsR2.Count - 40))) }
+        }
+        if ($onlyR2VsPdc.Count -gt 0) {
+            [void]$lines.Add(("On Replica 2 but not PDC ({0}):" -f $onlyR2VsPdc.Count))
+            foreach ($x in ($onlyR2VsPdc | Select-Object -First 40)) { [void]$lines.Add("  + $x") }
+            if ($onlyR2VsPdc.Count -gt 40) { [void]$lines.Add(("  ... and {0} more" -f ($onlyR2VsPdc.Count - 40))) }
+        }
+        if ($onlyPdcVsR1.Count -eq 0 -and $onlyR1VsPdc.Count -eq 0 -and $onlyPdcVsR2.Count -eq 0 -and $onlyR2VsPdc.Count -eq 0) {
+            [void]$lines.Add('(Values differ as whole strings but token sets look identical — check whitespace/order.)')
+        }
+    }
+
+    return ($lines -join "`r`n")
+}
+
+function Show-DifferenceDetail {
+    param(
+        [string]$ObjectName,
+        [string]$Attribute,
+        [string]$Guid,
+        [string]$Dn,
+        [string]$Status,
+        [string]$PdcName,
+        [string]$PdcVal,
+        [string]$R1Name,
+        [string]$R1Val,
+        [string]$R2Name,
+        [string]$R2Val,
+        [string]$TargetType
+    )
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Difference Details'
+    $dlg.Size = New-Object System.Drawing.Size(980, 640)
+    $dlg.MinimumSize = New-Object System.Drawing.Size(800, 520)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.BackColor = $script:Theme.BgApp
+    $dlg.Font = $script:Theme.FontUi
+    $dlg.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
+
+    $hdr = New-Object System.Windows.Forms.Panel
+    $hdr.Dock = 'Top'
+    $hdr.Height = 72
+    $hdr.BackColor = $script:Theme.BgHeader
+    $dlg.Controls.Add($hdr)
+
+    $ht = New-Object System.Windows.Forms.Label
+    $ht.Text = 'Attribute difference details'
+    $ht.Font = $script:Theme.FontTitle
+    $ht.ForeColor = $script:Theme.TextOnDark
+    $ht.Location = New-Object System.Drawing.Point(18, 12)
+    $ht.AutoSize = $true
+    $ht.BackColor = [System.Drawing.Color]::Transparent
+    $hdr.Controls.Add($ht)
+
+    $hs = New-Object System.Windows.Forms.Label
+    $hs.Text = ("{0}  ·  {1}  ·  {2}" -f $ObjectName, $Attribute, $Status)
+    $hs.Font = $script:Theme.FontSub
+    $hs.ForeColor = [System.Drawing.Color]::FromArgb(160, 176, 190)
+    $hs.Location = New-Object System.Drawing.Point(20, 44)
+    $hs.AutoSize = $true
+    $hs.BackColor = [System.Drawing.Color]::Transparent
+    $hdr.Controls.Add($hs)
+
+    $footer = New-Object System.Windows.Forms.Panel
+    $footer.Dock = 'Bottom'
+    $footer.Height = 48
+    $footer.BackColor = $script:Theme.BgApp
+    $dlg.Controls.Add($footer)
+
+    $btnClose = New-FlatButton -Text 'Close' -Location (New-Object System.Drawing.Point(850, 8)) `
+        -Size (New-Object System.Drawing.Size(100, 32)) -Secondary
+    $btnClose.Anchor = 'Top,Right'
+    $btnClose.DialogResult = 'OK'
+    $footer.Controls.Add($btnClose)
+    $dlg.AcceptButton = $btnClose
+    $dlg.CancelButton = $btnClose
+    $footer.Add_Resize({ $btnClose.Left = $footer.ClientSize.Width - $btnClose.Width - 16 })
+
+    $body = New-Object System.Windows.Forms.Panel
+    $body.Dock = 'Fill'
+    $body.Padding = New-Object System.Windows.Forms.Padding(14)
+    $body.BackColor = $script:Theme.BgApp
+    $dlg.Controls.Add($body)
+    $body.BringToFront()
+
+    $meta = New-Object System.Windows.Forms.Label
+    $meta.Dock = 'Top'
+    $meta.Height = 56
+    $meta.Font = $script:Theme.FontUi
+    $meta.ForeColor = $script:Theme.TextPrimary
+    $metaText = "Target type: $TargetType`r`nDN: $Dn"
+    if ($Guid) { $metaText += "`r`nObjectGUID: $Guid" }
+    $meta.Text = $metaText
+    $body.Controls.Add($meta)
+
+    $split = New-Object System.Windows.Forms.SplitContainer
+    $split.Dock = 'Fill'
+    $split.Orientation = 'Horizontal'
+    $split.SplitterWidth = 6
+    $split.Panel1MinSize = 160
+    $split.Panel2MinSize = 100
+    $body.Controls.Add($split)
+    $split.BringToFront()
+
+    # Three value columns
+    $vals = New-Object System.Windows.Forms.TableLayoutPanel
+    $vals.Dock = 'Fill'
+    $vals.ColumnCount = 3
+    $vals.RowCount = 2
+    $vals.BackColor = $script:Theme.BgApp
+    [void]$vals.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 33.33)))
+    [void]$vals.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 33.33)))
+    [void]$vals.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 33.34)))
+    [void]$vals.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 28)))
+    [void]$vals.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    $split.Panel1.Controls.Add($vals)
+
+    function New-DetailValuePane {
+        param([string]$Title, [string]$Value, [System.Drawing.Color]$AccentBg)
+        $lbl = New-Object System.Windows.Forms.Label
+        $lbl.Text = $Title
+        $lbl.Dock = 'Fill'
+        $lbl.TextAlign = 'MiddleLeft'
+        $lbl.Font = $script:Theme.FontSection
+        $lbl.ForeColor = $script:Theme.TextPrimary
+        $lbl.Padding = New-Object System.Windows.Forms.Padding(4, 0, 0, 0)
+
+        $tb = New-Object System.Windows.Forms.TextBox
+        $tb.Multiline = $true
+        $tb.ScrollBars = 'Both'
+        $tb.WordWrap = $true
+        $tb.ReadOnly = $true
+        $tb.Dock = 'Fill'
+        $tb.Font = $script:Theme.FontMono
+        $tb.BorderStyle = 'FixedSingle'
+        $tb.BackColor = $AccentBg
+        $tb.ForeColor = $script:Theme.TextPrimary
+        $display = if ([string]::IsNullOrEmpty($Value)) { '(empty)' } else { $Value }
+        # Show multi-values one per line for readability
+        $tokens = @(Get-ValueTokens $Value)
+        if ($tokens.Count -gt 1) {
+            $tb.Text = ($tokens -join "`r`n")
+        } else {
+            $tb.Text = $display
+        }
+        return @{ Label = $lbl; Box = $tb }
+    }
+
+    $bgP = $script:Theme.BgPanel
+    $bgR1 = $script:Theme.BgPanel
+    $bgR2 = $script:Theme.BgPanel
+    if ($Status -eq 'Different') {
+        if ($PdcVal -ne $R1Val -or $PdcVal -ne $R2Val) { $bgP = $script:Theme.DiffBg }
+        if ($R1Val -ne $PdcVal) { $bgR1 = $script:Theme.MissingBg }
+        if ($R2Val -ne $PdcVal) { $bgR2 = $script:Theme.MissingBg }
+        if ($R1Val -eq $R2Val -and $R1Val -ne $PdcVal) {
+            $bgR1 = $script:Theme.MatchBg
+            $bgR2 = $script:Theme.MatchBg
+        }
+    }
+    elseif ($Status -eq 'ObjectMissing') {
+        $bgP = $script:Theme.MissingBg
+        $bgR1 = $script:Theme.MissingBg
+        $bgR2 = $script:Theme.MissingBg
+    }
+    elseif ($Status -eq 'Match') {
+        $bgP = $script:Theme.MatchBg; $bgR1 = $script:Theme.MatchBg; $bgR2 = $script:Theme.MatchBg
+    }
+
+    $pP = New-DetailValuePane -Title ("PDC  ($PdcName)") -Value $PdcVal -AccentBg $bgP
+    $p1 = New-DetailValuePane -Title ("Replica 1  ($R1Name)") -Value $R1Val -AccentBg $bgR1
+    $p2 = New-DetailValuePane -Title ("Replica 2  ($R2Name)") -Value $R2Val -AccentBg $bgR2
+
+    $vals.Controls.Add($pP.Label, 0, 0)
+    $vals.Controls.Add($p1.Label, 1, 0)
+    $vals.Controls.Add($p2.Label, 2, 0)
+    $vals.Controls.Add($pP.Box, 0, 1)
+    $vals.Controls.Add($p1.Box, 1, 1)
+    $vals.Controls.Add($p2.Box, 2, 1)
+
+    $sumBox = New-Object System.Windows.Forms.TextBox
+    $sumBox.Multiline = $true
+    $sumBox.ScrollBars = 'Vertical'
+    $sumBox.ReadOnly = $true
+    $sumBox.Dock = 'Fill'
+    $sumBox.Font = $script:Theme.FontUi
+    $sumBox.BorderStyle = 'FixedSingle'
+    $sumBox.BackColor = $script:Theme.BgPanel
+    $sumBox.ForeColor = $script:Theme.TextPrimary
+    $sumBox.Text = Get-DiffSummaryText -PdcVal $PdcVal -R1Val $R1Val -R2Val $R2Val `
+        -R1Name $R1Name -R2Name $R2Name -Status $Status
+    $split.Panel2.Controls.Add($sumBox)
+
+    $dlg.Add_Shown({
+        try {
+            $split.SplitterDistance = [Math]::Max(180, [int]($split.ClientSize.Height * 0.55))
+        } catch { }
+    })
+
+    [void]$dlg.ShowDialog($form)
+}
+
+function Show-SelectedRowDetails {
+    if ($grid.SelectedRows.Count -ne 1) {
+        [System.Windows.Forms.MessageBox]::Show(
+            'Select a single results row, then click View Details (or double-click the row).',
+            'View Details', 'OK', 'Information') | Out-Null
+        return
+    }
+    $row = $grid.SelectedRows[0]
+    Show-DifferenceDetail `
+        -ObjectName ([string]$row.Cells['Object'].Value) `
+        -Attribute  ([string]$row.Cells['Attribute'].Value) `
+        -Guid       ([string]$row.Cells['ObjectGUID'].Value) `
+        -Dn         ([string]$row.Cells['DN'].Value) `
+        -Status     ([string]$row.Cells['Status'].Value) `
+        -PdcName    $txtPdc.Text `
+        -PdcVal     ([string]$row.Cells['PDC'].Value) `
+        -R1Name     ([string]$cmbR1.SelectedItem) `
+        -R1Val      ([string]$row.Cells['Replica1'].Value) `
+        -R2Name     ([string]$cmbR2.SelectedItem) `
+        -R2Val      ([string]$row.Cells['Replica2'].Value) `
+        -TargetType ([string]$cmbType.SelectedItem)
+}
+
+$btnDetails.Add_Click({ Show-SelectedRowDetails })
+$grid.Add_CellDoubleClick({
+    if ($grid.SelectedRows.Count -ge 1) { Show-SelectedRowDetails }
 })
 
 # ---------------------------------------------------------------------------
@@ -1713,8 +2014,11 @@ $btnExport.Add_Click({
 # ---------------------------------------------------------------------------
 $form.Add_Shown({
     Update-ContextControls
+    $script:SplitUserAdjusted = $false
+    Update-SplitLayout
     Write-Status 'Ready. Click Discover DCs to begin.'
     Write-Status ("Audit log: {0}" -f $script:AuditLog)
+    Write-Status 'Tip: Drag the bar above ACTIVITY to resize the results grid.'
 })
 
 $form.Add_FormClosing({
