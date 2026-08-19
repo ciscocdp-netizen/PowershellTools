@@ -10,7 +10,8 @@
     - Performs a 3-way, attribute-level comparison (PDC + Replica1 + Replica2)
       for Users, Computers, Groups, DNS, Group Policy, and Replication Metadata.
     - Restores individual attributes on existing directory objects FROM either
-      delayed replica TO the PDC Emulator (Set-ADObject -Replace / -Clear).
+      delayed replica TO the PDC Emulator (Set-ADObject -Replace / -Clear /
+      -Add / -Remove for selected multi-value entries).
     - Every restore is preceded by a before/after confirmation dialog.
 
     Restore is enabled for directory objects only (Users / Computers / Groups).
@@ -24,10 +25,11 @@
     powershell -ExecutionPolicy Bypass -STA -File .\AD-Delta-Compare-FIXED.ps1
 
 .NOTES
-    Version: 1.9
+    Version: 1.10
     - Pick-and-choose restore: checkbox column, Check Differences / Clear Checks
     - Restore Checked only restores ticked restorable changes
     - Details dialog: Check for Restore or Restore This Change
+    - Multi-value attributes (e.g. member): pick individual Add/Remove entries in Details
 #>
 
 # ---------------------------------------------------------------------------
@@ -1806,22 +1808,192 @@ function Show-DifferenceDetail {
     $vals.Controls.Add($p1.Box, 1, 1)
     $vals.Controls.Add($p2.Box, 2, 1)
 
-    $sumBox = New-Object System.Windows.Forms.TextBox
-    $sumBox.Multiline = $true
-    $sumBox.ScrollBars = 'Vertical'
-    $sumBox.ReadOnly = $true
-    $sumBox.Dock = 'Fill'
-    $sumBox.Font = $script:Theme.FontUi
-    $sumBox.BorderStyle = 'FixedSingle'
-    $sumBox.BackColor = $script:Theme.BgPanel
-    $sumBox.ForeColor = $script:Theme.TextPrimary
-    $sumBox.Text = Get-DiffSummaryText -PdcVal $PdcVal -R1Val $R1Val -R2Val $R2Val `
-        -R1Name $R1Name -R2Name $R2Name -Status $Status
-    $split.Panel2.Controls.Add($sumBox)
+    $pTokensAll = @(Get-ValueTokens $PdcVal)
+    $r1TokensAll = @(Get-ValueTokens $R1Val)
+    $r2TokensAll = @(Get-ValueTokens $R2Val)
+    $isMulti = ($pTokensAll.Count -gt 1) -or ($r1TokensAll.Count -gt 1) -or ($r2TokensAll.Count -gt 1) `
+        -or (($Status -eq 'Different') -and ($Attribute -in @('member','servicePrincipalName','proxyAddresses','otherTelephone','url')))
+
+    $script:DetailPartialPayload = $null
+
+    if ($isMulti -and $Restorable -and $Status -in @('Different','ObjectMissing')) {
+        # --- Pick individual multi-value entries ---
+        $pnlPick = New-Object System.Windows.Forms.Panel
+        $pnlPick.Dock = 'Fill'
+        $pnlPick.BackColor = $script:Theme.BgPanel
+        $split.Panel2.Controls.Add($pnlPick)
+
+        $pickTop = New-Object System.Windows.Forms.Panel
+        $pickTop.Dock = 'Top'
+        $pickTop.Height = 58
+        $pickTop.BackColor = $script:Theme.BgPanel
+        $pnlPick.Controls.Add($pickTop)
+
+        $lblPick = New-Object System.Windows.Forms.Label
+        $lblPick.Text = 'Select individual values to sync TO the PDC (from the chosen replica):'
+        $lblPick.Location = New-Object System.Drawing.Point(8, 6)
+        $lblPick.AutoSize = $true
+        $lblPick.ForeColor = $script:Theme.TextPrimary
+        $pickTop.Controls.Add($lblPick)
+
+        $rbSrc1 = New-Object System.Windows.Forms.RadioButton
+        $rbSrc1.Text = "Compare vs Replica 1 ($R1Name)"
+        $rbSrc1.Location = New-Object System.Drawing.Point(8, 28)
+        $rbSrc1.AutoSize = $true
+        $rbSrc1.Checked = $true
+        $pickTop.Controls.Add($rbSrc1)
+
+        $rbSrc2 = New-Object System.Windows.Forms.RadioButton
+        $rbSrc2.Text = "Compare vs Replica 2 ($R2Name)"
+        $rbSrc2.Location = New-Object System.Drawing.Point(280, 28)
+        $rbSrc2.AutoSize = $true
+        $pickTop.Controls.Add($rbSrc2)
+
+        $btnPickAll = New-FlatButton -Text 'Check All' -Location (New-Object System.Drawing.Point(560, 24)) `
+            -Size (New-Object System.Drawing.Size(90, 26)) -Secondary
+        $pickTop.Controls.Add($btnPickAll)
+        $btnPickNone = New-FlatButton -Text 'Clear' -Location (New-Object System.Drawing.Point(658, 24)) `
+            -Size (New-Object System.Drawing.Size(70, 26)) -Secondary
+        $pickTop.Controls.Add($btnPickNone)
+
+        $entryGrid = New-Object System.Windows.Forms.DataGridView
+        $entryGrid.Dock = 'Fill'
+        Set-ModernGridStyle -Grid $entryGrid
+        $entryGrid.MultiSelect = $false
+        $entryGrid.AutoSizeColumnsMode = 'Fill'
+        $pnlPick.Controls.Add($entryGrid)
+        $pickTop.BringToFront()
+
+        $egSel = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
+        $egSel.Name = 'Select'; $egSel.HeaderText = 'Restore?'
+        $egSel.FillWeight = 8; $egSel.MinimumWidth = 60
+        [void]$entryGrid.Columns.Add($egSel)
+        $egAct = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+        $egAct.Name = 'Action'; $egAct.HeaderText = 'Action'
+        $egAct.FillWeight = 22; $egAct.ReadOnly = $true
+        [void]$entryGrid.Columns.Add($egAct)
+        $egVal = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+        $egVal.Name = 'Value'; $egVal.HeaderText = 'Value'
+        $egVal.FillWeight = 70; $egVal.ReadOnly = $true
+        [void]$entryGrid.Columns.Add($egVal)
+
+        $entryGrid.Add_CurrentCellDirtyStateChanged({
+            if ($entryGrid.IsCurrentCellDirty) {
+                [void]$entryGrid.CommitEdit([System.Windows.Forms.DataGridViewDataErrorContexts]::Commit)
+            }
+        })
+
+        function Update-EntryPickGrid {
+            $entryGrid.Rows.Clear()
+            $srcName = if ($rbSrc1.Checked) { $R1Name } else { $R2Name }
+            $srcVal  = if ($rbSrc1.Checked) { $R1Val } else { $R2Val }
+            $pSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            $sSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            foreach ($t in (Get-ValueTokens $PdcVal)) {
+                if ($t -notin @('<object missing>','<missing>','(empty)')) { [void]$pSet.Add($t) }
+            }
+            foreach ($t in (Get-ValueTokens $srcVal)) {
+                if ($t -notin @('<object missing>','<missing>','(empty)')) { [void]$sSet.Add($t) }
+            }
+
+            foreach ($t in ($pSet | Sort-Object)) {
+                if (-not $sSet.Contains($t)) {
+                    [void]$entryGrid.Rows.Add(@($false, "Remove from PDC (not on $srcName)", $t))
+                    $entryGrid.Rows[$entryGrid.Rows.Count - 1].DefaultCellStyle.BackColor = $script:Theme.DiffBg
+                }
+            }
+            foreach ($t in ($sSet | Sort-Object)) {
+                if (-not $pSet.Contains($t)) {
+                    [void]$entryGrid.Rows.Add(@($false, "Add to PDC (only on $srcName)", $t))
+                    $entryGrid.Rows[$entryGrid.Rows.Count - 1].DefaultCellStyle.BackColor = $script:Theme.MatchBg
+                }
+            }
+            if ($entryGrid.Rows.Count -eq 0) {
+                [void]$entryGrid.Rows.Add(@($false, '(no entry-level diffs)', ''))
+                $entryGrid.Rows[0].Cells['Select'].ReadOnly = $true
+            }
+        }
+
+        $rbSrc1.Add_CheckedChanged({ if ($rbSrc1.Checked) { Update-EntryPickGrid } })
+        $rbSrc2.Add_CheckedChanged({ if ($rbSrc2.Checked) { Update-EntryPickGrid } })
+        $btnPickAll.Add_Click({
+            foreach ($row in $entryGrid.Rows) {
+                if ($row.Cells['Select'].ReadOnly) { continue }
+                if ([string]$row.Cells['Value'].Value) { $row.Cells['Select'].Value = $true }
+            }
+        })
+        $btnPickNone.Add_Click({
+            foreach ($row in $entryGrid.Rows) { $row.Cells['Select'].Value = $false }
+        })
+        Update-EntryPickGrid
+
+        $btnRestoreEntries = New-FlatButton -Text 'Restore Selected Entries…' -Location (New-Object System.Drawing.Point(368, 8)) `
+            -Size (New-Object System.Drawing.Size(200, 32)) -BackColor $script:Theme.Accent -ForeColor ([System.Drawing.Color]::White)
+        $footer.Controls.Add($btnRestoreEntries)
+
+        $btnRestoreEntries.Add_Click({
+            try { $entryGrid.EndEdit() } catch { }
+            $adds = New-Object System.Collections.ArrayList
+            $removes = New-Object System.Collections.ArrayList
+            foreach ($row in $entryGrid.Rows) {
+                if ($row.IsNewRow) { continue }
+                $v = $row.Cells['Select'].Value
+                $checked = ($v -eq $true -or "$v" -eq 'True')
+                if (-not $checked) { continue }
+                $val = [string]$row.Cells['Value'].Value
+                $act = [string]$row.Cells['Action'].Value
+                if (-not $val) { continue }
+                if ($act -like 'Add to PDC*') { [void]$adds.Add($val) }
+                elseif ($act -like 'Remove from PDC*') { [void]$removes.Add($val) }
+            }
+            if ($adds.Count -eq 0 -and $removes.Count -eq 0) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    'Check one or more values in the list, then click Restore Selected Entries.',
+                    'Nothing selected', 'OK', 'Information') | Out-Null
+                return
+            }
+            $srcName = if ($rbSrc1.Checked) { $R1Name } else { $R2Name }
+            $msg = "Apply these changes to the PDC for attribute '$Attribute' on '$ObjectName'?`r`n`r`n"
+            $msg += ("Add {0} value(s)`r`nRemove {1} value(s)`r`n`r`nReference replica: {2}" -f $adds.Count, $removes.Count, $srcName)
+            $ans = [System.Windows.Forms.MessageBox]::Show($msg, 'Confirm entry restore', 'YesNo', 'Question')
+            if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+            $script:DetailPartialPayload = @{
+                Guid    = $Guid
+                Attr    = $Attribute
+                Object  = $ObjectName
+                Pdc     = $PdcName
+                Source  = $srcName
+                Adds    = @($adds)
+                Removes = @($removes)
+                Row     = $SourceRow
+            }
+            $script:DetailAction = 'partial'
+            $dlg.DialogResult = 'OK'
+            $dlg.Close()
+        })
+
+        # Full-attribute restore still available; rename for clarity
+        $btnRestoreOne.Text = 'Replace Entire Attribute…'
+    }
+    else {
+        $sumBox = New-Object System.Windows.Forms.TextBox
+        $sumBox.Multiline = $true
+        $sumBox.ScrollBars = 'Vertical'
+        $sumBox.ReadOnly = $true
+        $sumBox.Dock = 'Fill'
+        $sumBox.Font = $script:Theme.FontUi
+        $sumBox.BorderStyle = 'FixedSingle'
+        $sumBox.BackColor = $script:Theme.BgPanel
+        $sumBox.ForeColor = $script:Theme.TextPrimary
+        $sumBox.Text = Get-DiffSummaryText -PdcVal $PdcVal -R1Val $R1Val -R2Val $R2Val `
+            -R1Name $R1Name -R2Name $R2Name -Status $Status
+        $split.Panel2.Controls.Add($sumBox)
+    }
 
     $dlg.Add_Shown({
         try {
-            $split.SplitterDistance = [Math]::Max(180, [int]($split.ClientSize.Height * 0.55))
+            $split.SplitterDistance = [Math]::Max(160, [int]($split.ClientSize.Height * 0.42))
         } catch { }
     })
 
@@ -1860,6 +2032,65 @@ function Show-SelectedRowDetails {
             $grid.EndEdit()
             Update-RestoreButtonState
             Write-Status ("Checked '{0}' on '{1}' for restore." -f $row.Cells['Attribute'].Value, $row.Cells['Object'].Value)
+        }
+    }
+    elseif ($action -eq 'partial') {
+        if (-not $restorable) { return }
+        $payload = $script:DetailPartialPayload
+        if (-not $payload) { return }
+
+        try { Import-Module ActiveDirectory -ErrorAction Stop }
+        catch {
+            Write-Status $_.Exception.Message 'ERROR'
+            [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Restore failed', 'OK', 'Error') | Out-Null
+            return
+        }
+
+        $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        $res = Invoke-MultiValueEntryRestore `
+            -Guid $payload.Guid `
+            -Attr $payload.Attr `
+            -Pdc $payload.Pdc `
+            -Adds $payload.Adds `
+            -Removes $payload.Removes
+        $form.Cursor = [System.Windows.Forms.Cursors]::Default
+
+        if ($res.Ok) {
+            Write-Status ("{0} selected entries of '{1}' on '{2}' at PDC (ref {3})." -f `
+                $res.Action, $payload.Attr, $payload.Object, $payload.Source)
+            Write-Audit ("PARTIAL-RESTORE obj='$($payload.Object)' guid='$($payload.Guid)' attr='$($payload.Attr)' action='$($res.Action)' source='$($payload.Source)' target-PDC='$($payload.Pdc)' added=$($payload.Adds.Count) removed=$($payload.Removes.Count)")
+
+            # Refresh displayed PDC value from live object when possible
+            $newPdcDisplay = $null
+            try {
+                $live = Get-ADObject -Server $payload.Pdc -Identity $payload.Guid -Properties $payload.Attr -ErrorAction Stop
+                $raw = $live.($payload.Attr)
+                if ($null -eq $raw) { $newPdcDisplay = '' }
+                elseif (($raw -is [System.Collections.IEnumerable]) -and -not ($raw -is [string]) -and -not ($raw -is [byte[]])) {
+                    $newPdcDisplay = (@($raw) | Sort-Object) -join '; '
+                }
+                else { $newPdcDisplay = [string]$raw }
+            } catch {
+                # Fall back to local token math from the grid cell
+                $set = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+                foreach ($t in (Get-ValueTokens ([string]$row.Cells['PDC'].Value))) {
+                    if ($t -notin @('<object missing>','<missing>','(empty)')) { [void]$set.Add($t) }
+                }
+                foreach ($r in @($payload.Removes)) { [void]$set.Remove($r) }
+                foreach ($a in @($payload.Adds)) { [void]$set.Add($a) }
+                $newPdcDisplay = ($set | Sort-Object) -join '; '
+            }
+            $row.Cells['PDC'].Value = $newPdcDisplay
+            $row.Cells['Select'].Value = $false
+            Update-RestoreButtonState
+            [System.Windows.Forms.MessageBox]::Show(
+                ("Updated '{0}' on the PDC with the selected entries.`r`n`r`n{1}`r`n`r`nAllow replication to converge, then re-run Compare to verify." -f `
+                    $payload.Attr, $res.Action),
+                'Entry restore complete', 'OK', 'Information') | Out-Null
+        }
+        else {
+            Write-Status $res.Error 'ERROR'
+            [System.Windows.Forms.MessageBox]::Show($res.Error, 'Restore failed', 'OK', 'Error') | Out-Null
         }
     }
     elseif ($action -eq 'restore') {
@@ -2072,6 +2303,36 @@ function Invoke-AttributeRestore {
     }
 }
 
+function Invoke-MultiValueEntryRestore {
+    param(
+        [string]$Guid,
+        [string]$Attr,
+        [string]$Pdc,
+        [string[]]$Adds,
+        [string[]]$Removes
+    )
+    $added = 0
+    $removed = 0
+    try {
+        $addList = @($Adds | Where-Object { $_ -and $_.Trim() -ne '' } | Select-Object -Unique)
+        $remList = @($Removes | Where-Object { $_ -and $_.Trim() -ne '' } | Select-Object -Unique)
+
+        if ($remList.Count -gt 0) {
+            Set-ADObject -Server $Pdc -Identity $Guid -Remove @{ $Attr = $remList } -Confirm:$false -ErrorAction Stop
+            $removed = $remList.Count
+        }
+        if ($addList.Count -gt 0) {
+            Set-ADObject -Server $Pdc -Identity $Guid -Add @{ $Attr = $addList } -Confirm:$false -ErrorAction Stop
+            $added = $addList.Count
+        }
+        $action = ("Added {0}; Removed {1}" -f $added, $removed)
+        return @{ Ok = $true; Action = $action; Error = $null; Added = $added; Removed = $removed }
+    }
+    catch {
+        return @{ Ok = $false; Action = $null; Error = $_.Exception.Message; Added = $added; Removed = $removed }
+    }
+}
+
 $btnRestore.Add_Click({
     $r1Name = [string]$cmbR1.SelectedItem
     $r2Name = [string]$cmbR2.SelectedItem
@@ -2187,7 +2448,7 @@ $form.Add_Shown({
     Write-Status 'Ready. Click Discover DCs to begin.'
     Write-Status ("Audit log: {0}" -f $script:AuditLog)
     Write-Status 'Tip: Check boxes for the changes you want, or use Check Differences then uncheck any to skip.'
-    Write-Status 'Tip: Double-click a row for details (Check for Restore / Restore This Change).'
+    Write-Status 'Tip: Double-click a row for details. For multi-value attrs (e.g. member), pick individual entries to Add/Remove on the PDC.'
     Write-Status 'Tip: Drag the bar above ACTIVITY to resize the results grid.'
 })
 
