@@ -100,7 +100,7 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.4.0'
+$Global:AppVersion       = '2.4.2'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:LogWatchState    = @{
     Local = @{ Enabled = $false; Path = $null; Offset = 0L }
@@ -416,6 +416,146 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
         </Setter.Value>
       </Setter>
     </Style>
+
+    <!-- ComboBoxItem: dark list rows (default popup is white; light Foreground was unreadable) -->
+    <Style TargetType="ComboBoxItem">
+      <Setter Property="SnapsToDevicePixels" Value="True"/>
+      <Setter Property="Padding" Value="8,5"/>
+      <Setter Property="HorizontalContentAlignment" Value="Left"/>
+      <Setter Property="VerticalContentAlignment" Value="Center"/>
+      <Setter Property="Background" Value="{StaticResource BgCard}"/>
+      <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ComboBoxItem">
+            <Border x:Name="Bd"
+                    Background="{TemplateBinding Background}"
+                    BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="{TemplateBinding BorderThickness}"
+                    Padding="{TemplateBinding Padding}">
+              <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsHighlighted" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="{StaticResource BgHover}"/>
+              </Trigger>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="{StaticResource BgSelected}"/>
+                <Setter Property="Foreground" Value="#FFFFFF"/>
+              </Trigger>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter Property="Foreground" Value="{StaticResource TextSecond}"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <!-- ComboBox: dark closed control + dark dropdown popup -->
+    <Style TargetType="ComboBox">
+      <Setter Property="Background" Value="{StaticResource BgDeep}"/>
+      <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource Border}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Padding" Value="6,3"/>
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Auto"/>
+      <Setter Property="ScrollViewer.VerticalScrollBarVisibility" Value="Auto"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ComboBox">
+            <Grid>
+              <ToggleButton x:Name="ToggleButton"
+                            Focusable="False"
+                            IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"
+                            ClickMode="Press">
+                <ToggleButton.Template>
+                  <ControlTemplate TargetType="ToggleButton">
+                    <Border x:Name="TemplateBorder"
+                            Background="{Binding Background, RelativeSource={RelativeSource AncestorType=ComboBox}}"
+                            BorderBrush="{Binding BorderBrush, RelativeSource={RelativeSource AncestorType=ComboBox}}"
+                            BorderThickness="{Binding BorderThickness, RelativeSource={RelativeSource AncestorType=ComboBox}}"
+                            CornerRadius="4">
+                      <Grid>
+                        <Grid.ColumnDefinitions>
+                          <ColumnDefinition Width="*"/>
+                          <ColumnDefinition Width="22"/>
+                        </Grid.ColumnDefinitions>
+                        <Border Grid.Column="0" Background="Transparent"/>
+                        <Path Grid.Column="1" Fill="{StaticResource TextPrimary}"
+                              HorizontalAlignment="Center" VerticalAlignment="Center"
+                              Data="M 0 0 L 4 4 L 8 0 Z"/>
+                      </Grid>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                      <Trigger Property="IsMouseOver" Value="True">
+                        <Setter TargetName="TemplateBorder" Property="BorderBrush" Value="{StaticResource Accent}"/>
+                      </Trigger>
+                    </ControlTemplate.Triggers>
+                  </ControlTemplate>
+                </ToggleButton.Template>
+              </ToggleButton>
+              <ContentPresenter x:Name="ContentSite"
+                                IsHitTestVisible="False"
+                                Content="{TemplateBinding SelectionBoxItem}"
+                                ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                                ContentTemplateSelector="{TemplateBinding ItemTemplateSelector}"
+                                Margin="8,3,26,3"
+                                VerticalAlignment="Center"
+                                HorizontalAlignment="Left"/>
+              <TextBox x:Name="PART_EditableTextBox"
+                       Style="{x:Null}"
+                       Visibility="Hidden"
+                       IsReadOnly="{TemplateBinding IsReadOnly}"
+                       Margin="8,3,26,3"
+                       VerticalAlignment="Center"
+                       Background="Transparent"
+                       Foreground="{StaticResource TextPrimary}"
+                       BorderThickness="0"
+                       Focusable="True"/>
+              <Popup x:Name="Popup"
+                     Placement="Bottom"
+                     IsOpen="{TemplateBinding IsDropDownOpen}"
+                     AllowsTransparency="True"
+                     Focusable="False"
+                     PopupAnimation="Slide">
+                <Grid x:Name="DropDown"
+                      MinWidth="{TemplateBinding ActualWidth}"
+                      MaxHeight="{TemplateBinding MaxDropDownHeight}">
+                  <Border x:Name="DropDownBorder"
+                          Background="{StaticResource BgCard}"
+                          BorderBrush="{StaticResource Border}"
+                          BorderThickness="1"
+                          CornerRadius="4">
+                    <ScrollViewer Margin="2" SnapsToDevicePixels="True">
+                      <StackPanel IsItemsHost="True" KeyboardNavigation.DirectionalNavigation="Contained"/>
+                    </ScrollViewer>
+                  </Border>
+                </Grid>
+              </Popup>
+            </Grid>
+            <ControlTemplate.Triggers>
+              <Trigger Property="HasItems" Value="False">
+                <Setter TargetName="DropDownBorder" Property="MinHeight" Value="40"/>
+              </Trigger>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter Property="Opacity" Value="0.45"/>
+              </Trigger>
+              <Trigger Property="IsEditable" Value="True">
+                <Setter TargetName="PART_EditableTextBox" Property="Visibility" Value="Visible"/>
+                <Setter TargetName="ContentSite" Property="Visibility" Value="Hidden"/>
+              </Trigger>
+              <Trigger Property="IsKeyboardFocusWithin" Value="True">
+                <Setter Property="BorderBrush" Value="{StaticResource Accent}"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
   </Window.Resources>
 
   <!-- Main Layout -->
@@ -488,7 +628,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                    HorizontalAlignment="Center"/>
         
         <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-          <Run Text="v2.4.0  |  "/>
+          <Run Text="v2.4.2  |  "/>
           <Run Text="Anthony Blake  |  " Foreground="#90CAF9"/>
           <Run x:Name="StatusTime" Text=""/>
         </TextBlock>
@@ -3569,9 +3709,9 @@ function Import-MigrationSourceScopes {
         $script:GridMigrateScopes.ItemsSource = $Global:MigrationScopes
     }, [System.Windows.Threading.DispatcherPriority]::Normal)
     
-    Write-ActionLog "Loaded $($sourceScopes.Count) source scopes for migration" "SUCCESS"
+    Write-ActionLog "Loaded $(Get-SafeCount $sourceScopes) source scopes for migration" "SUCCESS"
     Update-MigrateReadyState
-    Set-Status "Loaded $($sourceScopes.Count) scopes for migration"
+    Set-Status "Loaded $(Get-SafeCount $sourceScopes) scopes for migration"
     Update-LogDisplay
 }
 
