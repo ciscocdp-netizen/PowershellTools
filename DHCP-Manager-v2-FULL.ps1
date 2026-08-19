@@ -1819,6 +1819,52 @@ function Invoke-DomainDhcpServerScan {
     return $results
 }
 
+function Update-DomainScanDialogUi {
+    <#
+    .SYNOPSIS
+        Runs domain scan and updates the scan dialog grid/status controls
+    #>
+    param(
+        $Grid,
+        $StatusText
+    )
+    
+    try {
+        if ($null -ne $StatusText) {
+            $StatusText.Text = "Scanning Active Directory and pinging servers..."
+        }
+        try { [System.Windows.Forms.Application]::DoEvents() } catch {}
+        
+        $results = @(Invoke-DomainDhcpServerScan)
+        $Global:DomainScanResults.Clear()
+        foreach ($r in $results) { $Global:DomainScanResults.Add($r) }
+        
+        if ($null -ne $Grid) {
+            $Grid.ItemsSource = $null
+            $Grid.ItemsSource = @($Global:DomainScanResults)
+        }
+        
+        $up = @($Global:DomainScanResults | Where-Object { $_.Online -eq 'Up' -or $_.Status -eq 'Up' }).Count
+        $down = $Global:DomainScanResults.Count - $up
+        $authYes = @($Global:DomainScanResults | Where-Object { $_.Authorized -eq 'Yes' }).Count
+        $authNo = $Global:DomainScanResults.Count - $authYes
+        $summary = "Found $($Global:DomainScanResults.Count) server(s): Online $up Up / $down Down | Authorized $authYes Yes / $authNo No"
+        
+        if ($null -ne $StatusText) {
+            $StatusText.Text = $summary
+        }
+        Update-LogDisplay
+    } catch {
+        $err = "$_"
+        Write-ActionLog "Domain scan failed: $err" "ERROR"
+        if ($null -ne $StatusText) {
+            $StatusText.Text = "Scan failed: $err"
+        }
+        Show-MessageBox "Domain DHCP scan failed:`n$err" "Scan Error" OK Error
+        Update-LogDisplay
+    }
+}
+
 function Show-DomainDhcpScanDialog {
     <#
     .SYNOPSIS
@@ -1831,7 +1877,7 @@ function Show-DomainDhcpScanDialog {
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Domain DHCP Server Scan - Anthony Blake"
-        Height="520" Width="820"
+        Height="520" Width="920"
         WindowStartupLocation="CenterOwner"
         Background="#1A1D23"
         FontFamily="Segoe UI" FontSize="13">
@@ -1903,65 +1949,34 @@ function Show-DomainDhcpScanDialog {
         $dialog = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($dialogXaml))
         if ($script:Window) { $dialog.Owner = $script:Window }
         
-        $grid = $dialog.FindName('GridScanResults')
-        $txtStatus = $dialog.FindName('TxtScanStatus')
+        $script:ScanDialog = $dialog
+        $script:ScanDialogGrid = $dialog.FindName('GridScanResults')
+        $script:ScanDialogStatus = $dialog.FindName('TxtScanStatus')
         $btnScan = $dialog.FindName('BtnScanNow')
         $btnUseA = $dialog.FindName('BtnUseAsA')
         $btnUseB = $dialog.FindName('BtnUseAsB')
         $btnExport = $dialog.FindName('BtnExportScan')
         $btnClose = $dialog.FindName('BtnCloseScan')
         
-        # Store UI refs on the window Tag for reliable event-handler access
-        $dialog.Tag = @{
-            Grid   = $grid
-            Status = $txtStatus
-        }
-        
         $btnScan.add_Click({
-            $ui = $dialog.Tag
-            try {
-                $ui.Status.Text = "Scanning Active Directory and pinging servers..."
-                [System.Windows.Forms.Application]::DoEvents()
-                
-                $results = @(Invoke-DomainDhcpServerScan)
-                $Global:DomainScanResults.Clear()
-                foreach ($r in $results) { $Global:DomainScanResults.Add($r) }
-                
-                $ui.Grid.ItemsSource = $null
-                $ui.Grid.ItemsSource = @($Global:DomainScanResults)
-                
-                $up = @($Global:DomainScanResults | Where-Object { $_.Online -eq 'Up' -or $_.Status -eq 'Up' }).Count
-                $down = $Global:DomainScanResults.Count - $up
-                $authYes = @($Global:DomainScanResults | Where-Object { $_.Authorized -eq 'Yes' }).Count
-                $authNo = $Global:DomainScanResults.Count - $authYes
-                $ui.Status.Text = "Found $($Global:DomainScanResults.Count) server(s): Online $up Up / $down Down | Authorized $authYes Yes / $authNo No"
-                Update-LogDisplay
-            } catch {
-                $err = "$_"
-                Write-ActionLog "Domain scan failed: $err" "ERROR"
-                $ui.Status.Text = "Scan failed: $err"
-                Show-MessageBox "Domain DHCP scan failed:`n$err" "Scan Error" OK Error
-                Update-LogDisplay
-            }
-        }.GetNewClosure())
+            Update-DomainScanDialogUi -Grid $script:ScanDialogGrid -StatusText $script:ScanDialogStatus
+        })
         
         $btnUseA.add_Click({
-            $ui = $dialog.Tag
-            if ($null -eq $ui.Grid.SelectedItem) {
+            if ($null -eq $script:ScanDialogGrid -or $null -eq $script:ScanDialogGrid.SelectedItem) {
                 Show-MessageBox "Select a DHCP server first." "Scan" OK Warning
                 return
             }
-            $name = $ui.Grid.SelectedItem.DnsName
-            if ([string]::IsNullOrWhiteSpace($name)) { $name = $ui.Grid.SelectedItem.IPAddress }
+            $name = $script:ScanDialogGrid.SelectedItem.DnsName
+            if ([string]::IsNullOrWhiteSpace($name)) { $name = $script:ScanDialogGrid.SelectedItem.IPAddress }
             $script:TxtServerName.Text = $name
             Write-ActionLog "Scan: set Server A candidate to $name" "INFO"
-            $ui.Status.Text = "Filled main server box with $name — click Connect on the main window"
+            $script:ScanDialogStatus.Text = "Filled main server box with $name — click Connect on the main window"
             Update-LogDisplay
-        }.GetNewClosure())
+        })
         
         $btnUseB.add_Click({
-            $ui = $dialog.Tag
-            if ($null -eq $ui.Grid.SelectedItem) {
+            if ($null -eq $script:ScanDialogGrid -or $null -eq $script:ScanDialogGrid.SelectedItem) {
                 Show-MessageBox "Select a DHCP server first." "Scan" OK Warning
                 return
             }
@@ -1969,16 +1984,16 @@ function Show-DomainDhcpScanDialog {
                 Show-MessageBox "Compare controls not available." "Scan" OK Warning
                 return
             }
-            $name = $ui.Grid.SelectedItem.DnsName
-            if ([string]::IsNullOrWhiteSpace($name)) { $name = $ui.Grid.SelectedItem.IPAddress }
+            $name = $script:ScanDialogGrid.SelectedItem.DnsName
+            if ([string]::IsNullOrWhiteSpace($name)) { $name = $script:ScanDialogGrid.SelectedItem.IPAddress }
             $script:TxtCompareServer.Text = $name
             if ($null -ne $script:TabCompare) {
                 $script:MainTabs.SelectedItem = $script:TabCompare
             }
             Write-ActionLog "Scan: set Server B candidate to $name" "INFO"
-            $ui.Status.Text = "Filled Compare Server B with $name — connect it on the Compare tab"
+            $script:ScanDialogStatus.Text = "Filled Compare Server B with $name — connect it on the Compare tab"
             Update-LogDisplay
-        }.GetNewClosure())
+        })
         
         $btnExport.add_Click({
             if ($Global:DomainScanResults.Count -eq 0) {
@@ -2001,29 +2016,32 @@ function Show-DomainDhcpScanDialog {
             } catch {
                 Show-MessageBox "Export failed: $_" "Export Error" OK Error
             }
-        }.GetNewClosure())
+        })
         
-        $grid.add_MouseDoubleClick({
-            $ui = $dialog.Tag
-            if ($null -eq $ui.Grid.SelectedItem) { return }
-            $name = $ui.Grid.SelectedItem.DnsName
-            if ([string]::IsNullOrWhiteSpace($name)) { $name = $ui.Grid.SelectedItem.IPAddress }
+        $script:ScanDialogGrid.add_MouseDoubleClick({
+            if ($null -eq $script:ScanDialogGrid.SelectedItem) { return }
+            $name = $script:ScanDialogGrid.SelectedItem.DnsName
+            if ([string]::IsNullOrWhiteSpace($name)) { $name = $script:ScanDialogGrid.SelectedItem.IPAddress }
             $script:TxtServerName.Text = $name
             Write-ActionLog "Scan double-click: filled Server A box with $name" "INFO"
-            $ui.Status.Text = "Filled main server box with $name"
-        }.GetNewClosure())
+            $script:ScanDialogStatus.Text = "Filled main server box with $name"
+        })
         
-        $btnClose.add_Click({ $dialog.Close() }.GetNewClosure())
+        $btnClose.add_Click({
+            if ($null -ne $script:ScanDialog) { $script:ScanDialog.Close() }
+        })
         
-        # Auto-run scan when dialog opens
+        # Auto-run scan after dialog is shown (no RaiseEvent / GetNewClosure)
         $dialog.Add_ContentRendered({
-            $btnScan.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
-        }.GetNewClosure())
+            Update-DomainScanDialogUi -Grid $script:ScanDialogGrid -StatusText $script:ScanDialogStatus
+        })
         
         [void]$dialog.ShowDialog()
     } catch {
         Write-ActionLog "Failed to open domain scan dialog: $_" "ERROR"
         Show-MessageBox "Failed to open scan dialog: $_" "Scan Error" OK Error
+    } finally {
+        $script:ScanDialog = $null
     }
 }
 #endregion
