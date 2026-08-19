@@ -25,12 +25,12 @@
     powershell -ExecutionPolicy Bypass -STA -File .\AD-Delta-Compare-FIXED.ps1
 
 .NOTES
-    Version: 1.11
+    Version: 1.12
+    - Larger UI fonts across forms
+    - Fix restore when a single change is checked (ArrayList unwrap)
+    - Group member restore via Add/Remove-ADGroupMember
     - Pick-and-choose restore: checkbox column, Check Differences / Clear Checks
-    - Restore Checked only restores ticked restorable changes
-    - Details dialog: Check for Restore or Restore This Change
-    - Multi-value attributes (e.g. member): pick individual Add/Remove entries in Details
-    - Details multi-value picker layout: no overlapping replica radios / truncated actions
+    - Multi-value attributes: pick individual Add/Remove entries in Details
 #>
 
 # ---------------------------------------------------------------------------
@@ -65,13 +65,13 @@ $script:Theme = @{
     MissingBg   = [System.Drawing.Color]::FromArgb(255, 243, 214)
     MatchBg     = [System.Drawing.Color]::FromArgb(226, 245, 230)
     InputBg     = [System.Drawing.Color]::FromArgb(255, 255, 255)
-    FontUi      = New-Object System.Drawing.Font('Segoe UI', 9.0)
-    FontUiBold  = New-Object System.Drawing.Font('Segoe UI', 9.0, [System.Drawing.FontStyle]::Bold)
-    FontTitle   = New-Object System.Drawing.Font('Segoe UI', 15.0, [System.Drawing.FontStyle]::Bold)
-    FontSub     = New-Object System.Drawing.Font('Segoe UI', 8.5)
-    FontMono    = New-Object System.Drawing.Font('Consolas', 8.5)
-    FontSection = New-Object System.Drawing.Font('Segoe UI', 9.0, [System.Drawing.FontStyle]::Bold)
-    FontSync    = New-Object System.Drawing.Font('Segoe UI', 7.5)
+    FontUi      = New-Object System.Drawing.Font('Segoe UI', 11.0)
+    FontUiBold  = New-Object System.Drawing.Font('Segoe UI', 11.0, [System.Drawing.FontStyle]::Bold)
+    FontTitle   = New-Object System.Drawing.Font('Segoe UI', 17.0, [System.Drawing.FontStyle]::Bold)
+    FontSub     = New-Object System.Drawing.Font('Segoe UI', 10.0)
+    FontMono    = New-Object System.Drawing.Font('Consolas', 10.0)
+    FontSection = New-Object System.Drawing.Font('Segoe UI', 11.0, [System.Drawing.FontStyle]::Bold)
+    FontSync    = New-Object System.Drawing.Font('Segoe UI', 9.0)
 }
 
 # ---------------------------------------------------------------------------
@@ -95,11 +95,13 @@ function New-FlatButton {
     $btn.Font = $script:Theme.FontUiBold
     $btn.Cursor = [System.Windows.Forms.Cursors]::Hand
     if ($Secondary) {
+        $btn.Tag = 'secondary'
         $btn.BackColor = $script:Theme.BgPanel
         $btn.ForeColor = $script:Theme.TextPrimary
         $btn.FlatAppearance.BorderSize = 1
         $btn.FlatAppearance.BorderColor = $script:Theme.Border
     } else {
+        $btn.Tag = 'primary'
         $btn.BackColor = $BackColor
         $btn.ForeColor = $ForeColor
     }
@@ -208,7 +210,7 @@ function Set-ModernGridStyle {
     $Grid.ColumnHeadersDefaultCellStyle.Font = $script:Theme.FontUiBold
     $Grid.ColumnHeadersDefaultCellStyle.SelectionBackColor = $script:Theme.BgHeader
     $Grid.ColumnHeadersDefaultCellStyle.WrapMode = 'False'
-    $Grid.ColumnHeadersHeight = 34
+    $Grid.ColumnHeadersHeight = 38
     $Grid.ColumnHeadersHeightSizeMode = 'DisableResizing'
     $Grid.DefaultCellStyle.BackColor = $script:Theme.BgPanel
     $Grid.DefaultCellStyle.ForeColor = $script:Theme.TextPrimary
@@ -216,7 +218,7 @@ function Set-ModernGridStyle {
     $Grid.DefaultCellStyle.SelectionBackColor = [System.Drawing.Color]::FromArgb(200, 230, 232)
     $Grid.DefaultCellStyle.SelectionForeColor = $script:Theme.TextPrimary
     $Grid.AlternatingRowsDefaultCellStyle.BackColor = $script:Theme.GridAlt
-    $Grid.RowTemplate.Height = 26
+    $Grid.RowTemplate.Height = 30
     $Grid.AllowUserToAddRows = $false
     $Grid.AllowUserToDeleteRows = $false
     $Grid.AllowUserToResizeRows = $false
@@ -1128,51 +1130,51 @@ foreach ($c in $grid.Columns) {
 # ========== ACTIONS ==========
 
 $btnRestore = New-FlatButton -Text 'Restore Checked  →  PDC' -Location (New-Object System.Drawing.Point(0, 8)) `
-    -Size (New-Object System.Drawing.Size(220, 32)) -BackColor $script:Theme.Accent -ForeColor ([System.Drawing.Color]::White)
+    -Size (New-Object System.Drawing.Size(250, 36)) -BackColor $script:Theme.Accent -ForeColor ([System.Drawing.Color]::White)
 $btnRestore.Enabled = $false
 $pnlActions.Controls.Add($btnRestore)
 
-$btnDetails = New-FlatButton -Text 'View Details' -Location (New-Object System.Drawing.Point(232, 8)) `
-    -Size (New-Object System.Drawing.Size(120, 32)) -Secondary
+$btnDetails = New-FlatButton -Text 'View Details' -Location (New-Object System.Drawing.Point(260, 8)) `
+    -Size (New-Object System.Drawing.Size(130, 36)) -Secondary
 $btnDetails.Enabled = $false
 $pnlActions.Controls.Add($btnDetails)
 
-$btnExport = New-FlatButton -Text 'Export CSV' -Location (New-Object System.Drawing.Point(364, 8)) `
-    -Size (New-Object System.Drawing.Size(110, 32)) -Secondary
+$btnExport = New-FlatButton -Text 'Export CSV' -Location (New-Object System.Drawing.Point(400, 8)) `
+    -Size (New-Object System.Drawing.Size(120, 36)) -Secondary
 $pnlActions.Controls.Add($btnExport)
 
 $swDiff = New-Object System.Windows.Forms.Panel
-$swDiff.Location = New-Object System.Drawing.Point(500, 16)
+$swDiff.Location = New-Object System.Drawing.Point(540, 18)
 $swDiff.Size = New-Object System.Drawing.Size(12, 12)
 $swDiff.BackColor = $script:Theme.DiffBg
 $pnlActions.Controls.Add($swDiff)
 $lblLeg1 = New-Object System.Windows.Forms.Label
 $lblLeg1.Text = 'Different'
-$lblLeg1.Location = New-Object System.Drawing.Point(516, 13)
+$lblLeg1.Location = New-Object System.Drawing.Point(556, 15)
 $lblLeg1.AutoSize = $true
 $lblLeg1.ForeColor = $script:Theme.TextMuted
 $pnlActions.Controls.Add($lblLeg1)
 
 $swMiss = New-Object System.Windows.Forms.Panel
-$swMiss.Location = New-Object System.Drawing.Point(590, 16)
+$swMiss.Location = New-Object System.Drawing.Point(640, 18)
 $swMiss.Size = New-Object System.Drawing.Size(12, 12)
 $swMiss.BackColor = $script:Theme.MissingBg
 $pnlActions.Controls.Add($swMiss)
 $lblLeg2 = New-Object System.Windows.Forms.Label
 $lblLeg2.Text = 'Missing object'
-$lblLeg2.Location = New-Object System.Drawing.Point(606, 13)
+$lblLeg2.Location = New-Object System.Drawing.Point(656, 15)
 $lblLeg2.AutoSize = $true
 $lblLeg2.ForeColor = $script:Theme.TextMuted
 $pnlActions.Controls.Add($lblLeg2)
 
 $swMatch = New-Object System.Windows.Forms.Panel
-$swMatch.Location = New-Object System.Drawing.Point(720, 16)
+$swMatch.Location = New-Object System.Drawing.Point(790, 18)
 $swMatch.Size = New-Object System.Drawing.Size(12, 12)
 $swMatch.BackColor = $script:Theme.MatchBg
 $pnlActions.Controls.Add($swMatch)
 $lblLeg3 = New-Object System.Windows.Forms.Label
 $lblLeg3.Text = 'Match'
-$lblLeg3.Location = New-Object System.Drawing.Point(736, 13)
+$lblLeg3.Location = New-Object System.Drawing.Point(806, 15)
 $lblLeg3.AutoSize = $true
 $lblLeg3.ForeColor = $script:Theme.TextMuted
 $pnlActions.Controls.Add($lblLeg3)
@@ -1465,6 +1467,7 @@ function Test-RowChecked {
 
 function Get-CheckedRestoreTargets {
     $targets = New-Object System.Collections.ArrayList
+    try { $grid.EndEdit() } catch { }
     foreach ($row in $grid.Rows) {
         if ($row.IsNewRow) { continue }
         if (-not (Test-RowChecked $row)) { continue }
@@ -1479,7 +1482,8 @@ function Get-CheckedRestoreTargets {
             R2Val     = [string]$row.Cells['Replica2'].Value
         })
     }
-    return $targets
+    # Comma prevents PowerShell from unwrapping a 1-item ArrayList into a single object
+    return ,$targets
 }
 
 function Update-RestoreButtonState {
@@ -1984,8 +1988,8 @@ function Show-DifferenceDetail {
         })
         Update-EntryPickGrid
 
-        $btnRestoreEntries = New-FlatButton -Text 'Restore Selected Entries…' -Location (New-Object System.Drawing.Point(368, 8)) `
-            -Size (New-Object System.Drawing.Size(200, 32)) -BackColor $script:Theme.Accent -ForeColor ([System.Drawing.Color]::White)
+        $btnRestoreEntries = New-FlatButton -Text 'Restore Selected Entries…' -Location (New-Object System.Drawing.Point(396, 8)) `
+            -Size (New-Object System.Drawing.Size(220, 34)) -BackColor $script:Theme.Accent -ForeColor ([System.Drawing.Color]::White)
         $footer.Controls.Add($btnRestoreEntries)
 
         $btnRestoreEntries.Add_Click({
@@ -2033,8 +2037,6 @@ function Show-DifferenceDetail {
         # Full-attribute restore still available; rename for clarity
         $btnRestoreOne.Text = 'Replace Entire Attribute…'
         $btnRestoreOne.Size = New-Object System.Drawing.Size(200, 32)
-        $footer.PerformLayout()
-        $footer.Width = $footer.Width  # nudge Resize so buttons reflow
     }
     else {
         $sumBox = New-Object System.Windows.Forms.TextBox
@@ -2056,10 +2058,6 @@ function Show-DifferenceDetail {
             $split.SplitterDistance = [Math]::Max(160, [int]($split.ClientSize.Height * 0.42))
         } catch { }
         try {
-            # Force footer button reflow (Close right; actions left-to-right)
-            $footer.PerformLayout()
-            $null = $footer.ClientSize
-            foreach ($h in $footer.GetType().GetEvents() ) { }
             $btnClose.Left = [Math]::Max(16, $footer.ClientSize.Width - $btnClose.Width - 16)
             $x = 14
             $btnMark.Left = $x
@@ -2362,6 +2360,26 @@ function Invoke-AttributeRestore {
                    ($raw -is [string] -and $raw -eq '') -or `
                    (($raw -is [System.Collections.IEnumerable]) -and -not ($raw -is [string]) -and (@($raw).Count -eq 0))
 
+        # Linked 'member' is unreliable with -Replace; sync via add/remove instead
+        if ($Attr -eq 'member') {
+            $desired = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            if (-not $isEmpty) {
+                foreach ($m in @($raw)) {
+                    if ($m) { [void]$desired.Add([string]$m) }
+                }
+            }
+            $curObj = Get-ADObject -Server $Pdc -Identity $Guid -Properties member -ErrorAction Stop
+            $current = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            foreach ($m in @($curObj.member)) {
+                if ($m) { [void]$current.Add([string]$m) }
+            }
+            $toAdd = @($desired | Where-Object { -not $current.Contains($_) })
+            $toRemove = @($current | Where-Object { -not $desired.Contains($_) })
+            $partial = Invoke-MultiValueEntryRestore -Guid $Guid -Attr $Attr -Pdc $Pdc -Adds $toAdd -Removes $toRemove
+            if (-not $partial.Ok) { return $partial }
+            return @{ Ok = $true; Action = ("Synced member ({0})" -f $partial.Action); Error = $null }
+        }
+
         if ($isEmpty) {
             Set-ADObject -Server $Pdc -Identity $Guid -Clear $Attr -Confirm:$false -ErrorAction Stop
             return @{ Ok = $true; Action = 'Cleared'; Error = $null }
@@ -2391,16 +2409,39 @@ function Invoke-MultiValueEntryRestore {
     $added = 0
     $removed = 0
     try {
-        $addList = @($Adds | Where-Object { $_ -and $_.Trim() -ne '' } | Select-Object -Unique)
-        $remList = @($Removes | Where-Object { $_ -and $_.Trim() -ne '' } | Select-Object -Unique)
+        $addList = @($Adds | Where-Object { $_ -and ("$_").Trim() -ne '' } | Select-Object -Unique)
+        $remList = @($Removes | Where-Object { $_ -and ("$_").Trim() -ne '' } | Select-Object -Unique)
 
-        if ($remList.Count -gt 0) {
-            Set-ADObject -Server $Pdc -Identity $Guid -Remove @{ $Attr = $remList } -Confirm:$false -ErrorAction Stop
-            $removed = $remList.Count
+        if ($Attr -eq 'member') {
+            foreach ($dn in $remList) {
+                try {
+                    Remove-ADGroupMember -Server $Pdc -Identity $Guid -Members $dn -Confirm:$false -ErrorAction Stop
+                    $removed++
+                } catch {
+                    # Fall back to Set-ADObject -Remove for this DN
+                    Set-ADObject -Server $Pdc -Identity $Guid -Remove @{ member = $dn } -Confirm:$false -ErrorAction Stop
+                    $removed++
+                }
+            }
+            foreach ($dn in $addList) {
+                try {
+                    Add-ADGroupMember -Server $Pdc -Identity $Guid -Members $dn -ErrorAction Stop
+                    $added++
+                } catch {
+                    Set-ADObject -Server $Pdc -Identity $Guid -Add @{ member = $dn } -Confirm:$false -ErrorAction Stop
+                    $added++
+                }
+            }
         }
-        if ($addList.Count -gt 0) {
-            Set-ADObject -Server $Pdc -Identity $Guid -Add @{ $Attr = $addList } -Confirm:$false -ErrorAction Stop
-            $added = $addList.Count
+        else {
+            if ($remList.Count -gt 0) {
+                Set-ADObject -Server $Pdc -Identity $Guid -Remove @{ $Attr = $remList } -Confirm:$false -ErrorAction Stop
+                $removed = $remList.Count
+            }
+            if ($addList.Count -gt 0) {
+                Set-ADObject -Server $Pdc -Identity $Guid -Add @{ $Attr = $addList } -Confirm:$false -ErrorAction Stop
+                $added = $addList.Count
+            }
         }
         $action = ("Added {0}; Removed {1}" -f $added, $removed)
         return @{ Ok = $true; Action = $action; Error = $null; Added = $added; Removed = $removed }
@@ -2420,8 +2461,13 @@ $btnRestore.Add_Click({
         return
     }
 
+    try { $grid.EndEdit() } catch { }
+    if ($grid.IsCurrentCellDirty) {
+        try { [void]$grid.CommitEdit([System.Windows.Forms.DataGridViewDataErrorContexts]::Commit) } catch { }
+    }
+
     $targets = Get-CheckedRestoreTargets
-    if ($targets.Count -lt 1) {
+    if ($null -eq $targets -or $targets.Count -lt 1) {
         Write-Status 'No changes checked. Tick the boxes next to the attributes you want to restore, or click Check Differences.' 'WARN'
         [System.Windows.Forms.MessageBox]::Show(
             "Check the box on each change you want to restore, then click Restore Checked.`r`n`r`nTip: use Check Differences to select all restorable differences, then uncheck any you want to skip.",
@@ -2442,7 +2488,9 @@ $btnRestore.Add_Click({
                         -PdcVal $t.PdcVal -R1Name $r1Name -R1Val $t.R1Val -R2Name $r2Name -R2Val $t.R2Val
         if (-not $sourceDc) { Write-Status 'Restore cancelled.' 'WARN'; return }
 
+        $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
         $res = Invoke-AttributeRestore -Guid $t.Guid -Attr $t.Attribute -SourceDc $sourceDc -Pdc $pdc
+        $form.Cursor = [System.Windows.Forms.Cursors]::Default
         if ($res.Ok) {
             Write-Status ("{0} '{1}' on '{2}' at PDC from '{3}'." -f $res.Action, $t.Attribute, $t.Object, $sourceDc)
             Write-Audit ("RESTORE obj='$($t.Object)' guid='$($t.Guid)' attr='$($t.Attribute)' action='$($res.Action)' source='$sourceDc' target-PDC='$pdc' oldPDCval='$($t.PdcVal)'")
