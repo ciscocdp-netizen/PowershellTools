@@ -766,67 +766,85 @@ $gbGroup.Controls.AddRange(@($rdoMemberOf,$rdoNotMember,$rdoNoGroup,$txtGroupSea
 # ---------------------------------------------------------------------------
 # 7. ENTRA ID (Microsoft Graph enrichment — Users only)
 # ---------------------------------------------------------------------------
-$gbEntra = New-GroupBox "Entra ID Enrichment" 198
+$gbEntra = New-GroupBox "Entra ID Enrichment" 228
 Add-LeftRow $gbEntra
 
 $chkEntraEnrich = New-Object System.Windows.Forms.CheckBox
 $chkEntraEnrich.Text = "Enrich Users with Entra ID after query"; $chkEntraEnrich.AutoSize = $true
-$chkEntraEnrich.Location = New-Object System.Drawing.Point(12,20); $chkEntraEnrich.BackColor = $Theme.Card
+$chkEntraEnrich.Location = New-Object System.Drawing.Point(12,18); $chkEntraEnrich.BackColor = $Theme.Card
 $chkEntraEnrich.Checked = $false
 
 $lblTenant = New-Object System.Windows.Forms.Label
 $lblTenant.Text = "Tenant:"; $lblTenant.AutoSize = $true; $lblTenant.Font = $fntSmall
 $lblTenant.ForeColor = $Theme.TextMuted; $lblTenant.BackColor = $Theme.Card
-$lblTenant.Location = New-Object System.Drawing.Point(12,48)
+$lblTenant.Location = New-Object System.Drawing.Point(12,44)
 
 $txtEntraTenant = New-Object System.Windows.Forms.TextBox
-$txtEntraTenant.Location = New-Object System.Drawing.Point(58,45); $txtEntraTenant.Width = 280; $txtEntraTenant.Height = 22
+$txtEntraTenant.Location = New-Object System.Drawing.Point(58,41); $txtEntraTenant.Width = 280; $txtEntraTenant.Height = 22
 $txtEntraTenant.Anchor = "Left,Right,Top"; $txtEntraTenant.BorderStyle = "FixedSingle"; $txtEntraTenant.Font = $fntSmall
-$txtEntraTenant.Text = "contoso.onmicrosoft.com"
-$txtEntraTenant.ForeColor = $Theme.TextMuted
-# Placeholder hint — cleared on focus if still default
 $script:EntraTenantPlaceholder = "contoso.onmicrosoft.com  (or Directory/Tenant ID GUID)"
 $txtEntraTenant.Text = $script:EntraTenantPlaceholder
+$txtEntraTenant.ForeColor = $Theme.TextMuted
+
+$lblClient = New-Object System.Windows.Forms.Label
+$lblClient.Text = "App ID:"; $lblClient.AutoSize = $true; $lblClient.Font = $fntSmall
+$lblClient.ForeColor = $Theme.TextMuted; $lblClient.BackColor = $Theme.Card
+$lblClient.Location = New-Object System.Drawing.Point(12,70)
+
+# Default = Microsoft Graph PowerShell public client. Tenants that block it need
+# their own App Registration (public client + admin consent) — paste that GUID here.
+$script:DefaultGraphClientId = "14d82eec-204b-4c2f-b113-9d477e6ee18c"
+$txtEntraClientId = New-Object System.Windows.Forms.TextBox
+$txtEntraClientId.Location = New-Object System.Drawing.Point(58,67); $txtEntraClientId.Width = 220; $txtEntraClientId.Height = 22
+$txtEntraClientId.Anchor = "Left,Right,Top"; $txtEntraClientId.BorderStyle = "FixedSingle"; $txtEntraClientId.Font = $fntMono
+$txtEntraClientId.Text = $script:DefaultGraphClientId
+$txtEntraClientId.ForeColor = $Theme.Text
+
+$btnEntraConsent = New-Object System.Windows.Forms.Button
+$btnEntraConsent.Text = "Consent"; $btnEntraConsent.Width = 56; $btnEntraConsent.Height = 22
+$btnEntraConsent.Location = New-Object System.Drawing.Point(282,67); $btnEntraConsent.Anchor = "Right,Top"
+Set-SubtleButtonStyle $btnEntraConsent
 
 $btnEntraConnect = New-Object System.Windows.Forms.Button
 $btnEntraConnect.Text = "Connect Graph"; $btnEntraConnect.Width = 110; $btnEntraConnect.Height = 24
-$btnEntraConnect.Location = New-Object System.Drawing.Point(12,74)
+$btnEntraConnect.Location = New-Object System.Drawing.Point(12,96)
 Set-SecondaryButtonStyle $btnEntraConnect
 
 $btnEntraDisconnect = New-Object System.Windows.Forms.Button
 $btnEntraDisconnect.Text = "Disconnect"; $btnEntraDisconnect.Width = 90; $btnEntraDisconnect.Height = 24
-$btnEntraDisconnect.Location = New-Object System.Drawing.Point(128,74)
+$btnEntraDisconnect.Location = New-Object System.Drawing.Point(128,96)
 Set-SubtleButtonStyle $btnEntraDisconnect
 
 $lblEntraStatus = New-Object System.Windows.Forms.Label
 $lblEntraStatus.Text = "Not connected"; $lblEntraStatus.AutoSize = $true; $lblEntraStatus.Font = $fntSmall
 $lblEntraStatus.ForeColor = $Theme.TextMuted; $lblEntraStatus.BackColor = $Theme.Card
-$lblEntraStatus.Location = New-Object System.Drawing.Point(226,78)
+$lblEntraStatus.Location = New-Object System.Drawing.Point(226,100)
 
 $chkEntraRoles = New-Object System.Windows.Forms.CheckBox
 $chkEntraRoles.Text = "Assigned roles"; $chkEntraRoles.AutoSize = $true; $chkEntraRoles.Checked = $true
-$chkEntraRoles.Location = New-Object System.Drawing.Point(12,106); $chkEntraRoles.BackColor = $Theme.Card
+$chkEntraRoles.Location = New-Object System.Drawing.Point(12,128); $chkEntraRoles.BackColor = $Theme.Card
 
 $chkEntraDevices = New-Object System.Windows.Forms.CheckBox
 $chkEntraDevices.Text = "Devices"; $chkEntraDevices.AutoSize = $true; $chkEntraDevices.Checked = $true
-$chkEntraDevices.Location = New-Object System.Drawing.Point(130,106); $chkEntraDevices.BackColor = $Theme.Card
+$chkEntraDevices.Location = New-Object System.Drawing.Point(130,128); $chkEntraDevices.BackColor = $Theme.Card
 
 $chkEntraAuth = New-Object System.Windows.Forms.CheckBox
 $chkEntraAuth.Text = "Auth methods"; $chkEntraAuth.AutoSize = $true; $chkEntraAuth.Checked = $true
-$chkEntraAuth.Location = New-Object System.Drawing.Point(210,106); $chkEntraAuth.BackColor = $Theme.Card
+$chkEntraAuth.Location = New-Object System.Drawing.Point(210,128); $chkEntraAuth.BackColor = $Theme.Card
 
 $chkEntraFailSignIn = New-Object System.Windows.Forms.CheckBox
 $chkEntraFailSignIn.Text = "Last failed sign-in (code, time, app, location, IP)"; $chkEntraFailSignIn.AutoSize = $true
 $chkEntraFailSignIn.Checked = $true
-$chkEntraFailSignIn.Location = New-Object System.Drawing.Point(12,132); $chkEntraFailSignIn.BackColor = $Theme.Card
+$chkEntraFailSignIn.Location = New-Object System.Drawing.Point(12,154); $chkEntraFailSignIn.BackColor = $Theme.Card
 
 $btnEntraEnrichNow = New-Object System.Windows.Forms.Button
 $btnEntraEnrichNow.Text = "Enrich Current Results"; $btnEntraEnrichNow.Width = 160; $btnEntraEnrichNow.Height = 26
-$btnEntraEnrichNow.Location = New-Object System.Drawing.Point(12,160)
+$btnEntraEnrichNow.Location = New-Object System.Drawing.Point(12,182)
 Set-SecondaryButtonStyle $btnEntraEnrichNow
 
 $gbEntra.Controls.AddRange(@(
-    $chkEntraEnrich,$lblTenant,$txtEntraTenant,$btnEntraConnect,$btnEntraDisconnect,$lblEntraStatus,
+    $chkEntraEnrich,$lblTenant,$txtEntraTenant,$lblClient,$txtEntraClientId,$btnEntraConsent,
+    $btnEntraConnect,$btnEntraDisconnect,$lblEntraStatus,
     $chkEntraRoles,$chkEntraDevices,$chkEntraAuth,$chkEntraFailSignIn,$btnEntraEnrichNow
 ))
 
@@ -1729,9 +1747,10 @@ function Populate-Grid {
 # ===========================================================================
 # ENTRA ID / MICROSOFT GRAPH
 # ===========================================================================
-# Uses the public Microsoft Graph PowerShell client id for device-code auth
-# (same app used by Connect-MgGraph). No app registration required for
-# interactive delegated access; admin consent may still be needed for scopes.
+# Device-code auth. Default App ID is Microsoft Graph PowerShell
+# (14d82eec-204b-4c2f-b113-9d477e6ee18c). If the tenant returns AADSTS700016,
+# an admin must consent that app OR register a public-client app in the tenant
+# and paste its Application (client) ID into App ID.
 $script:GraphClientId = "14d82eec-204b-4c2f-b113-9d477e6ee18c"
 $script:GraphScopes = @(
     "User.Read.All",
@@ -1771,6 +1790,75 @@ function Get-EntraTenantId {
     return $null
 }
 
+function Get-EntraClientId {
+    $c = if ($null -ne $txtEntraClientId.Text) { $txtEntraClientId.Text.Trim() } else { "" }
+    if ($c -match '^[0-9a-fA-F-]{36}$') { return $c.ToLowerInvariant() }
+    if ($script:DefaultGraphClientId) { return $script:DefaultGraphClientId }
+    return $script:GraphClientId
+}
+
+function Show-EntraAppSetupHelp {
+    param([string]$Tenant, [string]$ClientId, [string]$ErrorText)
+
+    $consentUrl = "https://login.microsoftonline.com/$Tenant/adminconsent?client_id=$ClientId"
+    $msg = @"
+Graph connect failed (AADSTS700016 / app not found in tenant).
+
+The App ID is not available in this directory yet. Fix one of these ways:
+
+OPTION A — Admin consent for Microsoft Graph PowerShell
+1. Sign in as a Global Admin / Cloud App Admin
+2. Open this URL (also offered on OK):
+$consentUrl
+3. Accept the permissions, then Connect Graph again
+
+OPTION B — Use your own App Registration (recommended for locked-down tenants)
+1. Entra admin center → App registrations → New registration
+2. Accounts in this organizational directory only
+3. Authentication → Allow public client flows = Yes
+4. API permissions → Microsoft Graph (delegated):
+   User.Read.All, Directory.Read.All, AuditLog.Read.All,
+   UserAuthenticationMethod.Read.All, Device.Read.All,
+   RoleManagement.Read.Directory
+5. Grant admin consent
+6. Paste the Application (client) ID into the App ID box, then Connect
+
+Raw error:
+$ErrorText
+"@
+    $ask = [System.Windows.Forms.MessageBox]::Show(
+        $msg + "`r`n`r`nOpen the admin consent URL in your browser now?",
+        "Entra ID — App not in tenant",
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning)
+    if ($ask -eq "Yes") {
+        try { Start-Process $consentUrl } catch {
+            [System.Windows.Forms.Clipboard]::SetText($consentUrl)
+            [System.Windows.Forms.MessageBox]::Show("Could not open browser. Consent URL copied to clipboard.", "Entra ID",
+                [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+        }
+    }
+}
+
+function Open-EntraAdminConsent {
+    $tenant = Get-EntraTenantId
+    if (-not $tenant) {
+        [System.Windows.Forms.MessageBox]::Show("Enter Tenant (domain or GUID) first, then click Consent.", "Entra ID",
+            [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+        return
+    }
+    $clientId = Get-EntraClientId
+    $consentUrl = "https://login.microsoftonline.com/$tenant/adminconsent?client_id=$clientId"
+    $msg = "This opens the admin consent page for App ID:`r`n$clientId`r`n`r`nTenant: $tenant`r`n`r`nYou must sign in as an admin who can grant consent."
+    [System.Windows.Forms.MessageBox]::Show($msg, "Admin consent",
+        [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    try { Start-Process $consentUrl } catch {
+        try { [System.Windows.Forms.Clipboard]::SetText($consentUrl) } catch { }
+        [System.Windows.Forms.MessageBox]::Show("Could not open browser. URL copied to clipboard:`r`n$consentUrl", "Entra ID",
+            [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+    }
+}
+
 function Connect-EntraGraph {
     # Device-code flow against a specific tenant (AADSTS50059 if tenant is missing)
     try {
@@ -1778,10 +1866,12 @@ function Connect-EntraGraph {
         if (-not $tenant) {
             throw "Enter your Entra tenant domain (e.g. contoso.onmicrosoft.com) or Directory (tenant) ID GUID in the Tenant box, then Connect again."
         }
+        $clientId = Get-EntraClientId
+        $script:GraphClientId = $clientId
 
         $authority = "https://login.microsoftonline.com/$tenant"
         $dcBody = @{
-            client_id = $script:GraphClientId
+            client_id = $clientId
             scope     = $script:GraphScopes
         }
         $dc = Invoke-RestMethod -Method Post -Uri "$authority/oauth2/v2.0/devicecode" `
@@ -1791,6 +1881,7 @@ function Connect-EntraGraph {
 
         $msg = "Sign in to Microsoft Graph for Entra enrichment.`r`n`r`n" +
                "Tenant: $tenant`r`n" +
+               "App ID: $clientId`r`n" +
                "1. Open: $($dc.verification_uri)`r`n" +
                "2. Enter code: $($dc.user_code)  (copied to clipboard)`r`n`r`n" +
                "Click OK to start waiting (up to $([int]($dc.expires_in / 60)) min) while you finish in the browser."
@@ -1807,7 +1898,7 @@ function Connect-EntraGraph {
             try {
                 $tokBody = @{
                     grant_type  = "urn:ietf:params:oauth:grant-type:device_code"
-                    client_id   = $script:GraphClientId
+                    client_id   = $clientId
                     device_code = $dc.device_code
                 }
                 $token = Invoke-RestMethod -Method Post -Uri "$authority/oauth2/v2.0/token" `
@@ -1852,8 +1943,20 @@ function Connect-EntraGraph {
         Stop-Progress
         $script:EntraAccessToken = $null
         Update-EntraStatusLabel
-        [System.Windows.Forms.MessageBox]::Show("Graph connect failed:`r`n$_", "Entra ID",
-            [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+        $err = "$_"
+        $tenantForHelp = Get-EntraTenantId
+        $clientForHelp = Get-EntraClientId
+        if ($err -match 'AADSTS700016|unauthorized_client|was not found in the directory') {
+            if ($tenantForHelp) {
+                Show-EntraAppSetupHelp -Tenant $tenantForHelp -ClientId $clientForHelp -ErrorText $err
+            } else {
+                [System.Windows.Forms.MessageBox]::Show("Graph connect failed:`r`n$err", "Entra ID",
+                    [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+            }
+        } else {
+            [System.Windows.Forms.MessageBox]::Show("Graph connect failed:`r`n$err", "Entra ID",
+                [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+        }
     }
 }
 
@@ -2181,6 +2284,7 @@ function Invoke-EntraEnrichment {
 foreach ($c in @($chkEntraEnrich,$chkEntraRoles,$chkEntraDevices,$chkEntraAuth,$chkEntraFailSignIn)) {
     $c.Add_CheckedChanged({ Update-FilterPreview })
 }
+$btnEntraConsent.Add_Click({ Open-EntraAdminConsent })
 $btnEntraConnect.Add_Click({ Connect-EntraGraph })
 $btnEntraDisconnect.Add_Click({ Disconnect-EntraGraph })
 $btnEntraEnrichNow.Add_Click({

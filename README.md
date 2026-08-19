@@ -27,9 +27,18 @@ Interactive WinForms GUI for querying Active Directory (Users, Groups, Computers
    - Devices (registered / owned)
    - Authentication methods
    - Last failed sign-in (error code, time, app, location, IP)
-3. Enter your **Tenant** domain (e.g. `contoso.onmicrosoft.com`) or Directory (tenant) ID GUID — required to avoid AADSTS50059
-4. Click **Connect Graph** and complete device-code sign-in in the browser
-5. Either check **Enrich Users with Entra ID after query** and **Run Query**, or run a query first and click **Enrich Current Results**
-6. Entra columns also appear under **Columns** and can be exported to CSV
+3. Enter your **Tenant** domain (e.g. `contoso.onmicrosoft.com`) or Directory (tenant) ID GUID
+4. **App ID** defaults to Microsoft Graph PowerShell (`14d82eec-204b-4c2f-b113-9d477e6ee18c`)
+   - If you get **AADSTS700016** (app not found in directory): click **Consent** as an admin, **or** register your own public-client app in the tenant and paste its Application (client) ID into **App ID**
+5. Click **Connect Graph** and complete device-code sign-in in the browser
+6. Either check **Enrich Users with Entra ID after query** and **Run Query**, or run a query first and click **Enrich Current Results**
+7. Entra columns also appear under **Columns** and can be exported to CSV
+
+#### Own app registration (locked-down tenants)
+
+1. Entra admin center → **App registrations** → New registration (this org only)
+2. **Authentication** → Allow public client flows = **Yes**
+3. **API permissions** → Microsoft Graph (delegated) — the scopes listed above → **Grant admin consent**
+4. Copy **Application (client) ID** into the tool’s **App ID** box
 
 Matching uses `UserPrincipalName` / `EmailAddress` against Entra.
