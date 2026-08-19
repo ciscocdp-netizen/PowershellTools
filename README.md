@@ -27,8 +27,9 @@ Interactive WinForms GUI for querying Active Directory (Users, Groups, Computers
    - Devices (registered / owned)
    - Authentication methods
    - Last failed sign-in (error code, time, app, location, IP)
-3. Click **Connect Graph** and complete device-code sign-in in the browser
-4. Either check **Enrich Users with Entra ID after query** and **Run Query**, or run a query first and click **Enrich Current Results**
-5. Entra columns also appear under **Columns** and can be exported to CSV
+3. Enter your **Tenant** domain (e.g. `contoso.onmicrosoft.com`) or Directory (tenant) ID GUID — required to avoid AADSTS50059
+4. Click **Connect Graph** and complete device-code sign-in in the browser
+5. Either check **Enrich Users with Entra ID after query** and **Run Query**, or run a query first and click **Enrich Current Results**
+6. Entra columns also appear under **Columns** and can be exported to CSV
 
 Matching uses `UserPrincipalName` / `EmailAddress` against Entra.

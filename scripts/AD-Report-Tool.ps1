@@ -218,6 +218,7 @@ $script:IsRunning      = $false
 $script:EntraAccessToken = $null
 $script:EntraTokenExpires = [datetime]::MinValue
 $script:EntraAccountUpn = ""
+$script:EntraTenant = ""
 
 $DEFAULT_COLS["Users"] | ForEach-Object { $script:VisibleColumns.Add($_) }
 
@@ -765,55 +766,80 @@ $gbGroup.Controls.AddRange(@($rdoMemberOf,$rdoNotMember,$rdoNoGroup,$txtGroupSea
 # ---------------------------------------------------------------------------
 # 7. ENTRA ID (Microsoft Graph enrichment — Users only)
 # ---------------------------------------------------------------------------
-$gbEntra = New-GroupBox "Entra ID Enrichment" 168
+$gbEntra = New-GroupBox "Entra ID Enrichment" 198
 Add-LeftRow $gbEntra
 
 $chkEntraEnrich = New-Object System.Windows.Forms.CheckBox
 $chkEntraEnrich.Text = "Enrich Users with Entra ID after query"; $chkEntraEnrich.AutoSize = $true
-$chkEntraEnrich.Location = New-Object System.Drawing.Point(12,22); $chkEntraEnrich.BackColor = $Theme.Card
+$chkEntraEnrich.Location = New-Object System.Drawing.Point(12,20); $chkEntraEnrich.BackColor = $Theme.Card
 $chkEntraEnrich.Checked = $false
+
+$lblTenant = New-Object System.Windows.Forms.Label
+$lblTenant.Text = "Tenant:"; $lblTenant.AutoSize = $true; $lblTenant.Font = $fntSmall
+$lblTenant.ForeColor = $Theme.TextMuted; $lblTenant.BackColor = $Theme.Card
+$lblTenant.Location = New-Object System.Drawing.Point(12,48)
+
+$txtEntraTenant = New-Object System.Windows.Forms.TextBox
+$txtEntraTenant.Location = New-Object System.Drawing.Point(58,45); $txtEntraTenant.Width = 280; $txtEntraTenant.Height = 22
+$txtEntraTenant.Anchor = "Left,Right,Top"; $txtEntraTenant.BorderStyle = "FixedSingle"; $txtEntraTenant.Font = $fntSmall
+$txtEntraTenant.Text = "contoso.onmicrosoft.com"
+$txtEntraTenant.ForeColor = $Theme.TextMuted
+# Placeholder hint — cleared on focus if still default
+$script:EntraTenantPlaceholder = "contoso.onmicrosoft.com  (or Directory/Tenant ID GUID)"
+$txtEntraTenant.Text = $script:EntraTenantPlaceholder
 
 $btnEntraConnect = New-Object System.Windows.Forms.Button
 $btnEntraConnect.Text = "Connect Graph"; $btnEntraConnect.Width = 110; $btnEntraConnect.Height = 24
-$btnEntraConnect.Location = New-Object System.Drawing.Point(12,46)
+$btnEntraConnect.Location = New-Object System.Drawing.Point(12,74)
 Set-SecondaryButtonStyle $btnEntraConnect
 
 $btnEntraDisconnect = New-Object System.Windows.Forms.Button
 $btnEntraDisconnect.Text = "Disconnect"; $btnEntraDisconnect.Width = 90; $btnEntraDisconnect.Height = 24
-$btnEntraDisconnect.Location = New-Object System.Drawing.Point(128,46)
+$btnEntraDisconnect.Location = New-Object System.Drawing.Point(128,74)
 Set-SubtleButtonStyle $btnEntraDisconnect
 
 $lblEntraStatus = New-Object System.Windows.Forms.Label
 $lblEntraStatus.Text = "Not connected"; $lblEntraStatus.AutoSize = $true; $lblEntraStatus.Font = $fntSmall
 $lblEntraStatus.ForeColor = $Theme.TextMuted; $lblEntraStatus.BackColor = $Theme.Card
-$lblEntraStatus.Location = New-Object System.Drawing.Point(226,50)
+$lblEntraStatus.Location = New-Object System.Drawing.Point(226,78)
 
 $chkEntraRoles = New-Object System.Windows.Forms.CheckBox
 $chkEntraRoles.Text = "Assigned roles"; $chkEntraRoles.AutoSize = $true; $chkEntraRoles.Checked = $true
-$chkEntraRoles.Location = New-Object System.Drawing.Point(12,78); $chkEntraRoles.BackColor = $Theme.Card
+$chkEntraRoles.Location = New-Object System.Drawing.Point(12,106); $chkEntraRoles.BackColor = $Theme.Card
 
 $chkEntraDevices = New-Object System.Windows.Forms.CheckBox
 $chkEntraDevices.Text = "Devices"; $chkEntraDevices.AutoSize = $true; $chkEntraDevices.Checked = $true
-$chkEntraDevices.Location = New-Object System.Drawing.Point(130,78); $chkEntraDevices.BackColor = $Theme.Card
+$chkEntraDevices.Location = New-Object System.Drawing.Point(130,106); $chkEntraDevices.BackColor = $Theme.Card
 
 $chkEntraAuth = New-Object System.Windows.Forms.CheckBox
 $chkEntraAuth.Text = "Auth methods"; $chkEntraAuth.AutoSize = $true; $chkEntraAuth.Checked = $true
-$chkEntraAuth.Location = New-Object System.Drawing.Point(210,78); $chkEntraAuth.BackColor = $Theme.Card
+$chkEntraAuth.Location = New-Object System.Drawing.Point(210,106); $chkEntraAuth.BackColor = $Theme.Card
 
 $chkEntraFailSignIn = New-Object System.Windows.Forms.CheckBox
 $chkEntraFailSignIn.Text = "Last failed sign-in (code, time, app, location, IP)"; $chkEntraFailSignIn.AutoSize = $true
 $chkEntraFailSignIn.Checked = $true
-$chkEntraFailSignIn.Location = New-Object System.Drawing.Point(12,104); $chkEntraFailSignIn.BackColor = $Theme.Card
+$chkEntraFailSignIn.Location = New-Object System.Drawing.Point(12,132); $chkEntraFailSignIn.BackColor = $Theme.Card
 
 $btnEntraEnrichNow = New-Object System.Windows.Forms.Button
 $btnEntraEnrichNow.Text = "Enrich Current Results"; $btnEntraEnrichNow.Width = 160; $btnEntraEnrichNow.Height = 26
-$btnEntraEnrichNow.Location = New-Object System.Drawing.Point(12,132)
+$btnEntraEnrichNow.Location = New-Object System.Drawing.Point(12,160)
 Set-SecondaryButtonStyle $btnEntraEnrichNow
 
 $gbEntra.Controls.AddRange(@(
-    $chkEntraEnrich,$btnEntraConnect,$btnEntraDisconnect,$lblEntraStatus,
+    $chkEntraEnrich,$lblTenant,$txtEntraTenant,$btnEntraConnect,$btnEntraDisconnect,$lblEntraStatus,
     $chkEntraRoles,$chkEntraDevices,$chkEntraAuth,$chkEntraFailSignIn,$btnEntraEnrichNow
 ))
+
+$txtEntraTenant.Add_GotFocus({
+    if ($txtEntraTenant.Text -eq $script:EntraTenantPlaceholder) {
+        $txtEntraTenant.Text = ""; $txtEntraTenant.ForeColor = $Theme.Text
+    }
+})
+$txtEntraTenant.Add_LostFocus({
+    if ([string]::IsNullOrWhiteSpace($txtEntraTenant.Text)) {
+        $txtEntraTenant.Text = $script:EntraTenantPlaceholder; $txtEntraTenant.ForeColor = $Theme.TextMuted
+    }
+})
 
 # ---------------------------------------------------------------------------
 # 8. LIVE FILTER PREVIEW
@@ -1736,19 +1762,37 @@ function Update-EntraStatusLabel {
     }
 }
 
+function Get-EntraTenantId {
+    $t = if ($null -ne $txtEntraTenant.Text) { $txtEntraTenant.Text.Trim() } else { "" }
+    if (-not $t -or $t -eq $script:EntraTenantPlaceholder) { return $null }
+    # Accept GUID or domain (contoso.onmicrosoft.com / contoso.com)
+    if ($t -match '^[0-9a-fA-F-]{36}$') { return $t.ToLowerInvariant() }
+    if ($t -match '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$') { return $t.ToLowerInvariant() }
+    return $null
+}
+
 function Connect-EntraGraph {
-    # Device-code flow against login.microsoftonline.com (works on PS 5.1, no MSAL module)
+    # Device-code flow against a specific tenant (AADSTS50059 if tenant is missing)
     try {
+        $tenant = Get-EntraTenantId
+        if (-not $tenant) {
+            throw "Enter your Entra tenant domain (e.g. contoso.onmicrosoft.com) or Directory (tenant) ID GUID in the Tenant box, then Connect again."
+        }
+
+        $authority = "https://login.microsoftonline.com/$tenant"
         $dcBody = @{
             client_id = $script:GraphClientId
             scope     = $script:GraphScopes
         }
-        $dc = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/organizations/oauth2/v2.0/devicecode" `
+        $dc = Invoke-RestMethod -Method Post -Uri "$authority/oauth2/v2.0/devicecode" `
             -ContentType "application/x-www-form-urlencoded" -Body $dcBody -ErrorAction Stop
 
+        try { [System.Windows.Forms.Clipboard]::SetText([string]$dc.user_code) } catch { }
+
         $msg = "Sign in to Microsoft Graph for Entra enrichment.`r`n`r`n" +
+               "Tenant: $tenant`r`n" +
                "1. Open: $($dc.verification_uri)`r`n" +
-               "2. Enter code: $($dc.user_code)`r`n`r`n" +
+               "2. Enter code: $($dc.user_code)  (copied to clipboard)`r`n`r`n" +
                "Click OK to start waiting (up to $([int]($dc.expires_in / 60)) min) while you finish in the browser."
         [System.Windows.Forms.MessageBox]::Show($msg, "Connect to Entra ID",
             [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
@@ -1766,7 +1810,7 @@ function Connect-EntraGraph {
                     client_id   = $script:GraphClientId
                     device_code = $dc.device_code
                 }
-                $token = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/organizations/oauth2/v2.0/token" `
+                $token = Invoke-RestMethod -Method Post -Uri "$authority/oauth2/v2.0/token" `
                     -ContentType "application/x-www-form-urlencoded" -Body $tokBody -ErrorAction Stop
                 break
             } catch {
@@ -1794,6 +1838,7 @@ function Connect-EntraGraph {
         $script:EntraAccessToken = $token.access_token
         $script:EntraTokenExpires = [datetime]::UtcNow.AddSeconds([int]$token.expires_in)
         $script:EntraAccountUpn = ""
+        $script:EntraTenant = $tenant
         try {
             $me = Invoke-GraphGet -Uri "https://graph.microsoft.com/v1.0/me?`$select=userPrincipalName,displayName"
             if ($me.userPrincipalName) { $script:EntraAccountUpn = [string]$me.userPrincipalName }
@@ -1801,7 +1846,7 @@ function Connect-EntraGraph {
         } catch { }
 
         Update-EntraStatusLabel
-        [System.Windows.Forms.MessageBox]::Show("Connected to Microsoft Graph.", "Entra ID",
+        [System.Windows.Forms.MessageBox]::Show("Connected to Microsoft Graph ($tenant).", "Entra ID",
             [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
     } catch {
         Stop-Progress
@@ -2749,6 +2794,16 @@ $Form.Add_Shown({
     if ($script:FilterGroups.Count -eq 0) { $script:FilterGroups.Add((New-FilterGroup)) }
     Update-GroupMembershipPanel
     $gbEntra.Visible = ($script:CurrentObjType -eq "Users")
+    # Prefill tenant from AD DNS root when possible (e.g. contoso.com)
+    try {
+        if ($txtEntraTenant.Text -eq $script:EntraTenantPlaceholder) {
+            $dns = [string](Get-ADDomain -ErrorAction Stop).DNSRoot
+            if ($dns) {
+                $txtEntraTenant.Text = $dns
+                $txtEntraTenant.ForeColor = $Theme.Text
+            }
+        }
+    } catch { }
     Update-EntraStatusLabel
     Rebuild-FilterContainer
 })
