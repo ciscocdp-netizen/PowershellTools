@@ -13,7 +13,8 @@ Interactive WinForms GUI for querying Active Directory (Users, Groups, Computers
 - ActiveDirectory RSAT module
 - For Entra: install **one** of these (browser sign-in):
   ```powershell
-  Install-Module Microsoft.Graph -Scope CurrentUser
+  Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
+  # or full Graph SDK (heavier): Install-Module Microsoft.Graph -Scope CurrentUser
   # or
   Install-Module Az.Accounts -Scope CurrentUser
   ```

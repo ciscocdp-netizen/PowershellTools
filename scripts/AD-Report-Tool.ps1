@@ -1750,17 +1750,27 @@ function ConvertFrom-SecureToken {
 }
 
 function Import-EntraGraphModule {
-    foreach ($name in @("Microsoft.Graph.Authentication", "Microsoft.Graph")) {
-        if (Get-Module -Name $name -ListAvailable -ErrorAction SilentlyContinue) {
-            Import-Module $name -ErrorAction SilentlyContinue | Out-Null
-        }
+    # Connect-MgGraph / Invoke-MgGraphRequest live in Microsoft.Graph.Authentication.
+    # Never Import-Module Microsoft.Graph (meta-module) — it loads hundreds of
+    # submodules and can freeze the UI for minutes.
+    if (Get-Command Connect-MgGraph -ErrorAction SilentlyContinue) { return $true }
+    try {
+        Import-Module Microsoft.Graph.Authentication -ErrorAction Stop | Out-Null
+    } catch {
+        return $false
     }
     return [bool](Get-Command Connect-MgGraph -ErrorAction SilentlyContinue)
 }
 
 function Import-EntraAzModule {
-    if (Get-Module -Name Az.Accounts -ListAvailable -ErrorAction SilentlyContinue) {
-        Import-Module Az.Accounts -ErrorAction SilentlyContinue | Out-Null
+    if (
+        (Get-Command Connect-AzAccount -ErrorAction SilentlyContinue) -and
+        (Get-Command Get-AzAccessToken -ErrorAction SilentlyContinue)
+    ) { return $true }
+    try {
+        Import-Module Az.Accounts -ErrorAction Stop | Out-Null
+    } catch {
+        return $false
     }
     return (
         [bool](Get-Command Connect-AzAccount -ErrorAction SilentlyContinue) -and
@@ -1773,6 +1783,17 @@ function Test-EntraConnected {
         try {
             $ctx = Get-MgContext -ErrorAction Stop
             return ($null -ne $ctx -and $ctx.Account)
+        } catch { return $false }
+    }
+    if ($script:EntraAuthMode -eq "Az") {
+        # Session can be attached before a Graph token is fetched (lazy).
+        if ($script:EntraAccessToken -and [datetime]::UtcNow -lt $script:EntraTokenExpires.AddMinutes(-2)) {
+            return $true
+        }
+        try {
+            if (-not (Get-Command Get-AzContext -ErrorAction SilentlyContinue)) { return $false }
+            $ctx = Get-AzContext -ErrorAction SilentlyContinue
+            return ($null -ne $ctx -and $null -ne $ctx.Account)
         } catch { return $false }
     }
     if (-not $script:EntraAccessToken) { return $false }
@@ -1823,11 +1844,12 @@ function Set-EntraAzSession {
     return $true
 }
 
-# Pick up an already-open MgGraph / Az session so Sign in is not required again.
+# Pick up an already-open MgGraph / Az session. Does NOT Import-Module —
+# module import belongs only to explicit Sign in (keeps UI startup fast).
 function Attach-EntraExistingSession {
     if (Test-EntraConnected) { Update-EntraStatusLabel; return $true }
 
-    if (Import-EntraGraphModule) {
+    if (Get-Command Get-MgContext -ErrorAction SilentlyContinue) {
         try {
             $ctx = Get-MgContext -ErrorAction SilentlyContinue
             if ($ctx -and $ctx.Account -and (Set-EntraMgGraphSession $ctx)) {
@@ -1837,17 +1859,18 @@ function Attach-EntraExistingSession {
         } catch { }
     }
 
-    if (Import-EntraAzModule) {
+    if (Get-Command Get-AzContext -ErrorAction SilentlyContinue) {
         try {
             $azCtx = Get-AzContext -ErrorAction SilentlyContinue
-            if ($azCtx) {
-                $tokObj = Get-AzAccessToken -ResourceUrl "https://graph.microsoft.com" -ErrorAction Stop
-                $acct = ""
-                try { if ($azCtx.Account.Id) { $acct = [string]$azCtx.Account.Id } } catch { }
-                if (Set-EntraAzSession -TokenObject $tokObj -AccountUpn $acct) {
-                    Update-EntraStatusLabel
-                    return $true
-                }
+            if ($azCtx -and $azCtx.Account) {
+                # Do not call Get-AzAccessToken here — it can hang on network refresh.
+                # Token is fetched lazily in Invoke-GraphGet.
+                $script:EntraAuthMode = "Az"
+                $script:EntraAccessToken = $null
+                $script:EntraTokenExpires = [datetime]::UtcNow.AddMinutes(-30)
+                try { $script:EntraAccountUpn = [string]$azCtx.Account.Id } catch { }
+                Update-EntraStatusLabel
+                return $true
             }
         } catch { }
     }
@@ -2116,15 +2139,23 @@ function Invoke-GraphGet {
         if ($script:EntraAuthMode -eq "MgGraph") {
             $resp = Invoke-MgGraphRequest -Method GET -Uri $next -OutputType PSObject -ErrorAction Stop
         } else {
-            # Refresh Az token if close to expiry
-            if ($script:EntraAuthMode -eq "Az" -and [datetime]::UtcNow -ge $script:EntraTokenExpires.AddMinutes(-5)) {
+            # Refresh Az token if missing or close to expiry (lazy attach leaves token empty)
+            if ($script:EntraAuthMode -eq "Az" -and (
+                    -not $script:EntraAccessToken -or
+                    [datetime]::UtcNow -ge $script:EntraTokenExpires.AddMinutes(-5)
+                )) {
                 try {
                     $tokObj = Get-AzAccessToken -ResourceUrl "https://graph.microsoft.com" -ErrorAction Stop
                     $script:EntraAccessToken = ConvertFrom-SecureToken $tokObj
                     if ($tokObj.PSObject.Properties['ExpiresOn'] -and $tokObj.ExpiresOn) {
                         $script:EntraTokenExpires = ([datetime]$tokObj.ExpiresOn).ToUniversalTime()
+                    } else {
+                        $script:EntraTokenExpires = [datetime]::UtcNow.AddMinutes(45)
                     }
                 } catch { }
+            }
+            if (-not $script:EntraAccessToken) {
+                throw "No Graph access token. Click Sign in to Entra ID."
             }
             $headers = @{
                 Authorization    = "Bearer $($script:EntraAccessToken)"
@@ -3044,24 +3075,40 @@ function Load-SchemaAttributes {
 # STARTUP
 # ===========================================================================
 $Form.Add_Shown({
-    Load-SchemaAttributes
+    # Paint the UI first with curated attributes — do not block on Graph module
+    # imports or full AD schema enumeration (those made launch feel hung).
     $script:VisibleColumns.Clear()
     foreach ($col in $DEFAULT_COLS[$script:CurrentObjType]) { $script:VisibleColumns.Add($col) }
     $sState.Text = "Ready"
     if ($script:FilterGroups.Count -eq 0) { $script:FilterGroups.Add((New-FilterGroup)) }
     Update-GroupMembershipPanel
     $gbEntra.Visible = ($script:CurrentObjType -eq "Users")
-    # Soft-default tenant for device-code fallback only
-    try {
-        if (-not $script:EntraPreferredTenant) {
-            $dns = [string](Get-ADDomain -ErrorAction Stop).DNSRoot
-            if ($dns) { $script:EntraPreferredTenant = $dns }
-        }
-    } catch { }
-    # Reuse an existing Connect-MgGraph / Connect-AzAccount session if present
-    [void](Attach-EntraExistingSession)
     Update-EntraStatusLabel
     Rebuild-FilterContainer
+    $Form.Refresh()
+
+    # Defer AD schema merge + tenant hint so the window is interactive immediately
+    $script:StartupTimer = New-Object System.Windows.Forms.Timer
+    $script:StartupTimer.Interval = 75
+    $script:StartupTimer.Add_Tick({
+        $script:StartupTimer.Stop()
+        try { $script:StartupTimer.Dispose() } catch { }
+        $script:StartupTimer = $null
+        try {
+            Load-SchemaAttributes
+        } catch { }
+        try {
+            if (-not $script:EntraPreferredTenant) {
+                $dns = [string](Get-ADDomain -ErrorAction Stop).DNSRoot
+                if ($dns) { $script:EntraPreferredTenant = $dns }
+            }
+        } catch { }
+        # Only attach if Graph/Az cmds are already loaded in this process (no Import-Module)
+        try { [void](Attach-EntraExistingSession) } catch { }
+        Update-EntraStatusLabel
+        $sState.Text = "Ready"
+    })
+    $script:StartupTimer.Start()
 })
 
 # Rebuild filter rows on resize so the value inputs stretch to the new width
