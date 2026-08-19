@@ -1884,7 +1884,7 @@ function Show-EntraAdvancedOptions {
     $f.MaximizeBox = $false; $f.MinimizeBox = $false; $f.Font = $fntNormal; $f.BackColor = $Theme.Card
 
     $l1 = New-Object System.Windows.Forms.Label
-    $l1.Text = "Tenant (optional — leave blank for browser / common sign-in):"
+    $l1.Text = "Entra tenant (optional — leave blank; do NOT use on-prem AD DNS):"
     $l1.AutoSize = $true; $l1.Location = New-Object System.Drawing.Point(12,14)
 
     $tTenant = New-Object System.Windows.Forms.TextBox
@@ -1900,7 +1900,7 @@ function Show-EntraAdvancedOptions {
     $tApp.Text = $script:EntraCustomClientId
 
     $hint = New-Object System.Windows.Forms.Label
-    $hint.Text = "Normal use: leave both blank and click Sign in to Entra ID."
+    $hint.Text = "Example: contoso.onmicrosoft.com or a Tenant ID GUID. Leave blank for normal sign-in."
     $hint.AutoSize = $true; $hint.ForeColor = $Theme.TextMuted; $hint.Location = New-Object System.Drawing.Point(12,122)
 
     $ok = New-Object System.Windows.Forms.Button
@@ -1926,11 +1926,18 @@ function Show-EntraAdvancedOptions {
 }
 
 function Connect-EntraViaMgGraph {
+    param([switch]$UseDeviceCode)
     if (-not (Import-EntraGraphModule)) { return $false }
-    Update-Progress "Opening Microsoft Graph sign-in..."
+    if ($UseDeviceCode) {
+        Update-Progress "Opening Microsoft Graph device sign-in..."
+    } else {
+        Update-Progress "Opening Microsoft Graph sign-in..."
+    }
     $params = @{ Scopes = $script:GraphScopeList; NoWelcome = $true; ErrorAction = "Stop" }
+    # Only pass TenantId when the user set Advanced options — never guess from AD DNS.
     if ($script:EntraPreferredTenant) { $params["TenantId"] = $script:EntraPreferredTenant }
     if ($script:EntraCustomClientId) { $params["ClientId"] = $script:EntraCustomClientId }
+    if ($UseDeviceCode) { $params["UseDeviceAuthentication"] = $true }
     Connect-MgGraph @params | Out-Null
     $ctx = Get-MgContext -ErrorAction Stop
     return (Set-EntraMgGraphSession $ctx)
@@ -1941,7 +1948,18 @@ function Connect-EntraViaAzAccount {
     Update-Progress "Opening Azure sign-in..."
     $azParams = @{ ErrorAction = "Stop" }
     if ($script:EntraPreferredTenant) { $azParams["Tenant"] = $script:EntraPreferredTenant }
-    Connect-AzAccount @azParams | Out-Null
+    try {
+        Connect-AzAccount @azParams | Out-Null
+    } catch {
+        $msg = "$_"
+        # Wrong/guessed tenant (e.g. on-prem DNS) — retry with account picker
+        if ($script:EntraPreferredTenant -and ($msg -match 'tenant|AADSTS90002|Could not find tenant')) {
+            $script:EntraPreferredTenant = ""
+            Connect-AzAccount -ErrorAction Stop | Out-Null
+        } else {
+            throw
+        }
+    }
     $tokObj = Get-AzAccessToken -ResourceUrl "https://graph.microsoft.com" -ErrorAction Stop
     $acct = ""
     try {
@@ -1953,22 +1971,28 @@ function Connect-EntraViaAzAccount {
 
 function Read-EntraTenantPrompt {
     $f = New-Object System.Windows.Forms.Form
-    $f.Text = "Entra tenant"; $f.Size = New-Object System.Drawing.Size(420,160)
+    $f.Text = "Entra tenant required"; $f.Size = New-Object System.Drawing.Size(480,200)
     $f.StartPosition = "CenterParent"; $f.FormBorderStyle = "FixedDialog"
     $f.MaximizeBox = $false; $f.MinimizeBox = $false; $f.Font = $fntNormal; $f.BackColor = $Theme.Card
     $l = New-Object System.Windows.Forms.Label
-    $l.Text = "Enter tenant domain or Tenant ID GUID:"; $l.AutoSize = $true
-    $l.Location = New-Object System.Drawing.Point(12,14)
+    $l.Text = "Enter your Entra ID tenant (NOT your on-prem AD domain):"
+    $l.AutoSize = $true; $l.Location = New-Object System.Drawing.Point(12,14)
+    $hint = New-Object System.Windows.Forms.Label
+    $hint.Text = "Use contoso.onmicrosoft.com, a verified Entra domain, or the Tenant ID GUID."
+    $hint.AutoSize = $true; $hint.ForeColor = $Theme.TextMuted
+    $hint.Location = New-Object System.Drawing.Point(12,36)
     $t = New-Object System.Windows.Forms.TextBox
-    $t.Location = New-Object System.Drawing.Point(12,40); $t.Width = 380
-    if ($script:EntraPreferredTenant) { $t.Text = $script:EntraPreferredTenant }
+    $t.Location = New-Object System.Drawing.Point(12,62); $t.Width = 440
+    if ($script:EntraPreferredTenant -match 'onmicrosoft\.com$|^[0-9a-fA-F-]{36}$') {
+        $t.Text = $script:EntraPreferredTenant
+    }
     $ok = New-Object System.Windows.Forms.Button
-    $ok.Text = "OK"; $ok.Width = 90; $ok.Height = 28; $ok.Location = New-Object System.Drawing.Point(210,80)
+    $ok.Text = "OK"; $ok.Width = 90; $ok.Height = 28; $ok.Location = New-Object System.Drawing.Point(270,120)
     $ok.DialogResult = "OK"; Set-PrimaryButtonStyle $ok
     $cancel = New-Object System.Windows.Forms.Button
-    $cancel.Text = "Cancel"; $cancel.Width = 90; $cancel.Height = 28; $cancel.Location = New-Object System.Drawing.Point(308,80)
+    $cancel.Text = "Cancel"; $cancel.Width = 90; $cancel.Height = 28; $cancel.Location = New-Object System.Drawing.Point(368,120)
     $cancel.DialogResult = "Cancel"; Set-SecondaryButtonStyle $cancel
-    $f.Controls.AddRange(@($l,$t,$ok,$cancel)); $f.AcceptButton = $ok; $f.CancelButton = $cancel
+    $f.Controls.AddRange(@($l,$hint,$t,$ok,$cancel)); $f.AcceptButton = $ok; $f.CancelButton = $cancel
     if ($f.ShowDialog($Form) -ne "OK") { return $null }
     $v = $t.Text.Trim()
     if (-not $v) { return $null }
@@ -1977,16 +2001,31 @@ function Read-EntraTenantPrompt {
 
 function Connect-EntraViaDeviceCode {
     $clientId = if ($script:EntraCustomClientId) { $script:EntraCustomClientId } else { $script:DefaultGraphClientId }
+    # Always confirm Entra tenant for device-code — on-prem AD DNS is not valid here.
     $tenant = $script:EntraPreferredTenant
-    if (-not $tenant) {
+    $needsPrompt = (-not $tenant)
+    if ($tenant -and $tenant -notmatch 'onmicrosoft\.com$|^[0-9a-fA-F-]{36}$') {
+        # Likely an on-prem DNS guess (e.g. omi.com) — force the user to confirm
+        $needsPrompt = $true
+    }
+    if ($needsPrompt) {
         $tenant = Read-EntraTenantPrompt
-        if (-not $tenant) { throw "Sign-in cancelled — tenant is required for device-code fallback." }
+        if (-not $tenant) { throw "Sign-in cancelled — Entra tenant is required for device-code sign-in." }
         $script:EntraPreferredTenant = $tenant
     }
     $authority = "https://login.microsoftonline.com/$tenant"
     $dcBody = @{ client_id = $clientId; scope = $script:GraphScopes }
-    $dc = Invoke-RestMethod -Method Post -Uri "$authority/oauth2/v2.0/devicecode" `
-        -ContentType "application/x-www-form-urlencoded" -Body $dcBody -ErrorAction Stop
+    try {
+        $dc = Invoke-RestMethod -Method Post -Uri "$authority/oauth2/v2.0/devicecode" `
+            -ContentType "application/x-www-form-urlencoded" -Body $dcBody -ErrorAction Stop
+    } catch {
+        $msg = "$_"
+        if ($msg -match 'AADSTS90002|Tenant .* not found|invalid_request') {
+            $script:EntraPreferredTenant = ""
+            throw "Entra tenant '$tenant' was not found (AADSTS90002).`r`n`r`nUse your Entra tenant domain (e.g. contoso.onmicrosoft.com) or Tenant ID GUID — not the on-prem AD DNS name.`r`nSet it under Advanced sign-in options, then try again."
+        }
+        throw
+    }
     try { [System.Windows.Forms.Clipboard]::SetText([string]$dc.user_code) } catch { }
     [System.Windows.Forms.MessageBox]::Show(
         "Complete sign-in in your browser:`r`n`r`n1. Open $($dc.verification_uri)`r`n2. Enter code $($dc.user_code) (copied)`r`n`r`nClick OK to wait for completion.",
@@ -2031,6 +2070,28 @@ function Connect-EntraViaDeviceCode {
     return $true
 }
 
+function Format-EntraSignInErrors {
+    param([System.Collections.Generic.List[string]]$Errors)
+    $bits = New-Object System.Collections.Generic.List[string]
+    $joined = ($Errors -join "`n")
+    if ($joined -match 'AADSTS90002|Tenant .* not found|Could not find tenant') {
+        $bits.Add("Wrong Entra tenant: do not use your on-prem AD domain. Leave Tenant blank for browser sign-in, or set Advanced to your Entra tenant (*.onmicrosoft.com) / Tenant ID GUID.")
+    }
+    if ($joined -match 'GetTokenAsync|InteractiveBrowserCredential|does not have an implementation') {
+        $bits.Add("Azure.Identity assembly conflict in this PowerShell session. Close all PowerShell windows, open a fresh one, and try Sign in again (device sign-in will be tried automatically).")
+    }
+    if ($joined -match 'AADSTS700016|Application .* not found') {
+        $bits.Add("App registration not in your tenant. Use Advanced → Custom App (client) ID from an app your admin created, with admin consent.")
+    }
+    # Keep short excerpts of raw errors (avoid dumping huge JSON)
+    foreach ($e in $Errors) {
+        $short = ($e -replace '\s+', ' ').Trim()
+        if ($short.Length -gt 220) { $short = $short.Substring(0, 220) + "..." }
+        if ($short) { $bits.Add($short) }
+    }
+    return ($bits -join "`r`n`r`n")
+}
+
 function Resolve-EntraSignedInIdentity {
     if ($script:EntraAccountUpn) { return }
     try {
@@ -2058,10 +2119,23 @@ function Connect-EntraGraph {
         $ok = $false
         $errors = New-Object System.Collections.Generic.List[string]
 
-        # 1) Microsoft.Graph browser sign-in (best — correct Graph scopes)
+        # 1) Microsoft.Graph browser sign-in
         try {
             if (Connect-EntraViaMgGraph) { $ok = $true }
-        } catch { $errors.Add("Microsoft Graph: $_") }
+        } catch {
+            $errors.Add("Microsoft Graph (browser): $_")
+            # Azure.Identity conflicts often break browser auth — retry device flow via MgGraph
+            if ("$_" -match 'InteractiveBrowserCredential|GetTokenAsync|AuthenticationFailed|does not have an implementation') {
+                try {
+                    if (Connect-EntraViaMgGraph -UseDeviceCode) { $ok = $true }
+                } catch { $errors.Add("Microsoft Graph (device): $_") }
+            } elseif ($script:EntraPreferredTenant -and ("$_" -match 'tenant|AADSTS90002')) {
+                $script:EntraPreferredTenant = ""
+                try {
+                    if (Connect-EntraViaMgGraph) { $ok = $true }
+                } catch { $errors.Add("Microsoft Graph (retry no tenant): $_") }
+            }
+        }
 
         # 2) Azure PowerShell / Az.Accounts browser sign-in
         if (-not $ok) {
@@ -2070,7 +2144,7 @@ function Connect-EntraGraph {
             } catch { $errors.Add("Azure PowerShell: $_") }
         }
 
-        # 3) Device-code fallback (Azure PowerShell public client)
+        # 3) Raw device-code fallback (Azure PowerShell public client)
         if (-not $ok) {
             try {
                 if (Connect-EntraViaDeviceCode) { $ok = $true }
@@ -2079,8 +2153,8 @@ function Connect-EntraGraph {
 
         Stop-Progress
         if (-not $ok) {
-            $hint = ($errors -join "`r`n")
-            throw "Could not sign in to Entra ID.`r`n`r`nInstall one of:`r`n  Install-Module Microsoft.Graph -Scope CurrentUser`r`n  Install-Module Az.Accounts -Scope CurrentUser`r`n`r`nThen click Sign in again.`r`n`r`n$hint"
+            $hint = Format-EntraSignInErrors -Errors $errors
+            throw "Could not sign in to Entra ID.`r`n`r`nRecommended:`r`n  Install-Module Microsoft.Graph.Authentication -Scope CurrentUser`r`n  Then open a NEW PowerShell window and Sign in again (leave Tenant blank).`r`n`r`n$hint"
         }
 
         Resolve-EntraSignedInIdentity
@@ -3097,12 +3171,8 @@ $Form.Add_Shown({
         try {
             Load-SchemaAttributes
         } catch { }
-        try {
-            if (-not $script:EntraPreferredTenant) {
-                $dns = [string](Get-ADDomain -ErrorAction Stop).DNSRoot
-                if ($dns) { $script:EntraPreferredTenant = $dns }
-            }
-        } catch { }
+        # Do NOT default Entra tenant from Get-ADDomain DNSRoot — on-prem AD DNS
+        # (e.g. omi.com) is often not a valid Entra tenant and causes AADSTS90002.
         # Only attach if Graph/Az cmds are already loaded in this process (no Import-Module)
         try { [void](Attach-EntraExistingSession) } catch { }
         Update-EntraStatusLabel

@@ -28,6 +28,6 @@ Interactive WinForms GUI for querying Active Directory (Users, Groups, Computers
 
 If you already signed in with `Connect-MgGraph` / `Connect-AzAccount` in the same PowerShell session, the tool reuses that session.
 
-**Advanced sign-in options** (optional): tenant override or custom App (client) ID if your org blocks Microsoft first-party apps.
+**Advanced sign-in options** (optional): Entra tenant (`*.onmicrosoft.com` or Tenant ID GUID) or custom App (client) ID — **not** your on-prem AD DNS name.
 
 Enrichment matches users by `UserPrincipalName` / email. Failed sign-in logs need Entra ID P1/P2.
