@@ -25,11 +25,12 @@
     powershell -ExecutionPolicy Bypass -STA -File .\AD-Delta-Compare-FIXED.ps1
 
 .NOTES
-    Version: 1.10
+    Version: 1.11
     - Pick-and-choose restore: checkbox column, Check Differences / Clear Checks
     - Restore Checked only restores ticked restorable changes
     - Details dialog: Check for Restore or Restore This Change
     - Multi-value attributes (e.g. member): pick individual Add/Remove entries in Details
+    - Details multi-value picker layout: no overlapping replica radios / truncated actions
 #>
 
 # ---------------------------------------------------------------------------
@@ -1703,7 +1704,20 @@ function Show-DifferenceDetail {
     })
 
     $footer.Add_Resize({
-        $btnClose.Left = $footer.ClientSize.Width - $btnClose.Width - 16
+        $btnClose.Left = [Math]::Max(16, $footer.ClientSize.Width - $btnClose.Width - 16)
+        # Keep primary actions in a left-to-right group without overlap
+        $x = 14
+        $btnMark.Left = $x
+        $x = $btnMark.Right + 10
+        if ($btnRestoreOne.Visible) {
+            $btnRestoreOne.Left = $x
+            $x = $btnRestoreOne.Right + 10
+        }
+        foreach ($c in $footer.Controls) {
+            if ($c -is [System.Windows.Forms.Button] -and $c.Text -like 'Restore Selected Entries*') {
+                $c.Left = $x
+            }
+        }
     })
 
     $body = New-Object System.Windows.Forms.Panel
@@ -1821,61 +1835,90 @@ function Show-DifferenceDetail {
         $pnlPick = New-Object System.Windows.Forms.Panel
         $pnlPick.Dock = 'Fill'
         $pnlPick.BackColor = $script:Theme.BgPanel
+        $pnlPick.Padding = New-Object System.Windows.Forms.Padding(0, 2, 0, 0)
         $split.Panel2.Controls.Add($pnlPick)
 
         $pickTop = New-Object System.Windows.Forms.Panel
         $pickTop.Dock = 'Top'
-        $pickTop.Height = 58
+        $pickTop.Height = 70
         $pickTop.BackColor = $script:Theme.BgPanel
         $pnlPick.Controls.Add($pickTop)
 
         $lblPick = New-Object System.Windows.Forms.Label
-        $lblPick.Text = 'Select individual values to sync TO the PDC (from the chosen replica):'
-        $lblPick.Location = New-Object System.Drawing.Point(8, 6)
-        $lblPick.AutoSize = $true
+        $lblPick.Location = New-Object System.Drawing.Point(8, 4)
+        $lblPick.Size = New-Object System.Drawing.Size(900, 18)
+        $lblPick.Anchor = 'Top,Left,Right'
         $lblPick.ForeColor = $script:Theme.TextPrimary
         $pickTop.Controls.Add($lblPick)
 
+        # Flow row avoids fixed-X overlap when FQDNs are long
+        $flowPick = New-Object System.Windows.Forms.FlowLayoutPanel
+        $flowPick.Location = New-Object System.Drawing.Point(4, 28)
+        $flowPick.Size = New-Object System.Drawing.Size(920, 36)
+        $flowPick.Anchor = 'Top,Left,Right'
+        $flowPick.WrapContents = $false
+        $flowPick.FlowDirection = 'LeftToRight'
+        $flowPick.Padding = New-Object System.Windows.Forms.Padding(0)
+        $flowPick.BackColor = $script:Theme.BgPanel
+        $pickTop.Controls.Add($flowPick)
+
         $rbSrc1 = New-Object System.Windows.Forms.RadioButton
-        $rbSrc1.Text = "Compare vs Replica 1 ($R1Name)"
-        $rbSrc1.Location = New-Object System.Drawing.Point(8, 28)
+        $rbSrc1.Text = 'Replica 1'
         $rbSrc1.AutoSize = $true
+        $rbSrc1.Margin = New-Object System.Windows.Forms.Padding(4, 6, 12, 0)
         $rbSrc1.Checked = $true
-        $pickTop.Controls.Add($rbSrc1)
+        $flowPick.Controls.Add($rbSrc1)
 
         $rbSrc2 = New-Object System.Windows.Forms.RadioButton
-        $rbSrc2.Text = "Compare vs Replica 2 ($R2Name)"
-        $rbSrc2.Location = New-Object System.Drawing.Point(280, 28)
+        $rbSrc2.Text = 'Replica 2'
         $rbSrc2.AutoSize = $true
-        $pickTop.Controls.Add($rbSrc2)
+        $rbSrc2.Margin = New-Object System.Windows.Forms.Padding(0, 6, 16, 0)
+        $flowPick.Controls.Add($rbSrc2)
 
-        $btnPickAll = New-FlatButton -Text 'Check All' -Location (New-Object System.Drawing.Point(560, 24)) `
-            -Size (New-Object System.Drawing.Size(90, 26)) -Secondary
-        $pickTop.Controls.Add($btnPickAll)
-        $btnPickNone = New-FlatButton -Text 'Clear' -Location (New-Object System.Drawing.Point(658, 24)) `
+        $btnPickAll = New-FlatButton -Text 'Check All' -Location (New-Object System.Drawing.Point(0, 0)) `
+            -Size (New-Object System.Drawing.Size(88, 26)) -Secondary
+        $btnPickAll.Margin = New-Object System.Windows.Forms.Padding(8, 2, 6, 0)
+        $flowPick.Controls.Add($btnPickAll)
+
+        $btnPickNone = New-FlatButton -Text 'Clear' -Location (New-Object System.Drawing.Point(0, 0)) `
             -Size (New-Object System.Drawing.Size(70, 26)) -Secondary
-        $pickTop.Controls.Add($btnPickNone)
+        $btnPickNone.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 0)
+        $flowPick.Controls.Add($btnPickNone)
 
         $entryGrid = New-Object System.Windows.Forms.DataGridView
         $entryGrid.Dock = 'Fill'
         Set-ModernGridStyle -Grid $entryGrid
         $entryGrid.MultiSelect = $false
         $entryGrid.AutoSizeColumnsMode = 'Fill'
+        $entryGrid.RowHeadersVisible = $false
+        $entryGrid.AllowUserToResizeRows = $false
         $pnlPick.Controls.Add($entryGrid)
         $pickTop.BringToFront()
 
         $egSel = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
-        $egSel.Name = 'Select'; $egSel.HeaderText = 'Restore?'
-        $egSel.FillWeight = 8; $egSel.MinimumWidth = 60
+        $egSel.Name = 'Select'; $egSel.HeaderText = ''
+        $egSel.ToolTipText = 'Restore this value'
+        $egSel.FillWeight = 6; $egSel.MinimumWidth = 36; $egSel.Width = 40
+        $egSel.AutoSizeMode = 'None'
         [void]$entryGrid.Columns.Add($egSel)
+
         $egAct = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
         $egAct.Name = 'Action'; $egAct.HeaderText = 'Action'
-        $egAct.FillWeight = 22; $egAct.ReadOnly = $true
+        $egAct.FillWeight = 18; $egAct.MinimumWidth = 120; $egAct.Width = 130
+        $egAct.AutoSizeMode = 'None'
+        $egAct.ReadOnly = $true
         [void]$entryGrid.Columns.Add($egAct)
+
         $egVal = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
         $egVal.Name = 'Value'; $egVal.HeaderText = 'Value'
-        $egVal.FillWeight = 70; $egVal.ReadOnly = $true
+        $egVal.FillWeight = 76; $egVal.MinimumWidth = 200
+        $egVal.ReadOnly = $true
         [void]$entryGrid.Columns.Add($egVal)
+
+        $egKind = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+        $egKind.Name = 'Kind'; $egKind.HeaderText = 'Kind'
+        $egKind.Visible = $false
+        [void]$entryGrid.Columns.Add($egKind)
 
         $entryGrid.Add_CurrentCellDirtyStateChanged({
             if ($entryGrid.IsCurrentCellDirty) {
@@ -1883,10 +1926,17 @@ function Show-DifferenceDetail {
             }
         })
 
+        function Update-EntryPickHint {
+            $srcName = if ($rbSrc1.Checked) { $R1Name } else { $R2Name }
+            $which = if ($rbSrc1.Checked) { 'Replica 1' } else { 'Replica 2' }
+            $lblPick.Text = ("Check values to sync TO the PDC  ·  reference: {0} ({1})" -f $which, $srcName)
+        }
+
         function Update-EntryPickGrid {
             $entryGrid.Rows.Clear()
             $srcName = if ($rbSrc1.Checked) { $R1Name } else { $R2Name }
             $srcVal  = if ($rbSrc1.Checked) { $R1Val } else { $R2Val }
+            Update-EntryPickHint
             $pSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
             $sSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
             foreach ($t in (Get-ValueTokens $PdcVal)) {
@@ -1898,18 +1948,21 @@ function Show-DifferenceDetail {
 
             foreach ($t in ($pSet | Sort-Object)) {
                 if (-not $sSet.Contains($t)) {
-                    [void]$entryGrid.Rows.Add(@($false, "Remove from PDC (not on $srcName)", $t))
+                    # Short Action text — FQDN lives in the hint line above
+                    [void]$entryGrid.Rows.Add(@($false, 'Remove from PDC', $t, 'Remove'))
                     $entryGrid.Rows[$entryGrid.Rows.Count - 1].DefaultCellStyle.BackColor = $script:Theme.DiffBg
+                    $entryGrid.Rows[$entryGrid.Rows.Count - 1].Cells['Action'].ToolTipText = ("Present on PDC, not on {0}" -f $srcName)
                 }
             }
             foreach ($t in ($sSet | Sort-Object)) {
                 if (-not $pSet.Contains($t)) {
-                    [void]$entryGrid.Rows.Add(@($false, "Add to PDC (only on $srcName)", $t))
+                    [void]$entryGrid.Rows.Add(@($false, 'Add to PDC', $t, 'Add'))
                     $entryGrid.Rows[$entryGrid.Rows.Count - 1].DefaultCellStyle.BackColor = $script:Theme.MatchBg
+                    $entryGrid.Rows[$entryGrid.Rows.Count - 1].Cells['Action'].ToolTipText = ("Present on {0}, not on PDC" -f $srcName)
                 }
             }
             if ($entryGrid.Rows.Count -eq 0) {
-                [void]$entryGrid.Rows.Add(@($false, '(no entry-level diffs)', ''))
+                [void]$entryGrid.Rows.Add(@($false, '(none)', '', ''))
                 $entryGrid.Rows[0].Cells['Select'].ReadOnly = $true
             }
         }
@@ -1918,12 +1971,16 @@ function Show-DifferenceDetail {
         $rbSrc2.Add_CheckedChanged({ if ($rbSrc2.Checked) { Update-EntryPickGrid } })
         $btnPickAll.Add_Click({
             foreach ($row in $entryGrid.Rows) {
+                if ($row.IsNewRow) { continue }
                 if ($row.Cells['Select'].ReadOnly) { continue }
                 if ([string]$row.Cells['Value'].Value) { $row.Cells['Select'].Value = $true }
             }
         })
         $btnPickNone.Add_Click({
-            foreach ($row in $entryGrid.Rows) { $row.Cells['Select'].Value = $false }
+            foreach ($row in $entryGrid.Rows) {
+                if ($row.IsNewRow) { continue }
+                $row.Cells['Select'].Value = $false
+            }
         })
         Update-EntryPickGrid
 
@@ -1941,10 +1998,10 @@ function Show-DifferenceDetail {
                 $checked = ($v -eq $true -or "$v" -eq 'True')
                 if (-not $checked) { continue }
                 $val = [string]$row.Cells['Value'].Value
-                $act = [string]$row.Cells['Action'].Value
+                $kind = [string]$row.Cells['Kind'].Value
                 if (-not $val) { continue }
-                if ($act -like 'Add to PDC*') { [void]$adds.Add($val) }
-                elseif ($act -like 'Remove from PDC*') { [void]$removes.Add($val) }
+                if ($kind -eq 'Add') { [void]$adds.Add($val) }
+                elseif ($kind -eq 'Remove') { [void]$removes.Add($val) }
             }
             if ($adds.Count -eq 0 -and $removes.Count -eq 0) {
                 [System.Windows.Forms.MessageBox]::Show(
@@ -1975,6 +2032,9 @@ function Show-DifferenceDetail {
 
         # Full-attribute restore still available; rename for clarity
         $btnRestoreOne.Text = 'Replace Entire Attribute…'
+        $btnRestoreOne.Size = New-Object System.Drawing.Size(200, 32)
+        $footer.PerformLayout()
+        $footer.Width = $footer.Width  # nudge Resize so buttons reflow
     }
     else {
         $sumBox = New-Object System.Windows.Forms.TextBox
@@ -1994,6 +2054,19 @@ function Show-DifferenceDetail {
     $dlg.Add_Shown({
         try {
             $split.SplitterDistance = [Math]::Max(160, [int]($split.ClientSize.Height * 0.42))
+        } catch { }
+        try {
+            $btnClose.Left = [Math]::Max(16, $footer.ClientSize.Width - $btnClose.Width - 16)
+            $x = 14
+            $btnMark.Left = $x
+            $x = $btnMark.Right + 10
+            $btnRestoreOne.Left = $x
+            $x = $btnRestoreOne.Right + 10
+            foreach ($c in $footer.Controls) {
+                if ($c -is [System.Windows.Forms.Button] -and $c.Text -like 'Restore Selected Entries*') {
+                    $c.Left = $x
+                }
+            }
         } catch { }
     })
 
