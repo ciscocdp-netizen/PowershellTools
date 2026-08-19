@@ -24,10 +24,10 @@
     powershell -ExecutionPolicy Bypass -STA -File .\AD-Delta-Compare-FIXED.ps1
 
 .NOTES
-    Version: 1.7
-    - Dynamic resize: SplitContainer + Dock Fill results; columns AutoSize Fill
-    - Activity log is draggable; results grow when the window is maximized
-    - Fixed LDAP NUL escape; sAMAccountName / UPN filter
+    Version: 1.8
+    - View Details: double-click a results row (or View Details button) for a
+      full side-by-side diff with multi-value breakdown
+    - Dynamic resize SplitContainer; LDAP escape + sAMAccountName/UPN filter
 #>
 
 # ---------------------------------------------------------------------------
@@ -217,13 +217,13 @@ function Set-ModernGridStyle {
     $Grid.AllowUserToAddRows = $false
     $Grid.AllowUserToDeleteRows = $false
     $Grid.AllowUserToResizeRows = $false
-    $Grid.ReadOnly = $true
+    $Grid.ReadOnly = $false   # checkbox column must be editable
+    $Grid.EditMode = 'EditOnEnter'
     $Grid.SelectionMode = 'FullRowSelect'
     $Grid.MultiSelect = $true
     $Grid.AutoSizeColumnsMode = 'Fill'
     $Grid.RowHeadersVisible = $false
     $Grid.ScrollBars = 'Both'
-    # Reduce black-flash / paint artifacts on resize
     try {
         $flags = [System.Reflection.BindingFlags]'Instance, NonPublic'
         $prop = $Grid.GetType().GetProperty('DoubleBuffered', $flags)
@@ -1074,29 +1074,56 @@ $lblCount.Text = '0 rows'
 $lblCount.Font = $script:Theme.FontUi
 $lblCount.ForeColor = $script:Theme.TextMuted
 $lblCount.AutoSize = $true
-$lblCount.Margin = New-Object System.Windows.Forms.Padding(0, 5, 0, 0)
+$lblCount.Margin = New-Object System.Windows.Forms.Padding(0, 5, 12, 0)
 $hdrResults.Controls.Add($lblCount)
+
+$btnCheckDiffs = New-FlatButton -Text 'Check Differences' -Location (New-Object System.Drawing.Point(0, 0)) `
+    -Size (New-Object System.Drawing.Size(140, 26)) -Secondary
+$btnCheckDiffs.Margin = New-Object System.Windows.Forms.Padding(8, 1, 6, 0)
+$hdrResults.Controls.Add($btnCheckDiffs)
+
+$btnClearChecks = New-FlatButton -Text 'Clear Checks' -Location (New-Object System.Drawing.Point(0, 0)) `
+    -Size (New-Object System.Drawing.Size(110, 26)) -Secondary
+$btnClearChecks.Margin = New-Object System.Windows.Forms.Padding(0, 1, 0, 0)
+$hdrResults.Controls.Add($btnClearChecks)
 
 $grid = New-Object System.Windows.Forms.DataGridView
 $grid.Dock = 'Fill'
 Set-ModernGridStyle -Grid $grid
 $resInner.Controls.Add($grid, 0, 1)
 
+# Checkbox column for pick-and-choose restore
+$colSelect = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
+$colSelect.HeaderText = ''
+$colSelect.Name = 'Select'
+$colSelect.Width = 36
+$colSelect.FillWeight = 4
+$colSelect.MinimumWidth = 36
+$colSelect.TrueValue = $true
+$colSelect.FalseValue = $false
+$colSelect.ThreeState = $false
+[void]$grid.Columns.Add($colSelect)
+
 Add-GridColumns -Grid $grid -Columns @(
-    (New-GridColumn -Header 'Object'     -Name 'Object'     -Width 160 -FillWeight 18),
-    (New-GridColumn -Header 'Attribute'  -Name 'Attribute'  -Width 120 -FillWeight 14),
-    (New-GridColumn -Header 'PDC'        -Name 'PDC'        -Width 200 -FillWeight 22),
-    (New-GridColumn -Header 'Replica 1'  -Name 'Replica1'   -Width 200 -FillWeight 22),
-    (New-GridColumn -Header 'Replica 2'  -Name 'Replica2'   -Width 200 -FillWeight 22),
-    (New-GridColumn -Header 'Status'     -Name 'Status'     -Width 90  -FillWeight 10),
+    (New-GridColumn -Header 'Object'     -Name 'Object'     -Width 160 -FillWeight 17),
+    (New-GridColumn -Header 'Attribute'  -Name 'Attribute'  -Width 120 -FillWeight 13),
+    (New-GridColumn -Header 'PDC'        -Name 'PDC'        -Width 200 -FillWeight 21),
+    (New-GridColumn -Header 'Replica 1'  -Name 'Replica1'   -Width 200 -FillWeight 21),
+    (New-GridColumn -Header 'Replica 2'  -Name 'Replica2'   -Width 200 -FillWeight 21),
+    (New-GridColumn -Header 'Status'     -Name 'Status'     -Width 90  -FillWeight 9),
     (New-GridColumn -Header 'GUID'       -Name 'ObjectGUID' -Width 80  -FillWeight 1 -Hidden),
     (New-GridColumn -Header 'DN'         -Name 'DN'         -Width 80  -FillWeight 1 -Hidden),
     (New-GridColumn -Header 'Restorable' -Name 'Restorable' -Width 80  -FillWeight 1 -Hidden)
 )
 
+# Only the Select checkbox is editable
+foreach ($c in $grid.Columns) {
+    if ($c.Name -ne 'Select') { $c.ReadOnly = $true }
+}
+
 # ========== ACTIONS ==========
 
-$btnRestore = New-FlatButton -Text 'Restore Selected  →  PDC' -Location (New-Object System.Drawing.Point(0, 8)) `
+$btnRestore = New-FlatButton -Text 'Restore Checked  →  PDC' -Location (New-Object System.Drawing.Point(0, 8)) `
     -Size (New-Object System.Drawing.Size(220, 32)) -BackColor $script:Theme.Accent -ForeColor ([System.Drawing.Color]::White)
 $btnRestore.Enabled = $false
 $pnlActions.Controls.Add($btnRestore)
@@ -1192,7 +1219,7 @@ function Update-ContextControls {
     $lblDn.Visible = $isMeta;    $txtDn.Visible = $isMeta
 
     $btnRestore.Enabled = $false
-    $btnRestore.Text = 'Restore Selected  →  PDC'
+    $btnRestore.Text = 'Restore Checked  →  PDC'
 }
 $cmbType.Add_SelectedIndexChanged({ Update-ContextControls })
 
@@ -1370,8 +1397,18 @@ $timer.Add_Tick({
 
     $grid.SuspendLayout()
     foreach ($r in $rows) {
-        $idx = $grid.Rows.Add(@($r.Object,$r.Attribute,$r.PDC,$r.Replica1,$r.Replica2,$r.Status,$r.ObjectGUID,$r.DN,[string]$r.Restorable))
+        $canRestore = [bool]$r.Restorable
+        $idx = $grid.Rows.Add(@(
+            $false,
+            $r.Object, $r.Attribute, $r.PDC, $r.Replica1, $r.Replica2, $r.Status,
+            $r.ObjectGUID, $r.DN, [string]$r.Restorable
+        ))
         $row = $grid.Rows[$idx]
+        # Non-restorable rows cannot be checked for restore
+        $row.Cells['Select'].ReadOnly = (-not $canRestore)
+        if (-not $canRestore) {
+            $row.Cells['Select'].ToolTipText = 'Not restorable (system/computed attribute or missing object)'
+        }
         switch ($r.Status) {
             'Different'     { $row.DefaultCellStyle.BackColor = $script:Theme.DiffBg }
             'ObjectMissing' { $row.DefaultCellStyle.BackColor = $script:Theme.MissingBg }
@@ -1380,7 +1417,8 @@ $timer.Add_Tick({
     }
     $grid.ResumeLayout()
     $lblCount.Text = "$($grid.Rows.Count) rows"
-    Write-Status ("Comparison complete. {0} row(s)." -f $grid.Rows.Count)
+    Update-RestoreButtonState
+    Write-Status ("Comparison complete. {0} row(s). Check the boxes for changes you want to restore." -f $grid.Rows.Count)
 })
 
 $btnCompare.Add_Click({ Start-Comparison })
@@ -1399,26 +1437,97 @@ $btnCancel.Add_Click({
 })
 
 $grid.Add_SelectionChanged({
-    $btnRestore.Enabled = $false
-    $btnRestore.Text = 'Restore Selected  →  PDC'
     $btnDetails.Enabled = ($grid.SelectedRows.Count -eq 1)
+    Update-RestoreButtonState
+})
 
+# Commit checkbox edits immediately and refresh restore button
+$grid.Add_CurrentCellDirtyStateChanged({
+    if ($grid.IsCurrentCellDirty -and $grid.CurrentCell -is [System.Windows.Forms.DataGridViewCheckBoxCell]) {
+        [void]$grid.CommitEdit([System.Windows.Forms.DataGridViewDataErrorContexts]::Commit)
+    }
+})
+$grid.Add_CellValueChanged({
+    param($sender, $e)
+    if ($e.RowIndex -lt 0) { return }
+    if ($grid.Columns[$e.ColumnIndex].Name -eq 'Select') { Update-RestoreButtonState }
+})
+
+function Test-RowChecked {
+    param($Row)
+    $v = $Row.Cells['Select'].Value
+    return ($v -eq $true -or $v -eq 'True' -or $v -eq 1)
+}
+
+function Get-CheckedRestoreTargets {
+    $targets = New-Object System.Collections.ArrayList
+    foreach ($row in $grid.Rows) {
+        if ($row.IsNewRow) { continue }
+        if (-not (Test-RowChecked $row)) { continue }
+        if ([string]$row.Cells['Restorable'].Value -ne 'True') { continue }
+        [void]$targets.Add([pscustomobject]@{
+            Row       = $row
+            Object    = [string]$row.Cells['Object'].Value
+            Attribute = [string]$row.Cells['Attribute'].Value
+            Guid      = [string]$row.Cells['ObjectGUID'].Value
+            PdcVal    = [string]$row.Cells['PDC'].Value
+            R1Val     = [string]$row.Cells['Replica1'].Value
+            R2Val     = [string]$row.Cells['Replica2'].Value
+        })
+    }
+    return $targets
+}
+
+function Update-RestoreButtonState {
+    $btnRestore.Enabled = $false
+    $btnRestore.Text = 'Restore Checked  →  PDC'
     $t = $cmbType.SelectedItem
     if ($t -notin @('Users','Computers','Groups')) { return }
-    if ($grid.SelectedRows.Count -lt 1) { return }
 
-    $restCount = 0
-    foreach ($r in $grid.SelectedRows) {
-        if ([string]$r.Cells['Restorable'].Value -eq 'True') { $restCount++ }
+    $n = 0
+    foreach ($row in $grid.Rows) {
+        if ($row.IsNewRow) { continue }
+        if ((Test-RowChecked $row) -and ([string]$row.Cells['Restorable'].Value -eq 'True')) { $n++ }
     }
-    if ($restCount -lt 1) { return }
-
+    if ($n -lt 1) { return }
     $btnRestore.Enabled = $true
-    if ($restCount -eq 1) {
-        $btnRestore.Text = 'Restore Selected  →  PDC'
+    if ($n -eq 1) {
+        $btnRestore.Text = 'Restore Checked  →  PDC'
     } else {
-        $btnRestore.Text = ("Restore {0} Selected  →  PDC" -f $restCount)
+        $btnRestore.Text = ("Restore {0} Checked  →  PDC" -f $n)
     }
+}
+
+$btnCheckDiffs.Add_Click({
+    if ($cmbType.SelectedItem -notin @('Users','Computers','Groups')) {
+        Write-Status 'Restore checkboxes apply to Users / Computers / Groups only.' 'WARN'
+        return
+    }
+    $n = 0
+    foreach ($row in $grid.Rows) {
+        if ($row.IsNewRow) { continue }
+        $restorable = ([string]$row.Cells['Restorable'].Value -eq 'True')
+        $isDiff = ([string]$row.Cells['Status'].Value -eq 'Different')
+        if ($restorable -and $isDiff) {
+            $row.Cells['Select'].Value = $true
+            $n++
+        } else {
+            $row.Cells['Select'].Value = $false
+        }
+    }
+    $grid.EndEdit()
+    Update-RestoreButtonState
+    Write-Status ("Checked {0} different restorable change(s). Review, then Restore Checked." -f $n)
+})
+
+$btnClearChecks.Add_Click({
+    foreach ($row in $grid.Rows) {
+        if ($row.IsNewRow) { continue }
+        $row.Cells['Select'].Value = $false
+    }
+    $grid.EndEdit()
+    Update-RestoreButtonState
+    Write-Status 'Cleared all restore checkboxes.'
 })
 
 # ---------------------------------------------------------------------------
@@ -1515,8 +1624,12 @@ function Show-DifferenceDetail {
         [string]$R1Val,
         [string]$R2Name,
         [string]$R2Val,
-        [string]$TargetType
+        [string]$TargetType,
+        [bool]$Restorable = $false,
+        $SourceRow = $null
     )
+
+    $script:DetailAction = $null  # 'check' | 'restore' | $null
 
     $dlg = New-Object System.Windows.Forms.Form
     $dlg.Text = 'Difference Details'
@@ -1560,11 +1673,35 @@ function Show-DifferenceDetail {
     $btnClose = New-FlatButton -Text 'Close' -Location (New-Object System.Drawing.Point(850, 8)) `
         -Size (New-Object System.Drawing.Size(100, 32)) -Secondary
     $btnClose.Anchor = 'Top,Right'
-    $btnClose.DialogResult = 'OK'
+    $btnClose.DialogResult = 'Cancel'
     $footer.Controls.Add($btnClose)
-    $dlg.AcceptButton = $btnClose
     $dlg.CancelButton = $btnClose
-    $footer.Add_Resize({ $btnClose.Left = $footer.ClientSize.Width - $btnClose.Width - 16 })
+
+    $btnMark = New-FlatButton -Text 'Check for Restore' -Location (New-Object System.Drawing.Point(14, 8)) `
+        -Size (New-Object System.Drawing.Size(150, 32)) -Secondary
+    $btnMark.Enabled = $Restorable
+    if (-not $Restorable) { $btnMark.Text = 'Not Restorable' }
+    $footer.Controls.Add($btnMark)
+
+    $btnRestoreOne = New-FlatButton -Text 'Restore This Change…' -Location (New-Object System.Drawing.Point(176, 8)) `
+        -Size (New-Object System.Drawing.Size(180, 32)) -BackColor $script:Theme.Accent -ForeColor ([System.Drawing.Color]::White)
+    $btnRestoreOne.Enabled = $Restorable
+    $footer.Controls.Add($btnRestoreOne)
+
+    $btnMark.Add_Click({
+        $script:DetailAction = 'check'
+        $dlg.DialogResult = 'OK'
+        $dlg.Close()
+    })
+    $btnRestoreOne.Add_Click({
+        $script:DetailAction = 'restore'
+        $dlg.DialogResult = 'OK'
+        $dlg.Close()
+    })
+
+    $footer.Add_Resize({
+        $btnClose.Left = $footer.ClientSize.Width - $btnClose.Width - 16
+    })
 
     $body = New-Object System.Windows.Forms.Panel
     $body.Dock = 'Fill'
@@ -1688,6 +1825,7 @@ function Show-DifferenceDetail {
     })
 
     [void]$dlg.ShowDialog($form)
+    return $script:DetailAction
 }
 
 function Show-SelectedRowDetails {
@@ -1698,7 +1836,8 @@ function Show-SelectedRowDetails {
         return
     }
     $row = $grid.SelectedRows[0]
-    Show-DifferenceDetail `
+    $restorable = ([string]$row.Cells['Restorable'].Value -eq 'True')
+    $action = Show-DifferenceDetail `
         -ObjectName ([string]$row.Cells['Object'].Value) `
         -Attribute  ([string]$row.Cells['Attribute'].Value) `
         -Guid       ([string]$row.Cells['ObjectGUID'].Value) `
@@ -1710,7 +1849,30 @@ function Show-SelectedRowDetails {
         -R1Val      ([string]$row.Cells['Replica1'].Value) `
         -R2Name     ([string]$cmbR2.SelectedItem) `
         -R2Val      ([string]$row.Cells['Replica2'].Value) `
-        -TargetType ([string]$cmbType.SelectedItem)
+        -TargetType ([string]$cmbType.SelectedItem) `
+        -Restorable $restorable `
+        -SourceRow  $row
+
+    if ($action -eq 'check') {
+        if ($restorable) {
+            $row.Cells['Select'].Value = $true
+            $grid.EndEdit()
+            Update-RestoreButtonState
+            Write-Status ("Checked '{0}' on '{1}' for restore." -f $row.Cells['Attribute'].Value, $row.Cells['Object'].Value)
+        }
+    }
+    elseif ($action -eq 'restore') {
+        if (-not $restorable) { return }
+        # Check only this row, then invoke the normal restore path for a single checked item
+        foreach ($r in $grid.Rows) {
+            if ($r.IsNewRow) { continue }
+            $r.Cells['Select'].Value = $false
+        }
+        $row.Cells['Select'].Value = $true
+        $grid.EndEdit()
+        Update-RestoreButtonState
+        $btnRestore.PerformClick()
+    }
 }
 
 $btnDetails.Add_Click({ Show-SelectedRowDetails })
@@ -1907,25 +2069,23 @@ function Invoke-AttributeRestore {
 }
 
 $btnRestore.Add_Click({
-    if ($grid.SelectedRows.Count -lt 1) { return }
     $r1Name = [string]$cmbR1.SelectedItem
     $r2Name = [string]$cmbR2.SelectedItem
     $pdc    = $txtPdc.Text
 
-    $targets = New-Object System.Collections.ArrayList
-    foreach ($row in $grid.SelectedRows) {
-        if ([string]$row.Cells['Restorable'].Value -ne 'True') { continue }
-        [void]$targets.Add([pscustomobject]@{
-            Row       = $row
-            Object    = [string]$row.Cells['Object'].Value
-            Attribute = [string]$row.Cells['Attribute'].Value
-            Guid      = [string]$row.Cells['ObjectGUID'].Value
-            PdcVal    = [string]$row.Cells['PDC'].Value
-            R1Val     = [string]$row.Cells['Replica1'].Value
-            R2Val     = [string]$row.Cells['Replica2'].Value
-        })
+    if ($cmbType.SelectedItem -notin @('Users','Computers','Groups')) {
+        Write-Status 'Restore is only available for Users, Computers, and Groups.' 'WARN'
+        return
     }
-    if ($targets.Count -lt 1) { Write-Status 'No restorable rows selected.' 'WARN'; return }
+
+    $targets = Get-CheckedRestoreTargets
+    if ($targets.Count -lt 1) {
+        Write-Status 'No changes checked. Tick the boxes next to the attributes you want to restore, or click Check Differences.' 'WARN'
+        [System.Windows.Forms.MessageBox]::Show(
+            "Check the box on each change you want to restore, then click Restore Checked.`r`n`r`nTip: use Check Differences to select all restorable differences, then uncheck any you want to skip.",
+            'Nothing checked', 'OK', 'Information') | Out-Null
+        return
+    }
 
     try { Import-Module ActiveDirectory -ErrorAction Stop }
     catch {
@@ -1945,6 +2105,8 @@ $btnRestore.Add_Click({
             Write-Status ("{0} '{1}' on '{2}' at PDC from '{3}'." -f $res.Action, $t.Attribute, $t.Object, $sourceDc)
             Write-Audit ("RESTORE obj='$($t.Object)' guid='$($t.Guid)' attr='$($t.Attribute)' action='$($res.Action)' source='$sourceDc' target-PDC='$pdc' oldPDCval='$($t.PdcVal)'")
             $t.Row.Cells['PDC'].Value = if ($sourceDc -eq $r1Name) { $t.R1Val } else { $t.R2Val }
+            $t.Row.Cells['Select'].Value = $false
+            Update-RestoreButtonState
             [System.Windows.Forms.MessageBox]::Show(
                 "Attribute '$($t.Attribute)' restored to the PDC from '$sourceDc'.`r`n`r`nAllow replication to converge, then re-run Compare to verify.",
                 'Restore complete','OK','Information') | Out-Null
@@ -1968,6 +2130,7 @@ $btnRestore.Add_Click({
             Write-Status ("{0} '{1}' on '{2}' from '{3}'." -f $res.Action, $t.Attribute, $t.Object, $sourceDc)
             Write-Audit ("BULK-RESTORE obj='$($t.Object)' guid='$($t.Guid)' attr='$($t.Attribute)' action='$($res.Action)' source='$sourceDc' target-PDC='$pdc' oldPDCval='$($t.PdcVal)'")
             $t.Row.Cells['PDC'].Value = if ($sourceDc -eq $r1Name) { $t.R1Val } else { $t.R2Val }
+            $t.Row.Cells['Select'].Value = $false
         } else {
             $fail++
             Write-Status ("FAILED '{0}' on '{1}': {2}" -f $t.Attribute, $t.Object, $res.Error) 'ERROR'
@@ -1975,6 +2138,7 @@ $btnRestore.Add_Click({
         }
     }
     $form.Cursor = [System.Windows.Forms.Cursors]::Default
+    Update-RestoreButtonState
 
     $summary = ("Bulk restore complete.`r`n`r`nSucceeded: {0}`r`nFailed: {1}`r`nSource: {2}`r`n`r`nAllow replication to converge, then re-run Compare to verify." -f $ok, $fail, $sourceDc)
     if ($errs.Count -gt 0) {
@@ -2018,6 +2182,7 @@ $form.Add_Shown({
     Update-SplitLayout
     Write-Status 'Ready. Click Discover DCs to begin.'
     Write-Status ("Audit log: {0}" -f $script:AuditLog)
+    Write-Status 'Tip: Double-click a results row (or click View Details) to inspect differences.'
     Write-Status 'Tip: Drag the bar above ACTIVITY to resize the results grid.'
 })
 
