@@ -3,15 +3,22 @@
 
 <#
 .SYNOPSIS
-    AD Report Tool - Interactive GUI for querying Active Directory objects.
+    AD Report Tool - Interactive GUI for querying Active Directory and Entra ID.
 .DESCRIPTION
     Filter Users, Groups, Computers, and OUs by any combination of attributes,
     group membership, and account status. Build grouped AND/OR filter logic with
     smart value inputs, export results to CSV, view a summary, and choose which
     columns to display.
+
+    Optional Entra ID (Microsoft Graph) enrichment for users: assigned directory
+    roles, registered/owned devices, authentication methods, and last failed
+    sign-in (error code, time, application, location, IP).
 .NOTES
     Requires the ActiveDirectory RSAT module and read access to AD.
-    PowerShell 5.1 | WinForms GUI | Windows 10 flat theme.
+    Entra enrichment uses Microsoft Graph (device-code sign-in); needs Graph
+    permissions such as User.Read.All, Directory.Read.All, AuditLog.Read.All,
+    UserAuthenticationMethod.Read.All, Device.Read.All, RoleManagement.Read.Directory.
+    Sign-in logs require Entra ID P1/P2. PowerShell 5.1 | WinForms GUI.
 #>
 
 Set-StrictMode -Version Latest
@@ -82,6 +89,15 @@ $ATTR = @{
         "Extension Attr 9"        = "extensionAttribute9"
         "Extension Attr 10"       = "extensionAttribute10"
         "OU / Distinguished Name" = "DistinguishedName"
+        # --- Entra ID (populated by Graph enrichment; not LDAP-filterable) ---
+        "Entra Assigned Roles"           = "EntraAssignedRoles"
+        "Entra Devices"                  = "EntraDevices"
+        "Entra Auth Methods"             = "EntraAuthMethods"
+        "Entra Last Fail Sign-In Code"   = "EntraLastSignInErrorCode"
+        "Entra Last Fail Sign-In Time"   = "EntraLastSignInErrorTime"
+        "Entra Last Fail Sign-In App"    = "EntraLastSignInErrorApp"
+        "Entra Last Fail Sign-In Loc"    = "EntraLastSignInErrorLocation"
+        "Entra Last Fail Sign-In IP"     = "EntraLastSignInErrorIP"
     }
     Groups = [ordered]@{
         "Name"                    = "Name"
@@ -159,7 +175,22 @@ $PS_PROP_MAP = @{
     IPv4Address            = @{ Kind = "ClientOnly"; PsProp = "IPv4Address" }
     CannotChangePassword   = @{ Kind = "ClientOnly"; PsProp = "CannotChangePassword" }
     PasswordExpired        = @{ Kind = "ClientOnly"; PsProp = "PasswordExpired" }
+    EntraAssignedRoles           = @{ Kind = "ClientOnly"; PsProp = "EntraAssignedRoles" }
+    EntraDevices                 = @{ Kind = "ClientOnly"; PsProp = "EntraDevices" }
+    EntraAuthMethods             = @{ Kind = "ClientOnly"; PsProp = "EntraAuthMethods" }
+    EntraLastSignInErrorCode     = @{ Kind = "ClientOnly"; PsProp = "EntraLastSignInErrorCode" }
+    EntraLastSignInErrorTime     = @{ Kind = "ClientOnly"; PsProp = "EntraLastSignInErrorTime" }
+    EntraLastSignInErrorApp      = @{ Kind = "ClientOnly"; PsProp = "EntraLastSignInErrorApp" }
+    EntraLastSignInErrorLocation = @{ Kind = "ClientOnly"; PsProp = "EntraLastSignInErrorLocation" }
+    EntraLastSignInErrorIP       = @{ Kind = "ClientOnly"; PsProp = "EntraLastSignInErrorIP" }
 }
+
+# Entra-only property names (never request these from on-prem Get-AD*)
+$script:EntraPropNames = @(
+    "EntraAssignedRoles","EntraDevices","EntraAuthMethods",
+    "EntraLastSignInErrorCode","EntraLastSignInErrorTime","EntraLastSignInErrorApp",
+    "EntraLastSignInErrorLocation","EntraLastSignInErrorIP"
+)
 
 $DEFAULT_COLS = @{
     Users     = @("DisplayName","SamAccountName","UserPrincipalName","EmailAddress","EmployeeID","extensionAttribute3","Enabled")
@@ -183,6 +214,10 @@ $script:VisibleColumns = [System.Collections.Generic.List[string]]::new()
 $script:LoadedProperties = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 $script:CurrentObjType = "Users"
 $script:IsRunning      = $false
+# Entra / Microsoft Graph session (device-code token)
+$script:EntraAccessToken = $null
+$script:EntraTokenExpires = [datetime]::MinValue
+$script:EntraAccountUpn = ""
 
 $DEFAULT_COLS["Users"] | ForEach-Object { $script:VisibleColumns.Add($_) }
 
@@ -728,7 +763,60 @@ $lnkClear.LinkColor = $Theme.Accent
 $gbGroup.Controls.AddRange(@($rdoMemberOf,$rdoNotMember,$rdoNoGroup,$txtGroupSearch,$btnGroupSearch,$lstGroups,$lnkClear))
 
 # ---------------------------------------------------------------------------
-# 7. LIVE FILTER PREVIEW
+# 7. ENTRA ID (Microsoft Graph enrichment — Users only)
+# ---------------------------------------------------------------------------
+$gbEntra = New-GroupBox "Entra ID Enrichment" 168
+Add-LeftRow $gbEntra
+
+$chkEntraEnrich = New-Object System.Windows.Forms.CheckBox
+$chkEntraEnrich.Text = "Enrich Users with Entra ID after query"; $chkEntraEnrich.AutoSize = $true
+$chkEntraEnrich.Location = New-Object System.Drawing.Point(12,22); $chkEntraEnrich.BackColor = $Theme.Card
+$chkEntraEnrich.Checked = $false
+
+$btnEntraConnect = New-Object System.Windows.Forms.Button
+$btnEntraConnect.Text = "Connect Graph"; $btnEntraConnect.Width = 110; $btnEntraConnect.Height = 24
+$btnEntraConnect.Location = New-Object System.Drawing.Point(12,46)
+Set-SecondaryButtonStyle $btnEntraConnect
+
+$btnEntraDisconnect = New-Object System.Windows.Forms.Button
+$btnEntraDisconnect.Text = "Disconnect"; $btnEntraDisconnect.Width = 90; $btnEntraDisconnect.Height = 24
+$btnEntraDisconnect.Location = New-Object System.Drawing.Point(128,46)
+Set-SubtleButtonStyle $btnEntraDisconnect
+
+$lblEntraStatus = New-Object System.Windows.Forms.Label
+$lblEntraStatus.Text = "Not connected"; $lblEntraStatus.AutoSize = $true; $lblEntraStatus.Font = $fntSmall
+$lblEntraStatus.ForeColor = $Theme.TextMuted; $lblEntraStatus.BackColor = $Theme.Card
+$lblEntraStatus.Location = New-Object System.Drawing.Point(226,50)
+
+$chkEntraRoles = New-Object System.Windows.Forms.CheckBox
+$chkEntraRoles.Text = "Assigned roles"; $chkEntraRoles.AutoSize = $true; $chkEntraRoles.Checked = $true
+$chkEntraRoles.Location = New-Object System.Drawing.Point(12,78); $chkEntraRoles.BackColor = $Theme.Card
+
+$chkEntraDevices = New-Object System.Windows.Forms.CheckBox
+$chkEntraDevices.Text = "Devices"; $chkEntraDevices.AutoSize = $true; $chkEntraDevices.Checked = $true
+$chkEntraDevices.Location = New-Object System.Drawing.Point(130,78); $chkEntraDevices.BackColor = $Theme.Card
+
+$chkEntraAuth = New-Object System.Windows.Forms.CheckBox
+$chkEntraAuth.Text = "Auth methods"; $chkEntraAuth.AutoSize = $true; $chkEntraAuth.Checked = $true
+$chkEntraAuth.Location = New-Object System.Drawing.Point(210,78); $chkEntraAuth.BackColor = $Theme.Card
+
+$chkEntraFailSignIn = New-Object System.Windows.Forms.CheckBox
+$chkEntraFailSignIn.Text = "Last failed sign-in (code, time, app, location, IP)"; $chkEntraFailSignIn.AutoSize = $true
+$chkEntraFailSignIn.Checked = $true
+$chkEntraFailSignIn.Location = New-Object System.Drawing.Point(12,104); $chkEntraFailSignIn.BackColor = $Theme.Card
+
+$btnEntraEnrichNow = New-Object System.Windows.Forms.Button
+$btnEntraEnrichNow.Text = "Enrich Current Results"; $btnEntraEnrichNow.Width = 160; $btnEntraEnrichNow.Height = 26
+$btnEntraEnrichNow.Location = New-Object System.Drawing.Point(12,132)
+Set-SecondaryButtonStyle $btnEntraEnrichNow
+
+$gbEntra.Controls.AddRange(@(
+    $chkEntraEnrich,$btnEntraConnect,$btnEntraDisconnect,$lblEntraStatus,
+    $chkEntraRoles,$chkEntraDevices,$chkEntraAuth,$chkEntraFailSignIn,$btnEntraEnrichNow
+))
+
+# ---------------------------------------------------------------------------
+# 8. LIVE FILTER PREVIEW
 # ---------------------------------------------------------------------------
 $gbPreview = New-GroupBox "Filter Preview" 176
 Add-LeftRow $gbPreview
@@ -753,7 +841,7 @@ $txtLdap.ScrollBars = "Vertical"; $txtLdap.Font = $fntMono
 $gbPreview.Controls.AddRange(@($txtEnglish,$lblLdapCap,$txtLdap))
 
 # ---------------------------------------------------------------------------
-# 8. ACTION BUTTONS
+# 9. ACTION BUTTONS
 # ---------------------------------------------------------------------------
 $ActPanel = New-Object System.Windows.Forms.Panel
 $ActPanel.Height = 44; $ActPanel.BackColor = $Theme.Window
@@ -1441,6 +1529,16 @@ function Update-FilterPreview {
             [void]$sb.AppendLine("Groups: $mode $($sel -join ', ')")
         }
     }
+    if ($gbEntra.Visible -and $chkEntraEnrich.Checked) {
+        $bits = @()
+        if ($chkEntraRoles.Checked) { $bits += "roles" }
+        if ($chkEntraDevices.Checked) { $bits += "devices" }
+        if ($chkEntraAuth.Checked) { $bits += "auth methods" }
+        if ($chkEntraFailSignIn.Checked) { $bits += "last failed sign-in" }
+        if ($bits.Count -gt 0) {
+            [void]$sb.AppendLine("Entra enrich: $($bits -join ', ')")
+        }
+    }
     $txtEnglish.Text = $sb.ToString().TrimEnd()
 
     # Raw LDAP (attribute portion only; status is appended at query time)
@@ -1470,6 +1568,7 @@ function Switch-ObjectType ([string]$ObjType) {
         else { Set-SecondaryButtonStyle $kv.Value }
     }
     $gbStatus.Visible = ($ObjType -in @("Users","Computers"))
+    $gbEntra.Visible  = ($ObjType -eq "Users")
     Update-GroupMembershipPanel
     # Attributes differ per type — start the grouped builder fresh with one group
     $script:FilterGroups.Clear()
@@ -1568,8 +1667,8 @@ function Populate-Grid {
     $Grid.Rows.Clear()
     if (-not $Data -or $Data.Count -eq 0) { $Grid.ResumeLayout(); return }
 
-    $wideAttrs   = @("DistinguishedName","CanonicalName","HomeDirectory","ScriptPath","ProfilePath","Description","DisplayName","Mail","EmailAddress")
-    $narrowAttrs = @("Enabled","PasswordNeverExpires","PasswordNotRequired","LockedOut","SmartcardLogonRequired","TrustedForDelegation","SID","ObjectGUID","objectClass","objectCategory","AdminCount")
+    $wideAttrs   = @("DistinguishedName","CanonicalName","HomeDirectory","ScriptPath","ProfilePath","Description","DisplayName","Mail","EmailAddress","EntraAssignedRoles","EntraDevices","EntraAuthMethods","EntraLastSignInErrorLocation","EntraLastSignInErrorApp")
+    $narrowAttrs = @("Enabled","PasswordNeverExpires","PasswordNotRequired","LockedOut","SmartcardLogonRequired","TrustedForDelegation","SID","ObjectGUID","objectClass","objectCategory","AdminCount","EntraLastSignInErrorCode","EntraLastSignInErrorIP")
 
     foreach ($col in $script:VisibleColumns) {
         $gc = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
@@ -1600,6 +1699,456 @@ function Populate-Grid {
     $Grid.ScrollBars = [System.Windows.Forms.ScrollBars]::Both
     $Grid.ResumeLayout()
 }
+
+# ===========================================================================
+# ENTRA ID / MICROSOFT GRAPH
+# ===========================================================================
+# Uses the public Microsoft Graph PowerShell client id for device-code auth
+# (same app used by Connect-MgGraph). No app registration required for
+# interactive delegated access; admin consent may still be needed for scopes.
+$script:GraphClientId = "14d82eec-204b-4c2f-b113-9d477e6ee18c"
+$script:GraphScopes = @(
+    "User.Read.All",
+    "Directory.Read.All",
+    "AuditLog.Read.All",
+    "UserAuthenticationMethod.Read.All",
+    "Device.Read.All",
+    "RoleManagement.Read.Directory",
+    "offline_access"
+) -join " "
+
+function Test-EntraConnected {
+    if (-not $script:EntraAccessToken) { return $false }
+    if ([datetime]::UtcNow -ge $script:EntraTokenExpires.AddMinutes(-2)) { return $false }
+    return $true
+}
+
+function Update-EntraStatusLabel {
+    if (Test-EntraConnected) {
+        $who = if ($script:EntraAccountUpn) { $script:EntraAccountUpn } else { "connected" }
+        $lblEntraStatus.Text = $who
+        $lblEntraStatus.ForeColor = $Theme.Accent
+    } else {
+        $lblEntraStatus.Text = "Not connected"
+        $lblEntraStatus.ForeColor = $Theme.TextMuted
+        $script:EntraAccessToken = $null
+        $script:EntraAccountUpn = ""
+    }
+}
+
+function Connect-EntraGraph {
+    # Device-code flow against login.microsoftonline.com (works on PS 5.1, no MSAL module)
+    try {
+        $dcBody = @{
+            client_id = $script:GraphClientId
+            scope     = $script:GraphScopes
+        }
+        $dc = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/organizations/oauth2/v2.0/devicecode" `
+            -ContentType "application/x-www-form-urlencoded" -Body $dcBody -ErrorAction Stop
+
+        $msg = "Sign in to Microsoft Graph for Entra enrichment.`r`n`r`n" +
+               "1. Open: $($dc.verification_uri)`r`n" +
+               "2. Enter code: $($dc.user_code)`r`n`r`n" +
+               "Click OK to start waiting (up to $([int]($dc.expires_in / 60)) min) while you finish in the browser."
+        [System.Windows.Forms.MessageBox]::Show($msg, "Connect to Entra ID",
+            [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+
+        $deadline = [datetime]::UtcNow.AddSeconds([int]$dc.expires_in)
+        $interval = [Math]::Max(5, [int]$dc.interval)
+        $token = $null
+        Start-Progress "Waiting for Graph device sign-in..."
+        while ([datetime]::UtcNow -lt $deadline) {
+            Start-Sleep -Seconds $interval
+            Update-Progress "Waiting for Graph device sign-in..."
+            try {
+                $tokBody = @{
+                    grant_type  = "urn:ietf:params:oauth:grant-type:device_code"
+                    client_id   = $script:GraphClientId
+                    device_code = $dc.device_code
+                }
+                $token = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/organizations/oauth2/v2.0/token" `
+                    -ContentType "application/x-www-form-urlencoded" -Body $tokBody -ErrorAction Stop
+                break
+            } catch {
+                $errText = "$_"
+                try {
+                    $resp = $_.Exception.Response
+                    if ($resp) {
+                        $stream = $resp.GetResponseStream()
+                        if ($stream) {
+                            $reader = New-Object System.IO.StreamReader($stream)
+                            $errText += " " + $reader.ReadToEnd()
+                            $reader.Close()
+                        }
+                    }
+                } catch { }
+                if ($errText -match 'authorization_pending' -or $errText -match 'slow_down') { continue }
+                throw
+            }
+        }
+        Stop-Progress
+        if (-not $token -or -not $token.access_token) {
+            throw "Device sign-in timed out or was cancelled."
+        }
+
+        $script:EntraAccessToken = $token.access_token
+        $script:EntraTokenExpires = [datetime]::UtcNow.AddSeconds([int]$token.expires_in)
+        $script:EntraAccountUpn = ""
+        try {
+            $me = Invoke-GraphGet -Uri "https://graph.microsoft.com/v1.0/me?`$select=userPrincipalName,displayName"
+            if ($me.userPrincipalName) { $script:EntraAccountUpn = [string]$me.userPrincipalName }
+            elseif ($me.displayName) { $script:EntraAccountUpn = [string]$me.displayName }
+        } catch { }
+
+        Update-EntraStatusLabel
+        [System.Windows.Forms.MessageBox]::Show("Connected to Microsoft Graph.", "Entra ID",
+            [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    } catch {
+        Stop-Progress
+        $script:EntraAccessToken = $null
+        Update-EntraStatusLabel
+        [System.Windows.Forms.MessageBox]::Show("Graph connect failed:`r`n$_", "Entra ID",
+            [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+    }
+}
+
+function Disconnect-EntraGraph {
+    $script:EntraAccessToken = $null
+    $script:EntraTokenExpires = [datetime]::MinValue
+    $script:EntraAccountUpn = ""
+    Update-EntraStatusLabel
+}
+
+function Invoke-GraphGet {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [int]$MaxPages = 5
+    )
+    if (-not (Test-EntraConnected)) { throw "Not connected to Microsoft Graph. Click Connect Graph first." }
+    $headers = @{
+        Authorization = "Bearer $($script:EntraAccessToken)"
+        ConsistencyLevel = "eventual"
+    }
+    $items = [System.Collections.Generic.List[object]]::new()
+    $next = $Uri
+    $page = 0
+    $last = $null
+    while ($next -and $page -lt $MaxPages) {
+        $page++
+        $resp = Invoke-RestMethod -Method Get -Uri $next -Headers $headers -ErrorAction Stop
+        $last = $resp
+        if ($resp.PSObject.Properties['value']) {
+            foreach ($v in @($resp.value)) { $items.Add($v) }
+            if ($resp.PSObject.Properties['@odata.nextLink'] -and $resp.'@odata.nextLink') {
+                $next = [string]$resp.'@odata.nextLink'
+            } else { $next = $null }
+        } else {
+            return $resp
+        }
+    }
+    return @{ value = @($items); _raw = $last }
+}
+
+function Escape-ODataString ([string]$Value) {
+    if ($null -eq $Value) { return "" }
+    return ($Value -replace "'", "''")
+}
+
+function Get-AuthMethodLabel ($method) {
+    if (-not $method) { return "unknown" }
+    $type = [string]$method.'@odata.type'
+    switch -Regex ($type) {
+        'passwordAuthenticationMethod'          { return "Password" }
+        'microsoftAuthenticatorAuthenticationMethod' { return "Microsoft Authenticator" }
+        'phoneAuthenticationMethod' {
+            $num = if ($method.phoneNumber) { $method.phoneNumber } else { "" }
+            return ("Phone " + $num).Trim()
+        }
+        'fido2AuthenticationMethod'             { return "FIDO2" }
+        'windowsHelloForBusinessAuthenticationMethod' { return "Windows Hello" }
+        'emailAuthenticationMethod' {
+            $em = if ($method.emailAddress) { $method.emailAddress } else { "" }
+            return ("Email " + $em).Trim()
+        }
+        'softwareOathAuthenticationMethod'      { return "Software OATH" }
+        'temporaryAccessPassAuthenticationMethod' { return "Temporary Access Pass" }
+        'platformCredentialAuthenticationMethod' { return "Platform credential" }
+        default {
+            $short = $type -replace '#microsoft\.graph\.', '' -replace 'AuthenticationMethod$', ''
+            if ($short) { return $short }
+            return "Other"
+        }
+    }
+}
+
+function ConvertTo-EnrichableRow {
+    param($Object)
+    $ordered = [ordered]@{}
+    # Prefer currently visible + loaded props so we keep AD values
+    $names = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($p in $script:LoadedProperties) { [void]$names.Add($p) }
+    foreach ($p in $script:VisibleColumns) { [void]$names.Add($p) }
+    foreach ($p in @("DistinguishedName","SamAccountName","UserPrincipalName","EmailAddress","Enabled","DisplayName")) {
+        [void]$names.Add($p)
+    }
+    foreach ($p in $names) {
+        $ordered[$p] = Get-ObjectPropValue -Object $Object -Name $p
+    }
+    # Preserve any already-enriched Entra fields
+    foreach ($p in $script:EntraPropNames) {
+        if (Test-ObjectHasProp -Object $Object -Name $p) {
+            $ordered[$p] = Get-ObjectPropValue -Object $Object -Name $p
+        }
+    }
+    return [pscustomobject]$ordered
+}
+
+function Resolve-EntraUserId {
+    param([string]$Upn, [string]$Mail, [string]$Sam)
+    $candidates = @($Upn, $Mail) | Where-Object { $_ -and $_.Trim() -ne "" } | Select-Object -Unique
+    foreach ($c in $candidates) {
+        $safe = Escape-ODataString $c.Trim()
+        try {
+            $uri = "https://graph.microsoft.com/v1.0/users?`$filter=userPrincipalName eq '$safe' or mail eq '$safe'&`$select=id,userPrincipalName,mail&`$top=1"
+            $resp = Invoke-GraphGet -Uri $uri -MaxPages 1
+            $val = @($resp.value)
+            if ($val.Count -gt 0 -and $val[0].id) { return [string]$val[0].id }
+        } catch { }
+        # Direct lookup by UPN path
+        try {
+            $enc = [uri]::EscapeDataString($c.Trim())
+            $u = Invoke-GraphGet -Uri "https://graph.microsoft.com/v1.0/users/$enc`?`$select=id" -MaxPages 1
+            if ($u -and $u.id) { return [string]$u.id }
+        } catch { }
+    }
+    return $null
+}
+
+function Get-EntraAssignedRoles ([string]$UserId) {
+    $roles = [System.Collections.Generic.List[string]]::new()
+    try {
+        $uri = "https://graph.microsoft.com/v1.0/users/$UserId/memberOf/microsoft.graph.directoryRole?`$select=displayName"
+        $resp = Invoke-GraphGet -Uri $uri
+        foreach ($r in @($resp.value)) {
+            if ($r.displayName) { $roles.Add([string]$r.displayName) }
+        }
+    } catch { }
+    # App / unified role assignments (directory)
+    try {
+        $uri2 = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?`$filter=principalId eq '$UserId'&`$expand=roleDefinition(`$select=displayName)&`$top=50"
+        $resp2 = Invoke-GraphGet -Uri $uri2
+        foreach ($a in @($resp2.value)) {
+            $dn = $null
+            if ($a.roleDefinition -and $a.roleDefinition.displayName) { $dn = [string]$a.roleDefinition.displayName }
+            if ($dn -and -not $roles.Contains($dn)) { $roles.Add($dn) }
+        }
+    } catch { }
+    if ($roles.Count -eq 0) { return "" }
+    return (($roles | Select-Object -Unique | Sort-Object) -join "; ")
+}
+
+function Get-EntraDevices ([string]$UserId) {
+    $names = [System.Collections.Generic.List[string]]::new()
+    foreach ($nav in @("registeredDevices","ownedDevices")) {
+        try {
+            $uri = "https://graph.microsoft.com/v1.0/users/$UserId/$nav`?`$select=displayName,operatingSystem,deviceId&`$top=50"
+            $resp = Invoke-GraphGet -Uri $uri
+            foreach ($d in @($resp.value)) {
+                $label = if ($d.displayName) { [string]$d.displayName } else { [string]$d.deviceId }
+                if ($d.operatingSystem) { $label = "$label ($($d.operatingSystem))" }
+                if ($label -and -not $names.Contains($label)) { $names.Add($label) }
+            }
+        } catch { }
+    }
+    if ($names.Count -eq 0) { return "" }
+    return ($names -join "; ")
+}
+
+function Get-EntraAuthMethods ([string]$UserId) {
+    try {
+        # authentication/methods is complete on v1.0 for most method types
+        $uri = "https://graph.microsoft.com/v1.0/users/$UserId/authentication/methods"
+        $resp = Invoke-GraphGet -Uri $uri
+        $labels = @($resp.value | ForEach-Object { Get-AuthMethodLabel $_ }) | Where-Object { $_ } | Select-Object -Unique
+        return ($labels -join "; ")
+    } catch {
+        return ""
+    }
+}
+
+function Get-EntraLastFailedSignIn ([string]$Upn) {
+    $empty = @{
+        Code = ""; Time = ""; App = ""; Location = ""; IP = ""
+    }
+    if (-not $Upn) { return $empty }
+    $safe = Escape-ODataString $Upn.Trim()
+    try {
+        $filter = [uri]::EscapeDataString("userPrincipalName eq '$safe' and status/errorCode ne 0")
+        $uri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$filter=$filter&`$orderby=createdDateTime desc&`$top=1"
+        $resp = Invoke-GraphGet -Uri $uri -MaxPages 1
+        $row = @($resp.value) | Select-Object -First 1
+        if (-not $row) { return $empty }
+
+        $locParts = @()
+        if ($row.location) {
+            if ($row.location.city) { $locParts += [string]$row.location.city }
+            if ($row.location.state) { $locParts += [string]$row.location.state }
+            if ($row.location.countryOrRegion) { $locParts += [string]$row.location.countryOrRegion }
+        }
+        $code = ""
+        if ($row.status -and $null -ne $row.status.errorCode) { $code = [string]$row.status.errorCode }
+        $time = ""
+        if ($row.createdDateTime) {
+            try { $time = ([datetime]$row.createdDateTime).ToLocalTime().ToString($DATE_FORMAT) }
+            catch { $time = [string]$row.createdDateTime }
+        }
+        return @{
+            Code     = $code
+            Time     = $time
+            App      = if ($row.appDisplayName) { [string]$row.appDisplayName } else { "" }
+            Location = ($locParts -join ", ")
+            IP       = if ($row.ipAddress) { [string]$row.ipAddress } else { "" }
+        }
+    } catch {
+        return $empty
+    }
+}
+
+function Get-SelectedEntraColumns {
+    $cols = [System.Collections.Generic.List[string]]::new()
+    if ($chkEntraRoles.Checked) { $cols.Add("EntraAssignedRoles") }
+    if ($chkEntraDevices.Checked) { $cols.Add("EntraDevices") }
+    if ($chkEntraAuth.Checked) { $cols.Add("EntraAuthMethods") }
+    if ($chkEntraFailSignIn.Checked) {
+        $cols.Add("EntraLastSignInErrorCode")
+        $cols.Add("EntraLastSignInErrorTime")
+        $cols.Add("EntraLastSignInErrorApp")
+        $cols.Add("EntraLastSignInErrorLocation")
+        $cols.Add("EntraLastSignInErrorIP")
+    }
+    return @($cols)
+}
+
+function Ensure-EntraColumnsVisible {
+    $added = $false
+    foreach ($c in (Get-SelectedEntraColumns)) {
+        if (-not ($script:VisibleColumns -contains $c)) {
+            $script:VisibleColumns.Add($c)
+            $added = $true
+        }
+        [void]$script:LoadedProperties.Add($c)
+    }
+    return $added
+}
+
+function Invoke-EntraEnrichment {
+    param([switch]$Force)
+
+    if ($script:CurrentObjType -ne "Users") {
+        if ($Force) {
+            [System.Windows.Forms.MessageBox]::Show("Entra enrichment is only available for Users.", "Entra ID",
+                [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+        }
+        return
+    }
+    if (-not $chkEntraRoles.Checked -and -not $chkEntraDevices.Checked -and -not $chkEntraAuth.Checked -and -not $chkEntraFailSignIn.Checked) {
+        if ($Force) {
+            [System.Windows.Forms.MessageBox]::Show("Select at least one Entra data type to enrich.", "Entra ID",
+                [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+        }
+        return
+    }
+    if (-not (Test-EntraConnected)) {
+        Connect-EntraGraph
+        if (-not (Test-EntraConnected)) { return }
+    }
+    if ($script:Results.Count -eq 0) {
+        if ($Force) {
+            [System.Windows.Forms.MessageBox]::Show("Run a query first.", "Entra ID",
+                [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+        }
+        return
+    }
+
+    [void](Ensure-EntraColumnsVisible)
+    $wantRoles = $chkEntraRoles.Checked
+    $wantDev = $chkEntraDevices.Checked
+    $wantAuth = $chkEntraAuth.Checked
+    $wantFail = $chkEntraFailSignIn.Checked
+
+    $newRows = [System.Collections.Generic.List[object]]::new()
+    $i = 0
+    $total = $script:Results.Count
+    Start-Progress "Enriching with Entra ID (0 / $total)..."
+    foreach ($obj in $script:Results) {
+        $i++
+        if ($i % 5 -eq 0 -or $i -eq $total) {
+            Update-Progress "Enriching with Entra ID ($i / $total)..."
+        }
+        $row = ConvertTo-EnrichableRow -Object $obj
+        $upn = [string](Get-ObjectPropValue -Object $row -Name "UserPrincipalName")
+        $mail = [string](Get-ObjectPropValue -Object $row -Name "EmailAddress")
+        if (-not $mail) { $mail = [string](Get-ObjectPropValue -Object $row -Name "mail") }
+        $sam = [string](Get-ObjectPropValue -Object $row -Name "SamAccountName")
+
+        # Defaults
+        if ($wantRoles) { $row | Add-Member -NotePropertyName EntraAssignedRoles -NotePropertyValue "" -Force }
+        if ($wantDev)   { $row | Add-Member -NotePropertyName EntraDevices -NotePropertyValue "" -Force }
+        if ($wantAuth)  { $row | Add-Member -NotePropertyName EntraAuthMethods -NotePropertyValue "" -Force }
+        if ($wantFail) {
+            $row | Add-Member -NotePropertyName EntraLastSignInErrorCode -NotePropertyValue "" -Force
+            $row | Add-Member -NotePropertyName EntraLastSignInErrorTime -NotePropertyValue "" -Force
+            $row | Add-Member -NotePropertyName EntraLastSignInErrorApp -NotePropertyValue "" -Force
+            $row | Add-Member -NotePropertyName EntraLastSignInErrorLocation -NotePropertyValue "" -Force
+            $row | Add-Member -NotePropertyName EntraLastSignInErrorIP -NotePropertyValue "" -Force
+        }
+
+        try {
+            $uid = Resolve-EntraUserId -Upn $upn -Mail $mail -Sam $sam
+            if ($uid) {
+                if ($wantRoles) { $row.EntraAssignedRoles = Get-EntraAssignedRoles -UserId $uid }
+                if ($wantDev)   { $row.EntraDevices = Get-EntraDevices -UserId $uid }
+                if ($wantAuth)  { $row.EntraAuthMethods = Get-EntraAuthMethods -UserId $uid }
+                if ($wantFail) {
+                    $lookupUpn = if ($upn) { $upn } else { $mail }
+                    $fail = Get-EntraLastFailedSignIn -Upn $lookupUpn
+                    $row.EntraLastSignInErrorCode = $fail.Code
+                    $row.EntraLastSignInErrorTime = $fail.Time
+                    $row.EntraLastSignInErrorApp = $fail.App
+                    $row.EntraLastSignInErrorLocation = $fail.Location
+                    $row.EntraLastSignInErrorIP = $fail.IP
+                }
+            }
+        } catch {
+            # leave blanks on per-user failure; continue
+        }
+        $newRows.Add($row)
+    }
+    Stop-Progress
+    $script:Results = @($newRows)
+    foreach ($c in (Get-SelectedEntraColumns)) { [void]$script:LoadedProperties.Add($c) }
+    Apply-ResultsSearch
+    Set-Status "Entra enrichment done - $($script:Results.Count) user(s)" $script:Results.Count `
+        @($script:Results | Where-Object { (Get-ObjectPropValue -Object $_ -Name 'Enabled') -eq $true }).Count `
+        @($script:Results | Where-Object { (Get-ObjectPropValue -Object $_ -Name 'Enabled') -eq $false }).Count
+}
+
+foreach ($c in @($chkEntraEnrich,$chkEntraRoles,$chkEntraDevices,$chkEntraAuth,$chkEntraFailSignIn)) {
+    $c.Add_CheckedChanged({ Update-FilterPreview })
+}
+$btnEntraConnect.Add_Click({ Connect-EntraGraph })
+$btnEntraDisconnect.Add_Click({ Disconnect-EntraGraph })
+$btnEntraEnrichNow.Add_Click({
+    if ($script:IsRunning) { return }
+    $script:IsRunning = $true
+    $btnRun.Enabled = $false
+    $btnEntraEnrichNow.Enabled = $false
+    try { Invoke-EntraEnrichment -Force } finally {
+        $script:IsRunning = $false
+        $btnRun.Enabled = $true
+        $btnEntraEnrichNow.Enabled = $true
+    }
+})
 
 # ===========================================================================
 # QUERY ENGINE
@@ -1654,8 +2203,13 @@ function Invoke-Query {
         if ($objType -in @("Users","Computers")) {
             [void]$neededProps.Add("Enabled")
         }
+        if ($objType -eq "Users") {
+            [void]$neededProps.Add("UserPrincipalName")
+            [void]$neededProps.Add("EmailAddress")
+            [void]$neededProps.Add("mail")
+        }
 
-        $props = @($neededProps | Where-Object { $_ })
+        $props = @($neededProps | Where-Object { $_ -and ($script:EntraPropNames -notcontains $_) })
 
         $finalLdap = $ldap
         if ($gbStatus.Visible) {
@@ -1789,6 +2343,11 @@ function Invoke-Query {
         }
         Stop-Progress
         Set-Status "Done - $total result(s)" $total $enabled $disabled
+
+        # Optional Entra ID enrichment (Users only)
+        if ($objType -eq "Users" -and $chkEntraEnrich.Checked -and $total -gt 0) {
+            Invoke-EntraEnrichment
+        }
     } catch {
         Stop-Progress
         $filterHint = ""
@@ -1929,64 +2488,89 @@ function Update-ResultsWithProperties {
 
     if ($script:Results.Count -eq 0) { return }
 
-    $missing = @($NeededProps | Where-Object { $_ -and -not $script:LoadedProperties.Contains($_) })
-    if ($missing.Count -eq 0) { return }
+    $adNeeded = @($NeededProps | Where-Object { $_ -and ($script:EntraPropNames -notcontains $_) })
+    $entraNeeded = @($NeededProps | Where-Object { $_ -and ($script:EntraPropNames -contains $_) })
 
-    $fetchSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($p in $script:LoadedProperties) { [void]$fetchSet.Add($p) }
-    foreach ($p in $NeededProps) { if ($p) { [void]$fetchSet.Add($p) } }
-    [void]$fetchSet.Add("DistinguishedName")
-    # Ensure alias LDAP names are also requested when the PS name is needed
-    foreach ($p in @($NeededProps)) {
-        if ($p -and $PS_PROP_MAP.ContainsKey($p) -and $PS_PROP_MAP[$p].Kind -eq "Alias") {
-            [void]$fetchSet.Add($PS_PROP_MAP[$p].Ldap)
+    $missing = @($adNeeded | Where-Object { -not $script:LoadedProperties.Contains($_) })
+    $entraMissing = @($entraNeeded | Where-Object { -not $script:LoadedProperties.Contains($_) })
+
+    if ($missing.Count -eq 0 -and $entraMissing.Count -eq 0) { return }
+
+    if ($missing.Count -gt 0) {
+        $fetchSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($p in $script:LoadedProperties) {
+            if ($script:EntraPropNames -notcontains $p) { [void]$fetchSet.Add($p) }
         }
-    }
-    # Date convenience props need their underlying LDAP attrs too
-    foreach ($p in @($NeededProps)) {
-        if ($p -and $DATE_LDAP_MAP.ContainsKey($p)) { [void]$fetchSet.Add($DATE_LDAP_MAP[$p].Ldap) }
-    }
+        foreach ($p in $adNeeded) { if ($p) { [void]$fetchSet.Add($p) } }
+        [void]$fetchSet.Add("DistinguishedName")
+        # Ensure alias LDAP names are also requested when the PS name is needed
+        foreach ($p in @($adNeeded)) {
+            if ($p -and $PS_PROP_MAP.ContainsKey($p) -and $PS_PROP_MAP[$p].Kind -eq "Alias") {
+                [void]$fetchSet.Add($PS_PROP_MAP[$p].Ldap)
+            }
+        }
+        # Date convenience props need their underlying LDAP attrs too
+        foreach ($p in @($adNeeded)) {
+            if ($p -and $DATE_LDAP_MAP.ContainsKey($p)) { [void]$fetchSet.Add($DATE_LDAP_MAP[$p].Ldap) }
+        }
 
-    $fetchAttrs = @($fetchSet)
-    $fetchCmd = switch ($script:CurrentObjType) {
-        "Users"     { { param($dn,$p) Get-ADUser     -Identity $dn -Properties $p -ErrorAction Stop } }
-        "Computers" { { param($dn,$p) Get-ADComputer -Identity $dn -Properties $p -ErrorAction Stop } }
-        "Groups"    { { param($dn,$p) Get-ADGroup    -Identity $dn -Properties $p -ErrorAction Stop } }
-        default     { { param($dn,$p) Get-ADObject   -Identity $dn -Properties $p -ErrorAction Stop } }
-    }
+        $fetchAttrs = @($fetchSet)
+        $fetchCmd = switch ($script:CurrentObjType) {
+            "Users"     { { param($dn,$p) Get-ADUser     -Identity $dn -Properties $p -ErrorAction Stop } }
+            "Computers" { { param($dn,$p) Get-ADComputer -Identity $dn -Properties $p -ErrorAction Stop } }
+            "Groups"    { { param($dn,$p) Get-ADGroup    -Identity $dn -Properties $p -ErrorAction Stop } }
+            default     { { param($dn,$p) Get-ADObject   -Identity $dn -Properties $p -ErrorAction Stop } }
+        }
 
-    Start-Progress "Fetching $($missing.Count) attribute(s) for $($script:Results.Count) object(s)..."
-    $Form.Refresh()
+        Start-Progress "Fetching $($missing.Count) attribute(s) for $($script:Results.Count) object(s)..."
+        $Form.Refresh()
 
-    $newResults = [System.Collections.Generic.List[object]]::new()
-    $fetched = 0
-    $errors  = 0
-    foreach ($r in $script:Results) {
-        $dn = Get-ObjectPropValue -Object $r -Name 'DistinguishedName'
-        if (-not $dn) {
-            $newResults.Add($r)
+        $newResults = [System.Collections.Generic.List[object]]::new()
+        $fetched = 0
+        $errors  = 0
+        foreach ($r in $script:Results) {
+            $dn = Get-ObjectPropValue -Object $r -Name 'DistinguishedName'
+            if (-not $dn) {
+                $newResults.Add($r)
+                $fetched++
+                continue
+            }
+            try {
+                # Replace the whole object — do NOT Add-Member onto AD* instances
+                $fresh = & $fetchCmd $dn $fetchAttrs
+                # Preserve any Entra fields already on the prior row
+                $row = ConvertTo-EnrichableRow -Object $fresh
+                foreach ($ep in $script:EntraPropNames) {
+                    if (Test-ObjectHasProp -Object $r -Name $ep) {
+                        $row | Add-Member -NotePropertyName $ep -NotePropertyValue (Get-ObjectPropValue -Object $r -Name $ep) -Force
+                    }
+                }
+                $newResults.Add($row)
+            } catch {
+                $newResults.Add($r)
+                $errors++
+            }
             $fetched++
-            continue
+            if ($fetched % 25 -eq 0) {
+                Update-Progress "Fetching attributes: $fetched / $($script:Results.Count)..."
+            }
         }
-        try {
-            # Replace the whole object — do NOT Add-Member onto AD* instances
-            $fresh = & $fetchCmd $dn $fetchAttrs
-            $newResults.Add($fresh)
-        } catch {
-            $newResults.Add($r)
-            $errors++
-        }
-        $fetched++
-        if ($fetched % 25 -eq 0) {
-            Update-Progress "Fetching attributes: $fetched / $($script:Results.Count)..."
+
+        $script:Results = @($newResults)
+        foreach ($p in $fetchAttrs) { if ($p) { [void]$script:LoadedProperties.Add($p) } }
+        Stop-Progress
+        if ($errors -gt 0) {
+            Set-Status "Columns updated ($errors object(s) failed to refresh)"
         }
     }
 
-    $script:Results = @($newResults)
-    foreach ($p in $fetchAttrs) { if ($p) { [void]$script:LoadedProperties.Add($p) } }
-    Stop-Progress
-    if ($errors -gt 0) {
-        Set-Status "Columns updated ($errors object(s) failed to refresh)"
+    # Entra columns selected in the chooser → pull from Graph
+    if ($entraMissing.Count -gt 0 -and $script:CurrentObjType -eq "Users") {
+        if ($entraMissing -contains "EntraAssignedRoles") { $chkEntraRoles.Checked = $true }
+        if ($entraMissing -contains "EntraDevices") { $chkEntraDevices.Checked = $true }
+        if ($entraMissing -contains "EntraAuthMethods") { $chkEntraAuth.Checked = $true }
+        if ($entraMissing | Where-Object { $_ -like "EntraLastSignInError*" }) { $chkEntraFailSignIn.Checked = $true }
+        Invoke-EntraEnrichment
     }
 }
 
@@ -2164,6 +2748,8 @@ $Form.Add_Shown({
     $sState.Text = "Ready"
     if ($script:FilterGroups.Count -eq 0) { $script:FilterGroups.Add((New-FilterGroup)) }
     Update-GroupMembershipPanel
+    $gbEntra.Visible = ($script:CurrentObjType -eq "Users")
+    Update-EntraStatusLabel
     Rebuild-FilterContainer
 })
 
