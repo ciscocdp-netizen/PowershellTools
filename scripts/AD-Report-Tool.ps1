@@ -15,8 +15,9 @@
     sign-in (error code, time, application, location, IP).
 .NOTES
     Requires the ActiveDirectory RSAT module and read access to AD.
-    Entra enrichment uses Microsoft Graph (device-code sign-in); needs Graph
-    permissions such as User.Read.All, Directory.Read.All, AuditLog.Read.All,
+    Entra enrichment: click Sign in to Entra ID once (browser via Microsoft.Graph
+    or Az.Accounts). All Graph pulls then use that session through Invoke-GraphGet.
+    Permissions: User.Read.All, Directory.Read.All, AuditLog.Read.All,
     UserAuthenticationMethod.Read.All, Device.Read.All, RoleManagement.Read.Directory.
     Sign-in logs require Entra ID P1/P2. PowerShell 5.1 | WinForms GUI.
 #>
@@ -214,7 +215,7 @@ $script:VisibleColumns = [System.Collections.Generic.List[string]]::new()
 $script:LoadedProperties = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 $script:CurrentObjType = "Users"
 $script:IsRunning      = $false
-# Entra / Microsoft Graph session (device-code token)
+# Entra / Microsoft Graph session (set by Sign in; used by all Invoke-GraphGet calls)
 $script:EntraAccessToken = $null
 $script:EntraTokenExpires = [datetime]::MinValue
 $script:EntraAccountUpn = ""
@@ -1718,9 +1719,8 @@ function Populate-Grid {
 # ===========================================================================
 # ENTRA ID / MICROSOFT GRAPH
 # ===========================================================================
-# Simple sign-in: prefer Connect-MgGraph (browser), then Connect-AzAccount,
-# then interactive device-code with Azure PowerShell's public client.
-# After sign-in, all enrichment helpers call Invoke-GraphGet against Graph.
+# Flow: Sign in once → session stored in $script:Entra* → every enrichment
+# helper calls Invoke-GraphGet, which uses that session (MgGraph / Az / token).
 $script:GraphClientId = $script:DefaultGraphClientId
 $script:GraphScopeList = @(
     "User.Read.All",
@@ -1747,6 +1747,25 @@ function ConvertFrom-SecureToken {
         return (ConvertFrom-SecureToken $Token.Token)
     }
     return [string]$Token
+}
+
+function Import-EntraGraphModule {
+    foreach ($name in @("Microsoft.Graph.Authentication", "Microsoft.Graph")) {
+        if (Get-Module -Name $name -ListAvailable -ErrorAction SilentlyContinue) {
+            Import-Module $name -ErrorAction SilentlyContinue | Out-Null
+        }
+    }
+    return [bool](Get-Command Connect-MgGraph -ErrorAction SilentlyContinue)
+}
+
+function Import-EntraAzModule {
+    if (Get-Module -Name Az.Accounts -ListAvailable -ErrorAction SilentlyContinue) {
+        Import-Module Az.Accounts -ErrorAction SilentlyContinue | Out-Null
+    }
+    return (
+        [bool](Get-Command Connect-AzAccount -ErrorAction SilentlyContinue) -and
+        [bool](Get-Command Get-AzAccessToken -ErrorAction SilentlyContinue)
+    )
 }
 
 function Test-EntraConnected {
@@ -1776,6 +1795,63 @@ function Update-EntraStatusLabel {
         $script:EntraAccountUpn = ""
         $script:EntraAuthMode = ""
     }
+}
+
+function Set-EntraMgGraphSession {
+    param($Context)
+    if (-not $Context) { return $false }
+    $script:EntraAuthMode = "MgGraph"
+    $script:EntraAccessToken = "MGGRAPH"
+    $script:EntraTokenExpires = [datetime]::UtcNow.AddHours(1)
+    $script:EntraAccountUpn = [string]$Context.Account
+    if ($Context.TenantId) { $script:EntraTenant = [string]$Context.TenantId }
+    return $true
+}
+
+function Set-EntraAzSession {
+    param($TokenObject, [string]$AccountUpn = "")
+    $token = ConvertFrom-SecureToken $TokenObject
+    if (-not $token) { return $false }
+    $script:EntraAuthMode = "Az"
+    $script:EntraAccessToken = $token
+    if ($TokenObject.PSObject.Properties['ExpiresOn'] -and $TokenObject.ExpiresOn) {
+        $script:EntraTokenExpires = ([datetime]$TokenObject.ExpiresOn).ToUniversalTime()
+    } else {
+        $script:EntraTokenExpires = [datetime]::UtcNow.AddMinutes(45)
+    }
+    if ($AccountUpn) { $script:EntraAccountUpn = $AccountUpn }
+    return $true
+}
+
+# Pick up an already-open MgGraph / Az session so Sign in is not required again.
+function Attach-EntraExistingSession {
+    if (Test-EntraConnected) { Update-EntraStatusLabel; return $true }
+
+    if (Import-EntraGraphModule) {
+        try {
+            $ctx = Get-MgContext -ErrorAction SilentlyContinue
+            if ($ctx -and $ctx.Account -and (Set-EntraMgGraphSession $ctx)) {
+                Update-EntraStatusLabel
+                return $true
+            }
+        } catch { }
+    }
+
+    if (Import-EntraAzModule) {
+        try {
+            $azCtx = Get-AzContext -ErrorAction SilentlyContinue
+            if ($azCtx) {
+                $tokObj = Get-AzAccessToken -ResourceUrl "https://graph.microsoft.com" -ErrorAction Stop
+                $acct = ""
+                try { if ($azCtx.Account.Id) { $acct = [string]$azCtx.Account.Id } } catch { }
+                if (Set-EntraAzSession -TokenObject $tokObj -AccountUpn $acct) {
+                    Update-EntraStatusLabel
+                    return $true
+                }
+            }
+        } catch { }
+    }
+    return $false
 }
 
 function Show-EntraAdvancedOptions {
@@ -1827,43 +1903,29 @@ function Show-EntraAdvancedOptions {
 }
 
 function Connect-EntraViaMgGraph {
-    if (-not (Get-Command Connect-MgGraph -ErrorAction SilentlyContinue)) { return $false }
+    if (-not (Import-EntraGraphModule)) { return $false }
     Update-Progress "Opening Microsoft Graph sign-in..."
     $params = @{ Scopes = $script:GraphScopeList; NoWelcome = $true; ErrorAction = "Stop" }
     if ($script:EntraPreferredTenant) { $params["TenantId"] = $script:EntraPreferredTenant }
+    if ($script:EntraCustomClientId) { $params["ClientId"] = $script:EntraCustomClientId }
     Connect-MgGraph @params | Out-Null
     $ctx = Get-MgContext -ErrorAction Stop
-    if (-not $ctx) { return $false }
-    $script:EntraAuthMode = "MgGraph"
-    $script:EntraAccessToken = "MGGRAPH"
-    $script:EntraTokenExpires = [datetime]::UtcNow.AddHours(1)
-    $script:EntraAccountUpn = [string]$ctx.Account
-    if ($ctx.TenantId) { $script:EntraTenant = [string]$ctx.TenantId }
-    return $true
+    return (Set-EntraMgGraphSession $ctx)
 }
 
 function Connect-EntraViaAzAccount {
-    if (-not (Get-Command Connect-AzAccount -ErrorAction SilentlyContinue)) { return $false }
-    if (-not (Get-Command Get-AzAccessToken -ErrorAction SilentlyContinue)) { return $false }
+    if (-not (Import-EntraAzModule)) { return $false }
     Update-Progress "Opening Azure sign-in..."
     $azParams = @{ ErrorAction = "Stop" }
     if ($script:EntraPreferredTenant) { $azParams["Tenant"] = $script:EntraPreferredTenant }
     Connect-AzAccount @azParams | Out-Null
     $tokObj = Get-AzAccessToken -ResourceUrl "https://graph.microsoft.com" -ErrorAction Stop
-    $token = ConvertFrom-SecureToken $tokObj
-    if (-not $token) { return $false }
-    $script:EntraAuthMode = "Az"
-    $script:EntraAccessToken = $token
-    if ($tokObj.PSObject.Properties['ExpiresOn'] -and $tokObj.ExpiresOn) {
-        $script:EntraTokenExpires = ([datetime]$tokObj.ExpiresOn).ToUniversalTime()
-    } else {
-        $script:EntraTokenExpires = [datetime]::UtcNow.AddMinutes(45)
-    }
+    $acct = ""
     try {
-        $acct = (Get-AzContext).Account.Id
-        if ($acct) { $script:EntraAccountUpn = [string]$acct }
+        $id = (Get-AzContext).Account.Id
+        if ($id) { $acct = [string]$id }
     } catch { }
-    return $true
+    return (Set-EntraAzSession -TokenObject $tokObj -AccountUpn $acct)
 }
 
 function Read-EntraTenantPrompt {
@@ -1946,8 +2008,29 @@ function Connect-EntraViaDeviceCode {
     return $true
 }
 
+function Resolve-EntraSignedInIdentity {
+    if ($script:EntraAccountUpn) { return }
+    try {
+        $me = Invoke-GraphGet -Uri "https://graph.microsoft.com/v1.0/me?`$select=userPrincipalName,displayName"
+        if ($me.userPrincipalName) { $script:EntraAccountUpn = [string]$me.userPrincipalName }
+        elseif ($me.displayName) { $script:EntraAccountUpn = [string]$me.displayName }
+    } catch { }
+}
+
 function Connect-EntraGraph {
     try {
+        # Already signed in — keep using the same Graph session for enrichment.
+        if (Test-EntraConnected -or (Attach-EntraExistingSession)) {
+            Resolve-EntraSignedInIdentity
+            Update-EntraStatusLabel
+            [System.Windows.Forms.MessageBox]::Show(
+                "Already signed in to Entra ID as $($script:EntraAccountUpn).`r`n`r`nGraph API is ready — run a Users query and enrich, or click Enrich Current Results.",
+                "Entra ID",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+            return
+        }
+
         Start-Progress "Signing in to Entra ID..."
         $ok = $false
         $errors = New-Object System.Collections.Generic.List[string]
@@ -1977,17 +2060,10 @@ function Connect-EntraGraph {
             throw "Could not sign in to Entra ID.`r`n`r`nInstall one of:`r`n  Install-Module Microsoft.Graph -Scope CurrentUser`r`n  Install-Module Az.Accounts -Scope CurrentUser`r`n`r`nThen click Sign in again.`r`n`r`n$hint"
         }
 
-        # Resolve signed-in UPN via Graph /me when missing
-        if (-not $script:EntraAccountUpn) {
-            try {
-                $me = Invoke-GraphGet -Uri "https://graph.microsoft.com/v1.0/me?`$select=userPrincipalName,displayName"
-                if ($me.userPrincipalName) { $script:EntraAccountUpn = [string]$me.userPrincipalName }
-                elseif ($me.displayName) { $script:EntraAccountUpn = [string]$me.displayName }
-            } catch { }
-        }
+        Resolve-EntraSignedInIdentity
         Update-EntraStatusLabel
         [System.Windows.Forms.MessageBox]::Show(
-            "Signed in to Entra ID as $($script:EntraAccountUpn).`r`n`r`nYou can now enrich user results with roles, devices, auth methods, and failed sign-ins.",
+            "Signed in to Entra ID as $($script:EntraAccountUpn).`r`n`r`nGraph API is plugged in for this session. Enrich user results with roles, devices, auth methods, and failed sign-ins.",
             "Entra ID",
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
@@ -2018,12 +2094,17 @@ function Disconnect-EntraGraph {
     Update-EntraStatusLabel
 }
 
+# Single Graph entry point used by all Entra enrichment helpers below.
 function Invoke-GraphGet {
     param(
         [Parameter(Mandatory)][string]$Uri,
         [int]$MaxPages = 5
     )
-    if (-not (Test-EntraConnected)) { throw "Not signed in to Entra ID. Click Sign in to Entra ID first." }
+    if (-not (Test-EntraConnected)) {
+        if (-not (Attach-EntraExistingSession)) {
+            throw "Not signed in to Entra ID. Click Sign in to Entra ID first."
+        }
+    }
 
     $items = [System.Collections.Generic.List[object]]::new()
     $next = $Uri
@@ -2269,8 +2350,18 @@ function Invoke-EntraEnrichment {
         return
     }
     if (-not (Test-EntraConnected)) {
-        Connect-EntraGraph
-        if (-not (Test-EntraConnected)) { return }
+        if (-not (Attach-EntraExistingSession)) {
+            if ($Force) {
+                $ans = [System.Windows.Forms.MessageBox]::Show(
+                    "Sign in to Entra ID first so Graph API can enrich these users.`r`n`r`nSign in now?",
+                    "Entra ID",
+                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                    [System.Windows.Forms.MessageBoxIcon]::Question)
+                if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+            }
+            Connect-EntraGraph
+            if (-not (Test-EntraConnected)) { return }
+        }
     }
     if ($script:Results.Count -eq 0) {
         if ($Force) {
@@ -2967,6 +3058,8 @@ $Form.Add_Shown({
             if ($dns) { $script:EntraPreferredTenant = $dns }
         }
     } catch { }
+    # Reuse an existing Connect-MgGraph / Connect-AzAccount session if present
+    [void](Attach-EntraExistingSession)
     Update-EntraStatusLabel
     Rebuild-FilterContainer
 })
