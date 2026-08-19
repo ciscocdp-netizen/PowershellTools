@@ -1540,6 +1540,76 @@ function Show-MessageBox {
     return [System.Windows.MessageBox]::Show($Message, $Title, $Button, $Icon)
 }
 
+function Get-SafeCount {
+    <#
+    .SYNOPSIS
+        StrictMode-safe count for $null, single objects, or collections
+    #>
+    param($Object)
+    
+    if ($null -eq $Object) { return 0 }
+    
+    # Prefer true collection Count when available
+    if ($Object -is [System.Array]) { return $Object.Length }
+    if ($Object -is [System.Collections.ICollection] -and -not ($Object -is [string])) {
+        try { return [int]$Object.Count } catch { }
+    }
+    
+    # Single scalar / PSObject result from a cmdlet
+    return @($Object).Count
+}
+
+function Connect-DhcpServerTarget {
+    <#
+    .SYNOPSIS
+        Validates remote/local DHCP connectivity and returns a normalized server name
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComputerName
+    )
+    
+    $target = $ComputerName.Trim()
+    if ($target -match '^(localhost|127\.0\.0\.1|\.)$') {
+        $target = 'localhost'
+    }
+    
+    if (-not (Get-Module -Name DhcpServer -ListAvailable)) {
+        throw "DhcpServer module not installed. Install RSAT-DHCP: Install-WindowsFeature RSAT-DHCP (Server) or Add-WindowsCapability Rsat.DHCP.Tools~~~~0.0.1.0 (Windows 10/11)."
+    }
+    
+    Import-Module DhcpServer -ErrorAction Stop
+    
+    try {
+        $null = Get-DhcpServerv4Scope -ComputerName $target -ErrorAction Stop
+    } catch {
+        $raw = "$_"
+        $hint = switch -Regex ($raw) {
+            'access is denied|AccessDenied|0x80070005' {
+                "Access denied. Run as a user with DHCP Administrators rights on $target (or Domain Admins)."
+            }
+            'RPC|RPC server|0x800706BA|unavailable' {
+                "RPC unreachable. Check firewall (RPC TCP 135 + dynamic ports), that DHCP Server service is running, and that remote management is allowed on $target."
+            }
+            'WinRM|WS-Management' {
+                "WinRM issue. DHCP cmdlets use RPC (not WinRM). Verify RPC/firewall connectivity to $target."
+            }
+            'cannot find|not found|no such host|DNS' {
+                "Name resolution failed for '$target'. Try FQDN or IP address."
+            }
+            'The term .*Get-DhcpServerv4Scope' {
+                "DhcpServer module failed to load cmdlets. Reinstall RSAT-DHCP tools."
+            }
+            default {
+                "Verify network path to $target, DHCP service status, and your account permissions."
+            }
+        }
+        throw "Cannot reach DHCP on '$target'. $hint`n`nDetails: $raw"
+    }
+    
+    return $target
+}
+
 function Enable-ConnectedControls {
     <#
     .SYNOPSIS
@@ -2078,12 +2148,12 @@ function Build-NavTree {
             $scopesContainer.IsExpanded = $true
             
             try {
-                $scopes = Get-DhcpServerv4Scope -ComputerName $Global:DHCPServer -ErrorAction Stop
+                $scopes = @(Get-DhcpServerv4Scope -ComputerName $Global:DHCPServer -ErrorAction Stop)
                 
                 foreach ($scope in $scopes) {
                     $scopeNode = New-Object System.Windows.Controls.TreeViewItem
                     $scopeNode.Header = "📍 $($scope.Name) [$($scope.ScopeId)]"
-                    $scopeNode.Tag = $scope.ScopeId
+                    $scopeNode.Tag = "$($scope.ScopeId)"
                     
                     # Add sub-items
                     $leasesItem = New-Object System.Windows.Controls.TreeViewItem
@@ -2110,7 +2180,7 @@ function Build-NavTree {
                     $scopesContainer.Items.Add($scopeNode)
                 }
                 
-                Write-ActionLog "Added $($scopes.Count) scopes to navigation tree" "SUCCESS"
+                Write-ActionLog "Added $(Get-SafeCount $scopes) scopes to navigation tree" "SUCCESS"
                 
             } catch {
                 Write-ActionLog "Failed to load scopes for navigation: $_" "ERROR"
@@ -2165,14 +2235,15 @@ function Load-Scopes {
             throw "No DHCP server connected"
         }
         
-        $scopes = Get-DhcpServerv4Scope -ComputerName $Global:DHCPServer -ErrorAction Stop
+        $scopes = @(Get-DhcpServerv4Scope -ComputerName $Global:DHCPServer -ErrorAction Stop)
+        $count = Get-SafeCount $scopes
         
         $script:GridScopes.Dispatcher.Invoke([action]{
             $script:GridScopes.ItemsSource = $scopes
         }, [System.Windows.Threading.DispatcherPriority]::Normal)
         
-        Write-ActionLog "Loaded $($scopes.Count) scopes successfully" "SUCCESS"
-        Set-Status "Loaded $($scopes.Count) scopes"
+        Write-ActionLog "Loaded $count scopes successfully" "SUCCESS"
+        Set-Status "Loaded $count scopes"
         Update-LogDisplay
         
     } catch {
@@ -2206,15 +2277,16 @@ function Load-Leases {
     Set-Status "Loading leases for $scopeId..."
     
     try {
-        $leases = Get-DhcpServerv4Lease -ComputerName $Global:DHCPServer -ScopeId $scopeId -ErrorAction Stop
+        $leases = @(Get-DhcpServerv4Lease -ComputerName $Global:DHCPServer -ScopeId $scopeId -ErrorAction Stop)
+        $count = Get-SafeCount $leases
         
         $script:GridLeases.Dispatcher.Invoke([action]{
             $script:GridLeases.ItemsSource = $leases
             $script:BtnLeaseRefresh.IsEnabled = $true
         }, [System.Windows.Threading.DispatcherPriority]::Normal)
         
-        Write-ActionLog "Loaded $($leases.Count) leases for scope $scopeId" "SUCCESS"
-        Set-Status "Loaded $($leases.Count) leases"
+        Write-ActionLog "Loaded $count leases for scope $scopeId" "SUCCESS"
+        Set-Status "Loaded $count leases"
         Update-LogDisplay
         
     } catch {
@@ -2246,15 +2318,16 @@ function Load-Reservations {
     Set-Status "Loading reservations..."
     
     try {
-        $reservations = Get-DhcpServerv4Reservation -ComputerName $Global:DHCPServer -ScopeId $scopeId -ErrorAction Stop
+        $reservations = @(Get-DhcpServerv4Reservation -ComputerName $Global:DHCPServer -ScopeId $scopeId -ErrorAction Stop)
+        $count = Get-SafeCount $reservations
         
         $script:GridReservations.Dispatcher.Invoke([action]{
             $script:GridReservations.ItemsSource = $reservations
             $script:BtnResAdd.IsEnabled = $true
         }, [System.Windows.Threading.DispatcherPriority]::Normal)
         
-        Write-ActionLog "Loaded $($reservations.Count) reservations" "SUCCESS"
-        Set-Status "Loaded $($reservations.Count) reservations"
+        Write-ActionLog "Loaded $count reservations" "SUCCESS"
+        Set-Status "Loaded $count reservations"
         Update-LogDisplay
         
     } catch {
@@ -2283,15 +2356,16 @@ function Load-Exclusions {
     Set-Status "Loading exclusions..."
     
     try {
-        $exclusions = Get-DhcpServerv4ExclusionRange -ComputerName $Global:DHCPServer -ScopeId $scopeId -ErrorAction Stop
+        $exclusions = @(Get-DhcpServerv4ExclusionRange -ComputerName $Global:DHCPServer -ScopeId $scopeId -ErrorAction Stop)
+        $count = Get-SafeCount $exclusions
         
         $script:GridExclusions.Dispatcher.Invoke([action]{
             $script:GridExclusions.ItemsSource = $exclusions
             $script:BtnExcAdd.IsEnabled = $true
         }, [System.Windows.Threading.DispatcherPriority]::Normal)
         
-        Write-ActionLog "Loaded $($exclusions.Count) exclusions" "SUCCESS"
-        Set-Status "Loaded $($exclusions.Count) exclusions"
+        Write-ActionLog "Loaded $count exclusions" "SUCCESS"
+        Set-Status "Loaded $count exclusions"
         Update-LogDisplay
         
     } catch {
@@ -2313,29 +2387,31 @@ function Load-Options {
     
     try {
         $level = $script:CboOptionLevel.SelectedItem.Content
-        $options = $null
+        $options = @()
         
         if ($level -eq "Server") {
-            $options = Get-DhcpServerv4OptionValue -ComputerName $Global:DHCPServer -ErrorAction Stop
+            $options = @(Get-DhcpServerv4OptionValue -ComputerName $Global:DHCPServer -ErrorAction Stop)
             Write-ActionLog "Loading server-level options" "INFO"
         }
         elseif ($level -eq "Scope") {
             $scopeId = Get-SelectedScopeId
             if ($scopeId) {
-                $options = Get-DhcpServerv4OptionValue -ComputerName $Global:DHCPServer -ScopeId $scopeId -ErrorAction Stop
+                $options = @(Get-DhcpServerv4OptionValue -ComputerName $Global:DHCPServer -ScopeId $scopeId -ErrorAction Stop)
                 Write-ActionLog "Loading scope-level options for $scopeId" "INFO"
             } else {
                 throw "No scope selected"
             }
         }
         
+        $count = Get-SafeCount $options
+        
         $script:GridOptions.Dispatcher.Invoke([action]{
             $script:GridOptions.ItemsSource = $options
             $script:BtnOptionSet.IsEnabled = $true
         }, [System.Windows.Threading.DispatcherPriority]::Normal)
         
-        Write-ActionLog "Loaded options successfully" "SUCCESS"
-        Set-Status "Options loaded"
+        Write-ActionLog "Loaded $count options successfully" "SUCCESS"
+        Set-Status "Loaded $count options"
         Update-LogDisplay
         
     } catch {
@@ -2359,10 +2435,12 @@ function Load-Filters {
         $listType = $script:CboFilterList.SelectedItem.Content
         
         if ($listType -eq "Allow") {
-            $filters = Get-DhcpServerv4FilterList -ComputerName $Global:DHCPServer -List Allow -ErrorAction Stop
+            $filters = @(Get-DhcpServerv4Filter -ComputerName $Global:DHCPServer -List Allow -ErrorAction Stop)
         } else {
-            $filters = Get-DhcpServerv4FilterList -ComputerName $Global:DHCPServer -List Deny -ErrorAction Stop
+            $filters = @(Get-DhcpServerv4Filter -ComputerName $Global:DHCPServer -List Deny -ErrorAction Stop)
         }
+        
+        $count = Get-SafeCount $filters
         
         $script:GridFilters.Dispatcher.Invoke([action]{
             $script:GridFilters.ItemsSource = $filters
@@ -2370,8 +2448,8 @@ function Load-Filters {
             $script:ChkEnableFilters.IsEnabled = $true
         }, [System.Windows.Threading.DispatcherPriority]::Normal)
         
-        Write-ActionLog "Loaded $($filters.Count) $listType filters" "SUCCESS"
-        Set-Status "Filters loaded"
+        Write-ActionLog "Loaded $count $listType filters" "SUCCESS"
+        Set-Status "Loaded $count filters"
         Update-LogDisplay
         
     } catch {
@@ -2392,15 +2470,16 @@ function Load-Policies {
     Set-Status "Loading policies..."
     
     try {
-        $policies = Get-DhcpServerv4Policy -ComputerName $Global:DHCPServer -ErrorAction Stop
+        $policies = @(Get-DhcpServerv4Policy -ComputerName $Global:DHCPServer -ErrorAction Stop)
+        $count = Get-SafeCount $policies
         
         $script:GridPolicies.Dispatcher.Invoke([action]{
             $script:GridPolicies.ItemsSource = $policies
             $script:BtnPolicyAdd.IsEnabled = $true
         }, [System.Windows.Threading.DispatcherPriority]::Normal)
         
-        Write-ActionLog "Loaded $($policies.Count) policies" "SUCCESS"
-        Set-Status "Policies loaded"
+        Write-ActionLog "Loaded $count policies" "SUCCESS"
+        Set-Status "Loaded $count policies"
         Update-LogDisplay
         
     } catch {
@@ -2422,22 +2501,22 @@ function Load-Statistics {
     
     try {
         $stats = Get-DhcpServerv4Statistics -ComputerName $Global:DHCPServer -ErrorAction Stop
-        $scopes = Get-DhcpServerv4Scope -ComputerName $Global:DHCPServer -ErrorAction Stop
+        $scopes = @(Get-DhcpServerv4Scope -ComputerName $Global:DHCPServer -ErrorAction Stop)
         
         $totalReservations = 0
         foreach ($scope in $scopes) {
             try {
-                $res = Get-DhcpServerv4Reservation -ComputerName $Global:DHCPServer -ScopeId $scope.ScopeId -ErrorAction SilentlyContinue
-                $totalReservations += @($res).Count
+                $res = @(Get-DhcpServerv4Reservation -ComputerName $Global:DHCPServer -ScopeId $scope.ScopeId -ErrorAction SilentlyContinue)
+                $totalReservations += (Get-SafeCount $res)
             } catch {}
         }
         
         $script:Window.Dispatcher.Invoke([action]{
-            $script:StatTotalScopes.Text = $stats.TotalScopes
-            $script:StatActiveLeases.Text = $stats.InUse
-            $script:StatReservations.Text = $totalReservations
-            $script:StatAvailableIPs.Text = $stats.Available
-            $script:StatTotalIPs.Text = $stats.TotalAddresses
+            $script:StatTotalScopes.Text = "$($stats.TotalScopes)"
+            $script:StatActiveLeases.Text = "$($stats.InUse)"
+            $script:StatReservations.Text = "$totalReservations"
+            $script:StatAvailableIPs.Text = "$($stats.Available)"
+            $script:StatTotalIPs.Text = "$($stats.TotalAddresses)"
             
             if ($stats.TotalAddresses -gt 0) {
                 $util = [math]::Round(($stats.InUse / $stats.TotalAddresses) * 100, 1)
@@ -4218,26 +4297,18 @@ $BtnConnect.add_Click({
     Write-ActionLog "Attempting connection to: $serverName" "INFO"
     
     try {
-        # Test DhcpServer module
-        if (!(Get-Module -Name DhcpServer -ListAvailable)) {
-            throw "DhcpServer module not installed. Please install RSAT-DHCP feature."
-        }
+        $normalized = Connect-DhcpServerTarget -ComputerName $serverName
         
-        Import-Module DhcpServer -ErrorAction Stop
-        Write-ActionLog "DhcpServer module loaded" "INFO"
-        
-        # Test connection
-        $null = Get-DhcpServerv4Scope -ComputerName $serverName -ErrorAction Stop
-        
-        $Global:DHCPServer = $serverName
-        Write-ActionLog "Successfully connected to $serverName" "SUCCESS"
+        $Global:DHCPServer = $normalized
+        Write-ActionLog "Successfully connected to $normalized" "SUCCESS"
         
         # Update UI
         $script:BtnConnect.IsEnabled = $false
+        $script:TxtServerName.Text = $normalized
         $script:TxtServerName.IsEnabled = $false
         Enable-ConnectedControls $true
         
-        Set-Status "Connected" $serverName
+        Set-Status "Connected" $normalized
         $script:StatusServer.Foreground = [System.Windows.Media.Brushes]::LimeGreen
         
         # Load initial data
@@ -4248,7 +4319,7 @@ $BtnConnect.add_Click({
         Update-LogDisplay
         
     } catch {
-        $errMsg = "Failed to connect to $serverName : $_"
+        $errMsg = "$_"
         Write-ActionLog $errMsg "ERROR"
         Set-Status "Connection failed"
         Show-MessageBox $errMsg "Connection Error" OK Error
@@ -4794,27 +4865,22 @@ $BtnCompareConnect.add_Click({
     Set-Status "Connecting compare server $serverName..."
     
     try {
-        if (!(Get-Module -Name DhcpServer -ListAvailable)) {
-            throw "DhcpServer module not installed. Please install RSAT-DHCP feature."
-        }
+        $normalized = Connect-DhcpServerTarget -ComputerName $serverName
         
-        Import-Module DhcpServer -ErrorAction Stop
-        
-        $null = Get-DhcpServerv4Scope -ComputerName $serverName -ErrorAction Stop
-        
-        $Global:CompareServer = $serverName
-        Write-ActionLog "Connected compare Server B: $serverName" "SUCCESS"
+        $Global:CompareServer = $normalized
+        Write-ActionLog "Connected compare Server B: $normalized" "SUCCESS"
         
         $script:BtnCompareConnect.IsEnabled = $false
+        $script:TxtCompareServer.Text = $normalized
         $script:TxtCompareServer.IsEnabled = $false
         $script:BtnCompareDisconnect.IsEnabled = $true
         
         Update-CompareReadyState
-        Set-Status "Compare server connected: $serverName"
+        Set-Status "Compare server connected: $normalized"
         Update-LogDisplay
         
     } catch {
-        $errMsg = "Failed to connect compare server $serverName : $_"
+        $errMsg = "$_"
         Write-ActionLog $errMsg "ERROR"
         Set-Status "Compare connection failed"
         Show-MessageBox $errMsg "Connection Error" OK Error
