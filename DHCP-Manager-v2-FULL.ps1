@@ -29,11 +29,12 @@
     ✓ DHCP audit log ingest (local + remote)
     ✓ Real-time DHCP event watching on local and remote servers
     ✓ Scope migration (scopes, options, reservations/clients, exclusions)
+    ✓ Domain DHCP server discovery with ping up/down status
     
 .NOTES
     File Name      : DHCP-Manager-v2-FULL.ps1
-    Version        : 2.3.0 (Scope Migration)
-    Date           : 2026-08-17
+    Version        : 2.4.0 (Domain DHCP Scan)
+    Date           : 2026-08-19
     Author         : Anthony Blake
     Prerequisite   : PowerShell 5.1+
     Required Module: DhcpServer (Install-WindowsFeature RSAT-DHCP)
@@ -79,10 +80,10 @@ $banner = @"
 
 ╔══════════════════════════════════════════════════════════════════════════╗
 ║                                                                          ║
-║         DHCP Manager v2.3 - Scope Migration Edition                     ║
+║         DHCP Manager v2.4 - Domain Scan + Scope Migration               ║
 ║                      Built by Anthony Blake                              ║
 ║                                                                          ║
-║  ✓ Compare  ✓ Live Events  ✓ Migrate Scopes / Options / Clients        ║
+║  ✓ Scan Domain DHCP  ✓ Compare  ✓ Live Events  ✓ Migrate Scopes        ║
 ║                                                                          ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 
@@ -99,7 +100,7 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.3.0'
+$Global:AppVersion       = '2.4.0'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:LogWatchState    = @{
     Local = @{ Enabled = $false; Path = $null; Offset = 0L }
@@ -109,6 +110,7 @@ $Global:LogWatchState    = @{
 $Global:EventWatchActive = $false
 $Global:MigrationResults = [System.Collections.Generic.List[object]]::new()
 $Global:MigrationScopes  = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
+$Global:DomainScanResults = [System.Collections.Generic.List[object]]::new()
 #endregion
 
 #region Core Logging Functions
@@ -165,7 +167,7 @@ function Update-LogDisplay {
     } catch {}
 }
 
-Write-ActionLog "DHCP Manager v2.3 (Anthony Blake — Scope Migration) initializing..." "INFO"
+Write-ActionLog "DHCP Manager v2.4 (Anthony Blake — Domain Scan) initializing..." "INFO"
 Write-ActionLog "PowerShell Version: $($PSVersionTable.PSVersion)" "INFO"
 Write-ActionLog "OS: $([Environment]::OSVersion.VersionString)" "INFO"
 #endregion
@@ -177,7 +179,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
 <Window
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    Title="DHCP Manager v2.3 - Anthony Blake"
+    Title="DHCP Manager v2.4 - Anthony Blake"
     Height="780" Width="1260"
     MinHeight="600" MinWidth="900"
     WindowStartupLocation="CenterScreen"
@@ -437,6 +439,9 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                    Text="localhost" ToolTip="DHCP server hostname or IP address"/>
           <Button x:Name="BtnConnect" Content="🔌 Connect" Margin="8,0"
                   Style="{StaticResource BtnSuccess}" ToolTip="Connect to DHCP server"/>
+          <Button x:Name="BtnScanDomain" Content="🔍 Scan Domain" Margin="0,0,8,0"
+                  Style="{StaticResource BtnPrimary}"
+                  ToolTip="Discover authorized DHCP servers in the domain and ping them"/>
           <Button x:Name="BtnDisconnect" Content="🔌 Disconnect" Margin="0,0,8,0"
                   Style="{StaticResource BtnSecondary}" IsEnabled="False"
                   ToolTip="Disconnect from current server"/>
@@ -483,7 +488,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                    HorizontalAlignment="Center"/>
         
         <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-          <Run Text="v2.3.0  |  "/>
+          <Run Text="v2.4.0  |  "/>
           <Run Text="Anthony Blake  |  " Foreground="#90CAF9"/>
           <Run x:Name="StatusTime" Text=""/>
         </TextBlock>
@@ -1268,6 +1273,7 @@ try {
     # Connection Controls
     $script:TxtServerName    = $Window.FindName("TxtServerName")
     $script:BtnConnect       = $Window.FindName("BtnConnect")
+    $script:BtnScanDomain    = $Window.FindName("BtnScanDomain")
     $script:BtnDisconnect    = $Window.FindName("BtnDisconnect")
     $script:BtnRefresh       = $Window.FindName("BtnRefresh")
     $script:BtnSettings      = $Window.FindName("BtnSettings")
@@ -1552,6 +1558,404 @@ function Enable-ConnectedControls {
         Write-ActionLog "Controls enabled state set to: $Connected" "INFO"
     } catch {
         Write-ActionLog "Failed to enable controls: $_" "ERROR"
+    }
+}
+#endregion
+
+#region Domain DHCP Server Scan
+function Test-HostPingStatus {
+    <#
+    .SYNOPSIS
+        Pings a host with a short timeout and returns Up/Down + latency
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComputerName,
+        [int]$TimeoutMs = 1500
+    )
+    
+    $result = [PSCustomObject]@{
+        Status    = 'Down'
+        LatencyMs = $null
+        Detail    = ''
+    }
+    
+    try {
+        $ping = New-Object System.Net.NetworkInformation.Ping
+        $reply = $ping.Send($ComputerName, $TimeoutMs)
+        if ($null -ne $reply -and $reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
+            $result.Status = 'Up'
+            $result.LatencyMs = [int]$reply.RoundtripTime
+            $result.Detail = "$($reply.RoundtripTime) ms"
+        } else {
+            $statusText = if ($reply) { "$($reply.Status)" } else { 'No reply' }
+            $result.Status = 'Down'
+            $result.Detail = $statusText
+        }
+    } catch {
+        $result.Status = 'Down'
+        $result.Detail = "$_"
+    }
+    
+    return $result
+}
+
+function Get-DomainDhcpServers {
+    <#
+    .SYNOPSIS
+        Discovers authorized DHCP servers in Active Directory
+    #>
+    
+    $servers = [System.Collections.Generic.List[object]]::new()
+    $seen = @{}
+    
+    # Method 1: Get-DhcpServerInDC (preferred)
+    try {
+        if (-not (Get-Module -Name DhcpServer -ListAvailable)) {
+            throw "DhcpServer module not available"
+        }
+        Import-Module DhcpServer -ErrorAction Stop
+        $list = @(Get-DhcpServerInDC -ErrorAction Stop)
+        foreach ($item in $list) {
+            $dns = "$($item.DnsName)".Trim()
+            if ([string]::IsNullOrWhiteSpace($dns)) { continue }
+            $key = $dns.ToLowerInvariant()
+            if ($seen.ContainsKey($key)) { continue }
+            $seen[$key] = $true
+            
+            $ip = ''
+            try { $ip = "$($item.IPAddress)" } catch {}
+            
+            $servers.Add([PSCustomObject]@{
+                DnsName    = $dns
+                IPAddress  = $ip
+                Source     = 'AD Authorized (Get-DhcpServerInDC)'
+            })
+        }
+    } catch {
+        Write-ActionLog "Get-DhcpServerInDC unavailable or failed: $_" "WARN"
+    }
+    
+    # Method 2: ADSI fallback against Configuration\NetServices
+    if ($servers.Count -eq 0) {
+        try {
+            $rootDse = [ADSI]'LDAP://RootDSE'
+            $config = $rootDse.configurationNamingContext
+            $searchRoot = [ADSI]"LDAP://CN=NetServices,CN=Services,$config"
+            $searcher = New-Object System.DirectoryServices.DirectorySearcher($searchRoot)
+            $searcher.Filter = '(objectClass=dHCPClass)'
+            $searcher.PropertiesToLoad.Add('name') | Out-Null
+            $searcher.PropertiesToLoad.Add('dhcpServers') | Out-Null
+            $searcher.PageSize = 200
+            
+            foreach ($res in $searcher.FindAll()) {
+                $name = ''
+                if ($res.Properties['name'].Count -gt 0) {
+                    $name = [string]$res.Properties['name'][0]
+                }
+                
+                $dhcpServersProp = @()
+                if ($res.Properties['dhcpServers'].Count -gt 0) {
+                    $dhcpServersProp = @($res.Properties['dhcpServers'] | ForEach-Object { "$_" })
+                }
+                
+                # dhcpServers values often look like: i<ip>$<host>$...
+                foreach ($raw in $dhcpServersProp) {
+                    $dns = $null
+                    $ip = ''
+                    if ($raw -match 'i([0-9.]+)\$([^$]+)\$') {
+                        $ip = $Matches[1]
+                        $dns = $Matches[2]
+                    } elseif ($name -and $name -notmatch '^dhcpRoot') {
+                        $dns = $name
+                    }
+                    
+                    if ([string]::IsNullOrWhiteSpace($dns)) { continue }
+                    $key = $dns.ToLowerInvariant()
+                    if ($seen.ContainsKey($key)) { continue }
+                    $seen[$key] = $true
+                    
+                    $servers.Add([PSCustomObject]@{
+                        DnsName   = $dns
+                        IPAddress = $ip
+                        Source    = 'AD NetServices (ADSI)'
+                    })
+                }
+                
+                if ($dhcpServersProp.Count -eq 0 -and $name -and $name -notmatch '^dhcpRoot') {
+                    $key = $name.ToLowerInvariant()
+                    if (-not $seen.ContainsKey($key)) {
+                        $seen[$key] = $true
+                        $servers.Add([PSCustomObject]@{
+                            DnsName   = $name
+                            IPAddress = ''
+                            Source    = 'AD NetServices (ADSI)'
+                        })
+                    }
+                }
+            }
+        } catch {
+            Write-ActionLog "ADSI DHCP discovery failed: $_" "WARN"
+        }
+    }
+    
+    return @($servers | Sort-Object DnsName)
+}
+
+function Invoke-DomainDhcpServerScan {
+    <#
+    .SYNOPSIS
+        Discovers domain DHCP servers and pings each one
+    #>
+    param([int]$TimeoutMs = 1500)
+    
+    Write-ActionLog "Scanning domain for authorized DHCP servers..." "INFO"
+    Set-Status "Scanning domain DHCP servers..."
+    
+    $discovered = @(Get-DomainDhcpServers)
+    if ($discovered.Count -eq 0) {
+        throw "No DHCP servers found in Active Directory. Ensure this machine is domain-joined and you can query AD (or DhcpServer module / Get-DhcpServerInDC is available)."
+    }
+    
+    Write-ActionLog "Found $($discovered.Count) authorized DHCP server(s). Pinging..." "INFO"
+    
+    $results = [System.Collections.Generic.List[object]]::new()
+    
+    foreach ($srv in $discovered) {
+        $target = if ($srv.DnsName) { $srv.DnsName } else { $srv.IPAddress }
+        Write-ActionLog "Pinging $target ..." "INFO"
+        
+        $ping = Test-HostPingStatus -ComputerName $target -TimeoutMs $TimeoutMs
+        
+        # Resolve IP if missing and host is up / resolvable
+        $ip = "$($srv.IPAddress)"
+        if ([string]::IsNullOrWhiteSpace($ip)) {
+            try {
+                $addrs = [System.Net.Dns]::GetHostAddresses($srv.DnsName) |
+                    Where-Object { $_.AddressFamily -eq 'InterNetwork' }
+                if ($addrs) { $ip = "$($addrs[0])" }
+            } catch {}
+        }
+        
+        $results.Add([PSCustomObject]@{
+            DnsName   = $srv.DnsName
+            IPAddress = $ip
+            Status    = $ping.Status
+            LatencyMs = $ping.LatencyMs
+            Detail    = $ping.Detail
+            Source    = $srv.Source
+        })
+    }
+    
+    $up = @($results | Where-Object { $_.Status -eq 'Up' }).Count
+    $down = $results.Count - $up
+    Write-ActionLog "Domain scan complete: $($results.Count) servers — $up Up, $down Down" "SUCCESS"
+    Set-Status "Domain scan: $up Up / $down Down"
+    
+    return $results
+}
+
+function Show-DomainDhcpScanDialog {
+    <#
+    .SYNOPSIS
+        Shows dialog with discovered DHCP servers and ping status
+    #>
+    
+    Write-ActionLog "Opening Domain DHCP Scan dialog..." "INFO"
+    
+    [xml]$dialogXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Domain DHCP Server Scan - Anthony Blake"
+        Height="520" Width="820"
+        WindowStartupLocation="CenterOwner"
+        Background="#1A1D23"
+        FontFamily="Segoe UI" FontSize="13">
+  <Grid Margin="16">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+
+    <TextBlock Grid.Row="0" Text="Authorized DHCP Servers in Active Directory"
+               Foreground="#E8EAF0" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,8"/>
+
+    <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,10">
+      <Button x:Name="BtnScanNow" Content="🔍 Scan Now" Width="110" Height="30" Margin="0,0,8,0"
+              Background="#2196F3" Foreground="White" BorderThickness="0"/>
+      <Button x:Name="BtnUseAsA" Content="Use as Server A" Width="130" Height="30" Margin="0,0,8,0"
+              Background="#2A2F3A" Foreground="#E8EAF0" BorderBrush="#383E4A" BorderThickness="1"/>
+      <Button x:Name="BtnUseAsB" Content="Use as Server B" Width="130" Height="30" Margin="0,0,8,0"
+              Background="#2A2F3A" Foreground="#E8EAF0" BorderBrush="#383E4A" BorderThickness="1"/>
+      <Button x:Name="BtnExportScan" Content="💾 Export" Width="90" Height="30" Margin="0,0,8,0"
+              Background="#2A2F3A" Foreground="#E8EAF0" BorderBrush="#383E4A" BorderThickness="1"/>
+      <TextBlock x:Name="TxtScanStatus" Text="Click Scan Now to discover and ping DHCP servers"
+                 Foreground="#9AA3B2" VerticalAlignment="Center" Margin="8,0,0,0"/>
+    </StackPanel>
+
+    <DataGrid Grid.Row="2" x:Name="GridScanResults"
+              AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False"
+              SelectionMode="Single" HeadersVisibility="Column"
+              Background="#22262E" Foreground="#E8EAF0" BorderThickness="0"
+              RowBackground="#22262E" AlternatingRowBackground="#2A2F3A"
+              GridLinesVisibility="Horizontal" HorizontalGridLinesBrush="#383E4A"
+              RowHeight="28" ColumnHeaderHeight="32">
+      <DataGrid.Columns>
+        <DataGridTextColumn Header="DNS Name" Binding="{Binding DnsName}" Width="220"/>
+        <DataGridTextColumn Header="IP Address" Binding="{Binding IPAddress}" Width="130"/>
+        <DataGridTextColumn Header="Status" Binding="{Binding Status}" Width="80"/>
+        <DataGridTextColumn Header="Latency" Binding="{Binding Detail}" Width="100"/>
+        <DataGridTextColumn Header="Source" Binding="{Binding Source}" Width="*"/>
+      </DataGrid.Columns>
+      <DataGrid.ColumnHeaderStyle>
+        <Style TargetType="DataGridColumnHeader">
+          <Setter Property="Background" Value="#2A2F3A"/>
+          <Setter Property="Foreground" Value="#9AA3B2"/>
+          <Setter Property="Padding" Value="8,0"/>
+          <Setter Property="BorderBrush" Value="#383E4A"/>
+          <Setter Property="BorderThickness" Value="0,0,1,1"/>
+        </Style>
+      </DataGrid.ColumnHeaderStyle>
+    </DataGrid>
+
+    <TextBlock Grid.Row="3" Margin="0,10,0,8" Foreground="#9AA3B2" FontSize="11"
+               Text="Tip: Select a server and click Use as Server A/B, or double-click to fill the main connection box."
+               TextWrapping="Wrap"/>
+
+    <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right">
+      <Button x:Name="BtnCloseScan" Content="Close" Width="90" Height="30"
+              Background="#2A2F3A" Foreground="#E8EAF0" BorderBrush="#383E4A" BorderThickness="1"/>
+    </StackPanel>
+  </Grid>
+</Window>
+'@
+    
+    try {
+        $dialog = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($dialogXaml))
+        if ($script:Window) { $dialog.Owner = $script:Window }
+        
+        $grid = $dialog.FindName('GridScanResults')
+        $txtStatus = $dialog.FindName('TxtScanStatus')
+        $btnScan = $dialog.FindName('BtnScanNow')
+        $btnUseA = $dialog.FindName('BtnUseAsA')
+        $btnUseB = $dialog.FindName('BtnUseAsB')
+        $btnExport = $dialog.FindName('BtnExportScan')
+        $btnClose = $dialog.FindName('BtnCloseScan')
+        
+        # Store UI refs on the window Tag for reliable event-handler access
+        $dialog.Tag = @{
+            Grid   = $grid
+            Status = $txtStatus
+        }
+        
+        $btnScan.add_Click({
+            $ui = $dialog.Tag
+            try {
+                $ui.Status.Text = "Scanning Active Directory and pinging servers..."
+                [System.Windows.Forms.Application]::DoEvents()
+                
+                $results = @(Invoke-DomainDhcpServerScan)
+                $Global:DomainScanResults.Clear()
+                foreach ($r in $results) { $Global:DomainScanResults.Add($r) }
+                
+                $ui.Grid.ItemsSource = $null
+                $ui.Grid.ItemsSource = @($Global:DomainScanResults)
+                
+                $up = @($Global:DomainScanResults | Where-Object { $_.Status -eq 'Up' }).Count
+                $down = $Global:DomainScanResults.Count - $up
+                $ui.Status.Text = "Found $($Global:DomainScanResults.Count) server(s): $up Up, $down Down"
+                Update-LogDisplay
+            } catch {
+                $err = "$_"
+                Write-ActionLog "Domain scan failed: $err" "ERROR"
+                $ui.Status.Text = "Scan failed: $err"
+                Show-MessageBox "Domain DHCP scan failed:`n$err" "Scan Error" OK Error
+                Update-LogDisplay
+            }
+        }.GetNewClosure())
+        
+        $btnUseA.add_Click({
+            $ui = $dialog.Tag
+            if ($null -eq $ui.Grid.SelectedItem) {
+                Show-MessageBox "Select a DHCP server first." "Scan" OK Warning
+                return
+            }
+            $name = $ui.Grid.SelectedItem.DnsName
+            if ([string]::IsNullOrWhiteSpace($name)) { $name = $ui.Grid.SelectedItem.IPAddress }
+            $script:TxtServerName.Text = $name
+            Write-ActionLog "Scan: set Server A candidate to $name" "INFO"
+            $ui.Status.Text = "Filled main server box with $name — click Connect on the main window"
+            Update-LogDisplay
+        }.GetNewClosure())
+        
+        $btnUseB.add_Click({
+            $ui = $dialog.Tag
+            if ($null -eq $ui.Grid.SelectedItem) {
+                Show-MessageBox "Select a DHCP server first." "Scan" OK Warning
+                return
+            }
+            if ($null -eq $script:TxtCompareServer) {
+                Show-MessageBox "Compare controls not available." "Scan" OK Warning
+                return
+            }
+            $name = $ui.Grid.SelectedItem.DnsName
+            if ([string]::IsNullOrWhiteSpace($name)) { $name = $ui.Grid.SelectedItem.IPAddress }
+            $script:TxtCompareServer.Text = $name
+            if ($null -ne $script:TabCompare) {
+                $script:MainTabs.SelectedItem = $script:TabCompare
+            }
+            Write-ActionLog "Scan: set Server B candidate to $name" "INFO"
+            $ui.Status.Text = "Filled Compare Server B with $name — connect it on the Compare tab"
+            Update-LogDisplay
+        }.GetNewClosure())
+        
+        $btnExport.add_Click({
+            if ($Global:DomainScanResults.Count -eq 0) {
+                Show-MessageBox "No scan results to export. Run Scan Now first." "Export" OK Warning
+                return
+            }
+            try {
+                $saveDialog = New-Object System.Windows.Forms.SaveFileDialog
+                $saveDialog.Filter = "CSV Files (*.csv)|*.csv|All Files (*.*)|*.*"
+                $saveDialog.FileName = "DHCP-Domain-Scan-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
+                $saveDialog.Title = "Export Domain DHCP Scan"
+                if ($saveDialog.ShowDialog() -eq 'OK') {
+                    $Global:DomainScanResults |
+                        Select-Object DnsName, IPAddress, Status, LatencyMs, Detail, Source |
+                        Export-Csv -Path $saveDialog.FileName -NoTypeInformation -Encoding UTF8
+                    Write-ActionLog "Domain scan exported: $($saveDialog.FileName)" "SUCCESS"
+                    Show-MessageBox "Exported to:`n$($saveDialog.FileName)" "Export Complete" OK Information
+                    Update-LogDisplay
+                }
+            } catch {
+                Show-MessageBox "Export failed: $_" "Export Error" OK Error
+            }
+        }.GetNewClosure())
+        
+        $grid.add_MouseDoubleClick({
+            $ui = $dialog.Tag
+            if ($null -eq $ui.Grid.SelectedItem) { return }
+            $name = $ui.Grid.SelectedItem.DnsName
+            if ([string]::IsNullOrWhiteSpace($name)) { $name = $ui.Grid.SelectedItem.IPAddress }
+            $script:TxtServerName.Text = $name
+            Write-ActionLog "Scan double-click: filled Server A box with $name" "INFO"
+            $ui.Status.Text = "Filled main server box with $name"
+        }.GetNewClosure())
+        
+        $btnClose.add_Click({ $dialog.Close() }.GetNewClosure())
+        
+        # Auto-run scan when dialog opens
+        $dialog.Add_ContentRendered({
+            $btnScan.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
+        }.GetNewClosure())
+        
+        [void]$dialog.ShowDialog()
+    } catch {
+        Write-ActionLog "Failed to open domain scan dialog: $_" "ERROR"
+        Show-MessageBox "Failed to open scan dialog: $_" "Scan Error" OK Error
     }
 }
 #endregion
@@ -3709,6 +4113,11 @@ function Show-AddExclusionDialog {
 #endregion
 
 #region Event Handlers - Connection
+$BtnScanDomain.add_Click({
+    Write-ActionLog "Scan Domain button clicked" "INFO"
+    Show-DomainDhcpScanDialog
+})
+
 $BtnConnect.add_Click({
     Write-ActionLog "Connect button clicked" "INFO"
     
@@ -4619,7 +5028,7 @@ $BtnLogExport.add_Click({
             
             $header = @"
 ═══════════════════════════════════════════════════════════════════════
-DHCP Manager v2.3 - Action Log Export (Anthony Blake)
+DHCP Manager v2.4 - Action Log Export (Anthony Blake)
 ═══════════════════════════════════════════════════════════════════════
 Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
 Server: $Global:DHCPServer
@@ -4655,7 +5064,7 @@ $BtnSettings.add_Click({
     Write-ActionLog "Settings button clicked" "INFO"
     
     $settingsMsg = @"
-DHCP Manager v2.3 - Settings
+DHCP Manager v2.4 - Settings
 
 Author: $($Global:AppAuthor)
 Version: $($Global:AppVersion)
@@ -4667,6 +5076,7 @@ DhcpServer Module: $(if (Get-Module DhcpServer) { 'Loaded' } else { 'Not Loaded'
 Server A (Source): $(if ($Global:DHCPServer) { $Global:DHCPServer } else { 'None' })
 Server B (Dest): $(if ($Global:CompareServer) { $Global:CompareServer } else { 'None' })
 Selected Scope: $(if ($Global:SelectedScope) { $Global:SelectedScope } else { 'None' })
+Domain Scan Results: $($Global:DomainScanResults.Count)
 Migration Scopes Loaded: $($Global:MigrationScopes.Count)
 Migration Result Rows: $($Global:MigrationResults.Count)
 Compare Results: $($Global:CompareResults.Count)
@@ -4674,7 +5084,7 @@ DHCP Events Loaded: $($Global:DhcpEventEntries.Count)
 Live Watch Active: $($Global:EventWatchActive)
 Log Entries: $($Global:ActionLog.Count)
 
-Migration: Connect A + B, open Migrate tab, Load Source Scopes, Dry Run, then Migrate.
+Use Scan Domain to discover authorized DHCP servers and ping Up/Down status.
 "@
     
     Show-MessageBox $settingsMsg "Settings" OK Information
@@ -4686,20 +5096,21 @@ $BtnAbout.add_Click({
     $aboutMsg = @"
 ╔══════════════════════════════════════════════════════════════════╗
 ║                                                                  ║
-║              DHCP Manager v2.3                                   ║
+║              DHCP Manager v2.4                                   ║
 ║                  Built by Anthony Blake                          ║
 ║                                                                  ║
 ╚══════════════════════════════════════════════════════════════════╝
 
 🎯 Version: $($Global:AppVersion)
 👤 Author: $($Global:AppAuthor)
-📅 Date: August 17, 2026
+📅 Date: August 19, 2026
 🏢 Repository: ciscocdp-netizen/PowershellTools
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ✓ Features Included:
 
+  • Domain DHCP server scan + ping Up/Down status
   • Full WPF GUI with dark modern theme
   • Complete DHCP scope / lease / reservation management
   • Multi-server comparison (scopes, options, leases, reservations)
@@ -4744,8 +5155,8 @@ $Window.add_Loaded({
     Update-LogDisplay
     
     Write-Host "`n═══════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
-    Write-Host "  DHCP Manager v2.3 — Built by Anthony Blake" -ForegroundColor Green
-    Write-Host "  Compare • Live Events • Scope Migration A→B" -ForegroundColor Cyan
+    Write-Host "  DHCP Manager v2.4 — Built by Anthony Blake" -ForegroundColor Green
+    Write-Host "  Scan Domain • Compare • Live Events • Scope Migration" -ForegroundColor Cyan
     Write-Host "═══════════════════════════════════════════════════════════════════`n" -ForegroundColor Cyan
 })
 
@@ -4759,10 +5170,10 @@ $Window.add_Closing({
     }
     
     Write-ActionLog "Total log entries: $($Global:ActionLog.Count)" "INFO"
-    Write-ActionLog "DHCP Manager v2.3 shutdown complete — $($Global:AppAuthor)" "SUCCESS"
+    Write-ActionLog "DHCP Manager v2.4 shutdown complete — $($Global:AppAuthor)" "SUCCESS"
     
     Write-Host "`n═══════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
-    Write-Host "  DHCP Manager v2.3 closed — Anthony Blake" -ForegroundColor Yellow
+    Write-Host "  DHCP Manager v2.4 closed — Anthony Blake" -ForegroundColor Yellow
     Write-Host "  Thank you for using DHCP Manager!" -ForegroundColor Cyan
     Write-Host "═══════════════════════════════════════════════════════════════════`n" -ForegroundColor Cyan
 })
