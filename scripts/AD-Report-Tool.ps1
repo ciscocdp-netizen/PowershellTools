@@ -332,6 +332,12 @@ function Escape-ADFilterValue ([string]$Value) {
     return ($Value -replace "'", "''")
 }
 
+function Escape-ODataString ([string]$Value) {
+    # OData v4 single-quoted literals: escape ' as ''
+    if ($null -eq $Value) { return "" }
+    return ($Value -replace "'", "''")
+}
+
 function Get-UacLdapClause ([int]$Bit, [bool]$WantSet, [bool]$InvertMeaning = $false) {
     # OID 1.2.840.113556.1.4.803 = LDAP_MATCHING_RULE_BIT_AND
     $want = $WantSet
@@ -2195,7 +2201,8 @@ function Disconnect-EntraGraph {
 function Invoke-GraphGet {
     param(
         [Parameter(Mandatory)][string]$Uri,
-        [int]$MaxPages = 5
+        [int]$MaxPages = 5,
+        [hashtable]$Headers = $null
     )
     if (-not (Test-EntraConnected)) {
         if (-not (Attach-EntraExistingSession)) {
@@ -2207,11 +2214,16 @@ function Invoke-GraphGet {
     $next = $Uri
     $page = 0
     $last = $null
+    $extraHeaders = @{ ConsistencyLevel = "eventual" }
+    if ($Headers) {
+        foreach ($k in $Headers.Keys) { $extraHeaders[$k] = $Headers[$k] }
+    }
 
     while ($next -and $page -lt $MaxPages) {
         $page++
         if ($script:EntraAuthMode -eq "MgGraph") {
-            $resp = Invoke-MgGraphRequest -Method GET -Uri $next -OutputType PSObject -ErrorAction Stop
+            $resp = Invoke-MgGraphRequest -Method GET -Uri $next -Headers $extraHeaders `
+                -OutputType PSObject -ErrorAction Stop
         } else {
             # Refresh Az token if missing or close to expiry (lazy attach leaves token empty)
             if ($script:EntraAuthMode -eq "Az" -and (
@@ -2231,23 +2243,52 @@ function Invoke-GraphGet {
             if (-not $script:EntraAccessToken) {
                 throw "No Graph access token. Click Sign in to Entra ID."
             }
-            $headers = @{
-                Authorization    = "Bearer $($script:EntraAccessToken)"
-                ConsistencyLevel = "eventual"
+            $reqHeaders = @{
+                Authorization = "Bearer $($script:EntraAccessToken)"
             }
-            $resp = Invoke-RestMethod -Method Get -Uri $next -Headers $headers -ErrorAction Stop
+            foreach ($k in $extraHeaders.Keys) { $reqHeaders[$k] = $extraHeaders[$k] }
+            $resp = Invoke-RestMethod -Method Get -Uri $next -Headers $reqHeaders -ErrorAction Stop
         }
         $last = $resp
-        if ($resp.PSObject.Properties['value']) {
-            foreach ($v in @($resp.value)) { $items.Add($v) }
-            if ($resp.PSObject.Properties['@odata.nextLink'] -and $resp.'@odata.nextLink') {
-                $next = [string]$resp.'@odata.nextLink'
-            } else { $next = $null }
+        # Normalize hashtable / PSCustomObject / Dictionary responses from Graph
+        $hasValue = $false
+        $valueList = $null
+        $nextLink = $null
+        if ($null -ne $resp) {
+            if ($resp -is [hashtable]) {
+                if ($resp.ContainsKey('value')) {
+                    $hasValue = $true
+                    $valueList = $resp['value']
+                }
+                if ($resp.ContainsKey('@odata.nextLink')) { $nextLink = $resp['@odata.nextLink'] }
+            } elseif ($resp.PSObject.Properties['value']) {
+                $hasValue = $true
+                $valueList = $resp.value
+                if ($resp.PSObject.Properties['@odata.nextLink']) {
+                    $nextLink = $resp.'@odata.nextLink'
+                }
+            }
+        }
+        if ($hasValue) {
+            foreach ($v in @($valueList)) { if ($null -ne $v) { $items.Add($v) } }
+            if ($nextLink) { $next = [string]$nextLink } else { $next = $null }
         } else {
             return $resp
         }
     }
     return @{ value = @($items); _raw = $last }
+}
+
+function Get-GraphCollectionValue {
+    param($Response)
+    if ($null -eq $Response) { return @() }
+    if ($Response -is [hashtable] -and $Response.ContainsKey('value')) {
+        return @($Response['value'])
+    }
+    if ($Response.PSObject.Properties['value']) {
+        return @($Response.value)
+    }
+    return @($Response)
 }
 
 function Get-AuthMethodLabel ($method) {
@@ -2301,20 +2342,63 @@ function ConvertTo-EnrichableRow {
 
 function Resolve-EntraUserId {
     param([string]$Upn, [string]$Mail, [string]$Sam)
-    $candidates = @($Upn, $Mail) | Where-Object { $_ -and $_.Trim() -ne "" } | Select-Object -Unique
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+    foreach ($c in @($Upn, $Mail)) {
+        if ($c -and $c.Trim() -ne "") {
+            $t = $c.Trim()
+            if (-not $candidates.Contains($t)) { $candidates.Add($t) }
+        }
+    }
+
     foreach ($c in $candidates) {
-        $safe = Escape-ODataString $c.Trim()
+        # 1) Direct path lookup (works for UPN and often mail nicknames)
         try {
-            $uri = "https://graph.microsoft.com/v1.0/users?`$filter=userPrincipalName eq '$safe' or mail eq '$safe'&`$select=id,userPrincipalName,mail&`$top=1"
-            $resp = Invoke-GraphGet -Uri $uri -MaxPages 1
-            $val = @($resp.value)
-            if ($val.Count -gt 0 -and $val[0].id) { return [string]$val[0].id }
-        } catch { }
-        # Direct lookup by UPN path
-        try {
-            $enc = [uri]::EscapeDataString($c.Trim())
-            $u = Invoke-GraphGet -Uri "https://graph.microsoft.com/v1.0/users/$enc`?`$select=id" -MaxPages 1
+            $enc = [uri]::EscapeDataString($c)
+            $u = Invoke-GraphGet -Uri "https://graph.microsoft.com/v1.0/users/$enc`?`$select=id,userPrincipalName,mail" -MaxPages 1
             if ($u -and $u.id) { return [string]$u.id }
+        } catch { }
+
+        # 2) Simple equality filters (no OR — avoids advanced-query requirements)
+        $safe = Escape-ODataString $c
+        foreach ($filter in @(
+                "userPrincipalName eq '$safe'",
+                "mail eq '$safe'",
+                "proxyAddresses/any(p:p eq 'smtp:$safe')",
+                "proxyAddresses/any(p:p eq 'SMTP:$safe')"
+            )) {
+            try {
+                $needsCount = ($filter -match 'proxyAddresses')
+                $uri = "https://graph.microsoft.com/v1.0/users?`$filter=$([uri]::EscapeDataString($filter))&`$select=id,userPrincipalName,mail&`$top=1"
+                if ($needsCount) { $uri += "&`$count=true" }
+                $resp = Invoke-GraphGet -Uri $uri -MaxPages 1
+                $val = Get-GraphCollectionValue $resp
+                if ($val.Count -gt 0 -and $val[0].id) { return [string]$val[0].id }
+            } catch { }
+        }
+    }
+
+    # 3) Hybrid: match on-premises SAM account name
+    if ($Sam -and $Sam.Trim() -ne "") {
+        $safeSam = Escape-ODataString $Sam.Trim()
+        try {
+            $filter = "onPremisesSamAccountName eq '$safeSam'"
+            $uri = "https://graph.microsoft.com/v1.0/users?`$filter=$([uri]::EscapeDataString($filter))&`$select=id,userPrincipalName,mail&`$top=5&`$count=true"
+            $resp = Invoke-GraphGet -Uri $uri -MaxPages 1
+            $val = Get-GraphCollectionValue $resp
+            if ($val.Count -eq 1 -and $val[0].id) { return [string]$val[0].id }
+            # If multiple, prefer exact UPN/mail match among them
+            foreach ($u in $val) {
+                foreach ($c in $candidates) {
+                    if ($u.userPrincipalName -and [string]::Equals($u.userPrincipalName, $c, 'OrdinalIgnoreCase')) {
+                        return [string]$u.id
+                    }
+                    if ($u.mail -and [string]::Equals($u.mail, $c, 'OrdinalIgnoreCase')) {
+                        return [string]$u.id
+                    }
+                }
+            }
+            if ($val.Count -gt 0 -and $val[0].id) { return [string]$val[0].id }
         } catch { }
     }
     return $null
@@ -2325,15 +2409,15 @@ function Get-EntraAssignedRoles ([string]$UserId) {
     try {
         $uri = "https://graph.microsoft.com/v1.0/users/$UserId/memberOf/microsoft.graph.directoryRole?`$select=displayName"
         $resp = Invoke-GraphGet -Uri $uri
-        foreach ($r in @($resp.value)) {
+        foreach ($r in (Get-GraphCollectionValue $resp)) {
             if ($r.displayName) { $roles.Add([string]$r.displayName) }
         }
     } catch { }
-    # App / unified role assignments (directory)
+    # Unified role assignments (directory)
     try {
         $uri2 = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?`$filter=principalId eq '$UserId'&`$expand=roleDefinition(`$select=displayName)&`$top=50"
         $resp2 = Invoke-GraphGet -Uri $uri2
-        foreach ($a in @($resp2.value)) {
+        foreach ($a in (Get-GraphCollectionValue $resp2)) {
             $dn = $null
             if ($a.roleDefinition -and $a.roleDefinition.displayName) { $dn = [string]$a.roleDefinition.displayName }
             if ($dn -and -not $roles.Contains($dn)) { $roles.Add($dn) }
@@ -2349,7 +2433,7 @@ function Get-EntraDevices ([string]$UserId) {
         try {
             $uri = "https://graph.microsoft.com/v1.0/users/$UserId/$nav`?`$select=displayName,operatingSystem,deviceId&`$top=50"
             $resp = Invoke-GraphGet -Uri $uri
-            foreach ($d in @($resp.value)) {
+            foreach ($d in (Get-GraphCollectionValue $resp)) {
                 $label = if ($d.displayName) { [string]$d.displayName } else { [string]$d.deviceId }
                 if ($d.operatingSystem) { $label = "$label ($($d.operatingSystem))" }
                 if ($label -and -not $names.Contains($label)) { $names.Add($label) }
@@ -2362,10 +2446,10 @@ function Get-EntraDevices ([string]$UserId) {
 
 function Get-EntraAuthMethods ([string]$UserId) {
     try {
-        # authentication/methods is complete on v1.0 for most method types
         $uri = "https://graph.microsoft.com/v1.0/users/$UserId/authentication/methods"
         $resp = Invoke-GraphGet -Uri $uri
-        $labels = @($resp.value | ForEach-Object { Get-AuthMethodLabel $_ }) | Where-Object { $_ } | Select-Object -Unique
+        $labels = @(Get-GraphCollectionValue $resp | ForEach-Object { Get-AuthMethodLabel $_ }) |
+            Where-Object { $_ } | Select-Object -Unique
         return ($labels -join "; ")
     } catch {
         return ""
@@ -2379,10 +2463,10 @@ function Get-EntraLastFailedSignIn ([string]$Upn) {
     if (-not $Upn) { return $empty }
     $safe = Escape-ODataString $Upn.Trim()
     try {
-        $filter = [uri]::EscapeDataString("userPrincipalName eq '$safe' and status/errorCode ne 0")
-        $uri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$filter=$filter&`$orderby=createdDateTime desc&`$top=1"
+        $filter = "userPrincipalName eq '$safe' and status/errorCode ne 0"
+        $uri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$filter=$([uri]::EscapeDataString($filter))&`$orderby=createdDateTime desc&`$top=1"
         $resp = Invoke-GraphGet -Uri $uri -MaxPages 1
-        $row = @($resp.value) | Select-Object -First 1
+        $row = @(Get-GraphCollectionValue $resp) | Select-Object -First 1
         if (-not $row) { return $empty }
 
         $locParts = @()
@@ -2485,6 +2569,10 @@ function Invoke-EntraEnrichment {
     $newRows = [System.Collections.Generic.List[object]]::new()
     $i = 0
     $total = $script:Results.Count
+    $matched = 0
+    $unmatched = 0
+    $failed = 0
+    $firstError = ""
     Start-Progress "Enriching with Entra ID (0 / $total)..."
     foreach ($obj in $script:Results) {
         $i++
@@ -2497,36 +2585,40 @@ function Invoke-EntraEnrichment {
         if (-not $mail) { $mail = [string](Get-ObjectPropValue -Object $row -Name "mail") }
         $sam = [string](Get-ObjectPropValue -Object $row -Name "SamAccountName")
 
-        # Defaults
-        if ($wantRoles) { $row | Add-Member -NotePropertyName EntraAssignedRoles -NotePropertyValue "" -Force }
-        if ($wantDev)   { $row | Add-Member -NotePropertyName EntraDevices -NotePropertyValue "" -Force }
-        if ($wantAuth)  { $row | Add-Member -NotePropertyName EntraAuthMethods -NotePropertyValue "" -Force }
-        if ($wantFail) {
-            $row | Add-Member -NotePropertyName EntraLastSignInErrorCode -NotePropertyValue "" -Force
-            $row | Add-Member -NotePropertyName EntraLastSignInErrorTime -NotePropertyValue "" -Force
-            $row | Add-Member -NotePropertyName EntraLastSignInErrorApp -NotePropertyValue "" -Force
-            $row | Add-Member -NotePropertyName EntraLastSignInErrorLocation -NotePropertyValue "" -Force
-            $row | Add-Member -NotePropertyName EntraLastSignInErrorIP -NotePropertyValue "" -Force
+        # Ensure Entra note properties exist on the PSCustomObject row
+        foreach ($ep in (Get-SelectedEntraColumns)) {
+            if (-not (Test-ObjectHasProp -Object $row -Name $ep)) {
+                $row | Add-Member -NotePropertyName $ep -NotePropertyValue "" -Force
+            } else {
+                $row.PSObject.Properties[$ep].Value = ""
+            }
         }
 
         try {
             $uid = Resolve-EntraUserId -Upn $upn -Mail $mail -Sam $sam
             if ($uid) {
-                if ($wantRoles) { $row.EntraAssignedRoles = Get-EntraAssignedRoles -UserId $uid }
-                if ($wantDev)   { $row.EntraDevices = Get-EntraDevices -UserId $uid }
-                if ($wantAuth)  { $row.EntraAuthMethods = Get-EntraAuthMethods -UserId $uid }
+                $matched++
+                if ($wantRoles) { $row.PSObject.Properties["EntraAssignedRoles"].Value = Get-EntraAssignedRoles -UserId $uid }
+                if ($wantDev)   { $row.PSObject.Properties["EntraDevices"].Value = Get-EntraDevices -UserId $uid }
+                if ($wantAuth)  { $row.PSObject.Properties["EntraAuthMethods"].Value = Get-EntraAuthMethods -UserId $uid }
                 if ($wantFail) {
                     $lookupUpn = if ($upn) { $upn } else { $mail }
                     $fail = Get-EntraLastFailedSignIn -Upn $lookupUpn
-                    $row.EntraLastSignInErrorCode = $fail.Code
-                    $row.EntraLastSignInErrorTime = $fail.Time
-                    $row.EntraLastSignInErrorApp = $fail.App
-                    $row.EntraLastSignInErrorLocation = $fail.Location
-                    $row.EntraLastSignInErrorIP = $fail.IP
+                    $row.PSObject.Properties["EntraLastSignInErrorCode"].Value = $fail.Code
+                    $row.PSObject.Properties["EntraLastSignInErrorTime"].Value = $fail.Time
+                    $row.PSObject.Properties["EntraLastSignInErrorApp"].Value = $fail.App
+                    $row.PSObject.Properties["EntraLastSignInErrorLocation"].Value = $fail.Location
+                    $row.PSObject.Properties["EntraLastSignInErrorIP"].Value = $fail.IP
+                }
+            } else {
+                $unmatched++
+                if ($wantRoles -and (Test-ObjectHasProp -Object $row -Name "EntraAssignedRoles")) {
+                    $row.PSObject.Properties["EntraAssignedRoles"].Value = "(not found in Entra)"
                 }
             }
         } catch {
-            # leave blanks on per-user failure; continue
+            $failed++
+            if (-not $firstError) { $firstError = "$_" }
         }
         $newRows.Add($row)
     }
@@ -2534,9 +2626,21 @@ function Invoke-EntraEnrichment {
     $script:Results = @($newRows)
     foreach ($c in (Get-SelectedEntraColumns)) { [void]$script:LoadedProperties.Add($c) }
     Apply-ResultsSearch
-    Set-Status "Entra enrichment done - $($script:Results.Count) user(s)" $script:Results.Count `
+    $msg = "Entra enrichment done — $matched matched, $unmatched not in Entra"
+    if ($failed -gt 0) { $msg += ", $failed error(s)" }
+    Set-Status $msg $script:Results.Count `
         @($script:Results | Where-Object { (Get-ObjectPropValue -Object $_ -Name 'Enabled') -eq $true }).Count `
         @($script:Results | Where-Object { (Get-ObjectPropValue -Object $_ -Name 'Enabled') -eq $false }).Count
+    if ($Force -or $matched -eq 0 -or $failed -gt 0) {
+        $detail = "Matched in Entra: $matched`r`nNot found in Entra: $unmatched`r`nErrors: $failed"
+        if ($matched -eq 0 -and $total -gt 0) {
+            $detail += "`r`n`r`nNo users matched. Check that AD UserPrincipalName/Email matches Entra, and that your account has User.Read.All (admin consent)."
+        }
+        if ($firstError) { $detail += "`r`n`r`nFirst error:`r`n$firstError" }
+        [System.Windows.Forms.MessageBox]::Show($detail, "Entra ID enrichment",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            $(if ($matched -eq 0) { [System.Windows.Forms.MessageBoxIcon]::Warning } else { [System.Windows.Forms.MessageBoxIcon]::Information })) | Out-Null
+    }
 }
 
 foreach ($c in @($chkEntraEnrich,$chkEntraRoles,$chkEntraDevices,$chkEntraAuth,$chkEntraFailSignIn)) {
