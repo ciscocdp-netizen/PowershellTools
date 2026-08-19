@@ -24,10 +24,10 @@
     powershell -ExecutionPolicy Bypass -STA -File .\AD-Delta-Compare-FIXED.ps1
 
 .NOTES
-    Version: 1.8
-    - View Details: double-click a results row (or View Details button) for a
-      full side-by-side diff with multi-value breakdown
-    - Dynamic resize SplitContainer; LDAP escape + sAMAccountName/UPN filter
+    Version: 1.9
+    - Pick-and-choose restore: checkbox column, Check Differences / Clear Checks
+    - Restore Checked only restores ticked restorable changes
+    - Details dialog: Check for Restore or Restore This Change
 #>
 
 # ---------------------------------------------------------------------------
@@ -1094,14 +1094,15 @@ $resInner.Controls.Add($grid, 0, 1)
 
 # Checkbox column for pick-and-choose restore
 $colSelect = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
-$colSelect.HeaderText = ''
+$colSelect.HeaderText = 'Restore?'
 $colSelect.Name = 'Select'
-$colSelect.Width = 36
-$colSelect.FillWeight = 4
-$colSelect.MinimumWidth = 36
+$colSelect.Width = 70
+$colSelect.FillWeight = 7
+$colSelect.MinimumWidth = 60
 $colSelect.TrueValue = $true
 $colSelect.FalseValue = $false
 $colSelect.ThreeState = $false
+$colSelect.ToolTipText = 'Check each change you want to restore to the PDC'
 [void]$grid.Columns.Add($colSelect)
 
 Add-GridColumns -Grid $grid -Columns @(
@@ -1877,6 +1878,9 @@ function Show-SelectedRowDetails {
 
 $btnDetails.Add_Click({ Show-SelectedRowDetails })
 $grid.Add_CellDoubleClick({
+    param($sender, $e)
+    if ($e.RowIndex -lt 0) { return }
+    if ($grid.Columns[$e.ColumnIndex].Name -eq 'Select') { return }
     if ($grid.SelectedRows.Count -ge 1) { Show-SelectedRowDetails }
 })
 
@@ -2182,7 +2186,8 @@ $form.Add_Shown({
     Update-SplitLayout
     Write-Status 'Ready. Click Discover DCs to begin.'
     Write-Status ("Audit log: {0}" -f $script:AuditLog)
-    Write-Status 'Tip: Double-click a results row (or click View Details) to inspect differences.'
+    Write-Status 'Tip: Check boxes for the changes you want, or use Check Differences then uncheck any to skip.'
+    Write-Status 'Tip: Double-click a row for details (Check for Restore / Restore This Change).'
     Write-Status 'Tip: Drag the bar above ACTIVITY to resize the results grid.'
 })
 
