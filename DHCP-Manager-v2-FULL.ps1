@@ -1627,89 +1627,135 @@ function Get-DomainDhcpServers {
             try { $ip = "$($item.IPAddress)" } catch {}
             
             $servers.Add([PSCustomObject]@{
-                DnsName    = $dns
-                IPAddress  = $ip
-                Source     = 'AD Authorized (Get-DhcpServerInDC)'
+                DnsName     = $dns
+                IPAddress   = $ip
+                Authorized  = $true
+                AuthDetail  = 'Authorized in AD (Get-DhcpServerInDC)'
+                Source      = 'AD Authorized (Get-DhcpServerInDC)'
             })
         }
     } catch {
         Write-ActionLog "Get-DhcpServerInDC unavailable or failed: $_" "WARN"
     }
     
-    # Method 2: ADSI fallback against Configuration\NetServices
-    if ($servers.Count -eq 0) {
-        try {
-            $rootDse = [ADSI]'LDAP://RootDSE'
-            $config = $rootDse.configurationNamingContext
-            $searchRoot = [ADSI]"LDAP://CN=NetServices,CN=Services,$config"
-            $searcher = New-Object System.DirectoryServices.DirectorySearcher($searchRoot)
-            $searcher.Filter = '(objectClass=dHCPClass)'
-            $searcher.PropertiesToLoad.Add('name') | Out-Null
-            $searcher.PropertiesToLoad.Add('dhcpServers') | Out-Null
-            $searcher.PageSize = 200
+    # Method 2: ADSI fallback / supplement against Configuration\NetServices
+    try {
+        $rootDse = [ADSI]'LDAP://RootDSE'
+        $config = $rootDse.configurationNamingContext
+        $searchRoot = [ADSI]"LDAP://CN=NetServices,CN=Services,$config"
+        $searcher = New-Object System.DirectoryServices.DirectorySearcher($searchRoot)
+        $searcher.Filter = '(objectClass=dHCPClass)'
+        $searcher.PropertiesToLoad.Add('name') | Out-Null
+        $searcher.PropertiesToLoad.Add('dhcpServers') | Out-Null
+        $searcher.PageSize = 200
+        
+        foreach ($res in $searcher.FindAll()) {
+            $name = ''
+            if ($res.Properties['name'].Count -gt 0) {
+                $name = [string]$res.Properties['name'][0]
+            }
             
-            foreach ($res in $searcher.FindAll()) {
-                $name = ''
-                if ($res.Properties['name'].Count -gt 0) {
-                    $name = [string]$res.Properties['name'][0]
+            $dhcpServersProp = @()
+            if ($res.Properties['dhcpServers'].Count -gt 0) {
+                $dhcpServersProp = @($res.Properties['dhcpServers'] | ForEach-Object { "$_" })
+            }
+            
+            # dhcpServers values often look like: i<ip>$<host>$...
+            foreach ($raw in $dhcpServersProp) {
+                $dns = $null
+                $ip = ''
+                if ($raw -match 'i([0-9.]+)\$([^$]+)\$') {
+                    $ip = $Matches[1]
+                    $dns = $Matches[2]
+                } elseif ($name -and $name -notmatch '^dhcpRoot') {
+                    $dns = $name
                 }
                 
-                $dhcpServersProp = @()
-                if ($res.Properties['dhcpServers'].Count -gt 0) {
-                    $dhcpServersProp = @($res.Properties['dhcpServers'] | ForEach-Object { "$_" })
+                if ([string]::IsNullOrWhiteSpace($dns)) { continue }
+                $key = $dns.ToLowerInvariant()
+                if ($seen.ContainsKey($key)) {
+                    # Enrich existing entry with IP / confirm authorized
+                    continue
                 }
+                $seen[$key] = $true
                 
-                # dhcpServers values often look like: i<ip>$<host>$...
-                foreach ($raw in $dhcpServersProp) {
-                    $dns = $null
-                    $ip = ''
-                    if ($raw -match 'i([0-9.]+)\$([^$]+)\$') {
-                        $ip = $Matches[1]
-                        $dns = $Matches[2]
-                    } elseif ($name -and $name -notmatch '^dhcpRoot') {
-                        $dns = $name
-                    }
-                    
-                    if ([string]::IsNullOrWhiteSpace($dns)) { continue }
-                    $key = $dns.ToLowerInvariant()
-                    if ($seen.ContainsKey($key)) { continue }
+                $servers.Add([PSCustomObject]@{
+                    DnsName    = $dns
+                    IPAddress  = $ip
+                    Authorized = $true
+                    AuthDetail = 'Authorized in AD (NetServices/ADSI)'
+                    Source     = 'AD NetServices (ADSI)'
+                })
+            }
+            
+            if ($dhcpServersProp.Count -eq 0 -and $name -and $name -notmatch '^dhcpRoot') {
+                $key = $name.ToLowerInvariant()
+                if (-not $seen.ContainsKey($key)) {
                     $seen[$key] = $true
-                    
                     $servers.Add([PSCustomObject]@{
-                        DnsName   = $dns
-                        IPAddress = $ip
-                        Source    = 'AD NetServices (ADSI)'
+                        DnsName    = $name
+                        IPAddress  = ''
+                        Authorized = $true
+                        AuthDetail = 'Authorized in AD (NetServices object name)'
+                        Source     = 'AD NetServices (ADSI)'
                     })
                 }
-                
-                if ($dhcpServersProp.Count -eq 0 -and $name -and $name -notmatch '^dhcpRoot') {
-                    $key = $name.ToLowerInvariant()
-                    if (-not $seen.ContainsKey($key)) {
-                        $seen[$key] = $true
-                        $servers.Add([PSCustomObject]@{
-                            DnsName   = $name
-                            IPAddress = ''
-                            Source    = 'AD NetServices (ADSI)'
-                        })
-                    }
-                }
             }
-        } catch {
-            Write-ActionLog "ADSI DHCP discovery failed: $_" "WARN"
         }
+    } catch {
+        Write-ActionLog "ADSI DHCP discovery failed: $_" "WARN"
     }
     
     return @($servers | Sort-Object DnsName)
 }
 
+function Test-DhcpServerAdAuthorization {
+    <#
+    .SYNOPSIS
+        Verifies whether a DHCP server DNS name or IP is listed as authorized in AD
+    #>
+    param(
+        [string]$DnsName,
+        [string]$IPAddress,
+        [object[]]$AuthorizedServers
+    )
+    
+    $dnsKey = if ($DnsName) { $DnsName.Trim().ToLowerInvariant() } else { '' }
+    $ipKey  = if ($IPAddress) { $IPAddress.Trim() } else { '' }
+    
+    foreach ($auth in @($AuthorizedServers)) {
+        $authDns = "$($auth.DnsName)".Trim().ToLowerInvariant()
+        $authIp  = "$($auth.IPAddress)".Trim()
+        
+        if ($dnsKey -and $authDns -and ($dnsKey -eq $authDns -or $dnsKey.StartsWith("$authDns.") -or $authDns.StartsWith("$dnsKey."))) {
+            return [PSCustomObject]@{
+                Authorized = $true
+                AuthDetail = if ($auth.AuthDetail) { $auth.AuthDetail } else { 'Matched authorized AD DNS name' }
+            }
+        }
+        
+        if ($ipKey -and $authIp -and $ipKey -eq $authIp) {
+            return [PSCustomObject]@{
+                Authorized = $true
+                AuthDetail = 'Matched authorized AD IP address'
+            }
+        }
+    }
+    
+    return [PSCustomObject]@{
+        Authorized = $false
+        AuthDetail = 'Not found in AD authorized DHCP server list'
+    }
+}
+
 function Invoke-DomainDhcpServerScan {
     <#
     .SYNOPSIS
-        Discovers domain DHCP servers and pings each one
+        Discovers domain DHCP servers, verifies AD authorization, and pings each one
     #>
     param([int]$TimeoutMs = 1500)
     
-    Write-ActionLog "Scanning domain for authorized DHCP servers..." "INFO"
+    Write-ActionLog "Scanning domain for DHCP servers and checking AD authorization..." "INFO"
     Set-Status "Scanning domain DHCP servers..."
     
     $discovered = @(Get-DomainDhcpServers)
@@ -1717,17 +1763,17 @@ function Invoke-DomainDhcpServerScan {
         throw "No DHCP servers found in Active Directory. Ensure this machine is domain-joined and you can query AD (or DhcpServer module / Get-DhcpServerInDC is available)."
     }
     
-    Write-ActionLog "Found $($discovered.Count) authorized DHCP server(s). Pinging..." "INFO"
+    Write-ActionLog "Found $($discovered.Count) AD DHCP server record(s). Verifying authorization and pinging..." "INFO"
     
     $results = [System.Collections.Generic.List[object]]::new()
     
     foreach ($srv in $discovered) {
         $target = if ($srv.DnsName) { $srv.DnsName } else { $srv.IPAddress }
-        Write-ActionLog "Pinging $target ..." "INFO"
+        Write-ActionLog "Checking $target (authorize + ping)..." "INFO"
         
         $ping = Test-HostPingStatus -ComputerName $target -TimeoutMs $TimeoutMs
         
-        # Resolve IP if missing and host is up / resolvable
+        # Resolve IP if missing
         $ip = "$($srv.IPAddress)"
         if ([string]::IsNullOrWhiteSpace($ip)) {
             try {
@@ -1737,20 +1783,38 @@ function Invoke-DomainDhcpServerScan {
             } catch {}
         }
         
+        # Explicit authorization verification against the discovered AD set
+        $authCheck = Test-DhcpServerAdAuthorization -DnsName $srv.DnsName -IPAddress $ip -AuthorizedServers $discovered
+        $isAuthorized = [bool]$authCheck.Authorized
+        $authDetail = "$($authCheck.AuthDetail)"
+        if ($srv.Authorized -and -not $isAuthorized) {
+            # Source record came from AD list — treat as authorized
+            $isAuthorized = $true
+            $authDetail = if ($srv.AuthDetail) { $srv.AuthDetail } else { 'Listed in AD DHCP authorization data' }
+        } elseif ($srv.Authorized) {
+            $isAuthorized = $true
+            if ($srv.AuthDetail) { $authDetail = $srv.AuthDetail }
+        }
+        
         $results.Add([PSCustomObject]@{
-            DnsName   = $srv.DnsName
-            IPAddress = $ip
-            Status    = $ping.Status
-            LatencyMs = $ping.LatencyMs
-            Detail    = $ping.Detail
-            Source    = $srv.Source
+            DnsName     = $srv.DnsName
+            IPAddress   = $ip
+            Online      = $ping.Status
+            Status      = $ping.Status   # keep for backward compatibility
+            Authorized  = $(if ($isAuthorized) { 'Yes' } else { 'No' })
+            AuthDetail  = $authDetail
+            LatencyMs   = $ping.LatencyMs
+            Detail      = $ping.Detail
+            Source      = $srv.Source
         })
     }
     
-    $up = @($results | Where-Object { $_.Status -eq 'Up' }).Count
+    $up = @($results | Where-Object { $_.Online -eq 'Up' }).Count
     $down = $results.Count - $up
-    Write-ActionLog "Domain scan complete: $($results.Count) servers — $up Up, $down Down" "SUCCESS"
-    Set-Status "Domain scan: $up Up / $down Down"
+    $authYes = @($results | Where-Object { $_.Authorized -eq 'Yes' }).Count
+    $authNo = $results.Count - $authYes
+    Write-ActionLog "Domain scan complete: $($results.Count) servers — Online $up Up/$down Down — Authorized $authYes Yes/$authNo No" "SUCCESS"
+    Set-Status "Domain scan: $up Up / $down Down | Auth $authYes Yes / $authNo No"
     
     return $results
 }
@@ -1780,7 +1844,7 @@ function Show-DomainDhcpScanDialog {
       <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
 
-    <TextBlock Grid.Row="0" Text="Authorized DHCP Servers in Active Directory"
+    <TextBlock Grid.Row="0" Text="Domain DHCP Servers — Online Status + AD Authorization"
                Foreground="#E8EAF0" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,8"/>
 
     <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,10">
@@ -1792,7 +1856,7 @@ function Show-DomainDhcpScanDialog {
               Background="#2A2F3A" Foreground="#E8EAF0" BorderBrush="#383E4A" BorderThickness="1"/>
       <Button x:Name="BtnExportScan" Content="💾 Export" Width="90" Height="30" Margin="0,0,8,0"
               Background="#2A2F3A" Foreground="#E8EAF0" BorderBrush="#383E4A" BorderThickness="1"/>
-      <TextBlock x:Name="TxtScanStatus" Text="Click Scan Now to discover and ping DHCP servers"
+      <TextBlock x:Name="TxtScanStatus" Text="Click Scan Now to discover, authorize-check, and ping DHCP servers"
                  Foreground="#9AA3B2" VerticalAlignment="Center" Margin="8,0,0,0"/>
     </StackPanel>
 
@@ -1804,10 +1868,12 @@ function Show-DomainDhcpScanDialog {
               GridLinesVisibility="Horizontal" HorizontalGridLinesBrush="#383E4A"
               RowHeight="28" ColumnHeaderHeight="32">
       <DataGrid.Columns>
-        <DataGridTextColumn Header="DNS Name" Binding="{Binding DnsName}" Width="220"/>
-        <DataGridTextColumn Header="IP Address" Binding="{Binding IPAddress}" Width="130"/>
-        <DataGridTextColumn Header="Status" Binding="{Binding Status}" Width="80"/>
-        <DataGridTextColumn Header="Latency" Binding="{Binding Detail}" Width="100"/>
+        <DataGridTextColumn Header="DNS Name" Binding="{Binding DnsName}" Width="200"/>
+        <DataGridTextColumn Header="IP Address" Binding="{Binding IPAddress}" Width="120"/>
+        <DataGridTextColumn Header="Online" Binding="{Binding Online}" Width="70"/>
+        <DataGridTextColumn Header="Authorized" Binding="{Binding Authorized}" Width="90"/>
+        <DataGridTextColumn Header="Latency" Binding="{Binding Detail}" Width="90"/>
+        <DataGridTextColumn Header="Authorization Detail" Binding="{Binding AuthDetail}" Width="220"/>
         <DataGridTextColumn Header="Source" Binding="{Binding Source}" Width="*"/>
       </DataGrid.Columns>
       <DataGrid.ColumnHeaderStyle>
@@ -1822,7 +1888,7 @@ function Show-DomainDhcpScanDialog {
     </DataGrid>
 
     <TextBlock Grid.Row="3" Margin="0,10,0,8" Foreground="#9AA3B2" FontSize="11"
-               Text="Tip: Select a server and click Use as Server A/B, or double-click to fill the main connection box."
+               Text="Online = ICMP ping. Authorized = listed in Active Directory DHCP authorization (Get-DhcpServerInDC / NetServices)."
                TextWrapping="Wrap"/>
 
     <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right">
@@ -1864,9 +1930,11 @@ function Show-DomainDhcpScanDialog {
                 $ui.Grid.ItemsSource = $null
                 $ui.Grid.ItemsSource = @($Global:DomainScanResults)
                 
-                $up = @($Global:DomainScanResults | Where-Object { $_.Status -eq 'Up' }).Count
+                $up = @($Global:DomainScanResults | Where-Object { $_.Online -eq 'Up' -or $_.Status -eq 'Up' }).Count
                 $down = $Global:DomainScanResults.Count - $up
-                $ui.Status.Text = "Found $($Global:DomainScanResults.Count) server(s): $up Up, $down Down"
+                $authYes = @($Global:DomainScanResults | Where-Object { $_.Authorized -eq 'Yes' }).Count
+                $authNo = $Global:DomainScanResults.Count - $authYes
+                $ui.Status.Text = "Found $($Global:DomainScanResults.Count) server(s): Online $up Up / $down Down | Authorized $authYes Yes / $authNo No"
                 Update-LogDisplay
             } catch {
                 $err = "$_"
@@ -1924,7 +1992,7 @@ function Show-DomainDhcpScanDialog {
                 $saveDialog.Title = "Export Domain DHCP Scan"
                 if ($saveDialog.ShowDialog() -eq 'OK') {
                     $Global:DomainScanResults |
-                        Select-Object DnsName, IPAddress, Status, LatencyMs, Detail, Source |
+                        Select-Object DnsName, IPAddress, Online, Authorized, AuthDetail, LatencyMs, Detail, Source |
                         Export-Csv -Path $saveDialog.FileName -NoTypeInformation -Encoding UTF8
                     Write-ActionLog "Domain scan exported: $($saveDialog.FileName)" "SUCCESS"
                     Show-MessageBox "Exported to:`n$($saveDialog.FileName)" "Export Complete" OK Information
