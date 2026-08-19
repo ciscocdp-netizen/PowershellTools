@@ -11,34 +11,31 @@ Interactive WinForms GUI for querying Active Directory (Users, Groups, Computers
 **Requirements**
 - Windows PowerShell 5.1+
 - ActiveDirectory RSAT module and read access to AD
-- For Entra enrichment: network access to `login.microsoftonline.com` and `graph.microsoft.com`, plus Graph permissions (admin consent may be required):
-  - `User.Read.All`
-  - `Directory.Read.All`
-  - `AuditLog.Read.All` (failed sign-ins; needs Entra ID P1/P2)
-  - `UserAuthenticationMethod.Read.All`
-  - `Device.Read.All`
-  - `RoleManagement.Read.Directory`
+- For Entra enrichment: network access to `login.microsoftonline.com` and `graph.microsoft.com`
 
 ### Entra ID enrichment (Users)
 
 1. Select **Users**
-2. In **Entra ID Enrichment**, choose data to pull:
-   - Assigned roles
-   - Devices (registered / owned)
-   - Authentication methods
-   - Last failed sign-in (error code, time, app, location, IP)
-3. Enter your **Tenant** domain (e.g. `contoso.onmicrosoft.com`) or Directory (tenant) ID GUID
-4. **App ID** defaults to Microsoft Graph PowerShell (`14d82eec-204b-4c2f-b113-9d477e6ee18c`)
-   - If you get **AADSTS700016** (app not found in directory): click **Consent** as an admin, **or** register your own public-client app in the tenant and paste its Application (client) ID into **App ID**
-5. Click **Connect Graph** and complete device-code sign-in in the browser
-6. Either check **Enrich Users with Entra ID after query** and **Run Query**, or run a query first and click **Enrich Current Results**
-7. Entra columns also appear under **Columns** and can be exported to CSV
+2. Enter **Tenant** (domain or Directory ID GUID)
+3. Choose **App**:
+   - **Azure PowerShell** (try first — usually already in the tenant)
+   - **Azure CLI**
+   - **Custom App Registration** (required if Microsoft apps are blocked — see below)
+   - Avoid **Microsoft Graph PowerShell** if you see **AADSTS700016** (admin consent cannot install it)
+4. Click **Connect Graph** and complete device-code sign-in
+5. Enable enrich options / **Enrich Current Results**
 
-#### Own app registration (locked-down tenants)
+#### AADSTS700016 — register your own app
+
+Admin consent for `14d82eec-…` (Graph PowerShell) will **fail** if that app is not in your directory. Create your own:
 
 1. Entra admin center → **App registrations** → New registration (this org only)
 2. **Authentication** → Allow public client flows = **Yes**
-3. **API permissions** → Microsoft Graph (delegated) — the scopes listed above → **Grant admin consent**
-4. Copy **Application (client) ID** into the tool’s **App ID** box
+3. **API permissions** → Microsoft Graph (delegated) → Grant admin consent:
+   - `User.Read.All`, `Directory.Read.All`, `AuditLog.Read.All`
+   - `UserAuthenticationMethod.Read.All`, `Device.Read.All`, `RoleManagement.Read.Directory`
+4. Copy **Application (client) ID** → tool **App** = Custom → paste into **App ID** → Connect
 
-Matching uses `UserPrincipalName` / `EmailAddress` against Entra.
+Use the tool’s **Setup** button for the same walkthrough (opens App registrations).
+
+Matching uses `UserPrincipalName` / `EmailAddress` against Entra. Sign-in logs need Entra ID P1/P2.
