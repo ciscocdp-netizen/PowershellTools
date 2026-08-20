@@ -100,7 +100,7 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.4.7'
+$Global:AppVersion       = '2.4.8'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:LogWatchState    = @{
     Local = @{ Enabled = $false; Path = $null; Offset = 0L }
@@ -642,7 +642,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                      HorizontalAlignment="Center"/>
           
           <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-            <Run Text="v2.4.7  |  "/>
+            <Run Text="v2.4.8  |  "/>
             <Run Text="Anthony Blake  |  " Foreground="#90CAF9"/>
             <Run x:Name="StatusTime" Text=""/>
           </TextBlock>
@@ -1493,6 +1493,9 @@ try {
     $script:BarTaskProgress  = $Window.FindName("BarTaskProgress")
     $script:BtnTaskPause     = $Window.FindName("BtnTaskPause")
     $script:BtnTaskCancel    = $Window.FindName("BtnTaskCancel")
+    
+    # Live watch timer (must be initialized for StrictMode)
+    $script:EventWatchTimer  = $null
     
     # Navigation
     $script:NavTree          = $Window.FindName("NavTree")
@@ -4268,7 +4271,7 @@ function Import-DhcpAuditLogFile {
     try {
         if ($TailOnly) {
             $fs.Seek(0, [System.IO.SeekOrigin]::End) | Out-Null
-            return @{ Path = $Path; Offset = $fs.Position; Count = 0 }
+            return [PSCustomObject]@{ Path = $Path; Offset = $fs.Position; EventCount = 0; Shown = 0; Canceled = $false }
         }
         
         $totalBytes = [math]::Max(1L, [long]$fs.Length)
@@ -4317,7 +4320,7 @@ function Import-DhcpAuditLogFile {
             Write-ActionLog "Ingest canceled after $eventsFound parsed events ($linesRead lines)" "WARN"
             Complete-TaskProgress -Message "Ingest canceled — kept previous events"
             try { if ($null -ne $script:BtnEventIngest) { $script:BtnEventIngest.IsEnabled = $true } } catch {}
-            return @{ Path = $Path; Offset = $offset; Count = 0; Canceled = $true }
+            return [PSCustomObject]@{ Path = $Path; Offset = $offset; EventCount = 0; Shown = 0; Canceled = $true }
         }
         
         Update-TaskProgress -Processed $totalBytes -Total $totalBytes -Percent 95 `
@@ -4343,7 +4346,7 @@ function Import-DhcpAuditLogFile {
         
         try { if ($null -ne $script:BtnEventIngest) { $script:BtnEventIngest.IsEnabled = $true } } catch {}
         
-        return @{ Path = $Path; Offset = $offset; Count = $count; Shown = $shown; Canceled = $false }
+        return [PSCustomObject]@{ Path = $Path; Offset = $offset; EventCount = $count; Shown = $shown; Canceled = $false }
     } catch {
         Complete-TaskProgress -Message "Ingest failed"
         try { if ($null -ne $script:BtnEventIngest) { $script:BtnEventIngest.IsEnabled = $true } } catch {}
@@ -4361,7 +4364,7 @@ function Read-DhcpAuditLogDelta {
     )
     
     if (-not (Test-Path -LiteralPath $Path)) {
-        return @{ Offset = $Offset; Count = 0 }
+        return [PSCustomObject]@{ Offset = $Offset; Added = 0 }
     }
     
     $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
@@ -4384,7 +4387,7 @@ function Read-DhcpAuditLogDelta {
             Add-DhcpEventEntriesBatch -Entries @($ordered)
         }
         
-        return @{ Offset = $fs.Position; Count = (Get-SafeCount $batch) }
+        return [PSCustomObject]@{ Offset = $fs.Position; Added = (Get-SafeCount $batch) }
     } finally {
         $fs.Dispose()
     }
@@ -4498,6 +4501,10 @@ function Start-DhcpEventWatch {
         $started += "B ($($info.Path))"
     }
     
+    if (-not (Get-Variable -Name EventWatchTimer -Scope Script -ErrorAction SilentlyContinue)) {
+        $script:EventWatchTimer = $null
+    }
+    
     if ($null -eq $script:EventWatchTimer) {
         $script:EventWatchTimer = New-Object System.Windows.Threading.DispatcherTimer
         $script:EventWatchTimer.Interval = [TimeSpan]::FromSeconds(2)
@@ -4518,7 +4525,7 @@ function Start-DhcpEventWatch {
                 try {
                     $delta = Read-DhcpAuditLogDelta -Path $st.Path -Offset ([long]$st.Offset) -ServerLabel $label
                     $st.Offset = [long]$delta.Offset
-                    $newTotal += [int]$delta.Count
+                    $newTotal += [int]$delta.Added
                 } catch {
                     Write-ActionLog "Watch poll failed for $key : $_" "WARN"
                 }
@@ -4550,7 +4557,11 @@ function Stop-DhcpEventWatch {
     Write-ActionLog "Stopping DHCP live event watch..." "INFO"
     
     $Global:EventWatchActive = $false
-    try { if ($script:EventWatchTimer) { $script:EventWatchTimer.Stop() } } catch {}
+    try {
+        if ((Get-Variable -Name EventWatchTimer -Scope Script -ErrorAction SilentlyContinue) -and $script:EventWatchTimer) {
+            $script:EventWatchTimer.Stop()
+        }
+    } catch {}
     
     foreach ($key in @('Local','A','B')) {
         $Global:LogWatchState[$key].Enabled = $false
@@ -6445,9 +6456,9 @@ $BtnEventIngest.add_Click({
             $script:TxtEventStatus.Text = "Ingest canceled — previous events retained ($($info.Path))"
             Set-Status "Ingest canceled"
         } else {
-            $shown = if ($null -ne $info.Shown) { $info.Shown } else { $info.Count }
-            $script:TxtEventStatus.Text = "Ingested $($info.Count) events from $label (showing $shown) — $($info.Path)"
-            Set-Status "Ingested $($info.Count) DHCP events"
+            $shown = if ($null -ne $info.Shown) { $info.Shown } else { $info.EventCount }
+            $script:TxtEventStatus.Text = "Ingested $($info.EventCount) events from $label (showing $shown) — $($info.Path)"
+            Set-Status "Ingested $($info.EventCount) DHCP events"
         }
         Update-LogDisplay
     } catch {
