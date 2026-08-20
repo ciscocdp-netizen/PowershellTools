@@ -1,4 +1,4 @@
-# DHCP Events + Live Watch (v2.2)
+# DHCP Events + Live Watch (v2.4.7)
 
 Author stamp in footer: **Anthony Blake**
 
@@ -15,13 +15,21 @@ Author stamp in footer: **Anthony Blake**
    - Survives log rotation (resets offset if file shrinks)
    - Tags each event with the source server
 
+## Ingest performance + progress (v2.4.7)
+
+- Parsing no longer updates the grid on every line (was very slow on large logs)
+- Bottom status bar shows a **progress bar + ETA**; Events tab mirrors percent
+- **Pause** / **Resume** (Events button or status bar) and **Cancel** (status bar)
+- Keeps the newest 5,000 events if the file contains more
+
 ## How to use
 
 1. Open **📡 Events** (toolbar or tab).
 2. Choose source → **Detect** or **Browse** → **Ingest Log** for history.
-3. Check **Local** / **Server A** / **Server B** → **Start Watch**.
-4. New Assign / Renew / Release / NACK / etc. rows appear at the top of the grid.
-5. **Export** to CSV when needed. **Stop** when finished.
+3. Watch progress / ETA; use **Pause** or **Cancel** if needed.
+4. Check **Local** / **Server A** / **Server B** → **Start Watch**.
+5. New Assign / Renew / Release / NACK / etc. rows appear at the top of the grid.
+6. **Export** to CSV when needed. **Stop** when finished.
 
 ## Requirements for remote watch/ingest
 
