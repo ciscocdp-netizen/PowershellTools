@@ -100,7 +100,7 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.4.4'
+$Global:AppVersion       = '2.4.5'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:LogWatchState    = @{
     Local = @{ Enabled = $false; Path = $null; Offset = 0L }
@@ -111,6 +111,7 @@ $Global:EventWatchActive = $false
 $Global:MigrationResults = [System.Collections.Generic.List[object]]::new()
 $Global:MigrationScopes  = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:DomainScanResults = [System.Collections.Generic.List[object]]::new()
+$Global:ExtraScanDomains  = [System.Collections.Generic.List[string]]::new()
 #endregion
 
 #region Core Logging Functions
@@ -628,7 +629,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                    HorizontalAlignment="Center"/>
         
         <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-          <Run Text="v2.4.4  |  "/>
+          <Run Text="v2.4.5  |  "/>
           <Run Text="Anthony Blake  |  " Foreground="#90CAF9"/>
           <Run x:Name="StatusTime" Text=""/>
         </TextBlock>
@@ -1779,59 +1780,270 @@ function Enable-ConnectedControls {
 #endregion
 
 #region Domain DHCP Server Scan
-function Test-HostPingStatus {
+function Get-CurrentDnsDomainName {
     <#
     .SYNOPSIS
-        Pings a host with a short timeout and returns Up/Down + latency
+        Resolves the current machine DNS domain (best effort)
     #>
-    param(
-        [Parameter(Mandatory)]
-        [string]$ComputerName,
-        [int]$TimeoutMs = 1500
-    )
+    try {
+        $dom = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
+        if ($dom -and $dom.Name) { return "$($dom.Name)".Trim() }
+    } catch {}
     
-    $result = [PSCustomObject]@{
-        Status    = 'Down'
-        LatencyMs = $null
-        Detail    = ''
+    if (-not [string]::IsNullOrWhiteSpace($env:USERDNSDOMAIN)) {
+        return "$env:USERDNSDOMAIN".Trim()
     }
     
     try {
-        $ping = New-Object System.Net.NetworkInformation.Ping
-        $reply = $ping.Send($ComputerName, $TimeoutMs)
-        if ($null -ne $reply -and $reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
-            $result.Status = 'Up'
-            $result.LatencyMs = [int]$reply.RoundtripTime
-            $result.Detail = "$($reply.RoundtripTime) ms"
-        } else {
-            $statusText = if ($reply) { "$($reply.Status)" } else { 'No reply' }
-            $result.Status = 'Down'
-            $result.Detail = $statusText
+        $root = [ADSI]'LDAP://RootDSE'
+        $dn = [string]$root.defaultNamingContext
+        if ($dn) {
+            $parts = @($dn -split ',' | Where-Object { $_ -match '^DC=' } | ForEach-Object { $_ -replace '^DC=', '' })
+            if ((Get-SafeCount $parts) -gt 0) { return ($parts -join '.') }
+        }
+    } catch {}
+    
+    return ''
+}
+
+function Get-ScanDomainsConfigPath {
+    $dir = Join-Path $env:LOCALAPPDATA 'DHCPManager'
+    if (-not (Test-Path -LiteralPath $dir)) {
+        try { New-Item -ItemType Directory -Path $dir -Force | Out-Null } catch {}
+    }
+    return (Join-Path $dir 'scan-domains.txt')
+}
+
+function Import-ScanDomainsConfig {
+    <#
+    .SYNOPSIS
+        Loads persisted extra scan domains from %LOCALAPPDATA%\DHCPManager\scan-domains.txt
+    #>
+    $path = Get-ScanDomainsConfigPath
+    $list = [System.Collections.Generic.List[string]]::new()
+    if (-not (Test-Path -LiteralPath $path)) { return @($list) }
+    
+    try {
+        foreach ($line in @(Get-Content -LiteralPath $path -ErrorAction Stop)) {
+            foreach ($part in @($line -split '[;,]')) {
+                $d = "$part".Trim()
+                if ([string]::IsNullOrWhiteSpace($d)) { continue }
+                if ($d.StartsWith('#')) { continue }
+                $key = $d.ToLowerInvariant()
+                $exists = $false
+                foreach ($e in $list) {
+                    if ("$e".ToLowerInvariant() -eq $key) { $exists = $true; break }
+                }
+                if (-not $exists) { [void]$list.Add($d) }
+            }
         }
     } catch {
-        $result.Status = 'Down'
-        $result.Detail = "$_"
+        Write-ActionLog "Could not load scan domain list: $_" "WARN"
     }
     
-    return $result
+    return @($list)
+}
+
+function Export-ScanDomainsConfig {
+    <#
+    .SYNOPSIS
+        Persists extra scan domains (excludes current domain)
+    #>
+    param([string[]]$Domains)
+    
+    $current = Get-CurrentDnsDomainName
+    $currentKey = if ($current) { $current.ToLowerInvariant() } else { '' }
+    $toSave = [System.Collections.Generic.List[string]]::new()
+    
+    foreach ($d in @($Domains)) {
+        $name = "$d".Trim()
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+        $key = $name.ToLowerInvariant()
+        if ($currentKey -and $key -eq $currentKey) { continue }
+        $exists = $false
+        foreach ($e in $toSave) {
+            if ("$e".ToLowerInvariant() -eq $key) { $exists = $true; break }
+        }
+        if (-not $exists) { [void]$toSave.Add($name) }
+    }
+    
+    $path = Get-ScanDomainsConfigPath
+    try {
+        $header = @(
+            '# DHCP Manager — extra domains to scan for authorized DHCP servers'
+            '# One domain DNS name per line (or comma/semicolon separated)'
+            "# Current domain is always scanned automatically: $current"
+            ''
+        )
+        ($header + @($toSave)) | Set-Content -LiteralPath $path -Encoding UTF8
+        $Global:ExtraScanDomains = [System.Collections.Generic.List[string]]::new()
+        foreach ($s in $toSave) { [void]$Global:ExtraScanDomains.Add($s) }
+        Write-ActionLog "Saved $(Get-SafeCount $toSave) extra scan domain(s) to $path" "INFO"
+    } catch {
+        Write-ActionLog "Could not save scan domain list: $_" "WARN"
+    }
+}
+
+function Get-NormalizedScanDomainList {
+    <#
+    .SYNOPSIS
+        Builds a unique, ordered domain list (current domain first when known)
+    #>
+    param([string[]]$Domains)
+    
+    $result = [System.Collections.Generic.List[string]]::new()
+    $seen = @{}
+    
+    $current = Get-CurrentDnsDomainName
+    if (-not [string]::IsNullOrWhiteSpace($current)) {
+        [void]$result.Add($current)
+        $seen[$current.ToLowerInvariant()] = $true
+    }
+    
+    foreach ($raw in @($Domains)) {
+        foreach ($part in @("$raw" -split '[;,\r\n]+')) {
+            $d = "$part".Trim()
+            if ([string]::IsNullOrWhiteSpace($d)) { continue }
+            $key = $d.ToLowerInvariant()
+            if ($seen.ContainsKey($key)) { continue }
+            $seen[$key] = $true
+            [void]$result.Add($d)
+        }
+    }
+    
+    # If nothing resolved, still allow an empty list (caller may query default RootDSE)
+    return @($result)
+}
+
+function Get-DomainDhcpServersFromLdap {
+    <#
+    .SYNOPSIS
+        Discovers authorized DHCP servers via ADSI NetServices for a domain DNS name
+    #>
+    param(
+        [string]$DomainDns = ''
+    )
+    
+    $servers = [System.Collections.Generic.List[object]]::new()
+    $domainLabel = if ([string]::IsNullOrWhiteSpace($DomainDns)) { '(default)' } else { $DomainDns }
+    
+    try {
+        $rootPath = if ([string]::IsNullOrWhiteSpace($DomainDns)) {
+            'LDAP://RootDSE'
+        } else {
+            "LDAP://$DomainDns/RootDSE"
+        }
+        
+        $rootDse = [ADSI]$rootPath
+        $configNc = $null
+        try {
+            if ((Get-SafeCount $rootDse.Properties['configurationNamingContext']) -gt 0) {
+                $configNc = [string]$rootDse.Properties['configurationNamingContext'][0]
+            }
+        } catch {}
+        if ([string]::IsNullOrWhiteSpace($configNc)) {
+            try { $configNc = [string]$rootDse.configurationNamingContext } catch {}
+        }
+        if ([string]::IsNullOrWhiteSpace($configNc)) {
+            throw "Could not read configurationNamingContext for $domainLabel"
+        }
+        
+        $searchPath = if ([string]::IsNullOrWhiteSpace($DomainDns)) {
+            "LDAP://CN=NetServices,CN=Services,$configNc"
+        } else {
+            "LDAP://$DomainDns/CN=NetServices,CN=Services,$configNc"
+        }
+        
+        $searchRoot = [ADSI]$searchPath
+        $searcher = New-Object System.DirectoryServices.DirectorySearcher($searchRoot)
+        $searcher.Filter = '(objectClass=dHCPClass)'
+        [void]$searcher.PropertiesToLoad.Add('name')
+        [void]$searcher.PropertiesToLoad.Add('dhcpServers')
+        $searcher.PageSize = 200
+        
+        foreach ($res in $searcher.FindAll()) {
+            $name = ''
+            if ((Get-SafeCount $res.Properties['name']) -gt 0) {
+                $name = [string]$res.Properties['name'][0]
+            }
+            
+            $dhcpServersProp = @()
+            if ((Get-SafeCount $res.Properties['dhcpServers']) -gt 0) {
+                $dhcpServersProp = @($res.Properties['dhcpServers'] | ForEach-Object { "$_" })
+            }
+            
+            foreach ($raw in $dhcpServersProp) {
+                $dns = $null
+                $ip = ''
+                if ($raw -match 'i([0-9.]+)\$([^$]+)\$') {
+                    $ip = $Matches[1]
+                    $dns = $Matches[2]
+                } elseif ($name -and $name -notmatch '^dhcpRoot') {
+                    $dns = $name
+                }
+                
+                if ([string]::IsNullOrWhiteSpace($dns)) { continue }
+                
+                $servers.Add([PSCustomObject]@{
+                    DnsName    = $dns
+                    IPAddress  = $ip
+                    Authorized = $true
+                    AuthDetail = "Authorized in AD NetServices ($domainLabel)"
+                    Source     = "AD NetServices ($domainLabel)"
+                    Domain     = $(if ($DomainDns) { $DomainDns } else { $domainLabel })
+                })
+            }
+            
+            if ((Get-SafeCount $dhcpServersProp) -eq 0 -and $name -and $name -notmatch '^dhcpRoot') {
+                $servers.Add([PSCustomObject]@{
+                    DnsName    = $name
+                    IPAddress  = ''
+                    Authorized = $true
+                    AuthDetail = "Authorized in AD NetServices object ($domainLabel)"
+                    Source     = "AD NetServices ($domainLabel)"
+                    Domain     = $(if ($DomainDns) { $DomainDns } else { $domainLabel })
+                })
+            }
+        }
+        
+        Write-ActionLog "LDAP scan $domainLabel : found $(Get-SafeCount $servers) DHCP authorization record(s)" "INFO"
+    } catch {
+        Write-ActionLog "LDAP DHCP discovery failed for ${domainLabel}: $_" "WARN"
+    }
+    
+    return @($servers)
 }
 
 function Get-DomainDhcpServers {
     <#
     .SYNOPSIS
-        Discovers authorized DHCP servers in Active Directory
+        Discovers authorized DHCP servers across one or more DNS domains
     #>
+    param(
+        [string[]]$Domains
+    )
     
     $servers = [System.Collections.Generic.List[object]]::new()
     $seen = @{}
     
-    # Method 1: Get-DhcpServerInDC (preferred)
+    $domainList = @(Get-NormalizedScanDomainList -Domains $Domains)
+    if ((Get-SafeCount $domainList) -eq 0) {
+        # Fall back to default RootDSE only
+        $domainList = @('')
+    }
+    
+    Write-ActionLog "Scanning $(Get-SafeCount $domainList) domain(s) for authorized DHCP servers..." "INFO"
+    
+    # Forest/current context via DhcpServer module (covers current forest authorization list)
     try {
         if (-not (Get-Module -Name DhcpServer -ListAvailable)) {
             throw "DhcpServer module not available"
         }
         Import-Module DhcpServer -ErrorAction Stop
         $list = @(Get-DhcpServerInDC -ErrorAction Stop)
+        $current = Get-CurrentDnsDomainName
+        if ([string]::IsNullOrWhiteSpace($current)) { $current = '(current forest)' }
+        
         foreach ($item in $list) {
             $dns = "$($item.DnsName)".Trim()
             if ([string]::IsNullOrWhiteSpace($dns)) { continue }
@@ -1848,81 +2060,29 @@ function Get-DomainDhcpServers {
                 Authorized  = $true
                 AuthDetail  = 'Authorized in AD (Get-DhcpServerInDC)'
                 Source      = 'AD Authorized (Get-DhcpServerInDC)'
+                Domain      = $current
             })
         }
     } catch {
         Write-ActionLog "Get-DhcpServerInDC unavailable or failed: $_" "WARN"
     }
     
-    # Method 2: ADSI fallback / supplement against Configuration\NetServices
-    try {
-        $rootDse = [ADSI]'LDAP://RootDSE'
-        $config = $rootDse.configurationNamingContext
-        $searchRoot = [ADSI]"LDAP://CN=NetServices,CN=Services,$config"
-        $searcher = New-Object System.DirectoryServices.DirectorySearcher($searchRoot)
-        $searcher.Filter = '(objectClass=dHCPClass)'
-        $searcher.PropertiesToLoad.Add('name') | Out-Null
-        $searcher.PropertiesToLoad.Add('dhcpServers') | Out-Null
-        $searcher.PageSize = 200
-        
-        foreach ($res in $searcher.FindAll()) {
-            $name = ''
-            if ($res.Properties['name'].Count -gt 0) {
-                $name = [string]$res.Properties['name'][0]
+    # Per-domain ADSI NetServices (supports additional / trusted domains)
+    foreach ($dom in $domainList) {
+        $ldapServers = @(Get-DomainDhcpServersFromLdap -DomainDns $dom)
+        foreach ($srv in $ldapServers) {
+            $key = "$($srv.DnsName)".Trim().ToLowerInvariant()
+            if ([string]::IsNullOrWhiteSpace($key)) { continue }
+            if ($seen.ContainsKey($key)) {
+                # Enrich domain label if we only had forest entry
+                continue
             }
-            
-            $dhcpServersProp = @()
-            if ($res.Properties['dhcpServers'].Count -gt 0) {
-                $dhcpServersProp = @($res.Properties['dhcpServers'] | ForEach-Object { "$_" })
-            }
-            
-            # dhcpServers values often look like: i<ip>$<host>$...
-            foreach ($raw in $dhcpServersProp) {
-                $dns = $null
-                $ip = ''
-                if ($raw -match 'i([0-9.]+)\$([^$]+)\$') {
-                    $ip = $Matches[1]
-                    $dns = $Matches[2]
-                } elseif ($name -and $name -notmatch '^dhcpRoot') {
-                    $dns = $name
-                }
-                
-                if ([string]::IsNullOrWhiteSpace($dns)) { continue }
-                $key = $dns.ToLowerInvariant()
-                if ($seen.ContainsKey($key)) {
-                    # Enrich existing entry with IP / confirm authorized
-                    continue
-                }
-                $seen[$key] = $true
-                
-                $servers.Add([PSCustomObject]@{
-                    DnsName    = $dns
-                    IPAddress  = $ip
-                    Authorized = $true
-                    AuthDetail = 'Authorized in AD (NetServices/ADSI)'
-                    Source     = 'AD NetServices (ADSI)'
-                })
-            }
-            
-            if ($dhcpServersProp.Count -eq 0 -and $name -and $name -notmatch '^dhcpRoot') {
-                $key = $name.ToLowerInvariant()
-                if (-not $seen.ContainsKey($key)) {
-                    $seen[$key] = $true
-                    $servers.Add([PSCustomObject]@{
-                        DnsName    = $name
-                        IPAddress  = ''
-                        Authorized = $true
-                        AuthDetail = 'Authorized in AD (NetServices object name)'
-                        Source     = 'AD NetServices (ADSI)'
-                    })
-                }
-            }
+            $seen[$key] = $true
+            $servers.Add($srv)
         }
-    } catch {
-        Write-ActionLog "ADSI DHCP discovery failed: $_" "WARN"
     }
     
-    return @($servers | Sort-Object DnsName)
+    return @($servers | Sort-Object Domain, DnsName)
 }
 
 function Test-DhcpServerAdAuthorization {
@@ -1964,22 +2124,64 @@ function Test-DhcpServerAdAuthorization {
     }
 }
 
+function Test-HostPingStatus {
+    <#
+    .SYNOPSIS
+        Pings a host with a short timeout and returns Up/Down + latency
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComputerName,
+        [int]$TimeoutMs = 1500
+    )
+    
+    $result = [PSCustomObject]@{
+        Status    = 'Down'
+        LatencyMs = $null
+        Detail    = ''
+    }
+    
+    try {
+        $ping = New-Object System.Net.NetworkInformation.Ping
+        $reply = $ping.Send($ComputerName, $TimeoutMs)
+        if ($null -ne $reply -and $reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
+            $result.Status = 'Up'
+            $result.LatencyMs = [int]$reply.RoundtripTime
+            $result.Detail = "$($reply.RoundtripTime) ms"
+        } else {
+            $statusText = if ($reply) { "$($reply.Status)" } else { 'No reply' }
+            $result.Status = 'Down'
+            $result.Detail = $statusText
+        }
+    } catch {
+        $result.Status = 'Down'
+        $result.Detail = "$_"
+    }
+    
+    return $result
+}
+
 function Invoke-DomainDhcpServerScan {
     <#
     .SYNOPSIS
-        Discovers domain DHCP servers, verifies AD authorization, and pings each one
+        Discovers domain DHCP servers across domains, verifies AD authorization, and pings each one
     #>
-    param([int]$TimeoutMs = 1500)
+    param(
+        [int]$TimeoutMs = 1500,
+        [string[]]$Domains
+    )
     
-    Write-ActionLog "Scanning domain for DHCP servers and checking AD authorization..." "INFO"
-    Set-Status "Scanning domain DHCP servers..."
+    $domainList = @(Get-NormalizedScanDomainList -Domains $Domains)
+    $domainText = if ((Get-SafeCount $domainList) -gt 0) { $domainList -join ', ' } else { '(default directory)' }
+    Write-ActionLog "Scanning domains for DHCP servers: $domainText" "INFO"
+    Set-Status "Scanning DHCP servers in: $domainText"
     
-    $discovered = @(Get-DomainDhcpServers)
-    if ($discovered.Count -eq 0) {
-        throw "No DHCP servers found in Active Directory. Ensure this machine is domain-joined and you can query AD (or DhcpServer module / Get-DhcpServerInDC is available)."
+    $discovered = @(Get-DomainDhcpServers -Domains $domainList)
+    if ((Get-SafeCount $discovered) -eq 0) {
+        throw "No DHCP servers found in Active Directory for: $domainText. Check domain DNS names, trust, and LDAP access (or DhcpServer / Get-DhcpServerInDC)."
     }
     
-    Write-ActionLog "Found $($discovered.Count) AD DHCP server record(s). Verifying authorization and pinging..." "INFO"
+    Write-ActionLog "Found $(Get-SafeCount $discovered) AD DHCP server record(s). Verifying authorization and pinging..." "INFO"
     
     $results = [System.Collections.Generic.List[object]]::new()
     
@@ -1989,7 +2191,6 @@ function Invoke-DomainDhcpServerScan {
         
         $ping = Test-HostPingStatus -ComputerName $target -TimeoutMs $TimeoutMs
         
-        # Resolve IP if missing
         $ip = "$($srv.IPAddress)"
         if ([string]::IsNullOrWhiteSpace($ip)) {
             try {
@@ -1999,12 +2200,10 @@ function Invoke-DomainDhcpServerScan {
             } catch {}
         }
         
-        # Explicit authorization verification against the discovered AD set
         $authCheck = Test-DhcpServerAdAuthorization -DnsName $srv.DnsName -IPAddress $ip -AuthorizedServers $discovered
         $isAuthorized = [bool]$authCheck.Authorized
         $authDetail = "$($authCheck.AuthDetail)"
         if ($srv.Authorized -and -not $isAuthorized) {
-            # Source record came from AD list — treat as authorized
             $isAuthorized = $true
             $authDetail = if ($srv.AuthDetail) { $srv.AuthDetail } else { 'Listed in AD DHCP authorization data' }
         } elseif ($srv.Authorized) {
@@ -2012,11 +2211,14 @@ function Invoke-DomainDhcpServerScan {
             if ($srv.AuthDetail) { $authDetail = $srv.AuthDetail }
         }
         
+        $domainName = if ($srv.PSObject.Properties.Name -contains 'Domain' -and $srv.Domain) { "$($srv.Domain)" } else { '' }
+        
         $results.Add([PSCustomObject]@{
+            Domain      = $domainName
             DnsName     = $srv.DnsName
             IPAddress   = $ip
             Online      = $ping.Status
-            Status      = $ping.Status   # keep for backward compatibility
+            Status      = $ping.Status
             Authorized  = $(if ($isAuthorized) { 'Yes' } else { 'No' })
             AuthDetail  = $authDetail
             LatencyMs   = $ping.LatencyMs
@@ -2025,14 +2227,31 @@ function Invoke-DomainDhcpServerScan {
         })
     }
     
-    $up = @($results | Where-Object { $_.Online -eq 'Up' }).Count
-    $down = $results.Count - $up
-    $authYes = @($results | Where-Object { $_.Authorized -eq 'Yes' }).Count
-    $authNo = $results.Count - $authYes
-    Write-ActionLog "Domain scan complete: $($results.Count) servers — Online $up Up/$down Down — Authorized $authYes Yes/$authNo No" "SUCCESS"
+    $up = Get-SafeCount @($results | Where-Object { $_.Online -eq 'Up' })
+    $total = Get-SafeCount $results
+    $down = $total - $up
+    $authYes = Get-SafeCount @($results | Where-Object { $_.Authorized -eq 'Yes' })
+    $authNo = $total - $authYes
+    Write-ActionLog "Domain scan complete: $total servers — Online $up Up/$down Down — Authorized $authYes Yes/$authNo No" "SUCCESS"
     Set-Status "Domain scan: $up Up / $down Down | Auth $authYes Yes / $authNo No"
     
     return $results
+}
+
+function Get-ScanDomainsFromDialog {
+    param($ListBox)
+    
+    $domains = [System.Collections.Generic.List[string]]::new()
+    if ($null -eq $ListBox) {
+        return @(Get-NormalizedScanDomainList -Domains @())
+    }
+    
+    foreach ($item in @($ListBox.Items)) {
+        $d = "$item".Trim()
+        if (-not [string]::IsNullOrWhiteSpace($d)) { [void]$domains.Add($d) }
+    }
+    
+    return @(Get-NormalizedScanDomainList -Domains @($domains))
 }
 
 function Update-DomainScanDialogUi {
@@ -2042,16 +2261,20 @@ function Update-DomainScanDialogUi {
     #>
     param(
         $Grid,
-        $StatusText
+        $StatusText,
+        [string[]]$Domains
     )
     
     try {
+        $domainList = @(Get-NormalizedScanDomainList -Domains $Domains)
+        $domainText = if ((Get-SafeCount $domainList) -gt 0) { $domainList -join ', ' } else { '(default)' }
+        
         if ($null -ne $StatusText) {
-            $StatusText.Text = "Scanning Active Directory and pinging servers..."
+            $StatusText.Text = "Scanning $domainText — AD authorization + ping..."
         }
         try { [System.Windows.Forms.Application]::DoEvents() } catch {}
         
-        $results = @(Invoke-DomainDhcpServerScan)
+        $results = @(Invoke-DomainDhcpServerScan -Domains $domainList)
         $Global:DomainScanResults.Clear()
         foreach ($r in $results) { $Global:DomainScanResults.Add($r) }
         
@@ -2060,11 +2283,12 @@ function Update-DomainScanDialogUi {
             $Grid.ItemsSource = @($Global:DomainScanResults)
         }
         
-        $up = @($Global:DomainScanResults | Where-Object { $_.Online -eq 'Up' -or $_.Status -eq 'Up' }).Count
-        $down = $Global:DomainScanResults.Count - $up
-        $authYes = @($Global:DomainScanResults | Where-Object { $_.Authorized -eq 'Yes' }).Count
-        $authNo = $Global:DomainScanResults.Count - $authYes
-        $summary = "Found $($Global:DomainScanResults.Count) server(s): Online $up Up / $down Down | Authorized $authYes Yes / $authNo No"
+        $up = Get-SafeCount @($Global:DomainScanResults | Where-Object { $_.Online -eq 'Up' -or $_.Status -eq 'Up' })
+        $total = Get-SafeCount $Global:DomainScanResults
+        $down = $total - $up
+        $authYes = Get-SafeCount @($Global:DomainScanResults | Where-Object { $_.Authorized -eq 'Yes' })
+        $authNo = $total - $authYes
+        $summary = "Domains: $domainText — Found $total server(s): Online $up Up / $down Down | Authorized $authYes Yes / $authNo No"
         
         if ($null -ne $StatusText) {
             $StatusText.Text = $summary
@@ -2081,10 +2305,72 @@ function Update-DomainScanDialogUi {
     }
 }
 
+function Add-ScanDialogDomainEntry {
+    <#
+    .SYNOPSIS
+        Adds typed domain name(s) to the Scan dialog list and optionally persists
+    #>
+    if ($null -eq $script:ScanDialogDomains -or $null -eq $script:ScanDialogNewDomain) { return }
+    
+    $raw = "$($script:ScanDialogNewDomain.Text)"
+    $parts = @("$raw" -split '[;,\r\n]+' | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+    if ((Get-SafeCount $parts) -eq 0) {
+        Show-MessageBox "Enter a DNS domain name to add (example: child.contoso.com)." "Add Domain" OK Warning
+        return
+    }
+    
+    foreach ($d in $parts) {
+        $key = $d.ToLowerInvariant()
+        $exists = $false
+        foreach ($item in @($script:ScanDialogDomains.Items)) {
+            if ("$item".ToLowerInvariant() -eq $key) { $exists = $true; break }
+        }
+        if (-not $exists) {
+            [void]$script:ScanDialogDomains.Items.Add($d)
+            Write-ActionLog "Scan domain list: added $d" "INFO"
+        }
+    }
+    
+    $script:ScanDialogNewDomain.Text = ''
+    
+    $remember = $false
+    try { $remember = [bool]$script:ScanDialogRemember.IsChecked } catch {}
+    if ($remember) {
+        Export-ScanDomainsConfig -Domains @($script:ScanDialogDomains.Items)
+    }
+    Update-LogDisplay
+}
+
+function Remove-ScanDialogDomainEntry {
+    if ($null -eq $script:ScanDialogDomains) { return }
+    
+    if ($null -eq $script:ScanDialogDomains.SelectedItem) {
+        Show-MessageBox "Select a domain in the list to remove." "Remove Domain" OK Warning
+        return
+    }
+    
+    $selected = "$($script:ScanDialogDomains.SelectedItem)"
+    $current = Get-CurrentDnsDomainName
+    if ($current -and $selected.ToLowerInvariant() -eq $current.ToLowerInvariant()) {
+        $confirm = Show-MessageBox "Remove the current domain '$selected' from this scan list?`n(You can add it back later.)" "Remove Domain" YesNo Warning
+        if ($confirm -ne 'Yes') { return }
+    }
+    
+    $script:ScanDialogDomains.Items.Remove($script:ScanDialogDomains.SelectedItem)
+    Write-ActionLog "Scan domain list: removed $selected" "INFO"
+    
+    $remember = $false
+    try { $remember = [bool]$script:ScanDialogRemember.IsChecked } catch {}
+    if ($remember) {
+        Export-ScanDomainsConfig -Domains @($script:ScanDialogDomains.Items)
+    }
+    Update-LogDisplay
+}
+
 function Show-DomainDhcpScanDialog {
     <#
     .SYNOPSIS
-        Shows dialog with discovered DHCP servers and ping status
+        Shows dialog with discovered DHCP servers and ping status (multi-domain)
     #>
     
     Write-ActionLog "Opening Domain DHCP Scan dialog..." "INFO"
@@ -2093,12 +2379,13 @@ function Show-DomainDhcpScanDialog {
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Domain DHCP Server Scan - Anthony Blake"
-        Height="520" Width="920"
+        Height="620" Width="980"
         WindowStartupLocation="CenterOwner"
         Background="#1A1D23"
         FontFamily="Segoe UI" FontSize="13">
   <Grid Margin="16">
     <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
       <RowDefinition Height="Auto"/>
       <RowDefinition Height="Auto"/>
       <RowDefinition Height="*"/>
@@ -2109,7 +2396,51 @@ function Show-DomainDhcpScanDialog {
     <TextBlock Grid.Row="0" Text="Domain DHCP Servers — Online Status + AD Authorization"
                Foreground="#E8EAF0" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,8"/>
 
-    <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,10">
+    <!-- Multi-domain picker -->
+    <Border Grid.Row="1" Background="#2A2F3A" CornerRadius="6" Padding="12,10" Margin="0,0,0,10"
+            BorderBrush="#383E4A" BorderThickness="1">
+      <Grid>
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="220"/>
+          <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0" Grid.ColumnSpan="2" Text="Domains to scan"
+                   Foreground="#E8EAF0" FontWeight="SemiBold" Margin="0,0,0,6"/>
+
+        <ListBox x:Name="LstScanDomains" Grid.Row="1" Grid.Column="0" Height="88"
+                 Background="#1A1D23" Foreground="#E8EAF0" BorderBrush="#383E4A"
+                 Margin="0,0,12,0"/>
+
+        <StackPanel Grid.Row="1" Grid.Column="1" VerticalAlignment="Top">
+          <TextBlock Text="Add another DNS domain (child, trusted, or forest peer):"
+                     Foreground="#9AA3B2" FontSize="11" Margin="0,0,0,6" TextWrapping="Wrap"/>
+          <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+            <TextBox x:Name="TxtNewScanDomain" Width="280" Height="28"
+                     Background="#1A1D23" Foreground="#E8EAF0" BorderBrush="#383E4A"
+                     CaretBrush="#E8EAF0" VerticalContentAlignment="Center" Padding="6,2"
+                     ToolTip="Example: child.contoso.com or partner.fabrikam.com"/>
+            <Button x:Name="BtnAddScanDomain" Content="Add Domain" Width="100" Height="28" Margin="8,0,0,0"
+                    Background="#2196F3" Foreground="White" BorderThickness="0"/>
+            <Button x:Name="BtnRemoveScanDomain" Content="Remove" Width="80" Height="28" Margin="8,0,0,0"
+                    Background="#2A2F3A" Foreground="#E8EAF0" BorderBrush="#383E4A" BorderThickness="1"/>
+          </StackPanel>
+          <CheckBox x:Name="ChkRememberScanDomains" Content="Remember extra domains for next launch"
+                    IsChecked="True" Foreground="#E8EAF0" FontSize="11"/>
+        </StackPanel>
+
+        <TextBlock Grid.Row="2" Grid.ColumnSpan="2" Margin="0,8,0,0"
+                   Foreground="#9AA3B2" FontSize="11" TextWrapping="Wrap"
+                   Text="Current domain is included automatically. Extra domains are queried via LDAP NetServices on that domain (requires name resolution and directory access)."/>
+      </Grid>
+    </Border>
+
+    <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,10">
       <Button x:Name="BtnScanNow" Content="🔍 Scan Now" Width="110" Height="30" Margin="0,0,8,0"
               Background="#2196F3" Foreground="White" BorderThickness="0"/>
       <Button x:Name="BtnUseAsA" Content="Use as Server A" Width="130" Height="30" Margin="0,0,8,0"
@@ -2118,11 +2449,11 @@ function Show-DomainDhcpScanDialog {
               Background="#2A2F3A" Foreground="#E8EAF0" BorderBrush="#383E4A" BorderThickness="1"/>
       <Button x:Name="BtnExportScan" Content="💾 Export" Width="90" Height="30" Margin="0,0,8,0"
               Background="#2A2F3A" Foreground="#E8EAF0" BorderBrush="#383E4A" BorderThickness="1"/>
-      <TextBlock x:Name="TxtScanStatus" Text="Click Scan Now to discover, authorize-check, and ping DHCP servers"
+      <TextBlock x:Name="TxtScanStatus" Text="Add domains if needed, then click Scan Now"
                  Foreground="#9AA3B2" VerticalAlignment="Center" Margin="8,0,0,0"/>
     </StackPanel>
 
-    <DataGrid Grid.Row="2" x:Name="GridScanResults"
+    <DataGrid Grid.Row="3" x:Name="GridScanResults"
               AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False"
               SelectionMode="Single" HeadersVisibility="Column"
               Background="#22262E" Foreground="#E8EAF0" BorderThickness="0"
@@ -2130,12 +2461,13 @@ function Show-DomainDhcpScanDialog {
               GridLinesVisibility="Horizontal" HorizontalGridLinesBrush="#383E4A"
               RowHeight="28" ColumnHeaderHeight="32">
       <DataGrid.Columns>
-        <DataGridTextColumn Header="DNS Name" Binding="{Binding DnsName}" Width="200"/>
-        <DataGridTextColumn Header="IP Address" Binding="{Binding IPAddress}" Width="120"/>
+        <DataGridTextColumn Header="Domain" Binding="{Binding Domain}" Width="140"/>
+        <DataGridTextColumn Header="DNS Name" Binding="{Binding DnsName}" Width="180"/>
+        <DataGridTextColumn Header="IP Address" Binding="{Binding IPAddress}" Width="110"/>
         <DataGridTextColumn Header="Online" Binding="{Binding Online}" Width="70"/>
         <DataGridTextColumn Header="Authorized" Binding="{Binding Authorized}" Width="90"/>
-        <DataGridTextColumn Header="Latency" Binding="{Binding Detail}" Width="90"/>
-        <DataGridTextColumn Header="Authorization Detail" Binding="{Binding AuthDetail}" Width="220"/>
+        <DataGridTextColumn Header="Latency" Binding="{Binding Detail}" Width="80"/>
+        <DataGridTextColumn Header="Authorization Detail" Binding="{Binding AuthDetail}" Width="200"/>
         <DataGridTextColumn Header="Source" Binding="{Binding Source}" Width="*"/>
       </DataGrid.Columns>
       <DataGrid.ColumnHeaderStyle>
@@ -2149,11 +2481,11 @@ function Show-DomainDhcpScanDialog {
       </DataGrid.ColumnHeaderStyle>
     </DataGrid>
 
-    <TextBlock Grid.Row="3" Margin="0,10,0,8" Foreground="#9AA3B2" FontSize="11"
-               Text="Online = ICMP ping. Authorized = listed in Active Directory DHCP authorization (Get-DhcpServerInDC / NetServices)."
+    <TextBlock Grid.Row="4" Margin="0,10,0,8" Foreground="#9AA3B2" FontSize="11"
+               Text="Online = ICMP ping. Authorized = listed in Active Directory DHCP authorization (Get-DhcpServerInDC / NetServices per domain)."
                TextWrapping="Wrap"/>
 
-    <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right">
+    <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right">
       <Button x:Name="BtnCloseScan" Content="Close" Width="90" Height="30"
               Background="#2A2F3A" Foreground="#E8EAF0" BorderBrush="#383E4A" BorderThickness="1"/>
     </StackPanel>
@@ -2168,14 +2500,60 @@ function Show-DomainDhcpScanDialog {
         $script:ScanDialog = $dialog
         $script:ScanDialogGrid = $dialog.FindName('GridScanResults')
         $script:ScanDialogStatus = $dialog.FindName('TxtScanStatus')
+        $script:ScanDialogDomains = $dialog.FindName('LstScanDomains')
+        $script:ScanDialogNewDomain = $dialog.FindName('TxtNewScanDomain')
+        $script:ScanDialogRemember = $dialog.FindName('ChkRememberScanDomains')
         $btnScan = $dialog.FindName('BtnScanNow')
+        $btnAddDomain = $dialog.FindName('BtnAddScanDomain')
+        $btnRemoveDomain = $dialog.FindName('BtnRemoveScanDomain')
         $btnUseA = $dialog.FindName('BtnUseAsA')
         $btnUseB = $dialog.FindName('BtnUseAsB')
         $btnExport = $dialog.FindName('BtnExportScan')
         $btnClose = $dialog.FindName('BtnCloseScan')
         
+        # Seed domain list: current + persisted extras
+        $seed = [System.Collections.Generic.List[string]]::new()
+        $current = Get-CurrentDnsDomainName
+        if (-not [string]::IsNullOrWhiteSpace($current)) { [void]$seed.Add($current) }
+        
+        $extras = @()
+        if ($null -ne $Global:ExtraScanDomains -and (Get-SafeCount $Global:ExtraScanDomains) -gt 0) {
+            $extras = @($Global:ExtraScanDomains)
+        } else {
+            $extras = @(Import-ScanDomainsConfig)
+            $Global:ExtraScanDomains = [System.Collections.Generic.List[string]]::new()
+            foreach ($e in $extras) { [void]$Global:ExtraScanDomains.Add($e) }
+        }
+        
+        foreach ($d in @(Get-NormalizedScanDomainList -Domains (@($seed) + @($extras)))) {
+            [void]$script:ScanDialogDomains.Items.Add($d)
+        }
+        
+        $addDomainAction = {
+            Add-ScanDialogDomainEntry
+        }
+        
+        $btnAddDomain.add_Click($addDomainAction)
+        $script:ScanDialogNewDomain.add_KeyDown({
+            param($sender, $e)
+            if ($e.Key -eq 'Return') {
+                Add-ScanDialogDomainEntry
+                $e.Handled = $true
+            }
+        })
+        
+        $btnRemoveDomain.add_Click({
+            Remove-ScanDialogDomainEntry
+        })
+        
         $btnScan.add_Click({
-            Update-DomainScanDialogUi -Grid $script:ScanDialogGrid -StatusText $script:ScanDialogStatus
+            $domains = @(Get-ScanDomainsFromDialog -ListBox $script:ScanDialogDomains)
+            $remember = $false
+            try { $remember = [bool]$script:ScanDialogRemember.IsChecked } catch {}
+            if ($remember) {
+                Export-ScanDomainsConfig -Domains $domains
+            }
+            Update-DomainScanDialogUi -Grid $script:ScanDialogGrid -StatusText $script:ScanDialogStatus -Domains $domains
         })
         
         $btnUseA.add_Click({
@@ -2212,7 +2590,7 @@ function Show-DomainDhcpScanDialog {
         })
         
         $btnExport.add_Click({
-            if ($Global:DomainScanResults.Count -eq 0) {
+            if ((Get-SafeCount $Global:DomainScanResults) -eq 0) {
                 Show-MessageBox "No scan results to export. Run Scan Now first." "Export" OK Warning
                 return
             }
@@ -2223,7 +2601,7 @@ function Show-DomainDhcpScanDialog {
                 $saveDialog.Title = "Export Domain DHCP Scan"
                 if ($saveDialog.ShowDialog() -eq 'OK') {
                     $Global:DomainScanResults |
-                        Select-Object DnsName, IPAddress, Online, Authorized, AuthDetail, LatencyMs, Detail, Source |
+                        Select-Object Domain, DnsName, IPAddress, Online, Authorized, AuthDetail, LatencyMs, Detail, Source |
                         Export-Csv -Path $saveDialog.FileName -NoTypeInformation -Encoding UTF8
                     Write-ActionLog "Domain scan exported: $($saveDialog.FileName)" "SUCCESS"
                     Show-MessageBox "Exported to:`n$($saveDialog.FileName)" "Export Complete" OK Information
@@ -2249,7 +2627,8 @@ function Show-DomainDhcpScanDialog {
         
         # Auto-run scan after dialog is shown (no RaiseEvent / GetNewClosure)
         $dialog.Add_ContentRendered({
-            Update-DomainScanDialogUi -Grid $script:ScanDialogGrid -StatusText $script:ScanDialogStatus
+            $domains = @(Get-ScanDomainsFromDialog -ListBox $script:ScanDialogDomains)
+            Update-DomainScanDialogUi -Grid $script:ScanDialogGrid -StatusText $script:ScanDialogStatus -Domains $domains
         })
         
         [void]$dialog.ShowDialog()
@@ -2258,6 +2637,9 @@ function Show-DomainDhcpScanDialog {
         Show-MessageBox "Failed to open scan dialog: $_" "Scan Error" OK Error
     } finally {
         $script:ScanDialog = $null
+        $script:ScanDialogDomains = $null
+        $script:ScanDialogNewDomain = $null
+        $script:ScanDialogRemember = $null
     }
 }
 #endregion
@@ -5623,7 +6005,9 @@ DHCP Events Loaded: $($Global:DhcpEventEntries.Count)
 Live Watch Active: $($Global:EventWatchActive)
 Log Entries: $($Global:ActionLog.Count)
 
-Use Scan Domain to discover authorized DHCP servers and ping Up/Down status.
+Use Scan Domain to discover authorized DHCP servers across multiple DNS domains
+(add child/trusted domains in the scan dialog; extras can be remembered).
+Ping Up/Down + AD authorization. Use results as Server A/B.
 "@
     
     Show-MessageBox $settingsMsg "Settings" OK Information
