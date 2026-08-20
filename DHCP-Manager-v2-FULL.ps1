@@ -100,7 +100,7 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.4.2'
+$Global:AppVersion       = '2.4.3'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:LogWatchState    = @{
     Local = @{ Enabled = $false; Path = $null; Offset = 0L }
@@ -628,7 +628,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                    HorizontalAlignment="Center"/>
         
         <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-          <Run Text="v2.4.2  |  "/>
+          <Run Text="v2.4.3  |  "/>
           <Run Text="Anthony Blake  |  " Foreground="#90CAF9"/>
           <Run x:Name="StatusTime" Text=""/>
         </TextBlock>
@@ -2768,12 +2768,13 @@ function Get-DhcpCompareScopes {
         else {
             $valA = "$($a.Name)|$($a.StartRange)|$($a.EndRange)|$($a.SubnetMask)|$($a.State)"
             $valB = "$($b.Name)|$($b.StartRange)|$($b.EndRange)|$($b.SubnetMask)|$($b.State)"
-            $diffs = @()
-            if ($a.Name -ne $b.Name) { $diffs += "Name" }
-            if ("$($a.StartRange)" -ne "$($b.StartRange)") { $diffs += "Start" }
-            if ("$($a.EndRange)" -ne "$($b.EndRange)") { $diffs += "End" }
-            if ("$($a.SubnetMask)" -ne "$($b.SubnetMask)") { $diffs += "Mask" }
-            if ("$($a.State)" -ne "$($b.State)") { $diffs += "State" }
+            # Use List — `$arr += "x"` becomes a string under StrictMode when only one item is added
+            $diffs = [System.Collections.Generic.List[string]]::new()
+            if ($a.Name -ne $b.Name) { [void]$diffs.Add('Name') }
+            if ("$($a.StartRange)" -ne "$($b.StartRange)") { [void]$diffs.Add('Start') }
+            if ("$($a.EndRange)" -ne "$($b.EndRange)") { [void]$diffs.Add('End') }
+            if ("$($a.SubnetMask)" -ne "$($b.SubnetMask)") { [void]$diffs.Add('Mask') }
+            if ("$($a.State)" -ne "$($b.State)") { [void]$diffs.Add('State') }
             
             if ($diffs.Count -eq 0) {
                 $results.Add((New-CompareRow -Status 'Matching' -Key $key -Label $a.Name `
@@ -2918,11 +2919,11 @@ function Get-DhcpCompareLeases {
                 -Details "Expiry=$($b.LeaseExpiryTime)"))
         }
         else {
-            $diffs = @()
-            if ("$($a.IPAddress)" -ne "$($b.IPAddress)") { $diffs += 'IP' }
-            if ("$($a.HostName)" -ne "$($b.HostName)") { $diffs += 'Hostname' }
-            if ("$($a.ScopeId)" -ne "$($b.ScopeId)") { $diffs += 'Scope' }
-            if ("$($a.AddressState)" -ne "$($b.AddressState)") { $diffs += 'State' }
+            $diffs = [System.Collections.Generic.List[string]]::new()
+            if ("$($a.IPAddress)" -ne "$($b.IPAddress)") { [void]$diffs.Add('IP') }
+            if ("$($a.HostName)" -ne "$($b.HostName)") { [void]$diffs.Add('Hostname') }
+            if ("$($a.ScopeId)" -ne "$($b.ScopeId)") { [void]$diffs.Add('Scope') }
+            if ("$($a.AddressState)" -ne "$($b.AddressState)") { [void]$diffs.Add('State') }
             
             $valA = "$($a.IPAddress) [$($a.AddressState)] Host=$($a.HostName)"
             $valB = "$($b.IPAddress) [$($b.AddressState)] Host=$($b.HostName)"
@@ -2994,11 +2995,11 @@ function Get-DhcpCompareReservations {
                 -Details "Type=$($b.Type)"))
         }
         else {
-            $diffs = @()
-            if ("$($a.IPAddress)" -ne "$($b.IPAddress)") { $diffs += 'IP' }
-            if ("$($a.Name)" -ne "$($b.Name)") { $diffs += 'Name' }
-            if ("$($a.ScopeId)" -ne "$($b.ScopeId)") { $diffs += 'Scope' }
-            if ("$($a.ClientId)".ToUpper() -ne "$($b.ClientId)".ToUpper()) { $diffs += 'MAC' }
+            $diffs = [System.Collections.Generic.List[string]]::new()
+            if ("$($a.IPAddress)" -ne "$($b.IPAddress)") { [void]$diffs.Add('IP') }
+            if ("$($a.Name)" -ne "$($b.Name)") { [void]$diffs.Add('Name') }
+            if ("$($a.ScopeId)" -ne "$($b.ScopeId)") { [void]$diffs.Add('Scope') }
+            if ("$($a.ClientId)".ToUpper() -ne "$($b.ClientId)".ToUpper()) { [void]$diffs.Add('MAC') }
             
             $valA = "$($a.IPAddress) Name=$($a.Name) Scope=$($a.ScopeId)"
             $valB = "$($b.IPAddress) Name=$($b.Name) Scope=$($b.ScopeId)"
@@ -3038,22 +3039,36 @@ function Show-CompareResults {
     $match = @($all | Where-Object { $_.Status -eq 'Matching' })
     $diff  = @($all | Where-Object { $_.Status -eq 'Different' })
     
-    $filtered = switch ($filter) {
-        'Only on A' { $onlyA }
-        'Only on B' { $onlyB }
-        'Matching'  { $match }
-        'Different' { $diff }
-        default     { $all }
+    # Assign inside switch — outputting an array from switch unwraps a single-item array
+    # to a scalar, which has no .Count under Set-StrictMode.
+    $filtered = $all
+    switch ($filter) {
+        'Only on A' { $filtered = $onlyA }
+        'Only on B' { $filtered = $onlyB }
+        'Matching'  { $filtered = $match }
+        'Different' { $filtered = $diff }
+        default     { $filtered = $all }
     }
+    if ($null -eq $filtered) { $filtered = @() }
+    else { $filtered = @($filtered) }
+    
+    $countOnlyA    = Get-SafeCount $onlyA
+    $countOnlyB    = Get-SafeCount $onlyB
+    $countMatch    = Get-SafeCount $match
+    $countDiff     = Get-SafeCount $diff
+    $countAll      = Get-SafeCount $all
+    $countFiltered = Get-SafeCount $filtered
+    $statusText    = "Showing $countFiltered of $countAll results (filter: $filter)"
+    $exportEnabled = $countAll -gt 0
     
     $script:Window.Dispatcher.Invoke([action]{
-        $script:CmpOnlyA.Text = "$($onlyA.Count)"
-        $script:CmpOnlyB.Text = "$($onlyB.Count)"
-        $script:CmpMatch.Text = "$($match.Count)"
-        $script:CmpDiff.Text  = "$($diff.Count)"
+        $script:CmpOnlyA.Text = "$countOnlyA"
+        $script:CmpOnlyB.Text = "$countOnlyB"
+        $script:CmpMatch.Text = "$countMatch"
+        $script:CmpDiff.Text  = "$countDiff"
         $script:GridCompare.ItemsSource = $filtered
-        $script:BtnCompareExport.IsEnabled = ($all.Count -gt 0)
-        $script:TxtCompareStatus.Text = "Showing $($filtered.Count) of $($all.Count) results (filter: $filter)"
+        $script:BtnCompareExport.IsEnabled = $exportEnabled
+        $script:TxtCompareStatus.Text = $statusText
     }, [System.Windows.Threading.DispatcherPriority]::Normal)
 }
 
