@@ -100,12 +100,13 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.4.8'
+$Global:AppVersion       = '2.4.9'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:LogWatchState    = @{
-    Local = @{ Enabled = $false; Path = $null; Offset = 0L }
-    A     = @{ Enabled = $false; Path = $null; Offset = 0L }
-    B     = @{ Enabled = $false; Path = $null; Offset = 0L }
+    Local  = @{ Enabled = $false; Path = $null; Offset = 0L }
+    A      = @{ Enabled = $false; Path = $null; Offset = 0L }
+    B      = @{ Enabled = $false; Path = $null; Offset = 0L }
+    Custom = @{ Enabled = $false; Path = $null; Offset = 0L }
 }
 $Global:EventWatchActive = $false
 $Global:MigrationResults = [System.Collections.Generic.List[object]]::new()
@@ -192,7 +193,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
 <Window
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    Title="DHCP Manager v2.4 - Anthony Blake"
+    Title="DHCP Manager v2.4"
     Height="780" Width="1260"
     MinHeight="600" MinWidth="900"
     WindowStartupLocation="CenterScreen"
@@ -642,8 +643,9 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                      HorizontalAlignment="Center"/>
           
           <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-            <Run Text="v2.4.8  |  "/>
-            <Run Text="Anthony Blake  |  " Foreground="#90CAF9"/>
+            <Run Text="v2.4.9  |  "/>
+            <Run Text="Created by Anthony Blake" Foreground="#90CAF9"/>
+            <Run Text="  |  "/>
             <Run x:Name="StatusTime" Text=""/>
           </TextBlock>
         </Grid>
@@ -1343,35 +1345,60 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
               <!-- Live Watch Controls -->
               <Border Grid.Row="1" Background="{StaticResource BgCard}"
                       BorderThickness="0,0,0,1" BorderBrush="{StaticResource Border}" Padding="12,10">
-                <StackPanel Orientation="Horizontal">
-                  <TextBlock Text="Live Watch:" Style="{StaticResource FormLabel}"
-                             VerticalAlignment="Center" Margin="0,0,12,0"/>
-                  <CheckBox x:Name="ChkWatchLocal" Content="Local" Margin="0,0,12,0"
-                            VerticalAlignment="Center"/>
-                  <CheckBox x:Name="ChkWatchA" Content="Server A" Margin="0,0,12,0"
-                            VerticalAlignment="Center"/>
-                  <CheckBox x:Name="ChkWatchB" Content="Server B" Margin="0,0,16,0"
-                            VerticalAlignment="Center"/>
-                  <Button x:Name="BtnEventWatchStart" Content="▶️ Start Watch" Margin="0,0,8,0"
-                          Style="{StaticResource BtnSuccess}"/>
-                  <Button x:Name="BtnEventWatchStop" Content="⏹️ Stop" Margin="0,0,8,0"
-                          Style="{StaticResource BtnDanger}" IsEnabled="False"/>
-                  <Separator Width="1" Background="{StaticResource Border}" Margin="8,0"/>
-                  <Button x:Name="BtnEventClear" Content="🗑️ Clear" Margin="8,0,8,0"
-                          Style="{StaticResource BtnSecondary}"/>
-                  <Button x:Name="BtnEventExport" Content="💾 Export" Margin="0,0,8,0"
-                          Style="{StaticResource BtnSecondary}"/>
-                  <TextBlock Text="Filter:" Style="{StaticResource FormLabel}"
-                             VerticalAlignment="Center" Margin="8,0,8,0"/>
-                  <TextBox x:Name="TxtEventFilter" Width="180" Style="{StaticResource DarkTextBox}"
-                           ToolTip="Filter by IP, MAC, hostname, or event text"/>
+                <StackPanel>
+                  <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                    <TextBlock Text="Live Watch:" Style="{StaticResource FormLabel}"
+                               VerticalAlignment="Center" Margin="0,0,12,0"/>
+                    <CheckBox x:Name="ChkWatchLocal" Content="Local" Margin="0,0,12,0"
+                              VerticalAlignment="Center"/>
+                    <CheckBox x:Name="ChkWatchA" Content="Server A" Margin="0,0,12,0"
+                              VerticalAlignment="Center"/>
+                    <CheckBox x:Name="ChkWatchB" Content="Server B" Margin="0,0,12,0"
+                              VerticalAlignment="Center"/>
+                    <CheckBox x:Name="ChkWatchCustom" Content="Custom file" Margin="0,0,16,0"
+                              VerticalAlignment="Center"
+                              ToolTip="Watch a specific DhcpSrvLog file or folder you choose below"/>
+                    <Button x:Name="BtnEventWatchStart" Content="▶️ Start Watch" Margin="0,0,8,0"
+                            Style="{StaticResource BtnSuccess}"/>
+                    <Button x:Name="BtnEventWatchStop" Content="⏹️ Stop" Margin="0,0,8,0"
+                            Style="{StaticResource BtnDanger}" IsEnabled="False"/>
+                    <Separator Width="1" Background="{StaticResource Border}" Margin="8,0"/>
+                    <Button x:Name="BtnEventClear" Content="🗑️ Clear" Margin="8,0,8,0"
+                            Style="{StaticResource BtnSecondary}"/>
+                    <Button x:Name="BtnEventExport" Content="💾 Export" Margin="0,0,8,0"
+                            Style="{StaticResource BtnSecondary}"/>
+                    <TextBlock Text="Filter:" Style="{StaticResource FormLabel}"
+                               VerticalAlignment="Center" Margin="8,0,8,0"/>
+                    <TextBox x:Name="TxtEventFilter" Width="160" Style="{StaticResource DarkTextBox}"
+                             ToolTip="Filter by IP, MAC, hostname, or event text"/>
+                  </StackPanel>
+                  <Grid>
+                    <Grid.ColumnDefinitions>
+                      <ColumnDefinition Width="Auto"/>
+                      <ColumnDefinition Width="*"/>
+                      <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0" Text="Watch file:" Style="{StaticResource FormLabel}"
+                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                    <TextBox Grid.Column="1" x:Name="TxtWatchLogPath" Style="{StaticResource DarkTextBox}"
+                             Margin="0,0,8,0"
+                             ToolTip="Full path to DhcpSrvLog file (or folder). Used when Custom file is checked. Can also Use ingest path."/>
+                    <StackPanel Grid.Column="2" Orientation="Horizontal">
+                      <Button x:Name="BtnWatchBrowse" Content="📁 Browse" Margin="0,0,8,0"
+                              Style="{StaticResource BtnSecondary}"
+                              ToolTip="Choose the DHCP audit log file to live-watch"/>
+                      <Button x:Name="BtnWatchUseIngestPath" Content="Use ingest path"
+                              Style="{StaticResource BtnSecondary}"
+                              ToolTip="Copy the Ingest path above into the watch file box"/>
+                    </StackPanel>
+                  </Grid>
                 </StackPanel>
               </Border>
 
               <!-- Status line + ingest progress -->
               <Border Grid.Row="2" Background="{StaticResource BgPanel}" Padding="12,6">
                 <StackPanel>
-                  <TextBlock x:Name="TxtEventStatus" Text="Ingest a DHCP audit log or start live watch on Local / Server A / Server B"
+                  <TextBlock x:Name="TxtEventStatus" Text="Ingest a DHCP audit log, or live-watch Local / Server A / Server B / a Custom file"
                              Foreground="{StaticResource TextSecond}" FontSize="11" Margin="0,0,0,4"/>
                   <Grid x:Name="EventIngestProgressPanel" Visibility="Collapsed">
                     <Grid.ColumnDefinitions>
@@ -1604,6 +1631,10 @@ try {
     $script:ChkWatchLocal        = $Window.FindName("ChkWatchLocal")
     $script:ChkWatchA            = $Window.FindName("ChkWatchA")
     $script:ChkWatchB            = $Window.FindName("ChkWatchB")
+    $script:ChkWatchCustom       = $Window.FindName("ChkWatchCustom")
+    $script:TxtWatchLogPath      = $Window.FindName("TxtWatchLogPath")
+    $script:BtnWatchBrowse       = $Window.FindName("BtnWatchBrowse")
+    $script:BtnWatchUseIngestPath = $Window.FindName("BtnWatchUseIngestPath")
     $script:BtnEventWatchStart   = $Window.FindName("BtnEventWatchStart")
     $script:BtnEventWatchStop    = $Window.FindName("BtnEventWatchStop")
     $script:BtnEventClear        = $Window.FindName("BtnEventClear")
@@ -4420,14 +4451,15 @@ function Get-EventServerLabel {
 }
 
 function Update-EventWatchStatus {
-    $parts = @()
+    $parts = [System.Collections.Generic.List[string]]::new()
     if ($Global:EventWatchActive) {
-        if ($Global:LogWatchState.Local.Enabled) { $parts += "Local→$([IO.Path]::GetFileName($Global:LogWatchState.Local.Path))" }
-        if ($Global:LogWatchState.A.Enabled)     { $parts += "A→$([IO.Path]::GetFileName($Global:LogWatchState.A.Path))" }
-        if ($Global:LogWatchState.B.Enabled)     { $parts += "B→$([IO.Path]::GetFileName($Global:LogWatchState.B.Path))" }
-        $msg = if ($parts.Count) { "LIVE watching: " + ($parts -join '  |  ') } else { 'Watch running (no sources enabled)' }
+        if ($Global:LogWatchState.Local.Enabled)  { [void]$parts.Add("Local→$([IO.Path]::GetFileName($Global:LogWatchState.Local.Path))") }
+        if ($Global:LogWatchState.A.Enabled)      { [void]$parts.Add("A→$([IO.Path]::GetFileName($Global:LogWatchState.A.Path))") }
+        if ($Global:LogWatchState.B.Enabled)      { [void]$parts.Add("B→$([IO.Path]::GetFileName($Global:LogWatchState.B.Path))") }
+        if ($Global:LogWatchState.Custom.Enabled) { [void]$parts.Add("Custom→$([IO.Path]::GetFileName($Global:LogWatchState.Custom.Path))") }
+        $msg = if ((Get-SafeCount $parts) -gt 0) { "LIVE watching: " + ($parts -join '  |  ') } else { 'Watch running (no sources enabled)' }
     } else {
-        $msg = "Idle — $($Global:DhcpEventEntries.Count) events loaded. Built by $($Global:AppAuthor)."
+        $msg = "Idle — $(Get-SafeCount $Global:DhcpEventEntries) events loaded. Created by $($Global:AppAuthor)."
     }
     
     try {
@@ -4440,12 +4472,14 @@ function Update-EventWatchStatus {
 }
 
 function Start-DhcpEventWatch {
-    $watchLocal = [bool]$script:ChkWatchLocal.IsChecked
-    $watchA     = [bool]$script:ChkWatchA.IsChecked
-    $watchB     = [bool]$script:ChkWatchB.IsChecked
+    $watchLocal  = [bool]$script:ChkWatchLocal.IsChecked
+    $watchA      = [bool]$script:ChkWatchA.IsChecked
+    $watchB      = [bool]$script:ChkWatchB.IsChecked
+    $watchCustom = $false
+    try { $watchCustom = [bool]$script:ChkWatchCustom.IsChecked } catch {}
     
-    if (-not ($watchLocal -or $watchA -or $watchB)) {
-        Show-MessageBox "Select at least one live watch target: Local, Server A, and/or Server B." "Live Watch" OK Warning
+    if (-not ($watchLocal -or $watchA -or $watchB -or $watchCustom)) {
+        Show-MessageBox "Select at least one live watch target: Local, Server A, Server B, and/or Custom file." "Live Watch" OK Warning
         return
     }
     
@@ -4459,15 +4493,31 @@ function Start-DhcpEventWatch {
         return
     }
     
+    $customPath = ''
+    if ($watchCustom) {
+        try { $customPath = "$($script:TxtWatchLogPath.Text)".Trim() } catch {}
+        if ([string]::IsNullOrWhiteSpace($customPath)) {
+            try { $customPath = "$($script:TxtEventLogPath.Text)".Trim() } catch {}
+        }
+        if ([string]::IsNullOrWhiteSpace($customPath)) {
+            Show-MessageBox "Enter or browse to the DHCP audit log file to watch (Watch file path)." "Live Watch" OK Warning
+            return
+        }
+        if (-not (Test-Path -LiteralPath $customPath)) {
+            Show-MessageBox "Watch file path not found:`n$customPath" "Live Watch" OK Warning
+            return
+        }
+    }
+    
     Write-ActionLog "Starting DHCP live event watch..." "INFO"
     
-    foreach ($key in @('Local','A','B')) {
+    foreach ($key in @('Local','A','B','Custom')) {
         $Global:LogWatchState[$key].Enabled = $false
         $Global:LogWatchState[$key].Path = $null
         $Global:LogWatchState[$key].Offset = 0L
     }
     
-    $started = @()
+    $started = [System.Collections.Generic.List[string]]::new()
     
     if ($watchLocal) {
         $path = Get-DhcpAuditLogPath -Source Local
@@ -4476,7 +4526,7 @@ function Start-DhcpEventWatch {
         $Global:LogWatchState.Local.Enabled = $true
         $Global:LogWatchState.Local.Path = $info.Path
         $Global:LogWatchState.Local.Offset = [long]$info.Offset
-        $started += "Local ($($info.Path))"
+        [void]$started.Add("Local ($($info.Path))")
     }
     
     if ($watchA) {
@@ -4487,7 +4537,7 @@ function Start-DhcpEventWatch {
         $Global:LogWatchState.A.Enabled = $true
         $Global:LogWatchState.A.Path = $info.Path
         $Global:LogWatchState.A.Offset = [long]$info.Offset
-        $started += "A ($($info.Path))"
+        [void]$started.Add("A ($($info.Path))")
     }
     
     if ($watchB) {
@@ -4498,7 +4548,16 @@ function Start-DhcpEventWatch {
         $Global:LogWatchState.B.Enabled = $true
         $Global:LogWatchState.B.Path = $info.Path
         $Global:LogWatchState.B.Offset = [long]$info.Offset
-        $started += "B ($($info.Path))"
+        [void]$started.Add("B ($($info.Path))")
+    }
+    
+    if ($watchCustom) {
+        $info = Import-DhcpAuditLogFile -Path $customPath -ServerLabel 'Custom' -TailOnly
+        $Global:LogWatchState.Custom.Enabled = $true
+        $Global:LogWatchState.Custom.Path = $info.Path
+        $Global:LogWatchState.Custom.Offset = [long]$info.Offset
+        try { $script:TxtWatchLogPath.Text = $info.Path } catch {}
+        [void]$started.Add("Custom ($($info.Path))")
     }
     
     if (-not (Get-Variable -Name EventWatchTimer -Scope Script -ErrorAction SilentlyContinue)) {
@@ -4512,13 +4571,14 @@ function Start-DhcpEventWatch {
             if (-not $Global:EventWatchActive) { return }
             
             $newTotal = 0
-            foreach ($key in @('Local','A','B')) {
+            foreach ($key in @('Local','A','B','Custom')) {
                 $st = $Global:LogWatchState[$key]
                 if (-not $st.Enabled -or -not $st.Path) { continue }
                 
                 $label = switch ($key) {
                     'A' { Get-EventServerLabel -SourceKey 'A' }
                     'B' { Get-EventServerLabel -SourceKey 'B' }
+                    'Custom' { 'Custom' }
                     default { 'Local' }
                 }
                 
@@ -4546,6 +4606,12 @@ function Start-DhcpEventWatch {
     $script:ChkWatchLocal.IsEnabled = $false
     $script:ChkWatchA.IsEnabled = $false
     $script:ChkWatchB.IsEnabled = $false
+    try {
+        $script:ChkWatchCustom.IsEnabled = $false
+        $script:TxtWatchLogPath.IsEnabled = $false
+        $script:BtnWatchBrowse.IsEnabled = $false
+        $script:BtnWatchUseIngestPath.IsEnabled = $false
+    } catch {}
     
     Write-ActionLog ("Live watch started: " + ($started -join '; ')) "SUCCESS"
     Update-EventWatchStatus
@@ -4563,7 +4629,7 @@ function Stop-DhcpEventWatch {
         }
     } catch {}
     
-    foreach ($key in @('Local','A','B')) {
+    foreach ($key in @('Local','A','B','Custom')) {
         $Global:LogWatchState[$key].Enabled = $false
     }
     
@@ -4572,6 +4638,12 @@ function Stop-DhcpEventWatch {
     $script:ChkWatchLocal.IsEnabled = $true
     $script:ChkWatchA.IsEnabled = $true
     $script:ChkWatchB.IsEnabled = $true
+    try {
+        $script:ChkWatchCustom.IsEnabled = $true
+        $script:TxtWatchLogPath.IsEnabled = $true
+        $script:BtnWatchBrowse.IsEnabled = $true
+        $script:BtnWatchUseIngestPath.IsEnabled = $true
+    } catch {}
     
     Update-EventWatchStatus
     Write-ActionLog "Live watch stopped" "SUCCESS"
@@ -6393,6 +6465,36 @@ $BtnEventBrowse.add_Click({
     } catch {
         Write-ActionLog "Browse failed: $_" "ERROR"
     }
+})
+
+$BtnWatchBrowse.add_Click({
+    try {
+        $dlg = New-Object System.Windows.Forms.OpenFileDialog
+        $dlg.Filter = "DHCP Logs (DhcpSrvLog*.*)|DhcpSrvLog*.*|Log Files (*.log)|*.log|All Files (*.*)|*.*"
+        $dlg.Title = "Select DHCP Audit Log to Live Watch"
+        if ($dlg.ShowDialog() -eq 'OK') {
+            $script:TxtWatchLogPath.Text = $dlg.FileName
+            try { $script:ChkWatchCustom.IsChecked = $true } catch {}
+            Write-ActionLog "Watch file set to $($dlg.FileName)" "INFO"
+            Update-LogDisplay
+        }
+    } catch {
+        Write-ActionLog "Watch browse failed: $_" "ERROR"
+        Show-MessageBox "Browse failed: $_" "Browse" OK Error
+    }
+})
+
+$BtnWatchUseIngestPath.add_Click({
+    $path = ''
+    try { $path = "$($script:TxtEventLogPath.Text)".Trim() } catch {}
+    if ([string]::IsNullOrWhiteSpace($path)) {
+        Show-MessageBox "Ingest path is empty. Detect/Browse a log first, or type a path in Watch file." "Live Watch" OK Warning
+        return
+    }
+    $script:TxtWatchLogPath.Text = $path
+    try { $script:ChkWatchCustom.IsChecked = $true } catch {}
+    Write-ActionLog "Watch file set from ingest path: $path" "INFO"
+    Update-LogDisplay
 })
 
 $BtnEventDetect.add_Click({
