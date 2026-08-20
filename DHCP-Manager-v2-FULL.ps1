@@ -100,7 +100,7 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.4.3'
+$Global:AppVersion       = '2.4.4'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:LogWatchState    = @{
     Local = @{ Enabled = $false; Path = $null; Offset = 0L }
@@ -628,7 +628,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                    HorizontalAlignment="Center"/>
         
         <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-          <Run Text="v2.4.3  |  "/>
+          <Run Text="v2.4.4  |  "/>
           <Run Text="Anthony Blake  |  " Foreground="#90CAF9"/>
           <Run x:Name="StatusTime" Text=""/>
         </TextBlock>
@@ -1087,6 +1087,9 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                           Style="{StaticResource BtnPrimary}" IsEnabled="False"/>
                   <Button x:Name="BtnCompareExport" Content="💾 Export Results" Margin="0,0,8,0"
                           Style="{StaticResource BtnSecondary}" IsEnabled="False"/>
+                  <Button x:Name="BtnCompareMigrate" Content="🚚 Migrate Selected"
+                          Style="{StaticResource BtnSuccess}" IsEnabled="False"
+                          ToolTip="Migrate selected scope(s) and related settings (options, reservations, exclusions) between A and B. Direction: Only on A → to B; Only on B → to A."/>
                 </StackPanel>
               </Border>
 
@@ -1123,7 +1126,9 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
               </Border>
 
               <!-- Compare Results Grid -->
-              <DataGrid Grid.Row="3" x:Name="GridCompare" Style="{StaticResource DarkGrid}" Margin="8">
+              <DataGrid Grid.Row="3" x:Name="GridCompare" Style="{StaticResource DarkGrid}" Margin="8"
+                        SelectionMode="Extended"
+                        ToolTip="Select one or more scope rows, then Migrate Selected">
                 <DataGrid.Columns>
                   <DataGridTextColumn Header="Status" Binding="{Binding Status}" Width="100"/>
                   <DataGridTextColumn Header="Key" Binding="{Binding Key}" Width="160"/>
@@ -1517,6 +1522,7 @@ try {
     $script:CboCompareFilter     = $Window.FindName("CboCompareFilter")
     $script:BtnRunCompare        = $Window.FindName("BtnRunCompare")
     $script:BtnCompareExport     = $Window.FindName("BtnCompareExport")
+    $script:BtnCompareMigrate    = $Window.FindName("BtnCompareMigrate")
     $script:GridCompare          = $Window.FindName("GridCompare")
     $script:CmpOnlyA             = $Window.FindName("CmpOnlyA")
     $script:CmpOnlyB             = $Window.FindName("CmpOnlyB")
@@ -2692,6 +2698,9 @@ function Update-CompareReadyState {
         $script:Window.Dispatcher.Invoke([action]{
             $script:BtnRunCompare.IsEnabled = $bothReady
             $script:BtnCompareExport.IsEnabled = ($Global:CompareResults.Count -gt 0)
+            if ($null -ne $script:BtnCompareMigrate) {
+                $script:BtnCompareMigrate.IsEnabled = $bothReady
+            }
             
             if ($Global:DHCPServer) {
                 $script:TxtCompareServerA.Text = $Global:DHCPServer
@@ -3747,27 +3756,52 @@ function Set-MigrationScopeSelection {
 function Invoke-DhcpScopeMigration {
     <#
     .SYNOPSIS
-        Migrates selected scopes (and optional options/reservations/exclusions/leases) from A to B
+        Migrates selected scopes (and related options/reservations/exclusions/leases) from source to destination
     #>
     param(
-        [switch]$DryRun
+        [switch]$DryRun,
+        [string]$SourceServer,
+        [string]$DestServer,
+        [object[]]$Scopes,
+        [object]$Options,
+        [switch]$SkipConfirm,
+        [switch]$AppendResults,
+        [switch]$Quiet
     )
     
-    if ([string]::IsNullOrWhiteSpace($Global:DHCPServer) -or [string]::IsNullOrWhiteSpace($Global:CompareServer)) {
-        Show-MessageBox "Connect both Server A (source) and Server B (destination) first." "Migrate" OK Warning
+    if ([string]::IsNullOrWhiteSpace($SourceServer)) { $SourceServer = $Global:DHCPServer }
+    if ([string]::IsNullOrWhiteSpace($DestServer)) { $DestServer = $Global:CompareServer }
+    
+    if ([string]::IsNullOrWhiteSpace($SourceServer) -or [string]::IsNullOrWhiteSpace($DestServer)) {
+        Show-MessageBox "Connect both source and destination DHCP servers first." "Migrate" OK Warning
         return
     }
     
-    # Commit any pending checkbox edits
-    try { $script:GridMigrateScopes.CommitEdit() } catch {}
+    if ($SourceServer -eq $DestServer) {
+        Show-MessageBox "Source and destination must be different servers." "Migrate" OK Warning
+        return
+    }
     
-    $selected = @($Global:MigrationScopes | Where-Object { $_.Selected })
-    if ($selected.Count -eq 0) {
+    if ($null -eq $Scopes) {
+        # Commit any pending checkbox edits on Migrate tab
+        try { $script:GridMigrateScopes.CommitEdit() } catch {}
+        $Scopes = @($Global:MigrationScopes | Where-Object { $_.Selected })
+    } else {
+        $Scopes = @($Scopes)
+    }
+    
+    $selectedCount = Get-SafeCount $Scopes
+    if ($selectedCount -eq 0) {
         Show-MessageBox "Select at least one scope to migrate." "Migrate" OK Warning
         return
     }
     
-    $opts = Get-MigrationOptionsFromUi
+    if ($null -eq $Options) {
+        $opts = Get-MigrationOptionsFromUi
+    } else {
+        $opts = $Options
+    }
+    
     if (-not ($opts.MigrateScope -or $opts.MigrateOptions -or $opts.MigrateReservations -or $opts.MigrateExclusions -or $opts.MigrateLeasesAsRes)) {
         Show-MessageBox "Select at least one include option (Scope, Options, Reservations, Exclusions, or Leases)." "Migrate" OK Warning
         return
@@ -3775,7 +3809,7 @@ function Invoke-DhcpScopeMigration {
     
     $modeLabel = if ($DryRun) { 'DRY RUN' } else { 'MIGRATE' }
     
-    if (-not $DryRun) {
+    if (-not $DryRun -and -not $SkipConfirm) {
         $includeParts = [System.Collections.Generic.List[string]]::new()
         if ($opts.MigrateScope)        { [void]$includeParts.Add('Scope') }
         if ($opts.MigrateOptions)      { [void]$includeParts.Add('Options') }
@@ -3785,10 +3819,10 @@ function Invoke-DhcpScopeMigration {
         
         $includeText = $includeParts -join ', '
         $confirmMsg = @(
-            "Migrate $($selected.Count) scope(s) from"
-            $Global:DHCPServer
+            "Migrate $selectedCount scope(s) from"
+            $SourceServer
             "to"
-            $Global:CompareServer
+            $DestServer
             ""
             "Include: $includeText"
             "Conflict mode: $($opts.ConflictMode)"
@@ -3798,19 +3832,21 @@ function Invoke-DhcpScopeMigration {
         if ($confirm -ne 'Yes') { return }
     }
     
-    Write-ActionLog "===== $modeLabel start: $($selected.Count) scope(s) $($Global:DHCPServer) → $($Global:CompareServer) =====" "INFO"
+    Write-ActionLog "===== $modeLabel start: $selectedCount scope(s) $SourceServer → $DestServer =====" "INFO"
     Set-Status "$modeLabel in progress..."
     
-    $Global:MigrationResults.Clear()
+    if (-not $AppendResults) {
+        $Global:MigrationResults.Clear()
+    }
     $successScopes = 0
     $errorScopes = 0
     
-    foreach ($sel in $selected) {
-        $scopeId = $sel.ScopeId
+    foreach ($sel in $Scopes) {
+        $scopeId = if ($sel.PSObject.Properties.Name -contains 'ScopeId') { "$($sel.ScopeId)" } else { "$sel" }
         $scopeHadError = $false
         
         try {
-            $srcScope = Get-DhcpServerv4Scope -ComputerName $Global:DHCPServer -ScopeId $scopeId -ErrorAction Stop
+            $srcScope = Get-DhcpServerv4Scope -ComputerName $SourceServer -ScopeId $scopeId -ErrorAction Stop
         } catch {
             Add-MigrationResult -ScopeId $scopeId -Step 'Load Source' -Status 'ERROR' -Message "$_"
             $errorScopes++
@@ -3819,12 +3855,12 @@ function Invoke-DhcpScopeMigration {
         
         $destExists = $false
         try {
-            $null = Get-DhcpServerv4Scope -ComputerName $Global:CompareServer -ScopeId $scopeId -ErrorAction Stop
+            $null = Get-DhcpServerv4Scope -ComputerName $DestServer -ScopeId $scopeId -ErrorAction Stop
             $destExists = $true
         } catch {
             $destExists = $false
         }
-        
+
         # --- Scope definition ---
         if ($opts.MigrateScope) {
             if ($destExists) {
@@ -3852,7 +3888,7 @@ function Invoke-DhcpScopeMigration {
                 } else {
                     try {
                         $addParams = @{
-                            ComputerName = $Global:CompareServer
+                            ComputerName = $DestServer
                             Name         = $srcScope.Name
                             StartRange   = $srcScope.StartRange
                             EndRange     = $srcScope.EndRange
@@ -3864,7 +3900,7 @@ function Invoke-DhcpScopeMigration {
                         if ($srcScope.LeaseDuration) { $addParams['LeaseDuration'] = $srcScope.LeaseDuration }
                         
                         Add-DhcpServerv4Scope @addParams
-                        Add-MigrationResult -ScopeId $scopeId -Step 'Scope' -Status 'SUCCESS' -Message "Created on $($Global:CompareServer)"
+                        Add-MigrationResult -ScopeId $scopeId -Step 'Scope' -Status 'SUCCESS' -Message "Created on $($DestServer)"
                         $destExists = $true
                     } catch {
                         Add-MigrationResult -ScopeId $scopeId -Step 'Scope' -Status 'ERROR' -Message "$_"
@@ -3889,8 +3925,8 @@ function Invoke-DhcpScopeMigration {
         # --- Exclusions ---
         if ($opts.MigrateExclusions -and $canMutateChildren) {
             try {
-                $exclusions = @(Get-DhcpServerv4ExclusionRange -ComputerName $Global:DHCPServer -ScopeId $scopeId -ErrorAction SilentlyContinue)
-                if ($exclusions.Count -eq 0) {
+                $exclusions = @(Get-DhcpServerv4ExclusionRange -ComputerName $SourceServer -ScopeId $scopeId -ErrorAction SilentlyContinue)
+                if ((Get-SafeCount $exclusions) -eq 0) {
                     Add-MigrationResult -ScopeId $scopeId -Step 'Exclusions' -Status 'SKIP' -Message 'No exclusions on source'
                 } else {
                     foreach ($ex in $exclusions) {
@@ -3899,7 +3935,7 @@ function Invoke-DhcpScopeMigration {
                             Add-MigrationResult -ScopeId $scopeId -Step 'Exclusion' -Status 'PLAN' -Message $exMsg
                         } else {
                             try {
-                                Add-DhcpServerv4ExclusionRange -ComputerName $Global:CompareServer -ScopeId $scopeId `
+                                Add-DhcpServerv4ExclusionRange -ComputerName $DestServer -ScopeId $scopeId `
                                     -StartRange $ex.StartRange -EndRange $ex.EndRange -ErrorAction Stop
                                 Add-MigrationResult -ScopeId $scopeId -Step 'Exclusion' -Status 'SUCCESS' -Message $exMsg
                             } catch {
@@ -3922,8 +3958,8 @@ function Invoke-DhcpScopeMigration {
         # --- Scope options ---
         if ($opts.MigrateOptions -and $canMutateChildren) {
             try {
-                $options = @(Get-DhcpServerv4OptionValue -ComputerName $Global:DHCPServer -ScopeId $scopeId -ErrorAction SilentlyContinue)
-                if ($options.Count -eq 0) {
+                $options = @(Get-DhcpServerv4OptionValue -ComputerName $SourceServer -ScopeId $scopeId -ErrorAction SilentlyContinue)
+                if ((Get-SafeCount $options) -eq 0) {
                     Add-MigrationResult -ScopeId $scopeId -Step 'Options' -Status 'SKIP' -Message 'No scope options on source'
                 } else {
                     foreach ($opt in $options) {
@@ -3934,7 +3970,7 @@ function Invoke-DhcpScopeMigration {
                         } else {
                             try {
                                 $setParams = @{
-                                    ComputerName = $Global:CompareServer
+                                    ComputerName = $DestServer
                                     ScopeId      = $scopeId
                                     OptionId     = $opt.OptionId
                                     Value        = $opt.Value
@@ -3960,8 +3996,8 @@ function Invoke-DhcpScopeMigration {
         # --- Reservations (clients) ---
         if ($opts.MigrateReservations -and $canMutateChildren) {
             try {
-                $reservations = @(Get-DhcpServerv4Reservation -ComputerName $Global:DHCPServer -ScopeId $scopeId -ErrorAction SilentlyContinue)
-                if ($reservations.Count -eq 0) {
+                $reservations = @(Get-DhcpServerv4Reservation -ComputerName $SourceServer -ScopeId $scopeId -ErrorAction SilentlyContinue)
+                if ((Get-SafeCount $reservations) -eq 0) {
                     Add-MigrationResult -ScopeId $scopeId -Step 'Reservations' -Status 'SKIP' -Message 'No reservations on source'
                 } else {
                     foreach ($res in $reservations) {
@@ -3971,7 +4007,7 @@ function Invoke-DhcpScopeMigration {
                         } else {
                             try {
                                 $resParams = @{
-                                    ComputerName = $Global:CompareServer
+                                    ComputerName = $DestServer
                                     ScopeId      = $scopeId
                                     IPAddress    = $res.IPAddress
                                     ClientId     = $res.ClientId
@@ -4003,10 +4039,10 @@ function Invoke-DhcpScopeMigration {
         # --- Active leases as reservations ---
         if ($opts.MigrateLeasesAsRes -and $canMutateChildren) {
             try {
-                $leases = @(Get-DhcpServerv4Lease -ComputerName $Global:DHCPServer -ScopeId $scopeId -ErrorAction SilentlyContinue |
+                $leases = @(Get-DhcpServerv4Lease -ComputerName $SourceServer -ScopeId $scopeId -ErrorAction SilentlyContinue |
                     Where-Object { $_.AddressState -match 'Active|Offer' -and $_.ClientId })
                 
-                if ($leases.Count -eq 0) {
+                if ((Get-SafeCount $leases) -eq 0) {
                     Add-MigrationResult -ScopeId $scopeId -Step 'Leases→Res' -Status 'SKIP' -Message 'No active leases with client IDs'
                 } else {
                     foreach ($lease in $leases) {
@@ -4015,10 +4051,10 @@ function Invoke-DhcpScopeMigration {
                             Add-MigrationResult -ScopeId $scopeId -Step 'Lease→Res' -Status 'PLAN' -Message $leaseMsg
                         } else {
                             try {
-                                Add-DhcpServerv4Reservation -ComputerName $Global:CompareServer -ScopeId $scopeId `
+                                Add-DhcpServerv4Reservation -ComputerName $DestServer -ScopeId $scopeId `
                                     -IPAddress $lease.IPAddress -ClientId $lease.ClientId `
                                     -Name $(if ($lease.HostName) { $lease.HostName } else { "lease-$($lease.IPAddress)" }) `
-                                    -Description "Migrated from active lease on $($Global:DHCPServer)" `
+                                    -Description "Migrated from active lease on $($SourceServer)" `
                                     -ErrorAction Stop
                                 Add-MigrationResult -ScopeId $scopeId -Step 'Lease→Res' -Status 'SUCCESS' -Message $leaseMsg
                             } catch {
@@ -4041,29 +4077,29 @@ function Invoke-DhcpScopeMigration {
         # --- Activate destination ---
         if ($opts.ActivateDest -and -not $DryRun -and $destExists -and -not $scopeHadError) {
             try {
-                Set-DhcpServerv4Scope -ComputerName $Global:CompareServer -ScopeId $scopeId -State Active -ErrorAction Stop
-                Add-MigrationResult -ScopeId $scopeId -Step 'Activate B' -Status 'SUCCESS' -Message 'Scope activated on destination'
+                Set-DhcpServerv4Scope -ComputerName $DestServer -ScopeId $scopeId -State Active -ErrorAction Stop
+                Add-MigrationResult -ScopeId $scopeId -Step 'Activate Dest' -Status 'SUCCESS' -Message 'Scope activated on destination'
             } catch {
-                Add-MigrationResult -ScopeId $scopeId -Step 'Activate B' -Status 'ERROR' -Message "$_"
+                Add-MigrationResult -ScopeId $scopeId -Step 'Activate Dest' -Status 'ERROR' -Message "$_"
                 $scopeHadError = $true
             }
         }
         elseif ($opts.ActivateDest -and $DryRun) {
-            Add-MigrationResult -ScopeId $scopeId -Step 'Activate B' -Status 'PLAN' -Message 'Would activate scope on destination'
+            Add-MigrationResult -ScopeId $scopeId -Step 'Activate Dest' -Status 'PLAN' -Message 'Would activate scope on destination'
         }
         
         # --- Deactivate source ---
         if ($opts.DeactivateSource -and -not $DryRun -and -not $scopeHadError) {
             try {
-                Set-DhcpServerv4Scope -ComputerName $Global:DHCPServer -ScopeId $scopeId -State Inactive -ErrorAction Stop
-                Add-MigrationResult -ScopeId $scopeId -Step 'Deactivate A' -Status 'SUCCESS' -Message 'Source scope deactivated'
+                Set-DhcpServerv4Scope -ComputerName $SourceServer -ScopeId $scopeId -State Inactive -ErrorAction Stop
+                Add-MigrationResult -ScopeId $scopeId -Step 'Deactivate Src' -Status 'SUCCESS' -Message 'Source scope deactivated'
             } catch {
-                Add-MigrationResult -ScopeId $scopeId -Step 'Deactivate A' -Status 'ERROR' -Message "$_"
+                Add-MigrationResult -ScopeId $scopeId -Step 'Deactivate Src' -Status 'ERROR' -Message "$_"
                 $scopeHadError = $true
             }
         }
         elseif ($opts.DeactivateSource -and $DryRun) {
-            Add-MigrationResult -ScopeId $scopeId -Step 'Deactivate A' -Status 'PLAN' -Message 'Would deactivate source scope after success'
+            Add-MigrationResult -ScopeId $scopeId -Step 'Deactivate Src' -Status 'PLAN' -Message 'Would deactivate source scope after success'
         }
         
         if ($scopeHadError) { $errorScopes++ } else { $successScopes++ }
@@ -4072,20 +4108,205 @@ function Invoke-DhcpScopeMigration {
     $script:Window.Dispatcher.Invoke([action]{
         $script:GridMigrateResults.ItemsSource = $null
         $script:GridMigrateResults.ItemsSource = @($Global:MigrationResults)
-        $script:BtnMigrateExport.IsEnabled = ($Global:MigrationResults.Count -gt 0)
+        $script:BtnMigrateExport.IsEnabled = ((Get-SafeCount $Global:MigrationResults) -gt 0)
     }, [System.Windows.Threading.DispatcherPriority]::Normal)
     
-    $summary = "$modeLabel complete — OK scopes: $successScopes, scopes with errors: $errorScopes, result rows: $($Global:MigrationResults.Count)"
+    $summary = "$modeLabel complete — OK scopes: $successScopes, scopes with errors: $errorScopes, result rows: $(Get-SafeCount $Global:MigrationResults)"
     Write-ActionLog "===== $summary =====" $(if ($errorScopes -gt 0) { 'WARN' } else { 'SUCCESS' })
     $script:TxtMigrateStatus.Text = $summary
     Set-Status $summary
     Update-LogDisplay
     Update-MigrateReadyState
     
-    if (-not $DryRun -and $errorScopes -eq 0) {
-        Show-MessageBox "Migration completed successfully.`n$summary" "Migrate" OK Information
-    } elseif (-not $DryRun) {
-        Show-MessageBox "Migration finished with some errors.`n$summary`nSee results grid and Action Log." "Migrate" OK Warning
+    if (-not $Quiet) {
+        if (-not $DryRun -and $errorScopes -eq 0) {
+            Show-MessageBox "Migration completed successfully.`n$summary" "Migrate" OK Information
+        } elseif (-not $DryRun) {
+            Show-MessageBox "Migration finished with some errors.`n$summary`nSee results grid and Action Log." "Migrate" OK Warning
+        }
+    }
+}
+
+function Get-DefaultCompareMigrationOptions {
+    <#
+    .SYNOPSIS
+        Full related-settings package used by Compare → Migrate Selected
+    #>
+    return [PSCustomObject]@{
+        MigrateScope         = $true
+        MigrateOptions       = $true
+        MigrateReservations  = $true
+        MigrateExclusions    = $true
+        MigrateLeasesAsRes   = $false
+        ActivateDest         = $true
+        DeactivateSource     = $false
+        ConflictMode         = 'Merge into existing'
+    }
+}
+
+function Test-IsDhcpScopeIdKey {
+    param([string]$Key)
+    if ([string]::IsNullOrWhiteSpace($Key)) { return $false }
+    # Scope compare keys are ScopeId values (IPv4)
+    return [bool]($Key -match '^\d{1,3}(\.\d{1,3}){3}$')
+}
+
+function Invoke-CompareSelectedScopeMigration {
+    <#
+    .SYNOPSIS
+        Migrates selected Compare-grid scope rows (and related settings) between A and B
+    #>
+    param([switch]$DryRun)
+    
+    if ([string]::IsNullOrWhiteSpace($Global:DHCPServer) -or [string]::IsNullOrWhiteSpace($Global:CompareServer)) {
+        Show-MessageBox "Connect both Server A and Server B first." "Compare Migrate" OK Warning
+        return
+    }
+    
+    $category = 'Scopes'
+    try {
+        if ($null -ne $script:CboCompareCategory.SelectedItem) {
+            $category = "$($script:CboCompareCategory.SelectedItem.Content)"
+        }
+    } catch {}
+    
+    if ($category -ne 'Scopes') {
+        Show-MessageBox "Switch Compare category to Scopes, run compare, then select scope row(s) to migrate." "Compare Migrate" OK Warning
+        return
+    }
+    
+    $selectedRows = @($script:GridCompare.SelectedItems)
+    if ((Get-SafeCount $selectedRows) -eq 0 -and $null -ne $script:GridCompare.SelectedItem) {
+        $selectedRows = @($script:GridCompare.SelectedItem)
+    }
+    
+    if ((Get-SafeCount $selectedRows) -eq 0) {
+        Show-MessageBox "Select one or more scope rows in the Compare results grid first." "Compare Migrate" OK Warning
+        return
+    }
+    
+    $aToB = [System.Collections.Generic.List[object]]::new()
+    $bToA = [System.Collections.Generic.List[object]]::new()
+    $skipped = [System.Collections.Generic.List[string]]::new()
+    
+    foreach ($row in $selectedRows) {
+        $key = "$($row.Key)"
+        $status = "$($row.Status)"
+        $label = if ($row.Label) { "$($row.Label)" } else { $key }
+        
+        if (-not (Test-IsDhcpScopeIdKey $key)) {
+            [void]$skipped.Add("$label (not a scope id)")
+            continue
+        }
+        
+        $item = [PSCustomObject]@{
+            ScopeId = $key
+            Name    = $label
+            Status  = $status
+        }
+        
+        switch ($status) {
+            'Only on A' {
+                [void]$aToB.Add($item)
+            }
+            'Only on B' {
+                [void]$bToA.Add($item)
+            }
+            'Different' {
+                # Push primary (A) definition/settings onto B by default
+                [void]$aToB.Add($item)
+            }
+            'Matching' {
+                [void]$skipped.Add("$key — already matching (skipped)")
+            }
+            default {
+                [void]$skipped.Add("$key — unknown status '$status'")
+            }
+        }
+    }
+    
+    $countA = Get-SafeCount $aToB
+    $countB = Get-SafeCount $bToA
+    $countSkip = Get-SafeCount $skipped
+    
+    if ($countA -eq 0 -and $countB -eq 0) {
+        $skipText = if ($countSkip -gt 0) { ($skipped -join "`n") } else { 'No migratable scope rows.' }
+        Show-MessageBox "Nothing to migrate.`n$skipText" "Compare Migrate" OK Warning
+        return
+    }
+    
+    $opts = Get-DefaultCompareMigrationOptions
+    $modeLabel = if ($DryRun) { 'DRY RUN' } else { 'MIGRATE' }
+    
+    $confirmLines = [System.Collections.Generic.List[string]]::new()
+    [void]$confirmLines.Add("$modeLabel selected compare scope(s) with related settings")
+    [void]$confirmLines.Add('')
+    if ($countA -gt 0) {
+        [void]$confirmLines.Add("A → B ($($Global:DHCPServer) → $($Global:CompareServer)): $countA")
+        foreach ($s in $aToB) { [void]$confirmLines.Add("  • $($s.ScopeId)  $($s.Name)  [$($s.Status)]") }
+    }
+    if ($countB -gt 0) {
+        if ($countA -gt 0) { [void]$confirmLines.Add('') }
+        [void]$confirmLines.Add("B → A ($($Global:CompareServer) → $($Global:DHCPServer)): $countB")
+        foreach ($s in $bToA) { [void]$confirmLines.Add("  • $($s.ScopeId)  $($s.Name)  [$($s.Status)]") }
+    }
+    [void]$confirmLines.Add('')
+    [void]$confirmLines.Add('Includes: Scope, Options, Reservations, Exclusions')
+    [void]$confirmLines.Add('Activate on destination: Yes')
+    [void]$confirmLines.Add('Deactivate source: No')
+    if ($countSkip -gt 0) {
+        [void]$confirmLines.Add('')
+        [void]$confirmLines.Add("Skipped: $countSkip")
+    }
+    
+    $confirm = Show-MessageBox ($confirmLines -join "`n") "Confirm Compare Migration" YesNo Warning
+    if ($confirm -ne 'Yes') { return }
+    
+    $Global:MigrationResults.Clear()
+    
+    if ($countA -gt 0) {
+        Invoke-DhcpScopeMigration -DryRun:$DryRun `
+            -SourceServer $Global:DHCPServer `
+            -DestServer $Global:CompareServer `
+            -Scopes @($aToB) `
+            -Options $opts `
+            -SkipConfirm `
+            -AppendResults `
+            -Quiet
+    }
+    
+    if ($countB -gt 0) {
+        Invoke-DhcpScopeMigration -DryRun:$DryRun `
+            -SourceServer $Global:CompareServer `
+            -DestServer $Global:DHCPServer `
+            -Scopes @($bToA) `
+            -Options $opts `
+            -SkipConfirm `
+            -AppendResults `
+            -Quiet
+    }
+    
+    # Show detailed results on Migrate tab
+    try {
+        if ($null -ne $script:TabMigrate) {
+            $script:MainTabs.SelectedItem = $script:TabMigrate
+        }
+    } catch {}
+    
+    $errRows = Get-SafeCount @($Global:MigrationResults | Where-Object { $_.Status -eq 'ERROR' })
+    $summary = "Compare migrate finished — A→B: $countA, B→A: $countB, result rows: $(Get-SafeCount $Global:MigrationResults)"
+    Write-ActionLog $summary $(if ($errRows -gt 0) { 'WARN' } else { 'SUCCESS' })
+    if ($null -ne $script:TxtCompareStatus) {
+        $script:TxtCompareStatus.Text = $summary
+    }
+    Update-LogDisplay
+    
+    if (-not $DryRun) {
+        if ($errRows -eq 0) {
+            Show-MessageBox "Migration completed successfully.`n$summary`nSee the Migrate tab for step details." "Compare Migrate" OK Information
+        } else {
+            Show-MessageBox "Migration finished with $errRows error row(s).`n$summary`nSee Migrate tab results and Action Log." "Compare Migrate" OK Warning
+        }
     }
 }
 
@@ -5070,6 +5291,16 @@ $BtnRunCompare.add_Click({
 
 $BtnCompareExport.add_Click({
     Export-CompareResults
+})
+
+$BtnCompareMigrate.add_Click({
+    try {
+        Invoke-CompareSelectedScopeMigration
+    } catch {
+        Write-ActionLog "Compare migrate failed: $_" "ERROR"
+        Show-MessageBox "Compare migrate failed: $_" "Compare Migrate" OK Error
+        Update-LogDisplay
+    }
 })
 
 $CboCompareFilter.add_SelectionChanged({
