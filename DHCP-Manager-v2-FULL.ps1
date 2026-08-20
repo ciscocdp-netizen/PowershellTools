@@ -100,7 +100,7 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.4.6'
+$Global:AppVersion       = '2.4.7'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:LogWatchState    = @{
     Local = @{ Enabled = $false; Path = $null; Offset = 0L }
@@ -112,6 +112,18 @@ $Global:MigrationResults = [System.Collections.Generic.List[object]]::new()
 $Global:MigrationScopes  = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:DomainScanResults = [System.Collections.Generic.List[object]]::new()
 $Global:ExtraScanDomains  = [System.Collections.Generic.List[string]]::new()
+$Global:TaskProgress = @{
+    Active          = $false
+    Name            = ''
+    Message         = ''
+    Percent         = 0
+    Processed       = 0
+    Total           = 0
+    CanPause        = $false
+    Paused          = $false
+    CancelRequested = $false
+    StartTime       = $null
+}
 #endregion
 
 #region Core Logging Functions
@@ -612,28 +624,53 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
     <!-- BOTTOM STATUS BAR -->
     <Border DockPanel.Dock="Bottom" Background="{StaticResource BgCard}"
             BorderThickness="0,1,0,0" BorderBrush="{StaticResource Border}" Padding="10,5">
-      <Grid>
-        <Grid.ColumnDefinitions>
-          <ColumnDefinition Width="Auto"/>
-          <ColumnDefinition Width="*"/>
-          <ColumnDefinition Width="Auto"/>
-        </Grid.ColumnDefinitions>
-        
-        <TextBlock Grid.Column="0" Foreground="{StaticResource TextSecond}" FontSize="11">
-          <Run Text="Server: "/>
-          <Run x:Name="StatusServer" Text="Not Connected" Foreground="{StaticResource Warning}"/>
-        </TextBlock>
-        
-        <TextBlock x:Name="StatusMessage" Grid.Column="1" Text="Ready"
-                   Foreground="{StaticResource TextSecond}" FontSize="11"
-                   HorizontalAlignment="Center"/>
-        
-        <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-          <Run Text="v2.4.6  |  "/>
-          <Run Text="Anthony Blake  |  " Foreground="#90CAF9"/>
-          <Run x:Name="StatusTime" Text=""/>
-        </TextBlock>
-      </Grid>
+      <StackPanel>
+        <Grid>
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="Auto"/>
+          </Grid.ColumnDefinitions>
+          
+          <TextBlock Grid.Column="0" Foreground="{StaticResource TextSecond}" FontSize="11">
+            <Run Text="Server: "/>
+            <Run x:Name="StatusServer" Text="Not Connected" Foreground="{StaticResource Warning}"/>
+          </TextBlock>
+          
+          <TextBlock x:Name="StatusMessage" Grid.Column="1" Text="Ready"
+                     Foreground="{StaticResource TextSecond}" FontSize="11"
+                     HorizontalAlignment="Center"/>
+          
+          <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
+            <Run Text="v2.4.7  |  "/>
+            <Run Text="Anthony Blake  |  " Foreground="#90CAF9"/>
+            <Run x:Name="StatusTime" Text=""/>
+          </TextBlock>
+        </Grid>
+
+        <!-- Shared task progress (ingest, scan, migrate, etc.) -->
+        <Grid x:Name="TaskProgressPanel" Margin="0,6,0,0" Visibility="Collapsed">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="Auto"/>
+          </Grid.ColumnDefinitions>
+          <StackPanel Grid.Column="0" Margin="0,0,12,0">
+            <TextBlock x:Name="TxtTaskProgress" Text="" Foreground="{StaticResource TextPrimary}"
+                       FontSize="11" Margin="0,0,0,3" TextWrapping="NoWrap"/>
+            <ProgressBar x:Name="BarTaskProgress" Height="10" Minimum="0" Maximum="100" Value="0"
+                         Background="{StaticResource BgDeep}" Foreground="{StaticResource Accent}"
+                         BorderBrush="{StaticResource Border}" BorderThickness="1"/>
+          </StackPanel>
+          <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+            <Button x:Name="BtnTaskPause" Content="⏸ Pause" Width="88" Height="26" Margin="0,0,8,0"
+                    Style="{StaticResource BtnSecondary}" IsEnabled="False"
+                    ToolTip="Pause or resume the current long-running task"/>
+            <Button x:Name="BtnTaskCancel" Content="⏹ Cancel" Width="88" Height="26"
+                    Style="{StaticResource BtnDanger}" IsEnabled="False"
+                    ToolTip="Cancel the current long-running task"/>
+          </StackPanel>
+        </Grid>
+      </StackPanel>
     </Border>
 
     <!-- MAIN CONTENT AREA with Navigation and Tabs -->
@@ -1293,8 +1330,12 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                     <Button x:Name="BtnEventDetect" Content="🔎 Detect" Margin="0,0,8,0"
                             Style="{StaticResource BtnSecondary}"
                             ToolTip="Auto-detect DHCP audit log path"/>
-                    <Button x:Name="BtnEventIngest" Content="📥 Ingest Log" Margin="0,0,0,0"
-                            Style="{StaticResource BtnPrimary}"/>
+                    <Button x:Name="BtnEventIngest" Content="📥 Ingest Log" Margin="0,0,8,0"
+                            Style="{StaticResource BtnPrimary}"
+                            ToolTip="Parse and load DHCP audit log events (shows progress; can pause/cancel)"/>
+                    <Button x:Name="BtnEventIngestPause" Content="⏸ Pause" Margin="0,0,0,0"
+                            Style="{StaticResource BtnSecondary}" IsEnabled="False"
+                            ToolTip="Pause or resume log ingest"/>
                   </StackPanel>
                 </Grid>
               </Border>
@@ -1327,10 +1368,24 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                 </StackPanel>
               </Border>
 
-              <!-- Status line -->
+              <!-- Status line + ingest progress -->
               <Border Grid.Row="2" Background="{StaticResource BgPanel}" Padding="12,6">
-                <TextBlock x:Name="TxtEventStatus" Text="Ingest a DHCP audit log or start live watch on Local / Server A / Server B"
-                           Foreground="{StaticResource TextSecond}" FontSize="11"/>
+                <StackPanel>
+                  <TextBlock x:Name="TxtEventStatus" Text="Ingest a DHCP audit log or start live watch on Local / Server A / Server B"
+                             Foreground="{StaticResource TextSecond}" FontSize="11" Margin="0,0,0,4"/>
+                  <Grid x:Name="EventIngestProgressPanel" Visibility="Collapsed">
+                    <Grid.ColumnDefinitions>
+                      <ColumnDefinition Width="*"/>
+                      <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <ProgressBar x:Name="BarEventIngest" Height="10" Minimum="0" Maximum="100" Value="0"
+                                 Background="{StaticResource BgDeep}" Foreground="{StaticResource Accent}"
+                                 BorderBrush="{StaticResource Border}" BorderThickness="1" Margin="0,0,12,0"/>
+                    <TextBlock x:Name="TxtEventIngestPct" Grid.Column="1" Text="0%"
+                               Foreground="{StaticResource TextPrimary}" FontSize="11"
+                               VerticalAlignment="Center" MinWidth="40"/>
+                  </Grid>
+                </StackPanel>
               </Border>
 
               <!-- Events Grid -->
@@ -1433,6 +1488,11 @@ try {
     $script:StatusServer     = $Window.FindName("StatusServer")
     $script:StatusMessage    = $Window.FindName("StatusMessage")
     $script:StatusTime       = $Window.FindName("StatusTime")
+    $script:TaskProgressPanel = $Window.FindName("TaskProgressPanel")
+    $script:TxtTaskProgress  = $Window.FindName("TxtTaskProgress")
+    $script:BarTaskProgress  = $Window.FindName("BarTaskProgress")
+    $script:BtnTaskPause     = $Window.FindName("BtnTaskPause")
+    $script:BtnTaskCancel    = $Window.FindName("BtnTaskCancel")
     
     # Navigation
     $script:NavTree          = $Window.FindName("NavTree")
@@ -1537,6 +1597,7 @@ try {
     $script:BtnEventBrowse       = $Window.FindName("BtnEventBrowse")
     $script:BtnEventDetect       = $Window.FindName("BtnEventDetect")
     $script:BtnEventIngest       = $Window.FindName("BtnEventIngest")
+    $script:BtnEventIngestPause  = $Window.FindName("BtnEventIngestPause")
     $script:ChkWatchLocal        = $Window.FindName("ChkWatchLocal")
     $script:ChkWatchA            = $Window.FindName("ChkWatchA")
     $script:ChkWatchB            = $Window.FindName("ChkWatchB")
@@ -1546,6 +1607,9 @@ try {
     $script:BtnEventExport       = $Window.FindName("BtnEventExport")
     $script:TxtEventFilter       = $Window.FindName("TxtEventFilter")
     $script:TxtEventStatus       = $Window.FindName("TxtEventStatus")
+    $script:EventIngestProgressPanel = $Window.FindName("EventIngestProgressPanel")
+    $script:BarEventIngest       = $Window.FindName("BarEventIngest")
+    $script:TxtEventIngestPct    = $Window.FindName("TxtEventIngestPct")
     $script:GridEvents           = $Window.FindName("GridEvents")
     
     # Migrate Tab
@@ -1705,6 +1769,208 @@ function Get-SafeCount {
     # Single scalar / PSObject result from a cmdlet
     return @($Object).Count
 }
+
+#region Task Progress (status bar + pause/cancel)
+function Format-TaskEta {
+    param([TimeSpan]$Eta)
+    if ($null -eq $Eta -or $Eta.TotalSeconds -lt 0) { return '--:--' }
+    if ($Eta.TotalHours -ge 1) {
+        return '{0:hh\:mm\:ss}' -f $Eta
+    }
+    return '{0:mm\:ss}' -f $Eta
+}
+
+function Sync-TaskProgressUi {
+    param([switch]$ForcePump)
+    
+    $active = [bool]$Global:TaskProgress.Active
+    $pct = [math]::Max(0, [math]::Min(100, [int]$Global:TaskProgress.Percent))
+    $msg = "$($Global:TaskProgress.Message)"
+    $canPause = [bool]$Global:TaskProgress.CanPause
+    $paused = [bool]$Global:TaskProgress.Paused
+    $pauseLabel = if ($paused) { '▶️ Resume' } else { '⏸ Pause' }
+    
+    $update = {
+        if ($null -ne $script:TaskProgressPanel) {
+            $script:TaskProgressPanel.Visibility = if ($active) {
+                [System.Windows.Visibility]::Visible
+            } else {
+                [System.Windows.Visibility]::Collapsed
+            }
+        }
+        if ($null -ne $script:TxtTaskProgress) { $script:TxtTaskProgress.Text = $msg }
+        if ($null -ne $script:BarTaskProgress) { $script:BarTaskProgress.Value = $pct }
+        if ($null -ne $script:BtnTaskPause) {
+            $script:BtnTaskPause.IsEnabled = ($active -and $canPause)
+            $script:BtnTaskPause.Content = $pauseLabel
+        }
+        if ($null -ne $script:BtnTaskCancel) {
+            $script:BtnTaskCancel.IsEnabled = $active
+        }
+        if ($null -ne $script:EventIngestProgressPanel) {
+            $isIngest = $active -and ("$($Global:TaskProgress.Name)" -eq 'Ingest')
+            $script:EventIngestProgressPanel.Visibility = if ($isIngest) {
+                [System.Windows.Visibility]::Visible
+            } else {
+                [System.Windows.Visibility]::Collapsed
+            }
+        }
+        if ($null -ne $script:BarEventIngest) { $script:BarEventIngest.Value = $pct }
+        if ($null -ne $script:TxtEventIngestPct) { $script:TxtEventIngestPct.Text = "$pct%" }
+        if ($null -ne $script:BtnEventIngestPause) {
+            $isIngest = $active -and ("$($Global:TaskProgress.Name)" -eq 'Ingest')
+            $script:BtnEventIngestPause.IsEnabled = ($isIngest -and $canPause)
+            $script:BtnEventIngestPause.Content = $pauseLabel
+        }
+        if ($null -ne $script:StatusMessage -and $active -and $msg) {
+            $script:StatusMessage.Text = $msg
+        }
+    }
+    
+    try {
+        if ($null -ne $script:Window -and -not $script:Window.Dispatcher.CheckAccess()) {
+            $script:Window.Dispatcher.Invoke([action]$update, [System.Windows.Threading.DispatcherPriority]::Background)
+        } else {
+            & $update
+        }
+    } catch {
+        try { & $update } catch {}
+    }
+    
+    if ($ForcePump) {
+        try { [System.Windows.Forms.Application]::DoEvents() } catch {}
+        try {
+            if ($null -ne $script:Window) {
+                $script:Window.Dispatcher.Invoke([action]{}, [System.Windows.Threading.DispatcherPriority]::Background)
+            }
+        } catch {}
+    }
+}
+
+function Start-TaskProgress {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [string]$Message = 'Working...',
+        [switch]$CanPause,
+        [long]$Total = 0
+    )
+    
+    $Global:TaskProgress.Active = $true
+    $Global:TaskProgress.Name = $Name
+    $Global:TaskProgress.Message = $Message
+    $Global:TaskProgress.Percent = 0
+    $Global:TaskProgress.Processed = 0
+    $Global:TaskProgress.Total = $Total
+    $Global:TaskProgress.CanPause = [bool]$CanPause
+    $Global:TaskProgress.Paused = $false
+    $Global:TaskProgress.CancelRequested = $false
+    $Global:TaskProgress.StartTime = Get-Date
+    Sync-TaskProgressUi -ForcePump
+}
+
+function Update-TaskProgress {
+    param(
+        [long]$Processed = -1,
+        [long]$Total = -1,
+        [string]$Message,
+        [double]$Percent = -1
+    )
+    
+    if (-not $Global:TaskProgress.Active) { return }
+    
+    if ($Processed -ge 0) { $Global:TaskProgress.Processed = $Processed }
+    if ($Total -ge 0) { $Global:TaskProgress.Total = $Total }
+    
+    $pct = $Percent
+    if ($pct -lt 0) {
+        if ($Global:TaskProgress.Total -gt 0) {
+            $pct = (100.0 * $Global:TaskProgress.Processed) / [double]$Global:TaskProgress.Total
+        } else {
+            $pct = [double]$Global:TaskProgress.Percent
+        }
+    }
+    $pct = [math]::Max(0, [math]::Min(100, $pct))
+    $Global:TaskProgress.Percent = [int][math]::Round($pct)
+    
+    $etaText = ''
+    if ($null -ne $Global:TaskProgress.StartTime -and $Global:TaskProgress.Processed -gt 0 -and $Global:TaskProgress.Total -gt 0) {
+        $elapsed = (Get-Date) - $Global:TaskProgress.StartTime
+        if ($elapsed.TotalSeconds -gt 0.5) {
+            $rate = $Global:TaskProgress.Processed / $elapsed.TotalSeconds
+            if ($rate -gt 0) {
+                $remain = ($Global:TaskProgress.Total - $Global:TaskProgress.Processed) / $rate
+                $etaText = " — ETA $(Format-TaskEta ([TimeSpan]::FromSeconds([math]::Max(0, $remain))))"
+            }
+        }
+    }
+    
+    $pausePrefix = if ($Global:TaskProgress.Paused) { 'PAUSED — ' } else { '' }
+    if ($Message) {
+        $Global:TaskProgress.Message = "$pausePrefix$Message$etaText"
+    } elseif ($etaText -or $pausePrefix) {
+        $base = "$($Global:TaskProgress.Message)" -replace '^PAUSED — ', '' -replace ' — ETA .*$', ''
+        $Global:TaskProgress.Message = "$pausePrefix$base$etaText"
+    }
+    
+    Sync-TaskProgressUi -ForcePump
+}
+
+function Wait-TaskProgressIfPaused {
+    while ($Global:TaskProgress.Active -and $Global:TaskProgress.Paused -and -not $Global:TaskProgress.CancelRequested) {
+        Update-TaskProgress
+        Start-Sleep -Milliseconds 150
+        try { [System.Windows.Forms.Application]::DoEvents() } catch {}
+    }
+}
+
+function Test-TaskCancelRequested {
+    return [bool]($Global:TaskProgress.Active -and $Global:TaskProgress.CancelRequested)
+}
+
+function Complete-TaskProgress {
+    param(
+        [string]$Message = 'Ready',
+        [switch]$KeepVisibleBriefly
+    )
+    
+    $wasActive = [bool]$Global:TaskProgress.Active
+    $Global:TaskProgress.Active = $false
+    $Global:TaskProgress.Paused = $false
+    $Global:TaskProgress.CancelRequested = $false
+    $Global:TaskProgress.CanPause = $false
+    $Global:TaskProgress.Percent = 100
+    $Global:TaskProgress.Message = $Message
+    $Global:TaskProgress.Name = ''
+    
+    Sync-TaskProgressUi -ForcePump
+    
+    if ($wasActive -and $KeepVisibleBriefly) {
+        Start-Sleep -Milliseconds 400
+    }
+    
+    $Global:TaskProgress.Percent = 0
+    Sync-TaskProgressUi
+    
+    try {
+        if ($null -ne $script:StatusMessage) { $script:StatusMessage.Text = $Message }
+    } catch {}
+}
+
+function Toggle-TaskProgressPause {
+    if (-not $Global:TaskProgress.Active -or -not $Global:TaskProgress.CanPause) { return }
+    $Global:TaskProgress.Paused = -not [bool]$Global:TaskProgress.Paused
+    Write-ActionLog $(if ($Global:TaskProgress.Paused) { "Task paused: $($Global:TaskProgress.Name)" } else { "Task resumed: $($Global:TaskProgress.Name)" }) "INFO"
+    Update-TaskProgress
+}
+
+function Request-TaskProgressCancel {
+    if (-not $Global:TaskProgress.Active) { return }
+    $Global:TaskProgress.CancelRequested = $true
+    $Global:TaskProgress.Paused = $false
+    Write-ActionLog "Cancel requested for task: $($Global:TaskProgress.Name)" "WARN"
+    Update-TaskProgress -Message "Canceling $($Global:TaskProgress.Name)..."
+}
+#endregion
 
 function Get-CleanDhcpServerHostName {
     <#
@@ -2337,9 +2603,17 @@ function Invoke-DomainDhcpServerScan {
     Write-ActionLog "Found $(Get-SafeCount $discovered) AD DHCP server record(s). Verifying authorization and pinging..." "INFO"
     
     $results = [System.Collections.Generic.List[object]]::new()
+    $totalSrv = Get-SafeCount $discovered
+    Start-TaskProgress -Name 'Scan' -Message "Scanning $totalSrv DHCP server(s)..." -Total $totalSrv
+    $idx = 0
     
     foreach ($srv in $discovered) {
+        if (Test-TaskCancelRequested) { break }
+        Wait-TaskProgressIfPaused
+        
+        $idx++
         $target = if ($srv.DnsName) { $srv.DnsName } else { $srv.IPAddress }
+        Update-TaskProgress -Processed $idx -Total $totalSrv -Message "Scan $idx / $totalSrv — $target"
         Write-ActionLog "Checking $target (authorize + ping)..." "INFO"
         
         $ping = Test-HostPingStatus -ComputerName $target -TimeoutMs $TimeoutMs
@@ -2389,6 +2663,7 @@ function Invoke-DomainDhcpServerScan {
     $authNo = $total - $authYes
     Write-ActionLog "Domain scan complete: $total servers — Online $up Up/$down Down — Authorized $authYes Yes/$authNo No" "SUCCESS"
     Set-Status "Domain scan: $up Up / $down Down | Auth $authYes Yes / $authNo No"
+    Complete-TaskProgress -Message "Domain scan complete: $total server(s)"
     
     return $results
 }
@@ -2474,6 +2749,7 @@ function Update-DomainScanDialogUi {
         }
         Update-LogDisplay
     } catch {
+        Complete-TaskProgress -Message "Domain scan failed"
         $err = "$_"
         Write-ActionLog "Domain scan failed: $err" "ERROR"
         if ($null -ne $StatusText) {
@@ -3837,7 +4113,7 @@ function Get-DhcpAuditLogPath {
     $candidates = @(Get-ChildItem -LiteralPath $root -Filter 'DhcpSrvLog*' -File -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending)
     
-    if ($candidates.Count -eq 0) { return $root }
+    if ((Get-SafeCount $candidates) -eq 0) { return $root }
     return $candidates[0].FullName
 }
 
@@ -3852,23 +4128,24 @@ function ConvertFrom-DhcpAuditLine {
     if ($Line -match '^(ID|Microsoft)') { return $null }
     
     # Classic CSV: ID,Date,Time,Description,IP,HostName,MAC,...
-    $parts = $Line.Split(',')
-    if ($parts.Count -lt 3) { return $null }
+    $parts = @($Line.Split(','))
+    $partCount = Get-SafeCount $parts
+    if ($partCount -lt 3) { return $null }
     
-    $eventId = $parts[0].Trim()
+    $eventId = "$($parts[0])".Trim()
     if ($eventId -notmatch '^\d{1,3}$') { return $null }
     
-    $date = if ($parts.Count -gt 1) { $parts[1].Trim() } else { '' }
-    $time = if ($parts.Count -gt 2) { $parts[2].Trim() } else { '' }
-    $desc = if ($parts.Count -gt 3 -and $parts[3].Trim()) { $parts[3].Trim() } else { Get-DhcpEventDescription $eventId }
-    $ip   = if ($parts.Count -gt 4) { $parts[4].Trim() } else { '' }
-    $hostName = if ($parts.Count -gt 5) { $parts[5].Trim() } else { '' }
-    $mac  = if ($parts.Count -gt 6) { $parts[6].Trim() } else { '' }
+    $date = if ($partCount -gt 1) { "$($parts[1])".Trim() } else { '' }
+    $time = if ($partCount -gt 2) { "$($parts[2])".Trim() } else { '' }
+    $desc = if ($partCount -gt 3 -and "$($parts[3])".Trim()) { "$($parts[3])".Trim() } else { Get-DhcpEventDescription $eventId }
+    $ip   = if ($partCount -gt 4) { "$($parts[4])".Trim() } else { '' }
+    $hostName = if ($partCount -gt 5) { "$($parts[5])".Trim() } else { '' }
+    $mac  = if ($partCount -gt 6) { "$($parts[6])".Trim() } else { '' }
     
     $stamp = ("$date $time").Trim()
     if (-not $stamp) { $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss' }
     
-    $details = if ($parts.Count -gt 7) { ($parts[7..($parts.Count-1)] -join ',').Trim() } else { '' }
+    $details = if ($partCount -gt 7) { ($parts[7..($partCount-1)] -join ',').Trim() } else { '' }
     
     return [PSCustomObject]@{
         Server      = $ServerLabel
@@ -3887,29 +4164,79 @@ function Add-DhcpEventEntry {
     param([object]$Entry)
     
     if ($null -eq $Entry) { return }
+    Add-DhcpEventEntriesBatch -Entries @($Entry)
+}
+
+function Add-DhcpEventEntriesBatch {
+    <#
+    .SYNOPSIS
+        Adds event rows in one UI dispatcher call (much faster than per-line Invoke)
+    #>
+    param([object[]]$Entries)
+    
+    $items = @($Entries | Where-Object { $null -ne $_ })
+    if ((Get-SafeCount $items) -eq 0) { return }
     
     $filter = ''
-    try { $filter = $script:TxtEventFilter.Text } catch {}
+    try { $filter = "$($script:TxtEventFilter.Text)" } catch {}
     
     if (-not [string]::IsNullOrWhiteSpace($filter)) {
-        $blob = "$($Entry.Server) $($Entry.Time) $($Entry.EventId) $($Entry.Description) $($Entry.IPAddress) $($Entry.MacAddress) $($Entry.HostName) $($Entry.Details)"
-        if ($blob -notlike "*$filter*") { return }
+        $items = @($items | Where-Object {
+            $blob = "$($_.Server) $($_.Time) $($_.EventId) $($_.Description) $($_.IPAddress) $($_.MacAddress) $($_.HostName) $($_.Details)"
+            $blob -like "*$filter*"
+        })
+        if ((Get-SafeCount $items) -eq 0) { return }
+    }
+    
+    $apply = {
+        foreach ($entry in $items) {
+            $Global:DhcpEventEntries.Insert(0, $entry)
+        }
+        while ((Get-SafeCount $Global:DhcpEventEntries) -gt 5000) {
+            $Global:DhcpEventEntries.RemoveAt((Get-SafeCount $Global:DhcpEventEntries) - 1)
+        }
+        if ($null -eq $script:GridEvents.ItemsSource) {
+            $script:GridEvents.ItemsSource = $Global:DhcpEventEntries
+        }
     }
     
     try {
-        $script:Window.Dispatcher.Invoke([action]{
-            $Global:DhcpEventEntries.Insert(0, $Entry)
-            while ($Global:DhcpEventEntries.Count -gt 5000) {
-                $Global:DhcpEventEntries.RemoveAt($Global:DhcpEventEntries.Count - 1)
-            }
-            if ($null -eq $script:GridEvents.ItemsSource) {
-                $script:GridEvents.ItemsSource = $Global:DhcpEventEntries
-            }
-        }, [System.Windows.Threading.DispatcherPriority]::Background)
+        if ($null -ne $script:Window -and -not $script:Window.Dispatcher.CheckAccess()) {
+            $script:Window.Dispatcher.Invoke([action]$apply, [System.Windows.Threading.DispatcherPriority]::Background)
+        } else {
+            & $apply
+        }
     } catch {
-        try {
-            $Global:DhcpEventEntries.Insert(0, $Entry)
-        } catch {}
+        try { & $apply } catch {}
+    }
+}
+
+function Set-DhcpEventEntriesFromList {
+    <#
+    .SYNOPSIS
+        Replaces the events grid in one UI update (newest-first list)
+    #>
+    param([System.Collections.IList]$Entries)
+    
+    $snapshot = @($Entries)
+    
+    $apply = {
+        $Global:DhcpEventEntries.Clear()
+        foreach ($entry in $snapshot) {
+            if ($null -ne $entry) { [void]$Global:DhcpEventEntries.Add($entry) }
+        }
+        $script:GridEvents.ItemsSource = $null
+        $script:GridEvents.ItemsSource = $Global:DhcpEventEntries
+    }
+    
+    try {
+        if ($null -ne $script:Window -and -not $script:Window.Dispatcher.CheckAccess()) {
+            $script:Window.Dispatcher.Invoke([action]$apply, [System.Windows.Threading.DispatcherPriority]::Normal)
+        } else {
+            & $apply
+        }
+    } catch {
+        try { & $apply } catch {}
     }
 }
 
@@ -3918,7 +4245,8 @@ function Import-DhcpAuditLogFile {
         [Parameter(Mandatory)]
         [string]$Path,
         [string]$ServerLabel = 'Local',
-        [switch]$TailOnly
+        [switch]$TailOnly,
+        [int]$MaxEvents = 5000
     )
     
     if (-not (Test-Path -LiteralPath $Path)) {
@@ -3929,8 +4257,9 @@ function Import-DhcpAuditLogFile {
     if ($item.PSIsContainer) {
         $newest = @(Get-ChildItem -LiteralPath $Path -Filter 'DhcpSrvLog*' -File -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTime -Descending)
-        if ($newest.Count -eq 0) { throw "No DhcpSrvLog* files in $Path" }
+        if ((Get-SafeCount $newest) -eq 0) { throw "No DhcpSrvLog* files in $Path" }
         $Path = $newest[0].FullName
+        $item = Get-Item -LiteralPath $Path
     }
     
     Write-ActionLog "Ingesting DHCP audit log: $Path ($ServerLabel)" "INFO"
@@ -3939,21 +4268,86 @@ function Import-DhcpAuditLogFile {
     try {
         if ($TailOnly) {
             $fs.Seek(0, [System.IO.SeekOrigin]::End) | Out-Null
-            return @{ Path = $Path; Offset = $fs.Position }
+            return @{ Path = $Path; Offset = $fs.Position; Count = 0 }
         }
         
+        $totalBytes = [math]::Max(1L, [long]$fs.Length)
+        $fileSizeMb = [math]::Round($totalBytes / 1MB, 2)
+        Start-TaskProgress -Name 'Ingest' -CanPause `
+            -Message "Ingesting $([IO.Path]::GetFileName($Path)) ($fileSizeMb MB)..." `
+            -Total $totalBytes
+        
+        try {
+            if ($null -ne $script:BtnEventIngest) { $script:BtnEventIngest.IsEnabled = $false }
+        } catch {}
+        
         $reader = New-Object System.IO.StreamReader($fs)
-        $count = 0
+        $parsed = [System.Collections.Generic.List[object]]::new()
+        $linesRead = 0
+        $eventsFound = 0
+        $lastUi = Get-Date
+        $canceled = $false
+        
         while ($null -ne ($line = $reader.ReadLine())) {
+            Wait-TaskProgressIfPaused
+            if (Test-TaskCancelRequested) {
+                $canceled = $true
+                break
+            }
+            
+            $linesRead++
             $entry = ConvertFrom-DhcpAuditLine -Line $line -ServerLabel $ServerLabel
             if ($entry) {
-                Add-DhcpEventEntry -Entry $entry
-                $count++
+                $parsed.Add($entry)
+                $eventsFound++
+            }
+            
+            $now = Get-Date
+            if ((($now - $lastUi).TotalMilliseconds -ge 200) -or (($linesRead % 1500) -eq 0)) {
+                $pos = [long]$fs.Position
+                $msg = "Ingesting $([IO.Path]::GetFileName($Path)) — $eventsFound events / $linesRead lines ($([math]::Round($pos/1MB, 2)) / $fileSizeMb MB)"
+                Update-TaskProgress -Processed $pos -Total $totalBytes -Message $msg
+                $lastUi = $now
             }
         }
+        
         $offset = $fs.Position
-        Write-ActionLog "Ingested $count events from $ServerLabel" "SUCCESS"
-        return @{ Path = $Path; Offset = $offset; Count = $count }
+        
+        if ($canceled) {
+            Write-ActionLog "Ingest canceled after $eventsFound parsed events ($linesRead lines)" "WARN"
+            Complete-TaskProgress -Message "Ingest canceled — kept previous events"
+            try { if ($null -ne $script:BtnEventIngest) { $script:BtnEventIngest.IsEnabled = $true } } catch {}
+            return @{ Path = $Path; Offset = $offset; Count = 0; Canceled = $true }
+        }
+        
+        Update-TaskProgress -Processed $totalBytes -Total $totalBytes -Percent 95 `
+            -Message "Building event list ($eventsFound events)..."
+        
+        # Keep newest MaxEvents (file is oldest→newest)
+        $toShow = [System.Collections.Generic.List[object]]::new()
+        $startIdx = 0
+        $count = $parsed.Count
+        if ($count -gt $MaxEvents) {
+            $startIdx = $count - $MaxEvents
+        }
+        for ($i = $count - 1; $i -ge $startIdx; $i--) {
+            $toShow.Add($parsed[$i])
+        }
+        
+        Set-DhcpEventEntriesFromList -Entries $toShow
+        
+        $shown = Get-SafeCount $toShow
+        $trimNote = if ($count -gt $MaxEvents) { " (showing newest $shown of $count)" } else { '' }
+        Write-ActionLog "Ingested $count events from $ServerLabel$trimNote" "SUCCESS"
+        Complete-TaskProgress -Message "Ingested $count events$trimNote"
+        
+        try { if ($null -ne $script:BtnEventIngest) { $script:BtnEventIngest.IsEnabled = $true } } catch {}
+        
+        return @{ Path = $Path; Offset = $offset; Count = $count; Shown = $shown; Canceled = $false }
+    } catch {
+        Complete-TaskProgress -Message "Ingest failed"
+        try { if ($null -ne $script:BtnEventIngest) { $script:BtnEventIngest.IsEnabled = $true } } catch {}
+        throw
     } finally {
         $fs.Dispose()
     }
@@ -3977,15 +4371,20 @@ function Read-DhcpAuditLogDelta {
         
         $fs.Seek($Offset, [System.IO.SeekOrigin]::Begin) | Out-Null
         $reader = New-Object System.IO.StreamReader($fs)
-        $count = 0
+        $batch = [System.Collections.Generic.List[object]]::new()
         while ($null -ne ($line = $reader.ReadLine())) {
             $entry = ConvertFrom-DhcpAuditLine -Line $line -ServerLabel $ServerLabel
-            if ($entry) {
-                Add-DhcpEventEntry -Entry $entry
-                $count++
-            }
+            if ($entry) { $batch.Add($entry) }
         }
-        return @{ Offset = $fs.Position; Count = $count }
+        
+        if ((Get-SafeCount $batch) -gt 0) {
+            # Newest last in file → insert in reverse so newest ends on top
+            $ordered = [System.Collections.Generic.List[object]]::new()
+            for ($i = $batch.Count - 1; $i -ge 0; $i--) { $ordered.Add($batch[$i]) }
+            Add-DhcpEventEntriesBatch -Entries @($ordered)
+        }
+        
+        return @{ Offset = $fs.Position; Count = (Get-SafeCount $batch) }
     } finally {
         $fs.Dispose()
     }
@@ -6020,6 +6419,11 @@ $BtnEventDetect.add_Click({
 
 $BtnEventIngest.add_Click({
     try {
+        if ($Global:TaskProgress.Active) {
+            Show-MessageBox "A task is already running: $($Global:TaskProgress.Name). Pause/Cancel it first." "Ingest" OK Warning
+            return
+        }
+        
         $src = Get-SelectedEventSourceKey
         $path = $script:TxtEventLogPath.Text.Trim()
         
@@ -6036,15 +6440,36 @@ $BtnEventIngest.add_Click({
         $label = Get-EventServerLabel -SourceKey $src
         Set-Status "Ingesting DHCP log..."
         $info = Import-DhcpAuditLogFile -Path $path -ServerLabel $label
-        $script:TxtEventStatus.Text = "Ingested $($info.Count) events from $label ($($info.Path))"
-        Set-Status "Ingested $($info.Count) DHCP events"
+        
+        if ($info.Canceled) {
+            $script:TxtEventStatus.Text = "Ingest canceled — previous events retained ($($info.Path))"
+            Set-Status "Ingest canceled"
+        } else {
+            $shown = if ($null -ne $info.Shown) { $info.Shown } else { $info.Count }
+            $script:TxtEventStatus.Text = "Ingested $($info.Count) events from $label (showing $shown) — $($info.Path)"
+            Set-Status "Ingested $($info.Count) DHCP events"
+        }
         Update-LogDisplay
     } catch {
+        Complete-TaskProgress -Message "Ingest failed"
+        try { if ($null -ne $script:BtnEventIngest) { $script:BtnEventIngest.IsEnabled = $true } } catch {}
         $errMsg = "Ingest failed: $_"
         Write-ActionLog $errMsg "ERROR"
         Show-MessageBox $errMsg "Ingest Error" OK Error
         Update-LogDisplay
     }
+})
+
+$BtnEventIngestPause.add_Click({
+    Toggle-TaskProgressPause
+})
+
+$BtnTaskPause.add_Click({
+    Toggle-TaskProgressPause
+})
+
+$BtnTaskCancel.add_Click({
+    Request-TaskProgressCancel
 })
 
 $BtnEventWatchStart.add_Click({
