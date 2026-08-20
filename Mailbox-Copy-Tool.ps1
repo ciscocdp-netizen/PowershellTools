@@ -13,9 +13,19 @@
 
 .NOTES
     Author: v0
-    Version: 1.9
+    Version: 1.10
     Requires: Microsoft.Graph PowerShell SDK
     Authentication: Interactive (Delegated Permissions via browser)
+
+    Changelog v1.10:
+    - Fixed: UI appeared hung on large folders (e.g. Inbox with 16k+ items). Get-Mg* -All
+      downloaded every message body on the WinForms thread with no progress or DoEvents,
+      so Cancel/progress never painted. Listing now pages via @odata.nextLink, selects
+      headers only (no body), pumps the UI after each page, and GETs the full message
+      only for items that are actually copied.
+    - Fixed: Verification no longer enumerates every message (that hung after a large copy).
+    - Fixed: Draft copies retry a minimal payload so empty/incomplete drafts are less likely
+      to fail the whole item.
 
     Changelog v1.9:
     - Fixed: Copied emails showed the copy time instead of the original sent/received time.
@@ -179,6 +189,135 @@ function Invoke-GraphPagedRequest {
     return $results
 }
 
+function Update-CopyUi {
+    param(
+        [System.Windows.Forms.TextBox]$StatusBox,
+        [System.Windows.Forms.ProgressBar]$ProgressBar
+    )
+    try {
+        if ($StatusBox)    { $StatusBox.Refresh() }
+        if ($ProgressBar)  { $ProgressBar.Refresh() }
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+    catch { }
+}
+
+function Get-GraphProperty {
+    param(
+        $Object,
+        [Parameter(Mandatory = $true)][string[]]$Names
+    )
+    if ($null -eq $Object) { return $null }
+    foreach ($name in $Names) {
+        if ($Object -is [System.Collections.IDictionary]) {
+            if ($Object.Contains($name)) { return $Object[$name] }
+            foreach ($k in @($Object.Keys)) {
+                if ([string]$k -ieq $name) { return $Object[$k] }
+            }
+        }
+        $prop = $Object.PSObject.Properties[$name]
+        if ($prop) { return $prop.Value }
+        $match = $Object.PSObject.Properties | Where-Object { $_.Name -ieq $name } | Select-Object -First 1
+        if ($match) { return $match.Value }
+    }
+    return $null
+}
+
+function Get-GraphNextLink {
+    param($Response)
+    $link = Get-GraphProperty -Object $Response -Names @('@odata.nextLink')
+    if ($link) { return $link }
+    if ($Response -is [System.Collections.IDictionary]) {
+        foreach ($k in @($Response.Keys)) {
+            if ([string]$k -match 'nextLink$') { return $Response[$k] }
+        }
+    }
+    return $null
+}
+
+function Get-GraphCollection {
+    param(
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [System.Windows.Forms.TextBox]$StatusBox,
+        [string]$ProgressPrefix = '',
+        [int]$ExpectedCount = 0,
+        [int]$PageDelayMs = 150
+    )
+    $items = New-Object System.Collections.Generic.List[object]
+    $page  = 0
+    $next  = $Uri
+    while ($next) {
+        if ($script:CancelRequested) { break }
+        $page++
+        $resp = Invoke-WithRetry -ScriptBlock {
+            Invoke-MgGraphRequest -Method GET -Uri $next
+        }
+        $pageItems = Get-GraphProperty -Object $resp -Names @('value', 'Value')
+        foreach ($it in @($pageItems)) {
+            [void]$items.Add($it)
+        }
+        if ($StatusBox -and $ProgressPrefix) {
+            $of = if ($ExpectedCount -gt 0) { " / $ExpectedCount" } else { '' }
+            $StatusBox.AppendText("    $ProgressPrefix page $page : $($items.Count)$of items`r`n")
+            Update-CopyUi -StatusBox $StatusBox
+        }
+        $next = Get-GraphNextLink -Response $resp
+        if ($next) { Start-Sleep -Milliseconds $PageDelayMs }
+    }
+    return $items
+}
+
+function Format-DedupeDate {
+    param($Value)
+    if ($null -eq $Value -or "$Value" -eq '') { return 'nodate' }
+    try {
+        if ($Value -is [datetimeoffset]) { return $Value.ToString('yyyy-MM-dd HH:mm') }
+        if ($Value -is [datetime])       { return $Value.ToString('yyyy-MM-dd HH:mm') }
+        $dto = [datetimeoffset]::Parse("$Value", [cultureinfo]::InvariantCulture, [globalization.datetimestyles]::RoundtripKind)
+        return $dto.ToString('yyyy-MM-dd HH:mm')
+    }
+    catch {
+        return 'nodate'
+    }
+}
+
+function Get-MessageDedupeKey {
+    param($Message)
+    $from    = Get-GraphProperty -Object $Message -Names @('from', 'From')
+    $email   = Get-GraphProperty -Object $from -Names @('emailAddress', 'EmailAddress')
+    $sAddr   = Get-GraphProperty -Object $email -Names @('address', 'Address')
+    if (-not $sAddr) { $sAddr = 'unknown' }
+    $subject = Get-GraphProperty -Object $Message -Names @('subject', 'Subject')
+    $rDate   = Format-DedupeDate (Get-GraphProperty -Object $Message -Names @('receivedDateTime', 'ReceivedDateTime'))
+    return "$subject|$rDate|$sAddr"
+}
+
+function New-FolderMessagesListUri {
+    param(
+        [Parameter(Mandatory = $true)][string]$UserId,
+        [string]$FolderId,
+        [Parameter(Mandatory = $true)][string]$Select
+    )
+    $uEnc = [uri]::EscapeDataString($UserId)
+    if ($FolderId) {
+        $fEnc = [uri]::EscapeDataString($FolderId)
+        return "$script:GraphBase/users/$uEnc/mailFolders/$fEnc/messages?`$top=100&`$select=$Select"
+    }
+    return "$script:GraphBase/users/$uEnc/messages?`$top=100&`$select=$Select"
+}
+
+function Get-GraphMessageById {
+    param(
+        [Parameter(Mandatory = $true)][string]$UserId,
+        [Parameter(Mandatory = $true)][string]$MessageId
+    )
+    $uEnc  = [uri]::EscapeDataString($UserId)
+    $idEnc = [uri]::EscapeDataString($MessageId)
+    Invoke-WithRetry -ScriptBlock {
+        Invoke-MgGraphRequest -Method GET -Uri "$script:GraphBase/users/$uEnc/messages/$idEnc"
+    }
+}
+
 function ConvertTo-GraphJson {
     param([Parameter(Mandatory = $true)]$InputObject)
     return ($InputObject | ConvertTo-Json -Depth 30 -Compress:$false)
@@ -264,16 +403,11 @@ function Format-MapiSystemTime {
 function Convert-GraphEmailRecipient {
     param($Recipient)
     if (-not $Recipient) { return $null }
-    $address = $null
-    $name    = $null
-    if ($Recipient.EmailAddress) {
-        $address = $Recipient.EmailAddress.Address
-        $name    = $Recipient.EmailAddress.Name
-    }
-    elseif ($Recipient.Address) {
-        $address = $Recipient.Address
-        $name    = $Recipient.Name
-    }
+    $email   = Get-GraphProperty -Object $Recipient -Names @('emailAddress', 'EmailAddress')
+    $address = Get-GraphProperty -Object $email -Names @('address', 'Address')
+    if (-not $address) { $address = Get-GraphProperty -Object $Recipient -Names @('address', 'Address') }
+    $name = Get-GraphProperty -Object $email -Names @('name', 'Name')
+    if (-not $name) { $name = Get-GraphProperty -Object $Recipient -Names @('name', 'Name') }
     if (-not $address) { return $null }
     return @{
         emailAddress = @{
@@ -868,55 +1002,50 @@ function Copy-Emails {
             $StatusBox.AppendText("  Checking for existing messages in destination folder...`r`n")
             $StatusBox.Refresh()
 
+            $headerSelect = 'id,subject,from,receivedDateTime,sentDateTime,isRead,isDraft,hasAttachments,importance'
+
             $targetMessages = @{}
             try {
-                if ($targetFolderId) {
-                    $existingMessages = Invoke-GraphPagedRequest -CommandBlock {
-                        Get-MgUserMailFolderMessage -UserId $TargetEmail `
-                            -MailFolderId $targetFolderId `
-                            -All -PageSize 100 `
-                            -Property Subject,ReceivedDateTime,From
-                    }
-                }
-                else {
-                    $existingMessages = Invoke-GraphPagedRequest -CommandBlock {
-                        Get-MgUserMessage -UserId $TargetEmail `
-                            -All -PageSize 100 `
-                            -Property Subject,ReceivedDateTime,From
-                    }
-                }
-
+                $existingUri = New-FolderMessagesListUri -UserId $TargetEmail -FolderId $targetFolderId -Select $headerSelect
+                $existingMessages = Get-GraphCollection -Uri $existingUri -StatusBox $StatusBox `
+                    -ProgressPrefix 'Destination index' -ExpectedCount 0
                 foreach ($msg in $existingMessages) {
-                    $sAddr = if ($msg.From.EmailAddress.Address) { $msg.From.EmailAddress.Address } else { "unknown" }
-                    $rDate = if ($msg.ReceivedDateTime) { $msg.ReceivedDateTime.ToString("yyyy-MM-dd HH:mm") } else { "nodate" }
-                    $targetMessages["$($msg.Subject)|$rDate|$sAddr"] = $true
+                    if ($script:CancelRequested) {
+                        $StatusBox.AppendText("`r`n*** COPY CANCELLED BY USER ***`r`n")
+                        Update-CopyUi -StatusBox $StatusBox
+                        return @{ Copied = $totalCopied; Skipped = $totalSkipped; Failed = $totalFailed; Cancelled = $true }
+                    }
+                    $targetMessages[(Get-MessageDedupeKey -Message $msg)] = $true
                 }
-
                 $StatusBox.AppendText("  Found $($targetMessages.Count) existing messages in destination`r`n")
             }
             catch {
-                $StatusBox.AppendText("  Could not retrieve existing messages (folder may be empty)`r`n")
+                $StatusBox.AppendText("  Could not retrieve existing messages: $($_.Exception.Message)`r`n")
             }
-            $StatusBox.Refresh()
+            Update-CopyUi -StatusBox $StatusBox
 
-            $StatusBox.AppendText("  Retrieving $($sourceFolder.TotalItemCount) messages from source...`r`n")
-            $StatusBox.Refresh()
+            $StatusBox.AppendText("  Listing $($sourceFolder.TotalItemCount) source messages (headers only, no body)...`r`n")
+            Update-CopyUi -StatusBox $StatusBox
 
             try {
                 $folderCopied  = 0
                 $folderFailed  = 0
                 $folderSkipped = 0
 
-                $sourceMessages = Invoke-GraphPagedRequest -CommandBlock {
-                    Get-MgUserMailFolderMessage -UserId $SourceEmail `
-                        -MailFolderId $sourceFolder.Id `
-                        -All -PageSize 250
+                $sourceUri = New-FolderMessagesListUri -UserId $SourceEmail -FolderId $sourceFolder.Id -Select $headerSelect
+                $sourceMessages = Get-GraphCollection -Uri $sourceUri -StatusBox $StatusBox `
+                    -ProgressPrefix 'Source list' -ExpectedCount ([int]$sourceFolder.TotalItemCount)
+
+                if ($script:CancelRequested) {
+                    $StatusBox.AppendText("`r`n*** COPY CANCELLED BY USER ***`r`n")
+                    Update-CopyUi -StatusBox $StatusBox
+                    return @{ Copied = $totalCopied; Skipped = $totalSkipped; Failed = $totalFailed; Cancelled = $true }
                 }
 
-                $StatusBox.AppendText("  Retrieved $($sourceMessages.Count) messages. Starting copy...`r`n")
-                $StatusBox.Refresh()
+                $StatusBox.AppendText("  Listed $($sourceMessages.Count) messages. Starting copy...`r`n")
+                Update-CopyUi -StatusBox $StatusBox
 
-                $batchSize   = 250
+                $batchSize   = 100
                 $batchNumber = 0
                 $isSentFolder  = ($sentItemsId -and $sourceFolder.Id -eq $sentItemsId)
                 $isDraftFolder = ($draftsId -and $sourceFolder.Id -eq $draftsId)
@@ -924,87 +1053,105 @@ function Copy-Emails {
                 for ($i = 0; $i -lt $sourceMessages.Count; $i += $batchSize) {
                     if ($script:CancelRequested) {
                         $StatusBox.AppendText("`r`n*** COPY CANCELLED BY USER ***`r`n")
-                        $StatusBox.Refresh()
+                        Update-CopyUi -StatusBox $StatusBox
                         return @{ Copied = $totalCopied; Skipped = $totalSkipped; Failed = $totalFailed; Cancelled = $true }
                     }
 
                     $batchNumber++
-                    $batch = $sourceMessages | Select-Object -Skip $i -First $batchSize
+                    $end = [math]::Min($i + $batchSize, $sourceMessages.Count) - 1
+                    $batchCount = ($end - $i) + 1
 
-                    $StatusBox.AppendText("  Batch $batchNumber : Processing $($batch.Count) messages...`r`n")
-                    $StatusBox.Refresh()
+                    $StatusBox.AppendText("  Batch $batchNumber : Processing $batchCount messages ($($i + 1)-$($end + 1) of $($sourceMessages.Count))...`r`n")
+                    Update-CopyUi -StatusBox $StatusBox -ProgressBar $ProgressBar
 
-                    foreach ($message in $batch) {
+                    for ($j = $i; $j -le $end; $j++) {
                         if ($script:CancelRequested) {
                             $StatusBox.AppendText("`r`n*** COPY CANCELLED BY USER ***`r`n")
-                            $StatusBox.Refresh()
+                            Update-CopyUi -StatusBox $StatusBox
                             return @{ Copied = $totalCopied; Skipped = $totalSkipped; Failed = $totalFailed; Cancelled = $true }
                         }
 
-                        $sAddr      = if ($message.From.EmailAddress.Address) { $message.From.EmailAddress.Address } else { "unknown" }
-                        $rDate      = if ($message.ReceivedDateTime) { $message.ReceivedDateTime.ToString("yyyy-MM-dd HH:mm") } else { "nodate" }
-                        $messageKey = "$($message.Subject)|$rDate|$sAddr"
+                        $summary    = $sourceMessages[$j]
+                        $messageKey = Get-MessageDedupeKey -Message $summary
 
                         if ($targetMessages.ContainsKey($messageKey)) {
                             $folderSkipped++; $totalSkipped++; $overallProgress++
+                            if (($overallProgress % 25) -eq 0) {
+                                $ProgressBar.Value = [math]::Min([math]::Round(($overallProgress / $totalMessages) * 100), 100)
+                                Update-CopyUi -StatusBox $StatusBox -ProgressBar $ProgressBar
+                            }
                             continue
                         }
 
                         try {
+                            $msgId = Get-GraphProperty -Object $summary -Names @('id', 'Id')
+                            if (-not $msgId) { throw 'Source message is missing an id' }
+
+                            $message = Get-GraphMessageById -UserId $SourceEmail -MessageId $msgId
+
+                            $bodyObj     = Get-GraphProperty -Object $message -Names @('body', 'Body')
+                            $bodyType    = Get-GraphProperty -Object $bodyObj -Names @('contentType', 'ContentType')
+                            $bodyContent = Get-GraphProperty -Object $bodyObj -Names @('content', 'Content')
+                            $isRead      = [bool](Get-GraphProperty -Object $message -Names @('isRead', 'IsRead'))
+                            $isDraft     = [bool](Get-GraphProperty -Object $message -Names @('isDraft', 'IsDraft'))
+                            $hasAttach   = [bool](Get-GraphProperty -Object $message -Names @('hasAttachments', 'HasAttachments'))
+                            $subject     = Get-GraphProperty -Object $message -Names @('subject', 'Subject')
+                            $importance  = Get-GraphProperty -Object $message -Names @('importance', 'Importance')
+                            $sentDt      = Get-GraphProperty -Object $message -Names @('sentDateTime', 'SentDateTime')
+                            $recvDt      = Get-GraphProperty -Object $message -Names @('receivedDateTime', 'ReceivedDateTime')
+
                             $msgBody = @{
-                                subject = $message.Subject
+                                subject = $subject
                                 body    = @{
-                                    contentType = if ($message.Body.ContentType) { "$($message.Body.ContentType)" } else { "Text" }
-                                    content     = if ($message.Body.Content)     { $message.Body.Content }         else { "" }
+                                    contentType = if ($bodyType) { "$bodyType" } else { 'Text' }
+                                    content     = if ($bodyContent) { "$bodyContent" } else { '' }
                                 }
-                                importance = if ($message.Importance) { "$($message.Importance)" } else { "Normal" }
-                                isRead     = [bool]$message.IsRead
+                                importance = if ($importance) { "$importance" } else { 'Normal' }
+                                isRead     = $isRead
                             }
 
-                            # PidTagMessageFlags (0x0E07):
-                            #   MSGFLAG_READ   = 0x1
-                            #   MSGFLAG_UNSENT = 0x8  (draft)
-                            #   MSGFLAG_FROMME = 0x20 (sent item)
                             $msgFlags = 0
-                            if ($message.IsRead) { $msgFlags = $msgFlags -bor 1 }
-                            if ($isSentFolder)   { $msgFlags = $msgFlags -bor 0x20 }
-                            if ($isDraftFolder -or $message.IsDraft) { $msgFlags = $msgFlags -bor 0x8 }
+                            if ($isRead) { $msgFlags = $msgFlags -bor 1 }
+                            if ($isSentFolder) { $msgFlags = $msgFlags -bor 0x20 }
+                            if ($isDraftFolder -or $isDraft) { $msgFlags = $msgFlags -bor 0x8 }
 
                             $extended = New-ExtPropList
                             Add-ExtProp -List $extended -Id 'Integer 0x0E07' -Value "$msgFlags"
 
-                            # Graph ignores receivedDateTime/sentDateTime on create. Stamp the MAPI
-                            # times Outlook uses so the copied item keeps the original date/time.
-                            $submitTime   = Format-MapiSystemTime $(if ($message.SentDateTime) { $message.SentDateTime } else { $message.ReceivedDateTime })
-                            $deliveryTime = Format-MapiSystemTime $(if ($message.ReceivedDateTime) { $message.ReceivedDateTime } else { $message.SentDateTime })
+                            $submitTime   = Format-MapiSystemTime $(if ($sentDt) { $sentDt } else { $recvDt })
+                            $deliveryTime = Format-MapiSystemTime $(if ($recvDt) { $recvDt } else { $sentDt })
                             if ($submitTime)   { Add-ExtProp -List $extended -Id 'SystemTime 0x0039' -Value $submitTime }
                             if ($deliveryTime) { Add-ExtProp -List $extended -Id 'SystemTime 0x0E06' -Value $deliveryTime }
 
                             $msgBody.singleValueExtendedProperties = @($extended)
 
-                            $toList = @(foreach ($r in $message.ToRecipients) {
+                            $toList = @(foreach ($r in @(Get-GraphProperty -Object $message -Names @('toRecipients', 'ToRecipients'))) {
                                 Convert-GraphEmailRecipient -Recipient $r
                             }) | Where-Object { $_ }
                             if ($toList.Count) { $msgBody.toRecipients = @($toList) }
 
-                            $ccList = @(foreach ($r in $message.CcRecipients) {
+                            $ccList = @(foreach ($r in @(Get-GraphProperty -Object $message -Names @('ccRecipients', 'CcRecipients'))) {
                                 Convert-GraphEmailRecipient -Recipient $r
                             }) | Where-Object { $_ }
                             if ($ccList.Count) { $msgBody.ccRecipients = @($ccList) }
 
-                            $bccList = @(foreach ($r in $message.BccRecipients) {
+                            $bccList = @(foreach ($r in @(Get-GraphProperty -Object $message -Names @('bccRecipients', 'BccRecipients'))) {
                                 Convert-GraphEmailRecipient -Recipient $r
                             }) | Where-Object { $_ }
                             if ($bccList.Count) { $msgBody.bccRecipients = @($bccList) }
 
-                            $fromObj = Convert-GraphEmailRecipient -Recipient $message.From
-                            if ($fromObj) { $msgBody.from = $fromObj }
-                            $senderObj = Convert-GraphEmailRecipient -Recipient $message.Sender
-                            if ($senderObj) { $msgBody.sender = $senderObj }
+                            if (-not $isDraftFolder) {
+                                $fromObj = Convert-GraphEmailRecipient -Recipient (Get-GraphProperty -Object $message -Names @('from', 'From'))
+                                if ($fromObj) { $msgBody.from = $fromObj }
+                                $senderObj = Convert-GraphEmailRecipient -Recipient (Get-GraphProperty -Object $message -Names @('sender', 'Sender'))
+                                if ($senderObj) { $msgBody.sender = $senderObj }
+                                $internetId = Get-GraphProperty -Object $message -Names @('internetMessageId', 'InternetMessageId')
+                                if ($internetId) { $msgBody.internetMessageId = "$internetId" }
+                            }
 
-                            if ($message.InternetMessageId) { $msgBody.internetMessageId = "$($message.InternetMessageId)" }
-                            if ($message.Categories -and @($message.Categories).Count -gt 0) {
-                                $msgBody.categories = @($message.Categories | ForEach-Object { "$_" })
+                            $categories = Get-GraphProperty -Object $message -Names @('categories', 'Categories')
+                            if ($categories -and @($categories).Count -gt 0) {
+                                $msgBody.categories = @($categories | ForEach-Object { "$_" })
                             }
 
                             $uEnc      = [uri]::EscapeDataString($TargetEmail)
@@ -1018,37 +1165,49 @@ function Copy-Emails {
                                 $created = Invoke-GraphJsonPost -Uri $createUri -BodyObject $msgBody
                             }
                             catch {
-                                # Some tenants reject SystemTime stamps; retry with message flags only
-                                # so the item is still created as a non-draft.
                                 $flagsOnly = Copy-HashtableExcept -Source $msgBody -ExcludeKeys @('singleValueExtendedProperties')
                                 $flagsOnly.singleValueExtendedProperties = @(@{ id = 'Integer 0x0E07'; value = "$msgFlags" })
-                                $created = Invoke-GraphJsonPost -Uri $createUri -BodyObject $flagsOnly
+                                try {
+                                    $created = Invoke-GraphJsonPost -Uri $createUri -BodyObject $flagsOnly
+                                }
+                                catch {
+                                    $minimal = @{
+                                        subject = $subject
+                                        body    = $msgBody.body
+                                        isRead  = $isRead
+                                        singleValueExtendedProperties = @(@{ id = 'Integer 0x0E07'; value = "$msgFlags" })
+                                    }
+                                    $created = Invoke-GraphJsonPost -Uri $createUri -BodyObject $minimal
+                                }
                             }
-                            $newId   = $null
-                            if ($created -and $created.id) { $newId = $created.id }
-                            elseif ($created -and $created.Id) { $newId = $created.Id }
+                            $newId = Get-GraphProperty -Object $created -Names @('id', 'Id')
 
-                            if ($message.HasAttachments -and $newId) {
-                                Copy-MessageAttachments -SourceUserId $SourceEmail -SourceMessageId $message.Id `
+                            if ($hasAttach -and $newId) {
+                                Copy-MessageAttachments -SourceUserId $SourceEmail -SourceMessageId $msgId `
                                     -TargetUserId $TargetEmail -TargetMessageId $newId -HasAttachments $true
                             }
 
                             $folderCopied++; $totalCopied++
+                            $targetMessages[$messageKey] = $true
                         }
                         catch {
                             $folderFailed++; $totalFailed++
-                            if ($folderFailed -le 5) {
-                                $StatusBox.AppendText("    Failed '$($message.Subject)': $($_.Exception.Message)`r`n")
-                                $StatusBox.Refresh()
+                            if ($folderFailed -le 8) {
+                                $failSubj = Get-GraphProperty -Object $summary -Names @('subject', 'Subject')
+                                $StatusBox.AppendText("    Failed '$failSubj': $($_.Exception.Message)`r`n")
+                                Update-CopyUi -StatusBox $StatusBox
                             }
                         }
 
                         $overallProgress++
-                        $ProgressBar.Value = [math]::Min([math]::Round(($overallProgress / $totalMessages) * 100), 100)
+                        $ProgressBar.Value = [math]::Min([math]::Round(($overallProgress / [math]::Max($totalMessages, 1)) * 100), 100)
+                        if (($overallProgress % 10) -eq 0) {
+                            Update-CopyUi -StatusBox $StatusBox -ProgressBar $ProgressBar
+                        }
                     }
 
                     $StatusBox.AppendText("  Batch $batchNumber complete: $folderCopied copied, $folderSkipped skipped, $folderFailed failed`r`n")
-                    $StatusBox.Refresh()
+                    Update-CopyUi -StatusBox $StatusBox -ProgressBar $ProgressBar
                 }
 
                 $StatusBox.AppendText("  Folder '$($sourceFolder.FullPath)' done:`r`n")
@@ -1113,7 +1272,7 @@ function Copy-CalendarItems {
         }
 
         $StatusBox.AppendText("Retrieving calendar items from source...`r`n")
-        $StatusBox.Refresh()
+        Update-CopyUi -StatusBox $StatusBox
 
         $eventSelect = @(
             'id','subject','start','end','isAllDay','body','location','locations','attendees',
@@ -1123,23 +1282,20 @@ function Copy-CalendarItems {
             'hideAttendees','responseStatus','responseRequested','hasAttachments'
         ) -join ','
 
+        $srcCalEnc = [uri]::EscapeDataString($SourceEmail)
+        $srcCalIdEnc = [uri]::EscapeDataString($sourceCalendar.Id)
+        $eventUri  = "$script:GraphBase/users/$srcCalEnc/calendars/$srcCalIdEnc/events?`$top=50&`$select=$eventSelect"
         try {
-            $events = Invoke-GraphPagedRequest -CommandBlock {
-                Get-MgUserCalendarEvent -UserId $SourceEmail -CalendarId $sourceCalendar.Id -All `
-                    -Property $eventSelect `
-                    -ErrorAction Stop
-            }
+            $events = Get-GraphCollection -Uri $eventUri -StatusBox $StatusBox -ProgressPrefix 'Source calendar'
         }
         catch {
             $StatusBox.AppendText("  Full property select failed ($($_.Exception.Message)); retrying with a reduced set...`r`n")
-            $StatusBox.Refresh()
-            $events = Invoke-GraphPagedRequest -CommandBlock {
-                Get-MgUserCalendarEvent -UserId $SourceEmail -CalendarId $sourceCalendar.Id -All `
-                    -Property "id,subject,start,end,isAllDay,body,location,attendees,recurrence,showAs,importance,sensitivity,isReminderOn,reminderMinutesBeforeStart,isOnlineMeeting,onlineMeeting,onlineMeetingUrl,organizer,type,isCancelled,categories" `
-                    -ErrorAction Stop
-            }
+            Update-CopyUi -StatusBox $StatusBox
+            $reducedSelect = 'id,subject,start,end,isAllDay,body,location,attendees,recurrence,showAs,importance,sensitivity,isReminderOn,reminderMinutesBeforeStart,isOnlineMeeting,onlineMeeting,onlineMeetingUrl,organizer,type,isCancelled,categories'
+            $eventUri = "$script:GraphBase/users/$srcCalEnc/calendars/$srcCalIdEnc/events?`$top=50&`$select=$reducedSelect"
+            $events = Get-GraphCollection -Uri $eventUri -StatusBox $StatusBox -ProgressPrefix 'Source calendar'
         }
-        $totalEvents = @($events).Count
+        $totalEvents = $events.Count
 
         $StatusBox.AppendText("Found $totalEvents calendar items.`r`n")
         $StatusBox.Refresh()
@@ -1173,12 +1329,12 @@ function Copy-CalendarItems {
         }
 
         $StatusBox.AppendText("Fetching target calendar index...`r`n")
-        $StatusBox.Refresh()
+        Update-CopyUi -StatusBox $StatusBox
 
-        $targetCalendarItems = Invoke-GraphPagedRequest -CommandBlock {
-            Get-MgUserCalendarEvent -UserId $TargetEmail -CalendarId $targetCalendar.Id -All `
-                -Property "subject,start" -ErrorAction Stop
-        }
+        $tgtCalEnc = [uri]::EscapeDataString($TargetEmail)
+        $tgtCalIdEnc = [uri]::EscapeDataString($targetCalendar.Id)
+        $targetIndexUri = "$script:GraphBase/users/$tgtCalEnc/calendars/$tgtCalIdEnc/events?`$top=100&`$select=subject,start"
+        $targetCalendarItems = Get-GraphCollection -Uri $targetIndexUri -StatusBox $StatusBox -ProgressPrefix 'Target calendar index'
 
         $StatusBox.AppendText("Found $($targetCalendarItems.Count) existing items in target. Building duplicate index...`r`n")
         $StatusBox.Refresh()
@@ -1204,7 +1360,7 @@ function Copy-CalendarItems {
         $batchSize    = 250
         $batchNumber  = 0
         $uEnc         = [uri]::EscapeDataString($TargetEmail)
-        $createUri    = "$script:GraphBase/users/$uEnc/calendars/$($targetCalendar.Id)/events"
+        $createUri    = "$script:GraphBase/users/$uEnc/calendars/$([uri]::EscapeDataString($targetCalendar.Id))/events"
 
         for ($i = 0; $i -lt $totalEvents; $i += $batchSize) {
             if ($script:CancelRequested) {
@@ -1214,13 +1370,14 @@ function Copy-CalendarItems {
             }
 
             $batchNumber++
-            $batch      = $events | Select-Object -Skip $i -First $batchSize
-            $batchCount = @($batch).Count
+            $end        = [math]::Min($i + $batchSize, $totalEvents) - 1
+            $batchCount = ($end - $i) + 1
 
             $StatusBox.AppendText("  Batch $batchNumber : Processing $batchCount calendar items...`r`n")
-            $StatusBox.Refresh()
+            Update-CopyUi -StatusBox $StatusBox -ProgressBar $ProgressBar
 
-            foreach ($event in $batch) {
+            for ($j = $i; $j -le $end; $j++) {
+                $event = $events[$j]
                 if ($script:CancelRequested) {
                     $StatusBox.AppendText("`r`n*** COPY CANCELLED BY USER ***`r`n")
                     $StatusBox.Refresh()
@@ -1355,6 +1512,9 @@ function Copy-CalendarItems {
                 }
 
                 $ProgressBar.Value = [math]::Min([math]::Round((($copiedCount + $failedCount + $skippedCount) / [math]::Max($totalEvents, 1)) * 100), 100)
+                if ((($copiedCount + $failedCount + $skippedCount) % 10) -eq 0) {
+                    Update-CopyUi -StatusBox $StatusBox -ProgressBar $ProgressBar
+                }
             }
 
             $StatusBox.AppendText("  Batch $batchNumber : $copiedCount copied, $skippedCount skipped, $failedCount failed`r`n")
@@ -1393,14 +1553,13 @@ function Verify-CopiedItems {
         $StatusBox.AppendText("`r`n--- Verifying Copied Items ---`r`n")
 
         if ($CheckEmails) {
-            $srcCount = (Invoke-GraphPagedRequest -CommandBlock {
-                Get-MgUserMessage -UserId $SourceEmail -All
-            }).Count
-            $tgtCount = (Invoke-GraphPagedRequest -CommandBlock {
-                Get-MgUserMessage -UserId $TargetEmail -All
-            }).Count
+            $srcFolders = Get-AllMailFolders -UserId $SourceEmail
+            $tgtFolders = Get-AllMailFolders -UserId $TargetEmail
+            $srcCount = ($srcFolders | Measure-Object -Property TotalItemCount -Sum).Sum
+            $tgtCount = ($tgtFolders | Measure-Object -Property TotalItemCount -Sum).Sum
             $StatusBox.AppendText("Source mailbox emails: $srcCount`r`n")
             $StatusBox.AppendText("Target mailbox emails: $tgtCount`r`n")
+            Update-CopyUi -StatusBox $StatusBox
         }
 
         if ($CheckCalendar) {
@@ -1412,12 +1571,10 @@ function Verify-CopiedItems {
             }
 
             if ($srcCal -and $tgtCal) {
-                $srcEvtCount = (Invoke-GraphPagedRequest -CommandBlock {
-                    Get-MgUserCalendarEvent -UserId $SourceEmail -CalendarId $srcCal.Id -All
-                }).Count
-                $tgtEvtCount = (Invoke-GraphPagedRequest -CommandBlock {
-                    Get-MgUserCalendarEvent -UserId $TargetEmail -CalendarId $tgtCal.Id -All
-                }).Count
+                $srcEnc = [uri]::EscapeDataString($SourceEmail)
+                $tgtEnc = [uri]::EscapeDataString($TargetEmail)
+                $srcEvtCount = (Get-GraphCollection -Uri "$script:GraphBase/users/$srcEnc/calendars/$([uri]::EscapeDataString($srcCal.Id))/events?`$top=100&`$select=id" -StatusBox $StatusBox -ProgressPrefix 'Verify source calendar').Count
+                $tgtEvtCount = (Get-GraphCollection -Uri "$script:GraphBase/users/$tgtEnc/calendars/$([uri]::EscapeDataString($tgtCal.Id))/events?`$top=100&`$select=id" -StatusBox $StatusBox -ProgressPrefix 'Verify target calendar').Count
                 $StatusBox.AppendText("Source calendar items: $srcEvtCount`r`n")
                 $StatusBox.AppendText("Target calendar items: $tgtEvtCount`r`n")
             }
@@ -1437,7 +1594,7 @@ function Verify-CopiedItems {
 # GUI
 # ------------------------------------------------------------------------------
 $form = New-Object System.Windows.Forms.Form
-$form.Text            = "Microsoft 365 Mailbox Copy Tool v1.9 (Interactive Login)"
+$form.Text            = "Microsoft 365 Mailbox Copy Tool v1.10 (Interactive Login)"
 $form.Size            = New-Object System.Drawing.Size(700, 760)
 $form.StartPosition   = "CenterScreen"
 $form.FormBorderStyle = "FixedDialog"
