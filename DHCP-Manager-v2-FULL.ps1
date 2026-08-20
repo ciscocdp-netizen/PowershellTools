@@ -3114,9 +3114,10 @@ function Invoke-DhcpServerCompare {
         
         Show-CompareResults -Results $Global:CompareResults
         
-        $diffCount = @($Global:CompareResults | Where-Object { $_.Status -ne 'Matching' }).Count
-        Write-ActionLog "Compare complete: $($Global:CompareResults.Count) items, $diffCount non-matching" "SUCCESS"
-        Set-Status "Compare complete — $($Global:CompareResults.Count) items"
+        $diffCount = Get-SafeCount @($Global:CompareResults | Where-Object { $_.Status -ne 'Matching' })
+        $totalCount = Get-SafeCount $Global:CompareResults
+        Write-ActionLog "Compare complete: $totalCount items, $diffCount non-matching" "SUCCESS"
+        Set-Status "Compare complete — $totalCount items"
         Update-LogDisplay
         
     } catch {
