@@ -100,7 +100,7 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.4.5'
+$Global:AppVersion       = '2.4.6'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:LogWatchState    = @{
     Local = @{ Enabled = $false; Path = $null; Offset = 0L }
@@ -629,7 +629,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                    HorizontalAlignment="Center"/>
         
         <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-          <Run Text="v2.4.5  |  "/>
+          <Run Text="v2.4.6  |  "/>
           <Run Text="Anthony Blake  |  " Foreground="#90CAF9"/>
           <Run x:Name="StatusTime" Text=""/>
         </TextBlock>
@@ -1706,19 +1706,122 @@ function Get-SafeCount {
     return @($Object).Count
 }
 
+function Get-CleanDhcpServerHostName {
+    <#
+    .SYNOPSIS
+        Strips AD RDN prefixes (rcn=, cn=, etc.) and normalizes DHCP server host names
+    #>
+    param([string]$Name)
+    
+    $n = "$Name".Trim().Trim('"').Trim("'")
+    if ([string]::IsNullOrWhiteSpace($n)) { return '' }
+    
+    # Full DN / RDN style: rcn=host.domain.com,CN=...
+    if ($n -match '(?i)(?:^|,)(?:rcn|cn|dNSHostName|name)=([^,=]+)') {
+        $n = $Matches[1].Trim()
+    }
+    
+    # Repeated prefix=value
+    $guard = 0
+    while ($guard -lt 5 -and $n -match '(?i)^(rcn|cn|dns|dnshostname|name)=(.+)$') {
+        $n = $Matches[2].Trim()
+        $guard++
+    }
+    
+    # Still contains '=' — pull out a hostname-looking token
+    if ($n -match '=') {
+        if ($n -match '([A-Za-z0-9][A-Za-z0-9\-]{0,62}(?:\.[A-Za-z0-9][A-Za-z0-9\-]{0,62})+)') {
+            $n = $Matches[1]
+        } elseif ($n -match '([0-9]{1,3}(?:\.[0-9]{1,3}){3})') {
+            $n = $Matches[1]
+        }
+    }
+    
+    return $n.Trim().TrimEnd('.')
+}
+
+function ConvertFrom-AdDhcpServersValue {
+    <#
+    .SYNOPSIS
+        Parses AD dhcpServers attribute values into IP + cleaned DNS name
+    #>
+    param(
+        [string]$Raw,
+        [string]$FallbackName = ''
+    )
+    
+    $ip = ''
+    $dns = ''
+    $text = "$Raw".Trim()
+    
+    # Common format: i<ip>$<name>$...
+    if ($text -match '(?i)i([0-9]{1,3}(?:\.[0-9]{1,3}){3})\$([^$]*)') {
+        $ip = $Matches[1]
+        $dns = Get-CleanDhcpServerHostName -Name $Matches[2]
+    }
+    
+    if ([string]::IsNullOrWhiteSpace($ip) -and $text -match '([0-9]{1,3}(?:\.[0-9]{1,3}){3})') {
+        $ip = $Matches[1]
+    }
+    
+    if ([string]::IsNullOrWhiteSpace($dns)) {
+        $dns = Get-CleanDhcpServerHostName -Name $FallbackName
+    }
+    
+    if ([string]::IsNullOrWhiteSpace($dns) -and $text -match '(?i)(?:rcn|cn)=([A-Za-z0-9\.\-]+)') {
+        $dns = Get-CleanDhcpServerHostName -Name $Matches[1]
+    }
+    
+    return [PSCustomObject]@{
+        DnsName   = $dns
+        IPAddress = $ip
+    }
+}
+
+function Get-DhcpFallbackIpForName {
+    <#
+    .SYNOPSIS
+        Looks up a scanned DHCP server IP to use when hostname connect fails
+    #>
+    param([string]$Name)
+    
+    $clean = Get-CleanDhcpServerHostName -Name $Name
+    foreach ($r in @($Global:DomainScanResults)) {
+        $rowDns = Get-CleanDhcpServerHostName -Name "$($r.DnsName)"
+        $rowIp  = "$($r.IPAddress)".Trim()
+        if ($rowIp -notmatch '^[0-9]{1,3}(?:\.[0-9]{1,3}){3}$') { continue }
+        
+        if ($clean -and $rowDns -and $clean.Equals($rowDns, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $rowIp
+        }
+        if ($Name -and "$($r.DnsName)" -and $Name.Equals("$($r.DnsName)", [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $rowIp
+        }
+        if ($clean -and $rowIp -eq $clean) { return $rowIp }
+    }
+    
+    return ''
+}
+
 function Connect-DhcpServerTarget {
     <#
     .SYNOPSIS
-        Validates remote/local DHCP connectivity and returns a normalized server name
+        Validates DHCP connectivity; tries hostname then IP fallbacks
     #>
     param(
         [Parameter(Mandatory)]
-        [string]$ComputerName
+        [string]$ComputerName,
+        
+        [string]$FallbackIP = ''
     )
     
-    $target = $ComputerName.Trim()
-    if ($target -match '^(localhost|127\.0\.0\.1|\.)$') {
-        $target = 'localhost'
+    $cleaned = Get-CleanDhcpServerHostName -Name $ComputerName
+    if ([string]::IsNullOrWhiteSpace($cleaned)) {
+        $cleaned = "$ComputerName".Trim()
+    }
+    
+    if ($cleaned -match '^(localhost|127\.0\.0\.1|\.)$') {
+        $cleaned = 'localhost'
     }
     
     if (-not (Get-Module -Name DhcpServer -ListAvailable)) {
@@ -1727,34 +1830,85 @@ function Connect-DhcpServerTarget {
     
     Import-Module DhcpServer -ErrorAction Stop
     
-    try {
-        $null = Get-DhcpServerv4Scope -ComputerName $target -ErrorAction Stop
-    } catch {
-        $raw = "$_"
-        $hint = switch -Regex ($raw) {
-            'access is denied|AccessDenied|0x80070005' {
-                "Access denied. Run as a user with DHCP Administrators rights on $target (or Domain Admins)."
-            }
-            'RPC|RPC server|0x800706BA|unavailable' {
-                "RPC unreachable. Check firewall (RPC TCP 135 + dynamic ports), that DHCP Server service is running, and that remote management is allowed on $target."
-            }
-            'WinRM|WS-Management' {
-                "WinRM issue. DHCP cmdlets use RPC (not WinRM). Verify RPC/firewall connectivity to $target."
-            }
-            'cannot find|not found|no such host|DNS' {
-                "Name resolution failed for '$target'. Try FQDN or IP address."
-            }
-            'The term .*Get-DhcpServerv4Scope' {
-                "DhcpServer module failed to load cmdlets. Reinstall RSAT-DHCP tools."
-            }
-            default {
-                "Verify network path to $target, DHCP service status, and your account permissions."
-            }
+    $candidates = [System.Collections.Generic.List[string]]::new()
+    $addCandidate = {
+        param([string]$Value)
+        $v = "$Value".Trim()
+        if ([string]::IsNullOrWhiteSpace($v)) { return }
+        foreach ($existing in $candidates) {
+            if ($existing.Equals($v, [System.StringComparison]::OrdinalIgnoreCase)) { return }
         }
-        throw "Cannot reach DHCP on '$target'. $hint`n`nDetails: $raw"
+        [void]$candidates.Add($v)
     }
     
-    return $target
+    & $addCandidate $cleaned
+    
+    $fb = "$FallbackIP".Trim()
+    if ([string]::IsNullOrWhiteSpace($fb)) {
+        $fb = Get-DhcpFallbackIpForName -Name $ComputerName
+        if ([string]::IsNullOrWhiteSpace($fb)) {
+            $fb = Get-DhcpFallbackIpForName -Name $cleaned
+        }
+    }
+    if ($fb -match '^[0-9]{1,3}(?:\.[0-9]{1,3}){3}$') {
+        & $addCandidate $fb
+    }
+    
+    # DNS A-record fallbacks when primary is a hostname
+    if ($cleaned -ne 'localhost' -and $cleaned -notmatch '^[0-9]{1,3}(?:\.[0-9]{1,3}){3}$') {
+        try {
+            $addrs = @([System.Net.Dns]::GetHostAddresses($cleaned) |
+                Where-Object { $_.AddressFamily -eq 'InterNetwork' })
+            foreach ($a in $addrs) {
+                & $addCandidate "$a"
+            }
+        } catch {
+            Write-ActionLog "DNS resolve failed for '${cleaned}': $_" "WARN"
+        }
+    }
+    
+    $attemptErrors = [System.Collections.Generic.List[string]]::new()
+    
+    foreach ($target in $candidates) {
+        try {
+            Write-ActionLog "Trying DHCP RPC connect via '$target'..." "INFO"
+            $null = Get-DhcpServerv4Scope -ComputerName $target -ErrorAction Stop
+            if (-not $target.Equals($cleaned, [System.StringComparison]::OrdinalIgnoreCase)) {
+                Write-ActionLog "Connected using fallback target '$target' (requested '$cleaned')" "SUCCESS"
+            }
+            return $target
+        } catch {
+            $raw = "$_"
+            [void]$attemptErrors.Add("${target}: $raw")
+            Write-ActionLog "Connect attempt failed for '${target}': $raw" "WARN"
+        }
+    }
+    
+    $primaryFail = if ((Get-SafeCount $attemptErrors) -gt 0) { $attemptErrors[0] } else { 'Unknown error' }
+    $hint = switch -Regex ($primaryFail) {
+        'access is denied|AccessDenied|0x80070005' {
+            "Access denied. Run as a user with DHCP Administrators rights on the target (or Domain Admins). Cross-domain may need an account trusted in that domain."
+        }
+        'RPC|RPC server|0x800706BA|unavailable' {
+            "RPC unreachable. Check firewall (RPC TCP 135 + dynamic ports), DHCP Server service, and routing to the target (try IP if hostname fails)."
+        }
+        'WinRM|WS-Management' {
+            "WinRM issue. DHCP cmdlets use RPC (not WinRM). Verify RPC/firewall connectivity."
+        }
+        'cannot find|not found|no such host|DNS|No such host is known' {
+            "Name resolution failed. Use FQDN or IP address; Scan Domain can fill the IP."
+        }
+        'The term .*Get-DhcpServerv4Scope' {
+            "DhcpServer module failed to load cmdlets. Reinstall RSAT-DHCP tools."
+        }
+        default {
+            "Verify network path, DHCP service status, and account permissions. For other domains, prefer IP if DNS/suffix search fails."
+        }
+    }
+    
+    $tried = ($candidates -join ', ')
+    $details = ($attemptErrors -join "`n")
+    throw "Cannot reach DHCP on '$cleaned' (tried: $tried). $hint`n`nDetails:`n$details"
 }
 
 function Enable-ConnectedControls {
@@ -1973,16 +2127,12 @@ function Get-DomainDhcpServersFromLdap {
             }
             
             foreach ($raw in $dhcpServersProp) {
-                $dns = $null
-                $ip = ''
-                if ($raw -match 'i([0-9.]+)\$([^$]+)\$') {
-                    $ip = $Matches[1]
-                    $dns = $Matches[2]
-                } elseif ($name -and $name -notmatch '^dhcpRoot') {
-                    $dns = $name
-                }
+                $parsed = ConvertFrom-AdDhcpServersValue -Raw $raw -FallbackName $name
+                $dns = "$($parsed.DnsName)"
+                $ip  = "$($parsed.IPAddress)"
                 
-                if ([string]::IsNullOrWhiteSpace($dns)) { continue }
+                if ([string]::IsNullOrWhiteSpace($dns) -and [string]::IsNullOrWhiteSpace($ip)) { continue }
+                if ([string]::IsNullOrWhiteSpace($dns)) { $dns = $ip }
                 
                 $servers.Add([PSCustomObject]@{
                     DnsName    = $dns
@@ -1995,8 +2145,10 @@ function Get-DomainDhcpServersFromLdap {
             }
             
             if ((Get-SafeCount $dhcpServersProp) -eq 0 -and $name -and $name -notmatch '^dhcpRoot') {
+                $cleanName = Get-CleanDhcpServerHostName -Name $name
+                if ([string]::IsNullOrWhiteSpace($cleanName)) { $cleanName = $name }
                 $servers.Add([PSCustomObject]@{
-                    DnsName    = $name
+                    DnsName    = $cleanName
                     IPAddress  = ''
                     Authorized = $true
                     AuthDetail = "Authorized in AD NetServices object ($domainLabel)"
@@ -2045,7 +2197,8 @@ function Get-DomainDhcpServers {
         if ([string]::IsNullOrWhiteSpace($current)) { $current = '(current forest)' }
         
         foreach ($item in $list) {
-            $dns = "$($item.DnsName)".Trim()
+            $dns = Get-CleanDhcpServerHostName -Name "$($item.DnsName)"
+            if ([string]::IsNullOrWhiteSpace($dns)) { $dns = "$($item.DnsName)".Trim() }
             if ([string]::IsNullOrWhiteSpace($dns)) { continue }
             $key = $dns.ToLowerInvariant()
             if ($seen.ContainsKey($key)) { continue }
@@ -2212,10 +2365,12 @@ function Invoke-DomainDhcpServerScan {
         }
         
         $domainName = if ($srv.PSObject.Properties.Name -contains 'Domain' -and $srv.Domain) { "$($srv.Domain)" } else { '' }
+        $cleanDns = Get-CleanDhcpServerHostName -Name "$($srv.DnsName)"
+        if ([string]::IsNullOrWhiteSpace($cleanDns)) { $cleanDns = "$($srv.DnsName)" }
         
         $results.Add([PSCustomObject]@{
             Domain      = $domainName
-            DnsName     = $srv.DnsName
+            DnsName     = $cleanDns
             IPAddress   = $ip
             Online      = $ping.Status
             Status      = $ping.Status
@@ -2252,6 +2407,30 @@ function Get-ScanDomainsFromDialog {
     }
     
     return @(Get-NormalizedScanDomainList -Domains @($domains))
+}
+
+function Get-ScanRowConnectTarget {
+    <#
+    .SYNOPSIS
+        Chooses display/connect values from a scan row (clean host + IP fallback)
+    #>
+    param($Row)
+    
+    $clean = Get-CleanDhcpServerHostName -Name "$($Row.DnsName)"
+    $ip = "$($Row.IPAddress)".Trim()
+    if ($ip -notmatch '^[0-9]{1,3}(?:\.[0-9]{1,3}){3}$') { $ip = '' }
+    
+    if ([string]::IsNullOrWhiteSpace($clean) -or $clean -match '(?i)^rcn=|=') {
+        $primary = $(if ($ip) { $ip } else { "$($Row.DnsName)".Trim() })
+    } else {
+        $primary = $clean
+    }
+    
+    return [PSCustomObject]@{
+        Primary    = $primary
+        FallbackIP = $ip
+        HostName   = $clean
+    }
 }
 
 function Update-DomainScanDialogUi {
@@ -2561,11 +2740,15 @@ function Show-DomainDhcpScanDialog {
                 Show-MessageBox "Select a DHCP server first." "Scan" OK Warning
                 return
             }
-            $name = $script:ScanDialogGrid.SelectedItem.DnsName
-            if ([string]::IsNullOrWhiteSpace($name)) { $name = $script:ScanDialogGrid.SelectedItem.IPAddress }
-            $script:TxtServerName.Text = $name
-            Write-ActionLog "Scan: set Server A candidate to $name" "INFO"
-            $script:ScanDialogStatus.Text = "Filled main server box with $name — click Connect on the main window"
+            $target = Get-ScanRowConnectTarget -Row $script:ScanDialogGrid.SelectedItem
+            $script:TxtServerName.Text = $target.Primary
+            $hint = if ($target.FallbackIP -and $target.Primary -ne $target.FallbackIP) {
+                "Filled Server A with $($target.Primary) (IP fallback $($target.FallbackIP)) — click Connect"
+            } else {
+                "Filled main server box with $($target.Primary) — click Connect on the main window"
+            }
+            Write-ActionLog "Scan: set Server A candidate to $($target.Primary)" "INFO"
+            $script:ScanDialogStatus.Text = $hint
             Update-LogDisplay
         })
         
@@ -2578,14 +2761,18 @@ function Show-DomainDhcpScanDialog {
                 Show-MessageBox "Compare controls not available." "Scan" OK Warning
                 return
             }
-            $name = $script:ScanDialogGrid.SelectedItem.DnsName
-            if ([string]::IsNullOrWhiteSpace($name)) { $name = $script:ScanDialogGrid.SelectedItem.IPAddress }
-            $script:TxtCompareServer.Text = $name
+            $target = Get-ScanRowConnectTarget -Row $script:ScanDialogGrid.SelectedItem
+            $script:TxtCompareServer.Text = $target.Primary
             if ($null -ne $script:TabCompare) {
                 $script:MainTabs.SelectedItem = $script:TabCompare
             }
-            Write-ActionLog "Scan: set Server B candidate to $name" "INFO"
-            $script:ScanDialogStatus.Text = "Filled Compare Server B with $name — connect it on the Compare tab"
+            $hint = if ($target.FallbackIP -and $target.Primary -ne $target.FallbackIP) {
+                "Filled Compare Server B with $($target.Primary) (IP fallback $($target.FallbackIP)) — click Connect B"
+            } else {
+                "Filled Compare Server B with $($target.Primary) — connect it on the Compare tab"
+            }
+            Write-ActionLog "Scan: set Server B candidate to $($target.Primary)" "INFO"
+            $script:ScanDialogStatus.Text = $hint
             Update-LogDisplay
         })
         
@@ -2614,11 +2801,10 @@ function Show-DomainDhcpScanDialog {
         
         $script:ScanDialogGrid.add_MouseDoubleClick({
             if ($null -eq $script:ScanDialogGrid.SelectedItem) { return }
-            $name = $script:ScanDialogGrid.SelectedItem.DnsName
-            if ([string]::IsNullOrWhiteSpace($name)) { $name = $script:ScanDialogGrid.SelectedItem.IPAddress }
-            $script:TxtServerName.Text = $name
-            Write-ActionLog "Scan double-click: filled Server A box with $name" "INFO"
-            $script:ScanDialogStatus.Text = "Filled main server box with $name"
+            $target = Get-ScanRowConnectTarget -Row $script:ScanDialogGrid.SelectedItem
+            $script:TxtServerName.Text = $target.Primary
+            Write-ActionLog "Scan double-click: filled Server A box with $($target.Primary)" "INFO"
+            $script:ScanDialogStatus.Text = "Filled main server box with $($target.Primary)"
         })
         
         $btnClose.add_Click({
@@ -5052,11 +5238,19 @@ $BtnConnect.add_Click({
         return
     }
     
+    $cleaned = Get-CleanDhcpServerHostName -Name $serverName
+    if (-not [string]::IsNullOrWhiteSpace($cleaned) -and $cleaned -ne $serverName) {
+        Write-ActionLog "Cleaned server name '$serverName' -> '$cleaned'" "INFO"
+        $serverName = $cleaned
+        $script:TxtServerName.Text = $cleaned
+    }
+    
+    $fallbackIp = Get-DhcpFallbackIpForName -Name $serverName
     Set-Status "Connecting to $serverName..."
-    Write-ActionLog "Attempting connection to: $serverName" "INFO"
+    Write-ActionLog "Attempting connection to: $serverName$(if ($fallbackIp) { " (IP fallback $fallbackIp)" })" "INFO"
     
     try {
-        $normalized = Connect-DhcpServerTarget -ComputerName $serverName
+        $normalized = Connect-DhcpServerTarget -ComputerName $serverName -FallbackIP $fallbackIp
         
         $Global:DHCPServer = $normalized
         Write-ActionLog "Successfully connected to $normalized" "SUCCESS"
@@ -5611,6 +5805,13 @@ $BtnCompareConnect.add_Click({
         return
     }
     
+    $cleaned = Get-CleanDhcpServerHostName -Name $serverName
+    if (-not [string]::IsNullOrWhiteSpace($cleaned) -and $cleaned -ne $serverName) {
+        Write-ActionLog "Cleaned compare server name '$serverName' -> '$cleaned'" "INFO"
+        $serverName = $cleaned
+        $script:TxtCompareServer.Text = $cleaned
+    }
+    
     if ([string]::IsNullOrWhiteSpace($Global:DHCPServer)) {
         Show-MessageBox "Connect to primary Server A first, then connect Server B." "Compare" OK Warning
         return
@@ -5621,10 +5822,12 @@ $BtnCompareConnect.add_Click({
         return
     }
     
+    $fallbackIp = Get-DhcpFallbackIpForName -Name $serverName
     Set-Status "Connecting compare server $serverName..."
+    Write-ActionLog "Attempting compare connection to: $serverName$(if ($fallbackIp) { " (IP fallback $fallbackIp)" })" "INFO"
     
     try {
-        $normalized = Connect-DhcpServerTarget -ComputerName $serverName
+        $normalized = Connect-DhcpServerTarget -ComputerName $serverName -FallbackIP $fallbackIp
         
         $Global:CompareServer = $normalized
         Write-ActionLog "Connected compare Server B: $normalized" "SUCCESS"

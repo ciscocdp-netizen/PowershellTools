@@ -58,3 +58,5 @@ Each result is checked against the combined AD authorized set (DNS and IP match)
 - Authorized = listed in AD DHCP authorization — not a service health check
 - Extra domains require DNS resolution and LDAP access (trust / credentials)
 - Rogue/unauthorized DHCP servers are not returned by AD discovery alone
+- Host names from AD are cleaned (strips prefixes like `rcn=`)
+- **Connect** tries hostname first, then scanned/DNS **IP fallback** (helpful cross-domain)
