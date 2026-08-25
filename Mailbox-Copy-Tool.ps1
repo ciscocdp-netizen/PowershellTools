@@ -13,9 +13,23 @@
 
 .NOTES
     Author: v0
-    Version: 1.11
+    Version: 1.12
     Requires: Microsoft.Graph PowerShell SDK
     Authentication: Interactive (Delegated Permissions via browser)
+
+    Changelog v1.12:
+    - Fixed: Graph 400 BadRequest on every create (log showed only "BadRequest [line 411]").
+      v1.11 posted a byte[] when Get-MgGraphAccessToken was unavailable, which Graph
+      rejects, and Windows PowerShell ConvertTo-Json turns ArrayList / single-element
+      arrays into objects ({Count,Capacity,value} or a lone {id,value}) instead of a
+      JSON array. Creates now send UTF-8 JSON via Invoke-RestMethod first (never byte[]
+      to the SDK), serialize with Newtonsoft or JavaScriptSerializer so arrays stay
+      arrays, and failures log Graph error.code/message.
+    - Fixed: body contentType/importance/showAs/sensitivity/recurrence enums are sent
+      as Graph's camelCase values (html/text, normal, busy, weekly, ...).
+    - Fixed: Mail create retries without from/sender/internetMessageId (SendAs and
+      duplicate Internet-Message-Id are common 400s). Original From is still stamped
+      via MAPI sender properties so Outlook can show the original sender.
 
     Changelog v1.11:
     - Fixed: Every mail and calendar create failed with "Argument types do not match".
@@ -231,6 +245,25 @@ function Get-GraphProperty {
     return $null
 }
 
+function Get-GraphItemList {
+    param($Value)
+    $items = New-Object System.Collections.ArrayList
+    if ($null -eq $Value) { return , $items }
+    # Hashtable is IEnumerable of its values — a lone Graph object must stay one item.
+    if ($Value -is [System.Collections.IDictionary]) {
+        [void]$items.Add($Value)
+        return , $items
+    }
+    if ($Value -is [System.Collections.IEnumerable] -and -not ($Value -is [string])) {
+        foreach ($i in $Value) {
+            if ($null -ne $i) { [void]$items.Add($i) }
+        }
+        return , $items
+    }
+    [void]$items.Add($Value)
+    return , $items
+}
+
 function Get-GraphNextLink {
     param($Response)
     $link = Get-GraphProperty -Object $Response -Names @('@odata.nextLink')
@@ -272,7 +305,7 @@ function Get-GraphCollection {
         $next = Get-GraphNextLink -Response $resp
         if ($next) { Start-Sleep -Milliseconds $PageDelayMs }
     }
-    return $items
+    return , $items
 }
 
 function Format-DedupeDate {
@@ -326,8 +359,44 @@ function Get-GraphMessageById {
     }
 }
 
+function ConvertTo-PlainGraphObject {
+    param(
+        $Object,
+        [int]$Depth = 12
+    )
+    if ($null -eq $Object -or $Depth -le 0) { return $null }
+    if ($Object -is [string] -or $Object -is [bool] -or
+        $Object -is [int] -or $Object -is [long] -or $Object -is [double] -or
+        $Object -is [decimal] -or $Object -is [byte]) {
+        return $Object
+    }
+    # byte[] is IEnumerable; never expand it into a JSON number array
+    if ($Object -is [byte[]]) {
+        return [convert]::ToBase64String($Object)
+    }
+    if ($Object -is [System.Collections.IDictionary]) {
+        $h = @{}
+        foreach ($k in @($Object.Keys)) {
+            $converted = ConvertTo-PlainGraphObject -Object $Object[$k] -Depth ($Depth - 1)
+            if ($null -ne $converted) { $h["$k"] = $converted }
+        }
+        return $h
+    }
+    if ($Object -is [System.Collections.IEnumerable] -and -not ($Object -is [string])) {
+        $list = New-Object System.Collections.ArrayList
+        foreach ($item in $Object) {
+            $converted = ConvertTo-PlainGraphObject -Object $item -Depth ($Depth - 1)
+            if ($null -ne $converted) { [void]$list.Add($converted) }
+        }
+        # Unary comma keeps a single-element object[] from collapsing to a hashtable
+        return , $list.ToArray()
+    }
+    return "$Object"
+}
+
 function ConvertTo-GraphJson {
     param([Parameter(Mandatory = $true)]$InputObject)
+    $plain = ConvertTo-PlainGraphObject -Object $InputObject
 
     try {
         $loaded = [appdomain]::CurrentDomain.GetAssemblies() |
@@ -340,11 +409,25 @@ function ConvertTo-GraphJson {
                 if ($njs) { Add-Type -Path $njs.FullName -ErrorAction SilentlyContinue }
             }
         }
-        return [Newtonsoft.Json.JsonConvert]::SerializeObject($InputObject)
+        $json = [Newtonsoft.Json.JsonConvert]::SerializeObject($plain)
+        if ($json -and $json -ne 'null') { return $json }
     }
-    catch {
-        return ($InputObject | ConvertTo-Json -Depth 30)
+    catch { }
+
+    # JavaScriptSerializer preserves single-element arrays. ConvertTo-Json in
+    # Windows PowerShell 5.1 turns @( @{id=...} ) into a JSON object, which Graph
+    # rejects for collection properties (400 Bad Request).
+    try {
+        Add-Type -AssemblyName System.Web.Extensions -ErrorAction Stop
+        $ser = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+        $ser.MaxJsonLength = [int]::MaxValue
+        $ser.RecursionLimit = 100
+        $json = $ser.Serialize($plain)
+        if ($json -and $json -ne 'null') { return $json }
     }
+    catch { }
+
+    return ($plain | ConvertTo-Json -Depth 30 -Compress)
 }
 
 function Get-GraphAccessTokenString {
@@ -387,49 +470,128 @@ function Invoke-GraphJsonPost {
         [Parameter(Mandatory = $true)]$BodyObject
     )
 
-    if ($BodyObject -is [hashtable] -and $BodyObject.ContainsKey('singleValueExtendedProperties')) {
-        $normalized = New-Object System.Collections.ArrayList
-        foreach ($p in $BodyObject.singleValueExtendedProperties) {
-            if ($p -is [hashtable]) { [void]$normalized.Add($p) }
-        }
-        $BodyObject.singleValueExtendedProperties = $normalized
-    }
+    $plain = ConvertTo-PlainGraphObject -Object $BodyObject
+    $json  = ConvertTo-GraphJson -InputObject $plain
 
     Invoke-WithRetry -ScriptBlock {
-        $json  = ConvertTo-GraphJson -InputObject $BodyObject
+        $lastError = $null
+
+        # Prefer RestMethod + UTF-8 JSON. Invoke-MgGraphRequest -Body byte[] (v1.11)
+        # made Graph return 400 Bad Request on every create.
         $token = Get-GraphAccessTokenString
         if ($token) {
-            $headers = @{
-                Authorization  = "Bearer $token"
-                Accept         = 'application/json'
+            try {
+                $headers = @{
+                    Authorization = "Bearer $token"
+                    Accept        = 'application/json'
+                }
+                return Invoke-RestMethod -Method Post -Uri $Uri -Headers $headers -Body $json -ContentType 'application/json; charset=utf-8'
             }
-            return Invoke-RestMethod -Method Post -Uri $Uri -Headers $headers -Body $json -ContentType 'application/json; charset=utf-8'
+            catch { $lastError = $_ }
         }
 
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
         try {
-            return Invoke-MgGraphRequest -Method POST -Uri $Uri -Body $bytes -ContentType 'application/json'
+            return Invoke-MgGraphRequest -Method POST -Uri $Uri -Body $plain -ContentType 'application/json'
         }
-        catch {
-            $msg = $_.Exception.Message
-            if ($msg -match 'Argument types do not match|Cannot convert|Byte\[\]|IDictionary|Hashtable') {
-                return Invoke-MgGraphRequest -Method POST -Uri $Uri -Body $BodyObject -ContentType 'application/json'
-            }
-            throw
+        catch { $lastError = $_ }
+
+        try {
+            return Invoke-MgGraphRequest -Method POST -Uri $Uri -Body $json -ContentType 'application/json'
+        }
+        catch { $lastError = $_ }
+
+        if ($lastError) { throw $lastError }
+        throw 'Graph POST failed (no access token for Invoke-RestMethod, and Invoke-MgGraphRequest did not succeed).'
+    }
+}
+
+function Expand-GraphErrorJson {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    try {
+        $obj = $Text | ConvertFrom-Json
+        $err = $obj.error
+        if (-not $err -and $obj.Error) { $err = $obj.Error }
+        if ($err) {
+            $code = $err.code; if (-not $code) { $code = $err.Code }
+            $message = $err.message; if (-not $message) { $message = $err.Message }
+            if ($code -and $message) { return "${code}: $message" }
+            if ($message) { return [string]$message }
         }
     }
+    catch { }
+    if ($Text.Length -gt 500) { return $Text.Substring(0, 500) }
+    return $Text
+}
+
+function Get-ExceptionHttpBody {
+    param($Exception)
+    $ex = $Exception
+    $seen = 0
+    while ($ex -and $seen -lt 8) {
+        $seen++
+        try {
+            $resp = $ex.Response
+            if ($resp) {
+                if ($resp.PSObject.Properties['Content'] -and $resp.Content) {
+                    try {
+                        $task = $resp.Content.ReadAsStringAsync()
+                        $text = $task.GetAwaiter().GetResult()
+                        if ($text) { return $text }
+                    }
+                    catch { }
+                }
+                if ($resp.PSObject.Methods['GetResponseStream']) {
+                    $stream = $resp.GetResponseStream()
+                    if ($stream) {
+                        if ($stream.CanSeek) { [void]$stream.Seek(0, [System.IO.SeekOrigin]::Begin) }
+                        $reader = New-Object System.IO.StreamReader($stream)
+                        $text = $reader.ReadToEnd()
+                        if ($text) { return $text }
+                    }
+                }
+            }
+        }
+        catch { }
+        if ($ex.PSObject.Properties['Error'] -and $ex.Error) {
+            $code = $ex.Error.code; if (-not $code) { $code = $ex.Error.Code }
+            $message = $ex.Error.message; if (-not $message) { $message = $ex.Error.Message }
+            if ($code -or $message) { return (@{ error = @{ code = "$code"; message = "$message" } } | ConvertTo-Json -Compress) }
+        }
+        $ex = $ex.InnerException
+    }
+    return $null
 }
 
 function Get-CopyErrorDetail {
     param($ErrorRecord)
-    $msg = $ErrorRecord.Exception.Message
-    if ($ErrorRecord.Exception.InnerException -and $ErrorRecord.Exception.InnerException.Message) {
-        $msg += " | $($ErrorRecord.Exception.InnerException.Message)"
+    $parts = New-Object System.Collections.ArrayList
+
+    if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+        $g = Expand-GraphErrorJson $ErrorRecord.ErrorDetails.Message
+        if ($g) { [void]$parts.Add($g) }
     }
-    if ($ErrorRecord.InvocationInfo -and $ErrorRecord.InvocationInfo.ScriptLineNumber) {
-        $msg += " [line $($ErrorRecord.InvocationInfo.ScriptLineNumber)]"
+
+    $body = Get-ExceptionHttpBody $ErrorRecord.Exception
+    if ($body) {
+        $g = Expand-GraphErrorJson $body
+        if ($g) { [void]$parts.Add($g) }
     }
-    return $msg
+
+    $ex = $ErrorRecord.Exception
+    $seen = 0
+    while ($ex -and $seen -lt 8) {
+        $seen++
+        if ($ex.Message) {
+            $g = Expand-GraphErrorJson $ex.Message
+            if ($g) { [void]$parts.Add($g) } else { [void]$parts.Add($ex.Message) }
+        }
+        $ex = $ex.InnerException
+    }
+
+    if ($parts.Count -eq 0) { return 'Unknown error' }
+    $unique = @($parts | Select-Object -Unique)
+    return ($unique -join ' | ')
 }
 
 function Set-CopyProgress {
@@ -447,7 +609,7 @@ function Set-CopyProgress {
 }
 
 function New-ExtPropList {
-    return New-Object System.Collections.ArrayList
+    return , (New-Object System.Collections.ArrayList)
 }
 
 function Add-ExtProp {
@@ -471,6 +633,42 @@ function Add-ExtPropRange {
     }
 }
 
+function Convert-ExtPropArray {
+    param($List)
+    $out = New-Object System.Collections.ArrayList
+    if ($null -eq $List) { return $null }
+
+    $items = New-Object System.Collections.ArrayList
+    # Hashtable is IEnumerable of its values — never foreach a lone {id,value} property.
+    if ($List -is [System.Collections.IDictionary]) {
+        [void]$items.Add($List)
+    }
+    elseif ($List -is [System.Collections.IEnumerable] -and -not ($List -is [string])) {
+        foreach ($p in $List) { if ($null -ne $p) { [void]$items.Add($p) } }
+    }
+    else {
+        [void]$items.Add($List)
+    }
+
+    foreach ($p in $items) {
+        $id  = $null
+        $val = $null
+        if ($p -is [System.Collections.IDictionary]) {
+            $id  = $p['id'];  if (-not $id)  { $id  = $p.id }
+            $val = $p['value']; if ($null -eq $val) { $val = $p.value }
+        }
+        else {
+            $id  = $p.id
+            $val = $p.value
+        }
+        if ($id -and $null -ne $val) {
+            [void]$out.Add(@{ id = "$id"; value = "$val" })
+        }
+    }
+    if ($out.Count -eq 0) { return $null }
+    return , $out.ToArray()
+}
+
 function Copy-HashtableExcept {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Source,
@@ -487,7 +685,64 @@ function Copy-HashtableExcept {
 function Convert-GraphEnumString {
     param($Value, [string]$Fallback = $null)
     if ($null -eq $Value -or "$Value" -eq '') { return $Fallback }
-    return "$Value"
+    $s = "$Value".Trim()
+    $key = $s.ToLowerInvariant()
+    $known = @{
+        'html'              = 'html'
+        'text'              = 'text'
+        'low'               = 'low'
+        'normal'            = 'normal'
+        'high'              = 'high'
+        'free'              = 'free'
+        'tentative'         = 'tentative'
+        'busy'              = 'busy'
+        'oof'               = 'oof'
+        'workingelsewhere'  = 'workingElsewhere'
+        'unknown'           = 'unknown'
+        'personal'          = 'personal'
+        'private'           = 'private'
+        'confidential'      = 'confidential'
+        'daily'             = 'daily'
+        'weekly'            = 'weekly'
+        'absolutemonthly'   = 'absoluteMonthly'
+        'relativemonthly'   = 'relativeMonthly'
+        'absoluteyearly'    = 'absoluteYearly'
+        'relativeyearly'    = 'relativeYearly'
+        'enddate'           = 'endDate'
+        'noend'             = 'noEnd'
+        'numbered'          = 'numbered'
+        'sunday'            = 'sunday'
+        'monday'            = 'monday'
+        'tuesday'           = 'tuesday'
+        'wednesday'         = 'wednesday'
+        'thursday'          = 'thursday'
+        'friday'            = 'friday'
+        'saturday'          = 'saturday'
+        'first'             = 'first'
+        'second'            = 'second'
+        'third'             = 'third'
+        'fourth'            = 'fourth'
+        'last'              = 'last'
+        'required'          = 'required'
+        'optional'          = 'optional'
+        'resource'          = 'resource'
+        'singleinstance'    = 'singleInstance'
+        'occurrence'        = 'occurrence'
+        'exception'         = 'exception'
+        'seriesmaster'      = 'seriesMaster'
+        'default'           = 'default'
+        'conferenceroom'    = 'conferenceRoom'
+        'homeaddress'       = 'homeAddress'
+        'businessaddress'   = 'businessAddress'
+        'geocoordinates'    = 'geoCoordinates'
+        'streetaddress'     = 'streetAddress'
+        'hotel'             = 'hotel'
+        'restaurant'        = 'restaurant'
+        'localbusiness'     = 'localBusiness'
+        'postaladdress'     = 'postalAddress'
+    }
+    if ($known.ContainsKey($key)) { return $known[$key] }
+    return $s
 }
 
 function Format-MapiSystemTime {
@@ -532,9 +787,9 @@ function Convert-GraphEmailRecipient {
 function Convert-GraphDateTimeTimeZone {
     param($DateTimeTimeZone)
     if (-not $DateTimeTimeZone) { return $null }
-    $dt = $DateTimeTimeZone.DateTime
+    $dt = Get-GraphProperty -Object $DateTimeTimeZone -Names @('dateTime', 'DateTime')
     if (-not $dt) { return $null }
-    $tz = Convert-GraphEnumString -Value $DateTimeTimeZone.TimeZone -Fallback 'UTC'
+    $tz = Convert-GraphEnumString -Value (Get-GraphProperty -Object $DateTimeTimeZone -Names @('timeZone', 'TimeZone')) -Fallback 'UTC'
     return @{
         dateTime = "$dt"
         timeZone = $tz
@@ -550,10 +805,8 @@ function Convert-GraphLocation {
     $result = @{}
     if ($display) { $result.displayName = "$display" }
     if ($uri)     { $result.locationUri = "$uri" }
-    if ($Location.LocationType) { $result.locationType = "$( $Location.LocationType )" }
-    if ($Location.LocationEmailAddress) { $result.locationEmailAddress = "$($Location.LocationEmailAddress)" }
-    if ($Location.UniqueId) { $result.uniqueId = "$($Location.UniqueId)" }
-    if ($Location.UniqueIdType) { $result.uniqueIdType = "$($Location.UniqueIdType)" }
+    # Do not copy uniqueId / locationType from the source mailbox; those ids are
+    # not valid on the target and Graph returns 400 Bad Request.
     return $result
 }
 
@@ -577,7 +830,7 @@ function Convert-GraphRecurrence {
         interval = [int]$p.Interval
     }
     if ($p.DaysOfWeek) {
-        $pattern.daysOfWeek = @($p.DaysOfWeek | ForEach-Object { "$_" })
+        $pattern.daysOfWeek = @($p.DaysOfWeek | ForEach-Object { Convert-GraphEnumString -Value $_ })
     }
     if ($p.FirstDayOfWeek) { $pattern.firstDayOfWeek = (Convert-GraphEnumString -Value $p.FirstDayOfWeek) }
     if ($null -ne $p.Month -and "$($p.Month)" -ne '' -and [int]$p.Month -gt 0) { $pattern.month = [int]$p.Month }
@@ -655,7 +908,7 @@ function New-TeamsMeetingExtendedProperties {
     )
 
     $props = New-ExtPropList
-    if (-not $JoinUrl) { return $props }
+    if (-not $JoinUrl) { return , $props }
 
     Add-ExtProp -List $props -Id "String $script:PsetPublicStrings Name SkypeTeamsMeetingUrl" -Value $JoinUrl
     Add-ExtProp -List $props -Id "String $script:PsetAppointment Id 0x8248" -Value $JoinUrl   # PidLidNetShowUrl
@@ -699,7 +952,7 @@ function New-TeamsMeetingExtendedProperties {
             -Value "https://teams.microsoft.com/meetingOptions/?organizerId=$oid&tenantId=$tid&threadId=$threadForPath&messageId=0"
     }
 
-    return $props
+    return , $props
 }
 
 function Add-TeamsJoinLinkToBody {
@@ -709,20 +962,20 @@ function Add-TeamsJoinLinkToBody {
     )
     if (-not $JoinUrl) { return $Body }
     if (-not $Body) {
-        $Body = @{ contentType = 'HTML'; content = '' }
+        $Body = @{ contentType = 'html'; content = '' }
     }
 
     $content     = if ($Body.content) { "$($Body.content)" } else { '' }
-    $contentType = if ($Body.contentType) { "$($Body.contentType)" } else { 'HTML' }
+    $contentType = if ($Body.contentType) { "$($Body.contentType)" } else { 'html' }
 
     if ($content -match [regex]::Escape($JoinUrl) -or $content -match 'meetup-join') {
         return $Body
     }
 
-    if ($contentType -match 'HTML') {
+    if ($contentType -match '(?i)html') {
         $linkHtml = "<div style=`"margin-bottom:12px;`"><a href=`"$JoinUrl`">Join Microsoft Teams Meeting</a></div>"
         $Body.content     = $linkHtml + $content
-        $Body.contentType = 'HTML'
+        $Body.contentType = 'html'
     }
     else {
         $Body.content = "Join Microsoft Teams Meeting: $JoinUrl`r`n`r`n$content"
@@ -738,13 +991,12 @@ function Add-AttendeeListToBody {
     if (-not $Attendees) { return $Body }
     $required = New-Object System.Collections.Generic.List[string]
     $optional = New-Object System.Collections.Generic.List[string]
-    foreach ($att in @($Attendees)) {
+    foreach ($att in (Get-GraphItemList $Attendees)) {
         $address = $null
         $name    = $null
-        if ($att.EmailAddress) {
-            $address = $att.EmailAddress.Address
-            $name    = $att.EmailAddress.Name
-        }
+        $email   = Get-GraphProperty -Object $att -Names @('emailAddress', 'EmailAddress')
+        $address = Get-GraphProperty -Object $email -Names @('address', 'Address')
+        $name    = Get-GraphProperty -Object $email -Names @('name', 'Name')
         if (-not $address) { continue }
         $entry = if ($name) { "$name <$address>" } else { "$address" }
         $type  = (Convert-GraphEnumString -Value $att.Type -Fallback 'required').ToLowerInvariant()
@@ -752,19 +1004,19 @@ function Add-AttendeeListToBody {
     }
     if ($required.Count -eq 0 -and $optional.Count -eq 0) { return $Body }
 
-    if (-not $Body) { $Body = @{ contentType = 'HTML'; content = '' } }
+    if (-not $Body) { $Body = @{ contentType = 'html'; content = '' } }
     $content     = if ($Body.content) { "$($Body.content)" } else { '' }
-    $contentType = if ($Body.contentType) { "$($Body.contentType)" } else { 'HTML' }
+    $contentType = if ($Body.contentType) { "$($Body.contentType)" } else { 'html' }
 
     $reqText = ($required -join '; ')
     $optText = ($optional -join '; ')
-    if ($contentType -match 'HTML') {
+    if ($contentType -match '(?i)html') {
         $html = '<div style="margin-bottom:12px;color:#5f6a7d;font-size:12px;">'
         if ($reqText) { $html += "<div><b>Required attendees:</b> $([System.Net.WebUtility]::HtmlEncode($reqText))</div>" }
         if ($optText) { $html += "<div><b>Optional attendees:</b> $([System.Net.WebUtility]::HtmlEncode($optText))</div>" }
         $html += '</div>'
         $Body.content     = $html + $content
-        $Body.contentType = 'HTML'
+        $Body.contentType = 'html'
     }
     else {
         $block = ''
@@ -785,11 +1037,48 @@ function Convert-ShowAsToBusyStatus {
     }
 }
 
+function Add-SenderExtendedProperties {
+    param(
+        $List,
+        $FromObj,
+        $SenderObj
+    )
+    $fromAddr = $null; $fromName = $null
+    $sendAddr = $null; $sendName = $null
+    if ($FromObj -and $FromObj.emailAddress) {
+        $fromAddr = $FromObj.emailAddress.address
+        $fromName = $FromObj.emailAddress.name
+    }
+    if ($SenderObj -and $SenderObj.emailAddress) {
+        $sendAddr = $SenderObj.emailAddress.address
+        $sendName = $SenderObj.emailAddress.name
+    }
+    if (-not $sendAddr) { $sendAddr = $fromAddr }
+    if (-not $sendName) { $sendName = $fromName }
+
+    # PidTagSenderSmtpAddress / PidTagSenderEmailAddress / PidTagSenderName
+    if ($sendAddr) {
+        Add-ExtProp -List $List -Id 'String 0x5D01' -Value "$sendAddr"
+        Add-ExtProp -List $List -Id 'String 0x0C1F' -Value "$sendAddr"
+    }
+    if ($sendName) {
+        Add-ExtProp -List $List -Id 'String 0x0C1A' -Value "$sendName"
+    }
+    # PidTagSentRepresentingSmtpAddress / EmailAddress / Name (Outlook From)
+    if ($fromAddr) {
+        Add-ExtProp -List $List -Id 'String 0x5D02' -Value "$fromAddr"
+        Add-ExtProp -List $List -Id 'String 0x0065' -Value "$fromAddr"
+    }
+    if ($fromName) {
+        Add-ExtProp -List $List -Id 'String 0x0042' -Value "$fromName"
+    }
+}
+
 function New-SilentAttendeeExtendedProperties {
     param($Attendees)
 
     $props = New-ExtPropList
-    if (-not $Attendees) { return $props }
+    if (-not $Attendees) { return , $props }
 
     $required  = New-Object System.Collections.Generic.List[string]
     $optional  = New-Object System.Collections.Generic.List[string]
@@ -797,13 +1086,12 @@ function New-SilentAttendeeExtendedProperties {
     $toNames   = New-Object System.Collections.Generic.List[string]
     $ccNames   = New-Object System.Collections.Generic.List[string]
 
-    foreach ($att in @($Attendees)) {
+    foreach ($att in (Get-GraphItemList $Attendees)) {
         $address = $null
         $name    = $null
-        if ($att.EmailAddress) {
-            $address = $att.EmailAddress.Address
-            $name    = $att.EmailAddress.Name
-        }
+        $email   = Get-GraphProperty -Object $att -Names @('emailAddress', 'EmailAddress')
+        $address = Get-GraphProperty -Object $email -Names @('address', 'Address')
+        $name    = Get-GraphProperty -Object $email -Names @('name', 'Name')
         if (-not $address) { continue }
         $label = if ($name) { "$name" } else { "$address" }
         $entry = if ($name) { "$name <$address>" } else { "$address" }
@@ -842,7 +1130,7 @@ function New-SilentAttendeeExtendedProperties {
         Add-ExtProp -List $props -Id "String $script:PsetMeeting Id 0x0008" -Value ($resource -join '; ')
     }
 
-    return $props
+    return , $props
 }
 
 function Copy-MessageAttachments {
@@ -1220,10 +1508,10 @@ function Copy-Emails {
                             $msgBody = @{
                                 subject = $subject
                                 body    = @{
-                                    contentType = if ($bodyType) { "$bodyType" } else { 'Text' }
+                                    contentType = Convert-GraphEnumString -Value $bodyType -Fallback 'text'
                                     content     = if ($bodyContent) { "$bodyContent" } else { '' }
                                 }
-                                importance = if ($importance) { "$importance" } else { 'Normal' }
+                                importance = Convert-GraphEnumString -Value $importance -Fallback 'normal'
                                 isRead     = $isRead
                             }
 
@@ -1240,31 +1528,41 @@ function Copy-Emails {
                             if ($submitTime)   { Add-ExtProp -List $extended -Id 'SystemTime 0x0039' -Value $submitTime }
                             if ($deliveryTime) { Add-ExtProp -List $extended -Id 'SystemTime 0x0E06' -Value $deliveryTime }
 
-                            $msgBody.singleValueExtendedProperties = @($extended)
+                            $toList = New-Object System.Collections.ArrayList
+                            foreach ($r in (Get-GraphItemList (Get-GraphProperty -Object $message -Names @('toRecipients', 'ToRecipients')))) {
+                                $conv = Convert-GraphEmailRecipient -Recipient $r
+                                if ($conv) { [void]$toList.Add($conv) }
+                            }
+                            if ($toList.Count) { $msgBody.toRecipients = $toList.ToArray() }
 
-                            $toList = @(foreach ($r in @(Get-GraphProperty -Object $message -Names @('toRecipients', 'ToRecipients'))) {
-                                Convert-GraphEmailRecipient -Recipient $r
-                            }) | Where-Object { $_ }
-                            if ($toList.Count) { $msgBody.toRecipients = @($toList) }
+                            $ccList = New-Object System.Collections.ArrayList
+                            foreach ($r in (Get-GraphItemList (Get-GraphProperty -Object $message -Names @('ccRecipients', 'CcRecipients')))) {
+                                $conv = Convert-GraphEmailRecipient -Recipient $r
+                                if ($conv) { [void]$ccList.Add($conv) }
+                            }
+                            if ($ccList.Count) { $msgBody.ccRecipients = $ccList.ToArray() }
 
-                            $ccList = @(foreach ($r in @(Get-GraphProperty -Object $message -Names @('ccRecipients', 'CcRecipients'))) {
-                                Convert-GraphEmailRecipient -Recipient $r
-                            }) | Where-Object { $_ }
-                            if ($ccList.Count) { $msgBody.ccRecipients = @($ccList) }
+                            $bccList = New-Object System.Collections.ArrayList
+                            foreach ($r in (Get-GraphItemList (Get-GraphProperty -Object $message -Names @('bccRecipients', 'BccRecipients')))) {
+                                $conv = Convert-GraphEmailRecipient -Recipient $r
+                                if ($conv) { [void]$bccList.Add($conv) }
+                            }
+                            if ($bccList.Count) { $msgBody.bccRecipients = $bccList.ToArray() }
 
-                            $bccList = @(foreach ($r in @(Get-GraphProperty -Object $message -Names @('bccRecipients', 'BccRecipients'))) {
-                                Convert-GraphEmailRecipient -Recipient $r
-                            }) | Where-Object { $_ }
-                            if ($bccList.Count) { $msgBody.bccRecipients = @($bccList) }
-
+                            $fromObj = $null
+                            $senderObj = $null
                             if (-not $isDraftFolder) {
                                 $fromObj = Convert-GraphEmailRecipient -Recipient (Get-GraphProperty -Object $message -Names @('from', 'From'))
-                                if ($fromObj) { $msgBody.from = $fromObj }
                                 $senderObj = Convert-GraphEmailRecipient -Recipient (Get-GraphProperty -Object $message -Names @('sender', 'Sender'))
+                                if ($fromObj) { $msgBody.from = $fromObj }
                                 if ($senderObj) { $msgBody.sender = $senderObj }
                                 $internetId = Get-GraphProperty -Object $message -Names @('internetMessageId', 'InternetMessageId')
                                 if ($internetId) { $msgBody.internetMessageId = "$internetId" }
+                                Add-SenderExtendedProperties -List $extended -FromObj $fromObj -SenderObj $senderObj
                             }
+
+                            $extArr = Convert-ExtPropArray $extended
+                            if ($extArr) { $msgBody.singleValueExtendedProperties = $extArr }
 
                             $categories = Get-GraphProperty -Object $message -Names @('categories', 'Categories')
                             if ($categories -and @($categories).Count -gt 0) {
@@ -1282,19 +1580,25 @@ function Copy-Emails {
                                 $created = Invoke-GraphJsonPost -Uri $createUri -BodyObject $msgBody
                             }
                             catch {
-                                $flagsOnly = Copy-HashtableExcept -Source $msgBody -ExcludeKeys @('singleValueExtendedProperties')
-                                $flagsOnly.singleValueExtendedProperties = @(@{ id = 'Integer 0x0E07'; value = "$msgFlags" })
+                                $noIdentity = Copy-HashtableExcept -Source $msgBody -ExcludeKeys @('from', 'sender', 'internetMessageId')
                                 try {
-                                    $created = Invoke-GraphJsonPost -Uri $createUri -BodyObject $flagsOnly
+                                    $created = Invoke-GraphJsonPost -Uri $createUri -BodyObject $noIdentity
                                 }
                                 catch {
-                                    $minimal = @{
-                                        subject = $subject
-                                        body    = $msgBody.body
-                                        isRead  = $isRead
-                                        singleValueExtendedProperties = @(@{ id = 'Integer 0x0E07'; value = "$msgFlags" })
+                                    $flagsOnly = Copy-HashtableExcept -Source $noIdentity -ExcludeKeys @('singleValueExtendedProperties')
+                                    $flagsOnly.singleValueExtendedProperties = Convert-ExtPropArray @(@{ id = 'Integer 0x0E07'; value = "$msgFlags" })
+                                    try {
+                                        $created = Invoke-GraphJsonPost -Uri $createUri -BodyObject $flagsOnly
                                     }
-                                    $created = Invoke-GraphJsonPost -Uri $createUri -BodyObject $minimal
+                                    catch {
+                                        $minimal = @{
+                                            subject = $subject
+                                            body    = $msgBody.body
+                                            isRead  = $isRead
+                                            singleValueExtendedProperties = Convert-ExtPropArray @(@{ id = 'Integer 0x0E07'; value = "$msgFlags" })
+                                        }
+                                        $created = Invoke-GraphJsonPost -Uri $createUri -BodyObject $minimal
+                                    }
                                 }
                             }
                             $newId = Get-GraphProperty -Object $created -Names @('id', 'Id')
@@ -1521,7 +1825,7 @@ function Copy-CalendarItems {
 
                 try {
                     $bodyContent = @{
-                        contentType = if ($event.Body.ContentType) { "$($event.Body.ContentType)" } else { 'Text' }
+                        contentType = Convert-GraphEnumString -Value $(if ($event.Body) { $event.Body.ContentType } else { $null }) -Fallback 'text'
                         content     = if ($event.Body.Content)     { "$($event.Body.Content)" }     else { '' }
                     }
 
@@ -1536,6 +1840,7 @@ function Copy-CalendarItems {
                     if ($event.Attendees) {
                         $bodyContent = Add-AttendeeListToBody -Body $bodyContent -Attendees $event.Attendees
                     }
+                    $bodyContent.contentType = Convert-GraphEnumString -Value $bodyContent.contentType -Fallback 'text'
 
                     $start = Convert-GraphDateTimeTimeZone -DateTimeTimeZone $event.Start
                     $end   = Convert-GraphDateTimeTimeZone -DateTimeTimeZone $event.End
@@ -1593,9 +1898,9 @@ function Copy-CalendarItems {
                     Add-ExtProp -List $extended -Id "Integer $script:PsetAppointment Id 0x8205" -Value "$(Convert-ShowAsToBusyStatus $event.ShowAs)"
 
                     $organizerEmail = $null
-                    if ($event.Organizer -and $event.Organizer.EmailAddress) {
-                        $organizerEmail = $event.Organizer.EmailAddress.Address
-                    }
+                    $organizer = Get-GraphProperty -Object $event -Names @('organizer', 'Organizer')
+                    $orgEmailObj = Get-GraphProperty -Object $organizer -Names @('emailAddress', 'EmailAddress')
+                    $organizerEmail = Get-GraphProperty -Object $orgEmailObj -Names @('address', 'Address')
                     if ($organizerEmail) {
                         Add-ExtProp -List $extended -Id "String $script:PsetAppointment Id 0x8243" -Value "$organizerEmail"
                     }
@@ -1609,7 +1914,8 @@ function Copy-CalendarItems {
                         Add-ExtPropRange -List $extended -Items (New-TeamsMeetingExtendedProperties -JoinUrl $joinUrl -OrganizerEmail $organizerEmail)
                     }
 
-                    $eventBody.singleValueExtendedProperties = @($extended)
+                    $extArr = Convert-ExtPropArray $extended
+                    if ($extArr) { $eventBody.singleValueExtendedProperties = $extArr }
 
                     try {
                         Invoke-GraphJsonPost -Uri $createUri -BodyObject $eventBody | Out-Null
@@ -1617,8 +1923,19 @@ function Copy-CalendarItems {
                     catch {
                         # Retry without named properties if Graph rejected an extended-property id.
                         # Body still contains the Teams join hyperlink; invitations are still not sent.
-                        $reduced = Copy-HashtableExcept -Source $eventBody -ExcludeKeys @('singleValueExtendedProperties')
-                        Invoke-GraphJsonPost -Uri $createUri -BodyObject $reduced | Out-Null
+                        $reduced = Copy-HashtableExcept -Source $eventBody -ExcludeKeys @('singleValueExtendedProperties', 'hideAttendees', 'allowNewTimeProposals', 'responseRequested')
+                        try {
+                            Invoke-GraphJsonPost -Uri $createUri -BodyObject $reduced | Out-Null
+                        }
+                        catch {
+                            $minimal = @{
+                                subject = $event.Subject
+                                body    = $bodyContent
+                                start   = $start
+                                end     = $end
+                            }
+                            Invoke-GraphJsonPost -Uri $createUri -BodyObject $minimal | Out-Null
+                        }
                     }
                     $copiedCount++
                 }
@@ -1713,7 +2030,7 @@ function Verify-CopiedItems {
 # GUI
 # ------------------------------------------------------------------------------
 $form = New-Object System.Windows.Forms.Form
-$form.Text            = "Microsoft 365 Mailbox Copy Tool v1.11 (Interactive Login)"
+$form.Text            = "Microsoft 365 Mailbox Copy Tool v1.12 (Interactive Login)"
 $form.Size            = New-Object System.Drawing.Size(700, 760)
 $form.StartPosition   = "CenterScreen"
 $form.FormBorderStyle = "FixedDialog"
