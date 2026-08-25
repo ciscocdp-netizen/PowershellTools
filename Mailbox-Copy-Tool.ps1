@@ -13,9 +13,15 @@
 
 .NOTES
     Author: v0
-    Version: 1.13
+    Version: 1.14
     Requires: Microsoft.Graph PowerShell SDK
     Authentication: Interactive (Delegated Permissions via browser)
+
+    Changelog v1.14:
+    - Changed: The GUI is resizable (including maximize). Controls stay docked in a
+      table layout so they are not clipped or lost, long labels wrap instead of
+      cutting off, and the status log fills leftover space. A minimum window size
+      keeps the form usable when shrunk.
 
     Changelog v1.13:
     - Fixed: Calendar copy aborted after the first item with
@@ -2035,138 +2041,219 @@ function Verify-CopiedItems {
 # ------------------------------------------------------------------------------
 # GUI
 # ------------------------------------------------------------------------------
+$script:GuiWrapControls = New-Object System.Collections.ArrayList
+$script:GuiLayoutRoot   = $null
+
+function New-GuiLabel {
+    param(
+        [Parameter(Mandatory = $true)][string]$Text,
+        [Parameter(Mandatory = $true)][System.Drawing.Font]$Font,
+        [System.Drawing.Color]$ForeColor = [System.Drawing.Color]::Empty,
+        [int]$TopMargin = 6,
+        [int]$BottomMargin = 2
+    )
+    $l = New-Object System.Windows.Forms.Label
+    $l.Text = $Text
+    $l.Font = $Font
+    $l.AutoSize = $true
+    $l.Margin = New-Object System.Windows.Forms.Padding(0, $TopMargin, 0, $BottomMargin)
+    if ($ForeColor -ne [System.Drawing.Color]::Empty) { $l.ForeColor = $ForeColor }
+    [void]$script:GuiWrapControls.Add($l)
+    return $l
+}
+
+function New-GuiCheckRow {
+    param(
+        [Parameter(Mandatory = $true)][string]$Text,
+        [bool]$Checked = $false
+    )
+    $row = New-Object System.Windows.Forms.TableLayoutPanel
+    $row.AutoSize = $true
+    $row.ColumnCount = 2
+    $row.RowCount = 1
+    $row.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $row.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 2)
+    [void]$row.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 28)))
+    [void]$row.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+
+    $cb = New-Object System.Windows.Forms.CheckBox
+    $cb.AutoSize = $true
+    $cb.Checked = $Checked
+    $cb.Text = ''
+    $cb.Margin = New-Object System.Windows.Forms.Padding(0, 1, 0, 0)
+    $cb.Dock = [System.Windows.Forms.DockStyle]::Left
+
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = $Text
+    $lbl.AutoSize = $true
+    $lbl.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $lbl.Margin = New-Object System.Windows.Forms.Padding(0, 3, 0, 0)
+    $lbl.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $lbl.Tag = $cb
+    $lbl.Add_Click({
+        $box = [System.Windows.Forms.CheckBox]$this.Tag
+        if ($box -and $box.Enabled) { $box.Checked = -not $box.Checked }
+    })
+    [void]$script:GuiWrapControls.Add($lbl)
+
+    $row.Controls.Add($cb, 0, 0)
+    $row.Controls.Add($lbl, 1, 0)
+    return @{ Row = $row; CheckBox = $cb; Label = $lbl }
+}
+
+function Update-GuiWrapWidths {
+    if (-not $script:GuiLayoutRoot) { return }
+    $w = $script:GuiLayoutRoot.ClientSize.Width - $script:GuiLayoutRoot.Padding.Left - $script:GuiLayoutRoot.Padding.Right
+    if ($w -lt 80) { $w = 80 }
+    foreach ($c in $script:GuiWrapControls) {
+        $c.MaximumSize = New-Object System.Drawing.Size($w, 0)
+    }
+}
+
+$fontTitle   = New-Object System.Drawing.Font('Segoe UI', 14, [System.Drawing.FontStyle]::Bold)
+$fontStep    = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
+$fontBody    = New-Object System.Drawing.Font('Segoe UI', 9)
+$fontHint    = New-Object System.Drawing.Font('Segoe UI', 8, [System.Drawing.FontStyle]::Italic)
+$fontButton  = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
+$fontStatus  = New-Object System.Drawing.Font('Consolas', 9)
+
 $form = New-Object System.Windows.Forms.Form
-$form.Text            = "Microsoft 365 Mailbox Copy Tool v1.13 (Interactive Login)"
-$form.Size            = New-Object System.Drawing.Size(700, 760)
+$form.Text            = "Microsoft 365 Mailbox Copy Tool v1.14 (Interactive Login)"
+$form.Size            = New-Object System.Drawing.Size(780, 820)
+$form.MinimumSize     = New-Object System.Drawing.Size(600, 700)
 $form.StartPosition   = "CenterScreen"
-$form.FormBorderStyle = "FixedDialog"
-$form.MaximizeBox     = $false
+$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::Sizable
+$form.MaximizeBox     = $true
+$form.MinimizeBox     = $true
+$form.AutoScaleMode   = [System.Windows.Forms.AutoScaleMode]::Font
+$form.Padding         = New-Object System.Windows.Forms.Padding(0)
 
-$titleLabel          = New-Object System.Windows.Forms.Label
-$titleLabel.Location = New-Object System.Drawing.Point(20, 20)
-$titleLabel.Size     = New-Object System.Drawing.Size(660, 30)
-$titleLabel.Text     = "Copy Emails and Calendar Items Between Mailboxes"
-$titleLabel.Font     = New-Object System.Drawing.Font("Segoe UI", 14, [System.Drawing.FontStyle]::Bold)
-$form.Controls.Add($titleLabel)
+$root = New-Object System.Windows.Forms.TableLayoutPanel
+$root.Dock = [System.Windows.Forms.DockStyle]::Fill
+$root.ColumnCount = 1
+$root.RowCount = 16
+$root.Padding = New-Object System.Windows.Forms.Padding(16)
+$root.GrowStyle = [System.Windows.Forms.TableLayoutPanelGrowStyle]::FixedSize
+[void]$root.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+for ($guiRow = 0; $guiRow -lt 15; $guiRow++) {
+    [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+}
+[void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+$script:GuiLayoutRoot = $root
+$form.Controls.Add($root)
 
-$authLabel          = New-Object System.Windows.Forms.Label
-$authLabel.Location = New-Object System.Drawing.Point(20, 60)
-$authLabel.Size     = New-Object System.Drawing.Size(660, 20)
-$authLabel.Text     = "Step 1: Authenticate (Microsoft Graph)"
-$authLabel.Font     = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-$form.Controls.Add($authLabel)
+$titleLabel = New-GuiLabel -Text "Copy Emails and Calendar Items Between Mailboxes" -Font $fontTitle -TopMargin 0 -BottomMargin 8
+$root.Controls.Add($titleLabel, 0, 0)
 
-$connectButton          = New-Object System.Windows.Forms.Button
-$connectButton.Location = New-Object System.Drawing.Point(20, 85)
-$connectButton.Size     = New-Object System.Drawing.Size(220, 35)
-$connectButton.Text     = "Sign In to Microsoft 365"
-$connectButton.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
-$form.Controls.Add($connectButton)
+$authLabel = New-GuiLabel -Text "Step 1: Authenticate (Microsoft Graph)" -Font $fontStep -TopMargin 4
+$root.Controls.Add($authLabel, 0, 1)
 
-$preflightLabel          = New-Object System.Windows.Forms.Label
-$preflightLabel.Location = New-Object System.Drawing.Point(20, 140)
-$preflightLabel.Size     = New-Object System.Drawing.Size(660, 20)
-$preflightLabel.Text     = "Step 2: Pre-flight Checklist (must be completed before copying)"
-$preflightLabel.Font     = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-$form.Controls.Add($preflightLabel)
+$connectButton = New-Object System.Windows.Forms.Button
+$connectButton.Text = "Sign In to Microsoft 365"
+$connectButton.Font = $fontBody
+$connectButton.AutoSize = $true
+$connectButton.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+$connectButton.MinimumSize = New-Object System.Drawing.Size(200, 32)
+$connectButton.Margin = New-Object System.Windows.Forms.Padding(0, 2, 8, 10)
+$connectButton.Anchor = [System.Windows.Forms.AnchorStyles]::Left
+$root.Controls.Add($connectButton, 0, 2)
 
-$preflightHint          = New-Object System.Windows.Forms.Label
-$preflightHint.Location = New-Object System.Drawing.Point(20, 163)
-$preflightHint.Size     = New-Object System.Drawing.Size(660, 32)
-$preflightHint.Text     = "Grant FullAccess on both mailboxes via Exchange Admin Center or EXO PowerShell before proceeding. Remove it manually when done."
-$preflightHint.Font     = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Italic)
-$preflightHint.ForeColor = [System.Drawing.Color]::Gray
-$form.Controls.Add($preflightHint)
+$preflightLabel = New-GuiLabel -Text "Step 2: Pre-flight Checklist (must be completed before copying)" -Font $fontStep
+$root.Controls.Add($preflightLabel, 0, 3)
 
-$accessGrantedCheckbox          = New-Object System.Windows.Forms.CheckBox
-$accessGrantedCheckbox.Location = New-Object System.Drawing.Point(20, 198)
-$accessGrantedCheckbox.Size     = New-Object System.Drawing.Size(640, 22)
-$accessGrantedCheckbox.Text     = "I have granted FullAccess on both the source and target mailboxes to my account"
-$accessGrantedCheckbox.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
-$accessGrantedCheckbox.Checked  = $false
-$form.Controls.Add($accessGrantedCheckbox)
+$preflightHint = New-GuiLabel -Text "Grant FullAccess on both mailboxes via Exchange Admin Center or EXO PowerShell before proceeding. Remove it manually when done." -Font $fontHint -ForeColor ([System.Drawing.Color]::Gray) -TopMargin 0 -BottomMargin 4
+$root.Controls.Add($preflightHint, 0, 4)
 
-$sourceLabel          = New-Object System.Windows.Forms.Label
-$sourceLabel.Location = New-Object System.Drawing.Point(20, 232)
-$sourceLabel.Size     = New-Object System.Drawing.Size(660, 20)
-$sourceLabel.Text     = "Step 3: Source Mailbox (copy FROM)"
-$sourceLabel.Font     = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-$form.Controls.Add($sourceLabel)
+$accessRow = New-GuiCheckRow -Text "I have granted FullAccess on both the source and target mailboxes to my account" -Checked $false
+$accessGrantedCheckbox = $accessRow.CheckBox
+$accessGrantedLabel    = $accessRow.Label
+$root.Controls.Add($accessRow.Row, 0, 5)
 
-$sourceTextbox          = New-Object System.Windows.Forms.TextBox
-$sourceTextbox.Location = New-Object System.Drawing.Point(20, 255)
-$sourceTextbox.Size     = New-Object System.Drawing.Size(500, 25)
-$sourceTextbox.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
-$form.Controls.Add($sourceTextbox)
+$sourceLabel = New-GuiLabel -Text "Step 3: Source Mailbox (copy FROM)" -Font $fontStep
+$root.Controls.Add($sourceLabel, 0, 6)
 
-$targetLabel          = New-Object System.Windows.Forms.Label
-$targetLabel.Location = New-Object System.Drawing.Point(20, 293)
-$targetLabel.Size     = New-Object System.Drawing.Size(660, 20)
-$targetLabel.Text     = "Step 4: Target Mailbox (copy TO)"
-$targetLabel.Font     = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-$form.Controls.Add($targetLabel)
+$sourceTextbox = New-Object System.Windows.Forms.TextBox
+$sourceTextbox.Font = $fontBody
+$sourceTextbox.Dock = [System.Windows.Forms.DockStyle]::Fill
+$sourceTextbox.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 8)
+$sourceTextbox.MinimumSize = New-Object System.Drawing.Size(100, 24)
+$root.Controls.Add($sourceTextbox, 0, 7)
 
-$targetTextbox          = New-Object System.Windows.Forms.TextBox
-$targetTextbox.Location = New-Object System.Drawing.Point(20, 318)
-$targetTextbox.Size     = New-Object System.Drawing.Size(500, 25)
-$targetTextbox.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
-$form.Controls.Add($targetTextbox)
+$targetLabel = New-GuiLabel -Text "Step 4: Target Mailbox (copy TO)" -Font $fontStep
+$root.Controls.Add($targetLabel, 0, 8)
 
-$optionsLabel          = New-Object System.Windows.Forms.Label
-$optionsLabel.Location = New-Object System.Drawing.Point(20, 357)
-$optionsLabel.Size     = New-Object System.Drawing.Size(660, 20)
-$optionsLabel.Text     = "Step 5: What to Copy"
-$optionsLabel.Font     = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-$form.Controls.Add($optionsLabel)
+$targetTextbox = New-Object System.Windows.Forms.TextBox
+$targetTextbox.Font = $fontBody
+$targetTextbox.Dock = [System.Windows.Forms.DockStyle]::Fill
+$targetTextbox.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 8)
+$targetTextbox.MinimumSize = New-Object System.Drawing.Size(100, 24)
+$root.Controls.Add($targetTextbox, 0, 9)
 
-$emailCheckbox          = New-Object System.Windows.Forms.CheckBox
-$emailCheckbox.Location = New-Object System.Drawing.Point(20, 382)
-$emailCheckbox.Size     = New-Object System.Drawing.Size(200, 25)
-$emailCheckbox.Text     = "Copy Email Messages"
-$emailCheckbox.Checked  = $true
-$emailCheckbox.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
-$form.Controls.Add($emailCheckbox)
+$optionsLabel = New-GuiLabel -Text "Step 5: What to Copy" -Font $fontStep
+$root.Controls.Add($optionsLabel, 0, 10)
 
-$calendarCheckbox          = New-Object System.Windows.Forms.CheckBox
-$calendarCheckbox.Location = New-Object System.Drawing.Point(20, 410)
-$calendarCheckbox.Size     = New-Object System.Drawing.Size(420, 25)
-$calendarCheckbox.Text     = "Copy Calendar Items (attendees silent, Teams links kept)"
-$calendarCheckbox.Checked  = $true
-$calendarCheckbox.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
-$form.Controls.Add($calendarCheckbox)
+$emailRow = New-GuiCheckRow -Text "Copy Email Messages" -Checked $true
+$emailCheckbox = $emailRow.CheckBox
+$emailLabel    = $emailRow.Label
+$root.Controls.Add($emailRow.Row, 0, 11)
 
-$copyButton          = New-Object System.Windows.Forms.Button
-$copyButton.Location = New-Object System.Drawing.Point(20, 450)
-$copyButton.Size     = New-Object System.Drawing.Size(200, 40)
-$copyButton.Text     = "Start Copy"
-$copyButton.Font     = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-$copyButton.Enabled  = $false
-$form.Controls.Add($copyButton)
+$calendarRow = New-GuiCheckRow -Text "Copy Calendar Items (attendees silent, Teams links kept)" -Checked $true
+$calendarCheckbox = $calendarRow.CheckBox
+$calendarLabel    = $calendarRow.Label
+$root.Controls.Add($calendarRow.Row, 0, 12)
 
-$cancelButton           = New-Object System.Windows.Forms.Button
-$cancelButton.Location  = New-Object System.Drawing.Point(230, 450)
-$cancelButton.Size      = New-Object System.Drawing.Size(150, 40)
-$cancelButton.Text      = "Cancel"
-$cancelButton.Font      = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-$cancelButton.Enabled   = $false
+$buttonRow = New-Object System.Windows.Forms.FlowLayoutPanel
+$buttonRow.AutoSize = $true
+$buttonRow.WrapContents = $true
+$buttonRow.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+$buttonRow.Dock = [System.Windows.Forms.DockStyle]::Fill
+$buttonRow.Margin = New-Object System.Windows.Forms.Padding(0, 8, 0, 8)
+$buttonRow.Padding = New-Object System.Windows.Forms.Padding(0)
+
+$copyButton = New-Object System.Windows.Forms.Button
+$copyButton.Text = "Start Copy"
+$copyButton.Font = $fontButton
+$copyButton.AutoSize = $true
+$copyButton.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+$copyButton.MinimumSize = New-Object System.Drawing.Size(140, 36)
+$copyButton.Margin = New-Object System.Windows.Forms.Padding(0, 0, 10, 6)
+$copyButton.Enabled = $false
+$buttonRow.Controls.Add($copyButton)
+
+$cancelButton = New-Object System.Windows.Forms.Button
+$cancelButton.Text = "Cancel"
+$cancelButton.Font = $fontButton
+$cancelButton.AutoSize = $true
+$cancelButton.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+$cancelButton.MinimumSize = New-Object System.Drawing.Size(120, 36)
+$cancelButton.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 6)
+$cancelButton.Enabled = $false
 $cancelButton.BackColor = [System.Drawing.Color]::FromArgb(220, 53, 69)
 $cancelButton.ForeColor = [System.Drawing.Color]::White
-$form.Controls.Add($cancelButton)
+$buttonRow.Controls.Add($cancelButton)
+$root.Controls.Add($buttonRow, 0, 13)
 
-$progressBar          = New-Object System.Windows.Forms.ProgressBar
-$progressBar.Location = New-Object System.Drawing.Point(20, 505)
-$progressBar.Size     = New-Object System.Drawing.Size(660, 25)
-$form.Controls.Add($progressBar)
+$progressBar = New-Object System.Windows.Forms.ProgressBar
+$progressBar.Dock = [System.Windows.Forms.DockStyle]::Fill
+$progressBar.Height = 22
+$progressBar.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 8)
+$progressBar.MinimumSize = New-Object System.Drawing.Size(100, 18)
+$root.Controls.Add($progressBar, 0, 14)
 
-$statusBox            = New-Object System.Windows.Forms.TextBox
-$statusBox.Location   = New-Object System.Drawing.Point(20, 540)
-$statusBox.Size       = New-Object System.Drawing.Size(660, 178)
-$statusBox.Multiline  = $true
+$statusBox = New-Object System.Windows.Forms.TextBox
+$statusBox.Multiline = $true
 $statusBox.ScrollBars = "Vertical"
-$statusBox.ReadOnly   = $true
-$statusBox.Font       = New-Object System.Drawing.Font("Consolas", 9)
-$statusBox.Text       = "Welcome! Click 'Sign In to Microsoft 365' to begin.`r`n"
-$form.Controls.Add($statusBox)
+$statusBox.ReadOnly = $true
+$statusBox.WordWrap = $true
+$statusBox.Font = $fontStatus
+$statusBox.Dock = [System.Windows.Forms.DockStyle]::Fill
+$statusBox.Margin = New-Object System.Windows.Forms.Padding(0)
+$statusBox.MinimumSize = New-Object System.Drawing.Size(100, 80)
+$statusBox.Text = "Welcome! Click 'Sign In to Microsoft 365' to begin.`r`n"
+$root.Controls.Add($statusBox, 0, 15)
+
+$form.Add_Resize({ Update-GuiWrapWidths })
+$form.Add_Shown({ Update-GuiWrapWidths })
 
 $connectButton.Add_Click({
     $connectButton.Enabled = $false
@@ -2242,8 +2329,11 @@ $copyButton.Add_Click({
         $sourceTextbox.Enabled         = $false
         $targetTextbox.Enabled         = $false
         $accessGrantedCheckbox.Enabled = $false
+        $accessGrantedLabel.Enabled    = $false
         $emailCheckbox.Enabled         = $false
+        $emailLabel.Enabled            = $false
         $calendarCheckbox.Enabled      = $false
+        $calendarLabel.Enabled         = $false
         $progressBar.Value             = 0
 
         $statusBox.Clear()
@@ -2287,8 +2377,11 @@ $copyButton.Add_Click({
             $sourceTextbox.Enabled         = $true
             $targetTextbox.Enabled         = $true
             $accessGrantedCheckbox.Enabled = $true
+            $accessGrantedLabel.Enabled    = $true
             $emailCheckbox.Enabled         = $true
+            $emailLabel.Enabled            = $true
             $calendarCheckbox.Enabled      = $true
+            $calendarLabel.Enabled         = $true
             $cancelButton.Enabled          = $false
             $script:CancelRequested        = $false
         }
