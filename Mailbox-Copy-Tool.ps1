@@ -13,9 +13,15 @@
 
 .NOTES
     Author: v0
-    Version: 1.12
+    Version: 1.13
     Requires: Microsoft.Graph PowerShell SDK
     Authentication: Interactive (Delegated Permissions via browser)
+
+    Changelog v1.13:
+    - Fixed: Calendar copy aborted after the first item with
+      Could not compare "1" to "System.Collections.Hashtable". The batch loop and
+      the event's Graph end time both used $end, so after item 1 the for-loop
+      compared the next index to a hashtable. Those are now separate variables.
 
     Changelog v1.12:
     - Fixed: Graph 400 BadRequest on every create (log showed only "BadRequest [line 411]").
@@ -294,7 +300,7 @@ function Get-GraphCollection {
             Invoke-MgGraphRequest -Method GET -Uri $next
         }
         $pageItems = Get-GraphProperty -Object $resp -Names @('value', 'Value')
-        foreach ($it in @($pageItems)) {
+        foreach ($it in (Get-GraphItemList $pageItems)) {
             [void]$items.Add($it)
         }
         if ($StatusBox -and $ProgressPrefix) {
@@ -1461,15 +1467,15 @@ function Copy-Emails {
                     }
 
                     $batchNumber++
-                    $end = $i + $batchSize
-                    if ($end -gt $sourceMessages.Count) { $end = $sourceMessages.Count }
-                    $end = $end - 1
-                    $batchCount = ($end - $i) + 1
+                    $batchEnd = $i + $batchSize
+                    if ($batchEnd -gt $sourceMessages.Count) { $batchEnd = $sourceMessages.Count }
+                    $batchEnd = $batchEnd - 1
+                    $batchCount = ($batchEnd - $i) + 1
 
-                    $StatusBox.AppendText("  Batch $batchNumber : Processing $batchCount messages ($($i + 1)-$($end + 1) of $($sourceMessages.Count))...`r`n")
+                    $StatusBox.AppendText("  Batch $batchNumber : Processing $batchCount messages ($($i + 1)-$($batchEnd + 1) of $($sourceMessages.Count))...`r`n")
                     Update-CopyUi -StatusBox $StatusBox -ProgressBar $ProgressBar
 
-                    for ($j = $i; $j -le $end; $j++) {
+                    for ($j = $i; $j -le $batchEnd; $j++) {
                         if ($script:CancelRequested) {
                             $StatusBox.AppendText("`r`n*** COPY CANCELLED BY USER ***`r`n")
                             Update-CopyUi -StatusBox $StatusBox
@@ -1791,15 +1797,15 @@ function Copy-CalendarItems {
             }
 
             $batchNumber++
-            $end = $i + $batchSize
-            if ($end -gt $totalEvents) { $end = $totalEvents }
-            $end = $end - 1
-            $batchCount = ($end - $i) + 1
+            $batchEnd = $i + $batchSize
+            if ($batchEnd -gt $totalEvents) { $batchEnd = $totalEvents }
+            $batchEnd = $batchEnd - 1
+            $batchCount = ($batchEnd - $i) + 1
 
             $StatusBox.AppendText("  Batch $batchNumber : Processing $batchCount calendar items...`r`n")
             Update-CopyUi -StatusBox $StatusBox -ProgressBar $ProgressBar
 
-            for ($j = $i; $j -le $end; $j++) {
+            for ($j = $i; $j -le $batchEnd; $j++) {
                 $event = $events[$j]
                 if ($script:CancelRequested) {
                     $StatusBox.AppendText("`r`n*** COPY CANCELLED BY USER ***`r`n")
@@ -1842,17 +1848,17 @@ function Copy-CalendarItems {
                     }
                     $bodyContent.contentType = Convert-GraphEnumString -Value $bodyContent.contentType -Fallback 'text'
 
-                    $start = Convert-GraphDateTimeTimeZone -DateTimeTimeZone $event.Start
-                    $end   = Convert-GraphDateTimeTimeZone -DateTimeTimeZone $event.End
-                    if (-not $start -or -not $end) {
+                    $eventStart = Convert-GraphDateTimeTimeZone -DateTimeTimeZone (Get-GraphProperty -Object $event -Names @('start', 'Start'))
+                    $eventEnd   = Convert-GraphDateTimeTimeZone -DateTimeTimeZone (Get-GraphProperty -Object $event -Names @('end', 'End'))
+                    if (-not $eventStart -or -not $eventEnd) {
                         throw "Event is missing start/end: $($event.Subject)"
                     }
 
                     $eventBody = @{
                         subject     = $event.Subject
                         body        = $bodyContent
-                        start       = $start
-                        end         = $end
+                        start       = $eventStart
+                        end         = $eventEnd
                         isAllDay    = [bool]$event.IsAllDay
                         showAs      = (Convert-GraphEnumString -Value $event.ShowAs -Fallback 'busy')
                         importance  = (Convert-GraphEnumString -Value $event.Importance -Fallback 'normal')
@@ -1931,8 +1937,8 @@ function Copy-CalendarItems {
                             $minimal = @{
                                 subject = $event.Subject
                                 body    = $bodyContent
-                                start   = $start
-                                end     = $end
+                                start   = $eventStart
+                                end     = $eventEnd
                             }
                             Invoke-GraphJsonPost -Uri $createUri -BodyObject $minimal | Out-Null
                         }
@@ -1969,7 +1975,7 @@ function Copy-CalendarItems {
     }
     catch {
         $StatusBox.AppendText("ERROR during calendar copy: $($_.Exception.Message)`r`n")
-        throw
+        return @{ Copied = 0; Skipped = 0; Failed = 0; Cancelled = $false }
     }
 }
 
@@ -2030,7 +2036,7 @@ function Verify-CopiedItems {
 # GUI
 # ------------------------------------------------------------------------------
 $form = New-Object System.Windows.Forms.Form
-$form.Text            = "Microsoft 365 Mailbox Copy Tool v1.12 (Interactive Login)"
+$form.Text            = "Microsoft 365 Mailbox Copy Tool v1.13 (Interactive Login)"
 $form.Size            = New-Object System.Drawing.Size(700, 760)
 $form.StartPosition   = "CenterScreen"
 $form.FormBorderStyle = "FixedDialog"
