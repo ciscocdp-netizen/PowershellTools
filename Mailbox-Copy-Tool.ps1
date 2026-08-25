@@ -13,9 +13,17 @@
 
 .NOTES
     Author: v0
-    Version: 1.10
+    Version: 1.11
     Requires: Microsoft.Graph PowerShell SDK
     Authentication: Interactive (Delegated Permissions via browser)
+
+    Changelog v1.11:
+    - Fixed: Every mail and calendar create failed with "Argument types do not match".
+      Invoke-MgGraphRequest -Body was given a JSON string; several Microsoft.Graph.Authentication
+      builds type -Body as Hashtable/Byte[] and throw that error. Posts now go through
+      Invoke-RestMethod with the Graph token (UTF-8 JSON), with byte[]/hashtable SDK fallbacks.
+    - Fixed: [math]::Min(double, int) throws the same error in Windows PowerShell when updating
+      the progress bar (Round returns double, 100 is int). Progress now uses integer percent.
 
     Changelog v1.10:
     - Fixed: UI appeared hung on large folders (e.g. Inbox with 16k+ items). Get-Mg* -All
@@ -320,7 +328,57 @@ function Get-GraphMessageById {
 
 function ConvertTo-GraphJson {
     param([Parameter(Mandatory = $true)]$InputObject)
-    return ($InputObject | ConvertTo-Json -Depth 30 -Compress:$false)
+
+    try {
+        $loaded = [appdomain]::CurrentDomain.GetAssemblies() |
+            Where-Object { $_.GetName().Name -eq 'Newtonsoft.Json' }
+        if (-not $loaded) {
+            $authMod = Get-Module Microsoft.Graph.Authentication -ErrorAction SilentlyContinue
+            if ($authMod) {
+                $njs = Get-ChildItem -Path (Split-Path $authMod.Path -Parent) -Filter 'Newtonsoft.Json.dll' -Recurse -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+                if ($njs) { Add-Type -Path $njs.FullName -ErrorAction SilentlyContinue }
+            }
+        }
+        return [Newtonsoft.Json.JsonConvert]::SerializeObject($InputObject)
+    }
+    catch {
+        return ($InputObject | ConvertTo-Json -Depth 30)
+    }
+}
+
+function Get-GraphAccessTokenString {
+    $cmd = Get-Command Get-MgGraphAccessToken -ErrorAction SilentlyContinue
+    if ($cmd) {
+        $attempts = @(@{})
+        if ($cmd.Parameters.ContainsKey('AsSecureString')) {
+            $attempts += @{ AsSecureString = $true }
+        }
+        foreach ($splat in $attempts) {
+            try {
+                $token = Get-MgGraphAccessToken @splat -ErrorAction Stop
+                if ($token -is [securestring]) {
+                    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($token)
+                    try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+                    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+                }
+                if ($token) { return [string]$token }
+            }
+            catch { }
+        }
+    }
+
+    try {
+        $sessionType = [type]::GetType('Microsoft.Graph.PowerShell.Authentication.GraphSession, Microsoft.Graph.Authentication')
+        if ($sessionType) {
+            $instance = $sessionType.GetProperty('Instance').GetValue($null)
+            $auth = $instance.AuthContext
+            if ($auth.AccessToken) { return [string]$auth.AccessToken }
+        }
+    }
+    catch { }
+
+    return $null
 }
 
 function Invoke-GraphJsonPost {
@@ -328,14 +386,68 @@ function Invoke-GraphJsonPost {
         [Parameter(Mandatory = $true)][string]$Uri,
         [Parameter(Mandatory = $true)]$BodyObject
     )
-    $jsonBody = ConvertTo-GraphJson -InputObject $BodyObject
+
+    if ($BodyObject -is [hashtable] -and $BodyObject.ContainsKey('singleValueExtendedProperties')) {
+        $normalized = New-Object System.Collections.ArrayList
+        foreach ($p in $BodyObject.singleValueExtendedProperties) {
+            if ($p -is [hashtable]) { [void]$normalized.Add($p) }
+        }
+        $BodyObject.singleValueExtendedProperties = $normalized
+    }
+
     Invoke-WithRetry -ScriptBlock {
-        Invoke-MgGraphRequest -Method POST -Uri $Uri -Body $jsonBody -ContentType 'application/json'
+        $json  = ConvertTo-GraphJson -InputObject $BodyObject
+        $token = Get-GraphAccessTokenString
+        if ($token) {
+            $headers = @{
+                Authorization  = "Bearer $token"
+                Accept         = 'application/json'
+            }
+            return Invoke-RestMethod -Method Post -Uri $Uri -Headers $headers -Body $json -ContentType 'application/json; charset=utf-8'
+        }
+
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+        try {
+            return Invoke-MgGraphRequest -Method POST -Uri $Uri -Body $bytes -ContentType 'application/json'
+        }
+        catch {
+            $msg = $_.Exception.Message
+            if ($msg -match 'Argument types do not match|Cannot convert|Byte\[\]|IDictionary|Hashtable') {
+                return Invoke-MgGraphRequest -Method POST -Uri $Uri -Body $BodyObject -ContentType 'application/json'
+            }
+            throw
+        }
     }
 }
 
+function Get-CopyErrorDetail {
+    param($ErrorRecord)
+    $msg = $ErrorRecord.Exception.Message
+    if ($ErrorRecord.Exception.InnerException -and $ErrorRecord.Exception.InnerException.Message) {
+        $msg += " | $($ErrorRecord.Exception.InnerException.Message)"
+    }
+    if ($ErrorRecord.InvocationInfo -and $ErrorRecord.InvocationInfo.ScriptLineNumber) {
+        $msg += " [line $($ErrorRecord.InvocationInfo.ScriptLineNumber)]"
+    }
+    return $msg
+}
+
+function Set-CopyProgress {
+    param(
+        [System.Windows.Forms.ProgressBar]$ProgressBar,
+        [double]$Current,
+        [double]$Total
+    )
+    if (-not $ProgressBar) { return }
+    if ($Total -le 0) { $ProgressBar.Value = 0; return }
+    $pct = [int](($Current / $Total) * 100)
+    if ($pct -lt 0)   { $pct = 0 }
+    if ($pct -gt 100) { $pct = 100 }
+    $ProgressBar.Value = $pct
+}
+
 function New-ExtPropList {
-    return New-Object 'System.Collections.Generic.List[object]'
+    return New-Object System.Collections.ArrayList
 }
 
 function Add-ExtProp {
@@ -352,8 +464,8 @@ function Add-ExtPropRange {
         [Parameter(Mandatory = $true)]$List,
         $Items
     )
-    foreach ($item in @($Items)) {
-        if ($item -is [hashtable] -and $item.id) {
+    foreach ($item in $Items) {
+        if ($item -is [hashtable] -and ($item.ContainsKey('id') -or $item.id)) {
             [void]$List.Add($item)
         }
     }
@@ -513,8 +625,11 @@ function Get-TeamsMeetingJoinUrl {
     if (-not $url -and $Event.OnlineMeetingUrl) {
         $url = "$($Event.OnlineMeetingUrl)"
     }
-    if (-not $url -and $Event.Location -and $Event.Location.LocationUri -match 'teams\.microsoft\.com') {
-        $url = "$($Event.Location.LocationUri)"
+    if (-not $url -and $Event.Location) {
+        $locUri = [string](Get-GraphProperty -Object $Event.Location -Names @('locationUri', 'LocationUri'))
+        if ($locUri -and $locUri -match 'teams\.microsoft\.com') {
+            $url = $locUri
+        }
     }
     if (-not $url -and $Event.Location -and "$($Event.Location.DisplayName)" -match 'https://teams\.microsoft\.com') {
         $locMatch = [regex]::Match("$($Event.Location.DisplayName)", 'https://teams\.microsoft\.com[^\s<>"]+')
@@ -1058,7 +1173,9 @@ function Copy-Emails {
                     }
 
                     $batchNumber++
-                    $end = [math]::Min($i + $batchSize, $sourceMessages.Count) - 1
+                    $end = $i + $batchSize
+                    if ($end -gt $sourceMessages.Count) { $end = $sourceMessages.Count }
+                    $end = $end - 1
                     $batchCount = ($end - $i) + 1
 
                     $StatusBox.AppendText("  Batch $batchNumber : Processing $batchCount messages ($($i + 1)-$($end + 1) of $($sourceMessages.Count))...`r`n")
@@ -1077,7 +1194,7 @@ function Copy-Emails {
                         if ($targetMessages.ContainsKey($messageKey)) {
                             $folderSkipped++; $totalSkipped++; $overallProgress++
                             if (($overallProgress % 25) -eq 0) {
-                                $ProgressBar.Value = [math]::Min([math]::Round(($overallProgress / $totalMessages) * 100), 100)
+                                Set-CopyProgress -ProgressBar $ProgressBar -Current $overallProgress -Total $totalMessages
                                 Update-CopyUi -StatusBox $StatusBox -ProgressBar $ProgressBar
                             }
                             continue
@@ -1194,13 +1311,13 @@ function Copy-Emails {
                             $folderFailed++; $totalFailed++
                             if ($folderFailed -le 8) {
                                 $failSubj = Get-GraphProperty -Object $summary -Names @('subject', 'Subject')
-                                $StatusBox.AppendText("    Failed '$failSubj': $($_.Exception.Message)`r`n")
+                                $StatusBox.AppendText("    Failed '$failSubj': $(Get-CopyErrorDetail $_ )`r`n")
                                 Update-CopyUi -StatusBox $StatusBox
                             }
                         }
 
                         $overallProgress++
-                        $ProgressBar.Value = [math]::Min([math]::Round(($overallProgress / [math]::Max($totalMessages, 1)) * 100), 100)
+                        Set-CopyProgress -ProgressBar $ProgressBar -Current $overallProgress -Total $totalMessages
                         if (($overallProgress % 10) -eq 0) {
                             Update-CopyUi -StatusBox $StatusBox -ProgressBar $ProgressBar
                         }
@@ -1370,7 +1487,9 @@ function Copy-CalendarItems {
             }
 
             $batchNumber++
-            $end        = [math]::Min($i + $batchSize, $totalEvents) - 1
+            $end = $i + $batchSize
+            if ($end -gt $totalEvents) { $end = $totalEvents }
+            $end = $end - 1
             $batchCount = ($end - $i) + 1
 
             $StatusBox.AppendText("  Batch $batchNumber : Processing $batchCount calendar items...`r`n")
@@ -1506,12 +1625,12 @@ function Copy-CalendarItems {
                 catch {
                     $failedCount++
                     if ($failedCount -le 8) {
-                        $StatusBox.AppendText("    Failed '$($event.Subject)': $($_.Exception.Message)`r`n")
+                        $StatusBox.AppendText("    Failed '$($event.Subject)': $(Get-CopyErrorDetail $_ )`r`n")
                         $StatusBox.Refresh()
                     }
                 }
 
-                $ProgressBar.Value = [math]::Min([math]::Round((($copiedCount + $failedCount + $skippedCount) / [math]::Max($totalEvents, 1)) * 100), 100)
+                Set-CopyProgress -ProgressBar $ProgressBar -Current ($copiedCount + $failedCount + $skippedCount) -Total $totalEvents
                 if ((($copiedCount + $failedCount + $skippedCount) % 10) -eq 0) {
                     Update-CopyUi -StatusBox $StatusBox -ProgressBar $ProgressBar
                 }
@@ -1594,7 +1713,7 @@ function Verify-CopiedItems {
 # GUI
 # ------------------------------------------------------------------------------
 $form = New-Object System.Windows.Forms.Form
-$form.Text            = "Microsoft 365 Mailbox Copy Tool v1.10 (Interactive Login)"
+$form.Text            = "Microsoft 365 Mailbox Copy Tool v1.11 (Interactive Login)"
 $form.Size            = New-Object System.Drawing.Size(700, 760)
 $form.StartPosition   = "CenterScreen"
 $form.FormBorderStyle = "FixedDialog"
