@@ -100,8 +100,9 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.4.9'
+$Global:AppVersion       = '2.5.0'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
+$Global:DhcpEventEntriesAll = [System.Collections.Generic.List[object]]::new()
 $Global:LogWatchState    = @{
     Local  = @{ Enabled = $false; Path = $null; Offset = 0L }
     A      = @{ Enabled = $false; Path = $null; Offset = 0L }
@@ -643,7 +644,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                      HorizontalAlignment="Center"/>
           
           <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-            <Run Text="v2.4.9  |  "/>
+            <Run Text="v2.5.0  |  "/>
             <Run Text="Created by Anthony Blake" Foreground="#90CAF9"/>
             <Run Text="  |  "/>
             <Run x:Name="StatusTime" Text=""/>
@@ -1292,10 +1293,11 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
             </Grid>
           </TabItem>
 
-          <!-- TAB: DHCP Events / Live Watch (NEW) -->
+          <!-- TAB: DHCP Events / Live Watch -->
           <TabItem x:Name="TabEvents" Header="📡 Events">
             <Grid Background="{StaticResource BgPanel}">
               <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
@@ -1329,9 +1331,9 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                   <StackPanel Grid.Column="2" Orientation="Horizontal">
                     <Button x:Name="BtnEventBrowse" Content="📁 Browse" Margin="0,0,8,0"
                             Style="{StaticResource BtnSecondary}"/>
-                    <Button x:Name="BtnEventDetect" Content="🔎 Detect" Margin="0,0,8,0"
+                    <Button x:Name="BtnEventDetect" Content="🔎 Detect Logs" Margin="0,0,8,0"
                             Style="{StaticResource BtnSecondary}"
-                            ToolTip="Auto-detect DHCP audit log path"/>
+                            ToolTip="List DHCP audit logs (filename + last modified) and choose which to ingest"/>
                     <Button x:Name="BtnEventIngest" Content="📥 Ingest Log" Margin="0,0,8,0"
                             Style="{StaticResource BtnPrimary}"
                             ToolTip="Parse and load DHCP audit log events (shows progress; can pause/cancel)"/>
@@ -1365,12 +1367,8 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                     <Separator Width="1" Background="{StaticResource Border}" Margin="8,0"/>
                     <Button x:Name="BtnEventClear" Content="🗑️ Clear" Margin="8,0,8,0"
                             Style="{StaticResource BtnSecondary}"/>
-                    <Button x:Name="BtnEventExport" Content="💾 Export" Margin="0,0,8,0"
+                    <Button x:Name="BtnEventExport" Content="💾 Export" Margin="0,0,0,0"
                             Style="{StaticResource BtnSecondary}"/>
-                    <TextBlock Text="Filter:" Style="{StaticResource FormLabel}"
-                               VerticalAlignment="Center" Margin="8,0,8,0"/>
-                    <TextBox x:Name="TxtEventFilter" Width="160" Style="{StaticResource DarkTextBox}"
-                             ToolTip="Filter by IP, MAC, hostname, or event text"/>
                   </StackPanel>
                   <Grid>
                     <Grid.ColumnDefinitions>
@@ -1382,7 +1380,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                                VerticalAlignment="Center" Margin="0,0,8,0"/>
                     <TextBox Grid.Column="1" x:Name="TxtWatchLogPath" Style="{StaticResource DarkTextBox}"
                              Margin="0,0,8,0"
-                             ToolTip="Full path to DhcpSrvLog file (or folder). Used when Custom file is checked. Can also Use ingest path."/>
+                             ToolTip="Full path to DhcpSrvLog file (or folder). Used when Custom file is checked."/>
                     <StackPanel Grid.Column="2" Orientation="Horizontal">
                       <Button x:Name="BtnWatchBrowse" Content="📁 Browse" Margin="0,0,8,0"
                               Style="{StaticResource BtnSecondary}"
@@ -1395,10 +1393,75 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                 </StackPanel>
               </Border>
 
-              <!-- Status line + ingest progress -->
-              <Border Grid.Row="2" Background="{StaticResource BgPanel}" Padding="12,6">
+              <!-- Robust event filter -->
+              <Border Grid.Row="2" Background="{StaticResource BgCard}"
+                      BorderThickness="0,0,0,1" BorderBrush="{StaticResource Border}" Padding="12,10">
                 <StackPanel>
-                  <TextBlock x:Name="TxtEventStatus" Text="Ingest a DHCP audit log, or live-watch Local / Server A / Server B / a Custom file"
+                  <TextBlock Text="Filter ingested events" Style="{StaticResource FormLabel}" Margin="0,0,0,8"/>
+                  <WrapPanel Orientation="Horizontal">
+                    <StackPanel Orientation="Horizontal" Margin="0,0,16,6">
+                      <TextBlock Text="Search:" Style="{StaticResource FormLabel}" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                      <TextBox x:Name="TxtEventFilter" Width="160" Style="{StaticResource DarkTextBox}"
+                               ToolTip="Matches any field (IP, MAC, host, event text, details)"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,16,6">
+                      <TextBlock Text="Event ID:" Style="{StaticResource FormLabel}" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                      <ComboBox x:Name="CboEventIdFilter" Width="150" Height="26"
+                                Background="{StaticResource BgDeep}" Foreground="{StaticResource TextPrimary}"
+                                BorderBrush="{StaticResource Border}">
+                        <ComboBoxItem Content="All" IsSelected="True"/>
+                        <ComboBoxItem Content="10 — Assign"/>
+                        <ComboBoxItem Content="11 — Renew"/>
+                        <ComboBoxItem Content="12 — Release"/>
+                        <ComboBoxItem Content="13 — Conflict"/>
+                        <ComboBoxItem Content="15 — NACK"/>
+                        <ComboBoxItem Content="16 — Decline"/>
+                        <ComboBoxItem Content="30 — DNS request"/>
+                        <ComboBoxItem Content="31 — DNS failed"/>
+                        <ComboBoxItem Content="32 — DNS success"/>
+                        <ComboBoxItem Content="50+ — Auth/rogue"/>
+                      </ComboBox>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,16,6">
+                      <TextBlock Text="IP:" Style="{StaticResource FormLabel}" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                      <TextBox x:Name="TxtEventFilterIp" Width="120" Style="{StaticResource DarkTextBox}"
+                               ToolTip="Contains match on IP Address"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,16,6">
+                      <TextBlock Text="MAC:" Style="{StaticResource FormLabel}" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                      <TextBox x:Name="TxtEventFilterMac" Width="130" Style="{StaticResource DarkTextBox}"
+                               ToolTip="Contains match on MAC (dashes/colons optional)"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,16,6">
+                      <TextBlock Text="Host:" Style="{StaticResource FormLabel}" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                      <TextBox x:Name="TxtEventFilterHost" Width="130" Style="{StaticResource DarkTextBox}"
+                               ToolTip="Contains match on Hostname"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,16,6">
+                      <TextBlock Text="Server:" Style="{StaticResource FormLabel}" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                      <ComboBox x:Name="CboEventFilterServer" Width="120" Height="26"
+                                Background="{StaticResource BgDeep}" Foreground="{StaticResource TextPrimary}"
+                                BorderBrush="{StaticResource Border}">
+                        <ComboBoxItem Content="All" IsSelected="True"/>
+                      </ComboBox>
+                    </StackPanel>
+                    <Button x:Name="BtnEventFilterApply" Content="Apply Filter" Margin="0,0,8,6"
+                            Style="{StaticResource BtnPrimary}"
+                            ToolTip="Apply filters to ingested events"/>
+                    <Button x:Name="BtnEventFilterClear" Content="Clear Filters" Margin="0,0,8,6"
+                            Style="{StaticResource BtnSecondary}"
+                            ToolTip="Reset all event filters"/>
+                    <TextBlock x:Name="TxtEventFilterCount" Text="Showing 0 of 0"
+                               Foreground="{StaticResource TextSecond}" FontSize="11"
+                               VerticalAlignment="Center" Margin="4,0,0,6"/>
+                  </WrapPanel>
+                </StackPanel>
+              </Border>
+
+              <!-- Status line + ingest progress -->
+              <Border Grid.Row="3" Background="{StaticResource BgPanel}" Padding="12,6">
+                <StackPanel>
+                  <TextBlock x:Name="TxtEventStatus" Text="Detect logs to choose a file, ingest, then filter. Or live-watch Local / A / B / Custom."
                              Foreground="{StaticResource TextSecond}" FontSize="11" Margin="0,0,0,4"/>
                   <Grid x:Name="EventIngestProgressPanel" Visibility="Collapsed">
                     <Grid.ColumnDefinitions>
@@ -1416,7 +1479,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
               </Border>
 
               <!-- Events Grid -->
-              <DataGrid Grid.Row="3" x:Name="GridEvents" Style="{StaticResource DarkGrid}" Margin="8">
+              <DataGrid Grid.Row="4" x:Name="GridEvents" Style="{StaticResource DarkGrid}" Margin="8">
                 <DataGrid.Columns>
                   <DataGridTextColumn Header="Server" Binding="{Binding Server}" Width="110"/>
                   <DataGridTextColumn Header="Time" Binding="{Binding Time}" Width="140"/>
@@ -1523,6 +1586,9 @@ try {
     
     # Live watch timer (must be initialized for StrictMode)
     $script:EventWatchTimer  = $null
+    $script:UpdatingEventFilterServerCombo = $false
+    $script:PendingFilteredEvents = [System.Collections.Generic.List[object]]::new()
+    $script:AuditLogPickerSelection = $null
     
     # Navigation
     $script:NavTree          = $Window.FindName("NavTree")
@@ -1640,6 +1706,14 @@ try {
     $script:BtnEventClear        = $Window.FindName("BtnEventClear")
     $script:BtnEventExport       = $Window.FindName("BtnEventExport")
     $script:TxtEventFilter       = $Window.FindName("TxtEventFilter")
+    $script:CboEventIdFilter     = $Window.FindName("CboEventIdFilter")
+    $script:TxtEventFilterIp     = $Window.FindName("TxtEventFilterIp")
+    $script:TxtEventFilterMac    = $Window.FindName("TxtEventFilterMac")
+    $script:TxtEventFilterHost   = $Window.FindName("TxtEventFilterHost")
+    $script:CboEventFilterServer = $Window.FindName("CboEventFilterServer")
+    $script:BtnEventFilterApply  = $Window.FindName("BtnEventFilterApply")
+    $script:BtnEventFilterClear  = $Window.FindName("BtnEventFilterClear")
+    $script:TxtEventFilterCount  = $Window.FindName("TxtEventFilterCount")
     $script:TxtEventStatus       = $Window.FindName("TxtEventStatus")
     $script:EventIngestProgressPanel = $Window.FindName("EventIngestProgressPanel")
     $script:BarEventIngest       = $Window.FindName("BarEventIngest")
@@ -4090,10 +4164,10 @@ function Get-DhcpEventDescription {
     }
 }
 
-function Get-DhcpAuditLogPath {
+function Get-DhcpAuditLogFolder {
     <#
     .SYNOPSIS
-        Resolves the newest DHCP audit log for local or remote server
+        Resolves the DHCP audit log folder for Local / A / B / Custom
     #>
     param(
         [ValidateSet('Local','A','B','Custom')]
@@ -4103,8 +4177,11 @@ function Get-DhcpAuditLogPath {
     
     if ($Source -eq 'Custom') {
         if ([string]::IsNullOrWhiteSpace($CustomPath)) { return $null }
-        if (Test-Path -LiteralPath $CustomPath) { return $CustomPath }
-        return $null
+        if (-not (Test-Path -LiteralPath $CustomPath)) { return $null }
+        $item = Get-Item -LiteralPath $CustomPath -ErrorAction SilentlyContinue
+        if ($null -eq $item) { return $null }
+        if ($item.PSIsContainer) { return $item.FullName }
+        return $item.DirectoryName
     }
     
     $root = $null
@@ -4131,7 +4208,6 @@ function Get-DhcpAuditLogPath {
     }
     
     if (-not $root -or -not (Test-Path -LiteralPath $root)) {
-        # Fallback common UNC form
         if ($Source -eq 'A' -and $Global:DHCPServer) {
             $root = "\\$($Global:DHCPServer)\C$\Windows\System32\dhcp"
         }
@@ -4144,11 +4220,192 @@ function Get-DhcpAuditLogPath {
         return $null
     }
     
-    $candidates = @(Get-ChildItem -LiteralPath $root -Filter 'DhcpSrvLog*' -File -ErrorAction SilentlyContinue |
+    return $root
+}
+
+function Get-DhcpAuditLogCandidates {
+    <#
+    .SYNOPSIS
+        Lists DhcpSrvLog* files with name, last modified, and size
+    #>
+    param(
+        [ValidateSet('Local','A','B','Custom')]
+        [string]$Source = 'Local',
+        [string]$CustomPath = ''
+    )
+    
+    $folder = Get-DhcpAuditLogFolder -Source $Source -CustomPath $CustomPath
+    if (-not $folder) { return @() }
+    
+    $files = @(Get-ChildItem -LiteralPath $folder -Filter 'DhcpSrvLog*' -File -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending)
     
-    if ((Get-SafeCount $candidates) -eq 0) { return $root }
-    return $candidates[0].FullName
+    $results = [System.Collections.Generic.List[object]]::new()
+    foreach ($f in $files) {
+        $results.Add([PSCustomObject]@{
+            FileName       = $f.Name
+            LastModified   = $f.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
+            LastWriteTime  = $f.LastWriteTime
+            SizeKB         = [math]::Round($f.Length / 1KB, 1)
+            SizeBytes      = $f.Length
+            FullPath       = $f.FullName
+            Folder         = $folder
+        })
+    }
+    
+    return @($results)
+}
+
+function Get-DhcpAuditLogPath {
+    <#
+    .SYNOPSIS
+        Resolves the newest DHCP audit log for local or remote server
+    #>
+    param(
+        [ValidateSet('Local','A','B','Custom')]
+        [string]$Source = 'Local',
+        [string]$CustomPath = ''
+    )
+    
+    if ($Source -eq 'Custom') {
+        if ([string]::IsNullOrWhiteSpace($CustomPath)) { return $null }
+        if (Test-Path -LiteralPath $CustomPath) {
+            $item = Get-Item -LiteralPath $CustomPath
+            if (-not $item.PSIsContainer) { return $item.FullName }
+        }
+    }
+    
+    $candidates = @(Get-DhcpAuditLogCandidates -Source $Source -CustomPath $CustomPath)
+    if ((Get-SafeCount $candidates) -eq 0) {
+        return (Get-DhcpAuditLogFolder -Source $Source -CustomPath $CustomPath)
+    }
+    return $candidates[0].FullPath
+}
+
+function Show-DhcpAuditLogPickerDialog {
+    <#
+    .SYNOPSIS
+        Lets the user choose a DHCP audit log file (shows filename + last modified)
+    #>
+    param(
+        [ValidateSet('Local','A','B','Custom')]
+        [string]$Source = 'Local',
+        [string]$CustomPath = ''
+    )
+    
+    $candidates = @(Get-DhcpAuditLogCandidates -Source $Source -CustomPath $CustomPath)
+    if ((Get-SafeCount $candidates) -eq 0) {
+        $folder = Get-DhcpAuditLogFolder -Source $Source -CustomPath $CustomPath
+        $where = if ($folder) { $folder } else { 'the selected source' }
+        Show-MessageBox "No DhcpSrvLog* files found under:`n$where" "Detect Logs" OK Warning
+        return $null
+    }
+    
+    [xml]$dialogXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Select DHCP Audit Log"
+        Height="480" Width="820"
+        WindowStartupLocation="CenterOwner"
+        Background="#1A1D23"
+        FontFamily="Segoe UI" FontSize="13">
+  <Grid Margin="16">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+
+    <TextBlock Grid.Row="0" Text="Choose a DHCP audit log to ingest"
+               Foreground="#E8EAF0" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,6"/>
+    <TextBlock x:Name="TxtPickerFolder" Grid.Row="1" Foreground="#9AA3B2" FontSize="11"
+               Margin="0,0,0,10" TextWrapping="Wrap"/>
+
+    <DataGrid Grid.Row="2" x:Name="GridLogFiles"
+              AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False"
+              SelectionMode="Single" HeadersVisibility="Column"
+              Background="#22262E" Foreground="#E8EAF0" BorderThickness="0"
+              RowBackground="#22262E" AlternatingRowBackground="#2A2F3A"
+              GridLinesVisibility="Horizontal" HorizontalGridLinesBrush="#383E4A"
+              RowHeight="28" ColumnHeaderHeight="32">
+      <DataGrid.Columns>
+        <DataGridTextColumn Header="File Name" Binding="{Binding FileName}" Width="220"/>
+        <DataGridTextColumn Header="Last Modified" Binding="{Binding LastModified}" Width="160"/>
+        <DataGridTextColumn Header="Size (KB)" Binding="{Binding SizeKB}" Width="90"/>
+        <DataGridTextColumn Header="Full Path" Binding="{Binding FullPath}" Width="*"/>
+      </DataGrid.Columns>
+      <DataGrid.ColumnHeaderStyle>
+        <Style TargetType="DataGridColumnHeader">
+          <Setter Property="Background" Value="#2A2F3A"/>
+          <Setter Property="Foreground" Value="#9AA3B2"/>
+          <Setter Property="Padding" Value="8,0"/>
+          <Setter Property="BorderBrush" Value="#383E4A"/>
+          <Setter Property="BorderThickness" Value="0,0,1,1"/>
+        </Style>
+      </DataGrid.ColumnHeaderStyle>
+    </DataGrid>
+
+    <TextBlock Grid.Row="3" Margin="0,10,0,8" Foreground="#9AA3B2" FontSize="11"
+               Text="Sorted by last modified (newest first). Double-click a row or select and click Use Selected."
+               TextWrapping="Wrap"/>
+
+    <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right">
+      <Button x:Name="BtnPickerUse" Content="Use Selected" Width="120" Height="30" Margin="0,0,8,0"
+              Background="#2196F3" Foreground="White" BorderThickness="0"/>
+      <Button x:Name="BtnPickerCancel" Content="Cancel" Width="90" Height="30"
+              Background="#2A2F3A" Foreground="#E8EAF0" BorderBrush="#383E4A" BorderThickness="1"/>
+    </StackPanel>
+  </Grid>
+</Window>
+'@
+    
+    $selectedPath = $null
+    try {
+        $dialog = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($dialogXaml))
+        if ($script:Window) { $dialog.Owner = $script:Window }
+        
+        $grid = $dialog.FindName('GridLogFiles')
+        $txtFolder = $dialog.FindName('TxtPickerFolder')
+        $btnUse = $dialog.FindName('BtnPickerUse')
+        $btnCancel = $dialog.FindName('BtnPickerCancel')
+        
+        $folder = "$($candidates[0].Folder)"
+        $txtFolder.Text = "Folder: $folder  —  $(Get-SafeCount $candidates) file(s)"
+        $grid.ItemsSource = $candidates
+        if ((Get-SafeCount $candidates) -gt 0) { $grid.SelectedIndex = 0 }
+        
+        $choose = {
+            if ($null -eq $grid.SelectedItem) {
+                Show-MessageBox "Select a log file first." "Detect Logs" OK Warning
+                return
+            }
+            $script:AuditLogPickerSelection = "$($grid.SelectedItem.FullPath)"
+            $dialog.DialogResult = $true
+            $dialog.Close()
+        }
+        
+        $btnUse.add_Click($choose)
+        $grid.add_MouseDoubleClick({
+            if ($null -ne $grid.SelectedItem) { & $choose }
+        })
+        $btnCancel.add_Click({
+            $script:AuditLogPickerSelection = $null
+            $dialog.DialogResult = $false
+            $dialog.Close()
+        })
+        
+        $script:AuditLogPickerSelection = $null
+        [void]$dialog.ShowDialog()
+        $selectedPath = $script:AuditLogPickerSelection
+    } catch {
+        Write-ActionLog "Log picker failed: $_" "ERROR"
+        Show-MessageBox "Failed to open log picker: $_" "Detect Logs" OK Error
+        return $null
+    }
+    
+    return $selectedPath
 }
 
 function ConvertFrom-DhcpAuditLine {
@@ -4194,6 +4451,206 @@ function ConvertFrom-DhcpAuditLine {
     }
 }
 
+function Get-NormalizedMacForFilter {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    return (($Value -replace '[^0-9A-Fa-f]', '')).ToUpperInvariant()
+}
+
+function Get-EventFilterCriteria {
+    $search = ''
+    $eventId = 'All'
+    $ip = ''
+    $mac = ''
+    $hostName = ''
+    $server = 'All'
+    
+    try { $search = "$($script:TxtEventFilter.Text)".Trim() } catch {}
+    try {
+        if ($null -ne $script:CboEventIdFilter.SelectedItem) {
+            $eventId = "$($script:CboEventIdFilter.SelectedItem.Content)"
+        }
+    } catch {}
+    try { $ip = "$($script:TxtEventFilterIp.Text)".Trim() } catch {}
+    try { $mac = "$($script:TxtEventFilterMac.Text)".Trim() } catch {}
+    try { $hostName = "$($script:TxtEventFilterHost.Text)".Trim() } catch {}
+    try {
+        if ($null -ne $script:CboEventFilterServer.SelectedItem) {
+            $server = "$($script:CboEventFilterServer.SelectedItem.Content)"
+        }
+    } catch {}
+    
+    return [PSCustomObject]@{
+        Search   = $search
+        EventId  = $eventId
+        IP       = $ip
+        MAC      = $mac
+        HostName = $hostName
+        Server   = $server
+    }
+}
+
+function Test-DhcpEventMatchesFilter {
+    param(
+        [object]$Entry,
+        [object]$Criteria
+    )
+    
+    if ($null -eq $Entry) { return $false }
+    if ($null -eq $Criteria) { return $true }
+    
+    if ($Criteria.Server -and $Criteria.Server -ne 'All') {
+        if ("$($Entry.Server)" -ne "$($Criteria.Server)") { return $false }
+    }
+    
+    if ($Criteria.EventId -and $Criteria.EventId -ne 'All') {
+        $idText = "$($Criteria.EventId)"
+        $wantId = ($idText -split '—')[0].Trim()
+        if ($wantId -eq '50+') {
+            $num = 0
+            if (-not [int]::TryParse("$($Entry.EventId)", [ref]$num) -or $num -lt 50) { return $false }
+        } else {
+            if ("$($Entry.EventId)" -ne $wantId) { return $false }
+        }
+    }
+    
+    if ($Criteria.IP) {
+        if ("$($Entry.IPAddress)" -notlike "*$($Criteria.IP)*") { return $false }
+    }
+    
+    if ($Criteria.MAC) {
+        $needle = Get-NormalizedMacForFilter $Criteria.MAC
+        $hay = Get-NormalizedMacForFilter "$($Entry.MacAddress)"
+        if (-not $hay -or ($hay -notlike "*$needle*")) { return $false }
+    }
+    
+    if ($Criteria.HostName) {
+        if ("$($Entry.HostName)" -notlike "*$($Criteria.HostName)*") { return $false }
+    }
+    
+    if ($Criteria.Search) {
+        $blob = "$($Entry.Server) $($Entry.Time) $($Entry.EventId) $($Entry.Description) $($Entry.IPAddress) $($Entry.MacAddress) $($Entry.HostName) $($Entry.Details)"
+        if ($blob -notlike "*$($Criteria.Search)*") { return $false }
+    }
+    
+    return $true
+}
+
+function Update-EventFilterServerCombo {
+    $current = 'All'
+    try {
+        if ($null -ne $script:CboEventFilterServer.SelectedItem) {
+            $current = "$($script:CboEventFilterServer.SelectedItem.Content)"
+        }
+    } catch {}
+    
+    $servers = @('All') + @($Global:DhcpEventEntriesAll | ForEach-Object { "$($_.Server)" } | Where-Object { $_ } | Sort-Object -Unique)
+    
+    $script:UpdatingEventFilterServerCombo = $true
+    try {
+        $script:CboEventFilterServer.Items.Clear()
+        foreach ($s in $servers) {
+            $item = New-Object System.Windows.Controls.ComboBoxItem
+            $item.Content = $s
+            [void]$script:CboEventFilterServer.Items.Add($item)
+            if ($s -eq $current) { $script:CboEventFilterServer.SelectedItem = $item }
+        }
+        if ($null -eq $script:CboEventFilterServer.SelectedItem -and (Get-SafeCount $script:CboEventFilterServer.Items) -gt 0) {
+            $script:CboEventFilterServer.SelectedIndex = 0
+        }
+    } catch {
+    } finally {
+        $script:UpdatingEventFilterServerCombo = $false
+    }
+}
+
+function Update-EventFilterCountDisplay {
+    param(
+        [int]$Shown = -1,
+        [int]$Total = -1
+    )
+    
+    if ($Shown -lt 0) { $Shown = Get-SafeCount $Global:DhcpEventEntries }
+    if ($Total -lt 0) { $Total = Get-SafeCount $Global:DhcpEventEntriesAll }
+    
+    try {
+        if ($null -ne $script:TxtEventFilterCount) {
+            $script:TxtEventFilterCount.Text = "Showing $Shown of $Total"
+        }
+    } catch {}
+}
+
+function Apply-DhcpEventFilter {
+    <#
+    .SYNOPSIS
+        Rebuilds the visible events grid from the master ingested list
+    #>
+    param([switch]$Quiet)
+    
+    $criteria = Get-EventFilterCriteria
+    $filtered = [System.Collections.Generic.List[object]]::new()
+    
+    foreach ($entry in @($Global:DhcpEventEntriesAll)) {
+        if (Test-DhcpEventMatchesFilter -Entry $entry -Criteria $criteria) {
+            [void]$filtered.Add($entry)
+        }
+    }
+    
+    $script:PendingFilteredEvents = $filtered
+    
+    $apply = {
+        $Global:DhcpEventEntries.Clear()
+        foreach ($entry in @($script:PendingFilteredEvents)) {
+            [void]$Global:DhcpEventEntries.Add($entry)
+        }
+        if ($null -ne $script:GridEvents) {
+            $script:GridEvents.ItemsSource = $null
+            $script:GridEvents.ItemsSource = $Global:DhcpEventEntries
+        }
+    }
+    
+    try {
+        if ($null -ne $script:Window -and -not $script:Window.Dispatcher.CheckAccess()) {
+            $script:Window.Dispatcher.Invoke([action]$apply, [System.Windows.Threading.DispatcherPriority]::Normal)
+        } else {
+            & $apply
+        }
+    } catch {
+        try { & $apply } catch {}
+    }
+    
+    $shown = Get-SafeCount $filtered
+    $total = Get-SafeCount $Global:DhcpEventEntriesAll
+    Update-EventFilterCountDisplay -Shown $shown -Total $total
+    
+    if (-not $Quiet) {
+        Write-ActionLog "Event filter applied: showing $shown of $total" "INFO"
+        try {
+            if ($null -ne $script:TxtEventStatus -and -not $Global:EventWatchActive) {
+                $script:TxtEventStatus.Text = "Filter active — showing $shown of $total events. Created by $($Global:AppAuthor)."
+            }
+        } catch {}
+        Update-LogDisplay
+    }
+}
+
+function Clear-DhcpEventFilterFields {
+    try { $script:TxtEventFilter.Text = '' } catch {}
+    try { $script:TxtEventFilterIp.Text = '' } catch {}
+    try { $script:TxtEventFilterMac.Text = '' } catch {}
+    try { $script:TxtEventFilterHost.Text = '' } catch {}
+    try {
+        if ($null -ne $script:CboEventIdFilter -and (Get-SafeCount $script:CboEventIdFilter.Items) -gt 0) {
+            $script:CboEventIdFilter.SelectedIndex = 0
+        }
+    } catch {}
+    try {
+        if ($null -ne $script:CboEventFilterServer -and (Get-SafeCount $script:CboEventFilterServer.Items) -gt 0) {
+            $script:CboEventFilterServer.SelectedIndex = 0
+        }
+    } catch {}
+}
+
 function Add-DhcpEventEntry {
     param([object]$Entry)
     
@@ -4204,26 +4661,25 @@ function Add-DhcpEventEntry {
 function Add-DhcpEventEntriesBatch {
     <#
     .SYNOPSIS
-        Adds event rows in one UI dispatcher call (much faster than per-line Invoke)
+        Adds event rows to master list and visible grid (filtered) in one UI update
     #>
     param([object[]]$Entries)
     
     $items = @($Entries | Where-Object { $null -ne $_ })
     if ((Get-SafeCount $items) -eq 0) { return }
     
-    $filter = ''
-    try { $filter = "$($script:TxtEventFilter.Text)" } catch {}
-    
-    if (-not [string]::IsNullOrWhiteSpace($filter)) {
-        $items = @($items | Where-Object {
-            $blob = "$($_.Server) $($_.Time) $($_.EventId) $($_.Description) $($_.IPAddress) $($_.MacAddress) $($_.HostName) $($_.Details)"
-            $blob -like "*$filter*"
-        })
-        if ((Get-SafeCount $items) -eq 0) { return }
+    foreach ($entry in $items) {
+        $Global:DhcpEventEntriesAll.Insert(0, $entry)
+    }
+    while ((Get-SafeCount $Global:DhcpEventEntriesAll) -gt 5000) {
+        $Global:DhcpEventEntriesAll.RemoveAt((Get-SafeCount $Global:DhcpEventEntriesAll) - 1)
     }
     
+    $criteria = Get-EventFilterCriteria
+    $visible = @($items | Where-Object { Test-DhcpEventMatchesFilter -Entry $_ -Criteria $criteria })
+    
     $apply = {
-        foreach ($entry in $items) {
+        foreach ($entry in $visible) {
             $Global:DhcpEventEntries.Insert(0, $entry)
         }
         while ((Get-SafeCount $Global:DhcpEventEntries) -gt 5000) {
@@ -4243,35 +4699,27 @@ function Add-DhcpEventEntriesBatch {
     } catch {
         try { & $apply } catch {}
     }
+    
+    Update-EventFilterServerCombo
+    Update-EventFilterCountDisplay
 }
 
 function Set-DhcpEventEntriesFromList {
     <#
     .SYNOPSIS
-        Replaces the events grid in one UI update (newest-first list)
+        Replaces master + visible event lists (newest-first)
     #>
     param([System.Collections.IList]$Entries)
     
     $snapshot = @($Entries)
     
-    $apply = {
-        $Global:DhcpEventEntries.Clear()
-        foreach ($entry in $snapshot) {
-            if ($null -ne $entry) { [void]$Global:DhcpEventEntries.Add($entry) }
-        }
-        $script:GridEvents.ItemsSource = $null
-        $script:GridEvents.ItemsSource = $Global:DhcpEventEntries
+    $Global:DhcpEventEntriesAll.Clear()
+    foreach ($entry in $snapshot) {
+        if ($null -ne $entry) { [void]$Global:DhcpEventEntriesAll.Add($entry) }
     }
     
-    try {
-        if ($null -ne $script:Window -and -not $script:Window.Dispatcher.CheckAccess()) {
-            $script:Window.Dispatcher.Invoke([action]$apply, [System.Windows.Threading.DispatcherPriority]::Normal)
-        } else {
-            & $apply
-        }
-    } catch {
-        try { & $apply } catch {}
-    }
+    Update-EventFilterServerCombo
+    Apply-DhcpEventFilter -Quiet
 }
 
 function Import-DhcpAuditLogFile {
@@ -6500,33 +6948,33 @@ $BtnWatchUseIngestPath.add_Click({
 $BtnEventDetect.add_Click({
     try {
         $src = Get-SelectedEventSourceKey
-        if ($src -eq 'Custom') {
-            Show-MessageBox "Detect works for Local / Server A / Server B. For Custom, use Browse." "Detect" OK Information
+        $customPath = ''
+        try { $customPath = "$($script:TxtEventLogPath.Text)".Trim() } catch {}
+        
+        if ($src -eq 'Custom' -and [string]::IsNullOrWhiteSpace($customPath)) {
+            Show-MessageBox "For Custom Path, enter a folder/file path first (or Browse), then Detect Logs." "Detect Logs" OK Information
             return
         }
         
         if ($src -eq 'A' -and -not $Global:DHCPServer) {
-            Show-MessageBox "Connect Server A first." "Detect" OK Warning
+            Show-MessageBox "Connect Server A first." "Detect Logs" OK Warning
             return
         }
         if ($src -eq 'B' -and -not $Global:CompareServer) {
-            Show-MessageBox "Connect Server B first (Compare tab)." "Detect" OK Warning
+            Show-MessageBox "Connect Server B first (Compare tab)." "Detect Logs" OK Warning
             return
         }
         
-        $path = Get-DhcpAuditLogPath -Source $src
-        if (-not $path) {
-            Show-MessageBox "Could not detect DHCP audit log for $src.`nTried admin`$ / C`$ System32\dhcp." "Detect" OK Warning
-            return
-        }
+        $selected = Show-DhcpAuditLogPickerDialog -Source $src -CustomPath $customPath
+        if ([string]::IsNullOrWhiteSpace($selected)) { return }
         
-        $script:TxtEventLogPath.Text = $path
-        Write-ActionLog "Detected DHCP audit path ($src): $path" "SUCCESS"
-        $script:TxtEventStatus.Text = "Detected: $path"
+        $script:TxtEventLogPath.Text = $selected
+        Write-ActionLog "Selected DHCP audit log ($src): $selected" "SUCCESS"
+        $script:TxtEventStatus.Text = "Selected for ingest: $selected"
         Update-LogDisplay
     } catch {
         Write-ActionLog "Detect failed: $_" "ERROR"
-        Show-MessageBox "Detect failed: $_" "Detect" OK Error
+        Show-MessageBox "Detect failed: $_" "Detect Logs" OK Error
     }
 })
 
@@ -6559,8 +7007,11 @@ $BtnEventIngest.add_Click({
             Set-Status "Ingest canceled"
         } else {
             $shown = if ($null -ne $info.Shown) { $info.Shown } else { $info.EventCount }
-            $script:TxtEventStatus.Text = "Ingested $($info.EventCount) events from $label (showing $shown) — $($info.Path)"
+            $visible = Get-SafeCount $Global:DhcpEventEntries
+            $total = Get-SafeCount $Global:DhcpEventEntriesAll
+            $script:TxtEventStatus.Text = "Ingested $($info.EventCount) events from $label (showing $visible of $total) — $($info.Path)"
             Set-Status "Ingested $($info.EventCount) DHCP events"
+            Update-EventFilterCountDisplay
         }
         Update-LogDisplay
     } catch {
@@ -6606,7 +7057,11 @@ $BtnEventClear.add_Click({
     if ($result -eq 'Yes') {
         $script:Window.Dispatcher.Invoke([action]{
             $Global:DhcpEventEntries.Clear()
+            $Global:DhcpEventEntriesAll.Clear()
         }, [System.Windows.Threading.DispatcherPriority]::Normal)
+        Clear-DhcpEventFilterFields
+        Update-EventFilterServerCombo
+        Update-EventFilterCountDisplay -Shown 0 -Total 0
         Write-ActionLog "DHCP event grid cleared" "WARN"
         Update-EventWatchStatus
         Update-LogDisplay
@@ -6614,8 +7069,8 @@ $BtnEventClear.add_Click({
 })
 
 $BtnEventExport.add_Click({
-    if ($Global:DhcpEventEntries.Count -eq 0) {
-        Show-MessageBox "No DHCP events to export." "Export" OK Warning
+    if ((Get-SafeCount $Global:DhcpEventEntries) -eq 0) {
+        Show-MessageBox "No DHCP events to export (try clearing filters or ingest first)." "Export" OK Warning
         return
     }
     
@@ -6623,15 +7078,14 @@ $BtnEventExport.add_Click({
         $saveDialog = New-Object System.Windows.Forms.SaveFileDialog
         $saveDialog.Filter = "CSV Files (*.csv)|*.csv|All Files (*.*)|*.*"
         $saveDialog.FileName = "DHCP-Events-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
-        $saveDialog.Title = "Export DHCP Events"
+        $saveDialog.Title = "Export DHCP Events (filtered view)"
         
         if ($saveDialog.ShowDialog() -eq 'OK') {
             $Global:DhcpEventEntries |
                 Select-Object Server, Time, EventId, Description, IPAddress, MacAddress, HostName, Details |
                 Export-Csv -Path $saveDialog.FileName -NoTypeInformation -Encoding UTF8
-            
-            Write-ActionLog "DHCP events exported: $($saveDialog.FileName)" "SUCCESS"
-            Show-MessageBox "Exported to:`n$($saveDialog.FileName)" "Export Complete" OK Information
+            Write-ActionLog "Exported $(Get-SafeCount $Global:DhcpEventEntries) filtered events: $($saveDialog.FileName)" "SUCCESS"
+            Show-MessageBox "Exported $(Get-SafeCount $Global:DhcpEventEntries) event(s) to:`n$($saveDialog.FileName)" "Export Complete" OK Information
             Update-LogDisplay
         }
     } catch {
@@ -6640,16 +7094,43 @@ $BtnEventExport.add_Click({
     }
 })
 
-$TxtEventFilter.add_TextChanged({
-    # Filter applies to newly arriving live events; re-binding full filter would be expensive.
-    # Status note only.
-    try {
-        if ($script:TxtEventFilter.Text) {
-            $script:TxtEventStatus.Text = "Live filter active: '$($script:TxtEventFilter.Text)' (applies to new events)"
-        } else {
-            Update-EventWatchStatus
+$BtnEventFilterApply.add_Click({
+    Apply-DhcpEventFilter
+})
+
+$BtnEventFilterClear.add_Click({
+    Clear-DhcpEventFilterFields
+    Apply-DhcpEventFilter
+})
+
+# Enter key in filter text boxes applies filter
+foreach ($tbName in @('TxtEventFilter','TxtEventFilterIp','TxtEventFilterMac','TxtEventFilterHost')) {
+    $tb = $null
+    try { $tb = Get-Variable -Name $tbName -Scope Script -ValueOnly -ErrorAction SilentlyContinue } catch {}
+    if ($null -eq $tb) { continue }
+    $tb.add_KeyDown({
+        param($sender, $e)
+        if ($e.Key -eq 'Return') {
+            Apply-DhcpEventFilter
+            $e.Handled = $true
         }
-    } catch {}
+    })
+}
+
+$CboEventIdFilter.add_SelectionChanged({
+    if ($script:UpdatingEventFilterServerCombo) { return }
+    if ((Get-SafeCount $Global:DhcpEventEntriesAll) -gt 0) {
+        Apply-DhcpEventFilter -Quiet
+        Update-EventFilterCountDisplay
+    }
+})
+
+$CboEventFilterServer.add_SelectionChanged({
+    if ($script:UpdatingEventFilterServerCombo) { return }
+    if ((Get-SafeCount $Global:DhcpEventEntriesAll) -gt 0) {
+        Apply-DhcpEventFilter -Quiet
+        Update-EventFilterCountDisplay
+    }
 })
 #endregion
 
