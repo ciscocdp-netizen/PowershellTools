@@ -1,4 +1,4 @@
-# DHCP Events + Live Watch (v2.5.0)
+# DHCP Events + Live Watch (v2.5.1)
 
 Footer: **Created by Anthony Blake**
 
@@ -7,7 +7,14 @@ Footer: **Created by Anthony Blake**
 1. **Detect Logs** — list `DhcpSrvLog*` files with **filename**, **last modified**, and size; pick which file to ingest
 2. **Ingest** DHCP audit logs (Local / Server A / Server B / Custom path)
 3. **Filter** ingested events by search text, Event ID, IP, MAC, hostname, and server
-4. **Live Watch** Local / Server A / Server B / Custom file
+4. **Event details** — double-click a row (or select + **Details** / Enter) for a popup with full fields + raw line
+5. **Live Watch** Local / Server A / Server B / Custom file
+
+## Event details popup
+
+- **Double-click** any row in the Events grid, press **Enter**, or click **Details**
+- Shows Server, Time, Event ID, Description (with known ID meaning), IP, MAC, Hostname, Details, and the raw audit line
+- **Copy Raw Line** / **Copy All** for clipboard
 
 ## Detect Logs
 

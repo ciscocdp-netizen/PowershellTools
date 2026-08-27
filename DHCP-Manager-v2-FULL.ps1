@@ -644,7 +644,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                      HorizontalAlignment="Center"/>
           
           <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-            <Run Text="v2.5.0  |  "/>
+            <Run Text="v2.5.1  |  "/>
             <Run Text="Created by Anthony Blake" Foreground="#90CAF9"/>
             <Run Text="  |  "/>
             <Run x:Name="StatusTime" Text=""/>
@@ -1367,6 +1367,9 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                     <Separator Width="1" Background="{StaticResource Border}" Margin="8,0"/>
                     <Button x:Name="BtnEventClear" Content="🗑️ Clear" Margin="8,0,8,0"
                             Style="{StaticResource BtnSecondary}"/>
+                    <Button x:Name="BtnEventDetails" Content="🔍 Details" Margin="0,0,8,0"
+                            Style="{StaticResource BtnSecondary}"
+                            ToolTip="Open details for the selected event (or double-click a row)"/>
                     <Button x:Name="BtnEventExport" Content="💾 Export" Margin="0,0,0,0"
                             Style="{StaticResource BtnSecondary}"/>
                   </StackPanel>
@@ -1704,6 +1707,7 @@ try {
     $script:BtnEventWatchStart   = $Window.FindName("BtnEventWatchStart")
     $script:BtnEventWatchStop    = $Window.FindName("BtnEventWatchStop")
     $script:BtnEventClear        = $Window.FindName("BtnEventClear")
+    $script:BtnEventDetails      = $Window.FindName("BtnEventDetails")
     $script:BtnEventExport       = $Window.FindName("BtnEventExport")
     $script:TxtEventFilter       = $Window.FindName("TxtEventFilter")
     $script:CboEventIdFilter     = $Window.FindName("CboEventIdFilter")
@@ -4408,6 +4412,212 @@ function Show-DhcpAuditLogPickerDialog {
     return $selectedPath
 }
 
+function Show-DhcpEventDetailDialog {
+    <#
+    .SYNOPSIS
+        Modal popup with full details for one ingested DHCP audit event
+    #>
+    param(
+        [object]$Entry
+    )
+    
+    if ($null -eq $Entry) {
+        Show-MessageBox "Select an event in the grid first (or double-click a row)." "Event Details" OK Warning
+        return
+    }
+    
+    $eventId = "$($Entry.EventId)".Trim()
+    $knownDesc = Get-DhcpEventDescription $eventId
+    $logDesc = "$($Entry.Description)".Trim()
+    if ($logDesc -and $knownDesc -and $logDesc -ne $knownDesc -and $knownDesc -notmatch '^Event ') {
+        $meaning = "$logDesc  —  known ID meaning: $knownDesc"
+    } elseif ($logDesc) {
+        $meaning = $logDesc
+    } else {
+        $meaning = $knownDesc
+    }
+    
+    $server   = "$($Entry.Server)"
+    $time     = "$($Entry.Time)"
+    $ip       = "$($Entry.IPAddress)"
+    $mac      = "$($Entry.MacAddress)"
+    $hostName = "$($Entry.HostName)"
+    $details  = "$($Entry.Details)"
+    $raw      = "$($Entry.Raw)"
+    
+    [xml]$dialogXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="DHCP Event Details"
+        Height="560" Width="720"
+        MinHeight="420" MinWidth="560"
+        WindowStartupLocation="CenterOwner"
+        Background="#1A1D23"
+        FontFamily="Segoe UI" FontSize="13"
+        ResizeMode="CanResizeWithGrip">
+  <Grid Margin="16">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+
+    <StackPanel Grid.Row="0" Margin="0,0,0,12">
+      <TextBlock Text="Event details" Foreground="#E8EAF0" FontSize="18" FontWeight="SemiBold"/>
+      <TextBlock x:Name="TxtDetailSubtitle" Foreground="#9AA3B2" FontSize="12" Margin="0,4,0,0"
+                 TextWrapping="Wrap"/>
+    </StackPanel>
+
+    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+      <Grid>
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="120"/>
+          <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0" Grid.Column="0" Text="Server" Foreground="#9AA3B2" Margin="0,0,12,8" VerticalAlignment="Center"/>
+        <TextBox Grid.Row="0" Grid.Column="1" x:Name="TxtDetailServer" IsReadOnly="True"
+                 Background="#22262E" Foreground="#E8EAF0" BorderBrush="#383E4A" BorderThickness="1"
+                 Padding="8,6" Margin="0,0,0,8"/>
+
+        <TextBlock Grid.Row="1" Grid.Column="0" Text="Time" Foreground="#9AA3B2" Margin="0,0,12,8" VerticalAlignment="Center"/>
+        <TextBox Grid.Row="1" Grid.Column="1" x:Name="TxtDetailTime" IsReadOnly="True"
+                 Background="#22262E" Foreground="#E8EAF0" BorderBrush="#383E4A" BorderThickness="1"
+                 Padding="8,6" Margin="0,0,0,8"/>
+
+        <TextBlock Grid.Row="2" Grid.Column="0" Text="Event ID" Foreground="#9AA3B2" Margin="0,0,12,8" VerticalAlignment="Center"/>
+        <TextBox Grid.Row="2" Grid.Column="1" x:Name="TxtDetailEventId" IsReadOnly="True"
+                 Background="#22262E" Foreground="#E8EAF0" BorderBrush="#383E4A" BorderThickness="1"
+                 Padding="8,6" Margin="0,0,0,8"/>
+
+        <TextBlock Grid.Row="3" Grid.Column="0" Text="Description" Foreground="#9AA3B2" Margin="0,0,12,8" VerticalAlignment="Top"/>
+        <TextBox Grid.Row="3" Grid.Column="1" x:Name="TxtDetailDescription" IsReadOnly="True"
+                 TextWrapping="Wrap" AcceptsReturn="True" MinHeight="44"
+                 Background="#22262E" Foreground="#E8EAF0" BorderBrush="#383E4A" BorderThickness="1"
+                 Padding="8,6" Margin="0,0,0,8"/>
+
+        <TextBlock Grid.Row="4" Grid.Column="0" Text="IP Address" Foreground="#9AA3B2" Margin="0,0,12,8" VerticalAlignment="Center"/>
+        <TextBox Grid.Row="4" Grid.Column="1" x:Name="TxtDetailIp" IsReadOnly="True"
+                 Background="#22262E" Foreground="#E8EAF0" BorderBrush="#383E4A" BorderThickness="1"
+                 Padding="8,6" Margin="0,0,0,8"/>
+
+        <TextBlock Grid.Row="5" Grid.Column="0" Text="MAC" Foreground="#9AA3B2" Margin="0,0,12,8" VerticalAlignment="Center"/>
+        <TextBox Grid.Row="5" Grid.Column="1" x:Name="TxtDetailMac" IsReadOnly="True"
+                 Background="#22262E" Foreground="#E8EAF0" BorderBrush="#383E4A" BorderThickness="1"
+                 Padding="8,6" Margin="0,0,0,8"/>
+
+        <TextBlock Grid.Row="6" Grid.Column="0" Text="Hostname" Foreground="#9AA3B2" Margin="0,0,12,8" VerticalAlignment="Center"/>
+        <TextBox Grid.Row="6" Grid.Column="1" x:Name="TxtDetailHost" IsReadOnly="True"
+                 Background="#22262E" Foreground="#E8EAF0" BorderBrush="#383E4A" BorderThickness="1"
+                 Padding="8,6" Margin="0,0,0,8"/>
+
+        <TextBlock Grid.Row="7" Grid.Column="0" Text="Details" Foreground="#9AA3B2" Margin="0,0,12,8" VerticalAlignment="Top"/>
+        <TextBox Grid.Row="7" Grid.Column="1" x:Name="TxtDetailExtra" IsReadOnly="True"
+                 TextWrapping="Wrap" AcceptsReturn="True" MinHeight="56" VerticalScrollBarVisibility="Auto"
+                 Background="#22262E" Foreground="#E8EAF0" BorderBrush="#383E4A" BorderThickness="1"
+                 Padding="8,6" Margin="0,0,0,8"/>
+
+        <TextBlock Grid.Row="8" Grid.Column="0" Text="Raw line" Foreground="#9AA3B2" Margin="0,0,12,8" VerticalAlignment="Top"/>
+        <TextBox Grid.Row="9" Grid.Column="0" Grid.ColumnSpan="2" x:Name="TxtDetailRaw" IsReadOnly="True"
+                 TextWrapping="Wrap" AcceptsReturn="True" MinHeight="100" VerticalScrollBarVisibility="Auto"
+                 FontFamily="Consolas" FontSize="12"
+                 Background="#12151A" Foreground="#C5CAD3" BorderBrush="#383E4A" BorderThickness="1"
+                 Padding="8,6"/>
+      </Grid>
+    </ScrollViewer>
+
+    <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+      <Button x:Name="BtnDetailCopyRaw" Content="Copy Raw Line" Width="130" Height="30" Margin="0,0,8,0"
+              Background="#2A2F3A" Foreground="#E8EAF0" BorderBrush="#383E4A" BorderThickness="1"/>
+      <Button x:Name="BtnDetailCopyAll" Content="Copy All" Width="100" Height="30" Margin="0,0,8,0"
+              Background="#2A2F3A" Foreground="#E8EAF0" BorderBrush="#383E4A" BorderThickness="1"/>
+      <Button x:Name="BtnDetailClose" Content="Close" Width="90" Height="30" IsDefault="True" IsCancel="True"
+              Background="#2196F3" Foreground="White" BorderThickness="0"/>
+    </StackPanel>
+  </Grid>
+</Window>
+'@
+    
+    try {
+        $dialog = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($dialogXaml))
+        if ($script:Window) { $dialog.Owner = $script:Window }
+        
+        $dialog.FindName('TxtDetailSubtitle').Text = "ID $eventId  ·  $time  ·  $server"
+        $dialog.FindName('TxtDetailServer').Text = $server
+        $dialog.FindName('TxtDetailTime').Text = $time
+        $dialog.FindName('TxtDetailEventId').Text = $eventId
+        $dialog.FindName('TxtDetailDescription').Text = $meaning
+        $dialog.FindName('TxtDetailIp').Text = $ip
+        $dialog.FindName('TxtDetailMac').Text = $mac
+        $dialog.FindName('TxtDetailHost').Text = $hostName
+        $dialog.FindName('TxtDetailExtra').Text = $details
+        $dialog.FindName('TxtDetailRaw').Text = $raw
+        
+        $btnCopyRaw = $dialog.FindName('BtnDetailCopyRaw')
+        $btnCopyAll = $dialog.FindName('BtnDetailCopyAll')
+        $btnClose = $dialog.FindName('BtnDetailClose')
+        
+        $script:EventDetailCopyRaw = $raw
+        $script:EventDetailCopyAll = @(
+            "DHCP Event Details"
+            "Server:      $server"
+            "Time:        $time"
+            "Event ID:    $eventId"
+            "Description: $meaning"
+            "IP Address:  $ip"
+            "MAC:         $mac"
+            "Hostname:    $hostName"
+            "Details:     $details"
+            "Raw:         $raw"
+        ) -join [Environment]::NewLine
+        $script:EventDetailCopyId = $eventId
+        
+        $btnCopyRaw.add_Click({
+            try {
+                [System.Windows.Clipboard]::SetText("$($script:EventDetailCopyRaw)")
+                Write-ActionLog "Copied event raw line to clipboard (ID $($script:EventDetailCopyId))" "INFO"
+            } catch {
+                Show-MessageBox "Could not copy to clipboard: $_" "Event Details" OK Warning
+            }
+        })
+        
+        $btnCopyAll.add_Click({
+            try {
+                [System.Windows.Clipboard]::SetText("$($script:EventDetailCopyAll)")
+                Write-ActionLog "Copied full event details to clipboard (ID $($script:EventDetailCopyId))" "INFO"
+            } catch {
+                Show-MessageBox "Could not copy to clipboard: $_" "Event Details" OK Warning
+            }
+        })
+        
+        $btnClose.add_Click({
+            $dialog.DialogResult = $true
+            $dialog.Close()
+        })
+        
+        [void]$dialog.ShowDialog()
+    } catch {
+        Write-ActionLog "Event detail dialog failed: $_" "ERROR"
+        Show-MessageBox "Failed to open event details: $_" "Event Details" OK Error
+    } finally {
+        $script:EventDetailCopyRaw = $null
+        $script:EventDetailCopyAll = $null
+        $script:EventDetailCopyId = $null
+    }
+}
+
 function ConvertFrom-DhcpAuditLine {
     param(
         [string]$Line,
@@ -7065,6 +7275,32 @@ $BtnEventClear.add_Click({
         Write-ActionLog "DHCP event grid cleared" "WARN"
         Update-EventWatchStatus
         Update-LogDisplay
+    }
+})
+
+$BtnEventDetails.add_Click({
+    $item = $null
+    try { $item = $script:GridEvents.SelectedItem } catch {}
+    Show-DhcpEventDetailDialog -Entry $item
+})
+
+$script:GridEvents.add_MouseDoubleClick({
+    $item = $null
+    try { $item = $script:GridEvents.SelectedItem } catch {}
+    if ($null -ne $item) {
+        Show-DhcpEventDetailDialog -Entry $item
+    }
+})
+
+$script:GridEvents.add_KeyDown({
+    param($sender, $e)
+    if ($e.Key -eq [System.Windows.Input.Key]::Enter -or $e.Key -eq [System.Windows.Input.Key]::Return) {
+        $item = $null
+        try { $item = $script:GridEvents.SelectedItem } catch {}
+        if ($null -ne $item) {
+            Show-DhcpEventDetailDialog -Entry $item
+            $e.Handled = $true
+        }
     }
 })
 
