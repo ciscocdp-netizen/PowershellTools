@@ -1,25 +1,29 @@
 # PowershellTools
 
-PowerShell utilities for Windows administration.
+PowerShell utilities for Windows / Entra ID administration.
 
-## Get-LastLogonReport.ps1
+## Get-EntraSmsVoiceAuthUsers.ps1
 
-Looks up Active Directory last-logon data from a CSV of `SamAccountName` values and writes a results CSV.
+Finds **enabled** Entra ID users who have **SMS** and/or **voice** phone authentication methods, then exports a CSV.
 
-### Features
+### What it reports
 
-- GUI **Open** and **Save** file pickers (STA-safe) to choose the input CSV and where to place the report
-- Save dialog prefers the same folder as the input CSV when available
-- Exports **EmailAddress** (`mail`) and **EmployeeID** for each user
-- Optional `-AccurateLastLogon` mode that queries reachable domain controllers
+- Users with registered phone MFA methods (`mobilePhone`, `officePhone`, `alternateMobilePhone`)
+- Users whose preferred MFA method is `sms` or `voice*`
+- **EmailAddress** and **EmployeeID** for each user
+- Save File dialog to choose where the report is written
 
 ### Usage
 
 ```powershell
-.\Get-LastLogonReport.ps1
-.\Get-LastLogonReport.ps1 -AccurateLastLogon
-.\Get-LastLogonReport.ps1 -InputCsv .\users.csv -OutputCsv .\LastLogonReport.csv
-.\Get-LastLogonReport.ps1 -SelfTest
+.\Get-EntraSmsVoiceAuthUsers.ps1
+.\Get-EntraSmsVoiceAuthUsers.ps1 -OutputCsv .\SmsVoiceUsers.csv
+.\Get-EntraSmsVoiceAuthUsers.ps1 -TenantId contoso.onmicrosoft.com -DeviceCode
+.\Get-EntraSmsVoiceAuthUsers.ps1 -SelfTest
 ```
 
-Requires the Active Directory PowerShell module (RSAT).
+### Requirements
+
+- `Install-Module Microsoft.Graph.Authentication -Scope CurrentUser` (recommended)
+- Graph permissions: `AuditLog.Read.All`, `User.Read.All` (admin consent)
+- Entra role with access to the auth method registration report (e.g. Reports Reader)
