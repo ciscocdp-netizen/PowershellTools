@@ -35,8 +35,7 @@
     Optional public-client app ID. Defaults to the Microsoft Graph PowerShell app.
 
 .PARAMETER DeviceCode
-    Prefer device-code sign-in and skip browser sign-in. The script already tries
-    device-code first (console-safe) to avoid WAM window-handle failures.
+    Use device-code sign-in instead of interactive browser login.
 
 .PARAMETER SelfTest
     Runs built-in unit tests for SMS/voice classification helpers and exits.
@@ -49,7 +48,13 @@
     .\Get-EntraSmsVoiceAuthUsers.ps1 -OutputCsv .\SmsVoiceUsers.csv
 
 .EXAMPLE
-    .\Get-EntraSmsVoiceAuthUsers.ps1 -TenantId contoso.onmicrosoft.com -DeviceCode
+    .\Get-EntraSmsVoiceAuthUsers.ps1 -TenantId contoso.onmicrosoft.com
+
+.EXAMPLE
+    .\Get-EntraSmsVoiceAuthUsers.ps1 -DeviceCode
+
+.EXAMPLE
+    .\Get-EntraSmsVoiceAuthUsers.ps1 -SelfTest
 
 .NOTES
     Required Graph delegated permissions (admin consent typically needed):
@@ -58,6 +63,11 @@
 
     Least-privileged Entra roles that can run the registration report:
       Reports Reader, Security Reader, Security Administrator, Global Reader
+
+    Interactive browser sign-in is the default. The script relaunches in STA and
+    shows a small parent window so Windows WAM / MSAL can attach a window handle.
+    Azure PowerShell interactive login is used as a browser fallback. Pass
+    -DeviceCode only if interactive login is blocked in your environment.
 #>
 
 [CmdletBinding()]
@@ -92,7 +102,8 @@ $script:TokenExpiresUtc = [datetime]::MinValue
 $script:AuthMode = ''
 $script:SignedInUpn = ''
 $script:WinFormsLoaded = $false
-$script:UseGui = (-not $SelfTest) -and [string]::IsNullOrWhiteSpace($OutputCsv)
+# Interactive browser/WAM and Save dialogs need WinForms + STA (even with -OutputCsv).
+$script:UseGui = -not $SelfTest
 
 if ([string]::IsNullOrWhiteSpace($ClientId)) {
     $ClientId = $script:GraphPowerShellClientId
@@ -139,7 +150,7 @@ if ($script:UseGui -and [System.Threading.Thread]::CurrentThread.ApartmentState 
         [void]$argParts.Add('-DeviceCode')
     }
 
-    Write-Host "Relaunching in STA mode so the save dialog works..." -ForegroundColor Yellow
+    Write-Host "Relaunching in STA mode so interactive sign-in and file dialogs work..." -ForegroundColor Yellow
     $proc = Start-Process -FilePath $exe -ArgumentList ($argParts -join ' ') -Wait -PassThru -NoNewWindow
     if ($null -eq $proc.ExitCode) { exit 1 }
     exit $proc.ExitCode
@@ -507,12 +518,52 @@ function Complete-MgGraphSession {
     return $true
 }
 
+function New-AuthParentForm {
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'Entra ID interactive sign-in'
+    $form.Width = 480
+    $form.Height = 140
+    $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+    $form.TopMost = $true
+    $form.ShowInTaskbar = $true
+    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.ControlBox = $true
+
+    $label = New-Object System.Windows.Forms.Label
+    $label.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $label.Text = "Complete interactive sign-in in the browser / account picker.`r`nLeave this window open until sign-in finishes."
+    $form.Controls.Add($label)
+
+    [void]$form.Show()
+    $form.Activate()
+    [void][System.Windows.Forms.Application]::DoEvents()
+    return $form
+}
+
 function Connect-ViaMgGraph {
     param(
         [switch]$UseDeviceCode
     )
 
     if (-not (Import-GraphAuthModule)) { return $false }
+
+    # Custom apps can disable WAM and use classic interactive browser login.
+    $isCustomApp = -not [string]::Equals(
+        [string]$ClientId,
+        $script:GraphPowerShellClientId,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+    if ($isCustomApp -and -not $UseDeviceCode -and -not $DeviceCode) {
+        try {
+            if (Get-Command Set-MgGraphOption -ErrorAction SilentlyContinue) {
+                Set-MgGraphOption -DisableLoginByWAM $true -ErrorAction SilentlyContinue | Out-Null
+            }
+        }
+        catch { }
+    }
 
     $params = @{
         Scopes      = $script:GraphScopeList
@@ -529,15 +580,115 @@ function Connect-ViaMgGraph {
         $params['UseDeviceAuthentication'] = $true
     }
 
-    if ($UseDeviceCode -or $DeviceCode) {
-        Write-Host 'Opening Microsoft Graph device sign-in (enter the code in your browser)...' -ForegroundColor Cyan
+    $parent = $null
+    try {
+        if ($UseDeviceCode -or $DeviceCode) {
+            Write-Host 'Opening Microsoft Graph device sign-in (enter the code in your browser)...' -ForegroundColor Cyan
+        }
+        else {
+            Write-Host 'Opening interactive Microsoft Graph sign-in...' -ForegroundColor Cyan
+            if ($script:WinFormsLoaded) {
+                $parent = New-AuthParentForm
+            }
+        }
+
+        Connect-MgGraph @params | Out-Null
+        return (Complete-MgGraphSession)
     }
-    else {
-        Write-Host 'Opening Microsoft Graph browser sign-in...' -ForegroundColor Cyan
+    finally {
+        if ($null -ne $parent) {
+            try { $parent.Close() } catch { }
+            try { $parent.Dispose() } catch { }
+        }
+    }
+}
+
+function Import-AzAuthModule {
+    if (Get-Command Connect-AzAccount -ErrorAction SilentlyContinue) {
+        return $true
+    }
+    try {
+        Import-Module Az.Accounts -ErrorAction Stop
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function ConvertFrom-AzAccessToken {
+    param($TokenObject)
+
+    if ($null -eq $TokenObject) { return $null }
+
+    $raw = $null
+    if ($TokenObject.PSObject.Properties['Token']) {
+        $raw = $TokenObject.Token
+    }
+    elseif ($TokenObject -is [string]) {
+        $raw = $TokenObject
     }
 
-    Connect-MgGraph @params | Out-Null
-    return (Complete-MgGraphSession)
+    if ($null -eq $raw) { return $null }
+
+    if ($raw -is [securestring]) {
+        return [System.Net.NetworkCredential]::new('', $raw).Password
+    }
+
+    return [string]$raw
+}
+
+function Connect-ViaAzAccount {
+    if (-not (Import-AzAuthModule)) { return $false }
+
+    Write-Host 'Opening interactive Azure PowerShell sign-in (browser)...' -ForegroundColor Cyan
+
+    $parent = $null
+    try {
+        if ($script:WinFormsLoaded) {
+            $parent = New-AuthParentForm
+        }
+
+        $azParams = @{
+            ErrorAction = 'Stop'
+        }
+        if (-not [string]::IsNullOrWhiteSpace($TenantId)) {
+            $azParams['Tenant'] = $TenantId
+        }
+
+        Connect-AzAccount @azParams | Out-Null
+
+        $tokObj = Get-AzAccessToken -ResourceUrl 'https://graph.microsoft.com' -ErrorAction Stop
+        $accessToken = ConvertFrom-AzAccessToken -TokenObject $tokObj
+        if ([string]::IsNullOrWhiteSpace($accessToken)) {
+            throw 'Get-AzAccessToken returned an empty Graph token.'
+        }
+
+        $expires = [datetime]::UtcNow.AddHours(1)
+        if ($tokObj.PSObject.Properties['ExpiresOn'] -and $tokObj.ExpiresOn) {
+            try {
+                $expires = ([datetimeoffset]$tokObj.ExpiresOn).UtcDateTime
+            }
+            catch { }
+        }
+
+        $account = ''
+        try {
+            $ctx = Get-AzContext -ErrorAction SilentlyContinue
+            if ($ctx -and $ctx.Account -and $ctx.Account.Id) {
+                $account = [string]$ctx.Account.Id
+            }
+        }
+        catch { }
+
+        return (Set-TokenSession -AccessToken $accessToken -ExpiresOnUtc $expires -AccountUpn $account -Mode 'AzInteractive')
+    }
+    finally {
+        if ($null -ne $parent) {
+            try { $parent.Close() } catch { }
+            try { $parent.Dispose() } catch { }
+        }
+    }
 }
 
 function Connect-ViaDeviceCode {
@@ -613,42 +764,67 @@ function Connect-EntraGraph {
     $ok = $false
     $errors = New-Object System.Collections.Generic.List[string]
 
-    # 1) Preferred for consoles: Microsoft.Graph device-code (avoids WAM window-handle failures)
-    try {
-        if (Connect-ViaMgGraph -UseDeviceCode) { $ok = $true }
+    if ($DeviceCode) {
+        # Explicit device-code only
+        try {
+            if (Connect-ViaMgGraph -UseDeviceCode) { $ok = $true }
+        }
+        catch {
+            [void]$errors.Add("Microsoft.Graph device-code: $($_.Exception.Message)")
+        }
+        if (-not $ok) {
+            try {
+                if (Connect-ViaDeviceCode -AppClientId $script:AzurePowerShellClientId) { $ok = $true }
+            }
+            catch {
+                [void]$errors.Add("Device code (Azure PowerShell app): $($_.Exception.Message)")
+            }
+        }
+        if (-not $ok) {
+            try {
+                if (Connect-ViaDeviceCode -AppClientId $ClientId) { $ok = $true }
+            }
+            catch {
+                [void]$errors.Add("Device code (Graph app): $($_.Exception.Message)")
+            }
+        }
     }
-    catch {
-        [void]$errors.Add("Microsoft.Graph device-code: $($_.Exception.Message)")
-    }
-
-    # 2) Optional browser sign-in when -DeviceCode was not forced and device-code path failed
-    if (-not $ok -and -not $DeviceCode) {
+    else {
+        # 1) Interactive Microsoft Graph (browser / WAM with parent window)
         try {
             if (Connect-ViaMgGraph) { $ok = $true }
         }
         catch {
-            [void]$errors.Add("Microsoft.Graph browser: $($_.Exception.Message)")
+            [void]$errors.Add("Microsoft.Graph interactive: $($_.Exception.Message)")
         }
-    }
 
-    # 3) Raw device-code with Azure PowerShell public client (most reliable fallback)
-    if (-not $ok) {
-        try {
-            if (Connect-ViaDeviceCode -AppClientId $script:AzurePowerShellClientId) { $ok = $true }
+        # 2) Interactive Azure PowerShell browser login -> Graph token
+        if (-not $ok) {
+            try {
+                if (Connect-ViaAzAccount) { $ok = $true }
+            }
+            catch {
+                [void]$errors.Add("Azure PowerShell interactive: $($_.Exception.Message)")
+            }
         }
-        catch {
-            [void]$errors.Add("Device code (Azure PowerShell app): $($_.Exception.Message)")
-        }
-    }
 
-    # 4) Raw device-code with Microsoft Graph PowerShell app / custom -ClientId
-    if (-not $ok) {
-        try {
-            $fallbackClient = if (-not [string]::IsNullOrWhiteSpace($ClientId)) { $ClientId } else { $script:GraphPowerShellClientId }
-            if (Connect-ViaDeviceCode -AppClientId $fallbackClient) { $ok = $true }
+        # 3) Last resort: device code
+        if (-not $ok) {
+            Write-Host 'Interactive sign-in failed; falling back to device code...' -ForegroundColor Yellow
+            try {
+                if (Connect-ViaMgGraph -UseDeviceCode) { $ok = $true }
+            }
+            catch {
+                [void]$errors.Add("Microsoft.Graph device-code fallback: $($_.Exception.Message)")
+            }
         }
-        catch {
-            [void]$errors.Add("Device code (Graph PowerShell app): $($_.Exception.Message)")
+        if (-not $ok) {
+            try {
+                if (Connect-ViaDeviceCode -AppClientId $script:AzurePowerShellClientId) { $ok = $true }
+            }
+            catch {
+                [void]$errors.Add("Device code (Azure PowerShell app): $($_.Exception.Message)")
+            }
         }
     }
 
@@ -656,12 +832,12 @@ function Connect-EntraGraph {
         $hint = @(
             'Could not sign in to Entra ID / Microsoft Graph.',
             '',
-            'Try:',
-            '  1) Install-Module Microsoft.Graph.Authentication -Scope CurrentUser',
-            '  2) Close PowerShell, reopen, then run:',
-            '       .\Get-EntraSmsVoiceAuthUsers.ps1 -DeviceCode',
-            '  3) If needed, pass your tenant:',
-            '       .\Get-EntraSmsVoiceAuthUsers.ps1 -DeviceCode -TenantId contoso.onmicrosoft.com',
+            'Interactive login tips:',
+            '  1) Run Windows PowerShell or PowerShell 7 in a normal desktop session (not remoting).',
+            '  2) Install-Module Microsoft.Graph.Authentication -Scope CurrentUser',
+            '  3) Optional browser fallback: Install-Module Az.Accounts -Scope CurrentUser',
+            '  4) Re-run: .\Get-EntraSmsVoiceAuthUsers.ps1',
+            '  5) If interactive is blocked by policy, use: .\Get-EntraSmsVoiceAuthUsers.ps1 -DeviceCode',
             '',
             'Permissions needed: AuditLog.Read.All, User.Read.All (admin consent).',
             '',
