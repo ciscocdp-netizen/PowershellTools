@@ -18,10 +18,12 @@ Finds **enabled** Entra ID users who have **SMS** and/or **voice** phone authent
 ```powershell
 .\Get-EntraSmsVoiceAuthUsers.ps1
 .\Get-EntraSmsVoiceAuthUsers.ps1 -OutputCsv .\SmsVoiceUsers.csv
-.\Get-EntraSmsVoiceAuthUsers.ps1 -TenantId contoso.onmicrosoft.com -DeviceCode
+.\Get-EntraSmsVoiceAuthUsers.ps1 -DeviceCode -TenantId contoso.onmicrosoft.com
 .\Get-EntraSmsVoiceAuthUsers.ps1 -SelfTest
 ```
 
+Sign-in defaults to **device code** (console-safe). That avoids the common
+`A window handle must be configured` WAM/browser failure in PowerShell.
 ### Requirements
 
 - `Install-Module Microsoft.Graph.Authentication -Scope CurrentUser` (recommended)

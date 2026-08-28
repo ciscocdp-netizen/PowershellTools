@@ -35,7 +35,8 @@
     Optional public-client app ID. Defaults to the Microsoft Graph PowerShell app.
 
 .PARAMETER DeviceCode
-    Use device-code sign-in instead of a browser popup.
+    Prefer device-code sign-in and skip browser sign-in. The script already tries
+    device-code first (console-safe) to avoid WAM window-handle failures.
 
 .PARAMETER SelfTest
     Runs built-in unit tests for SMS/voice classification helpers and exits.
@@ -78,13 +79,24 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:GraphScopes = 'AuditLog.Read.All User.Read.All openid profile offline_access'
+# Avoid MSAL WAM "A window handle must be configured" in console hosts.
+$env:AZURE_IDENTITY_DISABLE_CP1 = 'true'
+$env:MSAL_DESKTOP_APP_USE_WAM = '0'
+
+$script:GraphScopeList = @('AuditLog.Read.All', 'User.Read.All')
+$script:GraphScopes = 'AuditLog.Read.All User.Read.All offline_access openid profile'
+$script:GraphPowerShellClientId = '14d82eec-204b-4c2f-b113-9d477e6ee18c'
+$script:AzurePowerShellClientId = '1950a258-227b-4e31-a9cf-717495945fc2'
 $script:AccessToken = $null
 $script:TokenExpiresUtc = [datetime]::MinValue
 $script:AuthMode = ''
 $script:SignedInUpn = ''
 $script:WinFormsLoaded = $false
 $script:UseGui = (-not $SelfTest) -and [string]::IsNullOrWhiteSpace($OutputCsv)
+
+if ([string]::IsNullOrWhiteSpace($ClientId)) {
+    $ClientId = $script:GraphPowerShellClientId
+}
 
 $script:PhoneMethodValues = @(
     'mobilePhone',
@@ -436,11 +448,74 @@ function Set-TokenSession {
     return $true
 }
 
+function ConvertTo-FormUrlEncoded {
+    param([hashtable]$Data)
+
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($key in $Data.Keys) {
+        $k = [uri]::EscapeDataString([string]$key)
+        $v = [uri]::EscapeDataString([string]$Data[$key])
+        [void]$parts.Add("$k=$v")
+    }
+    return ($parts -join '&')
+}
+
+function Get-HttpErrorBody {
+    param($ErrorRecord)
+
+    try {
+        $response = $ErrorRecord.Exception.Response
+        if (-not $response) { return [string]$ErrorRecord.Exception.Message }
+
+        $stream = $response.GetResponseStream()
+        if (-not $stream) { return [string]$ErrorRecord.Exception.Message }
+
+        $reader = New-Object System.IO.StreamReader($stream)
+        try {
+            $body = $reader.ReadToEnd()
+            if (-not [string]::IsNullOrWhiteSpace($body)) {
+                return $body
+            }
+        }
+        finally {
+            $reader.Close()
+        }
+    }
+    catch { }
+
+    return [string]$ErrorRecord.Exception.Message
+}
+
+function Complete-MgGraphSession {
+    $ctx = Get-MgContext -ErrorAction Stop
+    if (-not $ctx) { return $false }
+
+    $token = $null
+    try {
+        if (Get-Command Get-MgAccessToken -ErrorAction SilentlyContinue) {
+            $token = Get-MgAccessToken -ErrorAction Stop
+        }
+    }
+    catch { }
+
+    if ($token) {
+        return (Set-TokenSession -AccessToken ([string]$token) -AccountUpn ([string]$ctx.Account) -Mode 'MgGraphToken')
+    }
+
+    $script:AuthMode = 'MgGraph'
+    $script:SignedInUpn = [string]$ctx.Account
+    return $true
+}
+
 function Connect-ViaMgGraph {
+    param(
+        [switch]$UseDeviceCode
+    )
+
     if (-not (Import-GraphAuthModule)) { return $false }
 
     $params = @{
-        Scopes      = @('AuditLog.Read.All', 'User.Read.All')
+        Scopes      = $script:GraphScopeList
         NoWelcome   = $true
         ErrorAction = 'Stop'
     }
@@ -450,43 +525,47 @@ function Connect-ViaMgGraph {
     if (-not [string]::IsNullOrWhiteSpace($ClientId)) {
         $params['ClientId'] = $ClientId
     }
-    if ($DeviceCode) {
+    if ($UseDeviceCode -or $DeviceCode) {
         $params['UseDeviceAuthentication'] = $true
     }
 
+    if ($UseDeviceCode -or $DeviceCode) {
+        Write-Host 'Opening Microsoft Graph device sign-in (enter the code in your browser)...' -ForegroundColor Cyan
+    }
+    else {
+        Write-Host 'Opening Microsoft Graph browser sign-in...' -ForegroundColor Cyan
+    }
+
     Connect-MgGraph @params | Out-Null
-    $ctx = Get-MgContext -ErrorAction Stop
-    if (-not $ctx) { return $false }
-
-    $token = $null
-    try {
-        # Prefer Graph PowerShell token helper when available
-        if (Get-Command Get-MgAccessToken -ErrorAction SilentlyContinue) {
-            $token = Get-MgAccessToken -ErrorAction Stop
-        }
-    }
-    catch { }
-
-    if (-not $token) {
-        # Fall back to Invoke-MgGraphRequest path later via AuthMode=MgGraph
-        $script:AuthMode = 'MgGraph'
-        $script:SignedInUpn = [string]$ctx.Account
-        return $true
-    }
-
-    return (Set-TokenSession -AccessToken ([string]$token) -AccountUpn ([string]$ctx.Account) -Mode 'MgGraphToken')
+    return (Complete-MgGraphSession)
 }
 
 function Connect-ViaDeviceCode {
-    $tenant = if (-not [string]::IsNullOrWhiteSpace($TenantId)) { $TenantId } else { 'organizations' }
+    param(
+        [Parameter()]
+        [string]$AppClientId = $script:AzurePowerShellClientId
+    )
+
+    if ([string]::IsNullOrWhiteSpace($AppClientId)) {
+        $AppClientId = $script:AzurePowerShellClientId
+    }
+
+    $tenant = if (-not [string]::IsNullOrWhiteSpace($TenantId)) { $TenantId.Trim() } else { 'organizations' }
     $authority = "https://login.microsoftonline.com/$tenant"
-    $dcBody = @{
-        client_id = $ClientId
+
+    $dcBody = ConvertTo-FormUrlEncoded -Data @{
+        client_id = $AppClientId
         scope     = $script:GraphScopes
     }
 
-    $dc = Invoke-RestMethod -Method Post -Uri "$authority/oauth2/v2.0/devicecode" `
-        -ContentType 'application/x-www-form-urlencoded' -Body $dcBody -ErrorAction Stop
+    try {
+        $dc = Invoke-RestMethod -Method Post -Uri "$authority/oauth2/v2.0/devicecode" `
+            -ContentType 'application/x-www-form-urlencoded' -Body $dcBody -ErrorAction Stop
+    }
+    catch {
+        $detail = Get-HttpErrorBody -ErrorRecord $_
+        throw "Device code start failed for client $AppClientId / tenant $tenant`: $detail"
+    }
 
     Write-Host ""
     Write-Host "To sign in, open $($dc.verification_uri) and enter code: $($dc.user_code)" -ForegroundColor Cyan
@@ -494,7 +573,7 @@ function Connect-ViaDeviceCode {
 
     if ($script:WinFormsLoaded) {
         try { [System.Windows.Forms.Clipboard]::SetText([string]$dc.user_code) } catch { }
-        Show-UiMessage -Message "Open $($dc.verification_uri)`r`nEnter code: $($dc.user_code)`r`n`r`nClick OK, then complete sign-in in the browser." -Title 'Sign in to Entra ID' -Icon Information
+        Show-UiMessage -Message "Complete sign-in in your browser:`r`n`r`n1. Open $($dc.verification_uri)`r`n2. Enter code $($dc.user_code) (copied to clipboard)`r`n`r`nClick OK, then finish sign-in in the browser while this window waits." -Title 'Sign in to Entra ID' -Icon Information
     }
 
     $deadline = [datetime]::UtcNow.AddSeconds([int]$dc.expires_in)
@@ -504,19 +583,19 @@ function Connect-ViaDeviceCode {
     while ([datetime]::UtcNow -lt $deadline) {
         Start-Sleep -Seconds $interval
         try {
-            $tokBody = @{
+            $tokBody = ConvertTo-FormUrlEncoded -Data @{
                 grant_type  = 'urn:ietf:params:oauth:grant-type:device_code'
-                client_id   = $ClientId
-                device_code = $dc.device_code
+                client_id   = $AppClientId
+                device_code = [string]$dc.device_code
             }
             $token = Invoke-RestMethod -Method Post -Uri "$authority/oauth2/v2.0/token" `
                 -ContentType 'application/x-www-form-urlencoded' -Body $tokBody -ErrorAction Stop
             break
         }
         catch {
-            $errText = "$_"
+            $errText = Get-HttpErrorBody -ErrorRecord $_
             if ($errText -match 'authorization_pending|slow_down') { continue }
-            throw
+            throw "Device code token exchange failed: $errText"
         }
     }
 
@@ -534,21 +613,42 @@ function Connect-EntraGraph {
     $ok = $false
     $errors = New-Object System.Collections.Generic.List[string]
 
-    if (-not $DeviceCode) {
+    # 1) Preferred for consoles: Microsoft.Graph device-code (avoids WAM window-handle failures)
+    try {
+        if (Connect-ViaMgGraph -UseDeviceCode) { $ok = $true }
+    }
+    catch {
+        [void]$errors.Add("Microsoft.Graph device-code: $($_.Exception.Message)")
+    }
+
+    # 2) Optional browser sign-in when -DeviceCode was not forced and device-code path failed
+    if (-not $ok -and -not $DeviceCode) {
         try {
             if (Connect-ViaMgGraph) { $ok = $true }
         }
         catch {
-            [void]$errors.Add("Microsoft.Graph browser/device: $($_.Exception.Message)")
+            [void]$errors.Add("Microsoft.Graph browser: $($_.Exception.Message)")
         }
     }
 
+    # 3) Raw device-code with Azure PowerShell public client (most reliable fallback)
     if (-not $ok) {
         try {
-            if (Connect-ViaDeviceCode) { $ok = $true }
+            if (Connect-ViaDeviceCode -AppClientId $script:AzurePowerShellClientId) { $ok = $true }
         }
         catch {
-            [void]$errors.Add("Device code: $($_.Exception.Message)")
+            [void]$errors.Add("Device code (Azure PowerShell app): $($_.Exception.Message)")
+        }
+    }
+
+    # 4) Raw device-code with Microsoft Graph PowerShell app / custom -ClientId
+    if (-not $ok) {
+        try {
+            $fallbackClient = if (-not [string]::IsNullOrWhiteSpace($ClientId)) { $ClientId } else { $script:GraphPowerShellClientId }
+            if (Connect-ViaDeviceCode -AppClientId $fallbackClient) { $ok = $true }
+        }
+        catch {
+            [void]$errors.Add("Device code (Graph PowerShell app): $($_.Exception.Message)")
         }
     }
 
@@ -556,7 +656,13 @@ function Connect-EntraGraph {
         $hint = @(
             'Could not sign in to Entra ID / Microsoft Graph.',
             '',
-            'Install: Install-Module Microsoft.Graph.Authentication -Scope CurrentUser',
+            'Try:',
+            '  1) Install-Module Microsoft.Graph.Authentication -Scope CurrentUser',
+            '  2) Close PowerShell, reopen, then run:',
+            '       .\Get-EntraSmsVoiceAuthUsers.ps1 -DeviceCode',
+            '  3) If needed, pass your tenant:',
+            '       .\Get-EntraSmsVoiceAuthUsers.ps1 -DeviceCode -TenantId contoso.onmicrosoft.com',
+            '',
             'Permissions needed: AuditLog.Read.All, User.Read.All (admin consent).',
             '',
             ($errors -join "`r`n")
@@ -606,7 +712,7 @@ function Invoke-GraphGet {
                 throw 'Graph access token expired. Re-run the script to sign in again.'
             }
             $headers = @{
-                Authorization = "Bearer $($script:AccessToken)"
+                Authorization    = "Bearer $($script:AccessToken)"
                 ConsistencyLevel = 'eventual'
             }
             $resp = Invoke-RestMethod -Method Get -Uri $next -Headers $headers -ErrorAction Stop
