@@ -296,16 +296,49 @@ function Test-StringInSet {
     return $false
 }
 
+function Get-GraphResponseProperty {
+    param(
+        $Response,
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
+
+    if ($null -eq $Response) {
+        return $null
+    }
+
+    # Invoke-MgGraphRequest often returns Hashtable/OrderedDictionary/Dictionary.
+    # Do NOT use $Response.PSObject.Properties[$Name] on dictionaries — under
+    # StrictMode that throws "Argument types do not match".
+    if ($Response -is [System.Collections.IDictionary]) {
+        if ($Response.Contains($Name)) {
+            return $Response[$Name]
+        }
+        foreach ($key in @($Response.Keys)) {
+            if ([string]::Equals([string]$key, $Name, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $Response[$key]
+            }
+        }
+        return $null
+    }
+
+    $prop = $Response.PSObject.Properties[$Name]
+    if ($null -ne $prop) {
+        return $prop.Value
+    }
+    return $null
+}
+
 function Get-SmsVoiceClassification {
     param(
         [Parameter(Mandatory)]
         $Registration
     )
 
-    $methods = ConvertTo-StringArray $Registration.methodsRegistered
-    $preferred = [string]$Registration.userPreferredMethodForSecondaryAuthentication
-    if ($null -eq $preferred) { $preferred = '' }
-    $systemPreferred = ConvertTo-StringArray $Registration.systemPreferredAuthenticationMethods
+    $methods = ConvertTo-StringArray (Get-GraphResponseProperty -Response $Registration -Name 'methodsRegistered')
+    $preferred = [string](Get-GraphResponseProperty -Response $Registration -Name 'userPreferredMethodForSecondaryAuthentication')
+    if ([string]::IsNullOrWhiteSpace($preferred)) { $preferred = '' }
+    $systemPreferred = ConvertTo-StringArray (Get-GraphResponseProperty -Response $Registration -Name 'systemPreferredAuthenticationMethods')
 
     $phoneMethods = @(
         $methods | Where-Object { Test-StringInSet -Value $_ -Set $script:PhoneMethodValues }
@@ -409,6 +442,18 @@ function Invoke-SmsVoiceSelfTest {
         })
     Assert-Equal $false $noPhone.IsMatch 'authenticator-only is not a match'
     Assert-Equal 'None' $noPhone.Category 'authenticator-only category'
+
+    $dictReg = [ordered]@{
+        methodsRegistered = @('mobilePhone')
+        userPreferredMethodForSecondaryAuthentication = 'push'
+        systemPreferredAuthenticationMethods = @('push')
+    }
+    $fromDict = Get-SmsVoiceClassification -Registration $dictReg
+    Assert-Equal $true $fromDict.IsMatch 'ordered dictionary registration is match'
+
+    $ht = @{ value = @(@{ id = '1' }, @{ id = '2' }); '@odata.nextLink' = $null }
+    $extracted = Get-GraphResponseProperty -Response $ht -Name 'value'
+    Assert-Equal 2 @($extracted).Count 'dictionary value extraction count'
 
     Write-Host 'All self-tests passed.' -ForegroundColor Green
 }
@@ -868,23 +913,55 @@ function Invoke-GraphGet {
         [int]$MaxPages = 0
     )
 
-    $items = New-Object System.Collections.Generic.List[object]
+    $items = New-Object 'System.Collections.Generic.List[object]'
     $next = $Uri
     $pages = 0
     $last = $null
 
-    while ($next) {
+    while (-not [string]::IsNullOrWhiteSpace($next)) {
         $pages++
         if ($MaxPages -gt 0 -and $pages -gt $MaxPages) { break }
 
-        if ($script:AuthMode -eq 'MgGraph' -and (Get-Command Invoke-MgGraphRequest -ErrorAction SilentlyContinue)) {
-            $resp = Invoke-MgGraphRequest -Method GET -Uri $next -ErrorAction Stop
+        $resp = $null
+        $useMg = ($script:AuthMode -eq 'MgGraph') -and (Get-Command Invoke-MgGraphRequest -ErrorAction SilentlyContinue)
+
+        if ($useMg) {
+            try {
+                # Prefer PSObject when supported; fall back to default hashtable/dictionary.
+                $mgParams = @{
+                    Method      = 'GET'
+                    Uri         = $next
+                    ErrorAction = 'Stop'
+                }
+                $cmd = Get-Command Invoke-MgGraphRequest -ErrorAction Stop
+                if ($cmd.Parameters.ContainsKey('OutputType')) {
+                    try {
+                        $resp = Invoke-MgGraphRequest @mgParams -OutputType PSObject
+                    }
+                    catch {
+                        $resp = Invoke-MgGraphRequest @mgParams
+                    }
+                }
+                else {
+                    $resp = Invoke-MgGraphRequest @mgParams
+                }
+            }
+            catch {
+                # Some Graph module builds reject Method as string; retry with enum-like casing / no OutputType.
+                try {
+                    $resp = Invoke-MgGraphRequest -Method Get -Uri $next -ErrorAction Stop
+                }
+                catch {
+                    throw
+                }
+            }
         }
         else {
             if ([string]::IsNullOrWhiteSpace($script:AccessToken)) {
                 throw 'No Graph access token is available.'
             }
-            if ([datetime]::UtcNow -ge $script:TokenExpiresUtc.AddMinutes(-2)) {
+            if ($script:TokenExpiresUtc -gt [datetime]::MinValue -and
+                [datetime]::UtcNow -ge $script:TokenExpiresUtc.AddMinutes(-2)) {
                 throw 'Graph access token expired. Re-run the script to sign in again.'
             }
             $headers = @{
@@ -895,51 +972,39 @@ function Invoke-GraphGet {
         }
 
         $last = $resp
-        $hasValue = $false
-        $valueList = $null
-        $nextLink = $null
+        $valueList = Get-GraphResponseProperty -Response $resp -Name 'value'
+        $nextLink = Get-GraphResponseProperty -Response $resp -Name '@odata.nextLink'
 
-        if ($resp -is [hashtable]) {
-            if ($resp.ContainsKey('value')) {
-                $hasValue = $true
-                $valueList = $resp['value']
-            }
-            if ($resp.ContainsKey('@odata.nextLink')) {
-                $nextLink = $resp['@odata.nextLink']
-            }
-        }
-        elseif ($resp.PSObject.Properties['value']) {
-            $hasValue = $true
-            $valueList = $resp.value
-            if ($resp.PSObject.Properties['@odata.nextLink']) {
-                $nextLink = $resp.'@odata.nextLink'
-            }
-        }
-
-        if ($hasValue) {
+        if ($null -ne $valueList) {
             foreach ($v in @($valueList)) {
-                if ($null -ne $v) { [void]$items.Add($v) }
+                if ($null -ne $v) {
+                    [void]$items.Add($v)
+                }
             }
             $next = if ($nextLink) { [string]$nextLink } else { $null }
         }
         else {
+            # Single-object response (e.g. /users/{id})
             return $resp
         }
     }
 
-    return @{ value = @($items); _raw = $last }
+    return @{
+        value = @($items.ToArray())
+        _raw  = $last
+    }
 }
 
 function Get-GraphCollectionValue {
     param($Response)
 
     if ($null -eq $Response) { return @() }
-    if ($Response -is [hashtable] -and $Response.ContainsKey('value')) {
-        return @($Response['value'])
+
+    $value = Get-GraphResponseProperty -Response $Response -Name 'value'
+    if ($null -ne $value) {
+        return @($value)
     }
-    if ($Response.PSObject.Properties['value']) {
-        return @($Response.value)
-    }
+
     return @($Response)
 }
 
@@ -963,15 +1028,15 @@ function Get-EmailFromProfile {
     param($Profile)
 
     if ($null -eq $Profile) { return $null }
-    foreach ($name in @('mail')) {
-        $prop = $Profile.PSObject.Properties[$name]
-        if ($prop -and -not [string]::IsNullOrWhiteSpace([string]$prop.Value)) {
-            return ([string]$prop.Value).Trim()
-        }
+
+    $mail = Get-GraphResponseProperty -Response $Profile -Name 'mail'
+    if (-not [string]::IsNullOrWhiteSpace([string]$mail)) {
+        return ([string]$mail).Trim()
     }
-    $other = $Profile.PSObject.Properties['otherMails']
-    if ($other -and $other.Value) {
-        $first = @(ConvertTo-StringArray $other.Value) | Select-Object -First 1
+
+    $other = Get-GraphResponseProperty -Response $Profile -Name 'otherMails'
+    if ($null -ne $other) {
+        $first = @(ConvertTo-StringArray $other) | Select-Object -First 1
         if ($first) { return $first }
     }
     return $null
@@ -1030,7 +1095,11 @@ try {
     $regResponse = Invoke-GraphGet -Uri $uri
 }
 catch {
-    Show-UiMessage -Message "Failed to query authentication method registration details:`r`n$($_.Exception.Message)`r`n`r`nEnsure your account has AuditLog.Read.All (Reports Reader or higher)." -Title 'Graph query failed' -Icon Error
+    $detail = $_.Exception.Message
+    if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+        $detail = "$detail`r`n$($_.ErrorDetails.Message)"
+    }
+    Show-UiMessage -Message "Failed to query authentication method registration details:`r`n$detail`r`n`r`nEnsure your account has AuditLog.Read.All (Reports Reader or higher)." -Title 'Graph query failed' -Icon Error
     exit 1
 }
 
@@ -1055,7 +1124,7 @@ foreach ($reg in $registrations) {
         continue
     }
 
-    $userId = [string]$reg.id
+    $userId = [string](Get-GraphResponseProperty -Response $reg -Name 'id')
     $profile = $null
     if (-not [string]::IsNullOrWhiteSpace($userId)) {
         $profile = Get-EntraUserProfile -UserId $userId
@@ -1065,27 +1134,42 @@ foreach ($reg in $registrations) {
     }
 
     $accountEnabled = $true
-    if ($null -ne $profile -and $null -ne $profile.PSObject.Properties['accountEnabled']) {
-        $accountEnabled = [bool]$profile.accountEnabled
+    if ($null -ne $profile) {
+        $enabledRaw = Get-GraphResponseProperty -Response $profile -Name 'accountEnabled'
+        if ($null -ne $enabledRaw) {
+            $accountEnabled = [bool]$enabledRaw
+        }
     }
     if (-not $accountEnabled) {
         $skippedDisabled++
         continue
     }
 
-    $displayName = [string]$reg.userDisplayName
-    $upn = [string]$reg.userPrincipalName
+    $displayName = [string](Get-GraphResponseProperty -Response $reg -Name 'userDisplayName')
+    $upn = [string](Get-GraphResponseProperty -Response $reg -Name 'userPrincipalName')
     $email = $null
     $employeeId = $null
 
     if ($null -ne $profile) {
-        if ($profile.displayName) { $displayName = [string]$profile.displayName }
-        if ($profile.userPrincipalName) { $upn = [string]$profile.userPrincipalName }
+        $profileDisplay = Get-GraphResponseProperty -Response $profile -Name 'displayName'
+        $profileUpn = Get-GraphResponseProperty -Response $profile -Name 'userPrincipalName'
+        if (-not [string]::IsNullOrWhiteSpace([string]$profileDisplay)) {
+            $displayName = [string]$profileDisplay
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$profileUpn)) {
+            $upn = [string]$profileUpn
+        }
         $email = Get-EmailFromProfile -Profile $profile
-        if ($profile.PSObject.Properties['employeeId'] -and $profile.employeeId) {
-            $employeeId = ([string]$profile.employeeId).Trim()
+        $employeeRaw = Get-GraphResponseProperty -Response $profile -Name 'employeeId'
+        if (-not [string]::IsNullOrWhiteSpace([string]$employeeRaw)) {
+            $employeeId = ([string]$employeeRaw).Trim()
         }
     }
+
+    $userType = Get-GraphResponseProperty -Response $reg -Name 'userType'
+    $isMfaRegistered = Get-GraphResponseProperty -Response $reg -Name 'isMfaRegistered'
+    $isMfaCapable = Get-GraphResponseProperty -Response $reg -Name 'isMfaCapable'
+    $lastUpdated = Get-GraphResponseProperty -Response $reg -Name 'lastUpdatedDateTime'
 
     [void]$results.Add([pscustomobject][ordered]@{
             DisplayName        = $displayName
@@ -1093,7 +1177,7 @@ foreach ($reg in $registrations) {
             EmailAddress       = $email
             EmployeeID         = $employeeId
             AccountEnabled     = $accountEnabled
-            UserType           = [string]$reg.userType
+            UserType           = [string]$userType
             AuthCategory       = $classification.Category
             UsesSms            = $classification.UsesSms
             UsesVoice          = $classification.UsesVoice
@@ -1101,9 +1185,9 @@ foreach ($reg in $registrations) {
             PreferredMfaMethod = $classification.PreferredMethod
             SystemPreferred    = $classification.SystemPreferred
             MethodsRegistered  = $classification.MethodsRegisteredAll
-            IsMfaRegistered    = $reg.isMfaRegistered
-            IsMfaCapable       = $reg.isMfaCapable
-            LastUpdated        = $reg.lastUpdatedDateTime
+            IsMfaRegistered    = $isMfaRegistered
+            IsMfaCapable       = $isMfaCapable
+            LastUpdated        = $lastUpdated
             UserId             = $userId
         })
 }
