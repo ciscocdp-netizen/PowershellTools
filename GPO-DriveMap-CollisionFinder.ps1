@@ -1053,6 +1053,36 @@ function ConvertTo-GuiBrush {
             <Setter Property="FontWeight" Value="SemiBold"/>
             <Setter Property="Cursor" Value="Hand"/>
         </Style>
+
+        <!-- Default Aero header is white; DataGrid Foreground is light, so titles vanish.
+             Replace the template so Background/Foreground actually apply. -->
+        <Style x:Key="GridColumnHeader" TargetType="DataGridColumnHeader">
+            <Setter Property="Background" Value="#FF32323C"/>
+            <Setter Property="Foreground" Value="#FFF2F2F7"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Padding" Value="8,6"/>
+            <Setter Property="BorderBrush" Value="#FF3A3A46"/>
+            <Setter Property="BorderThickness" Value="0,0,1,1"/>
+            <Setter Property="HorizontalContentAlignment" Value="Left"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+            <Setter Property="SnapsToDevicePixels" Value="True"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="DataGridColumnHeader">
+                        <Border Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                              VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+                                              RecognizesAccessKey="True"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style TargetType="DataGridColumnHeader" BasedOn="{StaticResource GridColumnHeader}"/>
     </Window.Resources>
 
     <Grid Margin="16">
@@ -1128,8 +1158,11 @@ function ConvertTo-GuiBrush {
         <DataGrid x:Name="grid" Grid.Row="3" AutoGenerateColumns="False" IsReadOnly="True"
                   Background="#FF20202A" Foreground="{StaticResource Fg}" BorderBrush="#FF3A3A46"
                   GridLinesVisibility="Horizontal" HeadersVisibility="Column"
+                  HorizontalGridLinesBrush="#FF3A3A46"
                   RowBackground="#FF20202A" AlternatingRowBackground="#FF24242E"
-                  CanUserResizeRows="False" HorizontalScrollBarVisibility="Auto">
+                  CanUserResizeRows="False" HorizontalScrollBarVisibility="Auto"
+                  ColumnHeaderStyle="{StaticResource GridColumnHeader}"
+                  RowHeaderWidth="0">
             <DataGrid.RowStyle>
                 <Style TargetType="DataGridRow">
                     <Style.Triggers>
