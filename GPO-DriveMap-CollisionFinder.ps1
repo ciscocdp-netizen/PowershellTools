@@ -52,6 +52,10 @@
         when GpoId is already braced).
       * [guid]::Empty is truthy in PowerShell; an unselected GPO no longer injects
         a fake {00000000-...} policy into the applicable set.
+      * Returning ", `$array" from Get-ApplicableGpo nested the GPO list, so
+        foreach ran once and $gpo.DisplayName became string[]. On Windows
+        PowerShell 5.1 that throws: Cannot convert value to type System.String
+        (parameter GpoName). Items are now emitted one-by-one and flattened.
       * Same-letter Delete mappings are collisions (CSE order can unmap the
         proposed drive).
       * UNC path compare is case-insensitive and ignores trailing slashes.
@@ -118,6 +122,42 @@ function ConvertTo-NormalizedDriveLetter {
     param([string]$Letter)
     if ([string]::IsNullOrWhiteSpace($Letter)) { return '' }
     return $Letter.Trim().TrimEnd(':').ToUpperInvariant()
+}
+
+function ConvertTo-SingleString {
+    <#
+        PowerShell [string] parameters cannot bind a multi-element array
+        ("Cannot convert value to type System.String"). That happens when a
+        nested GPO/map collection is member-enumerated (e.g. $gpos.DisplayName).
+    #>
+    param($Value)
+    if ($null -eq $Value) { return '' }
+    if ($Value -is [string]) { return $Value }
+    if ($Value -is [System.Array]) {
+        if ($Value.Length -eq 0) { return '' }
+        return [string]$Value[0]
+    }
+    return [string]$Value
+}
+
+function ConvertTo-FlatList {
+    <#
+        Unwraps the extra Object[] layer created by "return , $array" so
+        foreach iterates real GPO/map objects instead of one nested array.
+    #>
+    param($InputObject)
+    $list = New-Object System.Collections.Generic.List[object]
+    foreach ($item in @($InputObject)) {
+        if ($null -eq $item) { continue }
+        if ($item -is [System.Array]) {
+            foreach ($inner in $item) {
+                if ($null -ne $inner) { [void]$list.Add($inner) }
+            }
+            continue
+        }
+        [void]$list.Add($item)
+    }
+    return $list
 }
 
 function ConvertTo-NormalizedUncPath {
@@ -208,8 +248,9 @@ function ConvertFrom-DrivesXml {
     #>
     param(
         [Parameter(Mandatory)][xml]$Xml,
-        [Parameter(Mandatory)][string]$GpoName
+        [Parameter(Mandatory)]$GpoName
     )
+    $GpoName = ConvertTo-SingleString $GpoName
 
     if (-not $Xml.DocumentElement) { return @() }
     $root = $Xml.DocumentElement
@@ -243,7 +284,7 @@ function ConvertFrom-DrivesXml {
         $useLetter = $props.GetAttribute('useLetter')
 
         $maps.Add([pscustomobject]@{
-            GpoName     = $GpoName
+            GpoName     = (ConvertTo-SingleString $GpoName)
             Letter      = $letter
             Path        = $props.GetAttribute('path')
             Action      = $action
@@ -255,8 +296,9 @@ function ConvertFrom-DrivesXml {
         }) | Out-Null
     }
 
-    # Prevent PowerShell from unrolling a single-element collection on return.
-    return , $maps.ToArray()
+    # Emit items one-by-one. Do NOT "return , $array" — the caller then gets a
+    # nested array, foreach runs once, and $gpo.DisplayName becomes string[].
+    foreach ($item in $maps) { $item }
 }
 
 function Get-XmlAttr {
@@ -424,7 +466,7 @@ function Get-TokenGroupSidFromAdsi {
     finally {
         if ($entry) { $entry.Dispose() }
     }
-    return , @($sids)
+    foreach ($s in $sids) { $s }
 }
 
 # ---------------------------------------------------------------------------
@@ -565,14 +607,14 @@ function Get-ApplicableGpo {
 
             $result.Add([pscustomobject]@{
                 Id          = $gpoId
-                DisplayName = $displayName
+                DisplayName = (ConvertTo-SingleString $displayName)
                 Enabled     = $true
                 FilterNote  = $filterNote
             }) | Out-Null
         }
     }
 
-    return , $result.ToArray()
+    foreach ($item in $result) { $item }
 }
 
 # ---------------------------------------------------------------------------
@@ -585,9 +627,11 @@ function Get-GpoDriveMap {
     #>
     param(
         [Parameter(Mandatory)]$GpoId,
-        [Parameter(Mandatory)][string]$GpoName,
-        [Parameter(Mandatory)][string]$DomainDns
+        [Parameter(Mandatory)]$GpoName,
+        [Parameter(Mandatory)]$DomainDns
     )
+    $GpoName = ConvertTo-SingleString $GpoName
+    $DomainDns = ConvertTo-SingleString $DomainDns
 
     $folder = Get-SysvolPolicyFolderName -GpoId $GpoId
     if (-not $folder) { return @() }
@@ -848,7 +892,7 @@ function Invoke-CollisionCheck {
     $userCtx = Get-UserContext -Identity $Identity
     $letter = ConvertTo-NormalizedDriveLetter $ProposedLetter
 
-    $applicable = @(Get-ApplicableGpo -UserContext $userCtx)
+    $applicable = ConvertTo-FlatList (Get-ApplicableGpo -UserContext $userCtx)
 
     # Ensure the selected GPO is always evaluated even if filtering excluded it.
     # [guid]::Empty is truthy in PowerShell — only honor a real caller-supplied id.
@@ -860,12 +904,12 @@ function Invoke-CollisionCheck {
             if ((ConvertTo-NormalizedGuid $g.Id) -eq $SelectedGpoId) { $already = $true; break }
         }
         if (-not $already) {
-            $applicable += [pscustomobject]@{
+            [void]$applicable.Add([pscustomobject]@{
                 Id          = $SelectedGpoId
-                DisplayName = $SelectedGpoName
+                DisplayName = (ConvertTo-SingleString $SelectedGpoName)
                 Enabled     = $true
                 FilterNote  = 'Selected GPO (not in user scope - shown anyway)'
-            }
+            })
         }
     }
 
@@ -884,7 +928,8 @@ function Invoke-CollisionCheck {
 
     $collidingCount = 0
     foreach ($gpo in $applicable) {
-        $maps = @(Get-GpoDriveMap -GpoId $gpo.Id -GpoName $gpo.DisplayName -DomainDns $domainDns)
+        $gpoName = ConvertTo-SingleString $gpo.DisplayName
+        $maps = ConvertTo-FlatList (Get-GpoDriveMap -GpoId $gpo.Id -GpoName $gpoName -DomainDns $domainDns)
         foreach ($m in $maps) {
             if (-not $m) { continue }
             $eval = Test-DriveMapApplies -DriveMap $m -UserContext $userCtx
@@ -911,7 +956,7 @@ function Invoke-CollisionCheck {
 
             [void]$rows.Add([pscustomobject]@{
                 Letter      = $m.Letter
-                Source      = $gpo.DisplayName
+                Source      = $gpoName
                 Path        = $m.Path
                 Action      = $m.Action
                 Applies     = 'Yes'
@@ -922,7 +967,7 @@ function Invoke-CollisionCheck {
         }
     }
 
-    $gpoCount = @($applicable).Count
+    $gpoCount = $applicable.Count
     $summary = if ($collidingCount -gt 0) {
         "COLLISION: drive letter $($letter): conflicts with $collidingCount existing mapping(s) that also apply to $($userCtx.UserName)."
     }

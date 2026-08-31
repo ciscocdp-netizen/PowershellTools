@@ -177,6 +177,41 @@ Assert-Eq $one.Count 1 'single Drive is not lost to array unrolling'
 Assert-Eq $one[0].Letter 'S' 'letter normalized to S'
 Assert-True ($null -ne $one[0].FiltersNode) 'Filters node is kept for ILT'
 
+[xml]$twoDrives = @'
+<Drives>
+  <Drive name="S:"><Properties action="U" path="\\fs\a" letter="S"/></Drive>
+  <Drive name="I:"><Properties action="C" path="\\fs\appdata" letter="I"/></Drive>
+</Drives>
+'@
+$twoMaps = @(ConvertFrom-DrivesXml -Xml $twoDrives -GpoName 'MAC Drive Mapping')
+Assert-Eq $twoMaps.Count 2 'two Drive elements enumerate as two objects (not one nested array)'
+Assert-Eq $twoMaps[0].Letter 'S' 'first map letter is a single string S'
+Assert-Eq $twoMaps[1].Letter 'I' 'second map letter is I'
+Assert-True ($twoMaps[0].Letter -is [string]) 'Letter is System.String, not string[]'
+
+Write-Host "`n=== Nested GPO array / GpoName [string] bind ==="
+$nestedGpos = , @(
+    [pscustomobject]@{ Id = [guid]::NewGuid(); DisplayName = 'MAC Drive Mapping' },
+    [pscustomobject]@{ Id = [guid]::NewGuid(); DisplayName = 'Other GPO' }
+)
+$flatGpos = ConvertTo-FlatList $nestedGpos
+Assert-Eq $flatGpos.Count 2 'ConvertTo-FlatList unwraps return , $array'
+
+# Same shape as foreach ($gpo in $applicable) when $applicable is a nested array:
+# $gpo is Object[] of GPO rows, so $gpo.DisplayName member-enumerates to string[].
+$asOneGpo = $nestedGpos[0]
+$enumeratedNames = @($asOneGpo | ForEach-Object { $_.DisplayName })
+Assert-True ($enumeratedNames.Count -gt 1) 'nested GPO row.DisplayName is a multi-element array'
+# Windows PowerShell 5.1 throws "Cannot convert value to type System.String" here.
+# PowerShell 7 joins the names with a space. Neither is a valid -GpoName.
+$bound = ConvertTo-SingleString $enumeratedNames
+Assert-Eq $bound 'MAC Drive Mapping' 'ConvertTo-SingleString binds the first name instead of throwing or joining'
+
+foreach ($g in $flatGpos) {
+    $n = ConvertTo-SingleString $g.DisplayName
+    Assert-True ($n -is [string]) ("flattened GPO DisplayName is a string: $n")
+}
+
 Write-Host "`n=== ILT: group / user / OU / domain ==="
 $financeSid = 'S-1-5-21-1-2-3-1111'
 $ctx = New-TestUserContext -GroupSids @($financeSid) -GroupNames @('CONTOSO\Finance')
