@@ -296,6 +296,37 @@ $wmiEval = Test-IltFilterList -FilterNode $wmiXml -UserContext $ctx
 Assert-True $wmiEval.Result 'unsupported WMI filter is conservative-true'
 Assert-True $wmiEval.Unknown 'unsupported WMI filter sets Unknown'
 
+$iltTree = Get-IltDetail -FilterNode $collXml
+Assert-True ($iltTree -like '*security group*CONTOSO\Nobody*') 'ILT detail names the group'
+Assert-True ($iltTree -like '*collection*') 'ILT detail nests FilterCollection'
+Assert-True ($iltTree -like '*user  CONTOSO\alice*') 'ILT detail names the user'
+$noIltText = Get-IltDetail -FilterNode $null
+Assert-True ($noIltText -like '*No Item Level Targeting*') 'null Filters node explains no ILT'
+
+$detailRow = [pscustomobject]@{
+    Letter          = 'I'
+    Source          = 'MAC Drive Mapping'
+    Path            = '\\appdata.mcgnt.org\appdata'
+    Action          = 'Update'
+    Applies         = 'Yes'
+    Targeting       = 'Group:CONTOSO\Finance'
+    TargetingDetail = "WHEN security group  CONTOSO\Finance`n    SID: S-1-5-21-1-2-3-1111"
+    Notes           = 'CONFLICT: letter I already used'
+    Label           = 'AppData'
+    DriveName       = 'I:'
+    GpoId           = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    Collision       = 'Yes'
+    IsCollision     = $true
+}
+$popup = Get-DriveMapDetailText -Row $detailRow
+Assert-True ($popup -like '*Drive letter:  I*') 'detail text includes drive letter'
+Assert-True ($popup -like '*Source GPO:    MAC Drive Mapping*') 'detail text includes source GPO'
+Assert-True ($popup -like '*\\appdata.mcgnt.org\appdata*') 'detail text includes UNC path'
+Assert-True ($popup -like '*Item Level Targeting*') 'detail text has ILT section'
+Assert-True ($popup -like '*CONTOSO\Finance*') 'detail text includes ILT group'
+Assert-True ($popup -like '*CONFLICT: letter I already used*') 'detail text includes notes'
+Assert-True ($popup -like '*Collision:     Yes*') 'detail text includes collision flag'
+
 Write-Host "`n=== End-to-end: group-targeted map would be missed without tokenGroups ==="
 # This is the original bug: empty GroupSids made FilterGroup false, so the
 # colliding S: map was skipped. With SIDs populated it must be reported.

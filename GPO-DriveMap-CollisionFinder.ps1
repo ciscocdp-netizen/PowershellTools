@@ -840,11 +840,17 @@ function Test-DriveMapApplies {
     param($DriveMap, $UserContext)
 
     if (-not $DriveMap.FiltersNode) {
-        return @{ Applies = $true; Unknown = $false; Summary = 'No ILT (applies to all)' }
+        return @{
+            Applies = $true
+            Unknown = $false
+            Summary = 'No ILT (applies to all)'
+            Detail  = 'No Item Level Targeting (applies to everyone the GPO reaches).'
+        }
     }
     $eval = Test-IltFilterList -FilterNode $DriveMap.FiltersNode -UserContext $UserContext
     $summary = Get-IltSummary -FilterNode $DriveMap.FiltersNode
-    @{ Applies = $eval.Result; Unknown = $eval.Unknown; Summary = $summary }
+    $detail = Get-IltDetail -FilterNode $DriveMap.FiltersNode
+    @{ Applies = $eval.Result; Unknown = $eval.Unknown; Summary = $summary; Detail = $detail }
 }
 
 function Get-IltSummary {
@@ -869,6 +875,140 @@ function Get-IltSummary {
         $parts.Add($piece) | Out-Null
     }
     ($parts -join ' ')
+}
+
+function Get-IltDetail {
+    <#
+        Multi-line ILT dump for the detail popup. Indent nested collections.
+        Pass -AsFragment when rendering a Collection's children.
+    #>
+    param($FilterNode, [int]$Indent = 0, [switch]$AsFragment)
+
+    if (-not $FilterNode) {
+        if ($AsFragment) { return '' }
+        return 'No Item Level Targeting (applies to everyone the GPO reaches).'
+    }
+
+    $pad = '  ' * $Indent
+    $lines = New-Object System.Collections.Generic.List[string]
+    $index = 0
+    foreach ($child in $FilterNode.ChildNodes) {
+        if ($child.NodeType -ne 'Element') { continue }
+        $index++
+        $notRaw = Get-XmlAttr $child 'not'
+        $boolRaw = Get-XmlAttr $child 'bool'
+        $combine = if ($index -eq 1) { 'WHEN' } elseif ($boolRaw) { $boolRaw.ToUpperInvariant() } else { 'AND' }
+        $neg = if ($notRaw -eq '1') { 'NOT ' } else { '' }
+
+        switch -Regex ($child.LocalName) {
+            '^(FilterCollection|Collection)$' {
+                $lines.Add("$pad$combine ${neg}collection") | Out-Null
+                $sub = Get-IltDetail -FilterNode $child -Indent ($Indent + 1) -AsFragment
+                foreach ($line in @($sub -split "`r?`n")) {
+                    if ($line) { $lines.Add($line) | Out-Null }
+                }
+            }
+            '^FilterGroup$' {
+                $name = Get-XmlAttr $child 'name'
+                $sid = Get-XmlAttr $child 'sid'
+                $lines.Add("$pad$combine ${neg}security group  $name") | Out-Null
+                if ($sid) { $lines.Add("$pad    SID: $sid") | Out-Null }
+                if ((Get-XmlAttr $child 'userContext') -eq '0') {
+                    $lines.Add("$pad    evaluates computer token (not fully checked)") | Out-Null
+                }
+                if ((Get-XmlAttr $child 'primaryGroup') -eq '1') {
+                    $lines.Add("$pad    primary group only") | Out-Null
+                }
+                if ((Get-XmlAttr $child 'localGroup') -eq '1') {
+                    $lines.Add("$pad    local group (not fully checked)") | Out-Null
+                }
+            }
+            '^FilterUser$' {
+                $name = Get-XmlAttr $child 'name'
+                $sid = Get-XmlAttr $child 'sid'
+                $lines.Add("$pad$combine ${neg}user  $name") | Out-Null
+                if ($sid) { $lines.Add("$pad    SID: $sid") | Out-Null }
+            }
+            '^FilterOrgUnit$' {
+                $name = Get-XmlAttr $child 'name'
+                $direct = if ((Get-XmlAttr $child 'directMember') -eq '1') { 'direct members only' } else { 'this OU and child OUs' }
+                $lines.Add("$pad$combine ${neg}organizational unit  $name") | Out-Null
+                $lines.Add("$pad    $direct") | Out-Null
+            }
+            '^FilterDomain$' {
+                $lines.Add("$pad$combine ${neg}domain  $(Get-XmlAttr $child 'name')") | Out-Null
+            }
+            default {
+                $extra = Get-XmlAttr $child 'query'
+                if (-not $extra) { $extra = Get-XmlAttr $child 'name' }
+                $suffix = if ($extra) { "  $extra" } else { '' }
+                $lines.Add("$pad$combine ${neg}$($child.LocalName)$suffix") | Out-Null
+                $lines.Add("$pad    not fully evaluated — treated as could-apply") | Out-Null
+            }
+        }
+    }
+
+    if ($lines.Count -eq 0) {
+        if ($AsFragment) { return '' }
+        return 'Empty Item Level Targeting list (applies to everyone the GPO reaches).'
+    }
+    ($lines -join [Environment]::NewLine)
+}
+
+function Get-RowProp {
+    param($Row, [string]$Name, [string]$Default = '')
+    if ($null -eq $Row) { return $Default }
+    $prop = $Row.PSObject.Properties[$Name]
+    if (-not $prop -or $null -eq $prop.Value) { return $Default }
+    $text = [string]$prop.Value
+    if ([string]::IsNullOrWhiteSpace($text)) { return $Default }
+    return $text
+}
+
+function Get-DriveMapDetailText {
+    <#
+        Plain-text body for the double-click popup (and Copy details).
+    #>
+    param($Row)
+
+    $letter = Get-RowProp $Row 'Letter' '(none)'
+    $source = Get-RowProp $Row 'Source' '(none)'
+    $path = Get-RowProp $Row 'Path' '(none)'
+    $action = Get-RowProp $Row 'Action' '(none)'
+    $label = Get-RowProp $Row 'Label' '(none)'
+    $item = Get-RowProp $Row 'DriveName' '(none)'
+    $applies = Get-RowProp $Row 'Applies' '(unknown)'
+    $collision = Get-RowProp $Row 'Collision' ''
+    if (-not $collision) {
+        $isHit = $false
+        if ($Row.PSObject.Properties['IsCollision'] -and $Row.IsCollision) { $isHit = $true }
+        $collision = if ($isHit) { 'Yes' } else { 'No' }
+    }
+    $gpoId = Get-RowProp $Row 'GpoId' ''
+    $notes = Get-RowProp $Row 'Notes' '(none)'
+    $ilt = Get-RowProp $Row 'TargetingDetail' ''
+    if (-not $ilt) { $ilt = Get-RowProp $Row 'Targeting' '(none)' }
+
+    $nl = [Environment]::NewLine
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine("Drive letter:  $letter")
+    [void]$sb.AppendLine("Source GPO:    $source")
+    if ($gpoId) { [void]$sb.AppendLine("GPO GUID:      $gpoId") }
+    [void]$sb.AppendLine("UNC path:      $path")
+    [void]$sb.AppendLine("Action:        $action")
+    [void]$sb.AppendLine("GPP item:      $item")
+    [void]$sb.AppendLine("Label:         $label")
+    [void]$sb.AppendLine("Applies:       $applies")
+    [void]$sb.AppendLine("Collision:     $collision")
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('Item Level Targeting')
+    [void]$sb.AppendLine('-------------------')
+    [void]$sb.AppendLine($ilt)
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('Notes')
+    [void]$sb.AppendLine('-----')
+    [void]$sb.Append($notes)
+    return $sb.ToString().TrimEnd() + $nl
 }
 
 # ---------------------------------------------------------------------------
@@ -916,14 +1056,19 @@ function Invoke-CollisionCheck {
     $rows = New-Object System.Collections.ArrayList
 
     [void]$rows.Add([pscustomobject]@{
-        Letter      = $letter
-        Source      = '>> PROPOSED <<'
-        Path        = $ProposedPath
-        Action      = $ProposedAction
-        Applies     = 'Yes'
-        Targeting   = "User:$($userCtx.UserName)"
-        Notes       = ''
-        IsCollision = $false
+        Letter          = $letter
+        Source          = '>> PROPOSED <<'
+        Path            = $ProposedPath
+        Action          = $ProposedAction
+        Applies         = 'Yes'
+        Targeting       = "User:$($userCtx.UserName)"
+        TargetingDetail = "This is the mapping you are proposing for this check.`nIt is assumed to apply to $($userCtx.UserName)."
+        Notes           = ''
+        Label           = ''
+        DriveName       = 'Proposed mapping'
+        GpoId           = ''
+        Collision       = 'No'
+        IsCollision     = $false
     })
 
     $collidingCount = 0
@@ -955,14 +1100,19 @@ function Invoke-CollisionCheck {
             }
 
             [void]$rows.Add([pscustomobject]@{
-                Letter      = $m.Letter
-                Source      = $gpoName
-                Path        = $m.Path
-                Action      = $m.Action
-                Applies     = 'Yes'
-                Targeting   = $eval.Summary
-                Notes       = ($notes -join '; ')
-                IsCollision = [bool]$hit.IsCollision
+                Letter          = $m.Letter
+                Source          = $gpoName
+                Path            = $m.Path
+                Action          = $m.Action
+                Applies         = 'Yes'
+                Targeting       = $eval.Summary
+                TargetingDetail = $(if ($eval.Detail) { $eval.Detail } else { $eval.Summary })
+                Notes           = ($notes -join '; ')
+                Label           = $m.Label
+                DriveName       = $m.DriveName
+                GpoId           = [string]$gpo.Id
+                Collision       = $(if ($hit.IsCollision) { 'Yes' } else { 'No' })
+                IsCollision     = [bool]$hit.IsCollision
             })
         }
     }
@@ -1014,6 +1164,148 @@ function ConvertTo-GuiBrush {
     param([Parameter(Mandatory)][string]$Hex)
     $color = [System.Windows.Media.ColorConverter]::ConvertFromString($Hex)
     return New-Object System.Windows.Media.SolidColorBrush $color
+}
+
+function Find-VisualAncestor {
+    param($Start, [type]$Type)
+    $obj = $Start
+    while ($obj) {
+        if ($Type.IsInstanceOfType($obj)) { return $obj }
+        try { $obj = [System.Windows.Media.VisualTreeHelper]::GetParent($obj) }
+        catch { break }
+    }
+    return $null
+}
+
+function Show-DriveMapDetailWindow {
+    param($Row, $Owner)
+
+    $letter = Get-RowProp $Row 'Letter' '(none)'
+    $source = Get-RowProp $Row 'Source' '(none)'
+    $path = Get-RowProp $Row 'Path' '(none)'
+    $action = Get-RowProp $Row 'Action' '(none)'
+    $label = Get-RowProp $Row 'Label' '(none)'
+    $item = Get-RowProp $Row 'DriveName' '(none)'
+    $applies = Get-RowProp $Row 'Applies' '(unknown)'
+    $collision = Get-RowProp $Row 'Collision' ''
+    if (-not $collision) {
+        $isHit = $false
+        if ($Row.PSObject.Properties['IsCollision'] -and $Row.IsCollision) { $isHit = $true }
+        $collision = if ($isHit) { 'Yes' } else { 'No' }
+    }
+    $gpoId = Get-RowProp $Row 'GpoId' '(n/a)'
+    $notes = Get-RowProp $Row 'Notes' '(none)'
+    $ilt = Get-RowProp $Row 'TargetingDetail' ''
+    if (-not $ilt) { $ilt = Get-RowProp $Row 'Targeting' '(none)' }
+    $copyText = Get-DriveMapDetailText -Row $Row
+
+    [xml]$detailXaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Drive mapping details" Height="580" Width="700"
+        MinHeight="400" MinWidth="520" Background="#FF1E1E24"
+        WindowStartupLocation="CenterOwner" ResizeMode="CanResizeWithGrip">
+    <Grid Margin="18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="2*"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0" Text="Drive mapping details" Foreground="#FFEDEDF2"
+                   FontSize="18" FontWeight="Bold" Margin="0,0,0,12"/>
+
+        <Border Grid.Row="1" Background="#FF2A2A33" CornerRadius="8" Padding="14" Margin="0,0,0,12">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="140"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="140"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+
+                <TextBlock Grid.Row="0" Grid.Column="0" Text="Drive letter" Foreground="#FF9A9AA6" Margin="0,0,8,8"/>
+                <TextBlock x:Name="valLetter" Grid.Row="0" Grid.Column="1" Foreground="#FFEDEDF2" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,12,8"/>
+                <TextBlock Grid.Row="0" Grid.Column="2" Text="Action" Foreground="#FF9A9AA6" Margin="0,0,8,8"/>
+                <TextBlock x:Name="valAction" Grid.Row="0" Grid.Column="3" Foreground="#FFEDEDF2" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,0,8"/>
+
+                <TextBlock Grid.Row="1" Grid.Column="0" Text="Source GPO" Foreground="#FF9A9AA6" Margin="0,0,8,8"/>
+                <TextBlock x:Name="valSource" Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="3" Foreground="#FFEDEDF2" TextWrapping="Wrap" Margin="0,0,0,8"/>
+
+                <TextBlock Grid.Row="2" Grid.Column="0" Text="UNC path" Foreground="#FF9A9AA6" Margin="0,0,8,8"/>
+                <TextBlock x:Name="valPath" Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="3" Foreground="#FFEDEDF2" TextWrapping="Wrap" Margin="0,0,0,8"/>
+
+                <TextBlock Grid.Row="3" Grid.Column="0" Text="GPP item / label" Foreground="#FF9A9AA6" Margin="0,0,8,8"/>
+                <TextBlock x:Name="valItem" Grid.Row="3" Grid.Column="1" Grid.ColumnSpan="3" Foreground="#FFEDEDF2" TextWrapping="Wrap" Margin="0,0,0,8"/>
+
+                <TextBlock Grid.Row="4" Grid.Column="0" Text="Applies / collision" Foreground="#FF9A9AA6" Margin="0,0,8,0"/>
+                <TextBlock x:Name="valFlags" Grid.Row="4" Grid.Column="1" Grid.ColumnSpan="3" Foreground="#FFEDEDF2" TextWrapping="Wrap"/>
+            </Grid>
+        </Border>
+
+        <DockPanel Grid.Row="2" Margin="0,0,0,12">
+            <TextBlock DockPanel.Dock="Top" Text="Item Level Targeting" Foreground="#FF9A9AA6" Margin="0,0,0,6"/>
+            <TextBox x:Name="txtIlt" IsReadOnly="True" TextWrapping="Wrap" AcceptsReturn="True"
+                     VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+                     Background="#FF20202A" Foreground="#FFEDEDF2" BorderBrush="#FF3A3A46"
+                     Padding="8" FontFamily="Consolas" FontSize="12"/>
+        </DockPanel>
+
+        <TextBlock Grid.Row="3" Text="Notes" Foreground="#FF9A9AA6" Margin="0,0,0,6"/>
+        <TextBox x:Name="txtNotes" Grid.Row="4" IsReadOnly="True" TextWrapping="Wrap" AcceptsReturn="True"
+                 VerticalScrollBarVisibility="Auto"
+                 Background="#FF20202A" Foreground="#FFEDEDF2" BorderBrush="#FF3A3A46"
+                 Padding="8" FontSize="13" Margin="0,0,0,14"/>
+
+        <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button x:Name="btnCopy" Content="Copy details" Padding="16,8" Margin="0,0,8,0"
+                    Background="#FF3A3A46" Foreground="White" BorderThickness="0" Cursor="Hand"/>
+            <Button x:Name="btnClose" Content="Close" Padding="16,8" IsDefault="True" IsCancel="True"
+                    Background="#FF4C8DFF" Foreground="White" BorderThickness="0" FontWeight="SemiBold" Cursor="Hand"/>
+        </StackPanel>
+    </Grid>
+</Window>
+"@
+
+    $reader = New-Object System.Xml.XmlNodeReader $detailXaml
+    $dlg = [Windows.Markup.XamlReader]::Load($reader)
+    if ($Owner) { $dlg.Owner = $Owner }
+
+    $dlg.FindName('valLetter').Text = $letter
+    $dlg.FindName('valAction').Text = $action
+    $dlg.FindName('valSource').Text = $(if ($gpoId -and $gpoId -ne '(n/a)') { "$source  ($gpoId)" } else { $source })
+    $dlg.FindName('valPath').Text = $path
+    $itemLine = $item
+    if ($label -and $label -ne '(none)' -and $label -ne $item) { $itemLine = "$item  /  $label" }
+    $dlg.FindName('valItem').Text = $itemLine
+    $dlg.FindName('valFlags').Text = "Applies: $applies    Collision: $collision"
+    $dlg.FindName('txtIlt').Text = $ilt
+    $dlg.FindName('txtNotes').Text = $notes
+
+    $dlg.FindName('btnClose').Add_Click({ $dlg.Close() }.GetNewClosure())
+    $dlg.FindName('btnCopy').Add_Click({
+        try {
+            [System.Windows.Clipboard]::SetText($copyText)
+            $dlg.FindName('btnCopy').Content = 'Copied'
+        }
+        catch {
+            [System.Windows.MessageBox]::Show(
+                "Could not copy to clipboard: $($_.Exception.Message)",
+                'Copy failed', 'OK', 'Warning') | Out-Null
+        }
+    }.GetNewClosure())
+
+    [void]$dlg.ShowDialog()
 }
 
 [xml]$xaml = @"
@@ -1098,7 +1390,7 @@ function ConvertTo-GuiBrush {
         <StackPanel Grid.Row="0" Margin="0,0,0,14">
             <TextBlock Text="GPO Drive-Mapping Collision Finder"
                        Foreground="{StaticResource Fg}" FontSize="20" FontWeight="Bold"/>
-            <TextBlock Text="Check a proposed drive mapping against every GPO that applies to a user (OU inheritance + security filtering + Item Level Targeting). Site-linked GPOs and loopback are not evaluated."
+            <TextBlock Text="Check a proposed drive mapping against every GPO that applies to a user (OU inheritance + security filtering + Item Level Targeting). Site-linked GPOs and loopback are not evaluated. Double-click a result row for full details."
                        Foreground="{StaticResource Muted}" FontSize="12" TextWrapping="Wrap" Margin="0,4,0,0"/>
         </StackPanel>
 
@@ -1281,7 +1573,7 @@ $btnCheck.Add_Click({
         $banner.Visibility = 'Visible'
         $existing = @($out.Rows).Count - 1
         if ($existing -lt 0) { $existing = 0 }
-        Set-Status "Checked $($out.GpoCount) applicable GPO(s) for $($out.UserContext.UserName). $existing applicable existing mapping(s) found."
+        Set-Status "Checked $($out.GpoCount) applicable GPO(s) for $($out.UserContext.UserName). $existing applicable existing mapping(s) found. Double-click a row for details."
     }
     catch {
         $txtBanner.Text = "Error: $($_.Exception.Message)"
@@ -1299,6 +1591,22 @@ $txtUser.Add_KeyDown({
         $btnCheck.RaiseEvent(
             (New-Object System.Windows.RoutedEventArgs ([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)))
     }
+})
+
+$grid.Add_MouseDoubleClick({
+    $cell = Find-VisualAncestor -Start $_.OriginalSource -Type ([System.Windows.Controls.DataGridCell])
+    if (-not $cell) { return }
+    $row = $grid.SelectedItem
+    if (-not $row) { return }
+    Show-DriveMapDetailWindow -Row $row -Owner $window
+})
+
+$grid.Add_PreviewKeyDown({
+    if ($_.Key -ne 'Return') { return }
+    $row = $grid.SelectedItem
+    if (-not $row) { return }
+    $_.Handled = $true
+    Show-DriveMapDetailWindow -Row $row -Owner $window
 })
 
 [void]$window.ShowDialog()
