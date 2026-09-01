@@ -144,6 +144,10 @@ function ConvertTo-FlatList {
     <#
         Unwraps the extra Object[] layer created by "return , $array" so
         foreach iterates real GPO/map objects instead of one nested array.
+
+        Returns a growable List. The unary comma is required: without it
+        PowerShell enumerates List[T] into a fixed Object[] and later .Add()
+        throws "Collection was of a fixed size."
     #>
     param($InputObject)
     $list = New-Object System.Collections.Generic.List[object]
@@ -157,7 +161,7 @@ function ConvertTo-FlatList {
         }
         [void]$list.Add($item)
     }
-    return $list
+    , $list
 }
 
 function ConvertTo-NormalizedUncPath {
@@ -1032,7 +1036,10 @@ function Invoke-CollisionCheck {
     $userCtx = Get-UserContext -Identity $Identity
     $letter = ConvertTo-NormalizedDriveLetter $ProposedLetter
 
-    $applicable = ConvertTo-FlatList (Get-ApplicableGpo -UserContext $userCtx)
+    $applicable = New-Object System.Collections.Generic.List[object]
+    foreach ($g in (ConvertTo-FlatList (Get-ApplicableGpo -UserContext $userCtx))) {
+        if ($null -ne $g) { [void]$applicable.Add($g) }
+    }
 
     # Ensure the selected GPO is always evaluated even if filtering excluded it.
     # [guid]::Empty is truthy in PowerShell — only honor a real caller-supplied id.

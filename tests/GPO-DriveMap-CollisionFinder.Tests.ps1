@@ -196,6 +196,9 @@ $nestedGpos = , @(
 )
 $flatGpos = ConvertTo-FlatList $nestedGpos
 Assert-Eq $flatGpos.Count 2 'ConvertTo-FlatList unwraps return , $array'
+$flatGpos.Add([pscustomobject]@{ DisplayName = 'Extra' })
+Assert-Eq $flatGpos.Count 3 'ConvertTo-FlatList result supports Add (not a fixed-size array)'
+Assert-True (-not $flatGpos.IsFixedSize) 'list IsFixedSize is false (the dlamb GUI error)'
 
 # Same shape as foreach ($gpo in $applicable) when $applicable is a nested array:
 # $gpo is Object[] of GPO rows, so $gpo.DisplayName member-enumerates to string[].
