@@ -32,10 +32,8 @@
     only password-only / no-method users, plus not-found / error / skipped rows.
 
 .PARAMETER DeviceCode
-    Skip Windows WAM / interactive browser login and use device-code sign-in.
-    Use this when the Graph sign-in window appears, you complete login, and
-    Connect-MgGraph still reports InteractiveBrowserCredential authentication
-    failed. The script also falls back to device code automatically.
+    Skip the system-browser sign-in and use device-code login instead.
+    A browser is still opened to the Microsoft device-login page.
 
 .PARAMETER TenantId
     Optional Entra tenant (contoso.onmicrosoft.com or a Tenant ID GUID).
@@ -69,11 +67,11 @@
     Requires the UserAuthenticationMethod.Read.All and User.Read.All permissions
     (delegated). An admin may need to consent the first time you run it.
 
-    Microsoft Graph PowerShell 2.34+ uses Windows Web Account Manager (WAM)
-    by default. WAM often reports a successful login and then fails with
-    "InteractiveBrowserCredential authentication failed". This script disables
-    WAM when the SDK allows it and automatically falls back to device-code
-    sign-in so a completed login is not lost.
+    Sign-in opens your default web browser (authorization code + PKCE to
+    http://localhost). Windows Web Account Manager is not used, because it
+    often fails with "Missing wamcompat_id_token" after a successful login.
+    If the browser callback cannot start, the script falls back to device-code
+    sign-in and still launches the browser.
 
     CSV requirement: a header row containing a column with the user's UPN /
     email / object id. The script auto-detects common column names
@@ -787,7 +785,7 @@ function New-AuthParentForm {
     $label = New-Object System.Windows.Forms.Label
     $label.Dock = [System.Windows.Forms.DockStyle]::Fill
     $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
-    $label.Text = "Complete interactive sign-in in the browser / account picker.`r`nLeave this window open until sign-in finishes."
+    $label.Text = "A web browser was opened for Microsoft sign-in.`r`nFinish signing in there, then return to this window."
     $form.Controls.Add($label)
 
     [void]$form.Show()
@@ -892,6 +890,294 @@ function Connect-WithAccessToken {
     return $true
 }
 
+function ConvertTo-Base64Url {
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+
+    $b64 = [Convert]::ToBase64String($Bytes)
+    return ($b64.TrimEnd('=') -replace '\+', '-' -replace '/', '_')
+}
+
+function New-PkcePair {
+    $bytes = New-Object byte[] 32
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $rng.GetBytes($bytes)
+    }
+    finally {
+        $rng.Dispose()
+    }
+
+    $verifier = ConvertTo-Base64Url -Bytes $bytes
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha.ComputeHash([System.Text.Encoding]::ASCII.GetBytes($verifier))
+    }
+    finally {
+        $sha.Dispose()
+    }
+
+    return [pscustomobject]@{
+        Verifier  = $verifier
+        Challenge = (ConvertTo-Base64Url -Bytes $hash)
+    }
+}
+
+function Get-QueryValue {
+    param(
+        [Parameter(Mandatory)][uri]$Uri,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    $query = [string]$Uri.Query
+    if ([string]::IsNullOrWhiteSpace($query)) { return $null }
+    if ($query.StartsWith('?')) { $query = $query.Substring(1) }
+
+    foreach ($part in $query.Split('&')) {
+        if ([string]::IsNullOrWhiteSpace($part)) { continue }
+        $eq = $part.IndexOf('=')
+        $key = $part
+        $val = ''
+        if ($eq -ge 0) {
+            $key = $part.Substring(0, $eq)
+            $val = $part.Substring($eq + 1)
+        }
+        $decodedKey = [uri]::UnescapeDataString($key)
+        if ([string]::Equals($decodedKey, $Name, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return [uri]::UnescapeDataString($val.Replace('+', ' '))
+        }
+    }
+    return $null
+}
+
+function Get-EntraAuthorizeUrl {
+    param(
+        [Parameter(Mandatory)][string]$Authority,
+        [Parameter(Mandatory)][string]$ClientId,
+        [Parameter(Mandatory)][string]$RedirectUri,
+        [Parameter(Mandatory)][string]$State,
+        [Parameter(Mandatory)][string]$CodeChallenge
+    )
+
+    $pairs = @(
+        "client_id=$([uri]::EscapeDataString($ClientId))",
+        'response_type=code',
+        "redirect_uri=$([uri]::EscapeDataString($RedirectUri))",
+        'response_mode=query',
+        "scope=$([uri]::EscapeDataString($script:GraphScopeString))",
+        "state=$([uri]::EscapeDataString($State))",
+        "code_challenge=$([uri]::EscapeDataString($CodeChallenge))",
+        'code_challenge_method=S256',
+        'prompt=select_account'
+    )
+    return "$Authority/oauth2/v2.0/authorize?$($pairs -join '&')"
+}
+
+function Start-SystemBrowser {
+    param([Parameter(Mandatory)][string]$Url)
+
+    Write-Host "Launching your web browser for Microsoft sign-in..." -ForegroundColor Cyan
+
+    try {
+        Start-Process $Url | Out-Null
+        return $true
+    }
+    catch { }
+
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $Url
+        $psi.UseShellExecute = $true
+        [void][System.Diagnostics.Process]::Start($psi)
+        return $true
+    }
+    catch { }
+
+    try {
+        if ($env:OS -match 'Windows') {
+            cmd.exe /c start "" "$Url" | Out-Null
+            return $true
+        }
+    }
+    catch { }
+
+    return $false
+}
+
+function Get-AuthListener {
+    $ports = @(8400, 8401, 8402, 18800, 18801, 5050, 5051)
+    foreach ($port in $ports) {
+        foreach ($hostName in @('localhost', '127.0.0.1')) {
+            $listener = $null
+            try {
+                $listener = New-Object System.Net.HttpListener
+                $prefix = "http://${hostName}:${port}/"
+                $listener.Prefixes.Add($prefix)
+                $listener.Start()
+                return [pscustomobject]@{
+                    Listener    = $listener
+                    RedirectUri = $prefix
+                    Port        = $port
+                }
+            }
+            catch {
+                if ($null -ne $listener) {
+                    try { $listener.Close() } catch { }
+                }
+            }
+        }
+    }
+    return $null
+}
+
+function Write-AuthBrowserResponse {
+    param(
+        $Context,
+        [string]$Title,
+        [string]$Body
+    )
+
+    $html = @"
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>$Title</title></head>
+<body style="font-family: Segoe UI, Tahoma, sans-serif; padding: 48px; max-width: 640px;">
+  <h2>$Title</h2>
+  <p>$Body</p>
+  <p>You can close this tab and return to PowerShell.</p>
+</body>
+</html>
+"@
+    $buffer = [System.Text.Encoding]::UTF8.GetBytes($html)
+    try {
+        $Context.Response.StatusCode = 200
+        $Context.Response.ContentType = 'text/html; charset=utf-8'
+        $Context.Response.ContentLength64 = $buffer.Length
+        $Context.Response.OutputStream.Write($buffer, 0, $buffer.Length)
+        $Context.Response.OutputStream.Close()
+    }
+    catch { }
+}
+
+function Complete-GraphTokenResponse {
+    param(
+        $Token,
+        [Parameter(Mandatory)][string]$AppClientId,
+        [Parameter(Mandatory)][string]$Tenant
+    )
+
+    $accessToken = [string](Get-GraphResponseProperty -Response $Token -Name 'access_token')
+    if ([string]::IsNullOrWhiteSpace($accessToken)) {
+        throw 'Sign-in succeeded but no access_token was returned.'
+    }
+
+    $script:TokenClientId = $AppClientId
+    $script:TokenTenant = $Tenant
+    $refresh = [string](Get-GraphResponseProperty -Response $Token -Name 'refresh_token')
+    if (-not [string]::IsNullOrWhiteSpace($refresh)) {
+        $script:RefreshToken = $refresh
+    }
+
+    return (Connect-WithAccessToken -AccessToken $accessToken)
+}
+
+function Connect-ViaSystemBrowser {
+    param(
+        [Parameter()]
+        [string]$AppClientId
+    )
+
+    if ([string]::IsNullOrWhiteSpace($AppClientId)) {
+        $AppClientId = $script:GraphPowerShellClientId
+    }
+
+    $tenant = 'organizations'
+    if (-not [string]::IsNullOrWhiteSpace($TenantId)) {
+        $tenant = $TenantId.Trim()
+    }
+    $authority = "https://login.microsoftonline.com/$tenant"
+    $pkce = New-PkcePair
+    $state = [guid]::NewGuid().ToString('N')
+
+    $listenerInfo = Get-AuthListener
+    if ($null -eq $listenerInfo) {
+        throw 'Could not start a local http://localhost listener for the browser redirect. Try -DeviceCode.'
+    }
+
+    $listener = $listenerInfo.Listener
+    $redirect = [string]$listenerInfo.RedirectUri
+    $parent = $null
+
+    try {
+        $authUrl = Get-EntraAuthorizeUrl -Authority $authority -ClientId $AppClientId `
+            -RedirectUri $redirect -State $state -CodeChallenge $pkce.Challenge
+
+        Write-Host ""
+        Write-Host "Opening your web browser to sign in to Microsoft Graph." -ForegroundColor Cyan
+        Write-Host "Complete sign-in in the browser, then return here." -ForegroundColor Cyan
+
+        if ($script:WinFormsLoaded) {
+            $parent = New-AuthParentForm
+        }
+
+        $opened = Start-SystemBrowser -Url $authUrl
+        if (-not $opened) {
+            Write-Host "The browser could not be launched automatically. Open this URL:" -ForegroundColor Yellow
+            Write-Host $authUrl -ForegroundColor White
+        }
+
+        $async = $listener.BeginGetContext($null, $null)
+        $signaled = $async.AsyncWaitHandle.WaitOne(300000)
+        if (-not $signaled) {
+            throw 'Timed out waiting for browser sign-in (5 minutes).'
+        }
+
+        $context = $listener.EndGetContext($async)
+        $requestUri = $context.Request.Url
+        $code = Get-QueryValue -Uri $requestUri -Name 'code'
+        $returnedState = Get-QueryValue -Uri $requestUri -Name 'state'
+        $errorCode = Get-QueryValue -Uri $requestUri -Name 'error'
+        $errorDesc = Get-QueryValue -Uri $requestUri -Name 'error_description'
+
+        if ($errorCode) {
+            Write-AuthBrowserResponse -Context $context -Title 'Sign-in did not complete' -Body ([System.Net.WebUtility]::HtmlEncode("$errorCode $errorDesc"))
+            throw "Browser sign-in failed: $errorCode $errorDesc"
+        }
+
+        if (-not [string]::Equals([string]$returnedState, $state, [System.StringComparison]::Ordinal)) {
+            Write-AuthBrowserResponse -Context $context -Title 'Sign-in did not complete' -Body 'Security check failed (state mismatch).'
+            throw 'Browser sign-in failed: state mismatch.'
+        }
+
+        if ([string]::IsNullOrWhiteSpace($code)) {
+            Write-AuthBrowserResponse -Context $context -Title 'Sign-in did not complete' -Body 'No authorization code was returned.'
+            throw 'Browser sign-in failed: no authorization code returned.'
+        }
+
+        Write-AuthBrowserResponse -Context $context -Title 'Sign-in complete' -Body 'You signed in successfully.'
+
+        $tokBody = ConvertTo-FormUrlEncoded -Data @{
+            client_id     = $AppClientId
+            grant_type    = 'authorization_code'
+            code          = $code
+            redirect_uri  = $redirect
+            code_verifier = $pkce.Verifier
+            scope         = $script:GraphScopeString
+        }
+        $token = Invoke-RestMethod -Method Post -Uri "$authority/oauth2/v2.0/token" `
+            -ContentType 'application/x-www-form-urlencoded' -Body $tokBody -ErrorAction Stop
+
+        return (Complete-GraphTokenResponse -Token $token -AppClientId $AppClientId -Tenant $tenant)
+    }
+    finally {
+        if ($null -ne $parent) {
+            try { $parent.Close() } catch { }
+            try { $parent.Dispose() } catch { }
+        }
+        try { $listener.Stop() } catch { }
+        try { $listener.Close() } catch { }
+    }
+}
+
 function Connect-ViaRestDeviceCode {
     param(
         [Parameter()]
@@ -916,22 +1202,34 @@ function Connect-ViaRestDeviceCode {
     $dc = Invoke-RestMethod -Method Post -Uri "$authority/oauth2/v2.0/devicecode" `
         -ContentType 'application/x-www-form-urlencoded' -Body $dcBody -ErrorAction Stop
 
-    $verifyUrl = [string]$dc.verification_uri
-    $userCode  = [string]$dc.user_code
-
-    Write-Host ""
-    Write-Host "To sign in, open: $verifyUrl" -ForegroundColor Cyan
-    Write-Host "Enter code: $userCode" -ForegroundColor Cyan
-    Write-Host "Waiting for sign-in..." -ForegroundColor Yellow
-
-    if ($script:WinFormsLoaded) {
-        try { [System.Windows.Forms.Clipboard]::SetText($userCode) } catch { }
-        try { Start-Process $verifyUrl | Out-Null } catch { }
-        Write-Host "(The code was copied to the clipboard and the browser was opened if possible.)" -ForegroundColor Gray
+    $verifyUrl = [string](Get-GraphResponseProperty -Response $dc -Name 'verification_uri')
+    $userCode  = [string](Get-GraphResponseProperty -Response $dc -Name 'user_code')
+    $completeUrl = [string](Get-GraphResponseProperty -Response $dc -Name 'verification_uri_complete')
+    $openUrl = $verifyUrl
+    if (-not [string]::IsNullOrWhiteSpace($completeUrl)) {
+        $openUrl = $completeUrl
     }
 
-    $deadline = [datetime]::UtcNow.AddSeconds([int]$dc.expires_in)
-    $interval = [Math]::Max(5, [int]$dc.interval)
+    Write-Host ""
+    Write-Host "To sign in, a web browser will open." -ForegroundColor Cyan
+    Write-Host "If asked for a code, enter: $userCode" -ForegroundColor Cyan
+    Write-Host "Waiting for sign-in..." -ForegroundColor Yellow
+
+    try { [System.Windows.Forms.Clipboard]::SetText($userCode) } catch { }
+    $opened = Start-SystemBrowser -Url $openUrl
+    if (-not $opened) {
+        Write-Host "Open this URL manually: $openUrl" -ForegroundColor Yellow
+        Write-Host "Enter code: $userCode" -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "(If the browser did not show a code prompt, enter $userCode at $verifyUrl)" -ForegroundColor Gray
+    }
+
+    $deadline = [datetime]::UtcNow.AddSeconds([int](Get-GraphResponseProperty -Response $dc -Name 'expires_in'))
+    $intervalRaw = Get-GraphResponseProperty -Response $dc -Name 'interval'
+    $interval = 5
+    if ($null -ne $intervalRaw) { $interval = [Math]::Max(5, [int]$intervalRaw) }
+    $deviceCode = [string](Get-GraphResponseProperty -Response $dc -Name 'device_code')
     $token = $null
 
     while ([datetime]::UtcNow -lt $deadline) {
@@ -940,7 +1238,7 @@ function Connect-ViaRestDeviceCode {
             $tokBody = ConvertTo-FormUrlEncoded -Data @{
                 grant_type  = 'urn:ietf:params:oauth:grant-type:device_code'
                 client_id   = $AppClientId
-                device_code = [string]$dc.device_code
+                device_code = $deviceCode
             }
             $token = Invoke-RestMethod -Method Post -Uri "$authority/oauth2/v2.0/token" `
                 -ContentType 'application/x-www-form-urlencoded' -Body $tokBody -ErrorAction Stop
@@ -962,14 +1260,7 @@ function Connect-ViaRestDeviceCode {
         throw 'Device code sign-in succeeded but no access_token was returned.'
     }
 
-    $script:TokenClientId = $AppClientId
-    $script:TokenTenant = $tenant
-    $refresh = [string](Get-GraphResponseProperty -Response $token -Name 'refresh_token')
-    if (-not [string]::IsNullOrWhiteSpace($refresh)) {
-        $script:RefreshToken = $refresh
-    }
-
-    return (Connect-WithAccessToken -AccessToken $accessToken)
+    return (Complete-GraphTokenResponse -Token $token -AppClientId $AppClientId -Tenant $tenant)
 }
 
 function Invoke-ConnectMgGraph {
@@ -1042,61 +1333,54 @@ function Connect-EntraGraph {
 
     $errors = New-Object System.Collections.Generic.List[string]
     $connected = $false
-    $tryInteractive = -not $DeviceCode
+    $tryBrowser = -not $DeviceCode
 
-    if ($tryInteractive) {
-        Write-Host "Opening interactive Microsoft Graph sign-in..." -ForegroundColor Cyan
-        try {
-            Invoke-ConnectMgGraph
-            $connected = $true
-        }
-        catch {
-            $msg = Get-GraphErrorMessage -ErrorRecord $_
-            if ([string]::IsNullOrWhiteSpace($msg)) {
-                $msg = 'InteractiveBrowserCredential authentication failed (no extra detail from the Graph SDK).'
-            }
-            [void]$errors.Add("Interactive: $msg")
-            Write-Host ""
-            Write-Host "Interactive / WAM sign-in did not complete, even if a login window appeared." -ForegroundColor Yellow
-            Write-Host "This is a known Microsoft Graph PowerShell issue on Windows (Web Account Manager)." -ForegroundColor Yellow
-            Write-Host $msg -ForegroundColor DarkYellow
-            Write-Host "Falling back to device-code sign-in..." -ForegroundColor Yellow
-            try { Disconnect-MgGraph | Out-Null } catch { }
-        }
+    $clientIds = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace($ClientId)) {
+        [void]$clientIds.Add($ClientId)
     }
+    [void]$clientIds.Add($script:GraphPowerShellClientId)
+    [void]$clientIds.Add($script:AzurePowerShellClientId)
 
-    if (-not $connected) {
-        $deviceParam = Get-ConnectMgGraphDeviceCodeParameter
-        if ($deviceParam) {
+    if ($tryBrowser) {
+        $browserApps = New-Object System.Collections.Generic.List[string]
+        if (-not [string]::IsNullOrWhiteSpace($ClientId)) {
+            [void]$browserApps.Add($ClientId)
+        }
+        [void]$browserApps.Add($script:GraphPowerShellClientId)
+        [void]$browserApps.Add($script:AzurePowerShellClientId)
+
+        $seenBrowser = @{}
+        foreach ($appId in $browserApps) {
+            if ($seenBrowser.ContainsKey($appId)) { continue }
+            $seenBrowser[$appId] = $true
             try {
-                Invoke-ConnectMgGraph -UseDeviceCode
-                $connected = $true
+                Write-Host "Starting browser sign-in..." -ForegroundColor Cyan
+                if (Connect-ViaSystemBrowser -AppClientId $appId) {
+                    $connected = $true
+                    break
+                }
             }
             catch {
                 $msg = Get-GraphErrorMessage -ErrorRecord $_
-                [void]$errors.Add("SDK device code: $msg")
+                [void]$errors.Add("Browser ($appId): $msg")
+                Write-Host "Browser sign-in did not complete: $msg" -ForegroundColor Yellow
                 try { Disconnect-MgGraph | Out-Null } catch { }
+                if ($msg -notmatch 'AADSTS50011|redirect_uri|redirect URI') {
+                    break
+                }
             }
-        }
-        else {
-            Write-Host "This Graph SDK build has no device-code switch; using browser device-code login instead." -ForegroundColor Yellow
         }
     }
 
     if (-not $connected) {
-        $clientIds = New-Object System.Collections.Generic.List[string]
-        if (-not [string]::IsNullOrWhiteSpace($ClientId)) {
-            [void]$clientIds.Add($ClientId)
-        }
-        [void]$clientIds.Add($script:GraphPowerShellClientId)
-        [void]$clientIds.Add($script:AzurePowerShellClientId)
-
+        Write-Host "Falling back to device-code sign-in (a browser will still open)..." -ForegroundColor Yellow
         $seen = @{}
         foreach ($appId in $clientIds) {
             if ($seen.ContainsKey($appId)) { continue }
             $seen[$appId] = $true
             try {
-                Write-Host "Starting device-code sign-in (app $appId)..." -ForegroundColor Cyan
+                Write-Host "Starting device-code sign-in..." -ForegroundColor Cyan
                 if (Connect-ViaRestDeviceCode -AppClientId $appId) {
                     $connected = $true
                     break
@@ -1114,9 +1398,9 @@ function Connect-EntraGraph {
             'Could not sign in to Microsoft Graph.',
             '',
             'Try:',
-            '  1) Re-run:  .\Get-EntraUsersWithoutAuthMethod.ps1 -DeviceCode',
-            '  2) Use Windows PowerShell or PowerShell 7 in a normal desktop session (not remoting).',
-            '  3) Update-Module Microsoft.Graph.Authentication -Scope CurrentUser',
+            '  1) Re-run:  .\Get-EntraUsersWithoutAuthMethod.ps1',
+            '  2) If no browser opened, copy the URL printed in this window.',
+            '  3) Or use:  .\Get-EntraUsersWithoutAuthMethod.ps1 -DeviceCode',
             '  4) An admin may need to consent UserAuthenticationMethod.Read.All and User.Read.All.',
             '',
             ($errors -join [Environment]::NewLine)
@@ -1593,6 +1877,22 @@ function Invoke-SelfTest {
     $form = ConvertTo-FormUrlEncoded -Data @{ client_id = 'abc'; scope = 'User.Read' }
     Assert-True ($form -match 'client_id=abc') 'form encode client_id'
     Assert-True ($form -match 'scope=User\.Read') 'form encode scope'
+
+    $pkce = New-PkcePair
+    Assert-True ($pkce.Verifier.Length -ge 43) 'pkce verifier length'
+    Assert-True ($pkce.Challenge.Length -ge 43) 'pkce challenge length'
+    Assert-True ($pkce.Verifier -notmatch '[+/=]') 'pkce verifier is base64url'
+
+    $authUrl = Get-EntraAuthorizeUrl -Authority 'https://login.microsoftonline.com/organizations' `
+        -ClientId 'abc' -RedirectUri 'http://localhost:8400/' -State 'st' -CodeChallenge 'ch'
+    Assert-True ($authUrl -match 'response_type=code') 'authorize url response_type'
+    Assert-True ($authUrl -match 'code_challenge_method=S256') 'authorize url pkce method'
+    Assert-True ($authUrl -match 'prompt=select_account') 'authorize url prompt'
+    Assert-True ($authUrl -match 'redirect_uri=http%3A%2F%2Flocalhost%3A8400%2F') 'authorize url redirect'
+
+    $callback = [uri]'http://localhost:8400/?code=abc%2Fde&state=xyz'
+    Assert-Equal 'abc/de' (Get-QueryValue -Uri $callback -Name 'code') 'query code decode'
+    Assert-Equal 'xyz' (Get-QueryValue -Uri $callback -Name 'state') 'query state'
 
     try { $null = Get-ConnectMgGraphDeviceCodeParameter } catch {
         [void]$failures.Add('Get-ConnectMgGraphDeviceCodeParameter threw')
