@@ -84,8 +84,10 @@
     -BrowserSignIn only if you want Connect-AzAccount / Connect-MgGraph first;
     that path hangs in Command Prompt on Windows Server.
 
-    The user sign-in is used only to discover the tenant. The OAuth test itself
-    uses the client-credentials grant against the app registration you supply.
+    The user sign-in is used only to discover the tenant. After sign-in the script
+    lists directories the account can access and selects the Home (main) tenant,
+    not a guest directory. The OAuth test itself uses the client-credentials grant
+    against the app registration you supply.
 
     Compatible with Windows PowerShell 5.1 and PowerShell 7. On 5.1 the script
     enables TLS 1.2 (required by login.microsoftonline.com) and avoids PowerShell
@@ -582,18 +584,38 @@ function Show-UiMessage {
     }
 }
 
+function Get-GuidFromText {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    if ($Text -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
+        return $Matches[1]
+    }
+    return $null
+}
+
 function Get-TenantFromJwt {
     param([string]$Token)
 
     if ([string]::IsNullOrWhiteSpace($Token)) { return $null }
+    $parts = $Token.Split('.')
+    if ($parts.Count -lt 2) { return $null }
+
     try {
         $payload = ConvertFrom-Jwt -Token $Token
         $tid = [string](Get-ClaimValue -Payload $payload -Name 'tid')
+        $iss = [string](Get-ClaimValue -Payload $payload -Name 'iss')
+        if ([string]::IsNullOrWhiteSpace($tid)) {
+            $tid = [string](Get-GuidFromText -Text $iss)
+        }
         if ([string]::IsNullOrWhiteSpace($tid)) { return $null }
 
         $upn = [string](Get-ClaimValue -Payload $payload -Name 'preferred_username')
         if ([string]::IsNullOrWhiteSpace($upn)) {
             $upn = [string](Get-ClaimValue -Payload $payload -Name 'upn')
+        }
+        if ([string]::IsNullOrWhiteSpace($upn)) {
+            $upn = [string](Get-ClaimValue -Payload $payload -Name 'unique_name')
         }
         $name = [string](Get-ClaimValue -Payload $payload -Name 'name')
 
@@ -601,12 +623,298 @@ function Get-TenantFromJwt {
             TenantId = $tid
             Account  = $upn
             Name     = $name
-            Issuer   = [string](Get-ClaimValue -Payload $payload -Name 'iss')
+            Issuer   = $iss
         }
     }
     catch {
         return $null
     }
+}
+
+function Get-DirectoryTenantId {
+    param($Record)
+
+    if ($null -eq $Record) { return '' }
+    $id = [string](Get-ClaimValue -Payload $Record -Name 'tenantId')
+    if ([string]::IsNullOrWhiteSpace($id)) {
+        $id = [string](Get-ClaimValue -Payload $Record -Name 'TenantId')
+    }
+    if ([string]::IsNullOrWhiteSpace($id)) {
+        $id = [string](Get-ClaimValue -Payload $Record -Name 'Id')
+    }
+    if ([string]::IsNullOrWhiteSpace($id)) {
+        $id = [string](Get-GuidFromText -Text ([string](Get-ClaimValue -Payload $Record -Name 'id')))
+    }
+    return $id
+}
+
+function Select-MainEntraTenant {
+    param(
+        $Directories,
+        [string]$LoginTenantId,
+        [string]$Upn
+    )
+
+    $msa = '9188040d-6c67-4c5b-b112-36a304b66dad'
+    $list = New-Object System.Collections.Generic.List[object]
+    foreach ($item in @($Directories)) {
+        if ($null -eq $item) { continue }
+        $tid = Get-DirectoryTenantId -Record $item
+        if ([string]::IsNullOrWhiteSpace($tid)) { continue }
+        if ([string]::Equals($tid, $msa, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+
+        $display = [string](Get-ClaimValue -Payload $item -Name 'displayName')
+        if ([string]::IsNullOrWhiteSpace($display)) {
+            $display = [string](Get-ClaimValue -Payload $item -Name 'Name')
+        }
+        $category = [string](Get-ClaimValue -Payload $item -Name 'tenantCategory')
+        $defaultDomain = [string](Get-ClaimValue -Payload $item -Name 'defaultDomain')
+        if ([string]::IsNullOrWhiteSpace($defaultDomain)) {
+            $defaultDomain = [string](Get-ClaimValue -Payload $item -Name 'DefaultDomain')
+        }
+        $domains = Get-ClaimValue -Payload $item -Name 'domains'
+        if ($null -eq $domains) {
+            $domains = Get-ClaimValue -Payload $item -Name 'Domains'
+        }
+
+        [void]$list.Add([pscustomobject]@{
+            TenantId       = $tid
+            DisplayName    = $display
+            TenantCategory = $category
+            DefaultDomain  = $defaultDomain
+            Domains        = $domains
+        })
+    }
+
+    $chosen = $null
+    $reason = 'login-token'
+
+    foreach ($row in $list) {
+        if ([string]::Equals([string]$row.TenantCategory, 'Home', [System.StringComparison]::OrdinalIgnoreCase)) {
+            $chosen = $row
+            $reason = 'home'
+            break
+        }
+    }
+
+    if ($null -eq $chosen -and -not [string]::IsNullOrWhiteSpace($Upn) -and $Upn -match '@(.+)$') {
+        $upnDomain = $Matches[1]
+        foreach ($row in $list) {
+            $hit = $false
+            if (-not [string]::IsNullOrWhiteSpace($row.DefaultDomain) -and
+                [string]::Equals($row.DefaultDomain, $upnDomain, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $hit = $true
+            }
+            foreach ($d in @($row.Domains)) {
+                $text = [string]$d
+                if ($text -match 'name=') {
+                    # Graph verifiedDomains objects
+                    $n = [string](Get-ClaimValue -Payload $d -Name 'name')
+                    if ([string]::Equals($n, $upnDomain, [System.StringComparison]::OrdinalIgnoreCase)) { $hit = $true }
+                }
+                elseif ([string]::Equals($text, $upnDomain, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $hit = $true
+                }
+            }
+            if ($hit) {
+                $chosen = $row
+                $reason = 'upn-domain'
+                break
+            }
+        }
+    }
+
+    if ($null -eq $chosen -and -not [string]::IsNullOrWhiteSpace($LoginTenantId)) {
+        foreach ($row in $list) {
+            if ([string]::Equals($row.TenantId, $LoginTenantId, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $chosen = $row
+                $reason = 'login-match'
+                break
+            }
+        }
+    }
+
+    if ($null -eq $chosen -and $list.Count -eq 1) {
+        $chosen = $list[0]
+        $reason = 'only-directory'
+    }
+
+    if ($null -eq $chosen) {
+        return [pscustomobject]@{
+            TenantId      = $LoginTenantId
+            DisplayName   = ''
+            DefaultDomain = ''
+            IsHome        = $false
+            Reason        = $reason
+            Directories   = $list
+        }
+    }
+
+    return [pscustomobject]@{
+        TenantId      = [string]$chosen.TenantId
+        DisplayName   = [string]$chosen.DisplayName
+        DefaultDomain = [string]$chosen.DefaultDomain
+        IsHome        = [string]::Equals([string]$chosen.TenantCategory, 'Home', [System.StringComparison]::OrdinalIgnoreCase)
+        Reason        = $reason
+        Directories   = $list
+    }
+}
+
+function Get-ArmAccessToken {
+    param(
+        [string]$RefreshToken,
+        [string]$ClientId,
+        [string]$Authority,
+        [string]$ExistingAccessToken
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($ExistingAccessToken)) {
+        try {
+            $payload = ConvertFrom-Jwt -Token $ExistingAccessToken
+            $aud = Get-ClaimValue -Payload $payload -Name 'aud'
+            foreach ($a in @($aud)) {
+                if ([string]$a -like '*management.azure.com*') { return $ExistingAccessToken }
+            }
+        }
+        catch { }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($RefreshToken) -or [string]::IsNullOrWhiteSpace($ClientId)) {
+        return $null
+    }
+
+    try {
+        $body = ConvertTo-FormUrlEncoded -Data @{
+            grant_type    = 'refresh_token'
+            client_id     = $ClientId
+            refresh_token = $RefreshToken
+            scope         = 'https://management.azure.com/.default'
+        }
+        $tok = Invoke-RestMethod -Method Post -Uri "$Authority/oauth2/v2.0/token" `
+            -ContentType 'application/x-www-form-urlencoded' -Body $body -ErrorAction Stop
+        return [string](Get-ClaimValue -Payload $tok -Name 'access_token')
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-GraphAccessToken {
+    param(
+        [string]$RefreshToken,
+        [string]$ClientId,
+        [string]$Authority,
+        [string]$ExistingAccessToken
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($ExistingAccessToken)) {
+        try {
+            $payload = ConvertFrom-Jwt -Token $ExistingAccessToken
+            $aud = Get-ClaimValue -Payload $payload -Name 'aud'
+            foreach ($a in @($aud)) {
+                if ([string]$a -like '*graph.microsoft.com*' -or [string]$a -eq '00000003-0000-0000-c000-000000000000') {
+                    return $ExistingAccessToken
+                }
+            }
+        }
+        catch { }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($RefreshToken) -or [string]::IsNullOrWhiteSpace($ClientId)) {
+        return $null
+    }
+
+    try {
+        $body = ConvertTo-FormUrlEncoded -Data @{
+            grant_type    = 'refresh_token'
+            client_id     = $ClientId
+            refresh_token = $RefreshToken
+            scope         = 'https://graph.microsoft.com/User.Read'
+        }
+        $tok = Invoke-RestMethod -Method Post -Uri "$Authority/oauth2/v2.0/token" `
+            -ContentType 'application/x-www-form-urlencoded' -Body $body -ErrorAction Stop
+        return [string](Get-ClaimValue -Payload $tok -Name 'access_token')
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-DirectoryListFromArm {
+    param([string]$AccessToken)
+
+    if ([string]::IsNullOrWhiteSpace($AccessToken)) { return @() }
+    try {
+        $headers = @{ Authorization = "Bearer $AccessToken" }
+        $resp = Invoke-RestMethod -Method Get -Uri 'https://management.azure.com/tenants?api-version=2020-01-01' `
+            -Headers $headers -ErrorAction Stop
+        $value = Get-ClaimValue -Payload $resp -Name 'value'
+        return @($value)
+    }
+    catch {
+        return @()
+    }
+}
+
+function Get-DirectoryListFromGraph {
+    param([string]$AccessToken)
+
+    if ([string]::IsNullOrWhiteSpace($AccessToken)) { return @() }
+    try {
+        $headers = @{ Authorization = "Bearer $AccessToken" }
+        $resp = Invoke-RestMethod -Method Get -Uri 'https://graph.microsoft.com/v1.0/organization?$select=id,displayName,verifiedDomains' `
+            -Headers $headers -ErrorAction Stop
+        $value = Get-ClaimValue -Payload $resp -Name 'value'
+        $list = New-Object System.Collections.Generic.List[object]
+        foreach ($org in @($value)) {
+            $domains = New-Object System.Collections.Generic.List[string]
+            $verified = Get-ClaimValue -Payload $org -Name 'verifiedDomains'
+            $defaultDomain = ''
+            foreach ($d in @($verified)) {
+                $n = [string](Get-ClaimValue -Payload $d -Name 'name')
+                if (-not [string]::IsNullOrWhiteSpace($n)) { [void]$domains.Add($n) }
+                $isDefault = Get-ClaimValue -Payload $d -Name 'isDefault'
+                if ($isDefault) { $defaultDomain = $n }
+            }
+            [void]$list.Add([pscustomobject]@{
+                tenantId      = [string](Get-ClaimValue -Payload $org -Name 'id')
+                displayName   = [string](Get-ClaimValue -Payload $org -Name 'displayName')
+                defaultDomain = $defaultDomain
+                tenantCategory = ''
+                domains       = $domains.ToArray()
+            })
+        }
+        return ,$list.ToArray()
+    }
+    catch {
+        return @()
+    }
+}
+
+function Resolve-MainEntraTenant {
+    param(
+        $TokenResponse,
+        [string]$ClientId,
+        [string]$Authority,
+        [string]$LoginTenantId,
+        [string]$Account
+    )
+
+    $access = [string](Get-ClaimValue -Payload $TokenResponse -Name 'access_token')
+    $refresh = [string](Get-ClaimValue -Payload $TokenResponse -Name 'refresh_token')
+
+    $directories = @()
+    $armToken = Get-ArmAccessToken -RefreshToken $refresh -ClientId $ClientId -Authority $Authority -ExistingAccessToken $access
+    if (-not [string]::IsNullOrWhiteSpace($armToken)) {
+        $directories = Get-DirectoryListFromArm -AccessToken $armToken
+    }
+
+    if ($directories.Count -eq 0) {
+        $graphToken = Get-GraphAccessToken -RefreshToken $refresh -ClientId $ClientId -Authority $Authority -ExistingAccessToken $access
+        $directories = Get-DirectoryListFromGraph -AccessToken $graphToken
+    }
+
+    return (Select-MainEntraTenant -Directories $directories -LoginTenantId $LoginTenantId -Upn $Account)
 }
 
 function Connect-ViaAzAccountTenant {
@@ -622,21 +930,34 @@ function Connect-ViaAzAccountTenant {
 
     $ctx = Get-AzContext -ErrorAction Stop
     $tenantObj = Get-ClaimValue -Payload $ctx -Name 'Tenant'
-    $tid = [string](Get-ClaimValue -Payload $tenantObj -Name 'Id')
-    if ([string]::IsNullOrWhiteSpace($tid)) {
-        $tid = [string](Get-ClaimValue -Payload $tenantObj -Name 'TenantId')
+    $loginTid = [string](Get-ClaimValue -Payload $tenantObj -Name 'Id')
+    if ([string]::IsNullOrWhiteSpace($loginTid)) {
+        $loginTid = [string](Get-ClaimValue -Payload $tenantObj -Name 'TenantId')
     }
-    if ([string]::IsNullOrWhiteSpace($tid)) { return $null }
+    if ([string]::IsNullOrWhiteSpace($loginTid)) { return $null }
 
     $accountObj = Get-ClaimValue -Payload $ctx -Name 'Account'
     $account = [string](Get-ClaimValue -Payload $accountObj -Name 'Id')
 
+    $azTenants = @()
+    try { $azTenants = @(Get-AzTenant -ErrorAction Stop) } catch { }
+
+    $main = Select-MainEntraTenant -Directories $azTenants -LoginTenantId $loginTid -Upn $account
+    $tid = [string]$main.TenantId
+    if ([string]::IsNullOrWhiteSpace($tid)) { $tid = $loginTid }
+
     return [pscustomobject]@{
-        TenantId = $tid
-        Account  = $account
-        Name     = $account
-        Issuer   = "https://login.microsoftonline.com/$tid/v2.0"
-        Mode     = 'AzInteractive'
+        TenantId        = $tid
+        LoginTenantId   = $loginTid
+        TenantName      = [string]$main.DisplayName
+        TenantDomain    = [string]$main.DefaultDomain
+        IsHomeTenant    = [bool]$main.IsHome
+        TenantReason    = [string]$main.Reason
+        DirectoryCount  = @($main.Directories).Count
+        Account         = $account
+        Name            = $account
+        Issuer          = "https://login.microsoftonline.com/$tid/v2.0"
+        Mode            = 'AzInteractive'
     }
 }
 
@@ -680,19 +1001,43 @@ function Connect-ViaMgGraphTenant {
 function Connect-ViaDeviceCodeTenant {
     param(
         [Parameter(Mandatory)]
-        [string]$AppClientId
+        [string]$AppClientId,
+
+        [Parameter()]
+        [string[]]$ScopeList
     )
+
+    if (-not $ScopeList -or $ScopeList.Count -eq 0) {
+        $ScopeList = @(
+            'openid profile offline_access https://management.azure.com/.default',
+            'openid profile offline_access'
+        )
+    }
 
     $tenantHint = if (-not [string]::IsNullOrWhiteSpace($TenantId)) { $TenantId.Trim() } else { 'organizations' }
     $authority = "https://login.microsoftonline.com/$tenantHint"
 
-    $dcBody = ConvertTo-FormUrlEncoded -Data @{
-        client_id = $AppClientId
-        scope     = 'openid profile offline_access'
+    $dc = $null
+    $usedScope = $null
+    foreach ($scope in $ScopeList) {
+        try {
+            $dcBody = ConvertTo-FormUrlEncoded -Data @{
+                client_id = $AppClientId
+                scope     = $scope
+            }
+            $dc = Invoke-RestMethod -Method Post -Uri "$authority/oauth2/v2.0/devicecode" `
+                -ContentType 'application/x-www-form-urlencoded' -Body $dcBody -ErrorAction Stop
+            $usedScope = $scope
+            break
+        }
+        catch {
+            $dc = $null
+        }
     }
 
-    $dc = Invoke-RestMethod -Method Post -Uri "$authority/oauth2/v2.0/devicecode" `
-        -ContentType 'application/x-www-form-urlencoded' -Body $dcBody -ErrorAction Stop
+    if ($null -eq $dc) {
+        throw "Device code start failed for client $AppClientId"
+    }
 
     $verificationUri = [string](Get-ClaimValue -Payload $dc -Name 'verification_uri')
     $verificationUriComplete = [string](Get-ClaimValue -Payload $dc -Name 'verification_uri_complete')
@@ -769,8 +1114,31 @@ function Connect-ViaDeviceCodeTenant {
         throw 'Sign-in succeeded but the token did not include a tenant ID (tid) claim.'
     }
 
-    $discovered | Add-Member -NotePropertyName Mode -NotePropertyValue 'DeviceCode' -Force
-    return $discovered
+    $refreshAuthority = $authority
+    if (-not [string]::IsNullOrWhiteSpace($discovered.TenantId)) {
+        $refreshAuthority = "https://login.microsoftonline.com/$($discovered.TenantId)"
+    }
+
+    $main = Resolve-MainEntraTenant -TokenResponse $token -ClientId $AppClientId `
+        -Authority $refreshAuthority -LoginTenantId $discovered.TenantId -Account $discovered.Account
+
+    $tid = [string]$main.TenantId
+    if ([string]::IsNullOrWhiteSpace($tid)) { $tid = $discovered.TenantId }
+
+    return [pscustomobject]@{
+        TenantId       = $tid
+        LoginTenantId  = $discovered.TenantId
+        TenantName     = [string]$main.DisplayName
+        TenantDomain   = [string]$main.DefaultDomain
+        IsHomeTenant   = [bool]$main.IsHome
+        TenantReason   = [string]$main.Reason
+        DirectoryCount = @($main.Directories).Count
+        Account        = $discovered.Account
+        Name           = $discovered.Name
+        Issuer         = $discovered.Issuer
+        Mode           = 'DeviceCode'
+        Scope          = $usedScope
+    }
 }
 
 function Connect-EntraTenant {
@@ -797,18 +1165,18 @@ function Connect-EntraTenant {
     }
 
     if ($null -eq $result) {
-        $clientIds = @(
-            $script:AzurePowerShellClientId,
-            $script:GraphPowerShellClientId,
-            $script:AzureCliClientId
+        $attempts = @(
+            @{ ClientId = $script:AzureCliClientId;        Scopes = @('openid profile offline_access https://management.azure.com/.default', 'openid profile offline_access') }
+            @{ ClientId = $script:AzurePowerShellClientId; Scopes = @('openid profile offline_access https://management.azure.com/.default', 'openid profile offline_access') }
+            @{ ClientId = $script:GraphPowerShellClientId; Scopes = @('openid profile offline_access https://graph.microsoft.com/User.Read', 'openid profile offline_access') }
         )
-        foreach ($app in $clientIds) {
+        foreach ($attempt in $attempts) {
             try {
-                $result = Connect-ViaDeviceCodeTenant -AppClientId $app
+                $result = Connect-ViaDeviceCodeTenant -AppClientId ([string]$attempt.ClientId) -ScopeList $attempt.Scopes
                 if ($null -ne $result) { break }
             }
             catch {
-                [void]$errors.Add("Device code ($app): $($_.Exception.Message)")
+                [void]$errors.Add("Device code ($($attempt.ClientId)): $($_.Exception.Message)")
             }
         }
     }
@@ -819,7 +1187,30 @@ function Connect-EntraTenant {
     }
 
     Write-KV 'Signed in as' $result.Account Cyan
-    Write-KV 'Tenant ID'    $result.TenantId Green
+    $tenantName = [string](Get-ClaimValue -Payload $result -Name 'TenantName')
+    $tenantDomain = [string](Get-ClaimValue -Payload $result -Name 'TenantDomain')
+    $loginTid = [string](Get-ClaimValue -Payload $result -Name 'LoginTenantId')
+    if (-not [string]::IsNullOrWhiteSpace($tenantName)) {
+        Write-KV 'Main tenant' $tenantName Green
+    }
+    Write-KV 'Main tenant ID' $result.TenantId Green
+    if (-not [string]::IsNullOrWhiteSpace($tenantDomain)) {
+        Write-KV 'Tenant domain' $tenantDomain
+    }
+    if (-not [string]::IsNullOrWhiteSpace($loginTid) -and
+        -not [string]::Equals($loginTid, $result.TenantId, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-KV 'Sign-in directory' $loginTid Yellow
+        Write-Host '  Using the Home (main) tenant, not the guest directory from sign-in.' -ForegroundColor Yellow
+    }
+    $dirCount = Get-ClaimValue -Payload $result -Name 'DirectoryCount'
+    if ($null -eq $dirCount -or [int]$dirCount -lt 1) {
+        Write-Host '  Could not list all directories; using the tenant ID from the sign-in token.' -ForegroundColor Yellow
+        Write-Host '  If this is not the main (Home) tenant, rerun with -TenantId <guid>.' -ForegroundColor Yellow
+    }
+    elseif ([int]$dirCount -gt 1) {
+        Write-KV 'Directories found' ([string]$dirCount)
+        Write-Host '  To test an app in a different tenant, rerun with -TenantId <guid>.' -ForegroundColor DarkGray
+    }
     $signInMode = [string](Get-ClaimValue -Payload $result -Name 'Mode')
     if (-not [string]::IsNullOrWhiteSpace($signInMode)) { Write-KV 'Sign-in method' $signInMode DarkGray }
     return $result
@@ -1489,6 +1880,36 @@ function Invoke-SelfTest {
         $info = Get-TenantFromJwt -Token $jwt
         Assert-Equal $info.TenantId 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' 'tid'
         Assert-Equal $info.Account 'ada@contoso.com' 'upn'
+    }
+
+    Invoke-Case 'Tenant id falls back to issuer GUID when tid is missing' {
+        $jwt = New-TestJwt @{
+            preferred_username = 'ada@contoso.com'
+            iss                = 'https://sts.windows.net/bbbbbbbb-cccc-dddd-eeee-ffffffffffff/'
+        }
+        $info = Get-TenantFromJwt -Token $jwt
+        Assert-Equal $info.TenantId 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff' 'iss tid'
+    }
+
+    Invoke-Case 'Main tenant prefers Home directory over guest login tid' {
+        $dirs = @(
+            [pscustomobject]@{ tenantId = 'guest-id'; displayName = 'Fabrikam'; tenantCategory = 'Managed'; defaultDomain = 'fabrikam.com' },
+            [pscustomobject]@{ tenantId = 'home-id'; displayName = 'Contoso'; tenantCategory = 'Home'; defaultDomain = 'contoso.com' }
+        )
+        $main = Select-MainEntraTenant -Directories $dirs -LoginTenantId 'guest-id' -Upn 'ada@contoso.com'
+        Assert-Equal $main.TenantId 'home-id' 'home'
+        Assert-Equal $main.Reason 'home' 'reason'
+        Assert-Equal $main.DisplayName 'Contoso' 'name'
+    }
+
+    Invoke-Case 'Main tenant matches UPN domain when category is missing' {
+        $dirs = @(
+            [pscustomobject]@{ TenantId = 'other-id'; Name = 'Other'; Domains = @('other.onmicrosoft.com') },
+            [pscustomobject]@{ TenantId = 'main-id'; Name = 'Contoso'; DefaultDomain = 'contoso.com'; Domains = @('contoso.com') }
+        )
+        $main = Select-MainEntraTenant -Directories $dirs -LoginTenantId 'other-id' -Upn 'ada@contoso.com'
+        Assert-Equal $main.TenantId 'main-id' 'upn'
+        Assert-Equal $main.Reason 'upn-domain' 'reason'
     }
 
     Invoke-Case 'Unix timestamp conversion' {
