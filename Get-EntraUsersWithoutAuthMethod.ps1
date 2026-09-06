@@ -70,8 +70,11 @@
     Sign-in opens your default web browser (authorization code + PKCE to
     http://localhost). Windows Web Account Manager is not used, because it
     often fails with "Missing wamcompat_id_token" after a successful login.
-    If the browser callback cannot start, the script falls back to device-code
-    sign-in and still launches the browser.
+
+    The Microsoft Graph PowerShell app (14d82eec-...) is tried last because many
+    tenants have not added it, which causes AADSTS700016. Sign-in uses the
+    Azure CLI / Azure PowerShell public clients first. If the browser shows
+    AADSTS700016, click "Try another method" in the small helper window.
 
     CSV requirement: a header row containing a column with the user's UPN /
     email / object id. The script auto-detects common column names
@@ -117,12 +120,14 @@ $script:GraphScopeList = @('UserAuthenticationMethod.Read.All', 'User.Read.All')
 $script:GraphScopeString = 'UserAuthenticationMethod.Read.All User.Read.All offline_access openid profile'
 $script:GraphPowerShellClientId = '14d82eec-204b-4c2f-b113-9d477e6ee18c'
 $script:AzurePowerShellClientId = '1950a258-227b-4e31-a9cf-717495945fc2'
+$script:AzureCliClientId = '04b07795-8ddb-461a-bbee-02f9e1bf7b46'
 $script:PasswordMethodId = '28c10230-6103-485e-b985-444c60001490'
 $script:GraphBase = 'https://graph.microsoft.com/v1.0'
 $script:AccessToken = $null
 $script:RefreshToken = $null
 $script:TokenClientId = $null
 $script:TokenTenant = 'organizations'
+$script:AuthSkipRequested = $false
 
 # ---------------------------------------------------------------------------
 # STA relaunch (WinForms dialogs + WAM parent window)
@@ -771,10 +776,12 @@ function Ensure-GraphModule {
 }
 
 function New-AuthParentForm {
+    $script:AuthSkipRequested = $false
+
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'Entra ID interactive sign-in'
-    $form.Width = 480
-    $form.Height = 140
+    $form.Width = 520
+    $form.Height = 200
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
     $form.TopMost = $true
     $form.ShowInTaskbar = $true
@@ -783,15 +790,51 @@ function New-AuthParentForm {
     $form.MinimizeBox = $false
 
     $label = New-Object System.Windows.Forms.Label
-    $label.Dock = [System.Windows.Forms.DockStyle]::Fill
-    $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
-    $label.Text = "A web browser was opened for Microsoft sign-in.`r`nFinish signing in there, then return to this window."
+    $label.Left = 16
+    $label.Top = 16
+    $label.Width = 470
+    $label.Height = 80
+    $label.Text = "A web browser was opened for Microsoft sign-in.`r`nFinish signing in there, then return to this window.`r`n`r`nIf the browser shows an error (for example AADSTS700016), click Try another method."
     $form.Controls.Add($label)
+
+    $skip = New-Object System.Windows.Forms.Button
+    $skip.Text = 'Try another method'
+    $skip.Width = 180
+    $skip.Height = 32
+    $skip.Left = 160
+    $skip.Top = 110
+    $skip.Add_Click({
+        $script:AuthSkipRequested = $true
+        $this.FindForm().Close()
+    })
+    $form.Controls.Add($skip)
 
     [void]$form.Show()
     $form.Activate()
     [void][System.Windows.Forms.Application]::DoEvents()
     return $form
+}
+
+function Get-PublicClientIdList {
+    $ids = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace($ClientId)) {
+        [void]$ids.Add($ClientId)
+    }
+    # Prefer apps that already exist in most enterprise tenants.
+    # Microsoft Graph PowerShell (14d82eec-...) is often missing and causes AADSTS700016.
+    [void]$ids.Add($script:AzureCliClientId)
+    [void]$ids.Add($script:AzurePowerShellClientId)
+    [void]$ids.Add($script:GraphPowerShellClientId)
+
+    $seen = @{}
+    $unique = New-Object System.Collections.Generic.List[string]
+    foreach ($id in $ids) {
+        $key = $id.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        [void]$unique.Add($id)
+    }
+    return ,$unique
 }
 
 function Disable-GraphWamIfPossible {
@@ -1087,7 +1130,7 @@ function Connect-ViaSystemBrowser {
     )
 
     if ([string]::IsNullOrWhiteSpace($AppClientId)) {
-        $AppClientId = $script:GraphPowerShellClientId
+        $AppClientId = $script:AzureCliClientId
     }
 
     $tenant = 'organizations'
@@ -1108,6 +1151,7 @@ function Connect-ViaSystemBrowser {
     $parent = $null
 
     try {
+        $script:AuthSkipRequested = $false
         $authUrl = Get-EntraAuthorizeUrl -Authority $authority -ClientId $AppClientId `
             -RedirectUri $redirect -State $state -CodeChallenge $pkce.Challenge
 
@@ -1126,7 +1170,18 @@ function Connect-ViaSystemBrowser {
         }
 
         $async = $listener.BeginGetContext($null, $null)
-        $signaled = $async.AsyncWaitHandle.WaitOne(300000)
+        $deadline = [datetime]::UtcNow.AddMinutes(5)
+        $signaled = $false
+        while ([datetime]::UtcNow -lt $deadline) {
+            if ($script:AuthSkipRequested) {
+                throw 'USER_SKIPPED_BROWSER'
+            }
+            if ($async.AsyncWaitHandle.WaitOne(200)) {
+                $signaled = $true
+                break
+            }
+            try { [void][System.Windows.Forms.Application]::DoEvents() } catch { }
+        }
         if (-not $signaled) {
             throw 'Timed out waiting for browser sign-in (5 minutes).'
         }
@@ -1185,7 +1240,7 @@ function Connect-ViaRestDeviceCode {
     )
 
     if ([string]::IsNullOrWhiteSpace($AppClientId)) {
-        $AppClientId = $script:GraphPowerShellClientId
+        $AppClientId = $script:AzureCliClientId
     }
 
     $tenant = 'organizations'
@@ -1335,23 +1390,11 @@ function Connect-EntraGraph {
     $connected = $false
     $tryBrowser = -not $DeviceCode
 
-    $clientIds = New-Object System.Collections.Generic.List[string]
-    if (-not [string]::IsNullOrWhiteSpace($ClientId)) {
-        [void]$clientIds.Add($ClientId)
-    }
-    [void]$clientIds.Add($script:GraphPowerShellClientId)
-    [void]$clientIds.Add($script:AzurePowerShellClientId)
+    $clientIds = Get-PublicClientIdList
 
     if ($tryBrowser) {
-        $browserApps = New-Object System.Collections.Generic.List[string]
-        if (-not [string]::IsNullOrWhiteSpace($ClientId)) {
-            [void]$browserApps.Add($ClientId)
-        }
-        [void]$browserApps.Add($script:GraphPowerShellClientId)
-        [void]$browserApps.Add($script:AzurePowerShellClientId)
-
         $seenBrowser = @{}
-        foreach ($appId in $browserApps) {
+        foreach ($appId in $clientIds) {
             if ($seenBrowser.ContainsKey($appId)) { continue }
             $seenBrowser[$appId] = $true
             try {
@@ -1366,9 +1409,8 @@ function Connect-EntraGraph {
                 [void]$errors.Add("Browser ($appId): $msg")
                 Write-Host "Browser sign-in did not complete: $msg" -ForegroundColor Yellow
                 try { Disconnect-MgGraph | Out-Null } catch { }
-                if ($msg -notmatch 'AADSTS50011|redirect_uri|redirect URI') {
-                    break
-                }
+                # AADSTS700016 = this public client is not in the tenant; try the next well-known app.
+                # USER_SKIPPED_BROWSER = the sign-in helper button was used after a browser error page.
             }
         }
     }
@@ -1889,6 +1931,10 @@ function Invoke-SelfTest {
     Assert-True ($authUrl -match 'code_challenge_method=S256') 'authorize url pkce method'
     Assert-True ($authUrl -match 'prompt=select_account') 'authorize url prompt'
     Assert-True ($authUrl -match 'redirect_uri=http%3A%2F%2Flocalhost%3A8400%2F') 'authorize url redirect'
+
+    $pubIds = Get-PublicClientIdList
+    Assert-Equal $script:AzureCliClientId $pubIds[0] 'azure CLI client is tried first'
+    Assert-Equal $script:GraphPowerShellClientId $pubIds[$pubIds.Count - 1] 'graph powershell client is last'
 
     $callback = [uri]'http://localhost:8400/?code=abc%2Fde&state=xyz'
     Assert-Equal 'abc/de' (Get-QueryValue -Uri $callback -Name 'code') 'query code decode'
