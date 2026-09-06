@@ -80,6 +80,10 @@
 
     The user sign-in is used only to discover the tenant. The OAuth test itself
     uses the client-credentials grant against the app registration you supply.
+
+    Compatible with Windows PowerShell 5.1 and PowerShell 7. On 5.1 the script
+    enables TLS 1.2 (required by login.microsoftonline.com) and avoids PowerShell
+    7-only syntax.
 #>
 
 [CmdletBinding()]
@@ -119,6 +123,19 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Windows PowerShell 5.1 defaults to TLS 1.0; Entra ID requires TLS 1.2.
+try {
+    $tls12 = [Net.SecurityProtocolType]::Tls12
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor $tls12
+}
+catch {
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]3072
+    }
+    catch { }
+}
+
 $env:AZURE_IDENTITY_DISABLE_CP1 = 'true'
 $env:MSAL_DESKTOP_APP_USE_WAM = '0'
 
@@ -130,11 +147,12 @@ $script:IsWindowsHost           = $false
 $script:UseGui                  = $false
 
 try {
-    if ($PSVersionTable.PSVersion.Major -ge 6) {
-        $script:IsWindowsHost = [bool]$IsWindows
+    # $IsWindows is PowerShell 6+ only; OS env/platform checks work on 5.1.
+    if ([string]$env:OS -eq 'Windows_NT') {
+        $script:IsWindowsHost = $true
     }
-    else {
-        $script:IsWindowsHost = [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
+    elseif ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+        $script:IsWindowsHost = $true
     }
 }
 catch {
@@ -253,17 +271,36 @@ function Get-HttpErrorBody {
     catch { }
 
     try {
-        $response = $ErrorRecord.Exception.Response
+        $response = $null
+        $ex = $ErrorRecord.Exception
+        if ($null -ne $ex -and $ex.PSObject.Properties['Response'] -and $ex.Response) {
+            $response = $ex.Response
+        }
+        elseif ($null -ne $ex -and $ex.PSObject.Properties['InnerException'] -and $ex.InnerException) {
+            $inner = $ex.InnerException
+            if ($inner.PSObject.Properties['Response'] -and $inner.Response) {
+                $response = $inner.Response
+            }
+        }
+
         if ($response) {
+            # PS 7 HttpResponseMessage.Content; skip on 5.1 HttpWebResponse.
             if ($response.PSObject.Properties['Content'] -and $response.Content) {
                 $content = $response.Content
                 if ($content -is [string]) { return $content }
                 try { return [string]$content.ReadAsStringAsync().Result } catch { }
             }
 
-            $stream = $response.GetResponseStream()
+            $stream = $null
+            try { $stream = $response.GetResponseStream() } catch { }
             if ($stream) {
-                $reader = New-Object System.IO.StreamReader($stream)
+                try {
+                    if ($stream.PSObject.Properties['CanSeek'] -and $stream.CanSeek) {
+                        $stream.Position = 0
+                    }
+                }
+                catch { }
+                $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
                 try {
                     $body = $reader.ReadToEnd()
                     if (-not [string]::IsNullOrWhiteSpace($body)) { return $body }
@@ -276,7 +313,10 @@ function Get-HttpErrorBody {
     }
     catch { }
 
-    return [string]$ErrorRecord.Exception.Message
+    if ($null -ne $ErrorRecord.Exception) {
+        return [string]$ErrorRecord.Exception.Message
+    }
+    return [string]$ErrorRecord
 }
 
 function ConvertTo-Base64Url {
@@ -314,7 +354,8 @@ function ConvertFrom-Jwt {
 
     $bytes = ConvertFrom-Base64Url -Value $parts[1]
     $json = [System.Text.Encoding]::UTF8.GetString($bytes)
-    return $json | ConvertFrom-Json
+    # -InputObject avoids 5.1 pipeline quirks with ConvertFrom-Json.
+    return ConvertFrom-Json -InputObject $json
 }
 
 function Get-JwtRoles {
@@ -357,7 +398,8 @@ function ConvertFrom-UnixSeconds {
     if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) { return $null }
     try {
         $seconds = [int64]$Value
-        return ([datetime]'1970-01-01Z').ToUniversalTime().AddSeconds($seconds)
+        $epoch = New-Object System.DateTime 1970, 1, 1, 0, 0, 0, ([System.DateTimeKind]::Utc)
+        return $epoch.AddSeconds($seconds)
     }
     catch {
         return $null
@@ -388,7 +430,7 @@ function Get-FriendlyAadError {
     $errorId = ''
 
     try {
-        $json = $Raw | ConvertFrom-Json
+        $json = ConvertFrom-Json -InputObject $Raw
         if ($json.PSObject.Properties['error']) { $errorId = [string]$json.error }
         if ($json.PSObject.Properties['error_description']) { $description = [string]$json.error_description }
         if ($json.PSObject.Properties['error_codes'] -and $json.error_codes) {
@@ -599,11 +641,15 @@ function Connect-ViaAzAccountTenant {
         Connect-AzAccount @azParams | Out-Null
 
         $ctx = Get-AzContext -ErrorAction Stop
-        $tid = [string]$ctx.Tenant.Id
+        $tenantObj = Get-ClaimValue -Payload $ctx -Name 'Tenant'
+        $tid = [string](Get-ClaimValue -Payload $tenantObj -Name 'Id')
+        if ([string]::IsNullOrWhiteSpace($tid)) {
+            $tid = [string](Get-ClaimValue -Payload $tenantObj -Name 'TenantId')
+        }
         if ([string]::IsNullOrWhiteSpace($tid)) { return $null }
 
-        $account = ''
-        if ($ctx.Account -and $ctx.Account.Id) { $account = [string]$ctx.Account.Id }
+        $accountObj = Get-ClaimValue -Payload $ctx -Name 'Account'
+        $account = [string](Get-ClaimValue -Payload $accountObj -Name 'Id')
 
         return [pscustomobject]@{
             TenantId = $tid
@@ -632,23 +678,30 @@ function Connect-ViaMgGraphTenant {
     try {
         if ($script:WinFormsLoaded) { $parent = New-AuthParentForm }
 
+        $cmd = Get-Command Connect-MgGraph -ErrorAction Stop
         $params = @{
             Scopes      = @('openid', 'profile')
-            NoWelcome   = $true
             ErrorAction = 'Stop'
         }
+        # -NoWelcome / -UseDeviceAuthentication are not in every Graph 5.1 module build.
+        if ($cmd.Parameters.ContainsKey('NoWelcome')) {
+            $params['NoWelcome'] = $true
+        }
         if (-not [string]::IsNullOrWhiteSpace($TenantId)) { $params['TenantId'] = $TenantId }
-        if ($DeviceCode) { $params['UseDeviceAuthentication'] = $true }
+        if ($DeviceCode) {
+            if (-not $cmd.Parameters.ContainsKey('UseDeviceAuthentication')) { return $null }
+            $params['UseDeviceAuthentication'] = $true
+        }
 
         Connect-MgGraph @params | Out-Null
         $ctx = Get-MgContext -ErrorAction Stop
-        $tid = [string]$ctx.TenantId
+        $tid = [string](Get-ClaimValue -Payload $ctx -Name 'TenantId')
         if ([string]::IsNullOrWhiteSpace($tid)) { return $null }
 
         return [pscustomobject]@{
             TenantId = $tid
-            Account  = [string]$ctx.Account
-            Name     = [string]$ctx.Account
+            Account  = [string](Get-ClaimValue -Payload $ctx -Name 'Account')
+            Name     = [string](Get-ClaimValue -Payload $ctx -Name 'Account')
             Issuer   = "https://login.microsoftonline.com/$tid/v2.0"
             Mode     = 'MgGraph'
         }
@@ -678,30 +731,40 @@ function Connect-ViaDeviceCodeTenant {
     $dc = Invoke-RestMethod -Method Post -Uri "$authority/oauth2/v2.0/devicecode" `
         -ContentType 'application/x-www-form-urlencoded' -Body $dcBody -ErrorAction Stop
 
+    $verificationUri = [string](Get-ClaimValue -Payload $dc -Name 'verification_uri')
+    $userCode = [string](Get-ClaimValue -Payload $dc -Name 'user_code')
+    $deviceCodeValue = [string](Get-ClaimValue -Payload $dc -Name 'device_code')
+    $expiresIn = Get-ClaimValue -Payload $dc -Name 'expires_in'
+    $pollInterval = Get-ClaimValue -Payload $dc -Name 'interval'
+    if ($null -eq $expiresIn -or [string]::IsNullOrWhiteSpace([string]$expiresIn)) { $expiresIn = 900 }
+    if ($null -eq $pollInterval -or [string]::IsNullOrWhiteSpace([string]$pollInterval)) { $pollInterval = 5 }
+
     Write-Host ''
-    Write-Host "  To sign in, open  $($dc.verification_uri)" -ForegroundColor Cyan
-    Write-Host "  Enter code:       $($dc.user_code)" -ForegroundColor Yellow
+    Write-Host "  To sign in, open  $verificationUri" -ForegroundColor Cyan
+    Write-Host "  Enter code:       $userCode" -ForegroundColor Yellow
     Write-Host '  Waiting for sign-in...' -ForegroundColor DarkGray
     Write-Host ''
 
-    try { Set-Clipboard -Value ([string]$dc.user_code) -ErrorAction SilentlyContinue } catch { }
+    try { Set-Clipboard -Value $userCode -ErrorAction SilentlyContinue } catch { }
     if ($script:WinFormsLoaded) {
-        try { [System.Windows.Forms.Clipboard]::SetText([string]$dc.user_code) } catch { }
+        try { [System.Windows.Forms.Clipboard]::SetText($userCode) } catch { }
         $deviceMessage = @(
             'Complete sign-in in your browser:',
             '',
-            "1. Open $($dc.verification_uri)",
-            "2. Enter code $($dc.user_code)  (copied to clipboard)",
+            "1. Open $verificationUri",
+            "2. Enter code $userCode  (copied to clipboard)",
             '',
             'Click OK, then finish sign-in in the browser while this window waits.'
         ) -join [Environment]::NewLine
         Show-UiMessage -Title 'Sign in to Entra ID' -Icon Information -Message $deviceMessage
     }
 
-    try { Start-Process ([string]$dc.verification_uri) | Out-Null } catch { }
+    if (-not [string]::IsNullOrWhiteSpace($verificationUri)) {
+        try { Start-Process $verificationUri | Out-Null } catch { }
+    }
 
-    $deadline = [datetime]::UtcNow.AddSeconds([int]$dc.expires_in)
-    $interval = [Math]::Max(5, [int]$dc.interval)
+    $deadline = [datetime]::UtcNow.AddSeconds([int]$expiresIn)
+    $interval = [Math]::Max(5, [int]$pollInterval)
     $token = $null
     $lastPoll = [datetime]::MinValue
 
@@ -721,7 +784,7 @@ function Connect-ViaDeviceCodeTenant {
             $tokBody = ConvertTo-FormUrlEncoded -Data @{
                 grant_type  = 'urn:ietf:params:oauth:grant-type:device_code'
                 client_id   = $AppClientId
-                device_code = [string]$dc.device_code
+                device_code = $deviceCodeValue
             }
             $token = Invoke-RestMethod -Method Post -Uri "$authority/oauth2/v2.0/token" `
                 -ContentType 'application/x-www-form-urlencoded' -Body $tokBody -ErrorAction Stop
@@ -738,12 +801,9 @@ function Connect-ViaDeviceCodeTenant {
         throw 'Sign-in timed out or was cancelled.'
     }
 
-    $jwt = $null
-    if ($token.PSObject.Properties['id_token'] -and $token.id_token) {
-        $jwt = [string]$token.id_token
-    }
-    elseif ($token.PSObject.Properties['access_token'] -and $token.access_token) {
-        $jwt = [string]$token.access_token
+    $jwt = [string](Get-ClaimValue -Payload $token -Name 'id_token')
+    if ([string]::IsNullOrWhiteSpace($jwt)) {
+        $jwt = [string](Get-ClaimValue -Payload $token -Name 'access_token')
     }
 
     $discovered = Get-TenantFromJwt -Token $jwt
@@ -796,7 +856,8 @@ function Connect-EntraTenant {
 
     Write-KV 'Signed in as' $result.Account Cyan
     Write-KV 'Tenant ID'    $result.TenantId Green
-    if ($result.Mode) { Write-KV 'Sign-in method' $result.Mode DarkGray }
+    $signInMode = [string](Get-ClaimValue -Payload $result -Name 'Mode')
+    if (-not [string]::IsNullOrWhiteSpace($signInMode)) { Write-KV 'Sign-in method' $signInMode DarkGray }
     return $result
 }
 
@@ -835,7 +896,7 @@ function Get-AppAccessToken {
         $friendly = Get-FriendlyAadError -Raw $raw
         $message = $friendly.Title + ': ' + $friendly.Description
         if ($friendly.Hint) { $message += [Environment]::NewLine + $friendly.Hint }
-        $ex = New-Object System.Exception $message
+        $ex = New-Object -TypeName System.Exception -ArgumentList $message
         throw $ex
     }
 }
@@ -1469,7 +1530,15 @@ function Invoke-SelfTest {
     Invoke-Case 'Unix timestamp conversion' {
         $dt = ConvertFrom-UnixSeconds 0
         Assert-Equal $dt.Year 1970 'epoch year'
+        Assert-Equal $dt.Hour 0 'epoch hour'
+        Assert-Equal $dt.Kind 'Utc' 'epoch kind'
         Assert-Equal (ConvertFrom-UnixSeconds $null) $null 'null'
+    }
+
+    Invoke-Case 'Single-element JSON error_codes unwraps on 5.1' {
+        $raw = '{"error":"invalid_client","error_description":"AADSTS7000215: Invalid client secret provided.","error_codes":[7000215]}'
+        $info = Get-FriendlyAadError -Raw $raw
+        if ($info.Title -notmatch '7000215') { throw "Title missing code: $($info.Title)" }
     }
 
     Write-Host ''
@@ -1500,7 +1569,7 @@ $resolvedTenantId = $TenantId
 if ([string]::IsNullOrWhiteSpace($resolvedTenantId)) {
     try {
         $tenantInfo = Connect-EntraTenant
-        $resolvedTenantId = $tenantInfo.TenantId
+        $resolvedTenantId = [string](Get-ClaimValue -Payload $tenantInfo -Name 'TenantId')
     }
     catch {
         Write-Host ''
@@ -1552,8 +1621,8 @@ catch {
 $account = $null
 $mode = $null
 if ($null -ne $tenantInfo) {
-    $account = $tenantInfo.Account
-    $mode = $tenantInfo.Mode
+    $account = [string](Get-ClaimValue -Payload $tenantInfo -Name 'Account')
+    $mode = [string](Get-ClaimValue -Payload $tenantInfo -Name 'Mode')
 }
 
 $report = New-ValidationReport -Success $success -TenantIdValue $resolvedTenantId `
