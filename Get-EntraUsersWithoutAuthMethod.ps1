@@ -32,7 +32,18 @@
     only password-only / no-method users, plus not-found / error / skipped rows.
 
 .PARAMETER DeviceCode
-    Use device-code sign-in instead of interactive browser login.
+    Skip Windows WAM / interactive browser login and use device-code sign-in.
+    Use this when the Graph sign-in window appears, you complete login, and
+    Connect-MgGraph still reports InteractiveBrowserCredential authentication
+    failed. The script also falls back to device code automatically.
+
+.PARAMETER TenantId
+    Optional Entra tenant (contoso.onmicrosoft.com or a Tenant ID GUID).
+
+.PARAMETER ClientId
+    Optional public-client app ID. Leave blank to use the Microsoft Graph
+    PowerShell app. A custom app is required only if you want to disable WAM
+    and keep interactive browser login.
 
 .PARAMETER SelfTest
     Runs built-in unit tests for classification helpers and exits
@@ -50,10 +61,19 @@
 .EXAMPLE
     .\Get-EntraUsersWithoutAuthMethod.ps1 -SelfTest
 
+.EXAMPLE
+    .\Get-EntraUsersWithoutAuthMethod.ps1 -DeviceCode
+
 .NOTES
     Requires the Microsoft.Graph.Authentication module.
     Requires the UserAuthenticationMethod.Read.All and User.Read.All permissions
     (delegated). An admin may need to consent the first time you run it.
+
+    Microsoft Graph PowerShell 2.34+ uses Windows Web Account Manager (WAM)
+    by default. WAM often reports a successful login and then fails with
+    "InteractiveBrowserCredential authentication failed". This script disables
+    WAM when the SDK allows it and automatically falls back to device-code
+    sign-in so a completed login is not lost.
 
     CSV requirement: a header row containing a column with the user's UPN /
     email / object id. The script auto-detects common column names
@@ -72,6 +92,12 @@ param(
     [switch]$IncludeAll,
 
     [switch]$DeviceCode,
+
+    [Parameter()]
+    [string]$TenantId,
+
+    [Parameter()]
+    [string]$ClientId,
 
     [switch]$SelfTest
 )
@@ -124,6 +150,14 @@ if ($script:UseGui -and [System.Threading.Thread]::CurrentThread.ApartmentState 
     }
     if ($DeviceCode) {
         [void]$argParts.Add('-DeviceCode')
+    }
+    if (-not [string]::IsNullOrWhiteSpace($TenantId)) {
+        [void]$argParts.Add('-TenantId')
+        [void]$argParts.Add(('"{0}"' -f $TenantId))
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ClientId)) {
+        [void]$argParts.Add('-ClientId')
+        [void]$argParts.Add(('"{0}"' -f $ClientId))
     }
 
     Write-Host "Relaunching in STA mode so file dialogs and sign-in work..." -ForegroundColor Yellow
@@ -755,44 +789,81 @@ function New-AuthParentForm {
     return $form
 }
 
-function Connect-EntraGraph {
+function Disable-GraphWamIfPossible {
+    try {
+        if (-not (Get-Command Set-MgGraphOption -ErrorAction SilentlyContinue)) {
+            return
+        }
+        $cmd = Get-Command Set-MgGraphOption -ErrorAction Stop
+        if ($cmd.Parameters.ContainsKey('DisableLoginByWAM')) {
+            Set-MgGraphOption -DisableLoginByWAM $true -ErrorAction SilentlyContinue | Out-Null
+        }
+    }
+    catch { }
+}
+
+function Test-GraphContextHasRequiredScopes {
     $ctx = $null
     try { $ctx = Get-MgContext -ErrorAction SilentlyContinue } catch { }
+    if (-not $ctx) { return $false }
 
-    $hasScopes = $false
-    if ($ctx -and $ctx.Scopes) {
+    $scopeText = ''
+    if ($ctx.Scopes) {
         $scopeText = @($ctx.Scopes) -join ' '
-        $hasUserRead = ($scopeText -match 'User\.Read\.All|Directory\.Read\.All')
-        $hasAuthRead = ($scopeText -match 'UserAuthenticationMethod\.Read\.All|AuthenticationMethod\.Read\.All')
-        $hasScopes = $hasUserRead -and $hasAuthRead
+    }
+    if ([string]::IsNullOrWhiteSpace($scopeText)) {
+        $account = ''
+        try {
+            if ($ctx.Account) { $account = [string]$ctx.Account }
+        }
+        catch { }
+        # Some SDK builds omit Scopes; treat an account as connected.
+        return (-not [string]::IsNullOrWhiteSpace($account))
     }
 
-    if ($hasScopes) {
-        Write-Host "Already connected to Microsoft Graph as $($ctx.Account)." -ForegroundColor Green
-        return
-    }
+    $hasUserRead = ($scopeText -match 'User\.Read\.All|Directory\.Read\.All')
+    $hasAuthRead = ($scopeText -match 'UserAuthenticationMethod\.Read\.All|AuthenticationMethod\.Read\.All')
+    return ($hasUserRead -and $hasAuthRead)
+}
 
-    Write-Host "A sign-in window may appear. Sign in with an account that can read" -ForegroundColor Gray
-    Write-Host "authentication method details (e.g. Global Reader / Auth Admin)." -ForegroundColor Gray
+function Invoke-ConnectMgGraph {
+    param([switch]$UseDeviceCode)
 
-    $connectParams = @{
+    $cmd = Get-Command Connect-MgGraph -ErrorAction Stop
+    $params = @{
         Scopes      = $script:GraphScopeList
         ErrorAction = 'Stop'
     }
-    $cmd = Get-Command Connect-MgGraph -ErrorAction Stop
     if ($cmd.Parameters.ContainsKey('NoWelcome')) {
-        $connectParams['NoWelcome'] = $true
+        $params['NoWelcome'] = $true
     }
-    if ($DeviceCode -and $cmd.Parameters.ContainsKey('UseDeviceAuthentication')) {
-        $connectParams['UseDeviceAuthentication'] = $true
+    if ($UseDeviceCode) {
+        if (-not $cmd.Parameters.ContainsKey('UseDeviceAuthentication')) {
+            throw 'This Microsoft.Graph.Authentication build does not support -UseDeviceAuthentication. Update the module, then re-run.'
+        }
+        $params['UseDeviceAuthentication'] = $true
+    }
+    if ($cmd.Parameters.ContainsKey('DisableLoginByWAM') -and -not $UseDeviceCode) {
+        $params['DisableLoginByWAM'] = $true
+    }
+    if (-not [string]::IsNullOrWhiteSpace($TenantId) -and $cmd.Parameters.ContainsKey('TenantId')) {
+        $params['TenantId'] = $TenantId
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ClientId) -and $cmd.Parameters.ContainsKey('ClientId')) {
+        $params['ClientId'] = $ClientId
     }
 
     $parent = $null
     try {
-        if (-not $DeviceCode -and $script:WinFormsLoaded) {
+        if ($UseDeviceCode) {
+            Write-Host ""
+            Write-Host "Device-code sign-in: a URL and code will appear below." -ForegroundColor Cyan
+            Write-Host "Open the URL, enter the code, and finish signing in. Leave this window open." -ForegroundColor Cyan
+        }
+        elseif ($script:WinFormsLoaded) {
             $parent = New-AuthParentForm
         }
-        Connect-MgGraph @connectParams | Out-Null
+        Connect-MgGraph @params | Out-Null
     }
     finally {
         if ($null -ne $parent) {
@@ -802,19 +873,116 @@ function Connect-EntraGraph {
     }
 }
 
+function Connect-EntraGraph {
+    Disable-GraphWamIfPossible
+
+    if (Test-GraphContextHasRequiredScopes) {
+        $ctx = $null
+        try { $ctx = Get-MgContext -ErrorAction SilentlyContinue } catch { }
+        $account = ''
+        if ($ctx -and $ctx.Account) { $account = [string]$ctx.Account }
+        if ([string]::IsNullOrWhiteSpace($account)) {
+            Write-Host "Already connected to Microsoft Graph." -ForegroundColor Green
+        }
+        else {
+            Write-Host "Already connected to Microsoft Graph as $account." -ForegroundColor Green
+        }
+        return
+    }
+
+    Write-Host "Sign in with an account that can read authentication method details" -ForegroundColor Gray
+    Write-Host "(for example Global Reader, Authentication Admin, or Privileged Auth Admin)." -ForegroundColor Gray
+
+    $errors = New-Object System.Collections.Generic.List[string]
+    $connected = $false
+    $tryInteractive = -not $DeviceCode
+
+    if ($tryInteractive) {
+        Write-Host "Opening interactive Microsoft Graph sign-in..." -ForegroundColor Cyan
+        try {
+            Invoke-ConnectMgGraph
+            $connected = $true
+        }
+        catch {
+            $msg = Get-GraphErrorMessage -ErrorRecord $_
+            if ([string]::IsNullOrWhiteSpace($msg)) {
+                $msg = 'InteractiveBrowserCredential authentication failed (no extra detail from the Graph SDK).'
+            }
+            [void]$errors.Add("Interactive: $msg")
+            Write-Host ""
+            Write-Host "Interactive / WAM sign-in did not complete, even if a login window appeared." -ForegroundColor Yellow
+            Write-Host "This is a known Microsoft Graph PowerShell issue on Windows (Web Account Manager)." -ForegroundColor Yellow
+            Write-Host $msg -ForegroundColor DarkYellow
+            Write-Host "Falling back to device-code sign-in..." -ForegroundColor Yellow
+            try { Disconnect-MgGraph | Out-Null } catch { }
+        }
+    }
+
+    if (-not $connected) {
+        try {
+            Invoke-ConnectMgGraph -UseDeviceCode
+            $connected = $true
+        }
+        catch {
+            $msg = Get-GraphErrorMessage -ErrorRecord $_
+            [void]$errors.Add("Device code: $msg")
+            try { Disconnect-MgGraph | Out-Null } catch { }
+        }
+    }
+
+    if (-not $connected) {
+        $hint = @(
+            'Could not sign in to Microsoft Graph.',
+            '',
+            'Try:',
+            '  1) Re-run:  .\Get-EntraUsersWithoutAuthMethod.ps1 -DeviceCode',
+            '  2) Use Windows PowerShell or PowerShell 7 in a normal desktop session (not remoting).',
+            '  3) Update-Module Microsoft.Graph.Authentication -Scope CurrentUser',
+            '  4) An admin may need to consent UserAuthenticationMethod.Read.All and User.Read.All.',
+            '',
+            ($errors -join [Environment]::NewLine)
+        ) -join [Environment]::NewLine
+        throw $hint
+    }
+}
+
 function Get-GraphErrorMessage {
     param($ErrorRecord)
 
     if ($null -eq $ErrorRecord) { return '' }
 
     $parts = New-Object System.Collections.Generic.List[string]
-    if ($ErrorRecord.Exception -and $ErrorRecord.Exception.Message) {
-        [void]$parts.Add([string]$ErrorRecord.Exception.Message)
+    $ex = $null
+
+    if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) {
+        $ex = $ErrorRecord.Exception
+        if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+            [void]$parts.Add([string]$ErrorRecord.ErrorDetails.Message)
+        }
     }
-    if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
-        [void]$parts.Add([string]$ErrorRecord.ErrorDetails.Message)
+    elseif ($ErrorRecord -is [System.Exception]) {
+        $ex = $ErrorRecord
     }
-    return (($parts | Select-Object -Unique) -join ' | ')
+    else {
+        return [string]$ErrorRecord
+    }
+
+    while ($null -ne $ex) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$ex.Message)) {
+            [void]$parts.Add([string]$ex.Message)
+        }
+        $ex = $ex.InnerException
+    }
+
+    $seen = @{}
+    $unique = New-Object System.Collections.Generic.List[string]
+    foreach ($p in $parts) {
+        if (-not $seen.ContainsKey($p)) {
+            $seen[$p] = $true
+            [void]$unique.Add($p)
+        }
+    }
+    return ($unique -join ' | ')
 }
 
 function Test-TransientGraphError {
@@ -1137,6 +1305,16 @@ function Invoke-SelfTest {
     Assert-True (Test-TransientGraphError '429 Too Many Requests') '429 is transient'
     Assert-False (Test-TransientGraphError 'Authorization_RequestDenied') 'auth denied is not transient'
 
+    try {
+        $inner = New-Object System.Exception 'broker window handle missing'
+        throw (New-Object System.Exception 'InteractiveBrowserCredential authentication failed: ', $inner)
+    }
+    catch {
+        $msg = Get-GraphErrorMessage -ErrorRecord $_
+        Assert-True ($msg -match 'broker window handle missing') 'inner exception is surfaced'
+        Assert-True ($msg -match 'InteractiveBrowserCredential') 'outer exception is surfaced'
+    }
+
     if ($failures.Count -gt 0) {
         Write-Host 'Self-test FAILED:' -ForegroundColor Red
         foreach ($f in $failures) { Write-Host "  - $f" -ForegroundColor Red }
@@ -1225,12 +1403,23 @@ try {
     Connect-EntraGraph
 }
 catch {
-    Write-Host "Failed to connect to Microsoft Graph: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Failed to connect to Microsoft Graph:" -ForegroundColor Red
+    Write-Host (Get-GraphErrorMessage -ErrorRecord $_) -ForegroundColor Red
     exit 1
 }
 
-$context = Get-MgContext
-Write-Host "Connected as: $($context.Account)" -ForegroundColor Green
+$context = $null
+try { $context = Get-MgContext -ErrorAction SilentlyContinue } catch { }
+$connectedAs = ''
+try {
+    if ($context -and $context.Account) { $connectedAs = [string]$context.Account }
+} catch { }
+if (-not [string]::IsNullOrWhiteSpace($connectedAs)) {
+    Write-Host "Connected as: $connectedAs" -ForegroundColor Green
+}
+else {
+    Write-Host "Connected to Microsoft Graph." -ForegroundColor Green
+}
 
 # 6. Process each user -------------------------------------------------------
 Write-Section "Checking authentication methods"
