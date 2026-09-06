@@ -116,8 +116,15 @@ $script:ProgressBar = $null
 $script:ProgressLabel = $null
 $script:ProgressDetail = $null
 $script:GraphScopeList = @('UserAuthenticationMethod.Read.All', 'User.Read.All')
+$script:GraphScopeString = 'UserAuthenticationMethod.Read.All User.Read.All offline_access openid profile'
+$script:GraphPowerShellClientId = '14d82eec-204b-4c2f-b113-9d477e6ee18c'
+$script:AzurePowerShellClientId = '1950a258-227b-4e31-a9cf-717495945fc2'
 $script:PasswordMethodId = '28c10230-6103-485e-b985-444c60001490'
 $script:GraphBase = 'https://graph.microsoft.com/v1.0'
+$script:AccessToken = $null
+$script:RefreshToken = $null
+$script:TokenClientId = $null
+$script:TokenTenant = 'organizations'
 
 # ---------------------------------------------------------------------------
 # STA relaunch (WinForms dialogs + WAM parent window)
@@ -826,6 +833,145 @@ function Test-GraphContextHasRequiredScopes {
     return ($hasUserRead -and $hasAuthRead)
 }
 
+function ConvertTo-FormUrlEncoded {
+    param([hashtable]$Data)
+
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($key in $Data.Keys) {
+        $k = [uri]::EscapeDataString([string]$key)
+        $v = [uri]::EscapeDataString([string]$Data[$key])
+        [void]$parts.Add("$k=$v")
+    }
+    return ($parts -join '&')
+}
+
+function Get-ConnectMgGraphDeviceCodeParameter {
+    $cmd = Get-Command Connect-MgGraph -ErrorAction SilentlyContinue
+    if (-not $cmd) { return $null }
+    foreach ($name in @('UseDeviceAuthentication', 'UseDeviceCode', 'DeviceCode')) {
+        if ($cmd.Parameters.ContainsKey($name)) {
+            return $name
+        }
+    }
+    return $null
+}
+
+function ConvertTo-GraphAccessTokenArgument {
+    param([Parameter(Mandatory)][string]$AccessToken)
+
+    $cmd = Get-Command Connect-MgGraph -ErrorAction SilentlyContinue
+    if (-not $cmd -or -not $cmd.Parameters.ContainsKey('AccessToken')) {
+        return $null
+    }
+
+    $typeName = [string]$cmd.Parameters['AccessToken'].ParameterType.FullName
+    if ($typeName -match 'SecureString') {
+        return (ConvertTo-SecureString -String $AccessToken -AsPlainText -Force)
+    }
+    return $AccessToken
+}
+
+function Connect-WithAccessToken {
+    param([Parameter(Mandatory)][string]$AccessToken)
+
+    $script:AccessToken = $AccessToken
+    $tokenArg = ConvertTo-GraphAccessTokenArgument -AccessToken $AccessToken
+    if ($null -eq $tokenArg) {
+        return $true
+    }
+
+    $cmd = Get-Command Connect-MgGraph -ErrorAction Stop
+    $params = @{
+        AccessToken = $tokenArg
+        ErrorAction = 'Stop'
+    }
+    if ($cmd.Parameters.ContainsKey('NoWelcome')) {
+        $params['NoWelcome'] = $true
+    }
+    Connect-MgGraph @params | Out-Null
+    return $true
+}
+
+function Connect-ViaRestDeviceCode {
+    param(
+        [Parameter()]
+        [string]$AppClientId
+    )
+
+    if ([string]::IsNullOrWhiteSpace($AppClientId)) {
+        $AppClientId = $script:GraphPowerShellClientId
+    }
+
+    $tenant = 'organizations'
+    if (-not [string]::IsNullOrWhiteSpace($TenantId)) {
+        $tenant = $TenantId.Trim()
+    }
+    $authority = "https://login.microsoftonline.com/$tenant"
+
+    $dcBody = ConvertTo-FormUrlEncoded -Data @{
+        client_id = $AppClientId
+        scope     = $script:GraphScopeString
+    }
+
+    $dc = Invoke-RestMethod -Method Post -Uri "$authority/oauth2/v2.0/devicecode" `
+        -ContentType 'application/x-www-form-urlencoded' -Body $dcBody -ErrorAction Stop
+
+    $verifyUrl = [string]$dc.verification_uri
+    $userCode  = [string]$dc.user_code
+
+    Write-Host ""
+    Write-Host "To sign in, open: $verifyUrl" -ForegroundColor Cyan
+    Write-Host "Enter code: $userCode" -ForegroundColor Cyan
+    Write-Host "Waiting for sign-in..." -ForegroundColor Yellow
+
+    if ($script:WinFormsLoaded) {
+        try { [System.Windows.Forms.Clipboard]::SetText($userCode) } catch { }
+        try { Start-Process $verifyUrl | Out-Null } catch { }
+        Write-Host "(The code was copied to the clipboard and the browser was opened if possible.)" -ForegroundColor Gray
+    }
+
+    $deadline = [datetime]::UtcNow.AddSeconds([int]$dc.expires_in)
+    $interval = [Math]::Max(5, [int]$dc.interval)
+    $token = $null
+
+    while ([datetime]::UtcNow -lt $deadline) {
+        Start-Sleep -Seconds $interval
+        try {
+            $tokBody = ConvertTo-FormUrlEncoded -Data @{
+                grant_type  = 'urn:ietf:params:oauth:grant-type:device_code'
+                client_id   = $AppClientId
+                device_code = [string]$dc.device_code
+            }
+            $token = Invoke-RestMethod -Method Post -Uri "$authority/oauth2/v2.0/token" `
+                -ContentType 'application/x-www-form-urlencoded' -Body $tokBody -ErrorAction Stop
+            break
+        }
+        catch {
+            $errText = Get-RestErrorText -ErrorRecord $_
+            if ($errText -match 'authorization_pending|slow_down') { continue }
+            throw "Device code token exchange failed: $errText"
+        }
+    }
+
+    if (-not $token) {
+        throw 'Sign-in timed out or was cancelled.'
+    }
+
+    $accessToken = [string](Get-GraphResponseProperty -Response $token -Name 'access_token')
+    if ([string]::IsNullOrWhiteSpace($accessToken)) {
+        throw 'Device code sign-in succeeded but no access_token was returned.'
+    }
+
+    $script:TokenClientId = $AppClientId
+    $script:TokenTenant = $tenant
+    $refresh = [string](Get-GraphResponseProperty -Response $token -Name 'refresh_token')
+    if (-not [string]::IsNullOrWhiteSpace($refresh)) {
+        $script:RefreshToken = $refresh
+    }
+
+    return (Connect-WithAccessToken -AccessToken $accessToken)
+}
+
 function Invoke-ConnectMgGraph {
     param([switch]$UseDeviceCode)
 
@@ -838,10 +984,11 @@ function Invoke-ConnectMgGraph {
         $params['NoWelcome'] = $true
     }
     if ($UseDeviceCode) {
-        if (-not $cmd.Parameters.ContainsKey('UseDeviceAuthentication')) {
-            throw 'This Microsoft.Graph.Authentication build does not support -UseDeviceAuthentication. Update the module, then re-run.'
+        $deviceParam = Get-ConnectMgGraphDeviceCodeParameter
+        if ([string]::IsNullOrWhiteSpace($deviceParam)) {
+            throw 'SDK_NO_DEVICE_CODE'
         }
-        $params['UseDeviceAuthentication'] = $true
+        $params[$deviceParam] = $true
     }
     if ($cmd.Parameters.ContainsKey('DisableLoginByWAM') -and -not $UseDeviceCode) {
         $params['DisableLoginByWAM'] = $true
@@ -919,14 +1066,46 @@ function Connect-EntraGraph {
     }
 
     if (-not $connected) {
-        try {
-            Invoke-ConnectMgGraph -UseDeviceCode
-            $connected = $true
+        $deviceParam = Get-ConnectMgGraphDeviceCodeParameter
+        if ($deviceParam) {
+            try {
+                Invoke-ConnectMgGraph -UseDeviceCode
+                $connected = $true
+            }
+            catch {
+                $msg = Get-GraphErrorMessage -ErrorRecord $_
+                [void]$errors.Add("SDK device code: $msg")
+                try { Disconnect-MgGraph | Out-Null } catch { }
+            }
         }
-        catch {
-            $msg = Get-GraphErrorMessage -ErrorRecord $_
-            [void]$errors.Add("Device code: $msg")
-            try { Disconnect-MgGraph | Out-Null } catch { }
+        else {
+            Write-Host "This Graph SDK build has no device-code switch; using browser device-code login instead." -ForegroundColor Yellow
+        }
+    }
+
+    if (-not $connected) {
+        $clientIds = New-Object System.Collections.Generic.List[string]
+        if (-not [string]::IsNullOrWhiteSpace($ClientId)) {
+            [void]$clientIds.Add($ClientId)
+        }
+        [void]$clientIds.Add($script:GraphPowerShellClientId)
+        [void]$clientIds.Add($script:AzurePowerShellClientId)
+
+        $seen = @{}
+        foreach ($appId in $clientIds) {
+            if ($seen.ContainsKey($appId)) { continue }
+            $seen[$appId] = $true
+            try {
+                Write-Host "Starting device-code sign-in (app $appId)..." -ForegroundColor Cyan
+                if (Connect-ViaRestDeviceCode -AppClientId $appId) {
+                    $connected = $true
+                    break
+                }
+            }
+            catch {
+                $msg = Get-GraphErrorMessage -ErrorRecord $_
+                [void]$errors.Add("Device code ($appId): $msg")
+            }
         }
     }
 
@@ -985,11 +1164,109 @@ function Get-GraphErrorMessage {
     return ($unique -join ' | ')
 }
 
+function Get-RestErrorText {
+    param($ErrorRecord)
+
+    $chunks = New-Object System.Collections.Generic.List[string]
+    $fromGraph = Get-GraphErrorMessage -ErrorRecord $ErrorRecord
+    if (-not [string]::IsNullOrWhiteSpace($fromGraph)) {
+        [void]$chunks.Add($fromGraph)
+    }
+
+    try {
+        $ex = $null
+        if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) {
+            $ex = $ErrorRecord.Exception
+        }
+        elseif ($ErrorRecord -is [System.Exception]) {
+            $ex = $ErrorRecord
+        }
+
+        $response = $null
+        while ($null -ne $ex -and $null -eq $response) {
+            try {
+                if ($ex.Response) { $response = $ex.Response }
+            }
+            catch { }
+            $ex = $ex.InnerException
+        }
+
+        if ($response) {
+            $stream = $response.GetResponseStream()
+            if ($stream) {
+                $reader = New-Object System.IO.StreamReader($stream)
+                try {
+                    $body = $reader.ReadToEnd()
+                    if (-not [string]::IsNullOrWhiteSpace($body)) {
+                        [void]$chunks.Add([string]$body)
+                    }
+                }
+                finally {
+                    $reader.Close()
+                }
+            }
+        }
+    }
+    catch { }
+
+    return ($chunks -join ' | ')
+}
+
 function Test-TransientGraphError {
     param([string]$Message)
 
     if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
     return ($Message -match '429|Too Many Requests|503|Server Busy|temporarily unavailable|timeout|timed out')
+}
+
+function Update-GraphAccessToken {
+    if ([string]::IsNullOrWhiteSpace($script:RefreshToken) -or [string]::IsNullOrWhiteSpace($script:TokenClientId)) {
+        return $false
+    }
+
+    $tenant = $script:TokenTenant
+    if ([string]::IsNullOrWhiteSpace($tenant)) { $tenant = 'organizations' }
+    $authority = "https://login.microsoftonline.com/$tenant"
+
+    try {
+        $tokBody = ConvertTo-FormUrlEncoded -Data @{
+            client_id     = $script:TokenClientId
+            grant_type    = 'refresh_token'
+            refresh_token = $script:RefreshToken
+            scope         = $script:GraphScopeString
+        }
+        $token = Invoke-RestMethod -Method Post -Uri "$authority/oauth2/v2.0/token" `
+            -ContentType 'application/x-www-form-urlencoded' -Body $tokBody -ErrorAction Stop
+        $accessToken = [string](Get-GraphResponseProperty -Response $token -Name 'access_token')
+        if ([string]::IsNullOrWhiteSpace($accessToken)) { return $false }
+
+        $refresh = [string](Get-GraphResponseProperty -Response $token -Name 'refresh_token')
+        if (-not [string]::IsNullOrWhiteSpace($refresh)) {
+            $script:RefreshToken = $refresh
+        }
+        [void](Connect-WithAccessToken -AccessToken $accessToken)
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Invoke-GraphRestGet {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri
+    )
+
+    if ([string]::IsNullOrWhiteSpace($script:AccessToken)) {
+        throw 'No Graph access token is available.'
+    }
+
+    $headers = @{
+        Authorization    = "Bearer $($script:AccessToken)"
+        ConsistencyLevel = 'eventual'
+    }
+    return Invoke-RestMethod -Method GET -Uri $Uri -Headers $headers -ErrorAction Stop
 }
 
 function Invoke-GraphGetWithRetry {
@@ -1002,10 +1279,18 @@ function Invoke-GraphGetWithRetry {
 
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         try {
+            if (-not [string]::IsNullOrWhiteSpace($script:AccessToken)) {
+                return (Invoke-GraphRestGet -Uri $Uri)
+            }
             return Invoke-MgGraphRequest -Method GET -Uri $Uri -ErrorAction Stop
         }
         catch {
             $msg = Get-GraphErrorMessage -ErrorRecord $_
+            $unauthorized = ($msg -match '401|Unauthorized|InvalidAuthenticationToken|expired')
+            if ($unauthorized -and (Update-GraphAccessToken)) {
+                continue
+            }
+
             $transient = Test-TransientGraphError -Message $msg
             if (-not $transient -or $attempt -eq $MaxAttempts) {
                 throw
@@ -1305,6 +1590,14 @@ function Invoke-SelfTest {
     Assert-True (Test-TransientGraphError '429 Too Many Requests') '429 is transient'
     Assert-False (Test-TransientGraphError 'Authorization_RequestDenied') 'auth denied is not transient'
 
+    $form = ConvertTo-FormUrlEncoded -Data @{ client_id = 'abc'; scope = 'User.Read' }
+    Assert-True ($form -match 'client_id=abc') 'form encode client_id'
+    Assert-True ($form -match 'scope=User\.Read') 'form encode scope'
+
+    try { $null = Get-ConnectMgGraphDeviceCodeParameter } catch {
+        [void]$failures.Add('Get-ConnectMgGraphDeviceCodeParameter threw')
+    }
+
     try {
         $inner = New-Object System.Exception 'broker window handle missing'
         throw (New-Object System.Exception 'InteractiveBrowserCredential authentication failed: ', $inner)
@@ -1313,6 +1606,8 @@ function Invoke-SelfTest {
         $msg = Get-GraphErrorMessage -ErrorRecord $_
         Assert-True ($msg -match 'broker window handle missing') 'inner exception is surfaced'
         Assert-True ($msg -match 'InteractiveBrowserCredential') 'outer exception is surfaced'
+        $restText = Get-RestErrorText -ErrorRecord $_
+        Assert-True ($restText -match 'InteractiveBrowserCredential') 'rest error text includes outer message'
     }
 
     if ($failures.Count -gt 0) {
