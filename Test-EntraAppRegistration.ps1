@@ -5,9 +5,9 @@
     connection and reports the application roles present in the access token.
 
 .DESCRIPTION
-    Signs the operator into Microsoft Entra ID (browser or device code) to discover
-    the tenant ID automatically, then requests an app-only token using the registered
-    application's client ID, client secret, and Application ID URI.
+    Signs the operator into Microsoft Entra ID with a device-code browser prompt
+    to discover the tenant ID automatically, then requests an app-only token using
+    the registered application's client ID, client secret, and Application ID URI.
 
     A formatted console report (and an optional Windows results window) shows:
       - Whether the OAuth client-credentials request succeeded
@@ -42,7 +42,12 @@
     called out in the report.
 
 .PARAMETER DeviceCode
-    Force device-code sign-in instead of trying interactive browser login first.
+    Use device-code sign-in. This is already the default because Connect-AzAccount
+    hangs in Command Prompt / Windows Server (a "Not Responding" sign-in window).
+
+.PARAMETER BrowserSignIn
+    Try Azure PowerShell / Microsoft Graph interactive login first. Do not use this
+    from cmd.exe; it commonly freezes on Windows Server 2016/2019.
 
 .PARAMETER ConsoleOnly
     Skip Windows Forms dialogs. Prompts and the report stay in the console.
@@ -68,15 +73,16 @@
     .\Test-EntraAppRegistration.ps1 -TenantId 'contoso.onmicrosoft.com' -ExpectedRoles 'Orders.Read','Orders.Write'
 
 .EXAMPLE
-    .\Test-EntraAppRegistration.ps1 -DeviceCode -ConsoleOnly
+    .\Test-EntraAppRegistration.ps1 -ConsoleOnly
 
 .EXAMPLE
     .\Test-EntraAppRegistration.ps1 -SelfTest
 
 .NOTES
-    No Microsoft Graph or Azure PowerShell modules are required. If Az.Accounts or
-    Microsoft.Graph.Authentication is installed, interactive browser sign-in is
-    attempted first; device code is always available as a fallback.
+    No Microsoft Graph or Azure PowerShell modules are required. Tenant discovery
+    uses the OAuth device-code flow (open a browser, enter a code). Pass
+    -BrowserSignIn only if you want Connect-AzAccount / Connect-MgGraph first;
+    that path hangs in Command Prompt on Windows Server.
 
     The user sign-in is used only to discover the tenant. The OAuth test itself
     uses the client-credentials grant against the app registration you supply.
@@ -109,6 +115,8 @@ param(
     [string[]]$ExpectedRoles,
 
     [switch]$DeviceCode,
+
+    [switch]$BrowserSignIn,
 
     [switch]$ConsoleOnly,
 
@@ -197,6 +205,7 @@ if ($script:UseGui -and [System.Threading.Thread]::CurrentThread.ApartmentState 
         }
     }
     if ($DeviceCode) { [void]$argParts.Add('-DeviceCode') }
+    if ($BrowserSignIn) { [void]$argParts.Add('-BrowserSignIn') }
     if ($ShowToken)  { [void]$argParts.Add('-ShowToken') }
 
     if (-not [string]::IsNullOrWhiteSpace($ClientSecret)) {
@@ -573,31 +582,6 @@ function Show-UiMessage {
     }
 }
 
-function New-AuthParentForm {
-    if (-not $script:WinFormsLoaded) { return $null }
-
-    $form = New-Object System.Windows.Forms.Form
-    $form.Text = 'Entra ID sign-in'
-    $form.Width = 460
-    $form.Height = 140
-    $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-    $form.TopMost = $true
-    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
-    $form.MaximizeBox = $false
-    $form.MinimizeBox = $false
-
-    $label = New-Object System.Windows.Forms.Label
-    $label.Dock = [System.Windows.Forms.DockStyle]::Fill
-    $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
-    $label.Text = "Complete sign-in in the browser / account picker.`r`nLeave this window open until sign-in finishes."
-    $form.Controls.Add($label)
-
-    [void]$form.Show()
-    $form.Activate()
-    [void][System.Windows.Forms.Application]::DoEvents()
-    return $form
-}
-
 function Get-TenantFromJwt {
     param([string]$Token)
 
@@ -632,38 +616,27 @@ function Connect-ViaAzAccountTenant {
     if (-not (Get-Command Connect-AzAccount -ErrorAction SilentlyContinue)) { return $null }
 
     Write-Host '  Opening interactive Azure PowerShell sign-in (browser)...' -ForegroundColor Cyan
-    $parent = $null
-    try {
-        if ($script:WinFormsLoaded) { $parent = New-AuthParentForm }
+    $azParams = @{ ErrorAction = 'Stop' }
+    if (-not [string]::IsNullOrWhiteSpace($TenantId)) { $azParams['Tenant'] = $TenantId }
+    Connect-AzAccount @azParams | Out-Null
 
-        $azParams = @{ ErrorAction = 'Stop' }
-        if (-not [string]::IsNullOrWhiteSpace($TenantId)) { $azParams['Tenant'] = $TenantId }
-        Connect-AzAccount @azParams | Out-Null
-
-        $ctx = Get-AzContext -ErrorAction Stop
-        $tenantObj = Get-ClaimValue -Payload $ctx -Name 'Tenant'
-        $tid = [string](Get-ClaimValue -Payload $tenantObj -Name 'Id')
-        if ([string]::IsNullOrWhiteSpace($tid)) {
-            $tid = [string](Get-ClaimValue -Payload $tenantObj -Name 'TenantId')
-        }
-        if ([string]::IsNullOrWhiteSpace($tid)) { return $null }
-
-        $accountObj = Get-ClaimValue -Payload $ctx -Name 'Account'
-        $account = [string](Get-ClaimValue -Payload $accountObj -Name 'Id')
-
-        return [pscustomobject]@{
-            TenantId = $tid
-            Account  = $account
-            Name     = $account
-            Issuer   = "https://login.microsoftonline.com/$tid/v2.0"
-            Mode     = 'AzInteractive'
-        }
+    $ctx = Get-AzContext -ErrorAction Stop
+    $tenantObj = Get-ClaimValue -Payload $ctx -Name 'Tenant'
+    $tid = [string](Get-ClaimValue -Payload $tenantObj -Name 'Id')
+    if ([string]::IsNullOrWhiteSpace($tid)) {
+        $tid = [string](Get-ClaimValue -Payload $tenantObj -Name 'TenantId')
     }
-    finally {
-        if ($null -ne $parent) {
-            try { $parent.Close() } catch { }
-            try { $parent.Dispose() } catch { }
-        }
+    if ([string]::IsNullOrWhiteSpace($tid)) { return $null }
+
+    $accountObj = Get-ClaimValue -Payload $ctx -Name 'Account'
+    $account = [string](Get-ClaimValue -Payload $accountObj -Name 'Id')
+
+    return [pscustomobject]@{
+        TenantId = $tid
+        Account  = $account
+        Name     = $account
+        Issuer   = "https://login.microsoftonline.com/$tid/v2.0"
+        Mode     = 'AzInteractive'
     }
 }
 
@@ -674,43 +647,33 @@ function Connect-ViaMgGraphTenant {
     if (-not (Get-Command Connect-MgGraph -ErrorAction SilentlyContinue)) { return $null }
 
     Write-Host '  Opening interactive Microsoft Graph sign-in...' -ForegroundColor Cyan
-    $parent = $null
-    try {
-        if ($script:WinFormsLoaded) { $parent = New-AuthParentForm }
 
-        $cmd = Get-Command Connect-MgGraph -ErrorAction Stop
-        $params = @{
-            Scopes      = @('openid', 'profile')
-            ErrorAction = 'Stop'
-        }
-        # -NoWelcome / -UseDeviceAuthentication are not in every Graph 5.1 module build.
-        if ($cmd.Parameters.ContainsKey('NoWelcome')) {
-            $params['NoWelcome'] = $true
-        }
-        if (-not [string]::IsNullOrWhiteSpace($TenantId)) { $params['TenantId'] = $TenantId }
-        if ($DeviceCode) {
-            if (-not $cmd.Parameters.ContainsKey('UseDeviceAuthentication')) { return $null }
-            $params['UseDeviceAuthentication'] = $true
-        }
-
-        Connect-MgGraph @params | Out-Null
-        $ctx = Get-MgContext -ErrorAction Stop
-        $tid = [string](Get-ClaimValue -Payload $ctx -Name 'TenantId')
-        if ([string]::IsNullOrWhiteSpace($tid)) { return $null }
-
-        return [pscustomobject]@{
-            TenantId = $tid
-            Account  = [string](Get-ClaimValue -Payload $ctx -Name 'Account')
-            Name     = [string](Get-ClaimValue -Payload $ctx -Name 'Account')
-            Issuer   = "https://login.microsoftonline.com/$tid/v2.0"
-            Mode     = 'MgGraph'
-        }
+    $cmd = Get-Command Connect-MgGraph -ErrorAction Stop
+    $params = @{
+        Scopes      = @('openid', 'profile')
+        ErrorAction = 'Stop'
     }
-    finally {
-        if ($null -ne $parent) {
-            try { $parent.Close() } catch { }
-            try { $parent.Dispose() } catch { }
-        }
+    # -NoWelcome / -UseDeviceAuthentication are not in every Graph 5.1 module build.
+    if ($cmd.Parameters.ContainsKey('NoWelcome')) {
+        $params['NoWelcome'] = $true
+    }
+    if (-not [string]::IsNullOrWhiteSpace($TenantId)) { $params['TenantId'] = $TenantId }
+    if ($DeviceCode) {
+        if (-not $cmd.Parameters.ContainsKey('UseDeviceAuthentication')) { return $null }
+        $params['UseDeviceAuthentication'] = $true
+    }
+
+    Connect-MgGraph @params | Out-Null
+    $ctx = Get-MgContext -ErrorAction Stop
+    $tid = [string](Get-ClaimValue -Payload $ctx -Name 'TenantId')
+    if ([string]::IsNullOrWhiteSpace($tid)) { return $null }
+
+    return [pscustomobject]@{
+        TenantId = $tid
+        Account  = [string](Get-ClaimValue -Payload $ctx -Name 'Account')
+        Name     = [string](Get-ClaimValue -Payload $ctx -Name 'Account')
+        Issuer   = "https://login.microsoftonline.com/$tid/v2.0"
+        Mode     = 'MgGraph'
     }
 }
 
@@ -732,6 +695,7 @@ function Connect-ViaDeviceCodeTenant {
         -ContentType 'application/x-www-form-urlencoded' -Body $dcBody -ErrorAction Stop
 
     $verificationUri = [string](Get-ClaimValue -Payload $dc -Name 'verification_uri')
+    $verificationUriComplete = [string](Get-ClaimValue -Payload $dc -Name 'verification_uri_complete')
     $userCode = [string](Get-ClaimValue -Payload $dc -Name 'user_code')
     $deviceCodeValue = [string](Get-ClaimValue -Payload $dc -Name 'device_code')
     $expiresIn = Get-ClaimValue -Payload $dc -Name 'expires_in'
@@ -740,27 +704,21 @@ function Connect-ViaDeviceCodeTenant {
     if ($null -eq $pollInterval -or [string]::IsNullOrWhiteSpace([string]$pollInterval)) { $pollInterval = 5 }
 
     Write-Host ''
-    Write-Host "  To sign in, open  $verificationUri" -ForegroundColor Cyan
-    Write-Host "  Enter code:       $userCode" -ForegroundColor Yellow
+    Write-Host '  Sign in with your work or school account:' -ForegroundColor White
+    Write-Host "    1. Open  $verificationUri" -ForegroundColor Cyan
+    Write-Host "    2. Enter code:  $userCode" -ForegroundColor Yellow
+    Write-Host '    3. Come back here; this window waits until you finish.' -ForegroundColor Gray
     Write-Host '  Waiting for sign-in...' -ForegroundColor DarkGray
     Write-Host ''
 
     try { Set-Clipboard -Value $userCode -ErrorAction SilentlyContinue } catch { }
-    if ($script:WinFormsLoaded) {
-        try { [System.Windows.Forms.Clipboard]::SetText($userCode) } catch { }
-        $deviceMessage = @(
-            'Complete sign-in in your browser:',
-            '',
-            "1. Open $verificationUri",
-            "2. Enter code $userCode  (copied to clipboard)",
-            '',
-            'Click OK, then finish sign-in in the browser while this window waits.'
-        ) -join [Environment]::NewLine
-        Show-UiMessage -Title 'Sign in to Entra ID' -Icon Information -Message $deviceMessage
-    }
 
-    if (-not [string]::IsNullOrWhiteSpace($verificationUri)) {
-        try { Start-Process $verificationUri | Out-Null } catch { }
+    $openUri = $verificationUri
+    if (-not [string]::IsNullOrWhiteSpace($verificationUriComplete)) {
+        $openUri = $verificationUriComplete
+    }
+    if (-not [string]::IsNullOrWhiteSpace($openUri)) {
+        try { Start-Process $openUri | Out-Null } catch { }
     }
 
     $deadline = [datetime]::UtcNow.AddSeconds([int]$expiresIn)
@@ -822,14 +780,20 @@ function Connect-EntraTenant {
     $errors = New-Object System.Collections.Generic.List[string]
     $result = $null
 
-    if (-not $DeviceCode) {
+    # Device code is the default. Connect-AzAccount plus a WinForms parent window
+    # freezes in cmd.exe on Windows Server ("Entra ID sign-in (Not Responding)").
+    $useBrowser = $BrowserSignIn -and -not $DeviceCode
+    if ($useBrowser) {
         try { $result = Connect-ViaAzAccountTenant } catch { [void]$errors.Add("Azure PowerShell: $($_.Exception.Message)") }
         if ($null -eq $result) {
             try { $result = Connect-ViaMgGraphTenant } catch { [void]$errors.Add("Microsoft Graph: $($_.Exception.Message)") }
         }
-        if ($null -eq $result -and $errors.Count -gt 0) {
+        if ($null -eq $result) {
             Write-Host '  Interactive browser sign-in was not available; using device code.' -ForegroundColor Yellow
         }
+    }
+    else {
+        Write-Host '  A browser will open. Enter the code shown below to continue.' -ForegroundColor Gray
     }
 
     if ($null -eq $result) {
@@ -1556,7 +1520,6 @@ if ($SelfTest) {
     Invoke-SelfTest
 }
 
-[void](Initialize-WinForms)
 Write-Banner
 
 Write-Host '  This tool signs you in to discover the tenant, then tests the app' -ForegroundColor Gray
