@@ -1337,7 +1337,7 @@ function Connect-ViaRestDeviceCode {
     }
 
     $dc = Invoke-RestMethod -Method Post -Uri "$authority/oauth2/v2.0/devicecode" `
-        -ContentType 'application/x-www-form-urlencoded' -Body $dcBody -ErrorAction Stop
+        -ContentType 'application/x-www-form-urlencoded' -Body $dcBody -TimeoutSec 45 -ErrorAction Stop
 
     $verifyUrl = [string](Get-GraphResponseProperty -Response $dc -Name 'verification_uri')
     $userCode  = [string](Get-GraphResponseProperty -Response $dc -Name 'user_code')
@@ -1348,30 +1348,46 @@ function Connect-ViaRestDeviceCode {
     }
 
     Write-Host ""
-    Write-Host "To sign in, a web browser will open." -ForegroundColor Cyan
-    Write-Host "If asked for a code, enter: $userCode" -ForegroundColor Cyan
-    Write-Host "Waiting for sign-in..." -ForegroundColor Yellow
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "  Sign in at:  $openUrl" -ForegroundColor Cyan
+    Write-Host "  Enter code:  $userCode" -ForegroundColor Yellow
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "Leave this window open until sign-in finishes." -ForegroundColor Gray
+    try { [Console]::Out.Flush() } catch { }
 
     if ($script:WinFormsLoaded) {
         try { [System.Windows.Forms.Clipboard]::SetText($userCode) } catch { }
-        try {
-            [void][System.Windows.Forms.MessageBox]::Show(
-                ("A web browser will open for Microsoft sign-in.`r`n`r`nIf asked for a code, enter:`r`n`r`n{0}`r`n`r`nThe code is copied to the clipboard.`r`nClick OK, then finish sign-in in the browser. Leave this window running." -f $userCode),
-                'Entra ID sign-in',
-                [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Information
-            )
-        }
-        catch { }
     }
 
     $opened = Start-SystemBrowser -Url $openUrl
     if (-not $opened) {
-        Write-Host "Open this URL manually: $openUrl" -ForegroundColor Yellow
-        Write-Host "Enter code: $userCode" -ForegroundColor Yellow
+        Write-Host "The browser did not open automatically. Copy this URL:" -ForegroundColor Yellow
+        Write-Host $openUrl -ForegroundColor White
     }
-    else {
-        Write-Host "(If the browser did not show a code prompt, enter $userCode at $verifyUrl)" -ForegroundColor Gray
+
+    if ($script:WinFormsLoaded) {
+        try {
+            $owner = New-Object System.Windows.Forms.Form
+            $owner.TopMost = $true
+            $owner.ShowInTaskbar = $false
+            $owner.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedToolWindow
+            $owner.Opacity = 0
+            $owner.Show()
+            try {
+                [void][System.Windows.Forms.MessageBox]::Show(
+                    $owner,
+                    ("Open the browser and enter this code:`r`n`r`n{0}`r`n`r`nURL: {1}`r`n`r`nClick OK, then finish sign-in in the browser." -f $userCode, $openUrl),
+                    'Entra ID sign-in',
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Information
+                )
+            }
+            finally {
+                $owner.Close()
+                $owner.Dispose()
+            }
+        }
+        catch { }
     }
 
     $deadline = [datetime]::UtcNow.AddSeconds([int](Get-GraphResponseProperty -Response $dc -Name 'expires_in'))
@@ -1391,12 +1407,15 @@ function Connect-ViaRestDeviceCode {
                 device_code = $deviceCode
             }
             $token = Invoke-RestMethod -Method Post -Uri "$authority/oauth2/v2.0/token" `
-                -ContentType 'application/x-www-form-urlencoded' -Body $tokBody -ErrorAction Stop
+                -ContentType 'application/x-www-form-urlencoded' -Body $tokBody -TimeoutSec 45 -ErrorAction Stop
             break
         }
         catch {
             $errText = Get-RestErrorText -ErrorRecord $_
-            if ($errText -match 'authorization_pending|slow_down') { continue }
+            if ($errText -match 'authorization_pending|slow_down') {
+                Write-Host "Still waiting for you to complete sign-in in the browser..." -ForegroundColor Gray
+                continue
+            }
             throw "Device code token exchange failed: $errText"
         }
     }
@@ -1467,20 +1486,14 @@ function Connect-WithDeviceCodeFlow {
         $appId = $ClientId
     }
 
-    # ISE / elevated hosts cannot use WAM. Prefer SDK device-code, then REST + browser.
+    # Do not call Connect-MgGraph -UseDeviceAuthentication here.
+    # On Windows (especially elevated / ISE) that cmdlet hangs after printing
+    # "a URL and code will appear below" and never shows the code.
     $env:AZURE_IDENTITY_DISABLE_CP1 = 'true'
     $env:MSAL_DESKTOP_APP_USE_WAM = '0'
 
-    try {
-        Invoke-ConnectMgGraph -UseDeviceCode
-        return
-    }
-    catch {
-        $msg = Get-GraphErrorMessage -ErrorRecord $_
-        Write-Host "SDK device-code sign-in was not available or failed: $msg" -ForegroundColor Yellow
-        Write-Host "Opening a browser for device-code sign-in instead..." -ForegroundColor Yellow
-    }
-
+    Write-Host "Requesting a sign-in code from Microsoft..." -ForegroundColor Cyan
+    try { [Console]::Out.Flush() } catch { }
     [void](Connect-ViaRestDeviceCode -AppClientId $appId)
 }
 
