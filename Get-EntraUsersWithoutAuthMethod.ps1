@@ -39,9 +39,11 @@
     Optional Entra tenant (contoso.onmicrosoft.com or a Tenant ID GUID).
 
 .PARAMETER ClientId
-    Optional public-client app ID. Leave blank to use the Microsoft Graph
-    PowerShell app. A custom app is required only if you want to disable WAM
-    and keep interactive browser login.
+    Optional public-client app ID from YOUR tenant. Required when Microsoft
+    Graph PowerShell is not installed in the directory (AADSTS700016) because
+    Azure CLI / Azure PowerShell cannot request authentication-method scopes
+    (AADSTS65002). Register a public client with redirect URI http://localhost
+    and delegated User.Read.All + UserAuthenticationMethod.Read.All.
 
 .PARAMETER SelfTest
     Runs built-in unit tests for classification helpers and exits
@@ -68,13 +70,14 @@
     (delegated). An admin may need to consent the first time you run it.
 
     Sign-in opens your default web browser (authorization code + PKCE to
-    http://localhost). Windows Web Account Manager is not used, because it
-    often fails with "Missing wamcompat_id_token" after a successful login.
+    http://localhost). Windows Web Account Manager is not used.
 
-    The Microsoft Graph PowerShell app (14d82eec-...) is tried last because many
-    tenants have not added it, which causes AADSTS700016. Sign-in uses the
-    Azure CLI / Azure PowerShell public clients first. If the browser shows
-    AADSTS700016, click "Try another method" in the small helper window.
+    Azure CLI and Azure PowerShell public clients cannot request
+    UserAuthenticationMethod.Read.All (AADSTS65002). This script uses the
+    Microsoft Graph PowerShell app, or a custom -ClientId from your tenant.
+
+    If the browser shows AADSTS700016, an admin must consent Graph PowerShell
+    or you must pass -ClientId for an app registration in this tenant.
 
     CSV requirement: a header row containing a column with the user's UPN /
     email / object id. The script auto-detects common column names
@@ -794,7 +797,7 @@ function New-AuthParentForm {
     $label.Top = 16
     $label.Width = 470
     $label.Height = 80
-    $label.Text = "A web browser was opened for Microsoft sign-in.`r`nFinish signing in there, then return to this window.`r`n`r`nIf the browser shows an error (for example AADSTS700016), click Try another method."
+    $label.Text = "A web browser was opened for Microsoft sign-in.`r`nFinish signing in there, then return to this window.`r`n`r`nIf the browser shows an error, click Try another method."
     $form.Controls.Add($label)
 
     $skip = New-Object System.Windows.Forms.Button
@@ -818,12 +821,11 @@ function New-AuthParentForm {
 function Get-PublicClientIdList {
     $ids = New-Object System.Collections.Generic.List[string]
     if (-not [string]::IsNullOrWhiteSpace($ClientId)) {
-        [void]$ids.Add($ClientId)
+        [void]$ids.Add($ClientId.Trim())
     }
-    # Prefer apps that already exist in most enterprise tenants.
-    # Microsoft Graph PowerShell (14d82eec-...) is often missing and causes AADSTS700016.
-    [void]$ids.Add($script:AzureCliClientId)
-    [void]$ids.Add($script:AzurePowerShellClientId)
+    # Azure CLI / Azure PowerShell first-party apps cannot request
+    # UserAuthenticationMethod.Read.All (AADSTS65002). Only Graph PowerShell
+    # or a custom public client in this tenant can.
     [void]$ids.Add($script:GraphPowerShellClientId)
 
     $seen = @{}
@@ -835,6 +837,55 @@ function Get-PublicClientIdList {
         [void]$unique.Add($id)
     }
     return ,$unique
+}
+
+function Get-GraphAdminConsentUrl {
+    $tenant = 'organizations'
+    if (-not [string]::IsNullOrWhiteSpace($TenantId)) {
+        $tenant = $TenantId.Trim()
+    }
+    return "https://login.microsoftonline.com/$tenant/adminconsent?client_id=$($script:GraphPowerShellClientId)"
+}
+
+function Show-GraphConsentGuidance {
+    $url = Get-GraphAdminConsentUrl
+    Write-Host ""
+    Write-Host "Azure CLI and Azure PowerShell cannot read authentication methods in this tenant (AADSTS65002)." -ForegroundColor Yellow
+    Write-Host "Microsoft Graph PowerShell may also be missing from the tenant (AADSTS700016)." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "An Entra admin must do ONE of these:" -ForegroundColor Cyan
+    Write-Host "  A) Consent the Microsoft Graph PowerShell app:" -ForegroundColor Cyan
+    Write-Host "     $url" -ForegroundColor White
+    Write-Host "  B) Create an app registration in Entra:" -ForegroundColor Cyan
+    Write-Host "     - Platform: Mobile and desktop / Public client" -ForegroundColor Gray
+    Write-Host "     - Redirect URI: http://localhost" -ForegroundColor Gray
+    Write-Host "     - Allow public client flows: Yes" -ForegroundColor Gray
+    Write-Host "     - Delegated permissions: User.Read.All, UserAuthenticationMethod.Read.All" -ForegroundColor Gray
+    Write-Host "     - Grant admin consent, then re-run:" -ForegroundColor Gray
+    Write-Host "       .\Get-EntraUsersWithoutAuthMethod.ps1 -ClientId <app-id> -TenantId <tenant-id>" -ForegroundColor White
+}
+
+function Read-CustomPublicClientId {
+    $prompt = 'Paste a custom App (client) ID from your tenant, or leave blank to skip'
+    if ($script:WinFormsLoaded) {
+        try {
+            Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction SilentlyContinue | Out-Null
+            $value = [Microsoft.VisualBasic.Interaction]::InputBox(
+                "Your tenant blocked Azure CLI/Azure PowerShell from reading auth methods.`r`n`r`nPaste an App (client) ID from an Entra app registration in THIS tenant.`r`nRedirect URI must be http://localhost, with User.Read.All and UserAuthenticationMethod.Read.All.`r`n`r`nLeave blank to skip.",
+                'Entra app Client ID',
+                ''
+            )
+            if (-not [string]::IsNullOrWhiteSpace($value)) {
+                return $value.Trim()
+            }
+            return ''
+        }
+        catch { }
+    }
+
+    $entered = Read-Host $prompt
+    if ([string]::IsNullOrWhiteSpace($entered)) { return '' }
+    return $entered.Trim()
 }
 
 function Disable-GraphWamIfPossible {
@@ -1130,7 +1181,7 @@ function Connect-ViaSystemBrowser {
     )
 
     if ([string]::IsNullOrWhiteSpace($AppClientId)) {
-        $AppClientId = $script:AzureCliClientId
+        $AppClientId = $script:GraphPowerShellClientId
     }
 
     $tenant = 'organizations'
@@ -1169,46 +1220,73 @@ function Connect-ViaSystemBrowser {
             Write-Host $authUrl -ForegroundColor White
         }
 
-        $async = $listener.BeginGetContext($null, $null)
+        $async = $null
         $deadline = [datetime]::UtcNow.AddMinutes(5)
-        $signaled = $false
-        while ([datetime]::UtcNow -lt $deadline) {
+        $code = $null
+        $errorCode = $null
+        $errorDesc = $null
+
+        while ([datetime]::UtcNow -lt $deadline -and [string]::IsNullOrWhiteSpace($code)) {
             if ($script:AuthSkipRequested) {
                 throw 'USER_SKIPPED_BROWSER'
             }
-            if ($async.AsyncWaitHandle.WaitOne(200)) {
-                $signaled = $true
-                break
+
+            $async = $listener.BeginGetContext($null, $null)
+            $got = $false
+            while ([datetime]::UtcNow -lt $deadline) {
+                if ($script:AuthSkipRequested) {
+                    throw 'USER_SKIPPED_BROWSER'
+                }
+                if ($async.AsyncWaitHandle.WaitOne(200)) {
+                    $got = $true
+                    break
+                }
+                try { [void][System.Windows.Forms.Application]::DoEvents() } catch { }
             }
-            try { [void][System.Windows.Forms.Application]::DoEvents() } catch { }
-        }
-        if (-not $signaled) {
-            throw 'Timed out waiting for browser sign-in (5 minutes).'
-        }
+            if (-not $got) {
+                throw 'Timed out waiting for browser sign-in (5 minutes).'
+            }
 
-        $context = $listener.EndGetContext($async)
-        $requestUri = $context.Request.Url
-        $code = Get-QueryValue -Uri $requestUri -Name 'code'
-        $returnedState = Get-QueryValue -Uri $requestUri -Name 'state'
-        $errorCode = Get-QueryValue -Uri $requestUri -Name 'error'
-        $errorDesc = Get-QueryValue -Uri $requestUri -Name 'error_description'
+            $context = $listener.EndGetContext($async)
+            $requestUri = $context.Request.Url
+            $path = [string]$requestUri.AbsolutePath
+            if ($path -match 'favicon') {
+                try {
+                    $context.Response.StatusCode = 404
+                    $context.Response.Close()
+                }
+                catch { }
+                continue
+            }
 
-        if ($errorCode) {
-            Write-AuthBrowserResponse -Context $context -Title 'Sign-in did not complete' -Body ([System.Net.WebUtility]::HtmlEncode("$errorCode $errorDesc"))
-            throw "Browser sign-in failed: $errorCode $errorDesc"
-        }
+            $returnedState = Get-QueryValue -Uri $requestUri -Name 'state'
+            $thisCode = Get-QueryValue -Uri $requestUri -Name 'code'
+            $thisError = Get-QueryValue -Uri $requestUri -Name 'error'
+            $thisErrorDesc = Get-QueryValue -Uri $requestUri -Name 'error_description'
+            $stateOk = [string]::Equals([string]$returnedState, $state, [System.StringComparison]::Ordinal)
 
-        if (-not [string]::Equals([string]$returnedState, $state, [System.StringComparison]::Ordinal)) {
-            Write-AuthBrowserResponse -Context $context -Title 'Sign-in did not complete' -Body 'Security check failed (state mismatch).'
-            throw 'Browser sign-in failed: state mismatch.'
+            if (-not $stateOk) {
+                Write-AuthBrowserResponse -Context $context -Title 'Waiting for sign-in' -Body 'This tab is from an older sign-in attempt. Use the newest browser window, or return to PowerShell.'
+                continue
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($thisError)) {
+                Write-AuthBrowserResponse -Context $context -Title 'Sign-in did not complete' -Body ([System.Net.WebUtility]::HtmlEncode("$thisError $thisErrorDesc"))
+                throw "Browser sign-in failed: $thisError $thisErrorDesc"
+            }
+
+            if ([string]::IsNullOrWhiteSpace($thisCode)) {
+                Write-AuthBrowserResponse -Context $context -Title 'Waiting for sign-in' -Body 'No authorization code was returned yet.'
+                continue
+            }
+
+            Write-AuthBrowserResponse -Context $context -Title 'Sign-in complete' -Body 'You signed in successfully.'
+            $code = $thisCode
         }
 
         if ([string]::IsNullOrWhiteSpace($code)) {
-            Write-AuthBrowserResponse -Context $context -Title 'Sign-in did not complete' -Body 'No authorization code was returned.'
-            throw 'Browser sign-in failed: no authorization code returned.'
+            throw 'Timed out waiting for browser sign-in (5 minutes).'
         }
-
-        Write-AuthBrowserResponse -Context $context -Title 'Sign-in complete' -Body 'You signed in successfully.'
 
         $tokBody = ConvertTo-FormUrlEncoded -Data @{
             client_id     = $AppClientId
@@ -1240,7 +1318,7 @@ function Connect-ViaRestDeviceCode {
     )
 
     if ([string]::IsNullOrWhiteSpace($AppClientId)) {
-        $AppClientId = $script:AzureCliClientId
+        $AppClientId = $script:GraphPowerShellClientId
     }
 
     $tenant = 'organizations'
@@ -1409,9 +1487,32 @@ function Connect-EntraGraph {
                 [void]$errors.Add("Browser ($appId): $msg")
                 Write-Host "Browser sign-in did not complete: $msg" -ForegroundColor Yellow
                 try { Disconnect-MgGraph | Out-Null } catch { }
-                # AADSTS700016 = this public client is not in the tenant; try the next well-known app.
-                # USER_SKIPPED_BROWSER = the sign-in helper button was used after a browser error page.
             }
+        }
+    }
+
+    if (-not $connected -and [string]::IsNullOrWhiteSpace($ClientId)) {
+        Show-GraphConsentGuidance
+        $customId = Read-CustomPublicClientId
+        if (Test-LooksLikeGuid -Value $customId) {
+            $ClientId = $customId
+            [void]$clientIds.Insert(0, $customId)
+            if ($tryBrowser) {
+                try {
+                    Write-Host "Starting browser sign-in with your app registration..." -ForegroundColor Cyan
+                    if (Connect-ViaSystemBrowser -AppClientId $customId) {
+                        $connected = $true
+                    }
+                }
+                catch {
+                    $msg = Get-GraphErrorMessage -ErrorRecord $_
+                    [void]$errors.Add("Browser (custom): $msg")
+                    Write-Host "Browser sign-in did not complete: $msg" -ForegroundColor Yellow
+                }
+            }
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($customId)) {
+            Write-Host "That value is not a valid Client ID GUID." -ForegroundColor Red
         }
     }
 
@@ -1436,14 +1537,13 @@ function Connect-EntraGraph {
     }
 
     if (-not $connected) {
+        Show-GraphConsentGuidance
         $hint = @(
             'Could not sign in to Microsoft Graph.',
             '',
-            'Try:',
-            '  1) Re-run:  .\Get-EntraUsersWithoutAuthMethod.ps1',
-            '  2) If no browser opened, copy the URL printed in this window.',
-            '  3) Or use:  .\Get-EntraUsersWithoutAuthMethod.ps1 -DeviceCode',
-            '  4) An admin may need to consent UserAuthenticationMethod.Read.All and User.Read.All.',
+            'This tenant cannot use Azure CLI or Azure PowerShell to read authentication methods.',
+            'Use a custom app registration, then:',
+            '  .\Get-EntraUsersWithoutAuthMethod.ps1 -ClientId <app-id> -TenantId <tenant-id>',
             '',
             ($errors -join [Environment]::NewLine)
         ) -join [Environment]::NewLine
@@ -1933,8 +2033,12 @@ function Invoke-SelfTest {
     Assert-True ($authUrl -match 'redirect_uri=http%3A%2F%2Flocalhost%3A8400%2F') 'authorize url redirect'
 
     $pubIds = Get-PublicClientIdList
-    Assert-Equal $script:AzureCliClientId $pubIds[0] 'azure CLI client is tried first'
-    Assert-Equal $script:GraphPowerShellClientId $pubIds[$pubIds.Count - 1] 'graph powershell client is last'
+    Assert-Equal $script:GraphPowerShellClientId $pubIds[0] 'graph powershell client is default'
+    Assert-Equal 1 $pubIds.Count 'only graph powershell is used by default'
+
+    $consent = Get-GraphAdminConsentUrl
+    Assert-True ($consent -match 'adminconsent') 'admin consent url'
+    Assert-True ($consent -match $script:GraphPowerShellClientId) 'admin consent uses graph powershell app'
 
     $callback = [uri]'http://localhost:8400/?code=abc%2Fde&state=xyz'
     Assert-Equal 'abc/de' (Get-QueryValue -Uri $callback -Name 'code') 'query code decode'
