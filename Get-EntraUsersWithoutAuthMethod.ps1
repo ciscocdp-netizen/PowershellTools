@@ -32,18 +32,14 @@
     only password-only / no-method users, plus not-found / error / skipped rows.
 
 .PARAMETER DeviceCode
-    Skip the system-browser sign-in and use device-code login instead.
-    A browser is still opened to the Microsoft device-login page.
+    Use device-code sign-in instead of Windows Web Account Manager (WAM).
 
 .PARAMETER TenantId
     Optional Entra tenant (contoso.onmicrosoft.com or a Tenant ID GUID).
 
 .PARAMETER ClientId
-    Optional public-client app ID from YOUR tenant. Required when Microsoft
-    Graph PowerShell is not installed in the directory (AADSTS700016) because
-    Azure CLI / Azure PowerShell cannot request authentication-method scopes
-    (AADSTS65002). Register a public client with redirect URI http://localhost
-    and delegated User.Read.All + UserAuthenticationMethod.Read.All.
+    Optional public-client app ID. Leave blank to use the Microsoft Graph
+    PowerShell app (the default WAM client).
 
 .PARAMETER SelfTest
     Runs built-in unit tests for classification helpers and exits
@@ -69,15 +65,12 @@
     Requires the UserAuthenticationMethod.Read.All and User.Read.All permissions
     (delegated). An admin may need to consent the first time you run it.
 
-    Sign-in opens your default web browser (authorization code + PKCE to
-    http://localhost). Windows Web Account Manager is not used.
+    Sign-in uses Windows Web Account Manager (WAM) via Connect-MgGraph, with a
+    parent window so the account picker can attach. Do not run the script from
+    an elevated Administrator prompt — WAM commonly fails there with
+    Missing wamcompat_id_token. Use a normal PowerShell window instead.
 
-    Azure CLI and Azure PowerShell public clients cannot request
-    UserAuthenticationMethod.Read.All (AADSTS65002). This script uses the
-    Microsoft Graph PowerShell app, or a custom -ClientId from your tenant.
-
-    If the browser shows AADSTS700016, an admin must consent Graph PowerShell
-    or you must pass -ClientId for an app registration in this tenant.
+    Pass -DeviceCode only if WAM is blocked in your environment.
 
     CSV requirement: a header row containing a column with the user's UPN /
     email / object id. The script auto-detects common column names
@@ -108,10 +101,6 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-
-# Avoid MSAL WAM "A window handle must be configured" in console hosts.
-$env:AZURE_IDENTITY_DISABLE_CP1 = 'true'
-$env:MSAL_DESKTOP_APP_USE_WAM = '0'
 
 $script:WinFormsLoaded = $false
 $script:UseGui = -not $SelfTest
@@ -779,12 +768,10 @@ function Ensure-GraphModule {
 }
 
 function New-AuthParentForm {
-    $script:AuthSkipRequested = $false
-
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = 'Entra ID interactive sign-in'
+    $form.Text = 'Entra ID sign-in (Windows WAM)'
     $form.Width = 520
-    $form.Height = 200
+    $form.Height = 160
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
     $form.TopMost = $true
     $form.ShowInTaskbar = $true
@@ -793,24 +780,10 @@ function New-AuthParentForm {
     $form.MinimizeBox = $false
 
     $label = New-Object System.Windows.Forms.Label
-    $label.Left = 16
-    $label.Top = 16
-    $label.Width = 470
-    $label.Height = 80
-    $label.Text = "A web browser was opened for Microsoft sign-in.`r`nFinish signing in there, then return to this window.`r`n`r`nIf the browser shows an error, click Try another method."
+    $label.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $label.Text = "Complete sign-in in the Windows account picker / browser.`r`nLeave this window open until sign-in finishes."
     $form.Controls.Add($label)
-
-    $skip = New-Object System.Windows.Forms.Button
-    $skip.Text = 'Try another method'
-    $skip.Width = 180
-    $skip.Height = 32
-    $skip.Left = 160
-    $skip.Top = 110
-    $skip.Add_Click({
-        $script:AuthSkipRequested = $true
-        $this.FindForm().Close()
-    })
-    $form.Controls.Add($skip)
 
     [void]$form.Show()
     $form.Activate()
@@ -888,17 +861,15 @@ function Read-CustomPublicClientId {
     return $entered.Trim()
 }
 
-function Disable-GraphWamIfPossible {
+function Test-IsProcessElevated {
     try {
-        if (-not (Get-Command Set-MgGraphOption -ErrorAction SilentlyContinue)) {
-            return
-        }
-        $cmd = Get-Command Set-MgGraphOption -ErrorAction Stop
-        if ($cmd.Parameters.ContainsKey('DisableLoginByWAM')) {
-            Set-MgGraphOption -DisableLoginByWAM $true -ErrorAction SilentlyContinue | Out-Null
-        }
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return [bool]$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     }
-    catch { }
+    catch {
+        return $false
+    }
 }
 
 function Test-GraphContextHasRequiredScopes {
@@ -1414,9 +1385,6 @@ function Invoke-ConnectMgGraph {
         }
         $params[$deviceParam] = $true
     }
-    if ($cmd.Parameters.ContainsKey('DisableLoginByWAM') -and -not $UseDeviceCode) {
-        $params['DisableLoginByWAM'] = $true
-    }
     if (-not [string]::IsNullOrWhiteSpace($TenantId) -and $cmd.Parameters.ContainsKey('TenantId')) {
         $params['TenantId'] = $TenantId
     }
@@ -1431,8 +1399,11 @@ function Invoke-ConnectMgGraph {
             Write-Host "Device-code sign-in: a URL and code will appear below." -ForegroundColor Cyan
             Write-Host "Open the URL, enter the code, and finish signing in. Leave this window open." -ForegroundColor Cyan
         }
-        elseif ($script:WinFormsLoaded) {
-            $parent = New-AuthParentForm
+        else {
+            Write-Host "Opening Windows Web Account Manager (WAM) sign-in..." -ForegroundColor Cyan
+            if ($script:WinFormsLoaded) {
+                $parent = New-AuthParentForm
+            }
         }
         Connect-MgGraph @params | Out-Null
     }
@@ -1445,8 +1416,6 @@ function Invoke-ConnectMgGraph {
 }
 
 function Connect-EntraGraph {
-    Disable-GraphWamIfPossible
-
     if (Test-GraphContextHasRequiredScopes) {
         $ctx = $null
         try { $ctx = Get-MgContext -ErrorAction SilentlyContinue } catch { }
@@ -1461,91 +1430,49 @@ function Connect-EntraGraph {
         return
     }
 
+    if ((-not $DeviceCode) -and (Test-IsProcessElevated)) {
+        Write-Host ""
+        Write-Host "This window is running as Administrator." -ForegroundColor Yellow
+        Write-Host "Windows WAM usually fails in an elevated prompt (Missing wamcompat_id_token)." -ForegroundColor Yellow
+        Write-Host "Close this window and run the script in a normal PowerShell session:" -ForegroundColor Yellow
+        Write-Host "  powershell.exe -STA -File .\Get-EntraUsersWithoutAuthMethod.ps1" -ForegroundColor Cyan
+        Write-Host "Continuing with WAM anyway. If sign-in fails, re-run without elevation." -ForegroundColor Yellow
+        Write-Host ""
+    }
+
     Write-Host "Sign in with an account that can read authentication method details" -ForegroundColor Gray
     Write-Host "(for example Global Reader, Authentication Admin, or Privileged Auth Admin)." -ForegroundColor Gray
 
-    $errors = New-Object System.Collections.Generic.List[string]
-    $connected = $false
-    $tryBrowser = -not $DeviceCode
-
-    $clientIds = Get-PublicClientIdList
-
-    if ($tryBrowser) {
-        $seenBrowser = @{}
-        foreach ($appId in $clientIds) {
-            if ($seenBrowser.ContainsKey($appId)) { continue }
-            $seenBrowser[$appId] = $true
-            try {
-                Write-Host "Starting browser sign-in..." -ForegroundColor Cyan
-                if (Connect-ViaSystemBrowser -AppClientId $appId) {
-                    $connected = $true
-                    break
-                }
+    if ($DeviceCode) {
+        try {
+            Invoke-ConnectMgGraph -UseDeviceCode
+            return
+        }
+        catch {
+            $msg = Get-GraphErrorMessage -ErrorRecord $_
+            if ($msg -notmatch 'SDK_NO_DEVICE_CODE') {
+                throw
             }
-            catch {
-                $msg = Get-GraphErrorMessage -ErrorRecord $_
-                [void]$errors.Add("Browser ($appId): $msg")
-                Write-Host "Browser sign-in did not complete: $msg" -ForegroundColor Yellow
-                try { Disconnect-MgGraph | Out-Null } catch { }
-            }
+            Write-Host "This Graph SDK has no device-code switch; using the browser device-code page..." -ForegroundColor Yellow
+            [void](Connect-ViaRestDeviceCode -AppClientId $(if ($ClientId) { $ClientId } else { $script:GraphPowerShellClientId }))
+            return
         }
     }
 
-    if (-not $connected -and [string]::IsNullOrWhiteSpace($ClientId)) {
-        Show-GraphConsentGuidance
-        $customId = Read-CustomPublicClientId
-        if (Test-LooksLikeGuid -Value $customId) {
-            $ClientId = $customId
-            [void]$clientIds.Insert(0, $customId)
-            if ($tryBrowser) {
-                try {
-                    Write-Host "Starting browser sign-in with your app registration..." -ForegroundColor Cyan
-                    if (Connect-ViaSystemBrowser -AppClientId $customId) {
-                        $connected = $true
-                    }
-                }
-                catch {
-                    $msg = Get-GraphErrorMessage -ErrorRecord $_
-                    [void]$errors.Add("Browser (custom): $msg")
-                    Write-Host "Browser sign-in did not complete: $msg" -ForegroundColor Yellow
-                }
-            }
-        }
-        elseif (-not [string]::IsNullOrWhiteSpace($customId)) {
-            Write-Host "That value is not a valid Client ID GUID." -ForegroundColor Red
-        }
+    try {
+        Invoke-ConnectMgGraph
     }
-
-    if (-not $connected) {
-        Write-Host "Falling back to device-code sign-in (a browser will still open)..." -ForegroundColor Yellow
-        $seen = @{}
-        foreach ($appId in $clientIds) {
-            if ($seen.ContainsKey($appId)) { continue }
-            $seen[$appId] = $true
-            try {
-                Write-Host "Starting device-code sign-in..." -ForegroundColor Cyan
-                if (Connect-ViaRestDeviceCode -AppClientId $appId) {
-                    $connected = $true
-                    break
-                }
-            }
-            catch {
-                $msg = Get-GraphErrorMessage -ErrorRecord $_
-                [void]$errors.Add("Device code ($appId): $msg")
-            }
-        }
-    }
-
-    if (-not $connected) {
-        Show-GraphConsentGuidance
+    catch {
+        $msg = Get-GraphErrorMessage -ErrorRecord $_
         $hint = @(
-            'Could not sign in to Microsoft Graph.',
+            'Windows WAM sign-in failed.',
+            $msg,
             '',
-            'This tenant cannot use Azure CLI or Azure PowerShell to read authentication methods.',
-            'Use a custom app registration, then:',
-            '  .\Get-EntraUsersWithoutAuthMethod.ps1 -ClientId <app-id> -TenantId <tenant-id>',
+            'Most common fix: run this script in a non-Administrator PowerShell window.',
+            '  powershell.exe -STA -File .\Get-EntraUsersWithoutAuthMethod.ps1',
             '',
-            ($errors -join [Environment]::NewLine)
+            'If WAM is blocked in this environment, use:',
+            '  .\Get-EntraUsersWithoutAuthMethod.ps1 -DeviceCode'
         ) -join [Environment]::NewLine
         throw $hint
     }
@@ -2039,6 +1966,10 @@ function Invoke-SelfTest {
     $consent = Get-GraphAdminConsentUrl
     Assert-True ($consent -match 'adminconsent') 'admin consent url'
     Assert-True ($consent -match $script:GraphPowerShellClientId) 'admin consent uses graph powershell app'
+
+    try { $null = Test-IsProcessElevated } catch {
+        [void]$failures.Add('Test-IsProcessElevated threw')
+    }
 
     $callback = [uri]'http://localhost:8400/?code=abc%2Fde&state=xyz'
     Assert-Equal 'abc/de' (Get-QueryValue -Uri $callback -Name 'code') 'query code decode'
