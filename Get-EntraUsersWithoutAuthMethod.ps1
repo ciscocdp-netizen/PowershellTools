@@ -5,7 +5,7 @@
     method registered in Entra ID (Azure AD) — only a password, or nothing at all.
 
 .DESCRIPTION
-    Fully interactive, PowerShell 5.1 compatible script.
+    Fully interactive, PowerShell 5.1 and Windows PowerShell ISE compatible.
       * Prompts you (via a GUI file picker) to select the input CSV of users.
       * Prompts you (via a GUI save dialog) to choose where the report is saved.
       * Connects to Microsoft Graph and inspects each user's registered
@@ -60,17 +60,19 @@
 .EXAMPLE
     .\Get-EntraUsersWithoutAuthMethod.ps1 -DeviceCode
 
+.EXAMPLE
+    # PowerShell ISE: open this script and press F5. File dialogs and browser sign-in are used automatically.
+
 .NOTES
     Requires the Microsoft.Graph.Authentication module.
     Requires the UserAuthenticationMethod.Read.All and User.Read.All permissions
     (delegated). An admin may need to consent the first time you run it.
 
-    Sign-in uses Windows Web Account Manager (WAM) via Connect-MgGraph, with a
-    parent window so the account picker can attach. Do not run the script from
-    an elevated Administrator prompt — WAM commonly fails there with
-    Missing wamcompat_id_token. Use a normal PowerShell window instead.
+    Sign-in: Windows console uses Web Account Manager (WAM). PowerShell ISE
+    cannot host WAM, so ISE automatically opens your web browser with a
+    device-code sign-in instead. In ISE, open the script and press F5.
 
-    Pass -DeviceCode only if WAM is blocked in your environment.
+    Do not rely on WAM from an elevated Administrator window.
 
     CSV requirement: a header row containing a column with the user's UPN /
     email / object id. The script auto-detects common column names
@@ -120,12 +122,26 @@ $script:RefreshToken = $null
 $script:TokenClientId = $null
 $script:TokenTenant = 'organizations'
 $script:AuthSkipRequested = $false
+$script:IsPowerShellIse = $false
+try {
+    if ($Host.Name -eq 'Windows PowerShell ISE Host') {
+        $script:IsPowerShellIse = $true
+    }
+}
+catch { }
+try {
+    if (Get-Variable -Name psISE -ErrorAction SilentlyContinue) {
+        if ($null -ne $psISE) { $script:IsPowerShellIse = $true }
+    }
+}
+catch { }
 
 # ---------------------------------------------------------------------------
 # STA relaunch (WinForms dialogs + WAM parent window)
+# ISE is already STA — never relaunch out of ISE into powershell.exe.
 # ---------------------------------------------------------------------------
 
-if ($script:UseGui -and [System.Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
+if ($script:UseGui -and -not $script:IsPowerShellIse -and [System.Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
     if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
         Write-Host "File dialogs require STA. Restart with: powershell.exe -STA -File <script>" -ForegroundColor Red
         exit 1
@@ -872,6 +888,23 @@ function Test-IsProcessElevated {
     }
 }
 
+function Test-IsPowerShellIse {
+    if ($script:IsPowerShellIse) { return $true }
+    try {
+        if ($Host.Name -eq 'Windows PowerShell ISE Host') { return $true }
+    }
+    catch { }
+    return $false
+}
+
+function Test-ShouldSkipWam {
+    param([switch]$ForceDeviceCode)
+    if ($ForceDeviceCode) { return $true }
+    if (Test-IsPowerShellIse) { return $true }
+    if (Test-IsProcessElevated) { return $true }
+    return $false
+}
+
 function Test-GraphContextHasRequiredScopes {
     $ctx = $null
     try { $ctx = Get-MgContext -ErrorAction SilentlyContinue } catch { }
@@ -1319,7 +1352,19 @@ function Connect-ViaRestDeviceCode {
     Write-Host "If asked for a code, enter: $userCode" -ForegroundColor Cyan
     Write-Host "Waiting for sign-in..." -ForegroundColor Yellow
 
-    try { [System.Windows.Forms.Clipboard]::SetText($userCode) } catch { }
+    if ($script:WinFormsLoaded) {
+        try { [System.Windows.Forms.Clipboard]::SetText($userCode) } catch { }
+        try {
+            [void][System.Windows.Forms.MessageBox]::Show(
+                ("A web browser will open for Microsoft sign-in.`r`n`r`nIf asked for a code, enter:`r`n`r`n{0}`r`n`r`nThe code is copied to the clipboard.`r`nClick OK, then finish sign-in in the browser. Leave this window running." -f $userCode),
+                'Entra ID sign-in',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            )
+        }
+        catch { }
+    }
+
     $opened = Start-SystemBrowser -Url $openUrl
     if (-not $opened) {
         Write-Host "Open this URL manually: $openUrl" -ForegroundColor Yellow
@@ -1338,6 +1383,7 @@ function Connect-ViaRestDeviceCode {
 
     while ([datetime]::UtcNow -lt $deadline) {
         Start-Sleep -Seconds $interval
+        try { [void][System.Windows.Forms.Application]::DoEvents() } catch { }
         try {
             $tokBody = ConvertTo-FormUrlEncoded -Data @{
                 grant_type  = 'urn:ietf:params:oauth:grant-type:device_code'
@@ -1415,6 +1461,29 @@ function Invoke-ConnectMgGraph {
     }
 }
 
+function Connect-WithDeviceCodeFlow {
+    $appId = $script:GraphPowerShellClientId
+    if (-not [string]::IsNullOrWhiteSpace($ClientId)) {
+        $appId = $ClientId
+    }
+
+    # ISE / elevated hosts cannot use WAM. Prefer SDK device-code, then REST + browser.
+    $env:AZURE_IDENTITY_DISABLE_CP1 = 'true'
+    $env:MSAL_DESKTOP_APP_USE_WAM = '0'
+
+    try {
+        Invoke-ConnectMgGraph -UseDeviceCode
+        return
+    }
+    catch {
+        $msg = Get-GraphErrorMessage -ErrorRecord $_
+        Write-Host "SDK device-code sign-in was not available or failed: $msg" -ForegroundColor Yellow
+        Write-Host "Opening a browser for device-code sign-in instead..." -ForegroundColor Yellow
+    }
+
+    [void](Connect-ViaRestDeviceCode -AppClientId $appId)
+}
+
 function Connect-EntraGraph {
     if (Test-GraphContextHasRequiredScopes) {
         $ctx = $null
@@ -1430,33 +1499,19 @@ function Connect-EntraGraph {
         return
     }
 
-    if ((-not $DeviceCode) -and (Test-IsProcessElevated)) {
-        Write-Host ""
-        Write-Host "This window is running as Administrator." -ForegroundColor Yellow
-        Write-Host "Windows WAM usually fails in an elevated prompt (Missing wamcompat_id_token)." -ForegroundColor Yellow
-        Write-Host "Close this window and run the script in a normal PowerShell session:" -ForegroundColor Yellow
-        Write-Host "  powershell.exe -STA -File .\Get-EntraUsersWithoutAuthMethod.ps1" -ForegroundColor Cyan
-        Write-Host "Continuing with WAM anyway. If sign-in fails, re-run without elevation." -ForegroundColor Yellow
-        Write-Host ""
-    }
-
     Write-Host "Sign in with an account that can read authentication method details" -ForegroundColor Gray
     Write-Host "(for example Global Reader, Authentication Admin, or Privileged Auth Admin)." -ForegroundColor Gray
 
-    if ($DeviceCode) {
-        try {
-            Invoke-ConnectMgGraph -UseDeviceCode
-            return
+    $skipWam = Test-ShouldSkipWam -ForceDeviceCode:$DeviceCode
+    if ($skipWam) {
+        if (Test-IsPowerShellIse) {
+            Write-Host "PowerShell ISE detected. WAM does not work in ISE, so a web browser will be used to sign in." -ForegroundColor Cyan
         }
-        catch {
-            $msg = Get-GraphErrorMessage -ErrorRecord $_
-            if ($msg -notmatch 'SDK_NO_DEVICE_CODE') {
-                throw
-            }
-            Write-Host "This Graph SDK has no device-code switch; using the browser device-code page..." -ForegroundColor Yellow
-            [void](Connect-ViaRestDeviceCode -AppClientId $(if ($ClientId) { $ClientId } else { $script:GraphPowerShellClientId }))
-            return
+        elseif (Test-IsProcessElevated) {
+            Write-Host "Administrator session detected. Skipping WAM (it fails when elevated) and opening a browser to sign in." -ForegroundColor Cyan
         }
+        Connect-WithDeviceCodeFlow
+        return
     }
 
     try {
@@ -1464,17 +1519,23 @@ function Connect-EntraGraph {
     }
     catch {
         $msg = Get-GraphErrorMessage -ErrorRecord $_
-        $hint = @(
-            'Windows WAM sign-in failed.',
-            $msg,
-            '',
-            'Most common fix: run this script in a non-Administrator PowerShell window.',
-            '  powershell.exe -STA -File .\Get-EntraUsersWithoutAuthMethod.ps1',
-            '',
-            'If WAM is blocked in this environment, use:',
-            '  .\Get-EntraUsersWithoutAuthMethod.ps1 -DeviceCode'
-        ) -join [Environment]::NewLine
-        throw $hint
+        Write-Host "Windows WAM sign-in failed: $msg" -ForegroundColor Yellow
+        Write-Host "Falling back to browser device-code sign-in (ISE-safe)..." -ForegroundColor Yellow
+        try {
+            Connect-WithDeviceCodeFlow
+        }
+        catch {
+            $msg2 = Get-GraphErrorMessage -ErrorRecord $_
+            $hint = @(
+                'Could not sign in to Microsoft Graph.',
+                $msg,
+                $msg2,
+                '',
+                'In PowerShell ISE, press F5 to run this script; a browser will open to sign in.',
+                'If you are in an Administrator window, WAM cannot be used — the script will use the browser instead.'
+            ) -join [Environment]::NewLine
+            throw $hint
+        }
     }
 }
 
@@ -1970,6 +2031,10 @@ function Invoke-SelfTest {
     try { $null = Test-IsProcessElevated } catch {
         [void]$failures.Add('Test-IsProcessElevated threw')
     }
+    try { $null = Test-IsPowerShellIse } catch {
+        [void]$failures.Add('Test-IsPowerShellIse threw')
+    }
+    Assert-True (Test-ShouldSkipWam -ForceDeviceCode) 'device-code switch skips WAM'
 
     $callback = [uri]'http://localhost:8400/?code=abc%2Fde&state=xyz'
     Assert-Equal 'abc/de' (Get-QueryValue -Uri $callback -Name 'code') 'query code decode'
