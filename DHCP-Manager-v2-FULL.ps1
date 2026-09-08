@@ -100,12 +100,16 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.5.3'
+$Global:AppVersion       = '2.5.4'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:DhcpEventEntriesAll = [System.Collections.Generic.List[object]]::new()
 $Global:ScopeStatEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:ScopeStatEntriesAll = [System.Collections.Generic.List[object]]::new()
 $Global:ScopeUtilThreshold = 90
+$Global:NavScopeIndex    = [System.Collections.Generic.List[object]]::new()
+$Global:NavScopeMatched  = [System.Collections.Generic.List[object]]::new()
+$Global:NavScopeSearchText = ''
+$Global:NavScopeMatchIndex = -1
 $Global:LogWatchState    = @{
     Local  = @{ Enabled = $false; Path = $null; Offset = 0L }
     A      = @{ Enabled = $false; Path = $null; Offset = 0L }
@@ -647,7 +651,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                      HorizontalAlignment="Center"/>
           
           <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-            <Run Text="v2.5.3  |  "/>
+            <Run Text="v2.5.4  |  "/>
             <Run Text="Created by Anthony Blake" Foreground="#90CAF9"/>
             <Run Text="  |  "/>
             <Run x:Name="StatusTime" Text=""/>
@@ -692,9 +696,30 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
               BorderThickness="0,0,1,0" BorderBrush="{StaticResource Border}">
         <DockPanel>
           <Border DockPanel.Dock="Top" Background="{StaticResource BgPanel}"
-                  Padding="12,10" BorderThickness="0,0,0,1" BorderBrush="{StaticResource Border}">
-            <TextBlock Text="📡 DHCP Navigation" Foreground="{StaticResource TextPrimary}"
-                       FontWeight="SemiBold" FontSize="13"/>
+                  Padding="10,10" BorderThickness="0,0,0,1" BorderBrush="{StaticResource Border}">
+            <StackPanel>
+              <TextBlock Text="📡 DHCP Navigation" Foreground="{StaticResource TextPrimary}"
+                         FontWeight="SemiBold" FontSize="13" Margin="0,0,0,8"/>
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="Auto"/>
+                  <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBox x:Name="TxtNavScopeSearch" Grid.Column="0" Height="28"
+                         Style="{StaticResource DarkTextBox}" Margin="0,0,6,0"
+                         ToolTip="Search scopes by name or Scope ID (Enter = next match)"/>
+                <Button x:Name="BtnNavScopeFind" Grid.Column="1" Content="Find" Width="48" Height="28"
+                        Margin="0,0,4,0" Style="{StaticResource BtnSecondary}"
+                        ToolTip="Jump to the next matching scope"/>
+                <Button x:Name="BtnNavScopeSearchClear" Grid.Column="2" Content="✕" Width="28" Height="28"
+                        Style="{StaticResource BtnSecondary}"
+                        ToolTip="Clear scope search"/>
+              </Grid>
+              <TextBlock x:Name="TxtNavScopeSearchStatus" Margin="0,6,0,0"
+                         Foreground="{StaticResource TextSecond}" FontSize="10"
+                         Text="Search by scope name or ID" TextWrapping="Wrap"/>
+            </StackPanel>
           </Border>
           
           <TreeView x:Name="NavTree" Background="{StaticResource BgCard}"
@@ -1680,6 +1705,10 @@ try {
     
     # Navigation
     $script:NavTree          = $Window.FindName("NavTree")
+    $script:TxtNavScopeSearch = $Window.FindName("TxtNavScopeSearch")
+    $script:BtnNavScopeFind  = $Window.FindName("BtnNavScopeFind")
+    $script:BtnNavScopeSearchClear = $Window.FindName("BtnNavScopeSearchClear")
+    $script:TxtNavScopeSearchStatus = $Window.FindName("TxtNavScopeSearchStatus")
     $script:MainTabs         = $Window.FindName("MainTabs")
     
     # Tabs
@@ -3317,6 +3346,207 @@ function Show-DomainDhcpScanDialog {
 #endregion
 
 #region Navigation Tree Builder
+function Update-NavScopeSearchStatus {
+    param(
+        [int]$MatchCount = -1,
+        [int]$TotalCount = -1,
+        [string]$Message
+    )
+    
+    try {
+        if ($null -eq $script:TxtNavScopeSearchStatus) { return }
+        
+        if ($Message) {
+            $script:TxtNavScopeSearchStatus.Text = $Message
+            return
+        }
+        
+        if ($TotalCount -lt 0) { $TotalCount = Get-SafeCount $Global:NavScopeIndex }
+        if ($MatchCount -lt 0) { $MatchCount = $TotalCount }
+        
+        $query = ''
+        try { $query = "$($script:TxtNavScopeSearch.Text)".Trim() } catch {}
+        
+        if (-not $query) {
+            $script:TxtNavScopeSearchStatus.Text = if ($TotalCount -gt 0) {
+                "$TotalCount scope(s) — search by name or Scope ID"
+            } else {
+                "Connect and refresh to load scopes"
+            }
+        } else {
+            $script:TxtNavScopeSearchStatus.Text = "Showing $MatchCount of $TotalCount scope(s) matching '$query'"
+        }
+    } catch {}
+}
+
+function Get-NavScopeSearchQuery {
+    $query = ''
+    try {
+        if ($null -ne $script:TxtNavScopeSearch) {
+            $query = "$($script:TxtNavScopeSearch.Text)".Trim()
+        }
+    } catch {}
+    return $query
+}
+
+function Test-NavScopeMatchesQuery {
+    param(
+        [object]$Entry,
+        [string]$Query
+    )
+    
+    if ([string]::IsNullOrWhiteSpace($Query)) { return $true }
+    if ($null -eq $Entry) { return $false }
+    
+    $q = $Query.ToLowerInvariant()
+    $hay = "$($Entry.SearchText)".ToLowerInvariant()
+    return $hay.Contains($q)
+}
+
+function Apply-NavScopeFilter {
+    <#
+    .SYNOPSIS
+        Filters navigation scope nodes by name / Scope ID search text
+    #>
+    param(
+        [switch]$Quiet
+    )
+    
+    $query = Get-NavScopeSearchQuery
+    $Global:NavScopeSearchText = $query
+    $total = Get-SafeCount $Global:NavScopeIndex
+    $matched = [System.Collections.Generic.List[object]]::new()
+    $hidden = [System.Collections.Generic.List[object]]::new()
+    
+    foreach ($entry in @($Global:NavScopeIndex)) {
+        if ($null -eq $entry -or $null -eq $entry.Node) { continue }
+        if (Test-NavScopeMatchesQuery -Entry $entry -Query $query) {
+            [void]$matched.Add($entry)
+        } else {
+            [void]$hidden.Add($entry)
+        }
+    }
+    
+    $matchCount = Get-SafeCount $matched
+    $Global:NavScopeMatched = $matched
+    
+    $apply = {
+        foreach ($entry in $matched) {
+            $entry.Node.Visibility = [System.Windows.Visibility]::Visible
+        }
+        foreach ($entry in $hidden) {
+            $entry.Node.Visibility = [System.Windows.Visibility]::Collapsed
+            try { $entry.Node.IsSelected = $false } catch {}
+        }
+        
+        if ($null -ne $script:NavScopesContainer) {
+            $script:NavScopesContainer.IsExpanded = $true
+            if ($query) {
+                $script:NavScopesContainer.Header = "🌐 Scopes ($matchCount/$total)"
+            } else {
+                $script:NavScopesContainer.Header = "🌐 Scopes ($total)"
+            }
+        }
+        
+        if ($null -ne $script:NavServerNode) {
+            $script:NavServerNode.IsExpanded = $true
+        }
+    }
+    
+    try {
+        if ($null -ne $script:Window -and -not $script:Window.Dispatcher.CheckAccess()) {
+            $script:Window.Dispatcher.Invoke([action]$apply, [System.Windows.Threading.DispatcherPriority]::Normal)
+        } else {
+            & $apply
+        }
+    } catch {
+        try { & $apply } catch {}
+    }
+    
+    if ($matchCount -eq 0) {
+        $Global:NavScopeMatchIndex = -1
+    } elseif ($Global:NavScopeMatchIndex -ge $matchCount) {
+        $Global:NavScopeMatchIndex = 0
+    }
+    
+    Update-NavScopeSearchStatus -MatchCount $matchCount -TotalCount $total
+    
+    if (-not $Quiet -and $query) {
+        Write-ActionLog "Nav scope search '$query': $matchCount of $total match(es)" "INFO"
+    }
+    
+    return $matchCount
+}
+
+function Select-NavScopeMatch {
+    <#
+    .SYNOPSIS
+        Selects the next (or first) matching scope in the navigation tree
+    #>
+    param(
+        [switch]$First
+    )
+    
+    $query = Get-NavScopeSearchQuery
+    if (-not $query) {
+        Update-NavScopeSearchStatus -Message "Type a scope name or ID, then press Find / Enter"
+        return
+    }
+    
+    [void](Apply-NavScopeFilter -Quiet)
+    
+    $matches = @($Global:NavScopeMatched)
+    $count = Get-SafeCount $matches
+    if ($count -eq 0) {
+        Update-NavScopeSearchStatus -MatchCount 0 -TotalCount (Get-SafeCount $Global:NavScopeIndex)
+        Show-MessageBox "No scopes match '$query'." "Scope Search" OK Information
+        return
+    }
+    
+    if ($First -or $Global:NavScopeMatchIndex -lt 0) {
+        $Global:NavScopeMatchIndex = 0
+    } else {
+        $Global:NavScopeMatchIndex = ($Global:NavScopeMatchIndex + 1) % $count
+    }
+    
+    $entry = $matches[$Global:NavScopeMatchIndex]
+    if ($null -eq $entry -or $null -eq $entry.Node) { return }
+    
+    try {
+        $script:Window.Dispatcher.Invoke([action]{
+            if ($null -ne $script:NavServerNode) { $script:NavServerNode.IsExpanded = $true }
+            if ($null -ne $script:NavScopesContainer) { $script:NavScopesContainer.IsExpanded = $true }
+            
+            $node = $entry.Node
+            $node.Visibility = [System.Windows.Visibility]::Visible
+            $node.IsExpanded = $true
+            $node.IsSelected = $true
+            $node.BringIntoView()
+            try { $node.Focus() } catch {}
+        }, [System.Windows.Threading.DispatcherPriority]::Normal)
+    } catch {
+        $entry.Node.IsSelected = $true
+        try { $entry.Node.BringIntoView() } catch {}
+    }
+    
+    $Global:SelectedScope = "$($entry.ScopeId)"
+    Update-NavScopeSearchStatus -Message "Match $($Global:NavScopeMatchIndex + 1) of $count — $($entry.Name) [$($entry.ScopeId)]"
+    Write-ActionLog "Nav scope find: $($entry.Name) [$($entry.ScopeId)] ($($Global:NavScopeMatchIndex + 1)/$count)" "INFO"
+    Set-Status "Selected scope $($entry.ScopeId)"
+}
+
+function Clear-NavScopeSearch {
+    try {
+        if ($null -ne $script:TxtNavScopeSearch) {
+            $script:TxtNavScopeSearch.Text = ''
+        }
+    } catch {}
+    $Global:NavScopeSearchText = ''
+    $Global:NavScopeMatchIndex = -1
+    [void](Apply-NavScopeFilter -Quiet)
+    Update-NavScopeSearchStatus
+}
+
 function Build-NavTree {
     <#
     .SYNOPSIS
@@ -3332,61 +3562,90 @@ function Build-NavTree {
             return
         }
         
+        $preservedQuery = Get-NavScopeSearchQuery
+        
         $script:NavTree.Dispatcher.Invoke([action]{
             $script:NavTree.Items.Clear()
+            $Global:NavScopeIndex.Clear()
+            $script:NavServerNode = $null
+            $script:NavScopesContainer = $null
             
             # Root - Server Node
             $serverNode = New-Object System.Windows.Controls.TreeViewItem
             $serverNode.Header = "🖥️ $Global:DHCPServer"
             $serverNode.Tag = "Server"
             $serverNode.IsExpanded = $true
+            $script:NavServerNode = $serverNode
             
             # Scopes Container
             $scopesContainer = New-Object System.Windows.Controls.TreeViewItem
             $scopesContainer.Header = "🌐 Scopes"
             $scopesContainer.Tag = "Scopes"
             $scopesContainer.IsExpanded = $true
+            $script:NavScopesContainer = $scopesContainer
             
             try {
                 $scopes = @(Get-DhcpServerv4Scope -ComputerName $Global:DHCPServer -ErrorAction Stop)
+                # Stable order for search: name then ScopeId
+                $scopes = @($scopes | Sort-Object Name, ScopeId)
                 
                 foreach ($scope in $scopes) {
+                    $scopeId = "$($scope.ScopeId)"
+                    $scopeName = "$($scope.Name)"
+                    $scopeDesc = ''
+                    try { $scopeDesc = "$($scope.Description)" } catch {}
+                    
                     $scopeNode = New-Object System.Windows.Controls.TreeViewItem
-                    $scopeNode.Header = "📍 $($scope.Name) [$($scope.ScopeId)]"
-                    $scopeNode.Tag = "$($scope.ScopeId)"
+                    $scopeNode.Header = "📍 $scopeName [$scopeId]"
+                    $scopeNode.Tag = $scopeId
+                    $scopeNode.ToolTip = if ($scopeDesc) {
+                        "$scopeName`n$scopeId`n$scopeDesc"
+                    } else {
+                        "$scopeName`n$scopeId"
+                    }
                     
                     # Add sub-items
                     $leasesItem = New-Object System.Windows.Controls.TreeViewItem
                     $leasesItem.Header = "📄 Leases"
-                    $leasesItem.Tag = "$($scope.ScopeId):Leases"
+                    $leasesItem.Tag = "${scopeId}:Leases"
                     
                     $reservationsItem = New-Object System.Windows.Controls.TreeViewItem
                     $reservationsItem.Header = "📌 Reservations"
-                    $reservationsItem.Tag = "$($scope.ScopeId):Reservations"
+                    $reservationsItem.Tag = "${scopeId}:Reservations"
                     
                     $exclusionsItem = New-Object System.Windows.Controls.TreeViewItem
                     $exclusionsItem.Header = "🚫 Exclusions"
-                    $exclusionsItem.Tag = "$($scope.ScopeId):Exclusions"
+                    $exclusionsItem.Tag = "${scopeId}:Exclusions"
                     
                     $optionsItem = New-Object System.Windows.Controls.TreeViewItem
                     $optionsItem.Header = "⚙️ Options"
-                    $optionsItem.Tag = "$($scope.ScopeId):Options"
+                    $optionsItem.Tag = "${scopeId}:Options"
                     
-                    $scopeNode.Items.Add($leasesItem)
-                    $scopeNode.Items.Add($reservationsItem)
-                    $scopeNode.Items.Add($exclusionsItem)
-                    $scopeNode.Items.Add($optionsItem)
+                    [void]$scopeNode.Items.Add($leasesItem)
+                    [void]$scopeNode.Items.Add($reservationsItem)
+                    [void]$scopeNode.Items.Add($exclusionsItem)
+                    [void]$scopeNode.Items.Add($optionsItem)
                     
-                    $scopesContainer.Items.Add($scopeNode)
+                    [void]$scopesContainer.Items.Add($scopeNode)
+                    
+                    $searchText = @($scopeName, $scopeId, $scopeDesc) -join ' '
+                    [void]$Global:NavScopeIndex.Add([PSCustomObject]@{
+                        ScopeId    = $scopeId
+                        Name       = $scopeName
+                        Description = $scopeDesc
+                        SearchText = $searchText
+                        Node       = $scopeNode
+                    })
                 }
                 
+                $scopesContainer.Header = "🌐 Scopes ($(Get-SafeCount $scopes))"
                 Write-ActionLog "Added $(Get-SafeCount $scopes) scopes to navigation tree" "SUCCESS"
                 
             } catch {
                 Write-ActionLog "Failed to load scopes for navigation: $_" "ERROR"
             }
             
-            $serverNode.Items.Add($scopesContainer)
+            [void]$serverNode.Items.Add($scopesContainer)
             
             # Other server items
             $filtersNode = New-Object System.Windows.Controls.TreeViewItem
@@ -3401,13 +3660,23 @@ function Build-NavTree {
             $statsNode.Header = "📊 Statistics"
             $statsNode.Tag = "Statistics"
             
-            $serverNode.Items.Add($filtersNode)
-            $serverNode.Items.Add($policiesNode)
-            $serverNode.Items.Add($statsNode)
+            [void]$serverNode.Items.Add($filtersNode)
+            [void]$serverNode.Items.Add($policiesNode)
+            [void]$serverNode.Items.Add($statsNode)
             
-            $script:NavTree.Items.Add($serverNode)
+            [void]$script:NavTree.Items.Add($serverNode)
             
         }, [System.Windows.Threading.DispatcherPriority]::Normal)
+        
+        # Restore / re-apply search after rebuild
+        if ($preservedQuery -and $null -ne $script:TxtNavScopeSearch) {
+            try {
+                if ("$($script:TxtNavScopeSearch.Text)".Trim() -ne $preservedQuery) {
+                    $script:TxtNavScopeSearch.Text = $preservedQuery
+                }
+            } catch {}
+        }
+        [void](Apply-NavScopeFilter -Quiet)
         
         Write-ActionLog "Navigation tree built successfully" "SUCCESS"
         Update-LogDisplay
@@ -7318,6 +7587,15 @@ $BtnDisconnect.add_Click({
         $script:GridCompare.ItemsSource = $null
         
         $script:NavTree.Items.Clear()
+        try {
+            $Global:NavScopeIndex.Clear()
+            $Global:NavScopeMatched.Clear()
+            $Global:NavScopeMatchIndex = -1
+            $script:NavServerNode = $null
+            $script:NavScopesContainer = $null
+            if ($null -ne $script:TxtNavScopeSearch) { $script:TxtNavScopeSearch.Text = '' }
+            Update-NavScopeSearchStatus -Message "Connect to a DHCP server to search scopes"
+        } catch {}
         
         Set-Status "Disconnected" "Not Connected"
         $script:StatusServer.Foreground = [System.Windows.Media.Brushes]::Orange
@@ -7430,6 +7708,36 @@ function Handle-NavSelect {
 }
 
 $NavTree.add_SelectedItemChanged({ Handle-NavSelect $this $_ })
+
+# Navigation scope search
+if ($null -ne $script:TxtNavScopeSearch) {
+    $script:TxtNavScopeSearch.add_TextChanged({
+        $Global:NavScopeMatchIndex = -1
+        [void](Apply-NavScopeFilter -Quiet)
+    })
+    $script:TxtNavScopeSearch.add_KeyDown({
+        param($sender, $e)
+        if ($e.Key -eq [System.Windows.Input.Key]::Enter -or $e.Key -eq [System.Windows.Input.Key]::Return) {
+            Select-NavScopeMatch
+            $e.Handled = $true
+        } elseif ($e.Key -eq [System.Windows.Input.Key]::Escape) {
+            Clear-NavScopeSearch
+            $e.Handled = $true
+        }
+    })
+}
+
+if ($null -ne $script:BtnNavScopeFind) {
+    $script:BtnNavScopeFind.add_Click({
+        Select-NavScopeMatch
+    })
+}
+
+if ($null -ne $script:BtnNavScopeSearchClear) {
+    $script:BtnNavScopeSearchClear.add_Click({
+        Clear-NavScopeSearch
+    })
+}
 #endregion
 
 #region Event Handlers - Scopes
