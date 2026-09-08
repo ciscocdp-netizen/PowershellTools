@@ -100,9 +100,12 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.5.0'
+$Global:AppVersion       = '2.5.2'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:DhcpEventEntriesAll = [System.Collections.Generic.List[object]]::new()
+$Global:ScopeStatEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
+$Global:ScopeStatEntriesAll = [System.Collections.Generic.List[object]]::new()
+$Global:ScopeUtilThreshold = 90
 $Global:LogWatchState    = @{
     Local  = @{ Enabled = $false; Path = $null; Offset = 0L }
     A      = @{ Enabled = $false; Path = $null; Offset = 0L }
@@ -644,7 +647,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                      HorizontalAlignment="Center"/>
           
           <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-            <Run Text="v2.5.1  |  "/>
+            <Run Text="v2.5.2  |  "/>
             <Run Text="Created by Anthony Blake" Foreground="#90CAF9"/>
             <Run Text="  |  "/>
             <Run x:Name="StatusTime" Text=""/>
@@ -979,10 +982,17 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
 
           <!-- TAB: Statistics -->
           <TabItem x:Name="TabStats" Header="📊 Statistics">
-            <ScrollViewer VerticalScrollBarVisibility="Auto" Background="{StaticResource BgPanel}">
-              <StackPanel Margin="16">
-                <TextBlock Text="Server Statistics" Style="{StaticResource SectionHeader}"/>
-                
+            <Grid Background="{StaticResource BgPanel}" Margin="12">
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+              </Grid.RowDefinitions>
+
+              <StackPanel Grid.Row="0">
+                <TextBlock Text="Server Statistics" Style="{StaticResource SectionHeader}" Margin="0,0,0,8"/>
                 <Grid>
                   <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
@@ -992,69 +1002,128 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                   <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="Auto"/>
                   </Grid.RowDefinitions>
 
-                  <!-- Stat Cards -->
                   <Border Grid.Row="0" Grid.Column="0" Background="{StaticResource BgCard}"
-                          CornerRadius="6" Padding="16" Margin="0,0,8,8">
+                          CornerRadius="6" Padding="14" Margin="0,0,8,8">
                     <StackPanel>
                       <TextBlock Text="Total Scopes" Style="{StaticResource FormLabel}"/>
-                      <TextBlock x:Name="StatTotalScopes" Text="0" FontSize="28" FontWeight="Bold"
+                      <TextBlock x:Name="StatTotalScopes" Text="0" FontSize="26" FontWeight="Bold"
                                  Foreground="{StaticResource Accent}"/>
                     </StackPanel>
                   </Border>
 
                   <Border Grid.Row="0" Grid.Column="1" Background="{StaticResource BgCard}"
-                          CornerRadius="6" Padding="16" Margin="4,0,4,8">
+                          CornerRadius="6" Padding="14" Margin="4,0,4,8">
                     <StackPanel>
                       <TextBlock Text="Active Leases" Style="{StaticResource FormLabel}"/>
-                      <TextBlock x:Name="StatActiveLeases" Text="0" FontSize="28" FontWeight="Bold"
+                      <TextBlock x:Name="StatActiveLeases" Text="0" FontSize="26" FontWeight="Bold"
                                  Foreground="{StaticResource Success}"/>
                     </StackPanel>
                   </Border>
 
                   <Border Grid.Row="0" Grid.Column="2" Background="{StaticResource BgCard}"
-                          CornerRadius="6" Padding="16" Margin="8,0,0,8">
+                          CornerRadius="6" Padding="14" Margin="8,0,0,8">
                     <StackPanel>
                       <TextBlock Text="Reservations" Style="{StaticResource FormLabel}"/>
-                      <TextBlock x:Name="StatReservations" Text="0" FontSize="28" FontWeight="Bold"
+                      <TextBlock x:Name="StatReservations" Text="0" FontSize="26" FontWeight="Bold"
                                  Foreground="{StaticResource Warning}"/>
                     </StackPanel>
                   </Border>
 
                   <Border Grid.Row="1" Grid.Column="0" Background="{StaticResource BgCard}"
-                          CornerRadius="6" Padding="16" Margin="0,0,8,8">
+                          CornerRadius="6" Padding="14" Margin="0,0,8,8">
                     <StackPanel>
                       <TextBlock Text="Available IPs" Style="{StaticResource FormLabel}"/>
-                      <TextBlock x:Name="StatAvailableIPs" Text="0" FontSize="28" FontWeight="Bold"
+                      <TextBlock x:Name="StatAvailableIPs" Text="0" FontSize="26" FontWeight="Bold"
                                  Foreground="{StaticResource TextPrimary}"/>
                     </StackPanel>
                   </Border>
 
                   <Border Grid.Row="1" Grid.Column="1" Background="{StaticResource BgCard}"
-                          CornerRadius="6" Padding="16" Margin="4,0,4,8">
+                          CornerRadius="6" Padding="14" Margin="4,0,4,8">
                     <StackPanel>
                       <TextBlock Text="Total Addresses" Style="{StaticResource FormLabel}"/>
-                      <TextBlock x:Name="StatTotalIPs" Text="0" FontSize="28" FontWeight="Bold"
+                      <TextBlock x:Name="StatTotalIPs" Text="0" FontSize="26" FontWeight="Bold"
                                  Foreground="{StaticResource TextPrimary}"/>
                     </StackPanel>
                   </Border>
 
                   <Border Grid.Row="1" Grid.Column="2" Background="{StaticResource BgCard}"
-                          CornerRadius="6" Padding="16" Margin="8,0,0,8">
+                          CornerRadius="6" Padding="14" Margin="8,0,0,8">
                     <StackPanel>
-                      <TextBlock Text="Utilization" Style="{StaticResource FormLabel}"/>
-                      <TextBlock x:Name="StatUtilization" Text="0%" FontSize="28" FontWeight="Bold"
+                      <TextBlock Text="Server Utilization" Style="{StaticResource FormLabel}"/>
+                      <TextBlock x:Name="StatUtilization" Text="0%" FontSize="26" FontWeight="Bold"
                                  Foreground="{StaticResource Accent}"/>
                     </StackPanel>
                   </Border>
                 </Grid>
-
-                <Button x:Name="BtnRefreshStats" Content="🔄 Refresh Statistics" Margin="0,16,0,0"
-                        Style="{StaticResource BtnPrimary}" HorizontalAlignment="Left" IsEnabled="False"/>
               </StackPanel>
-            </ScrollViewer>
+
+              <Border Grid.Row="1" Background="{StaticResource BgCard}" CornerRadius="6"
+                      Padding="10,8" Margin="0,0,0,8">
+                <WrapPanel Orientation="Horizontal">
+                  <Button x:Name="BtnRefreshStats" Content="🔄 Refresh All Scopes" Margin="0,0,8,4"
+                          Style="{StaticResource BtnPrimary}" IsEnabled="False"
+                          ToolTip="Load server totals and per-scope utilization for every scope"/>
+                  <TextBlock Text="Flag at ≥" Style="{StaticResource FormLabel}"
+                             VerticalAlignment="Center" Margin="4,0,6,4"/>
+                  <ComboBox x:Name="CboUtilThreshold" Width="72" Height="28" Margin="0,0,12,4"
+                            Background="{StaticResource BgDeep}" Foreground="{StaticResource TextPrimary}"
+                            BorderBrush="{StaticResource Border}"
+                            ToolTip="Scopes at or above this utilization are flagged Critical">
+                    <ComboBoxItem Content="70%"/>
+                    <ComboBoxItem Content="80%"/>
+                    <ComboBoxItem Content="85%"/>
+                    <ComboBoxItem Content="90%" IsSelected="True"/>
+                    <ComboBoxItem Content="95%"/>
+                  </ComboBox>
+                  <TextBlock Text="Show:" Style="{StaticResource FormLabel}"
+                             VerticalAlignment="Center" Margin="0,0,6,4"/>
+                  <ComboBox x:Name="CboScopeStatFilter" Width="150" Height="28" Margin="0,0,12,4"
+                            Background="{StaticResource BgDeep}" Foreground="{StaticResource TextPrimary}"
+                            BorderBrush="{StaticResource Border}">
+                    <ComboBoxItem Content="All scopes" IsSelected="True"/>
+                    <ComboBoxItem Content="Warning + Critical"/>
+                    <ComboBoxItem Content="Critical only"/>
+                  </ComboBox>
+                  <Button x:Name="BtnScopeStatDetails" Content="🔍 Scope Details" Margin="0,0,8,4"
+                          Style="{StaticResource BtnSecondary}" IsEnabled="False"
+                          ToolTip="Open detailed statistics for the selected scope"/>
+                  <Button x:Name="BtnExportScopeStats" Content="💾 Export" Margin="0,0,0,4"
+                          Style="{StaticResource BtnSecondary}" IsEnabled="False"
+                          ToolTip="Export the visible scope statistics to CSV"/>
+                </WrapPanel>
+              </Border>
+
+              <Border x:Name="ScopeUtilAlertBanner" Grid.Row="2" Background="#3A2418"
+                      BorderBrush="{StaticResource Warning}" BorderThickness="1"
+                      CornerRadius="4" Padding="10,8" Margin="0,0,0,8" Visibility="Collapsed">
+                <TextBlock x:Name="TxtScopeUtilAlert" Text="" Foreground="{StaticResource Warning}"
+                           FontWeight="SemiBold" TextWrapping="Wrap"/>
+              </Border>
+
+              <DataGrid Grid.Row="3" x:Name="GridScopeStats" Style="{StaticResource DarkGrid}"
+                        Margin="0,0,0,8" IsReadOnly="True" SelectionMode="Single">
+                <DataGrid.Columns>
+                  <DataGridTextColumn Header="Status" Binding="{Binding Status}" Width="120"/>
+                  <DataGridTextColumn Header="Util %" Binding="{Binding PercentDisplay}" Width="70"/>
+                  <DataGridTextColumn Header="Scope ID" Binding="{Binding ScopeId}" Width="110"/>
+                  <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="160"/>
+                  <DataGridTextColumn Header="State" Binding="{Binding State}" Width="80"/>
+                  <DataGridTextColumn Header="In Use" Binding="{Binding InUse}" Width="70"/>
+                  <DataGridTextColumn Header="Free" Binding="{Binding Free}" Width="70"/>
+                  <DataGridTextColumn Header="Total" Binding="{Binding Total}" Width="70"/>
+                  <DataGridTextColumn Header="Reserved" Binding="{Binding Reserved}" Width="80"/>
+                  <DataGridTextColumn Header="Pending" Binding="{Binding Pending}" Width="70"/>
+                  <DataGridTextColumn Header="Range" Binding="{Binding RangeDisplay}" Width="*"/>
+                </DataGrid.Columns>
+              </DataGrid>
+
+              <TextBlock Grid.Row="4" x:Name="TxtScopeStatStatus"
+                         Text="Connect to a DHCP server, then click Refresh All Scopes."
+                         Style="{StaticResource FormLabel}" TextWrapping="Wrap"/>
+            </Grid>
           </TabItem>
 
           <!-- TAB: Compare Servers (NEW) -->
@@ -1664,6 +1733,14 @@ try {
     $script:StatTotalIPs     = $Window.FindName("StatTotalIPs")
     $script:StatUtilization  = $Window.FindName("StatUtilization")
     $script:BtnRefreshStats  = $Window.FindName("BtnRefreshStats")
+    $script:CboUtilThreshold = $Window.FindName("CboUtilThreshold")
+    $script:CboScopeStatFilter = $Window.FindName("CboScopeStatFilter")
+    $script:BtnScopeStatDetails = $Window.FindName("BtnScopeStatDetails")
+    $script:BtnExportScopeStats = $Window.FindName("BtnExportScopeStats")
+    $script:ScopeUtilAlertBanner = $Window.FindName("ScopeUtilAlertBanner")
+    $script:TxtScopeUtilAlert = $Window.FindName("TxtScopeUtilAlert")
+    $script:GridScopeStats   = $Window.FindName("GridScopeStats")
+    $script:TxtScopeStatStatus = $Window.FindName("TxtScopeStatStatus")
     
     # Log Tab
     $script:TxtLog           = $Window.FindName("TxtLog")
@@ -2302,6 +2379,8 @@ function Enable-ConnectedControls {
             $script:BtnRefresh.IsEnabled = $Connected
             $script:BtnScopeAdd.IsEnabled = $Connected
             $script:BtnRefreshStats.IsEnabled = $Connected
+            if ($null -ne $script:BtnScopeStatDetails) { $script:BtnScopeStatDetails.IsEnabled = $Connected }
+            if ($null -ne $script:BtnExportScopeStats) { $script:BtnExportScopeStats.IsEnabled = $Connected }
         }, [System.Windows.Threading.DispatcherPriority]::Normal)
         
         Write-ActionLog "Controls enabled state set to: $Connected" "INFO"
@@ -3592,44 +3671,574 @@ function Load-Policies {
     }
 }
 
+function Get-ScopeUtilThresholdPercent {
+    $threshold = 90
+    try {
+        if ($null -ne $script:CboUtilThreshold -and $null -ne $script:CboUtilThreshold.SelectedItem) {
+            $text = "$($script:CboUtilThreshold.SelectedItem.Content)" -replace '[^0-9]', ''
+            $parsed = 0
+            if ([int]::TryParse($text, [ref]$parsed) -and $parsed -gt 0 -and $parsed -le 100) {
+                $threshold = $parsed
+            }
+        }
+    } catch {}
+    $Global:ScopeUtilThreshold = $threshold
+    return $threshold
+}
+
+function Get-ScopeUtilLevel {
+    param(
+        [double]$PercentInUse,
+        [int]$Threshold = 90
+    )
+    
+    $warnAt = [math]::Max(0, $Threshold - 10)
+    if ($PercentInUse -ge $Threshold) { return 'Critical' }
+    if ($PercentInUse -ge $warnAt) { return 'Warning' }
+    return 'OK'
+}
+
+function Get-ScopeStatFilterMode {
+    $mode = 'All scopes'
+    try {
+        if ($null -ne $script:CboScopeStatFilter -and $null -ne $script:CboScopeStatFilter.SelectedItem) {
+            $mode = "$($script:CboScopeStatFilter.SelectedItem.Content)"
+        }
+    } catch {}
+    return $mode
+}
+
+function Update-ScopeUtilAlertBanner {
+    param(
+        [int]$CriticalCount = 0,
+        [int]$WarningCount = 0,
+        [int]$Threshold = 90,
+        [object[]]$CriticalScopes = @()
+    )
+    
+    try {
+        $script:Window.Dispatcher.Invoke([action]{
+            if ($null -eq $script:ScopeUtilAlertBanner -or $null -eq $script:TxtScopeUtilAlert) { return }
+            
+            if ($CriticalCount -le 0 -and $WarningCount -le 0) {
+                $script:ScopeUtilAlertBanner.Visibility = [System.Windows.Visibility]::Collapsed
+                $script:TxtScopeUtilAlert.Text = ''
+                return
+            }
+            
+            $parts = [System.Collections.Generic.List[string]]::new()
+            if ($CriticalCount -gt 0) {
+                $names = @($CriticalScopes | ForEach-Object {
+                    $label = "$($_.Name)"
+                    if (-not $label) { $label = "$($_.ScopeId)" }
+                    "$label ($($_.PercentDisplay))"
+                } | Select-Object -First 8)
+                $list = $names -join '; '
+                if ($CriticalCount -gt 8) { $list = "$list; …" }
+                [void]$parts.Add("$CriticalCount scope(s) at or above ${Threshold}% utilization: $list")
+            }
+            if ($WarningCount -gt 0) {
+                $warnAt = [math]::Max(0, $Threshold - 10)
+                [void]$parts.Add("$WarningCount scope(s) in the warning band (${warnAt}–$([math]::Max(0, $Threshold - 1))%). Double-click a row for details.")
+            } else {
+                [void]$parts.Add('Double-click a flagged scope (or select and click Scope Details) for full statistics.')
+            }
+            
+            $script:TxtScopeUtilAlert.Text = ($parts -join '  ')
+            $script:ScopeUtilAlertBanner.Visibility = [System.Windows.Visibility]::Visible
+        }, [System.Windows.Threading.DispatcherPriority]::Normal)
+    } catch {}
+}
+
+function Apply-ScopeStatFilter {
+    $mode = Get-ScopeStatFilterMode
+    $visible = [System.Collections.Generic.List[object]]::new()
+    
+    foreach ($row in @($Global:ScopeStatEntriesAll)) {
+        if ($null -eq $row) { continue }
+        $level = "$($row.Level)"
+        switch ($mode) {
+            'Critical only' {
+                if ($level -eq 'Critical') { [void]$visible.Add($row) }
+            }
+            'Warning + Critical' {
+                if ($level -eq 'Critical' -or $level -eq 'Warning') { [void]$visible.Add($row) }
+            }
+            default {
+                [void]$visible.Add($row)
+            }
+        }
+    }
+    
+    try {
+        $script:Window.Dispatcher.Invoke([action]{
+            $Global:ScopeStatEntries.Clear()
+            foreach ($row in $visible) {
+                [void]$Global:ScopeStatEntries.Add($row)
+            }
+            if ($null -ne $script:GridScopeStats) {
+                if ($null -eq $script:GridScopeStats.ItemsSource) {
+                    $script:GridScopeStats.ItemsSource = $Global:ScopeStatEntries
+                }
+            }
+            if ($null -ne $script:TxtScopeStatStatus) {
+                $shown = Get-SafeCount $visible
+                $total = Get-SafeCount $Global:ScopeStatEntriesAll
+                $script:TxtScopeStatStatus.Text = "Showing $shown of $total scope(s)  ·  Filter: $mode  ·  Flag threshold: $(Get-ScopeUtilThresholdPercent)%"
+            }
+        }, [System.Windows.Threading.DispatcherPriority]::Normal)
+    } catch {
+        Write-ActionLog "Failed to apply scope stats filter: $_" "ERROR"
+    }
+}
+
+function New-ScopeStatRow {
+    param(
+        [object]$Scope,
+        [object]$Stat,
+        [int]$Threshold = 90
+    )
+    
+    $inUse = 0
+    $free = 0
+    $reserved = 0
+    $pending = 0
+    $pct = 0.0
+    
+    try { $inUse = [int]$Stat.AddressesInUse } catch { $inUse = 0 }
+    try { $free = [int]$Stat.AddressesFree } catch { $free = 0 }
+    try { $reserved = [int]$Stat.ReservedAddress } catch {
+        try { $reserved = [int]$Stat.ReservedAddresses } catch { $reserved = 0 }
+    }
+    try { $pending = [int]$Stat.PendingOffers } catch { $pending = 0 }
+    
+    $total = $inUse + $free
+    try {
+        if ($null -ne $Stat.PercentageInUse) {
+            $pct = [double]$Stat.PercentageInUse
+        } elseif ($total -gt 0) {
+            $pct = ($inUse / [double]$total) * 100.0
+        }
+    } catch {
+        if ($total -gt 0) { $pct = ($inUse / [double]$total) * 100.0 }
+    }
+    $pct = [math]::Round($pct, 1)
+    
+    $level = Get-ScopeUtilLevel -PercentInUse $pct -Threshold $Threshold
+    $status = switch ($level) {
+        'Critical' { "Critical ≥${Threshold}%" }
+        'Warning'  { 'Warning' }
+        default    { 'OK' }
+    }
+    
+    $startRange = ''
+    $endRange = ''
+    $mask = ''
+    $lease = ''
+    $name = ''
+    $state = ''
+    $desc = ''
+    $scopeId = ''
+    
+    try { $scopeId = "$($Scope.ScopeId)" } catch {
+        try { $scopeId = "$($Stat.ScopeId)" } catch { $scopeId = '' }
+    }
+    try { $name = "$($Scope.Name)" } catch { $name = '' }
+    try { $state = "$($Scope.State)" } catch { $state = '' }
+    try { $startRange = "$($Scope.StartRange)" } catch { $startRange = '' }
+    try { $endRange = "$($Scope.EndRange)" } catch { $endRange = '' }
+    try { $mask = "$($Scope.SubnetMask)" } catch { $mask = '' }
+    try { $desc = "$($Scope.Description)" } catch { $desc = '' }
+    try {
+        if ($null -ne $Scope.LeaseDuration) {
+            $lease = "$($Scope.LeaseDuration)"
+        }
+    } catch { $lease = '' }
+    
+    $rangeDisplay = if ($startRange -and $endRange) { "$startRange – $endRange" } else { '' }
+    
+    return [PSCustomObject]@{
+        ScopeId         = $scopeId
+        Name            = $name
+        State           = $state
+        Description     = $desc
+        StartRange      = $startRange
+        EndRange        = $endRange
+        SubnetMask      = $mask
+        LeaseDuration   = $lease
+        RangeDisplay    = $rangeDisplay
+        InUse           = $inUse
+        Free            = $free
+        Total           = $total
+        Reserved        = $reserved
+        Pending         = $pending
+        PercentInUse    = $pct
+        PercentDisplay  = "$pct%"
+        Level           = $level
+        Status          = $status
+        Threshold       = $threshold
+    }
+}
+
+function Show-ScopeStatDetailDialog {
+    <#
+    .SYNOPSIS
+        Modal with detailed utilization and scope configuration for one scope
+    #>
+    param([object]$Entry)
+    
+    if ($null -eq $Entry) {
+        Show-MessageBox "Select a scope row first (or double-click a row)." "Scope Details" OK Warning
+        return
+    }
+    
+    $scopeId = "$($Entry.ScopeId)"
+    $exclusions = [System.Collections.Generic.List[string]]::new()
+    $exclusionCount = 0
+    $reservationSamples = [System.Collections.Generic.List[string]]::new()
+    
+    if ($Global:DHCPServer -and $scopeId) {
+        try {
+            $ex = @(Get-DhcpServerv4ExclusionRange -ComputerName $Global:DHCPServer -ScopeId $scopeId -ErrorAction SilentlyContinue)
+            $exclusionCount = Get-SafeCount $ex
+            foreach ($item in $ex) {
+                [void]$exclusions.Add("$($item.StartRange) – $($item.EndRange)")
+                if ((Get-SafeCount $exclusions) -ge 20) { break }
+            }
+        } catch {}
+        
+        try {
+            $res = @(Get-DhcpServerv4Reservation -ComputerName $Global:DHCPServer -ScopeId $scopeId -ErrorAction SilentlyContinue |
+                Select-Object -First 15)
+            foreach ($r in $res) {
+                [void]$reservationSamples.Add("$($r.IPAddress)  $($r.ClientId)  $($r.Name)")
+            }
+        } catch {}
+    }
+    
+    $level = "$($Entry.Level)"
+    $advice = switch ($level) {
+        'Critical' {
+            "This scope is at or above the $($Entry.Threshold)% flag threshold. Consider expanding the range, reclaiming stale leases, adding a secondary scope/superscope, or reducing lease duration if appropriate."
+        }
+        'Warning' {
+            "This scope is approaching capacity. Monitor growth and plan expansion before it reaches $($Entry.Threshold)%."
+        }
+        default {
+            "Utilization is within the configured threshold. No immediate capacity action required based on this scan."
+        }
+    }
+    
+    $exclusionText = if ($exclusionCount -gt 0) {
+        $joined = ($exclusions -join [Environment]::NewLine)
+        if ($exclusionCount -gt (Get-SafeCount $exclusions)) {
+            "$joined`n… ($exclusionCount total)"
+        } else {
+            $joined
+        }
+    } else {
+        '(none)'
+    }
+    
+    $resText = if ((Get-SafeCount $reservationSamples) -gt 0) {
+        ($reservationSamples -join [Environment]::NewLine)
+    } else {
+        '(none listed)'
+    }
+    
+    [xml]$dialogXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Scope Statistics Details"
+        Height="640" Width="760"
+        MinHeight="480" MinWidth="600"
+        WindowStartupLocation="CenterOwner"
+        Background="#1A1D23"
+        FontFamily="Segoe UI" FontSize="13"
+        ResizeMode="CanResizeWithGrip">
+  <Grid Margin="16">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+
+    <StackPanel Grid.Row="0" Margin="0,0,0,12">
+      <TextBlock x:Name="TxtScopeDetailTitle" Foreground="#E8EAF0" FontSize="18" FontWeight="SemiBold"/>
+      <TextBlock x:Name="TxtScopeDetailSubtitle" Foreground="#9AA3B2" FontSize="12" Margin="0,4,0,0" TextWrapping="Wrap"/>
+    </StackPanel>
+
+    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+      <StackPanel>
+        <Border Background="#22262E" CornerRadius="6" Padding="12" Margin="0,0,0,10">
+          <StackPanel>
+            <TextBlock Text="Utilization" Foreground="#90CAF9" FontWeight="SemiBold" Margin="0,0,0,8"/>
+            <TextBlock x:Name="TxtScopeDetailUtil" Foreground="#E8EAF0" TextWrapping="Wrap"/>
+          </StackPanel>
+        </Border>
+        <Border Background="#22262E" CornerRadius="6" Padding="12" Margin="0,0,0,10">
+          <StackPanel>
+            <TextBlock Text="Scope configuration" Foreground="#90CAF9" FontWeight="SemiBold" Margin="0,0,0,8"/>
+            <TextBlock x:Name="TxtScopeDetailConfig" Foreground="#E8EAF0" TextWrapping="Wrap"/>
+          </StackPanel>
+        </Border>
+        <Border Background="#22262E" CornerRadius="6" Padding="12" Margin="0,0,0,10">
+          <StackPanel>
+            <TextBlock Text="Guidance" Foreground="#90CAF9" FontWeight="SemiBold" Margin="0,0,0,8"/>
+            <TextBlock x:Name="TxtScopeDetailAdvice" Foreground="#E8EAF0" TextWrapping="Wrap"/>
+          </StackPanel>
+        </Border>
+        <Border Background="#22262E" CornerRadius="6" Padding="12" Margin="0,0,0,10">
+          <StackPanel>
+            <TextBlock Text="Exclusion ranges" Foreground="#90CAF9" FontWeight="SemiBold" Margin="0,0,0,8"/>
+            <TextBox x:Name="TxtScopeDetailExclusions" IsReadOnly="True" TextWrapping="Wrap"
+                     AcceptsReturn="True" MinHeight="70" VerticalScrollBarVisibility="Auto"
+                     Background="#12151A" Foreground="#C5CAD3" BorderBrush="#383E4A"
+                     BorderThickness="1" Padding="8,6" FontFamily="Consolas" FontSize="12"/>
+          </StackPanel>
+        </Border>
+        <Border Background="#22262E" CornerRadius="6" Padding="12">
+          <StackPanel>
+            <TextBlock Text="Reservations (sample)" Foreground="#90CAF9" FontWeight="SemiBold" Margin="0,0,0,8"/>
+            <TextBox x:Name="TxtScopeDetailReservations" IsReadOnly="True" TextWrapping="Wrap"
+                     AcceptsReturn="True" MinHeight="90" VerticalScrollBarVisibility="Auto"
+                     Background="#12151A" Foreground="#C5CAD3" BorderBrush="#383E4A"
+                     BorderThickness="1" Padding="8,6" FontFamily="Consolas" FontSize="12"/>
+          </StackPanel>
+        </Border>
+      </StackPanel>
+    </ScrollViewer>
+
+    <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+      <Button x:Name="BtnScopeDetailCopy" Content="Copy Details" Width="120" Height="30" Margin="0,0,8,0"
+              Background="#2A2F3A" Foreground="#E8EAF0" BorderBrush="#383E4A" BorderThickness="1"/>
+      <Button x:Name="BtnScopeDetailClose" Content="Close" Width="90" Height="30" IsDefault="True" IsCancel="True"
+              Background="#2196F3" Foreground="White" BorderThickness="0"/>
+    </StackPanel>
+  </Grid>
+</Window>
+'@
+    
+    $title = if ("$($Entry.Name)") { "$($Entry.Name)  ($scopeId)" } else { "Scope $scopeId" }
+    $subtitle = "Status: $($Entry.Status)  ·  State: $($Entry.State)  ·  Server: $($Global:DHCPServer)"
+    $utilText = @(
+        "Utilization: $($Entry.PercentDisplay)  ($($Entry.Level))"
+        "In use: $($Entry.InUse)    Free: $($Entry.Free)    Total pool: $($Entry.Total)"
+        "Reserved addresses: $($Entry.Reserved)    Pending offers: $($Entry.Pending)"
+        "Flag threshold: $($Entry.Threshold)%"
+    ) -join [Environment]::NewLine
+    
+    $configText = @(
+        "Scope ID: $($Entry.ScopeId)"
+        "Name: $($Entry.Name)"
+        "Description: $($Entry.Description)"
+        "Range: $($Entry.RangeDisplay)"
+        "Subnet mask: $($Entry.SubnetMask)"
+        "Lease duration: $($Entry.LeaseDuration)"
+        "Exclusion ranges: $exclusionCount"
+    ) -join [Environment]::NewLine
+    
+    $copyBlock = @(
+        "DHCP Scope Statistics"
+        $title
+        $subtitle
+        ''
+        $utilText
+        ''
+        $configText
+        ''
+        "Guidance:"
+        $advice
+        ''
+        "Exclusions:"
+        $exclusionText
+        ''
+        "Reservations (sample):"
+        $resText
+    ) -join [Environment]::NewLine
+    
+    try {
+        $dialog = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($dialogXaml))
+        if ($script:Window) { $dialog.Owner = $script:Window }
+        
+        $dialog.FindName('TxtScopeDetailTitle').Text = $title
+        $dialog.FindName('TxtScopeDetailSubtitle').Text = $subtitle
+        $dialog.FindName('TxtScopeDetailUtil').Text = $utilText
+        $dialog.FindName('TxtScopeDetailConfig').Text = $configText
+        $dialog.FindName('TxtScopeDetailAdvice').Text = $advice
+        $dialog.FindName('TxtScopeDetailExclusions').Text = $exclusionText
+        $dialog.FindName('TxtScopeDetailReservations').Text = $resText
+        
+        $script:ScopeDetailCopyText = $copyBlock
+        $script:ScopeDetailScopeId = $scopeId
+        
+        $dialog.FindName('BtnScopeDetailCopy').add_Click({
+            try {
+                [System.Windows.Clipboard]::SetText("$($script:ScopeDetailCopyText)")
+                Write-ActionLog "Copied scope statistics details for $($script:ScopeDetailScopeId)" "INFO"
+            } catch {
+                Show-MessageBox "Could not copy to clipboard: $_" "Scope Details" OK Warning
+            }
+        })
+        
+        $dialog.FindName('BtnScopeDetailClose').add_Click({
+            $dialog.DialogResult = $true
+            $dialog.Close()
+        })
+        
+        [void]$dialog.ShowDialog()
+    } catch {
+        Write-ActionLog "Scope detail dialog failed: $_" "ERROR"
+        Show-MessageBox "Failed to open scope details: $_" "Scope Details" OK Error
+    } finally {
+        $script:ScopeDetailCopyText = $null
+        $script:ScopeDetailScopeId = $null
+    }
+}
+
 function Load-Statistics {
     <#
     .SYNOPSIS
-        Loads and displays server statistics
+        Loads server totals and per-scope utilization for every scope
     #>
     
-    Write-ActionLog "Loading server statistics..." "INFO"
-    Set-Status "Loading statistics..."
+    if ([string]::IsNullOrWhiteSpace($Global:DHCPServer)) {
+        Show-MessageBox "Connect to a DHCP server first." "Statistics" OK Warning
+        return
+    }
+    
+    Write-ActionLog "Loading server + per-scope statistics..." "INFO"
+    Set-Status "Loading scope statistics..."
+    
+    $threshold = Get-ScopeUtilThresholdPercent
+    Start-TaskProgress -Name 'ScopeStats' -Message "Loading scopes from $($Global:DHCPServer)..." -CanPause -Total 0
     
     try {
-        $stats = Get-DhcpServerv4Statistics -ComputerName $Global:DHCPServer -ErrorAction Stop
         $scopes = @(Get-DhcpServerv4Scope -ComputerName $Global:DHCPServer -ErrorAction Stop)
+        $scopeCount = Get-SafeCount $scopes
         
-        $totalReservations = 0
-        foreach ($scope in $scopes) {
+        Update-TaskProgress -Processed 0 -Total ([math]::Max(1, $scopeCount + 2)) -Message "Loading server totals..."
+        Wait-TaskProgressIfPaused
+        if (Test-TaskCancelRequested) {
+            Write-ActionLog "Scope statistics load cancelled" "WARN"
+            Set-Status "Statistics cancelled"
+            return
+        }
+        
+        $serverStats = $null
+        try {
+            $serverStats = Get-DhcpServerv4Statistics -ComputerName $Global:DHCPServer -ErrorAction Stop
+        } catch {
+            Write-ActionLog "Server statistics unavailable: $_" "WARN"
+        }
+        
+        Update-TaskProgress -Processed 1 -Message "Loading per-scope utilization ($scopeCount scopes)..."
+        Wait-TaskProgressIfPaused
+        if (Test-TaskCancelRequested) {
+            Write-ActionLog "Scope statistics load cancelled" "WARN"
+            Set-Status "Statistics cancelled"
+            return
+        }
+        
+        $allScopeStats = @()
+        try {
+            $allScopeStats = @(Get-DhcpServerv4ScopeStatistics -ComputerName $Global:DHCPServer -ErrorAction Stop)
+        } catch {
+            Write-ActionLog "Bulk scope statistics failed; falling back per scope: $_" "WARN"
+            $allScopeStats = @()
+        }
+        
+        $statsById = @{}
+        foreach ($ss in $allScopeStats) {
             try {
-                $res = @(Get-DhcpServerv4Reservation -ComputerName $Global:DHCPServer -ScopeId $scope.ScopeId -ErrorAction SilentlyContinue)
-                $totalReservations += (Get-SafeCount $res)
+                $key = "$($ss.ScopeId)"
+                if ($key) { $statsById[$key] = $ss }
             } catch {}
         }
         
-        $script:Window.Dispatcher.Invoke([action]{
-            $script:StatTotalScopes.Text = "$($stats.TotalScopes)"
-            $script:StatActiveLeases.Text = "$($stats.InUse)"
-            $script:StatReservations.Text = "$totalReservations"
-            $script:StatAvailableIPs.Text = "$($stats.Available)"
-            $script:StatTotalIPs.Text = "$($stats.TotalAddresses)"
+        $rows = [System.Collections.Generic.List[object]]::new()
+        $totalReserved = 0
+        $idx = 0
+        
+        foreach ($scope in $scopes) {
+            Wait-TaskProgressIfPaused
+            if (Test-TaskCancelRequested) { break }
             
-            if ($stats.TotalAddresses -gt 0) {
-                $util = [math]::Round(($stats.InUse / $stats.TotalAddresses) * 100, 1)
-                $script:StatUtilization.Text = "$util%"
+            $idx++
+            $sid = "$($scope.ScopeId)"
+            Update-TaskProgress -Processed ($idx + 1) -Total ($scopeCount + 2) -Message "Scope $idx/$scopeCount — $sid"
+            
+            $stat = $null
+            if ($statsById.ContainsKey($sid)) {
+                $stat = $statsById[$sid]
             } else {
-                $script:StatUtilization.Text = "N/A"
+                try {
+                    $stat = Get-DhcpServerv4ScopeStatistics -ComputerName $Global:DHCPServer -ScopeId $scope.ScopeId -ErrorAction Stop
+                } catch {
+                    Write-ActionLog "Stats failed for scope $sid : $_" "WARN"
+                    continue
+                }
+            }
+            
+            if ($null -eq $stat) { continue }
+            
+            $row = New-ScopeStatRow -Scope $scope -Stat $stat -Threshold $threshold
+            [void]$rows.Add($row)
+            try { $totalReserved += [int]$row.Reserved } catch {}
+        }
+        
+        if (Test-TaskCancelRequested) {
+            Write-ActionLog "Scope statistics load cancelled after partial results" "WARN"
+        }
+        
+        # Highest utilization first, then name
+        $sorted = @($rows | Sort-Object -Property @{ Expression = 'PercentInUse'; Descending = $true }, @{ Expression = 'Name'; Descending = $false })
+        
+        $Global:ScopeStatEntriesAll.Clear()
+        foreach ($row in $sorted) {
+            [void]$Global:ScopeStatEntriesAll.Add($row)
+        }
+        
+        $critical = @($sorted | Where-Object { "$($_.Level)" -eq 'Critical' })
+        $warning = @($sorted | Where-Object { "$($_.Level)" -eq 'Warning' })
+        $criticalCount = Get-SafeCount $critical
+        $warningCount = Get-SafeCount $warning
+        
+        $script:Window.Dispatcher.Invoke([action]{
+            if ($null -ne $serverStats) {
+                $script:StatTotalScopes.Text = "$($serverStats.TotalScopes)"
+                $script:StatActiveLeases.Text = "$($serverStats.InUse)"
+                $script:StatAvailableIPs.Text = "$($serverStats.Available)"
+                $script:StatTotalIPs.Text = "$($serverStats.TotalAddresses)"
+                if ($serverStats.TotalAddresses -gt 0) {
+                    $util = [math]::Round(($serverStats.InUse / $serverStats.TotalAddresses) * 100, 1)
+                    $script:StatUtilization.Text = "$util%"
+                    if ($util -ge $threshold) {
+                        $script:StatUtilization.Foreground = [System.Windows.Media.Brushes]::Tomato
+                    } elseif ($util -ge ($threshold - 10)) {
+                        $script:StatUtilization.Foreground = [System.Windows.Media.Brushes]::Orange
+                    } else {
+                        $script:StatUtilization.Foreground = [System.Windows.Media.Brushes]::DodgerBlue
+                    }
+                } else {
+                    $script:StatUtilization.Text = "N/A"
+                }
+            } else {
+                $script:StatTotalScopes.Text = "$(Get-SafeCount $sorted)"
+            }
+            $script:StatReservations.Text = "$totalReserved"
+            
+            if ($null -ne $script:GridScopeStats -and $null -eq $script:GridScopeStats.ItemsSource) {
+                $script:GridScopeStats.ItemsSource = $Global:ScopeStatEntries
             }
         }, [System.Windows.Threading.DispatcherPriority]::Normal)
         
-        Write-ActionLog "Statistics loaded successfully" "SUCCESS"
-        Set-Status "Statistics updated"
+        Apply-ScopeStatFilter
+        Update-ScopeUtilAlertBanner -CriticalCount $criticalCount -WarningCount $warningCount -Threshold $threshold -CriticalScopes $critical
+        
+        $msg = "Scope statistics: $(Get-SafeCount $sorted) scope(s); $criticalCount critical (≥${threshold}%); $warningCount warning"
+        Write-ActionLog $msg "SUCCESS"
+        Set-Status $msg
         Update-LogDisplay
         
     } catch {
@@ -3637,6 +4246,9 @@ function Load-Statistics {
         Write-ActionLog $errMsg "ERROR"
         Set-Status $errMsg
         Update-LogDisplay
+        Show-MessageBox $errMsg "Statistics" OK Error
+    } finally {
+        Complete-TaskProgress
     }
 }
 #endregion
@@ -6917,9 +7529,120 @@ $GridPolicies.add_SelectionChanged({
 
 #region Event Handlers - Statistics
 $BtnRefreshStats.add_Click({
-    Write-ActionLog "Refreshing statistics..." "INFO"
+    Write-ActionLog "Refreshing statistics (all scopes)..." "INFO"
     Load-Statistics
 })
+
+if ($null -ne $script:CboUtilThreshold) {
+    $script:CboUtilThreshold.add_SelectionChanged({
+        if ((Get-SafeCount $Global:ScopeStatEntriesAll) -eq 0) { return }
+        # Re-level existing rows against the new threshold without a full server round-trip
+        $threshold = Get-ScopeUtilThresholdPercent
+        $rebuilt = [System.Collections.Generic.List[object]]::new()
+        foreach ($row in @($Global:ScopeStatEntriesAll)) {
+            if ($null -eq $row) { continue }
+            $pct = 0.0
+            try { $pct = [double]$row.PercentInUse } catch { $pct = 0.0 }
+            $level = Get-ScopeUtilLevel -PercentInUse $pct -Threshold $threshold
+            $status = switch ($level) {
+                'Critical' { "Critical ≥${threshold}%" }
+                'Warning'  { 'Warning' }
+                default    { 'OK' }
+            }
+            [void]$rebuilt.Add([PSCustomObject]@{
+                ScopeId         = $row.ScopeId
+                Name            = $row.Name
+                State           = $row.State
+                Description     = $row.Description
+                StartRange      = $row.StartRange
+                EndRange        = $row.EndRange
+                SubnetMask      = $row.SubnetMask
+                LeaseDuration   = $row.LeaseDuration
+                RangeDisplay    = $row.RangeDisplay
+                InUse           = $row.InUse
+                Free            = $row.Free
+                Total           = $row.Total
+                Reserved        = $row.Reserved
+                Pending         = $row.Pending
+                PercentInUse    = $row.PercentInUse
+                PercentDisplay  = $row.PercentDisplay
+                Level           = $level
+                Status          = $status
+                Threshold       = $threshold
+            })
+        }
+        $sorted = @($rebuilt | Sort-Object -Property @{ Expression = 'PercentInUse'; Descending = $true }, @{ Expression = 'Name'; Descending = $false })
+        $Global:ScopeStatEntriesAll.Clear()
+        foreach ($r in $sorted) { [void]$Global:ScopeStatEntriesAll.Add($r) }
+        $critical = @($sorted | Where-Object { "$($_.Level)" -eq 'Critical' })
+        $warning = @($sorted | Where-Object { "$($_.Level)" -eq 'Warning' })
+        Apply-ScopeStatFilter
+        Update-ScopeUtilAlertBanner -CriticalCount (Get-SafeCount $critical) -WarningCount (Get-SafeCount $warning) -Threshold $threshold -CriticalScopes $critical
+    })
+}
+
+if ($null -ne $script:CboScopeStatFilter) {
+    $script:CboScopeStatFilter.add_SelectionChanged({
+        if ((Get-SafeCount $Global:ScopeStatEntriesAll) -eq 0) { return }
+        Apply-ScopeStatFilter
+    })
+}
+
+if ($null -ne $script:BtnScopeStatDetails) {
+    $script:BtnScopeStatDetails.add_Click({
+        $item = $null
+        try { $item = $script:GridScopeStats.SelectedItem } catch {}
+        Show-ScopeStatDetailDialog -Entry $item
+    })
+}
+
+if ($null -ne $script:GridScopeStats) {
+    $script:GridScopeStats.ItemsSource = $Global:ScopeStatEntries
+    $script:GridScopeStats.add_MouseDoubleClick({
+        $item = $null
+        try { $item = $script:GridScopeStats.SelectedItem } catch {}
+        if ($null -ne $item) {
+            Show-ScopeStatDetailDialog -Entry $item
+        }
+    })
+    $script:GridScopeStats.add_KeyDown({
+        param($sender, $e)
+        if ($e.Key -eq [System.Windows.Input.Key]::Enter -or $e.Key -eq [System.Windows.Input.Key]::Return) {
+            $item = $null
+            try { $item = $script:GridScopeStats.SelectedItem } catch {}
+            if ($null -ne $item) {
+                Show-ScopeStatDetailDialog -Entry $item
+                $e.Handled = $true
+            }
+        }
+    })
+}
+
+if ($null -ne $script:BtnExportScopeStats) {
+    $script:BtnExportScopeStats.add_Click({
+        if ((Get-SafeCount $Global:ScopeStatEntries) -eq 0) {
+            Show-MessageBox "No scope statistics to export. Click Refresh All Scopes first." "Export" OK Warning
+            return
+        }
+        try {
+            $saveDialog = New-Object System.Windows.Forms.SaveFileDialog
+            $saveDialog.Filter = "CSV Files (*.csv)|*.csv|All Files (*.*)|*.*"
+            $saveDialog.FileName = "DHCP-Scope-Stats-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
+            $saveDialog.Title = "Export Scope Statistics"
+            if ($saveDialog.ShowDialog() -eq 'OK') {
+                $Global:ScopeStatEntries |
+                    Select-Object Status, PercentDisplay, ScopeId, Name, State, InUse, Free, Total, Reserved, Pending, RangeDisplay, SubnetMask, LeaseDuration, Description, Level, Threshold |
+                    Export-Csv -Path $saveDialog.FileName -NoTypeInformation -Encoding UTF8
+                Write-ActionLog "Exported $(Get-SafeCount $Global:ScopeStatEntries) scope stats: $($saveDialog.FileName)" "SUCCESS"
+                Show-MessageBox "Exported $(Get-SafeCount $Global:ScopeStatEntries) scope(s) to:`n$($saveDialog.FileName)" "Export Complete" OK Information
+                Update-LogDisplay
+            }
+        } catch {
+            Write-ActionLog "Scope stats export failed: $_" "ERROR"
+            Show-MessageBox "Export failed: $_" "Export Error" OK Error
+        }
+    })
+}
 #endregion
 
 #region Event Handlers - Compare Servers
@@ -7521,6 +8244,9 @@ $Window.add_Loaded({
     try {
         $script:GridEvents.ItemsSource = $Global:DhcpEventEntries
         $script:GridMigrateScopes.ItemsSource = $Global:MigrationScopes
+        if ($null -ne $script:GridScopeStats) {
+            $script:GridScopeStats.ItemsSource = $Global:ScopeStatEntries
+        }
         Update-EventWatchStatus
         Update-MigrateReadyState
     } catch {}
