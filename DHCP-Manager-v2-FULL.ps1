@@ -100,7 +100,7 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.5.2'
+$Global:AppVersion       = '2.5.3'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:DhcpEventEntriesAll = [System.Collections.Generic.List[object]]::new()
 $Global:ScopeStatEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
@@ -647,7 +647,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                      HorizontalAlignment="Center"/>
           
           <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-            <Run Text="v2.5.2  |  "/>
+            <Run Text="v2.5.3  |  "/>
             <Run Text="Created by Anthony Blake" Foreground="#90CAF9"/>
             <Run Text="  |  "/>
             <Run x:Name="StatusTime" Text=""/>
@@ -770,23 +770,39 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
               <!-- Lease Toolbar -->
               <Border Grid.Row="0" Background="{StaticResource BgCard}"
                       BorderThickness="0,0,0,1" BorderBrush="{StaticResource Border}" Padding="12,10">
-                <StackPanel Orientation="Horizontal">
-                  <Button x:Name="BtnLeaseRelease" Content="🚫 Release" Margin="0,0,8,0"
-                          Style="{StaticResource BtnDanger}" IsEnabled="False"/>
-                  <Button x:Name="BtnLeaseReserve" Content="📌 Convert to Reservation" Margin="0,0,8,0"
-                          Style="{StaticResource BtnPrimary}" IsEnabled="False"/>
-                  <Button x:Name="BtnLeaseRefresh" Content="🔄 Refresh" Margin="0,0,8,0"
-                          Style="{StaticResource BtnSecondary}" IsEnabled="False"/>
-                  <Separator Width="1" Background="{StaticResource Border}" Margin="8,0"/>
-                  <TextBlock Text="Filter:" Style="{StaticResource FormLabel}"
-                             VerticalAlignment="Center" Margin="8,0,8,0"/>
-                  <TextBox x:Name="TxtLeaseFilter" Width="200" Style="{StaticResource DarkTextBox}"
-                           ToolTip="Filter by IP, MAC, or hostname"/>
+                <StackPanel>
+                  <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                    <Button x:Name="BtnLeaseRelease" Content="🚫 Release" Margin="0,0,8,0"
+                            Style="{StaticResource BtnDanger}" IsEnabled="False"
+                            ToolTip="Release the selected lease(s). Use Ctrl/Shift-click to multi-select."/>
+                    <Button x:Name="BtnLeaseReserve" Content="📌 Convert to Reservation" Margin="0,0,8,0"
+                            Style="{StaticResource BtnPrimary}" IsEnabled="False"
+                            ToolTip="Convert the selected lease(s) to reservations. Use Ctrl/Shift-click to multi-select."/>
+                    <Button x:Name="BtnLeaseRefresh" Content="🔄 Refresh" Margin="0,0,8,0"
+                            Style="{StaticResource BtnSecondary}" IsEnabled="False"/>
+                    <Separator Width="1" Background="{StaticResource Border}" Margin="8,0"/>
+                    <Button x:Name="BtnLeaseSelectAll" Content="☑ Select All" Margin="8,0,8,0"
+                            Style="{StaticResource BtnSecondary}" IsEnabled="False"
+                            ToolTip="Select all leases currently shown in the grid"/>
+                    <Button x:Name="BtnLeaseClearSel" Content="Clear Selection" Margin="0,0,8,0"
+                            Style="{StaticResource BtnSecondary}" IsEnabled="False"/>
+                    <TextBlock x:Name="TxtLeaseSelectedCount" Text="None selected"
+                               Style="{StaticResource FormLabel}" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                  </StackPanel>
+                  <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="Filter:" Style="{StaticResource FormLabel}"
+                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                    <TextBox x:Name="TxtLeaseFilter" Width="220" Style="{StaticResource DarkTextBox}"
+                             ToolTip="Filter by IP, MAC, or hostname"/>
+                    <TextBlock Text="  Tip: Ctrl+click or Shift+click to select multiple leases"
+                               Style="{StaticResource FormLabel}" VerticalAlignment="Center" Margin="12,0,0,0"/>
+                  </StackPanel>
                 </StackPanel>
               </Border>
 
               <!-- Leases Grid -->
-              <DataGrid Grid.Row="1" x:Name="GridLeases" Style="{StaticResource DarkGrid}" Margin="8">
+              <DataGrid Grid.Row="1" x:Name="GridLeases" Style="{StaticResource DarkGrid}" Margin="8"
+                        SelectionMode="Extended" SelectionUnit="FullRow">
                 <DataGrid.Columns>
                   <DataGridTextColumn Header="IP Address" Binding="{Binding IPAddress}" Width="130"/>
                   <DataGridTextColumn Header="MAC Address" Binding="{Binding ClientId}" Width="140"/>
@@ -1693,6 +1709,9 @@ try {
     $script:BtnLeaseRelease  = $Window.FindName("BtnLeaseRelease")
     $script:BtnLeaseReserve  = $Window.FindName("BtnLeaseReserve")
     $script:BtnLeaseRefresh  = $Window.FindName("BtnLeaseRefresh")
+    $script:BtnLeaseSelectAll = $Window.FindName("BtnLeaseSelectAll")
+    $script:BtnLeaseClearSel = $Window.FindName("BtnLeaseClearSel")
+    $script:TxtLeaseSelectedCount = $Window.FindName("TxtLeaseSelectedCount")
     $script:TxtLeaseFilter   = $Window.FindName("TxtLeaseFilter")
     
     # Reservations Tab
@@ -3436,6 +3455,246 @@ function Load-Scopes {
     }
 }
 
+function Get-SelectedLeaseRows {
+    <#
+    .SYNOPSIS
+        Returns the currently multi-selected lease rows from the Leases grid
+    #>
+    $items = @()
+    try {
+        if ($null -ne $script:GridLeases) {
+            $items = @($script:GridLeases.SelectedItems)
+        }
+    } catch {
+        $items = @()
+    }
+    return @($items | Where-Object { $null -ne $_ })
+}
+
+function Format-LeaseSelectionSummary {
+    param(
+        [object[]]$Leases,
+        [int]$MaxLines = 8
+    )
+    
+    $list = @($Leases | Where-Object { $null -ne $_ })
+    $count = Get-SafeCount $list
+    if ($count -eq 0) { return '(none)' }
+    
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $take = [math]::Min($MaxLines, $count)
+    for ($i = 0; $i -lt $take; $i++) {
+        $lease = $list[$i]
+        $hostName = "$($lease.HostName)"
+        if (-not $hostName) { $hostName = '(no hostname)' }
+        [void]$lines.Add("  $($lease.IPAddress)  —  $hostName  [$($lease.ClientId)]")
+    }
+    if ($count -gt $MaxLines) {
+        [void]$lines.Add("  … and $($count - $MaxLines) more")
+    }
+    return ($lines -join [Environment]::NewLine)
+}
+
+function Update-LeaseSelectionUi {
+    $selected = @(Get-SelectedLeaseRows)
+    $count = Get-SafeCount $selected
+    $hasSel = $count -gt 0
+    
+    $gridCount = 0
+    try {
+        if ($null -ne $script:GridLeases -and $null -ne $script:GridLeases.Items) {
+            $gridCount = Get-SafeCount @($script:GridLeases.Items)
+        }
+    } catch { $gridCount = 0 }
+    
+    try {
+        if ($null -ne $script:BtnLeaseRelease) { $script:BtnLeaseRelease.IsEnabled = $hasSel }
+        if ($null -ne $script:BtnLeaseReserve) { $script:BtnLeaseReserve.IsEnabled = $hasSel }
+        if ($null -ne $script:BtnLeaseClearSel) { $script:BtnLeaseClearSel.IsEnabled = $hasSel }
+        if ($null -ne $script:BtnLeaseSelectAll) { $script:BtnLeaseSelectAll.IsEnabled = ($gridCount -gt 0) }
+        if ($null -ne $script:TxtLeaseSelectedCount) {
+            $script:TxtLeaseSelectedCount.Text = if ($count -eq 0) {
+                "None selected  ·  $gridCount in grid"
+            } else {
+                "$count selected  ·  $gridCount in grid"
+            }
+        }
+    } catch {}
+}
+
+function Invoke-BulkLeaseRelease {
+    param([object[]]$Leases)
+    
+    $list = @($Leases | Where-Object { $null -ne $_ -and "$($_.IPAddress)" })
+    $total = Get-SafeCount $list
+    if ($total -eq 0) {
+        Show-MessageBox "No leases selected." "Release Leases" OK Warning
+        return
+    }
+    
+    if ([string]::IsNullOrWhiteSpace($Global:DHCPServer)) {
+        Show-MessageBox "Connect to a DHCP server first." "Release Leases" OK Warning
+        return
+    }
+    
+    $summary = Format-LeaseSelectionSummary -Leases $list
+    $confirm = Show-MessageBox "Release $total lease(s)?`n`n$summary`n`nThis removes the active lease(s) from the DHCP server." "Confirm Release" YesNo Warning
+    if ($confirm -ne 'Yes') { return }
+    
+    Write-ActionLog "Releasing $total lease(s)..." "INFO"
+    Start-TaskProgress -Name 'LeaseRelease' -Message "Releasing leases..." -CanPause -Total $total
+    
+    $ok = 0
+    $fail = 0
+    $errors = [System.Collections.Generic.List[string]]::new()
+    $idx = 0
+    
+    try {
+        foreach ($lease in $list) {
+            Wait-TaskProgressIfPaused
+            if (Test-TaskCancelRequested) { break }
+            
+            $idx++
+            $ip = "$($lease.IPAddress)"
+            Update-TaskProgress -Processed $idx -Total $total -Message "Releasing $idx/$total — $ip"
+            
+            try {
+                Remove-DhcpServerv4Lease -ComputerName $Global:DHCPServer -IPAddress $ip -ErrorAction Stop
+                $ok++
+                Write-ActionLog "Released lease $ip" "SUCCESS"
+            } catch {
+                $fail++
+                $err = "$ip — $_"
+                [void]$errors.Add($err)
+                Write-ActionLog "Failed to release lease $err" "ERROR"
+            }
+        }
+    } finally {
+        Complete-TaskProgress -Message "Lease release finished: $ok ok, $fail failed"
+    }
+    
+    Load-Leases
+    Update-LogDisplay
+    
+    $extra = ''
+    if ((Get-SafeCount $errors) -gt 0) {
+        $extra = "`n`nFailures:`n" + ((@($errors | Select-Object -First 10) -join [Environment]::NewLine))
+        if ((Get-SafeCount $errors) -gt 10) { $extra += "`n…" }
+    }
+    
+    $title = if ($fail -eq 0) { 'Release Complete' } else { 'Release Finished with Errors' }
+    $icon = if ($fail -eq 0) { 'Information' } else { 'Warning' }
+    Show-MessageBox "Released: $ok`nFailed: $fail$extra" $title OK $icon
+}
+
+function Invoke-BulkLeaseConvertToReservation {
+    param([object[]]$Leases)
+    
+    $list = @($Leases | Where-Object { $null -ne $_ -and "$($_.IPAddress)" })
+    $total = Get-SafeCount $list
+    if ($total -eq 0) {
+        Show-MessageBox "No leases selected." "Convert to Reservation" OK Warning
+        return
+    }
+    
+    if ([string]::IsNullOrWhiteSpace($Global:DHCPServer)) {
+        Show-MessageBox "Connect to a DHCP server first." "Convert to Reservation" OK Warning
+        return
+    }
+    
+    $summary = Format-LeaseSelectionSummary -Leases $list
+    $confirm = Show-MessageBox "Convert $total lease(s) to reservation(s)?`n`n$summary`n`nLeases that already look like reservations, or that have no MAC/Client ID, will be skipped." "Confirm Convert" YesNo Question
+    if ($confirm -ne 'Yes') { return }
+    
+    Write-ActionLog "Converting $total lease(s) to reservation(s)..." "INFO"
+    Start-TaskProgress -Name 'LeaseReserve' -Message "Converting leases to reservations..." -CanPause -Total $total
+    
+    $ok = 0
+    $skip = 0
+    $fail = 0
+    $notes = [System.Collections.Generic.List[string]]::new()
+    $idx = 0
+    
+    try {
+        foreach ($lease in $list) {
+            Wait-TaskProgressIfPaused
+            if (Test-TaskCancelRequested) { break }
+            
+            $idx++
+            $ip = "$($lease.IPAddress)"
+            $clientId = "$($lease.ClientId)".Trim()
+            $scopeId = "$($lease.ScopeId)"
+            $name = "$($lease.HostName)".Trim()
+            $state = "$($lease.AddressState)"
+            
+            Update-TaskProgress -Processed $idx -Total $total -Message "Converting $idx/$total — $ip"
+            
+            if (-not $clientId) {
+                $skip++
+                [void]$notes.Add("$ip — skipped (no Client ID / MAC)")
+                Write-ActionLog "Skip convert $ip — no ClientId" "WARN"
+                continue
+            }
+            
+            if (-not $scopeId) {
+                $skip++
+                [void]$notes.Add("$ip — skipped (no Scope ID)")
+                Write-ActionLog "Skip convert $ip — no ScopeId" "WARN"
+                continue
+            }
+            
+            if ($state -match 'Reservation') {
+                $skip++
+                [void]$notes.Add("$ip — skipped (already $state)")
+                Write-ActionLog "Skip convert $ip — already $state" "WARN"
+                continue
+            }
+            
+            try {
+                $params = @{
+                    ComputerName = $Global:DHCPServer
+                    ScopeId      = $scopeId
+                    IPAddress    = $ip
+                    ClientId     = $clientId
+                    ErrorAction  = 'Stop'
+                }
+                if ($name) { $params['Name'] = $name }
+                
+                Add-DhcpServerv4Reservation @params
+                $ok++
+                Write-ActionLog "Converted lease $ip → reservation ($clientId)" "SUCCESS"
+            } catch {
+                $msg = "$_"
+                if ($msg -match 'already|exists|duplicate') {
+                    $skip++
+                    [void]$notes.Add("$ip — skipped (reservation already exists)")
+                    Write-ActionLog "Skip convert $ip — already exists" "WARN"
+                } else {
+                    $fail++
+                    [void]$notes.Add("$ip — $msg")
+                    Write-ActionLog "Failed to convert lease $ip : $msg" "ERROR"
+                }
+            }
+        }
+    } finally {
+        Complete-TaskProgress -Message "Lease→reservation finished: $ok ok, $skip skipped, $fail failed"
+    }
+    
+    Load-Leases
+    try { Load-Reservations } catch {}
+    Update-LogDisplay
+    
+    $extra = ''
+    if ((Get-SafeCount $notes) -gt 0) {
+        $extra = "`n`nNotes:`n" + ((@($notes | Select-Object -First 12) -join [Environment]::NewLine))
+        if ((Get-SafeCount $notes) -gt 12) { $extra += "`n…" }
+    }
+    
+    $title = if ($fail -eq 0) { 'Convert Complete' } else { 'Convert Finished with Errors' }
+    $icon = if ($fail -eq 0) { 'Information' } else { 'Warning' }
+    Show-MessageBox "Converted: $ok`nSkipped: $skip`nFailed: $fail$extra" $title OK $icon
+}
+
 function Load-Leases {
     <#
     .SYNOPSIS
@@ -3464,7 +3723,10 @@ function Load-Leases {
         $script:GridLeases.Dispatcher.Invoke([action]{
             $script:GridLeases.ItemsSource = $leases
             $script:BtnLeaseRefresh.IsEnabled = $true
+            if ($null -ne $script:BtnLeaseSelectAll) { $script:BtnLeaseSelectAll.IsEnabled = ($count -gt 0) }
         }, [System.Windows.Threading.DispatcherPriority]::Normal)
+        
+        Update-LeaseSelectionUi
         
         Write-ActionLog "Loaded $count leases for scope $scopeId" "SUCCESS"
         Set-Status "Loaded $count leases"
@@ -7285,66 +7547,47 @@ $BtnLeaseRefresh.add_Click({
 })
 
 $BtnLeaseRelease.add_Click({
-    if ($null -eq $script:GridLeases.SelectedItem) {
-        Show-MessageBox "Please select a lease" "No Selection" OK Warning
+    $selected = @(Get-SelectedLeaseRows)
+    if ((Get-SafeCount $selected) -eq 0) {
+        Show-MessageBox "Select one or more leases first.`nTip: Ctrl+click or Shift+click to multi-select." "No Selection" OK Warning
         return
     }
-    
-    $lease = $script:GridLeases.SelectedItem
-    $result = Show-MessageBox "Release lease for $($lease.IPAddress)?`n`nClient: $($lease.HostName)" "Confirm Release" YesNo Warning
-    
-    if ($result -eq 'Yes') {
-        try {
-            Write-ActionLog "Releasing lease: $($lease.IPAddress)" "INFO"
-            
-            Remove-DhcpServerv4Lease -ComputerName $Global:DHCPServer -IPAddress $lease.IPAddress -ErrorAction Stop
-            
-            Write-ActionLog "Lease released successfully" "SUCCESS"
-            Show-MessageBox "Lease released" "Success" OK Information
-            
-            Load-Leases
-            
-        } catch {
-            $errMsg = "Failed to release lease: $_"
-            Write-ActionLog $errMsg "ERROR"
-            Show-MessageBox $errMsg "Error" OK Error
-        }
-    }
+    Invoke-BulkLeaseRelease -Leases $selected
 })
 
 $BtnLeaseReserve.add_Click({
-    if ($null -eq $script:GridLeases.SelectedItem) {
-        Show-MessageBox "Please select a lease to convert" "No Selection" OK Warning
+    $selected = @(Get-SelectedLeaseRows)
+    if ((Get-SafeCount $selected) -eq 0) {
+        Show-MessageBox "Select one or more leases to convert.`nTip: Ctrl+click or Shift+click to multi-select." "No Selection" OK Warning
         return
     }
-    
-    $lease = $script:GridLeases.SelectedItem
-    
-    try {
-        Write-ActionLog "Converting lease to reservation: $($lease.IPAddress)" "INFO"
-        
-        Add-DhcpServerv4Reservation -ComputerName $Global:DHCPServer `
-            -ScopeId $lease.ScopeId `
-            -IPAddress $lease.IPAddress `
-            -ClientId $lease.ClientId `
-            -Name $lease.HostName `
-            -ErrorAction Stop
-        
-        Write-ActionLog "Lease converted to reservation" "SUCCESS"
-        Show-MessageBox "Lease converted to reservation successfully" "Success" OK Information
-        
-        Load-Leases
-        
-    } catch {
-        $errMsg = "Failed to convert lease: $_"
-        Write-ActionLog $errMsg "ERROR"
-        Show-MessageBox $errMsg "Error" OK Error
-    }
+    Invoke-BulkLeaseConvertToReservation -Leases $selected
 })
 
+if ($null -ne $script:BtnLeaseSelectAll) {
+    $script:BtnLeaseSelectAll.add_Click({
+        try {
+            if ($null -eq $script:GridLeases -or $null -eq $script:GridLeases.Items) { return }
+            $script:GridLeases.SelectAll()
+            Update-LeaseSelectionUi
+            Write-ActionLog "Selected all $(Get-SafeCount @($script:GridLeases.SelectedItems)) lease(s)" "INFO"
+        } catch {
+            Write-ActionLog "Select all leases failed: $_" "ERROR"
+        }
+    })
+}
+
+if ($null -ne $script:BtnLeaseClearSel) {
+    $script:BtnLeaseClearSel.add_Click({
+        try {
+            if ($null -ne $script:GridLeases) { $script:GridLeases.UnselectAll() }
+            Update-LeaseSelectionUi
+        } catch {}
+    })
+}
+
 $GridLeases.add_SelectionChanged({
-    $script:BtnLeaseRelease.IsEnabled = ($null -ne $script:GridLeases.SelectedItem)
-    $script:BtnLeaseReserve.IsEnabled = ($null -ne $script:GridLeases.SelectedItem)
+    Update-LeaseSelectionUi
 })
 #endregion
 
