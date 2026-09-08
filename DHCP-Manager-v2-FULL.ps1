@@ -100,7 +100,7 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.5.4'
+$Global:AppVersion       = '2.5.5'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:DhcpEventEntriesAll = [System.Collections.Generic.List[object]]::new()
 $Global:ScopeStatEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
@@ -651,7 +651,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                      HorizontalAlignment="Center"/>
           
           <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-            <Run Text="v2.5.4  |  "/>
+            <Run Text="v2.5.5  |  "/>
             <Run Text="Created by Anthony Blake" Foreground="#90CAF9"/>
             <Run Text="  |  "/>
             <Run x:Name="StatusTime" Text=""/>
@@ -4822,6 +4822,119 @@ function Update-CompareReadyState {
     Update-MigrateReadyState
 }
 
+function Get-NormalizedCompareText {
+    param($Value)
+    if ($null -eq $Value) { return '' }
+    return "$Value".Trim()
+}
+
+function Get-NormalizedCompareIp {
+    param($Value)
+    $text = Get-NormalizedCompareText $Value
+    if (-not $text) { return '' }
+    try {
+        return ([System.Net.IPAddress]::Parse($text)).IPAddressToString
+    } catch {
+        return $text
+    }
+}
+
+function Get-NormalizedCompareMac {
+    param($Value)
+    $text = Get-NormalizedCompareText $Value
+    if (-not $text) { return '' }
+    return (($text -replace '[^0-9A-Fa-f]', '')).ToUpperInvariant()
+}
+
+function Get-NormalizedCompareName {
+    param($Value)
+    return (Get-NormalizedCompareText $Value).ToLowerInvariant()
+}
+
+function Format-CompareMacDisplay {
+    param($Value)
+    $norm = Get-NormalizedCompareMac $Value
+    if (-not $norm) { return '' }
+    if ($norm.Length -eq 12) {
+        return (($norm -replace '(.{2})', '$1-').TrimEnd('-'))
+    }
+    return $norm
+}
+
+function Get-LeaseReservationCompareKey {
+    param(
+        $ClientId,
+        $IPAddress,
+        $ScopeId = $null
+    )
+    
+    $mac = Get-NormalizedCompareMac $ClientId
+    $ip = Get-NormalizedCompareIp $IPAddress
+    if ($mac) {
+        return "MAC:$mac"
+    }
+    if ($ip) {
+        $scope = Get-NormalizedCompareIp $ScopeId
+        if ($scope) { return "IP:$ip|Scope:$scope" }
+        return "IP:$ip"
+    }
+    return "UNKNOWN:$([guid]::NewGuid().ToString('N'))"
+}
+
+function Get-NormalizedOptionValueText {
+    param($Value)
+    
+    $parts = [System.Collections.Generic.List[string]]::new()
+    foreach ($item in @($Value)) {
+        if ($null -eq $item) { continue }
+        $text = Get-NormalizedCompareText $item
+        if (-not $text) { continue }
+        $asIp = Get-NormalizedCompareIp $text
+        if ($asIp -and $asIp -match '^\d{1,3}(\.\d{1,3}){3}$') {
+            [void]$parts.Add($asIp)
+        } else {
+            [void]$parts.Add($text.ToLowerInvariant())
+        }
+    }
+    
+    if ((Get-SafeCount $parts) -eq 0) { return '' }
+    return ((@($parts | Sort-Object) -join ', '))
+}
+
+function Format-OptionValueDisplay {
+    param($Value)
+    $items = @($Value | Where-Object { $null -ne $_ } | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+    if ((Get-SafeCount $items) -eq 0) { return '' }
+    return ($items -join ', ')
+}
+
+function Get-CompareOptionMapKey {
+    param(
+        $Option,
+        [string]$ScopePart = 'Server'
+    )
+    
+    $optId = Get-NormalizedCompareText $Option.OptionId
+    $vendor = Get-NormalizedCompareText $Option.VendorClass
+    $user = Get-NormalizedCompareText $Option.UserClass
+    $policy = Get-NormalizedCompareText $Option.PolicyName
+    if (-not $ScopePart) { $ScopePart = 'Server' }
+    return "$ScopePart|Opt$optId|V:$vendor|U:$user|P:$policy"
+}
+
+function Test-LeaseStatesEquivalent {
+    param([string]$StateA, [string]$StateB)
+    
+    $a = (Get-NormalizedCompareText $StateA).ToLowerInvariant()
+    $b = (Get-NormalizedCompareText $StateB).ToLowerInvariant()
+    if ($a -eq $b) { return $true }
+    
+    # Failover / display variants of an active lease should not force "Different"
+    $activeLike = @('active', 'activereservation', 'offer', 'pending')
+    if (($activeLike -contains $a) -and ($activeLike -contains $b)) { return $true }
+    return $false
+}
+
 function New-CompareRow {
     param(
         [string]$Status,
@@ -4851,54 +4964,62 @@ function Get-DhcpCompareScopes {
     $scopesB = @(Get-DhcpServerv4Scope -ComputerName $ServerB -ErrorAction Stop)
     
     $mapA = @{}
-    foreach ($s in $scopesA) { $mapA["$($s.ScopeId)"] = $s }
+    foreach ($s in $scopesA) {
+        $id = Get-NormalizedCompareIp $s.ScopeId
+        if (-not $id) { $id = Get-NormalizedCompareText $s.ScopeId }
+        $mapA[$id] = $s
+    }
     
     $mapB = @{}
-    foreach ($s in $scopesB) { $mapB["$($s.ScopeId)"] = $s }
+    foreach ($s in $scopesB) {
+        $id = Get-NormalizedCompareIp $s.ScopeId
+        if (-not $id) { $id = Get-NormalizedCompareText $s.ScopeId }
+        $mapB[$id] = $s
+    }
     
     $results = [System.Collections.Generic.List[object]]::new()
-    $allKeys = @($mapA.Keys + $mapB.Keys) | Sort-Object -Unique
+    $allKeys = @(@($mapA.Keys) + @($mapB.Keys) | Select-Object -Unique | Sort-Object)
     
     foreach ($key in $allKeys) {
-        $a = $mapA[$key]
-        $b = $mapB[$key]
+        $a = $null
+        $b = $null
+        if ($mapA.ContainsKey($key)) { $a = $mapA[$key] }
+        if ($mapB.ContainsKey($key)) { $b = $mapB[$key] }
         
-        if ($a -and -not $b) {
-            $results.Add((New-CompareRow -Status 'Only on A' -Key $key -Label $a.Name `
+        if ($null -ne $a -and $null -eq $b) {
+            $results.Add((New-CompareRow -Status 'Only on A' -Key $key -Label (Get-NormalizedCompareText $a.Name) `
                 -ValueA "$($a.StartRange)-$($a.EndRange) [$($a.State)]" -ValueB '' `
-                -Details "Mask=$($a.SubnetMask)"))
+                -Details "Mask=$($a.SubnetMask); Lease=$($a.LeaseDuration)"))
         }
-        elseif ($b -and -not $a) {
-            $results.Add((New-CompareRow -Status 'Only on B' -Key $key -Label $b.Name `
+        elseif ($null -ne $b -and $null -eq $a) {
+            $results.Add((New-CompareRow -Status 'Only on B' -Key $key -Label (Get-NormalizedCompareText $b.Name) `
                 -ValueA '' -ValueB "$($b.StartRange)-$($b.EndRange) [$($b.State)]" `
-                -Details "Mask=$($b.SubnetMask)"))
+                -Details "Mask=$($b.SubnetMask); Lease=$($b.LeaseDuration)"))
         }
         else {
-            $valA = "$($a.Name)|$($a.StartRange)|$($a.EndRange)|$($a.SubnetMask)|$($a.State)"
-            $valB = "$($b.Name)|$($b.StartRange)|$($b.EndRange)|$($b.SubnetMask)|$($b.State)"
-            # Use List — `$arr += "x"` becomes a string under StrictMode when only one item is added
             $diffs = [System.Collections.Generic.List[string]]::new()
-            if ($a.Name -ne $b.Name) { [void]$diffs.Add('Name') }
-            if ("$($a.StartRange)" -ne "$($b.StartRange)") { [void]$diffs.Add('Start') }
-            if ("$($a.EndRange)" -ne "$($b.EndRange)") { [void]$diffs.Add('End') }
-            if ("$($a.SubnetMask)" -ne "$($b.SubnetMask)") { [void]$diffs.Add('Mask') }
-            if ("$($a.State)" -ne "$($b.State)") { [void]$diffs.Add('State') }
+            if ((Get-NormalizedCompareName $a.Name) -ne (Get-NormalizedCompareName $b.Name)) { [void]$diffs.Add('Name') }
+            if ((Get-NormalizedCompareIp $a.StartRange) -ne (Get-NormalizedCompareIp $b.StartRange)) { [void]$diffs.Add('Start') }
+            if ((Get-NormalizedCompareIp $a.EndRange) -ne (Get-NormalizedCompareIp $b.EndRange)) { [void]$diffs.Add('End') }
+            if ((Get-NormalizedCompareIp $a.SubnetMask) -ne (Get-NormalizedCompareIp $b.SubnetMask)) { [void]$diffs.Add('Mask') }
+            if ((Get-NormalizedCompareText $a.State).ToLowerInvariant() -ne (Get-NormalizedCompareText $b.State).ToLowerInvariant()) { [void]$diffs.Add('State') }
+            if ((Get-NormalizedCompareText $a.LeaseDuration) -ne (Get-NormalizedCompareText $b.LeaseDuration)) { [void]$diffs.Add('LeaseDuration') }
             
             if ($diffs.Count -eq 0) {
-                $results.Add((New-CompareRow -Status 'Matching' -Key $key -Label $a.Name `
+                $results.Add((New-CompareRow -Status 'Matching' -Key $key -Label (Get-NormalizedCompareText $a.Name) `
                     -ValueA "$($a.StartRange)-$($a.EndRange) [$($a.State)]" `
                     -ValueB "$($b.StartRange)-$($b.EndRange) [$($b.State)]" `
                     -Details "Identical"))
             } else {
-                $results.Add((New-CompareRow -Status 'Different' -Key $key -Label $a.Name `
-                    -ValueA "$($a.StartRange)-$($a.EndRange) [$($a.State)] Name=$($a.Name)" `
-                    -ValueB "$($b.StartRange)-$($b.EndRange) [$($b.State)] Name=$($b.Name)" `
+                $results.Add((New-CompareRow -Status 'Different' -Key $key -Label (Get-NormalizedCompareText $a.Name) `
+                    -ValueA "$($a.StartRange)-$($a.EndRange) [$($a.State)] Name=$($a.Name) Lease=$($a.LeaseDuration)" `
+                    -ValueB "$($b.StartRange)-$($b.EndRange) [$($b.State)] Name=$($b.Name) Lease=$($b.LeaseDuration)" `
                     -Details ("Differs: " + ($diffs -join ', '))))
             }
         }
     }
     
-    return $results
+    return ,$results
 }
 
 function Get-DhcpCompareOptions {
@@ -4906,71 +5027,87 @@ function Get-DhcpCompareOptions {
     
     Write-ActionLog "Fetching options from $ServerA and $ServerB..." "INFO"
     
-    # Server-level options
-    $optsA = @(Get-DhcpServerv4OptionValue -ComputerName $ServerA -ErrorAction SilentlyContinue)
-    $optsB = @(Get-DhcpServerv4OptionValue -ComputerName $ServerB -ErrorAction SilentlyContinue)
+    $optsA = [System.Collections.Generic.List[object]]::new()
+    $optsB = [System.Collections.Generic.List[object]]::new()
     
-    # Also include scope-level options for all scopes on each server
+    foreach ($o in @(Get-DhcpServerv4OptionValue -ComputerName $ServerA -ErrorAction SilentlyContinue)) {
+        $o | Add-Member -NotePropertyName '_ScopeId' -NotePropertyValue 'Server' -Force
+        [void]$optsA.Add($o)
+    }
+    foreach ($o in @(Get-DhcpServerv4OptionValue -ComputerName $ServerB -ErrorAction SilentlyContinue)) {
+        $o | Add-Member -NotePropertyName '_ScopeId' -NotePropertyValue 'Server' -Force
+        [void]$optsB.Add($o)
+    }
+    
     try {
         foreach ($scope in @(Get-DhcpServerv4Scope -ComputerName $ServerA -ErrorAction SilentlyContinue)) {
-            $scopeOpts = @(Get-DhcpServerv4OptionValue -ComputerName $ServerA -ScopeId $scope.ScopeId -ErrorAction SilentlyContinue)
-            foreach ($o in $scopeOpts) {
-                $o | Add-Member -NotePropertyName '_ScopeId' -NotePropertyValue "$($scope.ScopeId)" -Force
-                $optsA += $o
+            $scopeId = Get-NormalizedCompareIp $scope.ScopeId
+            if (-not $scopeId) { $scopeId = Get-NormalizedCompareText $scope.ScopeId }
+            foreach ($o in @(Get-DhcpServerv4OptionValue -ComputerName $ServerA -ScopeId $scope.ScopeId -ErrorAction SilentlyContinue)) {
+                $o | Add-Member -NotePropertyName '_ScopeId' -NotePropertyValue $scopeId -Force
+                [void]$optsA.Add($o)
             }
         }
     } catch {}
     
     try {
         foreach ($scope in @(Get-DhcpServerv4Scope -ComputerName $ServerB -ErrorAction SilentlyContinue)) {
-            $scopeOpts = @(Get-DhcpServerv4OptionValue -ComputerName $ServerB -ScopeId $scope.ScopeId -ErrorAction SilentlyContinue)
-            foreach ($o in $scopeOpts) {
-                $o | Add-Member -NotePropertyName '_ScopeId' -NotePropertyValue "$($scope.ScopeId)" -Force
-                $optsB += $o
+            $scopeId = Get-NormalizedCompareIp $scope.ScopeId
+            if (-not $scopeId) { $scopeId = Get-NormalizedCompareText $scope.ScopeId }
+            foreach ($o in @(Get-DhcpServerv4OptionValue -ComputerName $ServerB -ScopeId $scope.ScopeId -ErrorAction SilentlyContinue)) {
+                $o | Add-Member -NotePropertyName '_ScopeId' -NotePropertyValue $scopeId -Force
+                [void]$optsB.Add($o)
             }
         }
     } catch {}
     
     $mapA = @{}
     foreach ($o in $optsA) {
-        $scopePart = if ($o.PSObject.Properties.Name -contains '_ScopeId' -and $o._ScopeId) { $o._ScopeId } else { 'Server' }
-        $key = "$scopePart|Opt$($o.OptionId)"
+        $scopePart = if ($o._ScopeId) { "$($o._ScopeId)" } else { 'Server' }
+        $key = Get-CompareOptionMapKey -Option $o -ScopePart $scopePart
         $mapA[$key] = $o
     }
     
     $mapB = @{}
     foreach ($o in $optsB) {
-        $scopePart = if ($o.PSObject.Properties.Name -contains '_ScopeId' -and $o._ScopeId) { $o._ScopeId } else { 'Server' }
-        $key = "$scopePart|Opt$($o.OptionId)"
+        $scopePart = if ($o._ScopeId) { "$($o._ScopeId)" } else { 'Server' }
+        $key = Get-CompareOptionMapKey -Option $o -ScopePart $scopePart
         $mapB[$key] = $o
     }
     
     $results = [System.Collections.Generic.List[object]]::new()
-    $allKeys = @($mapA.Keys + $mapB.Keys) | Sort-Object -Unique
+    $allKeys = @(@($mapA.Keys) + @($mapB.Keys) | Select-Object -Unique | Sort-Object)
     
     foreach ($key in $allKeys) {
-        $a = $mapA[$key]
-        $b = $mapB[$key]
-        $label = if ($a) { $a.Name } elseif ($b) { $b.Name } else { $key }
+        $a = $null
+        $b = $null
+        if ($mapA.ContainsKey($key)) { $a = $mapA[$key] }
+        if ($mapB.ContainsKey($key)) { $b = $mapB[$key] }
         
-        $valA = if ($a) { ($a.Value -join ', ') } else { '' }
-        $valB = if ($b) { ($b.Value -join ', ') } else { '' }
+        $label = if ($null -ne $a -and $a.Name) { Get-NormalizedCompareText $a.Name }
+                 elseif ($null -ne $b -and $b.Name) { Get-NormalizedCompareText $b.Name }
+                 else { $key }
         
-        if ($a -and -not $b) {
-            $results.Add((New-CompareRow -Status 'Only on A' -Key $key -Label $label -ValueA $valA -ValueB '' -Details 'Missing on B'))
+        $valADisplay = if ($null -ne $a) { Format-OptionValueDisplay $a.Value } else { '' }
+        $valBDisplay = if ($null -ne $b) { Format-OptionValueDisplay $b.Value } else { '' }
+        $valANorm = if ($null -ne $a) { Get-NormalizedOptionValueText $a.Value } else { '' }
+        $valBNorm = if ($null -ne $b) { Get-NormalizedOptionValueText $b.Value } else { '' }
+        
+        if ($null -ne $a -and $null -eq $b) {
+            $results.Add((New-CompareRow -Status 'Only on A' -Key $key -Label $label -ValueA $valADisplay -ValueB '' -Details 'Missing on B'))
         }
-        elseif ($b -and -not $a) {
-            $results.Add((New-CompareRow -Status 'Only on B' -Key $key -Label $label -ValueA '' -ValueB $valB -Details 'Missing on A'))
+        elseif ($null -ne $b -and $null -eq $a) {
+            $results.Add((New-CompareRow -Status 'Only on B' -Key $key -Label $label -ValueA '' -ValueB $valBDisplay -Details 'Missing on A'))
         }
-        elseif ($valA -eq $valB) {
-            $results.Add((New-CompareRow -Status 'Matching' -Key $key -Label $label -ValueA $valA -ValueB $valB -Details 'Identical'))
+        elseif ($valANorm -eq $valBNorm) {
+            $results.Add((New-CompareRow -Status 'Matching' -Key $key -Label $label -ValueA $valADisplay -ValueB $valBDisplay -Details 'Identical'))
         }
         else {
-            $results.Add((New-CompareRow -Status 'Different' -Key $key -Label $label -ValueA $valA -ValueB $valB -Details 'Value mismatch'))
+            $results.Add((New-CompareRow -Status 'Different' -Key $key -Label $label -ValueA $valADisplay -ValueB $valBDisplay -Details 'Value mismatch'))
         }
     }
     
-    return $results
+    return ,$results
 }
 
 function Get-DhcpCompareLeases {
@@ -4984,69 +5121,95 @@ function Get-DhcpCompareLeases {
     foreach ($scope in @(Get-DhcpServerv4Scope -ComputerName $ServerA -ErrorAction Stop)) {
         try {
             $items = @(Get-DhcpServerv4Lease -ComputerName $ServerA -ScopeId $scope.ScopeId -ErrorAction SilentlyContinue)
-            foreach ($item in $items) { $leasesA.Add($item) }
+            foreach ($item in $items) { [void]$leasesA.Add($item) }
         } catch {}
     }
     
     foreach ($scope in @(Get-DhcpServerv4Scope -ComputerName $ServerB -ErrorAction Stop)) {
         try {
             $items = @(Get-DhcpServerv4Lease -ComputerName $ServerB -ScopeId $scope.ScopeId -ErrorAction SilentlyContinue)
-            foreach ($item in $items) { $leasesB.Add($item) }
+            foreach ($item in $items) { [void]$leasesB.Add($item) }
         } catch {}
     }
     
     $mapA = @{}
     foreach ($l in $leasesA) {
-        $mac = if ($l.ClientId) { "$($l.ClientId)".ToUpper() } else { '' }
-        $key = if ($mac) { "MAC:$mac" } else { "IP:$($l.IPAddress)" }
-        $mapA[$key] = $l
-    }
-    
-    $mapB = @{}
-    foreach ($l in $leasesB) {
-        $mac = if ($l.ClientId) { "$($l.ClientId)".ToUpper() } else { '' }
-        $key = if ($mac) { "MAC:$mac" } else { "IP:$($l.IPAddress)" }
-        $mapB[$key] = $l
-    }
-    
-    $results = [System.Collections.Generic.List[object]]::new()
-    $allKeys = @($mapA.Keys + $mapB.Keys) | Sort-Object -Unique
-    
-    foreach ($key in $allKeys) {
-        $a = $mapA[$key]
-        $b = $mapB[$key]
-        
-        if ($a -and -not $b) {
-            $results.Add((New-CompareRow -Status 'Only on A' -Key $key -Label $a.HostName `
-                -ValueA "$($a.IPAddress) [$($a.AddressState)] Scope=$($a.ScopeId)" -ValueB '' `
-                -Details "Expiry=$($a.LeaseExpiryTime)"))
-        }
-        elseif ($b -and -not $a) {
-            $results.Add((New-CompareRow -Status 'Only on B' -Key $key -Label $b.HostName `
-                -ValueA '' -ValueB "$($b.IPAddress) [$($b.AddressState)] Scope=$($b.ScopeId)" `
-                -Details "Expiry=$($b.LeaseExpiryTime)"))
-        }
-        else {
-            $diffs = [System.Collections.Generic.List[string]]::new()
-            if ("$($a.IPAddress)" -ne "$($b.IPAddress)") { [void]$diffs.Add('IP') }
-            if ("$($a.HostName)" -ne "$($b.HostName)") { [void]$diffs.Add('Hostname') }
-            if ("$($a.ScopeId)" -ne "$($b.ScopeId)") { [void]$diffs.Add('Scope') }
-            if ("$($a.AddressState)" -ne "$($b.AddressState)") { [void]$diffs.Add('State') }
-            
-            $valA = "$($a.IPAddress) [$($a.AddressState)] Host=$($a.HostName)"
-            $valB = "$($b.IPAddress) [$($b.AddressState)] Host=$($b.HostName)"
-            
-            if ($diffs.Count -eq 0) {
-                $results.Add((New-CompareRow -Status 'Matching' -Key $key -Label $a.HostName `
-                    -ValueA $valA -ValueB $valB -Details 'Identical'))
-            } else {
-                $results.Add((New-CompareRow -Status 'Different' -Key $key -Label $a.HostName `
-                    -ValueA $valA -ValueB $valB -Details ("Differs: " + ($diffs -join ', '))))
+        $key = Get-LeaseReservationCompareKey -ClientId $l.ClientId -IPAddress $l.IPAddress -ScopeId $l.ScopeId
+        # Prefer Active over duplicate MAC rows when collisions occur
+        if (-not $mapA.ContainsKey($key)) {
+            $mapA[$key] = $l
+        } else {
+            $existing = $mapA[$key]
+            $existState = Get-NormalizedCompareText $existing.AddressState
+            $newState = Get-NormalizedCompareText $l.AddressState
+            if ($existState -match 'Inactiv|Expired|Declin' -and $newState -match 'Active') {
+                $mapA[$key] = $l
             }
         }
     }
     
-    return $results
+    $mapB = @{}
+    foreach ($l in $leasesB) {
+        $key = Get-LeaseReservationCompareKey -ClientId $l.ClientId -IPAddress $l.IPAddress -ScopeId $l.ScopeId
+        if (-not $mapB.ContainsKey($key)) {
+            $mapB[$key] = $l
+        } else {
+            $existing = $mapB[$key]
+            $existState = Get-NormalizedCompareText $existing.AddressState
+            $newState = Get-NormalizedCompareText $l.AddressState
+            if ($existState -match 'Inactiv|Expired|Declin' -and $newState -match 'Active') {
+                $mapB[$key] = $l
+            }
+        }
+    }
+    
+    $results = [System.Collections.Generic.List[object]]::new()
+    $allKeys = @(@($mapA.Keys) + @($mapB.Keys) | Select-Object -Unique | Sort-Object)
+    
+    foreach ($key in $allKeys) {
+        $a = $null
+        $b = $null
+        if ($mapA.ContainsKey($key)) { $a = $mapA[$key] }
+        if ($mapB.ContainsKey($key)) { $b = $mapB[$key] }
+        
+        if ($null -ne $a -and $null -eq $b) {
+            $results.Add((New-CompareRow -Status 'Only on A' -Key $key -Label (Get-NormalizedCompareText $a.HostName) `
+                -ValueA "$($a.IPAddress) [$($a.AddressState)] Scope=$($a.ScopeId)" -ValueB '' `
+                -Details "MAC=$(Format-CompareMacDisplay $a.ClientId); Expiry=$($a.LeaseExpiryTime)"))
+        }
+        elseif ($null -ne $b -and $null -eq $a) {
+            $results.Add((New-CompareRow -Status 'Only on B' -Key $key -Label (Get-NormalizedCompareText $b.HostName) `
+                -ValueA '' -ValueB "$($b.IPAddress) [$($b.AddressState)] Scope=$($b.ScopeId)" `
+                -Details "MAC=$(Format-CompareMacDisplay $b.ClientId); Expiry=$($b.LeaseExpiryTime)"))
+        }
+        else {
+            $diffs = [System.Collections.Generic.List[string]]::new()
+            if ((Get-NormalizedCompareIp $a.IPAddress) -ne (Get-NormalizedCompareIp $b.IPAddress)) { [void]$diffs.Add('IP') }
+            if ((Get-NormalizedCompareName $a.HostName) -ne (Get-NormalizedCompareName $b.HostName)) { [void]$diffs.Add('Hostname') }
+            if ((Get-NormalizedCompareIp $a.ScopeId) -ne (Get-NormalizedCompareIp $b.ScopeId)) { [void]$diffs.Add('Scope') }
+            # AddressState intentionally ignored for Matching vs Different (failover display variants)
+            
+            $valA = "$($a.IPAddress) [$($a.AddressState)] Host=$($a.HostName)"
+            $valB = "$($b.IPAddress) [$($b.AddressState)] Host=$($b.HostName)"
+            $macNote = "MAC=$(Format-CompareMacDisplay $a.ClientId)"
+            
+            if ($diffs.Count -eq 0) {
+                $stateNote = ''
+                if (-not (Test-LeaseStatesEquivalent -StateA "$($a.AddressState)" -StateB "$($b.AddressState)")) {
+                    $stateNote = " (state display differs: $($a.AddressState) vs $($b.AddressState))"
+                } elseif ((Get-NormalizedCompareText $a.AddressState) -ne (Get-NormalizedCompareText $b.AddressState)) {
+                    $stateNote = " (state labels: $($a.AddressState) / $($b.AddressState))"
+                }
+                $results.Add((New-CompareRow -Status 'Matching' -Key $key -Label (Get-NormalizedCompareText $a.HostName) `
+                    -ValueA $valA -ValueB $valB -Details ("Identical; $macNote$stateNote")))
+            } else {
+                $results.Add((New-CompareRow -Status 'Different' -Key $key -Label (Get-NormalizedCompareText $a.HostName) `
+                    -ValueA $valA -ValueB $valB -Details ("Differs: " + ($diffs -join ', ') + "; $macNote")))
+            }
+        }
+    }
+    
+    return ,$results
 }
 
 function Get-DhcpCompareReservations {
@@ -5060,69 +5223,70 @@ function Get-DhcpCompareReservations {
     foreach ($scope in @(Get-DhcpServerv4Scope -ComputerName $ServerA -ErrorAction Stop)) {
         try {
             $items = @(Get-DhcpServerv4Reservation -ComputerName $ServerA -ScopeId $scope.ScopeId -ErrorAction SilentlyContinue)
-            foreach ($item in $items) { $resA.Add($item) }
+            foreach ($item in $items) { [void]$resA.Add($item) }
         } catch {}
     }
     
     foreach ($scope in @(Get-DhcpServerv4Scope -ComputerName $ServerB -ErrorAction Stop)) {
         try {
             $items = @(Get-DhcpServerv4Reservation -ComputerName $ServerB -ScopeId $scope.ScopeId -ErrorAction SilentlyContinue)
-            foreach ($item in $items) { $resB.Add($item) }
+            foreach ($item in $items) { [void]$resB.Add($item) }
         } catch {}
     }
     
     $mapA = @{}
     foreach ($r in $resA) {
-        $mac = if ($r.ClientId) { "$($r.ClientId)".ToUpper() } else { '' }
-        $key = if ($mac) { "MAC:$mac" } else { "IP:$($r.IPAddress)" }
+        $key = Get-LeaseReservationCompareKey -ClientId $r.ClientId -IPAddress $r.IPAddress -ScopeId $r.ScopeId
         $mapA[$key] = $r
     }
     
     $mapB = @{}
     foreach ($r in $resB) {
-        $mac = if ($r.ClientId) { "$($r.ClientId)".ToUpper() } else { '' }
-        $key = if ($mac) { "MAC:$mac" } else { "IP:$($r.IPAddress)" }
+        $key = Get-LeaseReservationCompareKey -ClientId $r.ClientId -IPAddress $r.IPAddress -ScopeId $r.ScopeId
         $mapB[$key] = $r
     }
     
     $results = [System.Collections.Generic.List[object]]::new()
-    $allKeys = @($mapA.Keys + $mapB.Keys) | Sort-Object -Unique
+    $allKeys = @(@($mapA.Keys) + @($mapB.Keys) | Select-Object -Unique | Sort-Object)
     
     foreach ($key in $allKeys) {
-        $a = $mapA[$key]
-        $b = $mapB[$key]
+        $a = $null
+        $b = $null
+        if ($mapA.ContainsKey($key)) { $a = $mapA[$key] }
+        if ($mapB.ContainsKey($key)) { $b = $mapB[$key] }
         
-        if ($a -and -not $b) {
-            $results.Add((New-CompareRow -Status 'Only on A' -Key $key -Label $a.Name `
+        if ($null -ne $a -and $null -eq $b) {
+            $results.Add((New-CompareRow -Status 'Only on A' -Key $key -Label (Get-NormalizedCompareText $a.Name) `
                 -ValueA "$($a.IPAddress) Scope=$($a.ScopeId)" -ValueB '' `
-                -Details "Type=$($a.Type)"))
+                -Details "MAC=$(Format-CompareMacDisplay $a.ClientId); Type=$($a.Type)"))
         }
-        elseif ($b -and -not $a) {
-            $results.Add((New-CompareRow -Status 'Only on B' -Key $key -Label $b.Name `
+        elseif ($null -ne $b -and $null -eq $a) {
+            $results.Add((New-CompareRow -Status 'Only on B' -Key $key -Label (Get-NormalizedCompareText $b.Name) `
                 -ValueA '' -ValueB "$($b.IPAddress) Scope=$($b.ScopeId)" `
-                -Details "Type=$($b.Type)"))
+                -Details "MAC=$(Format-CompareMacDisplay $b.ClientId); Type=$($b.Type)"))
         }
         else {
             $diffs = [System.Collections.Generic.List[string]]::new()
-            if ("$($a.IPAddress)" -ne "$($b.IPAddress)") { [void]$diffs.Add('IP') }
-            if ("$($a.Name)" -ne "$($b.Name)") { [void]$diffs.Add('Name') }
-            if ("$($a.ScopeId)" -ne "$($b.ScopeId)") { [void]$diffs.Add('Scope') }
-            if ("$($a.ClientId)".ToUpper() -ne "$($b.ClientId)".ToUpper()) { [void]$diffs.Add('MAC') }
+            if ((Get-NormalizedCompareIp $a.IPAddress) -ne (Get-NormalizedCompareIp $b.IPAddress)) { [void]$diffs.Add('IP') }
+            if ((Get-NormalizedCompareName $a.Name) -ne (Get-NormalizedCompareName $b.Name)) { [void]$diffs.Add('Name') }
+            if ((Get-NormalizedCompareIp $a.ScopeId) -ne (Get-NormalizedCompareIp $b.ScopeId)) { [void]$diffs.Add('Scope') }
+            if ((Get-NormalizedCompareMac $a.ClientId) -ne (Get-NormalizedCompareMac $b.ClientId)) { [void]$diffs.Add('MAC') }
             
             $valA = "$($a.IPAddress) Name=$($a.Name) Scope=$($a.ScopeId)"
             $valB = "$($b.IPAddress) Name=$($b.Name) Scope=$($b.ScopeId)"
+            $macNote = "MAC=$(Format-CompareMacDisplay $a.ClientId)"
             
             if ($diffs.Count -eq 0) {
-                $results.Add((New-CompareRow -Status 'Matching' -Key $key -Label $a.Name `
-                    -ValueA $valA -ValueB $valB -Details 'Identical'))
+                $results.Add((New-CompareRow -Status 'Matching' -Key $key -Label (Get-NormalizedCompareText $a.Name) `
+                    -ValueA $valA -ValueB $valB -Details "Identical; $macNote"))
             } else {
-                $results.Add((New-CompareRow -Status 'Different' -Key $key -Label $a.Name `
-                    -ValueA $valA -ValueB $valB -Details ("Differs: " + ($diffs -join ', '))))
+                $results.Add((New-CompareRow -Status 'Different' -Key $key -Label (Get-NormalizedCompareText $a.Name) `
+                    -ValueA $valA -ValueB $valB -Details ("Differs: " + ($diffs -join ', ') + "; $macNote")))
             }
         }
     }
     
-    return $results
+    return ,$results
 }
 
 function Show-CompareResults {

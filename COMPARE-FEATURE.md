@@ -1,13 +1,24 @@
-# Multi-Server Compare Feature (v2.1)
+# Multi-Server Compare Feature (v2.5.5)
+
+Footer: **Created by Anthony Blake**
 
 ## What it does
 
 Connect a second DHCP server (Server B) and compare it against the primary server (Server A) for:
 
-- **Scopes** — network ID, name, range, mask, state
-- **Options** — server-level and scope-level option values
-- **Leases** — matched primarily by MAC, then IP
-- **Reservations** — matched primarily by MAC, then IP
+- **Scopes** — network ID, name, range, mask, state, lease duration
+- **Options** — server-level and scope-level option values (keyed by Option ID + Vendor/User class + Policy)
+- **Leases** — matched by normalized MAC (fallback: IP+scope)
+- **Reservations** — matched by normalized MAC (fallback: IP+scope)
+
+## Accuracy notes (v2.5.5)
+
+- **MAC normalization:** `aa-bb-cc-…`, `AA:BB:CC:…`, and `AABBCC…` are treated as the same client
+- **IP normalization:** Scope IDs / ranges / option IPs compared via parsed IPv4 text
+- **Names/hostnames:** case-insensitive
+- **Options:** VendorClass, UserClass, and PolicyName are part of the match key (avoids collapsing different class options)
+- **Option values:** multi-value options compared order-independently after trim/IP normalize
+- **Lease AddressState:** Active vs ActiveReservation (and similar active variants) do **not** force a “Different” status on failover pairs
 
 ## How to use
 
@@ -26,11 +37,10 @@ Connect a second DHCP server (Server B) and compare it against the primary serve
 | Only on A | Present on primary, missing on compare server |
 | Only on B | Present on compare server, missing on primary |
 | Matching | Same key and same compared values |
-| Different | Same key exists on both, but values differ |
+| Different | Same key exists on both, but compared values differ |
 
 ## Notes
 
 - Server B must be a different host than Server A.
 - Primary Server A must be connected before connecting Server B.
-- Options compare includes server options plus all scope options.
-- Lease/reservation comparison keys off MAC when available (more stable across failover pairs).
+- Lease/reservation comparison keys off normalized MAC when available (stable across failover pairs).
