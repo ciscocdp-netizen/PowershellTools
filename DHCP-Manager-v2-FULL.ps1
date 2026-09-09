@@ -100,7 +100,7 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.5.9'
+$Global:AppVersion       = '2.5.10'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:DhcpEventEntriesAll = [System.Collections.Generic.List[object]]::new()
 $Global:ScopeStatEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
@@ -651,7 +651,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                      HorizontalAlignment="Center"/>
           
           <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-            <Run Text="v2.5.9  |  "/>
+            <Run Text="v2.5.10  |  "/>
             <Run Text="Created by Anthony Blake" Foreground="#90CAF9"/>
             <Run Text="  |  "/>
             <Run x:Name="StatusTime" Text=""/>
@@ -3130,40 +3130,46 @@ function Get-ScanDomainsFromDialog {
 function Get-ScanRowConnectTarget {
     <#
     .SYNOPSIS
-        Chooses display/connect values from a scan row (clean host + IP fallback)
-        Prefers an online DHCP node when the row looks like a cluster/VIP name
+        Chooses display/connect values from the selected scan row only
+        (does not substitute a different host — Connect handles cluster fallbacks)
     #>
     param($Row)
     
-    $clean = Get-CleanDhcpServerHostName -Name "$($Row.DnsName)"
+    if ($null -eq $Row) {
+        return [PSCustomObject]@{
+            Primary    = ''
+            FallbackIP = ''
+            HostName   = ''
+            Note       = ''
+            SelectedDnsName = ''
+            SelectedIP = ''
+        }
+    }
+    
+    $rawDns = "$($Row.DnsName)".Trim()
+    $clean = Get-CleanDhcpServerHostName -Name $rawDns
     $ip = "$($Row.IPAddress)".Trim()
     if ($ip -notmatch '^[0-9]{1,3}(?:\.[0-9]{1,3}){3}$') { $ip = '' }
     
+    # Always honor the selected row. Prefer cleaned DNS name; fall back to IP if name is unusable.
     if ([string]::IsNullOrWhiteSpace($clean) -or $clean -match '(?i)^rcn=|=') {
-        $primary = $(if ($ip) { $ip } else { "$($Row.DnsName)".Trim() })
+        $primary = $(if ($ip) { $ip } else { $rawDns })
     } else {
         $primary = $clean
     }
     
-    # Cluster/VIP rows: prefer a related online node for the connect box
+    $note = ''
     if (Test-DhcpClusterLikeName -Name $primary) {
-        $related = @(Get-DhcpRelatedConnectCandidates -Name $primary -FallbackIP $ip -MaxCandidates 1)
-        if ((Get-SafeCount $related) -gt 0 -and $related[0].DnsName) {
-            Write-ActionLog "Scan row '$primary' looks like a cluster/VIP — preferring node $($related[0].DnsName) for connect" "INFO"
-            return [PSCustomObject]@{
-                Primary    = "$($related[0].DnsName)"
-                FallbackIP = $(if ($related[0].IPAddress) { "$($related[0].IPAddress)" } else { $ip })
-                HostName   = "$($related[0].DnsName)"
-                Note       = "Preferred DHCP node over cluster name '$primary'"
-            }
-        }
+        $note = "Selected name looks like a cluster/VIP. Connect will also try related DHCP nodes if scope enumeration fails."
     }
     
     return [PSCustomObject]@{
-        Primary    = $primary
-        FallbackIP = $ip
-        HostName   = $clean
-        Note       = ''
+        Primary         = $primary
+        FallbackIP      = $ip
+        HostName        = $clean
+        Note            = $note
+        SelectedDnsName = $rawDns
+        SelectedIP      = $ip
     }
 }
 
@@ -3475,14 +3481,21 @@ function Show-DomainDhcpScanDialog {
                 Show-MessageBox "Select a DHCP server first." "Scan" OK Warning
                 return
             }
-            $target = Get-ScanRowConnectTarget -Row $script:ScanDialogGrid.SelectedItem
-            $script:TxtServerName.Text = $target.Primary
-            $hint = if ($target.FallbackIP -and $target.Primary -ne $target.FallbackIP) {
-                "Filled Server A with $($target.Primary) (IP fallback $($target.FallbackIP)) — click Connect"
-            } else {
-                "Filled main server box with $($target.Primary) — click Connect on the main window"
+            $row = $script:ScanDialogGrid.SelectedItem
+            $target = Get-ScanRowConnectTarget -Row $row
+            if ([string]::IsNullOrWhiteSpace($target.Primary)) {
+                Show-MessageBox "The selected row has no usable DNS name or IP." "Scan" OK Warning
+                return
             }
-            Write-ActionLog "Scan: set Server A candidate to $($target.Primary)" "INFO"
+            $script:TxtServerName.Text = $target.Primary
+            $selectedLabel = if ($target.SelectedDnsName) { $target.SelectedDnsName } else { $target.Primary }
+            $hint = "Filled Server A with $($target.Primary) (selected: $selectedLabel)"
+            if ($target.FallbackIP -and $target.Primary -ne $target.FallbackIP) {
+                $hint += " — IP fallback $($target.FallbackIP)"
+            }
+            $hint += " — click Connect"
+            if ($target.Note) { $hint += "  |  $($target.Note)" }
+            Write-ActionLog "Scan: Use as Server A — selected '$selectedLabel' / IP '$($target.SelectedIP)' → filled '$($target.Primary)'" "INFO"
             $script:ScanDialogStatus.Text = $hint
             Update-LogDisplay
         })
@@ -3496,17 +3509,24 @@ function Show-DomainDhcpScanDialog {
                 Show-MessageBox "Compare controls not available." "Scan" OK Warning
                 return
             }
-            $target = Get-ScanRowConnectTarget -Row $script:ScanDialogGrid.SelectedItem
+            $row = $script:ScanDialogGrid.SelectedItem
+            $target = Get-ScanRowConnectTarget -Row $row
+            if ([string]::IsNullOrWhiteSpace($target.Primary)) {
+                Show-MessageBox "The selected row has no usable DNS name or IP." "Scan" OK Warning
+                return
+            }
             $script:TxtCompareServer.Text = $target.Primary
             if ($null -ne $script:TabCompare) {
                 $script:MainTabs.SelectedItem = $script:TabCompare
             }
-            $hint = if ($target.FallbackIP -and $target.Primary -ne $target.FallbackIP) {
-                "Filled Compare Server B with $($target.Primary) (IP fallback $($target.FallbackIP)) — click Connect B"
-            } else {
-                "Filled Compare Server B with $($target.Primary) — connect it on the Compare tab"
+            $selectedLabel = if ($target.SelectedDnsName) { $target.SelectedDnsName } else { $target.Primary }
+            $hint = "Filled Server B with $($target.Primary) (selected: $selectedLabel)"
+            if ($target.FallbackIP -and $target.Primary -ne $target.FallbackIP) {
+                $hint += " — IP fallback $($target.FallbackIP)"
             }
-            Write-ActionLog "Scan: set Server B candidate to $($target.Primary)" "INFO"
+            $hint += " — click Connect B on the Compare tab"
+            if ($target.Note) { $hint += "  |  $($target.Note)" }
+            Write-ActionLog "Scan: Use as Server B — selected '$selectedLabel' / IP '$($target.SelectedIP)' → filled '$($target.Primary)'" "INFO"
             $script:ScanDialogStatus.Text = $hint
             Update-LogDisplay
         })
@@ -3536,10 +3556,13 @@ function Show-DomainDhcpScanDialog {
         
         $script:ScanDialogGrid.add_MouseDoubleClick({
             if ($null -eq $script:ScanDialogGrid.SelectedItem) { return }
-            $target = Get-ScanRowConnectTarget -Row $script:ScanDialogGrid.SelectedItem
+            $row = $script:ScanDialogGrid.SelectedItem
+            $target = Get-ScanRowConnectTarget -Row $row
+            if ([string]::IsNullOrWhiteSpace($target.Primary)) { return }
             $script:TxtServerName.Text = $target.Primary
-            Write-ActionLog "Scan double-click: filled Server A box with $($target.Primary)" "INFO"
-            $script:ScanDialogStatus.Text = "Filled main server box with $($target.Primary)"
+            $selectedLabel = if ($target.SelectedDnsName) { $target.SelectedDnsName } else { $target.Primary }
+            Write-ActionLog "Scan double-click: selected '$selectedLabel' → filled Server A with $($target.Primary)" "INFO"
+            $script:ScanDialogStatus.Text = "Filled Server A with $($target.Primary) (selected: $selectedLabel)"
         })
         
         $btnClose.add_Click({
