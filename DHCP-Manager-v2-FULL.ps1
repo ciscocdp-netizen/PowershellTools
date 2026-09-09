@@ -2412,9 +2412,7 @@ function Get-DhcpRelatedConnectCandidates {
         })
     }
     
-    $sorted = @($related | Sort-Object `
-        @{ Expression = 'Score'; Descending = $true }, `
-        @{ Expression = 'DnsName'; Descending = $false })
+    $sorted = @($related | Sort-Object -Property @{ Expression = 'Score'; Descending = $true }, @{ Expression = 'DnsName'; Descending = $false })
     if ((Get-SafeCount $sorted) -gt $MaxCandidates) {
         $sorted = @($sorted | Select-Object -First $MaxCandidates)
     }
