@@ -3131,6 +3131,7 @@ function Get-ScanRowConnectTarget {
     <#
     .SYNOPSIS
         Chooses display/connect values from a scan row (clean host + IP fallback)
+        Prefers an online DHCP node when the row looks like a cluster/VIP name
     #>
     param($Row)
     
@@ -3144,10 +3145,25 @@ function Get-ScanRowConnectTarget {
         $primary = $clean
     }
     
+    # Cluster/VIP rows: prefer a related online node for the connect box
+    if (Test-DhcpClusterLikeName -Name $primary) {
+        $related = @(Get-DhcpRelatedConnectCandidates -Name $primary -FallbackIP $ip -MaxCandidates 1)
+        if ((Get-SafeCount $related) -gt 0 -and $related[0].DnsName) {
+            Write-ActionLog "Scan row '$primary' looks like a cluster/VIP — preferring node $($related[0].DnsName) for connect" "INFO"
+            return [PSCustomObject]@{
+                Primary    = "$($related[0].DnsName)"
+                FallbackIP = $(if ($related[0].IPAddress) { "$($related[0].IPAddress)" } else { $ip })
+                HostName   = "$($related[0].DnsName)"
+                Note       = "Preferred DHCP node over cluster name '$primary'"
+            }
+        }
+    }
+    
     return [PSCustomObject]@{
         Primary    = $primary
         FallbackIP = $ip
         HostName   = $clean
+        Note       = ''
     }
 }
 
