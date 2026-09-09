@@ -100,7 +100,7 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.5.6'
+$Global:AppVersion       = '2.5.7'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:DhcpEventEntriesAll = [System.Collections.Generic.List[object]]::new()
 $Global:ScopeStatEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
@@ -651,7 +651,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                      HorizontalAlignment="Center"/>
           
           <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-            <Run Text="v2.5.6  |  "/>
+            <Run Text="v2.5.7  |  "/>
             <Run Text="Created by Anthony Blake" Foreground="#90CAF9"/>
             <Run Text="  |  "/>
             <Run x:Name="StatusTime" Text=""/>
@@ -2283,6 +2283,174 @@ function ConvertFrom-AdDhcpServersValue {
     }
 }
 
+function Get-DhcpConnectErrorDetail {
+    <#
+    .SYNOPSIS
+        Unwraps DHCP connect exceptions so Access Denied / RPC codes are visible
+    #>
+    param($ErrorRecord)
+    
+    $parts = [System.Collections.Generic.List[string]]::new()
+    
+    if ($null -eq $ErrorRecord) { return 'Unknown error' }
+    
+    try {
+        if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) {
+            if ($ErrorRecord.FullyQualifiedErrorId) {
+                [void]$parts.Add("Id=$($ErrorRecord.FullyQualifiedErrorId)")
+            }
+            try {
+                if ($ErrorRecord.CategoryInfo -and $ErrorRecord.CategoryInfo.Reason) {
+                    [void]$parts.Add("Reason=$($ErrorRecord.CategoryInfo.Reason)")
+                }
+            } catch {}
+            $ex = $ErrorRecord.Exception
+        } else {
+            $ex = $ErrorRecord
+        }
+    } catch {
+        $ex = $ErrorRecord
+    }
+    
+    $guard = 0
+    while ($null -ne $ex -and $guard -lt 8) {
+        $msg = ''
+        try { $msg = "$($ex.Message)".Trim() } catch { $msg = '' }
+        if ($msg -and -not ($parts -contains $msg)) {
+            [void]$parts.Add($msg)
+        }
+        try {
+            $hr = [int]$ex.HResult
+            if ($hr -ne 0) {
+                $hrText = ('HRESULT=0x{0:X8}' -f ([uint32]$hr))
+                if (-not ($parts -contains $hrText)) { [void]$parts.Add($hrText) }
+            }
+        } catch {}
+        try { $ex = $ex.InnerException } catch { $ex = $null }
+        $guard++
+    }
+    
+    if ((Get-SafeCount $parts) -eq 0) {
+        return "$ErrorRecord"
+    }
+    return ($parts -join ' | ')
+}
+
+function Test-DhcpClusterLikeName {
+    param([string]$Name)
+    $n = Get-CleanDhcpServerHostName -Name $Name
+    if (-not $n) { return $false }
+    $short = ($n -split '\.')[0]
+    return [bool]($short -match '(?i)(cluster|failover|vip|nlb|lb\d*|cast)$' -or $n -match '(?i)[-_.](cluster|failover|vip)([-_.]|$)')
+}
+
+function Get-DhcpRelatedConnectCandidates {
+    <#
+    .SYNOPSIS
+        Suggests real DHCP nodes from domain scan when a cluster/VIP name is used
+    #>
+    param(
+        [string]$Name,
+        [string]$FallbackIP = '',
+        [int]$MaxCandidates = 6
+    )
+    
+    $related = [System.Collections.Generic.List[object]]::new()
+    $clean = Get-CleanDhcpServerHostName -Name $Name
+    if (-not $clean) { return @() }
+    
+    $short = (($clean -split '\.')[0]).ToLowerInvariant()
+    $site = ''
+    if ($short -match '^(?<site>[a-z0-9]+)-') { $site = $Matches['site'] }
+    
+    $fallbackIp = "$FallbackIP".Trim()
+    $octet3 = ''
+    if ($fallbackIp -match '^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}$') {
+        $octet3 = $Matches[1]
+    }
+    
+    $clusterLike = Test-DhcpClusterLikeName -Name $clean
+    
+    foreach ($r in @($Global:DomainScanResults)) {
+        if ($null -eq $r) { continue }
+        
+        $dns = Get-CleanDhcpServerHostName -Name "$($r.DnsName)"
+        $ip = "$($r.IPAddress)".Trim()
+        if ([string]::IsNullOrWhiteSpace($dns)) { continue }
+        if ($dns.Equals($clean, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        if (Test-DhcpClusterLikeName -Name $dns) { continue }
+        
+        $online = "$($r.Online)"
+        $isUp = ($online -eq 'Up' -or $online -eq 'Yes' -or "$($r.Status)" -eq 'Up')
+        
+        $score = 0
+        $dnsLower = $dns.ToLowerInvariant()
+        $dnsShort = (($dns -split '\.')[0]).ToLowerInvariant()
+        
+        if ($dnsLower -match 'dhcp') { $score += 3 }
+        if ($site -and $dnsShort.StartsWith("$site-")) { $score += 3 }
+        if ($octet3 -and $ip -match "^$([regex]::Escape($octet3))\.\d{1,3}$") { $score += 4 }
+        if ($isUp) { $score += 2 }
+        if ("$($r.Authorized)" -eq 'Yes') { $score += 1 }
+        
+        # Strongly prefer node-like names when user asked for a cluster
+        if ($clusterLike) {
+            if ($score -lt 5) { continue }
+        } else {
+            # For non-cluster failures, only suggest same /24 dhcp hosts
+            if (-not ($octet3 -and $ip -match "^$([regex]::Escape($octet3))\.\d{1,3}$" -and $dnsLower -match 'dhcp')) {
+                continue
+            }
+            if ($score -lt 6) { continue }
+        }
+        
+        [void]$related.Add([PSCustomObject]@{
+            DnsName = $dns
+            IPAddress = if ($ip -match '^[0-9]{1,3}(?:\.[0-9]{1,3}){3}$') { $ip } else { '' }
+            Score = $score
+            Online = $online
+        })
+    }
+    
+    $sorted = @($related | Sort-Object Score -Descending, DnsName)
+    if ((Get-SafeCount $sorted) -gt $MaxCandidates) {
+        $sorted = @($sorted | Select-Object -First $MaxCandidates)
+    }
+    return $sorted
+}
+
+function Test-DhcpServerRpcReachable {
+    <#
+    .SYNOPSIS
+        Probes DHCP RPC management on a target (scopes first, then server settings)
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComputerName
+    )
+    
+    $target = "$ComputerName".Trim()
+    # Primary probe used everywhere else in the app
+    try {
+        $null = @(Get-DhcpServerv4Scope -ComputerName $target -ErrorAction Stop)
+        return [PSCustomObject]@{ Ok = $true; Method = 'Get-DhcpServerv4Scope'; Error = '' }
+    } catch {
+        $scopeErr = $_
+    }
+    
+    # Secondary probe — sometimes clarifies Access Denied vs empty/service issues
+    try {
+        $null = Get-DhcpServerSetting -ComputerName $target -ErrorAction Stop
+        # Settings worked but scopes failed — still treat as failure for app use, but richer error
+        $detail = Get-DhcpConnectErrorDetail -ErrorRecord $scopeErr
+        throw "Server settings reachable on '$target', but scope enumeration failed: $detail"
+    } catch {
+        if ("$_" -match 'Server settings reachable') { throw }
+        # Prefer the original scopes error (primary app requirement)
+        throw $scopeErr
+    }
+}
+
 function Get-DhcpFallbackIpForName {
     <#
     .SYNOPSIS
@@ -2311,7 +2479,7 @@ function Get-DhcpFallbackIpForName {
 function Connect-DhcpServerTarget {
     <#
     .SYNOPSIS
-        Validates DHCP connectivity; tries hostname then IP fallbacks
+        Validates DHCP connectivity; tries hostname, IP, DNS, and related scan nodes
     #>
     param(
         [Parameter(Mandatory)]
@@ -2367,9 +2535,25 @@ function Connect-DhcpServerTarget {
             foreach ($a in $addrs) {
                 & $addCandidate "$a"
             }
+            if (-not $fb -and (Get-SafeCount $addrs) -gt 0) {
+                $fb = "$($addrs[0])"
+            }
         } catch {
             Write-ActionLog "DNS resolve failed for '${cleaned}': $_" "WARN"
         }
+    }
+    
+    # Related DHCP nodes from domain scan (especially for *-cluster names / VIPs)
+    $related = @(Get-DhcpRelatedConnectCandidates -Name $cleaned -FallbackIP $fb -MaxCandidates 6)
+    if ((Get-SafeCount $related) -gt 0) {
+        $names = @($related | ForEach-Object { $_.DnsName }) -join ', '
+        Write-ActionLog "Also trying related DHCP node(s) from scan: $names" "INFO"
+        foreach ($rel in $related) {
+            & $addCandidate "$($rel.DnsName)"
+            if ($rel.IPAddress) { & $addCandidate "$($rel.IPAddress)" }
+        }
+    } elseif (Test-DhcpClusterLikeName -Name $cleaned) {
+        Write-ActionLog "Target looks like a cluster/VIP name. Run Scan Domain and connect to an active DHCP node (not the cluster name) if connect fails." "WARN"
     }
     
     $attemptErrors = [System.Collections.Generic.List[string]]::new()
@@ -2377,43 +2561,61 @@ function Connect-DhcpServerTarget {
     foreach ($target in $candidates) {
         try {
             Write-ActionLog "Trying DHCP RPC connect via '$target'..." "INFO"
-            $null = Get-DhcpServerv4Scope -ComputerName $target -ErrorAction Stop
+            $null = Test-DhcpServerRpcReachable -ComputerName $target
             if (-not $target.Equals($cleaned, [System.StringComparison]::OrdinalIgnoreCase)) {
                 Write-ActionLog "Connected using fallback target '$target' (requested '$cleaned')" "SUCCESS"
             }
             return $target
         } catch {
-            $raw = "$_"
+            $raw = Get-DhcpConnectErrorDetail -ErrorRecord $_
             [void]$attemptErrors.Add("${target}: $raw")
             Write-ActionLog "Connect attempt failed for '${target}': $raw" "WARN"
         }
     }
     
-    $primaryFail = if ((Get-SafeCount $attemptErrors) -gt 0) { $attemptErrors[0] } else { 'Unknown error' }
-    $hint = switch -Regex ($primaryFail) {
-        'access is denied|AccessDenied|0x80070005' {
-            "Access denied. Run as a user with DHCP Administrators rights on the target (or Domain Admins). Cross-domain may need an account trusted in that domain."
+    $allFailText = ($attemptErrors -join ' || ')
+    $hint = switch -Regex ($allFailText) {
+        'access is denied|AccessDenied|0x80070005|HRESULT=0x80070005' {
+            "Access denied. Run PowerShell / DHCP Manager as a user in DHCP Administrators (or equivalent) on the target domain."
         }
-        'RPC|RPC server|0x800706BA|unavailable' {
-            "RPC unreachable. Check firewall (RPC TCP 135 + dynamic ports), DHCP Server service, and routing to the target (try IP if hostname fails)."
+        'RPC|RPC server|0x800706BA|unavailable|HRESULT=0x800706BA' {
+            "RPC unreachable. Check firewall (RPC TCP 135 + dynamic high ports), DHCP Server service, and routing. Try a node hostname or IP from Scan Domain."
         }
         'WinRM|WS-Management' {
             "WinRM issue. DHCP cmdlets use RPC (not WinRM). Verify RPC/firewall connectivity."
         }
         'cannot find|not found|no such host|DNS|No such host is known' {
-            "Name resolution failed. Use FQDN or IP address; Scan Domain can fill the IP."
+            "Name resolution failed. Use FQDN or IP address; Scan Domain can fill a reachable host/IP."
         }
         'The term .*Get-DhcpServerv4Scope' {
             "DhcpServer module failed to load cmdlets. Reinstall RSAT-DHCP tools."
         }
+        'Failed to enumerate scopes|enumerate scopes' {
+            if (Test-DhcpClusterLikeName -Name $cleaned) {
+                "Cluster/VIP names often cannot enumerate scopes over DHCP RPC. Use Scan Domain and Connect to an active node (for example a host like …dhcp1… / …dhcp2…), not '$cleaned'."
+            } else {
+                "DHCP RPC could not enumerate scopes. Confirm the DHCP Server role is running on that host, your account is in DHCP Administrators/Users, and you are not targeting a cluster name/VIP. Prefer a node from Scan Domain."
+            }
+        }
         default {
-            "Verify network path, DHCP service status, and account permissions. For other domains, prefer IP if DNS/suffix search fails."
+            "Verify network path, DHCP Server service, and account permissions. If this is a failover cluster name, connect to an active DHCP node from Scan Domain instead of the cluster/VIP."
         }
     }
     
     $tried = ($candidates -join ', ')
     $details = ($attemptErrors -join "`n")
-    throw "Cannot reach DHCP on '$cleaned' (tried: $tried). $hint`n`nDetails:`n$details"
+    $suggest = ''
+    if ((Get-SafeCount $related) -gt 0) {
+        $nodeLines = @($related | ForEach-Object {
+            $ipPart = if ($_.IPAddress) { " ($($_.IPAddress))" } else { '' }
+            "  - $($_.DnsName)$ipPart"
+        }) -join "`n"
+        $suggest = "`n`nSuggested nodes from your last domain scan (try one of these in the DHCP Server box):`n$nodeLines"
+    } elseif (Test-DhcpClusterLikeName -Name $cleaned) {
+        $suggest = "`n`nTip: Run Scan Domain, then select an online DHCP host (not a *cluster* name) and click Use for Server A."
+    }
+    
+    throw "Cannot reach DHCP on '$cleaned' (tried: $tried). $hint$suggest`n`nDetails:`n$details"
 }
 
 function Enable-ConnectedControls {
