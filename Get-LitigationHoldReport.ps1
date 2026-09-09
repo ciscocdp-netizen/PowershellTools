@@ -34,6 +34,10 @@
     - Disconnect-ExchangeOnline was skipped on several error paths, leaving the
       session open. Disconnect runs in finally, and only if this script connected.
     - Install-Module could fail on TLS 1.0 defaults / missing NuGet provider.
+    - Connect-ExchangeOnline on Windows PowerShell 5.1 often fails with
+      "An error occurred while sending the request" because .NET still offers
+      TLS 1.0/1.1. TLS 1.2 is enabled before the module loads. Inner exceptions
+      are printed, WAM is disabled on 5.1, and default proxy credentials are set.
 
 .PARAMETER OutputCsv
     Optional. Path to write the report. When omitted, a Save File dialog is shown.
@@ -124,6 +128,154 @@ if ($script:UseGui -and [System.Threading.Thread]::CurrentThread.ApartmentState 
 #endregion
 
 #region Helpers ----------------------------------------------------------------
+
+function Enable-Tls12 {
+    # Windows PowerShell 5.1 / .NET 4.x still defaults to TLS 1.0/1.1.
+    # Connect-ExchangeOnline then fails with "An error occurred while sending the request".
+    $tls12 = [Net.SecurityProtocolType]::Tls12
+    try {
+        $current = [Net.ServicePointManager]::SecurityProtocol
+        if (($current -band $tls12) -ne $tls12) {
+            [Net.ServicePointManager]::SecurityProtocol = $current -bor $tls12
+        }
+    }
+    catch {
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = $tls12
+        }
+        catch {
+            # Runtime may not expose the enum; connection will fail with a clearer chain later.
+        }
+    }
+
+    try {
+        $tls13 = [Net.SecurityProtocolType]::Tls13
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor $tls13
+    }
+    catch {
+        # TLS 1.3 is not available on all .NET Framework builds.
+    }
+}
+
+function Enable-DefaultProxyCredentials {
+    try {
+        $proxy = [Net.WebRequest]::DefaultWebProxy
+        if ($null -ne $proxy -and $null -eq $proxy.Credentials) {
+            $proxy.Credentials = [Net.CredentialCache]::DefaultNetworkCredentials
+        }
+    }
+    catch {
+        # No proxy or the runtime does not allow this; ignore.
+    }
+}
+
+function Get-ExceptionMessageChain {
+    param($Exception)
+
+    $parts = New-Object System.Collections.Generic.List[string]
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    $queue = New-Object System.Collections.Generic.Queue[System.Exception]
+    if ($null -ne $Exception) {
+        $queue.Enqueue($Exception)
+    }
+
+    while ($queue.Count -gt 0) {
+        $ex = $queue.Dequeue()
+        if ($null -eq $ex) {
+            continue
+        }
+
+        $msg = $ex.Message
+        if (-not [string]::IsNullOrWhiteSpace($msg) -and $seen.Add($msg)) {
+            [void]$parts.Add($msg)
+        }
+
+        if ($null -ne $ex.InnerException) {
+            $queue.Enqueue($ex.InnerException)
+        }
+
+        if ($ex -is [System.AggregateException]) {
+            foreach ($inner in @($ex.InnerExceptions)) {
+                if ($null -ne $inner) {
+                    $queue.Enqueue($inner)
+                }
+            }
+        }
+    }
+
+    if ($parts.Count -eq 0) {
+        return 'Unknown error'
+    }
+    return ($parts -join ' --> ')
+}
+
+function Test-IsTransportFailure {
+    param([string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message)) {
+        return $false
+    }
+
+    return [bool]($Message -match 'sending the request|SSL/TLS|secure channel|common algorithm|underlying connection was closed|The request was aborted|Could not create SSL')
+}
+
+function Write-ConnectionFailureHelp {
+    param([string]$Message)
+
+    if (-not (Test-IsTransportFailure -Message $Message)) {
+        return
+    }
+
+    Write-Host @"
+
+This is almost always a TLS 1.2 or proxy/firewall problem on Windows PowerShell 5.1.
+The script already enabled TLS 1.2 for this process. If it still fails:
+
+  1. Update the module:   Update-Module ExchangeOnlineManagement -Force
+  2. Allow HTTPS to login.microsoftonline.com and outlook.office365.com
+  3. Confirm Internet Options has the corporate proxy (if you use one)
+  4. Run from PowerShell 7 instead:  pwsh -File .\Get-LitigationHoldReport.ps1
+"@ -ForegroundColor Yellow
+}
+
+function Test-HasCmdletParameter {
+    param(
+        [Parameter(Mandatory)]
+        [string]$CommandName,
+
+        [Parameter(Mandatory)]
+        [string]$ParameterName
+    )
+
+    $cmd = Get-Command -Name $CommandName -ErrorAction SilentlyContinue
+    if ($null -eq $cmd) {
+        return $false
+    }
+    return $cmd.Parameters.ContainsKey($ParameterName)
+}
+
+function Connect-LitigationHoldExchange {
+    param(
+        [string]$UserPrincipalName
+    )
+
+    $connectParams = @{
+        ShowBanner  = $false
+        ErrorAction = 'Stop'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($UserPrincipalName)) {
+        $connectParams['UserPrincipalName'] = $UserPrincipalName
+    }
+
+    # EXO module 3.7+ uses the Windows WAM broker by default; on Windows
+    # PowerShell 5.1 that often surfaces as HttpRequestException.
+    $isWindowsPowerShell = $PSVersionTable.PSVersion.Major -lt 6
+    if ($isWindowsPowerShell -and (Test-HasCmdletParameter -CommandName 'Connect-ExchangeOnline' -ParameterName 'DisableWAM')) {
+        $connectParams['DisableWAM'] = $true
+    }
+
+    Connect-ExchangeOnline @connectParams
+}
 
 function Assert-Equal {
     param($Actual, $Expected, [string]$Name)
@@ -376,12 +528,7 @@ function Install-ExchangeOnlineModuleIfMissing {
 
     Write-Host "ExchangeOnlineManagement module not found. Installing for current user..." -ForegroundColor Yellow
 
-    try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    }
-    catch {
-        # Older runtimes may not expose every TLS enum member; keep going.
-    }
+    Enable-Tls12
 
     $nuget = Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue
     if ($null -eq $nuget -or $nuget.Version -lt [version]'2.8.5.201') {
@@ -502,6 +649,15 @@ function Invoke-LitigationHoldSelfTest {
     $none = @()
     Assert-Equal $none.Count 0 'empty result count'
 
+    $inner = New-Object System.Exception 'The client and server cannot communicate, because they do not possess a common algorithm'
+    $outer = New-Object System.Exception 'An error occurred while sending the request.', $inner
+    Assert-Equal (Get-ExceptionMessageChain $outer) 'An error occurred while sending the request. --> The client and server cannot communicate, because they do not possess a common algorithm' 'inner exception chain'
+    Assert-Equal (Test-IsTransportFailure -Message $outer.Message) $true 'transport failure detected'
+
+    Enable-Tls12
+    $tls12 = [Net.SecurityProtocolType]::Tls12
+    Assert-Equal (([Net.ServicePointManager]::SecurityProtocol -band $tls12) -eq $tls12) $true 'TLS 1.2 enabled'
+
     Write-Host "All self-tests passed." -ForegroundColor Green
 }
 
@@ -513,6 +669,12 @@ if ($SelfTest) {
 }
 
 #region Setup ------------------------------------------------------------------
+
+# TLS 1.2 MUST be enabled before Import-Module ExchangeOnlineManagement.
+# Windows PowerShell 5.1 otherwise fails Connect-ExchangeOnline with
+# "An error occurred while sending the request".
+Enable-Tls12
+Enable-DefaultProxyCredentials
 
 $script:WinFormsLoaded = $false
 if ($script:UseGui) {
@@ -531,7 +693,7 @@ try {
     Install-ExchangeOnlineModuleIfMissing
 }
 catch {
-    Write-Host "Failed to install ExchangeOnlineManagement module: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Failed to install ExchangeOnlineManagement module: $(Get-ExceptionMessageChain $_.Exception)" -ForegroundColor Red
     exit 1
 }
 
@@ -545,14 +707,7 @@ try {
     }
     else {
         Write-Host "Connecting to Exchange Online..." -ForegroundColor Cyan
-        $connectParams = @{
-            ShowBanner  = $false
-            ErrorAction = 'Stop'
-        }
-        if (-not [string]::IsNullOrWhiteSpace($UserPrincipalName)) {
-            $connectParams['UserPrincipalName'] = $UserPrincipalName
-        }
-        Connect-ExchangeOnline @connectParams
+        Connect-LitigationHoldExchange -UserPrincipalName $UserPrincipalName
         $script:WeConnected = $true
     }
 
@@ -599,7 +754,9 @@ try {
     Write-Host "`nReport saved to: $targetPath" -ForegroundColor Green
 }
 catch {
-    Write-Host "Litigation Hold report failed: $($_.Exception.Message)" -ForegroundColor Red
+    $chain = Get-ExceptionMessageChain $_.Exception
+    Write-Host "Litigation Hold report failed: $chain" -ForegroundColor Red
+    Write-ConnectionFailureHelp -Message $chain
     exit 1
 }
 finally {

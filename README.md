@@ -26,3 +26,5 @@ Reports Exchange Online mailboxes that have **Litigation Hold** enabled and expo
 ```
 
 Requires the ExchangeOnlineManagement module (installed automatically for the current user if missing) and an Exchange Online admin account that can run `Get-EXOMailbox`.
+
+On **Windows PowerShell 5.1**, `Connect-ExchangeOnline` often fails with `An error occurred while sending the request` unless TLS 1.2 is enabled. The script does that automatically before the module loads. If it still fails, update the module (`Update-Module ExchangeOnlineManagement -Force`) or run the script in PowerShell 7.
