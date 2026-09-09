@@ -100,7 +100,7 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.5.8'
+$Global:AppVersion       = '2.5.9'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:DhcpEventEntriesAll = [System.Collections.Generic.List[object]]::new()
 $Global:ScopeStatEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
@@ -651,7 +651,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                      HorizontalAlignment="Center"/>
           
           <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-            <Run Text="v2.5.8  |  "/>
+            <Run Text="v2.5.9  |  "/>
             <Run Text="Created by Anthony Blake" Foreground="#90CAF9"/>
             <Run Text="  |  "/>
             <Run x:Name="StatusTime" Text=""/>
