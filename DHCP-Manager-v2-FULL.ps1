@@ -34,7 +34,7 @@
     
 .NOTES
     File Name      : DHCP-Manager-v2-FULL.ps1
-    Version        : 2.6.2 (BAD_ADDRESS Troubleshoot)
+    Version        : 2.6.3 (BAD_ADDRESS Troubleshoot)
     Date           : 2026-09-09
     Author         : Anthony Blake
     Prerequisite   : PowerShell 5.1+
@@ -101,7 +101,7 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.6.2'
+$Global:AppVersion       = '2.6.3'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:DhcpEventEntriesAll = [System.Collections.Generic.List[object]]::new()
 $Global:ScopeStatEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
@@ -666,7 +666,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                      HorizontalAlignment="Center"/>
           
           <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-            <Run Text="v2.6.2  |  "/>
+            <Run Text="v2.6.3  |  "/>
             <Run Text="Created by Anthony Blake" Foreground="#90CAF9"/>
             <Run Text="  |  "/>
             <Run x:Name="StatusTime" Text=""/>
@@ -1096,9 +1096,17 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                   <ColumnDefinition Width="*"/>
                 </Grid.ColumnDefinitions>
                 <DockPanel Grid.Column="0" Margin="0,0,6,0">
-                  <TextBlock DockPanel.Dock="Top" Text="Diagnostic findings" Style="{StaticResource FormLabel}" Margin="0,0,0,6"/>
+                  <DockPanel DockPanel.Dock="Top" Margin="0,0,0,6" LastChildFill="True">
+                    <Button x:Name="BtnTroubleshootFindingDetails" DockPanel.Dock="Right"
+                            Content="🔍 Details" Margin="8,0,0,0"
+                            Style="{StaticResource BtnSecondary}" IsEnabled="False"
+                            ToolTip="Show full finding and recommendation (or double-click a row)"/>
+                    <TextBlock Text="Diagnostic findings  (double-click for full text)" Style="{StaticResource FormLabel}"
+                               VerticalAlignment="Center"/>
+                  </DockPanel>
                   <DataGrid x:Name="GridTroubleshootFindings" Style="{StaticResource DarkGrid}"
-                            IsReadOnly="True" SelectionMode="Single">
+                            IsReadOnly="True" SelectionMode="Single"
+                            ToolTip="Double-click a row to view the full finding and recommendation">
                     <DataGrid.Columns>
                       <DataGridTextColumn Header="Step" Binding="{Binding Step}" Width="40"/>
                       <DataGridTextColumn Header="Check" Binding="{Binding Check}" Width="160"/>
@@ -1109,9 +1117,10 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                   </DataGrid>
                 </DockPanel>
                 <DockPanel Grid.Column="1" Margin="6,0,0,0">
-                  <TextBlock DockPanel.Dock="Top" Text="BAD_ADDRESS leases in scope" Style="{StaticResource FormLabel}" Margin="0,0,0,6"/>
+                  <TextBlock DockPanel.Dock="Top" Text="BAD_ADDRESS leases in scope  (double-click for details)" Style="{StaticResource FormLabel}" Margin="0,0,0,6"/>
                   <DataGrid x:Name="GridTroubleshootBadLeases" Style="{StaticResource DarkGrid}"
-                            IsReadOnly="True" SelectionMode="Extended">
+                            IsReadOnly="True" SelectionMode="Extended"
+                            ToolTip="Double-click a row for full lease details">
                     <DataGrid.Columns>
                       <DataGridTextColumn Header="IP Address" Binding="{Binding IPAddress}" Width="120"/>
                       <DataGridTextColumn Header="MAC / ClientId" Binding="{Binding ClientId}" Width="140"/>
@@ -1124,9 +1133,10 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
               </Grid>
 
               <DockPanel Grid.Row="3" Margin="0,0,0,8">
-                <TextBlock DockPanel.Dock="Top" Text="Ping / ARP sample probes" Style="{StaticResource FormLabel}" Margin="0,0,0,6"/>
+                <TextBlock DockPanel.Dock="Top" Text="Ping / ARP sample probes  (double-click for details)" Style="{StaticResource FormLabel}" Margin="0,0,0,6"/>
                 <DataGrid x:Name="GridTroubleshootProbes" Style="{StaticResource DarkGrid}"
-                          IsReadOnly="True" SelectionMode="Single">
+                          IsReadOnly="True" SelectionMode="Single"
+                          ToolTip="Double-click a row for full probe details">
                   <DataGrid.Columns>
                     <DataGridTextColumn Header="IP Address" Binding="{Binding IPAddress}" Width="120"/>
                     <DataGridTextColumn Header="Ping" Binding="{Binding PingStatus}" Width="70"/>
@@ -1919,6 +1929,7 @@ try {
     $script:BtnTroubleshootExport = $Window.FindName("BtnTroubleshootExport")
     $script:TxtTroubleshootSummary = $Window.FindName("TxtTroubleshootSummary")
     $script:GridTroubleshootFindings = $Window.FindName("GridTroubleshootFindings")
+    $script:BtnTroubleshootFindingDetails = $Window.FindName("BtnTroubleshootFindingDetails")
     $script:GridTroubleshootBadLeases = $Window.FindName("GridTroubleshootBadLeases")
     $script:GridTroubleshootProbes = $Window.FindName("GridTroubleshootProbes")
     $script:ChkTroubleshootReviewed = $Window.FindName("ChkTroubleshootReviewed")
@@ -5503,6 +5514,210 @@ function Export-BadAddressReport {
     } catch {
         Write-ActionLog "BAD_ADDRESS export failed: $_" "ERROR"
         Show-MessageBox "Export failed: $_" "Export Error" OK Error
+    }
+}
+
+function Show-TroubleshootDetailDialog {
+    <#
+    .SYNOPSIS
+        Modal popup with full text for a Troubleshoot finding, BAD lease, or probe row
+    #>
+    param(
+        [ValidateSet('Finding', 'BadLease', 'Probe')]
+        [string]$Kind = 'Finding',
+        [object]$Entry
+    )
+    
+    if ($null -eq $Entry) {
+        Show-MessageBox "Select a row first (or double-click a row)." "Troubleshoot Details" OK Warning
+        return
+    }
+    
+    $title = 'Troubleshoot Details'
+    $subtitle = ''
+    $fields = [System.Collections.Generic.List[object]]::new()
+    $copyAll = [System.Collections.Generic.List[string]]::new()
+    
+    switch ($Kind) {
+        'Finding' {
+            $title = 'Diagnostic Finding Details'
+            $step = "$($Entry.Step)"
+            $check = "$($Entry.Check)"
+            $status = "$($Entry.Status)"
+            $finding = "$($Entry.Finding)"
+            $rec = "$($Entry.Recommendation)"
+            $subtitle = "Step $step  ·  $check  ·  $status"
+            [void]$fields.Add(@{ Label = 'Step'; Value = $step; Tall = $false })
+            [void]$fields.Add(@{ Label = 'Check'; Value = $check; Tall = $false })
+            [void]$fields.Add(@{ Label = 'Status'; Value = $status; Tall = $false })
+            [void]$fields.Add(@{ Label = 'Finding'; Value = $finding; Tall = $true })
+            [void]$fields.Add(@{ Label = 'Recommendation'; Value = $rec; Tall = $true })
+            if ($Global:BadAddressDiag.ScopeId) {
+                [void]$fields.Add(@{ Label = 'Scope'; Value = "$($Global:BadAddressDiag.ScopeId) on $($Global:BadAddressDiag.Server)"; Tall = $false })
+            }
+            if ($Global:BadAddressDiag.Summary) {
+                [void]$fields.Add(@{ Label = 'Run summary'; Value = "$($Global:BadAddressDiag.Summary)"; Tall = $true })
+            }
+            [void]$copyAll.Add("Diagnostic Finding Details")
+            [void]$copyAll.Add("Step: $step")
+            [void]$copyAll.Add("Check: $check")
+            [void]$copyAll.Add("Status: $status")
+            [void]$copyAll.Add("Finding: $finding")
+            [void]$copyAll.Add("Recommendation: $rec")
+        }
+        'BadLease' {
+            $title = 'BAD_ADDRESS Lease Details'
+            $ip = "$($Entry.IPAddress)"
+            $clientId = "$($Entry.ClientId)"
+            $hostName = "$($Entry.HostName)"
+            $state = "$($Entry.AddressState)"
+            $expiry = "$($Entry.LeaseExpiryTime)"
+            $subtitle = "$ip  ·  $state"
+            [void]$fields.Add(@{ Label = 'IP Address'; Value = $ip; Tall = $false })
+            [void]$fields.Add(@{ Label = 'MAC / ClientId'; Value = $clientId; Tall = $false })
+            [void]$fields.Add(@{ Label = 'Hostname'; Value = $hostName; Tall = $false })
+            [void]$fields.Add(@{ Label = 'State'; Value = $state; Tall = $false })
+            [void]$fields.Add(@{ Label = 'Lease Expiry'; Value = $expiry; Tall = $false })
+            if ($Global:BadAddressDiag.ScopeId) {
+                [void]$fields.Add(@{ Label = 'Scope'; Value = "$($Global:BadAddressDiag.ScopeId)"; Tall = $false })
+            }
+            [void]$copyAll.Add("BAD_ADDRESS Lease Details")
+            [void]$copyAll.Add("IP Address: $ip")
+            [void]$copyAll.Add("MAC / ClientId: $clientId")
+            [void]$copyAll.Add("Hostname: $hostName")
+            [void]$copyAll.Add("State: $state")
+            [void]$copyAll.Add("Lease Expiry: $expiry")
+        }
+        'Probe' {
+            $title = 'Ping / ARP Probe Details'
+            $ip = "$($Entry.IPAddress)"
+            $ping = "$($Entry.PingStatus)"
+            $lat = "$($Entry.LatencyMs)"
+            $mac = "$($Entry.ArpMac)"
+            $arpState = "$($Entry.ArpState)"
+            $notes = "$($Entry.Notes)"
+            $subtitle = "$ip  ·  Ping $ping  ·  ARP $arpState"
+            [void]$fields.Add(@{ Label = 'IP Address'; Value = $ip; Tall = $false })
+            [void]$fields.Add(@{ Label = 'Ping'; Value = $ping; Tall = $false })
+            [void]$fields.Add(@{ Label = 'Latency'; Value = $lat; Tall = $false })
+            [void]$fields.Add(@{ Label = 'ARP MAC'; Value = $mac; Tall = $false })
+            [void]$fields.Add(@{ Label = 'ARP State'; Value = $arpState; Tall = $false })
+            [void]$fields.Add(@{ Label = 'Notes'; Value = $notes; Tall = $true })
+            if ($Global:BadAddressDiag.ScopeId) {
+                [void]$fields.Add(@{ Label = 'Scope'; Value = "$($Global:BadAddressDiag.ScopeId)"; Tall = $false })
+            }
+            [void]$copyAll.Add("Ping / ARP Probe Details")
+            [void]$copyAll.Add("IP Address: $ip")
+            [void]$copyAll.Add("Ping: $ping")
+            [void]$copyAll.Add("Latency: $lat")
+            [void]$copyAll.Add("ARP MAC: $mac")
+            [void]$copyAll.Add("ARP State: $arpState")
+            [void]$copyAll.Add("Notes: $notes")
+        }
+    }
+    
+    [xml]$dialogXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Troubleshoot Details"
+        Height="520" Width="720"
+        MinHeight="360" MinWidth="520"
+        WindowStartupLocation="CenterOwner"
+        Background="#1A1D23"
+        FontFamily="Segoe UI" FontSize="13"
+        ResizeMode="CanResizeWithGrip">
+  <Grid Margin="16">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+
+    <StackPanel Grid.Row="0" Margin="0,0,0,12">
+      <TextBlock x:Name="TxtTsDetailTitle" Foreground="#E8EAF0" FontSize="18" FontWeight="SemiBold"/>
+      <TextBlock x:Name="TxtTsDetailSubtitle" Foreground="#9AA3B2" FontSize="12" Margin="0,4,0,0" TextWrapping="Wrap"/>
+    </StackPanel>
+
+    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+      <StackPanel x:Name="PanelTsDetailFields"/>
+    </ScrollViewer>
+
+    <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+      <Button x:Name="BtnTsDetailCopy" Content="Copy All" Width="100" Height="30" Margin="0,0,8,0"
+              Background="#2A2F3A" Foreground="#E8EAF0" BorderBrush="#383E4A" BorderThickness="1"/>
+      <Button x:Name="BtnTsDetailClose" Content="Close" Width="90" Height="30" IsDefault="True" IsCancel="True"
+              Background="#2196F3" Foreground="White" BorderThickness="0"/>
+    </StackPanel>
+  </Grid>
+</Window>
+'@
+    
+    try {
+        $dialog = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($dialogXaml))
+        if ($script:Window) { $dialog.Owner = $script:Window }
+        $dialog.Title = $title
+        $dialog.FindName('TxtTsDetailTitle').Text = $title
+        $dialog.FindName('TxtTsDetailSubtitle').Text = $subtitle
+        
+        $panel = $dialog.FindName('PanelTsDetailFields')
+        foreach ($f in $fields) {
+            $border = New-Object System.Windows.Controls.Border
+            $border.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#22262E')
+            $border.CornerRadius = [System.Windows.CornerRadius]::new(6)
+            $border.Padding = [System.Windows.Thickness]::new(12)
+            $border.Margin = [System.Windows.Thickness]::new(0, 0, 0, 10)
+            
+            $stack = New-Object System.Windows.Controls.StackPanel
+            $lbl = New-Object System.Windows.Controls.TextBlock
+            $lbl.Text = "$($f.Label)"
+            $lbl.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#90CAF9')
+            $lbl.FontWeight = [System.Windows.FontWeights]::SemiBold
+            $lbl.Margin = [System.Windows.Thickness]::new(0, 0, 0, 6)
+            
+            $box = New-Object System.Windows.Controls.TextBox
+            $box.Text = "$(if ($null -ne $f.Value) { $f.Value } else { '' })"
+            $box.IsReadOnly = $true
+            $box.TextWrapping = [System.Windows.TextWrapping]::Wrap
+            $box.AcceptsReturn = $true
+            $box.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#12151A')
+            $box.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#E8EAF0')
+            $box.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#383E4A')
+            $box.BorderThickness = [System.Windows.Thickness]::new(1)
+            $box.Padding = [System.Windows.Thickness]::new(8, 6, 8, 6)
+            if ($f.Tall) {
+                $box.MinHeight = 72
+                $box.VerticalScrollBarVisibility = [System.Windows.Controls.ScrollBarVisibility]::Auto
+            } else {
+                $box.MinHeight = 28
+            }
+            
+            [void]$stack.Children.Add($lbl)
+            [void]$stack.Children.Add($box)
+            $border.Child = $stack
+            [void]$panel.Children.Add($border)
+        }
+        
+        $script:TroubleshootDetailCopyAll = ($copyAll -join [Environment]::NewLine)
+        
+        $btnCopy = $dialog.FindName('BtnTsDetailCopy')
+        $btnClose = $dialog.FindName('BtnTsDetailClose')
+        $btnCopy.add_Click({
+            try {
+                [System.Windows.Clipboard]::SetText("$($script:TroubleshootDetailCopyAll)")
+                Write-ActionLog "Copied Troubleshoot detail text to clipboard" "INFO"
+            } catch {
+                Show-MessageBox "Could not copy to clipboard: $_" "Troubleshoot Details" OK Warning
+            }
+        })
+        $btnClose.add_Click({
+            $dialog.DialogResult = $true
+            $dialog.Close()
+        })
+        
+        [void]$dialog.ShowDialog()
+    } catch {
+        Write-ActionLog "Troubleshoot detail dialog failed: $_" "ERROR"
+        Show-MessageBox "Could not open details: $_" "Troubleshoot Details" OK Error
     }
 }
 
@@ -9762,6 +9977,82 @@ if ($null -ne $script:ChkTroubleshootReviewed) {
 if ($null -ne $script:BtnTroubleshootClearBad) {
     $script:BtnTroubleshootClearBad.add_Click({
         Clear-BadAddressLeasesForScope
+    })
+}
+
+if ($null -ne $script:GridTroubleshootFindings) {
+    $script:GridTroubleshootFindings.add_SelectionChanged({
+        if ($null -ne $script:BtnTroubleshootFindingDetails) {
+            $script:BtnTroubleshootFindingDetails.IsEnabled = ($null -ne $script:GridTroubleshootFindings.SelectedItem)
+        }
+    })
+    $script:GridTroubleshootFindings.add_MouseDoubleClick({
+        $item = $null
+        try { $item = $script:GridTroubleshootFindings.SelectedItem } catch {}
+        if ($null -ne $item) {
+            Show-TroubleshootDetailDialog -Kind Finding -Entry $item
+        }
+    })
+    $script:GridTroubleshootFindings.add_KeyDown({
+        param($sender, $e)
+        if ($e.Key -eq [System.Windows.Input.Key]::Enter -or $e.Key -eq [System.Windows.Input.Key]::Return) {
+            $item = $null
+            try { $item = $script:GridTroubleshootFindings.SelectedItem } catch {}
+            if ($null -ne $item) {
+                Show-TroubleshootDetailDialog -Kind Finding -Entry $item
+                $e.Handled = $true
+            }
+        }
+    })
+}
+
+if ($null -ne $script:BtnTroubleshootFindingDetails) {
+    $script:BtnTroubleshootFindingDetails.add_Click({
+        $item = $null
+        try { $item = $script:GridTroubleshootFindings.SelectedItem } catch {}
+        Show-TroubleshootDetailDialog -Kind Finding -Entry $item
+    })
+}
+
+if ($null -ne $script:GridTroubleshootBadLeases) {
+    $script:GridTroubleshootBadLeases.add_MouseDoubleClick({
+        $item = $null
+        try { $item = $script:GridTroubleshootBadLeases.SelectedItem } catch {}
+        if ($null -ne $item) {
+            Show-TroubleshootDetailDialog -Kind BadLease -Entry $item
+        }
+    })
+    $script:GridTroubleshootBadLeases.add_KeyDown({
+        param($sender, $e)
+        if ($e.Key -eq [System.Windows.Input.Key]::Enter -or $e.Key -eq [System.Windows.Input.Key]::Return) {
+            $item = $null
+            try { $item = $script:GridTroubleshootBadLeases.SelectedItem } catch {}
+            if ($null -ne $item) {
+                Show-TroubleshootDetailDialog -Kind BadLease -Entry $item
+                $e.Handled = $true
+            }
+        }
+    })
+}
+
+if ($null -ne $script:GridTroubleshootProbes) {
+    $script:GridTroubleshootProbes.add_MouseDoubleClick({
+        $item = $null
+        try { $item = $script:GridTroubleshootProbes.SelectedItem } catch {}
+        if ($null -ne $item) {
+            Show-TroubleshootDetailDialog -Kind Probe -Entry $item
+        }
+    })
+    $script:GridTroubleshootProbes.add_KeyDown({
+        param($sender, $e)
+        if ($e.Key -eq [System.Windows.Input.Key]::Enter -or $e.Key -eq [System.Windows.Input.Key]::Return) {
+            $item = $null
+            try { $item = $script:GridTroubleshootProbes.SelectedItem } catch {}
+            if ($null -ne $item) {
+                Show-TroubleshootDetailDialog -Kind Probe -Entry $item
+                $e.Handled = $true
+            }
+        }
     })
 }
 #endregion

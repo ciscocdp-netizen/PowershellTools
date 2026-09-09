@@ -1,4 +1,4 @@
-# BAD_ADDRESS Troubleshooting (v2.6.2)
+# BAD_ADDRESS Troubleshooting (v2.6.3)
 
 Footer: **Created by Anthony Blake**
 
@@ -9,9 +9,10 @@ Footer: **Created by Anthony Blake**
 3. Choose a probe sample size (**3 / 4 / 5**)
 4. **Run Diagnostics** — walks the BAD_ADDRESS root-cause checklist
 5. Review findings, BAD_ADDRESS leases, and ping/ARP probes
-6. Fix the cause outside the tool as needed
-7. Check **I reviewed the findings…**, then **Clear BAD_ADDRESS leases**
-8. **Export Report** — CSV of findings, leases, and probes
+6. **Double-click** any finding / lease / probe row (or **Details** / Enter) for the full text popup
+7. Fix the cause outside the tool as needed
+8. Check **I reviewed the findings…**, then **Clear BAD_ADDRESS leases**
+9. **Export Report** — CSV of findings, leases, and probes
 
 ## Diagnostic checklist
 
@@ -27,6 +28,15 @@ Footer: **Created by Anthony Blake**
 | 8 | Other DHCP on VLAN | AD-authorized servers + guidance for on-VLAN capture |
 | 9 | Gateway / proxy ARP | Router option 003 ping/ARP + checklist |
 | 10 | Clear readiness | Unlock clear only after review confirmation |
+
+## Detail popup
+
+Truncated grid text is expected in narrow columns. Use:
+
+- **Double-click** a row in Findings, BAD_ADDRESS leases, or Probes
+- **Details** button on the findings header
+- **Enter** while a row is selected
+- **Copy All** inside the popup
 
 ## Clear gating (safety)
 
