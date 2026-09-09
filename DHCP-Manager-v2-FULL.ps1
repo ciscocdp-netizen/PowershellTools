@@ -3829,8 +3829,8 @@ function Build-NavTree {
             
             try {
                 $scopes = @(Get-DhcpServerv4Scope -ComputerName $Global:DHCPServer -ErrorAction Stop)
-                # Stable order for search: name then ScopeId
-                $scopes = @($scopes | Sort-Object Name, ScopeId)
+                # Numeric Scope ID order (matches MMC; avoids 10.15.100.0 sorting before 10.15.96.0)
+                $scopes = @($scopes | Sort-Object { Get-IpAddressSortKey "$($_.ScopeId)" }, Name)
                 
                 foreach ($scope in $scopes) {
                     $scopeId = "$($scope.ScopeId)"
@@ -3948,6 +3948,7 @@ function Load-Scopes {
         }
         
         $scopes = @(Get-DhcpServerv4Scope -ComputerName $Global:DHCPServer -ErrorAction Stop)
+        $scopes = @($scopes | Sort-Object { Get-IpAddressSortKey "$($_.ScopeId)" }, Name)
         $count = Get-SafeCount $scopes
         
         $script:GridScopes.Dispatcher.Invoke([action]{
@@ -5071,6 +5072,37 @@ function Get-NormalizedCompareText {
     return "$Value".Trim()
 }
 
+function Get-IpAddressSortKey {
+    <#
+    .SYNOPSIS
+        Builds a lexicographically sortable key so IPv4 addresses sort numerically
+        (10.15.96.0 then 10.15.100.0, not 10.15.100.0 then 10.15.96.0)
+    #>
+    param($Value)
+    
+    $text = Get-NormalizedCompareText $Value
+    if (-not $text) { return '' }
+    
+    $m = [regex]::Match($text, '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})')
+    if ($m.Success) {
+        $padded = '{0:D3}.{1:D3}.{2:D3}.{3:D3}' -f `
+            ([int]$m.Groups[1].Value),
+            ([int]$m.Groups[2].Value),
+            ([int]$m.Groups[3].Value),
+            ([int]$m.Groups[4].Value)
+        return $text.Substring(0, $m.Index) + $padded + $text.Substring($m.Index + $m.Length)
+    }
+    
+    return $text.ToLowerInvariant()
+}
+
+function Sort-ByIpAddressKey {
+    param([object[]]$Keys)
+    
+    $list = @($Keys | Where-Object { $null -ne $_ } | ForEach-Object { "$_" } | Select-Object -Unique)
+    return @($list | Sort-Object { Get-IpAddressSortKey $_ }, { "$_" })
+}
+
 function Get-NormalizedCompareIp {
     param($Value)
     $text = Get-NormalizedCompareText $Value
@@ -5221,7 +5253,7 @@ function Get-DhcpCompareScopes {
     }
     
     $results = [System.Collections.Generic.List[object]]::new()
-    $allKeys = @(@($mapA.Keys) + @($mapB.Keys) | Select-Object -Unique | Sort-Object)
+    $allKeys = @(Sort-ByIpAddressKey -Keys @(@($mapA.Keys) + @($mapB.Keys)))
     
     foreach ($key in $allKeys) {
         $a = $null
@@ -5319,7 +5351,7 @@ function Get-DhcpCompareOptions {
     }
     
     $results = [System.Collections.Generic.List[object]]::new()
-    $allKeys = @(@($mapA.Keys) + @($mapB.Keys) | Select-Object -Unique | Sort-Object)
+    $allKeys = @(Sort-ByIpAddressKey -Keys @(@($mapA.Keys) + @($mapB.Keys)))
     
     foreach ($key in $allKeys) {
         $a = $null
@@ -5407,7 +5439,7 @@ function Get-DhcpCompareLeases {
     }
     
     $results = [System.Collections.Generic.List[object]]::new()
-    $allKeys = @(@($mapA.Keys) + @($mapB.Keys) | Select-Object -Unique | Sort-Object)
+    $allKeys = @(Sort-ByIpAddressKey -Keys @(@($mapA.Keys) + @($mapB.Keys)))
     
     foreach ($key in $allKeys) {
         $a = $null
@@ -5490,7 +5522,7 @@ function Get-DhcpCompareReservations {
     }
     
     $results = [System.Collections.Generic.List[object]]::new()
-    $allKeys = @(@($mapA.Keys) + @($mapB.Keys) | Select-Object -Unique | Sort-Object)
+    $allKeys = @(Sort-ByIpAddressKey -Keys @(@($mapA.Keys) + @($mapB.Keys)))
     
     foreach ($key in $allKeys) {
         $a = $null

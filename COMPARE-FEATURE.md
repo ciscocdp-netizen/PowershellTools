@@ -11,8 +11,9 @@ Connect a second DHCP server (Server B) and compare it against the primary serve
 - **Leases** — matched by normalized MAC (fallback: IP+scope)
 - **Reservations** — matched by normalized MAC (fallback: IP+scope)
 
-## Accuracy notes (v2.5.5)
+## Accuracy notes (v2.5.11)
 
+- **Numeric Scope ID / IP sort:** Results sort like the DHCP MMC (`10.15.96.0` then `10.15.100.0`), not as text (`10.15.100.0` before `10.15.96.0`)
 - **MAC normalization:** `aa-bb-cc-…`, `AA:BB:CC:…`, and `AABBCC…` are treated as the same client
 - **IP normalization:** Scope IDs / ranges / option IPs compared via parsed IPv4 text
 - **Names/hostnames:** case-insensitive
