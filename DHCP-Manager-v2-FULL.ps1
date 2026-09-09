@@ -34,7 +34,7 @@
     
 .NOTES
     File Name      : DHCP-Manager-v2-FULL.ps1
-    Version        : 2.6.0 (BAD_ADDRESS Troubleshoot)
+    Version        : 2.6.1 (BAD_ADDRESS Troubleshoot)
     Date           : 2026-09-09
     Author         : Anthony Blake
     Prerequisite   : PowerShell 5.1+
@@ -101,7 +101,7 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.6.0'
+$Global:AppVersion       = '2.6.1'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:DhcpEventEntriesAll = [System.Collections.Generic.List[object]]::new()
 $Global:ScopeStatEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
@@ -666,7 +666,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                      HorizontalAlignment="Center"/>
           
           <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-            <Run Text="v2.6.0  |  "/>
+            <Run Text="v2.6.1  |  "/>
             <Run Text="Created by Anthony Blake" Foreground="#90CAF9"/>
             <Run Text="  |  "/>
             <Run x:Name="StatusTime" Text=""/>
@@ -5076,7 +5076,7 @@ function Invoke-BadAddressDiagnostics {
             $Global:BadAddressDiag.Pattern = 'None'
             $Global:BadAddressDiag.CanClear = $false
             $Global:BadAddressDiag.RanAt = Get-Date
-            $Global:BadAddressDiag.Summary = "Scope $ScopeId: no BAD_ADDRESS leases found."
+            $Global:BadAddressDiag.Summary = "Scope ${ScopeId}: no BAD_ADDRESS leases found."
             if ($null -ne $script:TxtTroubleshootSummary) {
                 $script:TxtTroubleshootSummary.Text = $Global:BadAddressDiag.Summary
             }
@@ -5177,7 +5177,7 @@ function Invoke-BadAddressDiagnostics {
             })
         }
         
-        $probeFinding = "Sampled $sampleN of $badCount: ping Up $pingUp/$sampleN, ARP MAC $arpHits/$sampleN."
+        $probeFinding = "Sampled $sampleN of ${badCount}: ping Up $pingUp/$sampleN, ARP MAC $arpHits/$sampleN."
         $probeRec = "If probes are live, those IPs belong to real devices (or a middlebox). Remove statics from the dynamic range, fix reservations, or exclude the addresses — then clear BAD_ADDRESS."
         $probeStatus = if ($pingUp -gt 0 -or $arpHits -gt 0) { 'Warn' } else { 'Info' }
         Add-BadAddressFinding -Step 4 -Check 'Ping / ARP sample' -Status $probeStatus -Finding $probeFinding -Recommendation $probeRec
