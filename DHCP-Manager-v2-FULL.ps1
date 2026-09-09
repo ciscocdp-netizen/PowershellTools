@@ -30,11 +30,12 @@
     ✓ Real-time DHCP event watching on local and remote servers
     ✓ Scope migration (scopes, options, reservations/clients, exclusions)
     ✓ Domain DHCP server discovery with ping up/down status
+    ✓ BAD_ADDRESS troubleshooting (conflict detection, ping/ARP, failover, clear gating)
     
 .NOTES
     File Name      : DHCP-Manager-v2-FULL.ps1
-    Version        : 2.4.0 (Domain DHCP Scan)
-    Date           : 2026-08-19
+    Version        : 2.6.0 (BAD_ADDRESS Troubleshoot)
+    Date           : 2026-09-09
     Author         : Anthony Blake
     Prerequisite   : PowerShell 5.1+
     Required Module: DhcpServer (Install-WindowsFeature RSAT-DHCP)
@@ -100,7 +101,7 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.5.11'
+$Global:AppVersion       = '2.6.0'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:DhcpEventEntriesAll = [System.Collections.Generic.List[object]]::new()
 $Global:ScopeStatEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
@@ -110,6 +111,18 @@ $Global:NavScopeIndex    = [System.Collections.Generic.List[object]]::new()
 $Global:NavScopeMatched  = [System.Collections.Generic.List[object]]::new()
 $Global:NavScopeSearchText = ''
 $Global:NavScopeMatchIndex = -1
+$Global:BadAddressFindings = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
+$Global:BadAddressLeases = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
+$Global:BadAddressProbes = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
+$Global:BadAddressDiag = @{
+    ScopeId     = ''
+    Server      = ''
+    RanAt       = $null
+    BadCount    = 0
+    Pattern     = ''
+    CanClear    = $false
+    Summary     = ''
+}
 $Global:LogWatchState    = @{
     Local  = @{ Enabled = $false; Path = $null; Offset = 0L }
     A      = @{ Enabled = $false; Path = $null; Offset = 0L }
@@ -618,6 +631,8 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                   Style="{StaticResource BtnSecondary}" ToolTip="Migrate scopes to another DHCP server"/>
           <Button x:Name="BtnViewEvents" Content="📡 Events" Margin="0,0,8,0"
                   Style="{StaticResource BtnSecondary}" ToolTip="DHCP audit logs and live events"/>
+          <Button x:Name="BtnViewTroubleshoot" Content="🛠️ Troubleshoot" Margin="0,0,8,0"
+                  Style="{StaticResource BtnSecondary}" ToolTip="BAD_ADDRESS and scope conflict diagnostics"/>
           <Button x:Name="BtnViewCompare" Content="🔀 Compare" Margin="0,0,8,0"
                   Style="{StaticResource BtnSecondary}" ToolTip="Compare two DHCP servers"/>
           <Button x:Name="BtnViewLog" Content="📋 View Log" Margin="0,0,8,0"
@@ -651,7 +666,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                      HorizontalAlignment="Center"/>
           
           <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-            <Run Text="v2.5.11  |  "/>
+            <Run Text="v2.6.0  |  "/>
             <Run Text="Created by Anthony Blake" Foreground="#90CAF9"/>
             <Run Text="  |  "/>
             <Run x:Name="StatusTime" Text=""/>
@@ -1020,6 +1035,124 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                   <DataGridTextColumn Header="Description" Binding="{Binding Description}" Width="*"/>
                 </DataGrid.Columns>
               </DataGrid>
+            </Grid>
+          </TabItem>
+
+          <!-- TAB: Troubleshoot BAD_ADDRESS -->
+          <TabItem x:Name="TabTroubleshoot" Header="🛠️ Troubleshoot">
+            <Grid Background="{StaticResource BgPanel}" Margin="8">
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="180"/>
+                <RowDefinition Height="Auto"/>
+              </Grid.RowDefinitions>
+
+              <Border Grid.Row="0" Background="{StaticResource BgCard}" CornerRadius="6"
+                      Padding="12,10" Margin="0,0,0,8">
+                <StackPanel>
+                  <TextBlock Text="BAD_ADDRESS conflict diagnostics" Style="{StaticResource SectionHeader}" Margin="0,0,0,8"/>
+                  <WrapPanel Orientation="Horizontal">
+                    <TextBlock Text="Scope:" Style="{StaticResource FormLabel}" VerticalAlignment="Center" Margin="0,0,8,4"/>
+                    <ComboBox x:Name="CboTroubleshootScope" Width="280" Height="28" Margin="0,0,12,4"
+                              Background="{StaticResource BgDeep}" Foreground="{StaticResource TextPrimary}"
+                              BorderBrush="{StaticResource Border}"
+                              ToolTip="Scope to analyze for BAD_ADDRESS leases"/>
+                    <Button x:Name="BtnTroubleshootRefreshScopes" Content="🔄 Scopes" Margin="0,0,8,4"
+                            Style="{StaticResource BtnSecondary}" IsEnabled="False"
+                            ToolTip="Reload scope list from the connected server"/>
+                    <Button x:Name="BtnTroubleshootUseSelected" Content="Use selected scope" Margin="0,0,12,4"
+                            Style="{StaticResource BtnSecondary}" IsEnabled="False"
+                            ToolTip="Use the scope currently selected in navigation / Scopes tab"/>
+                    <TextBlock Text="Probe sample:" Style="{StaticResource FormLabel}" VerticalAlignment="Center" Margin="0,0,6,4"/>
+                    <ComboBox x:Name="CboTroubleshootSample" Width="60" Height="28" Margin="0,0,12,4"
+                              Background="{StaticResource BgDeep}" Foreground="{StaticResource TextPrimary}"
+                              BorderBrush="{StaticResource Border}"
+                              ToolTip="How many BAD addresses to ping/ARP">
+                      <ComboBoxItem Content="3" IsSelected="True"/>
+                      <ComboBoxItem Content="4"/>
+                      <ComboBoxItem Content="5"/>
+                    </ComboBox>
+                    <Button x:Name="BtnTroubleshootRun" Content="▶️ Run Diagnostics" Margin="0,0,8,4"
+                            Style="{StaticResource BtnPrimary}" IsEnabled="False"
+                            ToolTip="Run the BAD_ADDRESS root-cause checklist for the selected scope"/>
+                    <Button x:Name="BtnTroubleshootExport" Content="💾 Export Report" Margin="0,0,0,4"
+                            Style="{StaticResource BtnSecondary}" IsEnabled="False"/>
+                  </WrapPanel>
+                </StackPanel>
+              </Border>
+
+              <Border Grid.Row="1" Background="{StaticResource BgCard}" CornerRadius="6"
+                      Padding="12,8" Margin="0,0,0,8">
+                <TextBlock x:Name="TxtTroubleshootSummary" TextWrapping="Wrap"
+                           Foreground="{StaticResource TextPrimary}" FontSize="12"
+                           Text="Connect to a DHCP server, choose a scope, then Run Diagnostics. Clear BAD_ADDRESS only after you review findings and correct the cause."/>
+              </Border>
+
+              <Grid Grid.Row="2" Margin="0,0,0,8">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="1.2*"/>
+                  <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <DockPanel Grid.Column="0" Margin="0,0,6,0">
+                  <TextBlock DockPanel.Dock="Top" Text="Diagnostic findings" Style="{StaticResource FormLabel}" Margin="0,0,0,6"/>
+                  <DataGrid x:Name="GridTroubleshootFindings" Style="{StaticResource DarkGrid}"
+                            IsReadOnly="True" SelectionMode="Single">
+                    <DataGrid.Columns>
+                      <DataGridTextColumn Header="Step" Binding="{Binding Step}" Width="40"/>
+                      <DataGridTextColumn Header="Check" Binding="{Binding Check}" Width="160"/>
+                      <DataGridTextColumn Header="Status" Binding="{Binding Status}" Width="80"/>
+                      <DataGridTextColumn Header="Finding" Binding="{Binding Finding}" Width="*"/>
+                      <DataGridTextColumn Header="Recommendation" Binding="{Binding Recommendation}" Width="*"/>
+                    </DataGrid.Columns>
+                  </DataGrid>
+                </DockPanel>
+                <DockPanel Grid.Column="1" Margin="6,0,0,0">
+                  <TextBlock DockPanel.Dock="Top" Text="BAD_ADDRESS leases in scope" Style="{StaticResource FormLabel}" Margin="0,0,0,6"/>
+                  <DataGrid x:Name="GridTroubleshootBadLeases" Style="{StaticResource DarkGrid}"
+                            IsReadOnly="True" SelectionMode="Extended">
+                    <DataGrid.Columns>
+                      <DataGridTextColumn Header="IP Address" Binding="{Binding IPAddress}" Width="120"/>
+                      <DataGridTextColumn Header="MAC / ClientId" Binding="{Binding ClientId}" Width="140"/>
+                      <DataGridTextColumn Header="Hostname" Binding="{Binding HostName}" Width="120"/>
+                      <DataGridTextColumn Header="State" Binding="{Binding AddressState}" Width="90"/>
+                      <DataGridTextColumn Header="Lease Expiry" Binding="{Binding LeaseExpiryTime}" Width="*"/>
+                    </DataGrid.Columns>
+                  </DataGrid>
+                </DockPanel>
+              </Grid>
+
+              <DockPanel Grid.Row="3" Margin="0,0,0,8">
+                <TextBlock DockPanel.Dock="Top" Text="Ping / ARP sample probes" Style="{StaticResource FormLabel}" Margin="0,0,0,6"/>
+                <DataGrid x:Name="GridTroubleshootProbes" Style="{StaticResource DarkGrid}"
+                          IsReadOnly="True" SelectionMode="Single">
+                  <DataGrid.Columns>
+                    <DataGridTextColumn Header="IP Address" Binding="{Binding IPAddress}" Width="120"/>
+                    <DataGridTextColumn Header="Ping" Binding="{Binding PingStatus}" Width="70"/>
+                    <DataGridTextColumn Header="Latency" Binding="{Binding LatencyMs}" Width="70"/>
+                    <DataGridTextColumn Header="ARP MAC" Binding="{Binding ArpMac}" Width="140"/>
+                    <DataGridTextColumn Header="ARP State" Binding="{Binding ArpState}" Width="100"/>
+                    <DataGridTextColumn Header="Notes" Binding="{Binding Notes}" Width="*"/>
+                  </DataGrid.Columns>
+                </DataGrid>
+              </DockPanel>
+
+              <Border Grid.Row="4" Background="{StaticResource BgCard}" CornerRadius="6" Padding="12,10">
+                <StackPanel>
+                  <CheckBox x:Name="ChkTroubleshootReviewed" Content="I reviewed the findings and corrected the root cause (safe to clear BAD_ADDRESS)"
+                            Margin="0,0,0,8" IsEnabled="False"
+                            Foreground="{StaticResource TextPrimary}"/>
+                  <StackPanel Orientation="Horizontal">
+                    <Button x:Name="BtnTroubleshootClearBad" Content="🗑️ Clear BAD_ADDRESS leases" Margin="0,0,12,0"
+                            Style="{StaticResource BtnDanger}" IsEnabled="False"
+                            ToolTip="Removes BAD_ADDRESS leases for this scope only after diagnostics and confirmation"/>
+                    <TextBlock x:Name="TxtTroubleshootClearHint" VerticalAlignment="Center"
+                               Foreground="{StaticResource TextSecond}" FontSize="11"
+                               Text="Clear stays disabled until diagnostics run and you confirm the cause was addressed."/>
+                  </StackPanel>
+                </StackPanel>
+              </Border>
             </Grid>
           </TabItem>
 
@@ -1687,6 +1820,7 @@ try {
     $script:BtnViewLog       = $Window.FindName("BtnViewLog")
     $script:BtnViewCompare   = $Window.FindName("BtnViewCompare")
     $script:BtnViewEvents    = $Window.FindName("BtnViewEvents")
+    $script:BtnViewTroubleshoot = $Window.FindName("BtnViewTroubleshoot")
     $script:BtnViewMigrate   = $Window.FindName("BtnViewMigrate")
     
     # Status Bar
@@ -1721,6 +1855,7 @@ try {
     $script:TabOptions       = $Window.FindName("TabOptions")
     $script:TabFilters       = $Window.FindName("TabFilters")
     $script:TabPolicies      = $Window.FindName("TabPolicies")
+    $script:TabTroubleshoot  = $Window.FindName("TabTroubleshoot")
     $script:TabStats         = $Window.FindName("TabStats")
     $script:TabCompare       = $Window.FindName("TabCompare")
     $script:TabMigrate       = $Window.FindName("TabMigrate")
@@ -1774,6 +1909,21 @@ try {
     $script:BtnPolicyAdd     = $Window.FindName("BtnPolicyAdd")
     $script:BtnPolicyEdit    = $Window.FindName("BtnPolicyEdit")
     $script:BtnPolicyDelete  = $Window.FindName("BtnPolicyDelete")
+    
+    # Troubleshoot Tab
+    $script:CboTroubleshootScope = $Window.FindName("CboTroubleshootScope")
+    $script:BtnTroubleshootRefreshScopes = $Window.FindName("BtnTroubleshootRefreshScopes")
+    $script:BtnTroubleshootUseSelected = $Window.FindName("BtnTroubleshootUseSelected")
+    $script:CboTroubleshootSample = $Window.FindName("CboTroubleshootSample")
+    $script:BtnTroubleshootRun = $Window.FindName("BtnTroubleshootRun")
+    $script:BtnTroubleshootExport = $Window.FindName("BtnTroubleshootExport")
+    $script:TxtTroubleshootSummary = $Window.FindName("TxtTroubleshootSummary")
+    $script:GridTroubleshootFindings = $Window.FindName("GridTroubleshootFindings")
+    $script:GridTroubleshootBadLeases = $Window.FindName("GridTroubleshootBadLeases")
+    $script:GridTroubleshootProbes = $Window.FindName("GridTroubleshootProbes")
+    $script:ChkTroubleshootReviewed = $Window.FindName("ChkTroubleshootReviewed")
+    $script:BtnTroubleshootClearBad = $Window.FindName("BtnTroubleshootClearBad")
+    $script:TxtTroubleshootClearHint = $Window.FindName("TxtTroubleshootClearHint")
     
     # Statistics Tab
     $script:StatTotalScopes  = $Window.FindName("StatTotalScopes")
@@ -2633,6 +2783,19 @@ function Enable-ConnectedControls {
             $script:BtnRefreshStats.IsEnabled = $Connected
             if ($null -ne $script:BtnScopeStatDetails) { $script:BtnScopeStatDetails.IsEnabled = $Connected }
             if ($null -ne $script:BtnExportScopeStats) { $script:BtnExportScopeStats.IsEnabled = $Connected }
+            if ($null -ne $script:BtnTroubleshootRefreshScopes) { $script:BtnTroubleshootRefreshScopes.IsEnabled = $Connected }
+            if ($null -ne $script:BtnTroubleshootUseSelected) { $script:BtnTroubleshootUseSelected.IsEnabled = $Connected }
+            if ($null -ne $script:BtnTroubleshootRun) { $script:BtnTroubleshootRun.IsEnabled = $Connected }
+            if ($null -ne $script:BtnTroubleshootExport) { $script:BtnTroubleshootExport.IsEnabled = $Connected }
+            if ($null -ne $script:CboTroubleshootScope) { $script:CboTroubleshootScope.IsEnabled = $Connected }
+            if ($null -ne $script:CboTroubleshootSample) { $script:CboTroubleshootSample.IsEnabled = $Connected }
+            if (-not $Connected) {
+                if ($null -ne $script:ChkTroubleshootReviewed) {
+                    $script:ChkTroubleshootReviewed.IsChecked = $false
+                    $script:ChkTroubleshootReviewed.IsEnabled = $false
+                }
+                if ($null -ne $script:BtnTroubleshootClearBad) { $script:BtnTroubleshootClearBad.IsEnabled = $false }
+            }
         }, [System.Windows.Threading.DispatcherPriority]::Normal)
         
         Write-ActionLog "Controls enabled state set to: $Connected" "INFO"
@@ -3899,12 +4062,17 @@ function Build-NavTree {
             $policiesNode.Header = "📋 Policies"
             $policiesNode.Tag = "Policies"
             
+            $troubleshootNode = New-Object System.Windows.Controls.TreeViewItem
+            $troubleshootNode.Header = "🛠️ Troubleshoot"
+            $troubleshootNode.Tag = "Troubleshoot"
+            
             $statsNode = New-Object System.Windows.Controls.TreeViewItem
             $statsNode.Header = "📊 Statistics"
             $statsNode.Tag = "Statistics"
             
             [void]$serverNode.Items.Add($filtersNode)
             [void]$serverNode.Items.Add($policiesNode)
+            [void]$serverNode.Items.Add($troubleshootNode)
             [void]$serverNode.Items.Add($statsNode)
             
             [void]$script:NavTree.Items.Add($serverNode)
@@ -4445,6 +4613,1010 @@ function Load-Policies {
         Update-LogDisplay
     }
 }
+
+#region BAD_ADDRESS Troubleshooting
+function Reset-BadAddressDiagState {
+    param([switch]$KeepScope)
+    
+    $scopeKeep = ''
+    if ($KeepScope) { $scopeKeep = "$($Global:BadAddressDiag.ScopeId)" }
+    
+    try { $Global:BadAddressFindings.Clear() } catch {}
+    try { $Global:BadAddressLeases.Clear() } catch {}
+    try { $Global:BadAddressProbes.Clear() } catch {}
+    
+    $Global:BadAddressDiag.ScopeId = $scopeKeep
+    $Global:BadAddressDiag.Server = ''
+    $Global:BadAddressDiag.RanAt = $null
+    $Global:BadAddressDiag.BadCount = 0
+    $Global:BadAddressDiag.Pattern = ''
+    $Global:BadAddressDiag.CanClear = $false
+    $Global:BadAddressDiag.Summary = ''
+    
+    try {
+        if ($null -ne $script:ChkTroubleshootReviewed) {
+            $script:ChkTroubleshootReviewed.IsChecked = $false
+            $script:ChkTroubleshootReviewed.IsEnabled = $false
+        }
+        if ($null -ne $script:BtnTroubleshootClearBad) { $script:BtnTroubleshootClearBad.IsEnabled = $false }
+        if ($null -ne $script:TxtTroubleshootClearHint) {
+            $script:TxtTroubleshootClearHint.Text = "Clear stays disabled until diagnostics run and you confirm the cause was addressed."
+        }
+        if ($null -ne $script:TxtTroubleshootSummary -and -not $KeepScope) {
+            $script:TxtTroubleshootSummary.Text = "Connect to a DHCP server, choose a scope, then Run Diagnostics. Clear BAD_ADDRESS only after you review findings and correct the cause."
+        }
+    } catch {}
+}
+
+function Add-BadAddressFinding {
+    param(
+        [int]$Step,
+        [string]$Check,
+        [string]$Status,
+        [string]$Finding,
+        [string]$Recommendation = ''
+    )
+    
+    $row = [PSCustomObject]@{
+        Step           = $Step
+        Check          = $Check
+        Status         = $Status
+        Finding        = $Finding
+        Recommendation = $Recommendation
+    }
+    [void]$Global:BadAddressFindings.Add($row)
+    return $row
+}
+
+function Get-TroubleshootSampleSize {
+    $n = 3
+    try {
+        if ($null -ne $script:CboTroubleshootSample -and $null -ne $script:CboTroubleshootSample.SelectedItem) {
+            $text = "$($script:CboTroubleshootSample.SelectedItem.Content)" -replace '[^0-9]', ''
+            $parsed = 0
+            if ([int]::TryParse($text, [ref]$parsed) -and $parsed -ge 3 -and $parsed -le 5) {
+                $n = $parsed
+            }
+        }
+    } catch {}
+    return $n
+}
+
+function Get-TroubleshootScopeIdFromUi {
+    try {
+        if ($null -eq $script:CboTroubleshootScope) { return '' }
+        $item = $script:CboTroubleshootScope.SelectedItem
+        if ($null -eq $item) { return '' }
+        if ($item -is [string]) {
+            $m = [regex]::Match("$item", '(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})')
+            if ($m.Success) { return $m.Groups[1].Value }
+            return ''
+        }
+        if ($null -ne $item.PSObject.Properties['ScopeId'] -and $item.ScopeId) {
+            return "$($item.ScopeId)"
+        }
+        $text = "$item"
+        $m2 = [regex]::Match($text, '(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})')
+        if ($m2.Success) { return $m2.Groups[1].Value }
+    } catch {}
+    return ''
+}
+
+function Update-TroubleshootScopeList {
+    <#
+    .SYNOPSIS
+        Reloads the Troubleshoot scope combo from the connected DHCP server
+    #>
+    if ([string]::IsNullOrWhiteSpace($Global:DHCPServer)) { return }
+    if ($null -eq $script:CboTroubleshootScope) { return }
+    
+    try {
+        $prev = Get-TroubleshootScopeIdFromUi
+        if (-not $prev) { $prev = "$($Global:SelectedScope)" }
+        
+        $scopes = @(Get-DhcpServerv4Scope -ComputerName $Global:DHCPServer -ErrorAction Stop)
+        $scopes = @($scopes | Sort-Object { Get-IpAddressSortKey "$($_.ScopeId)" }, Name)
+        
+        $items = [System.Collections.Generic.List[string]]::new()
+        foreach ($s in $scopes) {
+            $sid = "$($s.ScopeId)"
+            $name = "$($s.Name)".Trim()
+            if ($name) {
+                [void]$items.Add("$sid  —  $name")
+            } else {
+                [void]$items.Add($sid)
+            }
+        }
+        
+        $script:CboTroubleshootScope.Items.Clear()
+        foreach ($it in $items) { [void]$script:CboTroubleshootScope.Items.Add($it) }
+        
+        $selected = $false
+        if ($prev) {
+            for ($i = 0; $i -lt $script:CboTroubleshootScope.Items.Count; $i++) {
+                $cand = "$($script:CboTroubleshootScope.Items[$i])"
+                if ($cand -like "$prev*" -or $cand -match [regex]::Escape($prev)) {
+                    $script:CboTroubleshootScope.SelectedIndex = $i
+                    $selected = $true
+                    break
+                }
+            }
+        }
+        if (-not $selected -and $script:CboTroubleshootScope.Items.Count -gt 0) {
+            $script:CboTroubleshootScope.SelectedIndex = 0
+        }
+        
+        Write-ActionLog "Troubleshoot scope list loaded: $(Get-SafeCount $scopes) scope(s)" "INFO"
+    } catch {
+        Write-ActionLog "Failed to load Troubleshoot scopes: $_" "WARN"
+    }
+}
+
+function Set-TroubleshootScopeSelection {
+    param([string]$ScopeId)
+    
+    if ([string]::IsNullOrWhiteSpace($ScopeId)) { return $false }
+    if ($null -eq $script:CboTroubleshootScope) { return $false }
+    
+    if ($script:CboTroubleshootScope.Items.Count -eq 0) {
+        Update-TroubleshootScopeList
+    }
+    
+    for ($i = 0; $i -lt $script:CboTroubleshootScope.Items.Count; $i++) {
+        $cand = "$($script:CboTroubleshootScope.Items[$i])"
+        if ($cand -like "$ScopeId*" -or $cand -match ("^" + [regex]::Escape($ScopeId) + "(\s|$)")) {
+            $script:CboTroubleshootScope.SelectedIndex = $i
+            return $true
+        }
+    }
+    return $false
+}
+
+function Get-IpAddressUInt32 {
+    param([string]$IPAddress)
+    try {
+        $bytes = ([System.Net.IPAddress]::Parse($IPAddress)).GetAddressBytes()
+        if ([BitConverter]::IsLittleEndian) { [Array]::Reverse($bytes) }
+        return [BitConverter]::ToUInt32($bytes, 0)
+    } catch {
+        return [uint32]0
+    }
+}
+
+function Test-BadAddressPattern {
+    <#
+    .SYNOPSIS
+        Classifies BAD_ADDRESS IPs as Sequential, Clustered, or Random/Scattered
+    #>
+    param([string[]]$IPAddresses)
+    
+    $ips = @($IPAddresses | Where-Object { $_ -and (Test-IPAddress $_) } | Select-Object -Unique)
+    $count = Get-SafeCount $ips
+    if ($count -eq 0) {
+        return [PSCustomObject]@{
+            Pattern = 'None'
+            Detail  = 'No BAD_ADDRESS IPs to analyze'
+            Gaps    = @()
+        }
+    }
+    if ($count -eq 1) {
+        return [PSCustomObject]@{
+            Pattern = 'Single'
+            Detail  = "Only one BAD_ADDRESS ($($ips[0])) — pattern not conclusive"
+            Gaps    = @()
+        }
+    }
+    
+    $sorted = @($ips | Sort-Object { Get-IpAddressUInt32 $_ })
+    $gaps = [System.Collections.Generic.List[int]]::new()
+    for ($i = 1; $i -lt $sorted.Count; $i++) {
+        $a = Get-IpAddressUInt32 $sorted[$i - 1]
+        $b = Get-IpAddressUInt32 $sorted[$i]
+        if ($b -gt $a) {
+            [void]$gaps.Add([int]($b - $a))
+        }
+    }
+    
+    $gapArr = @($gaps)
+    $avgGap = ($gapArr | Measure-Object -Average).Average
+    $maxGap = ($gapArr | Measure-Object -Maximum).Maximum
+    $minGap = ($gapArr | Measure-Object -Minimum).Minimum
+    $adjacent = Get-SafeCount @($gapArr | Where-Object { $_ -eq 1 })
+    $near = Get-SafeCount @($gapArr | Where-Object { $_ -le 3 })
+    $gapCount = Get-SafeCount $gapArr
+    
+    $pattern = 'Random'
+    $detail = ''
+    if ($gapCount -gt 0 -and ($adjacent / [double]$gapCount) -ge 0.6) {
+        $pattern = 'Sequential'
+        $detail = "Mostly consecutive IPs ($adjacent/$gapCount adjacent gaps). Suggests conflict detection walking the pool, a scanner, or a device claiming a range."
+    } elseif ($gapCount -gt 0 -and ($near / [double]$gapCount) -ge 0.5 -and $maxGap -le 16) {
+        $pattern = 'Clustered'
+        $detail = "BAD addresses are tightly clustered (avg gap $([math]::Round($avgGap,1)), max $maxGap). Often a local device/range conflict rather than random clients."
+    } else {
+        $pattern = 'Random'
+        $detail = "Scattered across the scope (gaps min/avg/max = $minGap / $([math]::Round($avgGap,1)) / $maxGap). Often multi-client conflicts, rogue DHCP, or proxy-ARP replies from different sources."
+    }
+    
+    return [PSCustomObject]@{
+        Pattern = $pattern
+        Detail  = $detail
+        Gaps    = $gapArr
+    }
+}
+
+function Get-ArpNeighborInfo {
+    <#
+    .SYNOPSIS
+        Resolves ARP/neighbor MAC for an IPv4 address (Get-NetNeighbor, then arp -a)
+    #>
+    param([Parameter(Mandatory)][string]$IPAddress)
+    
+    $result = [PSCustomObject]@{
+        Mac     = ''
+        State   = 'Unknown'
+        Source  = ''
+        Detail  = ''
+    }
+    
+    try {
+        $neighbors = @(Get-NetNeighbor -IPAddress $IPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+        if ((Get-SafeCount $neighbors) -gt 0) {
+            $n = $neighbors | Select-Object -First 1
+            $mac = Get-NormalizedCompareMac $n.LinkLayerAddress
+            $state = "$($n.State)"
+            if ($mac -and $mac -ne '000000000000' -and $state -notmatch 'Unreachable|Incomplete') {
+                $result.Mac = Format-CompareMacDisplay $mac
+                $result.State = $state
+                $result.Source = 'Get-NetNeighbor'
+                $result.Detail = "Neighbor $state"
+                return $result
+            }
+            $result.State = $(if ($state) { $state } else { 'NoEntry' })
+            $result.Source = 'Get-NetNeighbor'
+            $result.Detail = "Neighbor present without usable MAC ($state)"
+        }
+    } catch {
+        $result.Detail = "Get-NetNeighbor: $_"
+    }
+    
+    # Trigger ARP resolution with a short ping first
+    try { $null = Test-HostPingStatus -ComputerName $IPAddress -TimeoutMs 800 } catch {}
+    
+    try {
+        $neighbors2 = @(Get-NetNeighbor -IPAddress $IPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+        if ((Get-SafeCount $neighbors2) -gt 0) {
+            $n2 = $neighbors2 | Select-Object -First 1
+            $mac2 = Get-NormalizedCompareMac $n2.LinkLayerAddress
+            $state2 = "$($n2.State)"
+            if ($mac2 -and $mac2 -ne '000000000000' -and $state2 -notmatch 'Unreachable|Incomplete') {
+                $result.Mac = Format-CompareMacDisplay $mac2
+                $result.State = $state2
+                $result.Source = 'Get-NetNeighbor'
+                $result.Detail = "Neighbor $state2 (after probe)"
+                return $result
+            }
+            if (-not $result.State -or $result.State -eq 'Unknown') { $result.State = $state2 }
+        }
+    } catch {}
+    
+    try {
+        $arpOut = & arp.exe -a $IPAddress 2>$null
+        foreach ($line in @($arpOut)) {
+            if ("$line" -match [regex]::Escape($IPAddress) -and "$line" -match '([0-9A-Fa-f]{2}[-:]){5}[0-9A-Fa-f]{2}') {
+                $macRaw = $Matches[0]
+                # Prefer the MAC token from the line
+                if ("$line" -match '([0-9A-Fa-f]{2}([-:])[0-9A-Fa-f]{2}(\2[0-9A-Fa-f]{2}){4})') {
+                    $macRaw = $Matches[1]
+                }
+                $mac3 = Get-NormalizedCompareMac $macRaw
+                if ($mac3 -and $mac3 -ne '000000000000') {
+                    $result.Mac = Format-CompareMacDisplay $mac3
+                    $result.State = 'Reachable'
+                    $result.Source = 'arp -a'
+                    $result.Detail = 'Resolved via arp.exe'
+                    return $result
+                }
+            }
+        }
+    } catch {
+        if (-not $result.Detail) { $result.Detail = "arp.exe: $_" }
+    }
+    
+    if (-not $result.State -or $result.State -eq 'Unknown') { $result.State = 'NoEntry' }
+    if (-not $result.Detail) { $result.Detail = 'No ARP entry (host may be offline or not on this L2 segment)' }
+    return $result
+}
+
+function Get-BadAddressLeasesForScope {
+    param(
+        [Parameter(Mandatory)][string]$Server,
+        [Parameter(Mandatory)][string]$ScopeId
+    )
+    
+    $leases = @(Get-DhcpServerv4Lease -ComputerName $Server -ScopeId $ScopeId -ErrorAction Stop)
+    $bad = @($leases | Where-Object {
+        $hn = "$($_.HostName)"
+        $st = "$($_.AddressState)"
+        ($hn -match 'BAD_ADDRESS') -or ($st -match 'Bad|Declined')
+    })
+    
+    # Stable numeric order for pattern + probe sampling
+    return @($bad | Sort-Object { Get-IpAddressUInt32 "$($_.IPAddress)" }, { "$($_.IPAddress)" })
+}
+
+function Update-TroubleshootClearUi {
+    $canEnableReview = [bool]$Global:BadAddressDiag.CanClear -and ($Global:BadAddressDiag.BadCount -gt 0)
+    $reviewed = $false
+    try { $reviewed = [bool]$script:ChkTroubleshootReviewed.IsChecked } catch {}
+    
+    try {
+        if ($null -ne $script:ChkTroubleshootReviewed) {
+            $script:ChkTroubleshootReviewed.IsEnabled = $canEnableReview
+            if (-not $canEnableReview) { $script:ChkTroubleshootReviewed.IsChecked = $false }
+        }
+        $allowClear = $canEnableReview -and $reviewed
+        if ($null -ne $script:BtnTroubleshootClearBad) {
+            $script:BtnTroubleshootClearBad.IsEnabled = $allowClear
+        }
+        if ($null -ne $script:TxtTroubleshootClearHint) {
+            if ($allowClear) {
+                $script:TxtTroubleshootClearHint.Text = "Ready to clear $($Global:BadAddressDiag.BadCount) BAD_ADDRESS lease(s) on scope $($Global:BadAddressDiag.ScopeId)."
+            } elseif ($canEnableReview) {
+                $script:TxtTroubleshootClearHint.Text = "Check the box after you correct the root cause, then Clear becomes available."
+            } elseif ($Global:BadAddressDiag.BadCount -eq 0 -and $Global:BadAddressDiag.RanAt) {
+                $script:TxtTroubleshootClearHint.Text = "No BAD_ADDRESS leases to clear for this scope."
+            } else {
+                $script:TxtTroubleshootClearHint.Text = "Clear stays disabled until diagnostics run and you confirm the cause was addressed."
+            }
+        }
+    } catch {}
+}
+
+function Invoke-BadAddressDiagnostics {
+    <#
+    .SYNOPSIS
+        Runs the BAD_ADDRESS root-cause checklist for a scope
+    #>
+    param(
+        [string]$ScopeId,
+        [int]$SampleSize = 3
+    )
+    
+    if ([string]::IsNullOrWhiteSpace($Global:DHCPServer)) {
+        Show-MessageBox "Connect to a DHCP server first." "Not Connected" OK Warning
+        return
+    }
+    
+    if ([string]::IsNullOrWhiteSpace($ScopeId)) {
+        $ScopeId = Get-TroubleshootScopeIdFromUi
+    }
+    if ([string]::IsNullOrWhiteSpace($ScopeId)) {
+        Show-MessageBox "Select a scope to troubleshoot." "No Scope" OK Warning
+        return
+    }
+    
+    if ($SampleSize -lt 3) { $SampleSize = 3 }
+    if ($SampleSize -gt 5) { $SampleSize = 5 }
+    
+    $server = $Global:DHCPServer
+    Reset-BadAddressDiagState -KeepScope
+    $Global:BadAddressDiag.ScopeId = $ScopeId
+    $Global:BadAddressDiag.Server = $server
+    
+    Write-ActionLog "BAD_ADDRESS diagnostics starting for scope $ScopeId on $server (sample=$SampleSize)" "INFO"
+    Set-Status "Running BAD_ADDRESS diagnostics for $ScopeId..."
+    Start-TaskProgress -Name 'BadAddressDiag' -Message "Diagnosing BAD_ADDRESS on $ScopeId..." -CanPause -Total 9
+    
+    $summaryParts = [System.Collections.Generic.List[string]]::new()
+    $likelyCauses = [System.Collections.Generic.List[string]]::new()
+    
+    try {
+        # --- Step 1: ConflictDetectionAttempts ---
+        Wait-TaskProgressIfPaused
+        if (Test-TaskCancelRequested) { throw "Canceled" }
+        Update-TaskProgress -Processed 1 -Message "Checking ConflictDetectionAttempts..."
+        
+        $conflictAttempts = $null
+        $conflictStatus = 'Info'
+        $conflictFinding = ''
+        $conflictRec = ''
+        try {
+            $settings = Get-DhcpServerSetting -ComputerName $server -ErrorAction Stop
+            $conflictAttempts = [int]$settings.ConflictDetectionAttempts
+            if ($conflictAttempts -le 0) {
+                $conflictStatus = 'Warn'
+                $conflictFinding = "ConflictDetectionAttempts = 0 (conflict detection disabled)."
+                $conflictRec = "Enable conflict detection (typically 1–2 attempts) so the server pings before offering an address. Note: enabling it will create BAD_ADDRESS entries when conflicts exist — fix the cause, don't only clear leases."
+                [void]$likelyCauses.Add('Conflict detection disabled (conflicts go unnoticed until client fails)')
+            } elseif ($conflictAttempts -ge 3) {
+                $conflictStatus = 'Info'
+                $conflictFinding = "ConflictDetectionAttempts = $conflictAttempts (aggressive)."
+                $conflictRec = "Value is valid but higher values slow offers. 1–2 is usual. BAD_ADDRESS growth means real conflicts are being detected — investigate probes/failover/rogue DHCP next."
+            } else {
+                $conflictStatus = 'OK'
+                $conflictFinding = "ConflictDetectionAttempts = $conflictAttempts."
+                $conflictRec = "Conflict detection is on. BAD_ADDRESS entries mean the server detected live IPs before offering — keep investigating who owns those IPs."
+            }
+        } catch {
+            $conflictStatus = 'Error'
+            $conflictFinding = "Could not read DHCP server settings: $_"
+            $conflictRec = "Verify DhcpServer module permissions on $server."
+        }
+        Add-BadAddressFinding -Step 1 -Check 'ConflictDetectionAttempts' -Status $conflictStatus -Finding $conflictFinding -Recommendation $conflictRec
+        [void]$summaryParts.Add("ConflictDetection=$conflictAttempts")
+        
+        # --- Collect BAD leases (feeds steps 2–5) ---
+        Wait-TaskProgressIfPaused
+        if (Test-TaskCancelRequested) { throw "Canceled" }
+        Update-TaskProgress -Processed 2 -Message "Loading BAD_ADDRESS leases..."
+        
+        $badLeases = @()
+        try {
+            $badLeases = @(Get-BadAddressLeasesForScope -Server $server -ScopeId $ScopeId)
+        } catch {
+            Add-BadAddressFinding -Step 2 -Check 'BAD_ADDRESS inventory' -Status 'Error' -Finding "Failed to load leases: $_" -Recommendation "Confirm scope exists and you have DHCP admin rights."
+            throw
+        }
+        
+        $badCount = Get-SafeCount $badLeases
+        $Global:BadAddressDiag.BadCount = $badCount
+        foreach ($lease in $badLeases) {
+            [void]$Global:BadAddressLeases.Add([PSCustomObject]@{
+                IPAddress       = "$($lease.IPAddress)"
+                ClientId        = "$(if ($lease.ClientId) { $lease.ClientId } else { '' })"
+                HostName        = "$($lease.HostName)"
+                AddressState    = "$($lease.AddressState)"
+                LeaseExpiryTime = "$(if ($lease.LeaseExpiryTime) { $lease.LeaseExpiryTime } else { '' })"
+            })
+        }
+        
+        if ($badCount -eq 0) {
+            Add-BadAddressFinding -Step 2 -Check 'BAD_ADDRESS inventory' -Status 'OK' -Finding "No BAD_ADDRESS / Declined leases in scope $ScopeId." -Recommendation "Nothing to clear. If utilization still looks wrong, refresh Statistics and check exclusions/reservations."
+            $Global:BadAddressDiag.Pattern = 'None'
+            $Global:BadAddressDiag.CanClear = $false
+            $Global:BadAddressDiag.RanAt = Get-Date
+            $Global:BadAddressDiag.Summary = "Scope $ScopeId: no BAD_ADDRESS leases found."
+            if ($null -ne $script:TxtTroubleshootSummary) {
+                $script:TxtTroubleshootSummary.Text = $Global:BadAddressDiag.Summary
+            }
+            Update-TroubleshootClearUi
+            Complete-TaskProgress -Message "No BAD_ADDRESS leases in $ScopeId"
+            Set-Status "No BAD_ADDRESS leases in $ScopeId"
+            Update-LogDisplay
+            return
+        }
+        
+        Add-BadAddressFinding -Step 2 -Check 'BAD_ADDRESS inventory' -Status 'Warn' -Finding "$badCount BAD_ADDRESS/Declined lease(s) in scope $ScopeId." -Recommendation "Do not clear yet — finish the checklist and correct the cause first."
+        [void]$summaryParts.Add("BAD=$badCount")
+        
+        # --- Step 2b / pattern: sequential vs random ---
+        Wait-TaskProgressIfPaused
+        if (Test-TaskCancelRequested) { throw "Canceled" }
+        Update-TaskProgress -Processed 3 -Message "Analyzing BAD_ADDRESS pattern..."
+        
+        $patternResult = Test-BadAddressPattern -IPAddresses @($badLeases | ForEach-Object { "$($_.IPAddress)" })
+        $Global:BadAddressDiag.Pattern = $patternResult.Pattern
+        $patternStatus = switch ($patternResult.Pattern) {
+            'Sequential' { 'Warn' }
+            'Clustered'  { 'Warn' }
+            'Random'     { 'Warn' }
+            default      { 'Info' }
+        }
+        $patternRec = switch ($patternResult.Pattern) {
+            'Sequential' { 'Look for conflict-detection walking the pool, a port scanner, or one device answering for a contiguous range (proxy ARP / misconfigured VIP).' }
+            'Clustered'  { 'Inspect the clustered subnet pocket — likely one L2/L3 device or a small set of static IPs overlapping the dynamic range.' }
+            'Random'     { 'Scattered conflicts often mean many real clients, intermittent rogue DHCP, or firewall/proxy-ARP answering inconsistently.' }
+            default      { 'Collect more BAD_ADDRESS samples if the issue continues.' }
+        }
+        Add-BadAddressFinding -Step 3 -Check 'Sequential vs random' -Status $patternStatus -Finding "$($patternResult.Pattern): $($patternResult.Detail)" -Recommendation $patternRec
+        [void]$summaryParts.Add("Pattern=$($patternResult.Pattern)")
+        
+        # --- Steps 4–5: Ping/ARP sample + MAC compare + device ownership ---
+        Wait-TaskProgressIfPaused
+        if (Test-TaskCancelRequested) { throw "Canceled" }
+        Update-TaskProgress -Processed 4 -Message "Probing sample BAD addresses (ping/ARP)..."
+        
+        $sampleN = [math]::Min($SampleSize, $badCount)
+        # Spread sample across the sorted list (first, middle-ish, last) when possible
+        $sampleIdx = [System.Collections.Generic.List[int]]::new()
+        if ($sampleN -eq 1) {
+            [void]$sampleIdx.Add(0)
+        } else {
+            for ($si = 0; $si -lt $sampleN; $si++) {
+                $idx = [int][math]::Round(($si * ($badCount - 1)) / [double]($sampleN - 1))
+                if (-not $sampleIdx.Contains($idx)) { [void]$sampleIdx.Add($idx) }
+            }
+            while ($sampleIdx.Count -lt $sampleN) {
+                for ($j = 0; $j -lt $badCount -and $sampleIdx.Count -lt $sampleN; $j++) {
+                    if (-not $sampleIdx.Contains($j)) { [void]$sampleIdx.Add($j) }
+                }
+            }
+        }
+        
+        $probeMacs = [System.Collections.Generic.List[string]]::new()
+        $pingUp = 0
+        $arpHits = 0
+        $probeNum = 0
+        foreach ($idx in $sampleIdx) {
+            Wait-TaskProgressIfPaused
+            if (Test-TaskCancelRequested) { throw "Canceled" }
+            $probeNum++
+            $lease = $badLeases[$idx]
+            $ip = "$($lease.IPAddress)"
+            Update-TaskProgress -Processed 4 -Message "Probing $ip ($probeNum/$sampleN)..."
+            
+            $ping = Test-HostPingStatus -ComputerName $ip -TimeoutMs 1500
+            if ($ping.Status -eq 'Up') { $pingUp++ }
+            
+            $arp = Get-ArpNeighborInfo -IPAddress $ip
+            if ($arp.Mac) {
+                $arpHits++
+                $norm = Get-NormalizedCompareMac $arp.Mac
+                if ($norm -and -not $probeMacs.Contains($norm)) { [void]$probeMacs.Add($norm) }
+            }
+            
+            $notes = @()
+            if ($ping.Status -eq 'Up' -and $arp.Mac) {
+                [void]$notes.Add('Live host with ARP — address is in use on this L2 path')
+            } elseif ($ping.Status -eq 'Up' -and -not $arp.Mac) {
+                [void]$notes.Add('Ping OK but no local ARP — may be routed/remote or filtered ARP')
+            } elseif ($ping.Status -ne 'Up' -and $arp.Mac) {
+                [void]$notes.Add('ARP present, ICMP blocked — device may still own the IP')
+            } else {
+                [void]$notes.Add('No live response from this workstation — conflict may be stale or on another segment')
+            }
+            
+            [void]$Global:BadAddressProbes.Add([PSCustomObject]@{
+                IPAddress  = $ip
+                PingStatus = $ping.Status
+                LatencyMs  = $(if ($null -ne $ping.LatencyMs) { "$($ping.LatencyMs) ms" } else { '' })
+                ArpMac     = $(if ($arp.Mac) { $arp.Mac } else { '' })
+                ArpState   = $arp.State
+                Notes      = ($notes -join '; ')
+            })
+        }
+        
+        $probeFinding = "Sampled $sampleN of $badCount: ping Up $pingUp/$sampleN, ARP MAC $arpHits/$sampleN."
+        $probeRec = "If probes are live, those IPs belong to real devices (or a middlebox). Remove statics from the dynamic range, fix reservations, or exclude the addresses — then clear BAD_ADDRESS."
+        $probeStatus = if ($pingUp -gt 0 -or $arpHits -gt 0) { 'Warn' } else { 'Info' }
+        Add-BadAddressFinding -Step 4 -Check 'Ping / ARP sample' -Status $probeStatus -Finding $probeFinding -Recommendation $probeRec
+        [void]$summaryParts.Add("Probes pingUp=$pingUp/$sampleN arp=$arpHits/$sampleN")
+        
+        Wait-TaskProgressIfPaused
+        if (Test-TaskCancelRequested) { throw "Canceled" }
+        Update-TaskProgress -Processed 5 -Message "Comparing probe MAC addresses..."
+        
+        $macCount = Get-SafeCount $probeMacs
+        $macStatus = 'Info'
+        $macFinding = ''
+        $macRec = ''
+        if ($macCount -eq 0) {
+            $macStatus = 'Info'
+            $macFinding = "No ARP MACs resolved from this management host for the sample."
+            $macRec = "Run probes from a host on the same VLAN as the scope for accurate ARP. Lack of ARP here does not prove the IPs are free."
+        } elseif ($macCount -eq 1 -and $arpHits -ge 2) {
+            $macStatus = 'Warn'
+            $displayMac = Format-CompareMacDisplay $probeMacs[0]
+            $macFinding = "Same MAC ($displayMac) answers for multiple BAD IPs."
+            $macRec = "Strong indicator of proxy ARP, firewall/NAT, load balancer, or a misconfigured router claiming many addresses. Check gateway/firewall proxy-ARP and HSRP/VRRP."
+            [void]$likelyCauses.Add("Proxy ARP / single MAC ($displayMac) owning multiple BAD IPs")
+        } elseif ($macCount -ge 2) {
+            $macStatus = 'Warn'
+            $macList = @($probeMacs | ForEach-Object { Format-CompareMacDisplay $_ }) -join ', '
+            $macFinding = "Multiple distinct MACs in sample ($macCount): $macList."
+            $macRec = "Different devices own these IPs. Look for static IP conflicts, missing reservations, or clients with manually assigned addresses inside the pool."
+            [void]$likelyCauses.Add('Multiple real devices conflicting with the DHCP pool')
+        } else {
+            $macStatus = 'Info'
+            $macFinding = "One ARP MAC observed on a single probe: $(Format-CompareMacDisplay $probeMacs[0])."
+            $macRec = "Correlate that MAC on switches (show mac address-table) to find the access port / device."
+        }
+        Add-BadAddressFinding -Step 5 -Check 'MAC comparison' -Status $macStatus -Finding $macFinding -Recommendation $macRec
+        
+        Wait-TaskProgressIfPaused
+        if (Test-TaskCancelRequested) { throw "Canceled" }
+        Update-TaskProgress -Processed 6 -Message "Assessing whether BAD IPs belong to devices..."
+        
+        $ownStatus = 'Info'
+        $ownFinding = ''
+        $ownRec = ''
+        if ($pingUp -gt 0 -or $arpHits -gt 0) {
+            $ownStatus = 'Warn'
+            $ownFinding = "One or more sampled BAD addresses respond (ping and/or ARP) — they currently belong to live devices or a middlebox."
+            $ownRec = "Do not clear yet. Identify owners (MAC → switch port → hostname), convert to reservations or exclusions, or move statics out of the pool."
+            [void]$likelyCauses.Add('Live devices still using BAD_ADDRESS IPs')
+        } else {
+            $ownStatus = 'Info'
+            $ownFinding = "Sampled BAD addresses did not respond from this host — may be stale, ICMP-filtered, or on another L2 segment."
+            $ownRec = "Re-probe from the VLAN, check DHCP audit/events for decline reasons, and confirm no other DHCP is offering those IPs before clearing."
+        }
+        Add-BadAddressFinding -Step 6 -Check 'Device ownership' -Status $ownStatus -Finding $ownFinding -Recommendation $ownRec
+        
+        # --- Step 7: Failover health ---
+        Wait-TaskProgressIfPaused
+        if (Test-TaskCancelRequested) { throw "Canceled" }
+        Update-TaskProgress -Processed 7 -Message "Checking DHCP failover health..."
+        
+        $foStatus = 'Info'
+        $foFinding = 'No failover relationship found on this server.'
+        $foRec = 'Standalone server — skip failover concerns unless a partner was expected.'
+        try {
+            $failovers = @(Get-DhcpServerv4Failover -ComputerName $server -ErrorAction SilentlyContinue)
+            if ((Get-SafeCount $failovers) -eq 0) {
+                $foStatus = 'OK'
+                $foFinding = 'No DHCP failover relationships configured on this server.'
+                $foRec = 'If a partner was expected, configure/repair failover. Otherwise continue with rogue DHCP / proxy-ARP checks.'
+            } else {
+                $foBits = [System.Collections.Generic.List[string]]::new()
+                $foWarn = $false
+                foreach ($fo in $failovers) {
+                    $name = "$($fo.Name)"
+                    $state = "$($fo.State)"
+                    $mode = "$($fo.Mode)"
+                    $partner = "$($fo.PartnerServer)"
+                    $scopeMatch = $false
+                    try {
+                        $foScopes = @($fo.ScopeId)
+                        foreach ($fs in $foScopes) {
+                            if ("$fs" -eq $ScopeId) { $scopeMatch = $true; break }
+                        }
+                    } catch {}
+                    $scopeNote = if ($scopeMatch) { "includes scope $ScopeId" } else { "scope $ScopeId not listed on this relationship (server-wide check)" }
+                    
+                    $statText = ''
+                    try {
+                        $stats = Get-DhcpServerv4FailoverStatistics -ComputerName $server -Name $name -ErrorAction SilentlyContinue
+                        if ($stats) {
+                            $statText = " (local free=$($stats.AddressesFree), partner free=$($stats.AddressesFreePartner), pending=$($stats.PendingOffers))"
+                        }
+                    } catch {}
+                    
+                    if ($state -notmatch 'Normal|NoState') {
+                        $foWarn = $true
+                        [void]$likelyCauses.Add("Failover '$name' state=$state")
+                    }
+                    [void]$foBits.Add("$name → partner $partner; mode=$mode; state=$state; $scopeNote$statText")
+                }
+                $foFinding = ($foBits -join ' | ')
+                if ($foWarn) {
+                    $foStatus = 'Warn'
+                    $foRec = 'Repair failover (replication, time sync, partner reachability). Split-brain / communication-interrupted partners commonly create duplicate offers and BAD_ADDRESS storms.'
+                } else {
+                    $foStatus = 'OK'
+                    $foRec = 'Failover reports a healthy state. Still verify both nodes authorize the same scopes and are not double-offering outside the relationship.'
+                }
+            }
+        } catch {
+            $foStatus = 'Error'
+            $foFinding = "Failover query failed: $_"
+            $foRec = 'Install/update DhcpServer RSAT tools and confirm permissions.'
+        }
+        Add-BadAddressFinding -Step 7 -Check 'DHCP failover health' -Status $foStatus -Finding $foFinding -Recommendation $foRec
+        
+        # --- Step 8: Another DHCP server on the VLAN ---
+        Wait-TaskProgressIfPaused
+        if (Test-TaskCancelRequested) { throw "Canceled" }
+        Update-TaskProgress -Processed 8 -Message "Checking for other DHCP servers..."
+        
+        $rogueStatus = 'Info'
+        $rogueFinding = ''
+        $rogueRec = 'From a client on this VLAN: run a DHCP discover capture (Wireshark filter bootp) or use a rogue-DHCP detector. Compare offeror IPs to authorized servers.'
+        try {
+            $authServers = @()
+            try { $authServers = @(Get-DhcpServerInDC -ErrorAction SilentlyContinue) } catch {}
+            $authNames = @($authServers | ForEach-Object {
+                $dn = "$($_.DnsName)".Trim()
+                $ip = "$($_.IPAddress)".Trim()
+                if ($dn -and $ip) { "$dn ($ip)" } elseif ($dn) { $dn } else { $ip }
+            } | Where-Object { $_ })
+            
+            $scanExtra = @()
+            if ((Get-SafeCount $Global:DomainScanResults) -gt 0) {
+                $scanExtra = @($Global:DomainScanResults | Where-Object {
+                    "$($_.Authorized)" -eq 'No' -or "$($_.Online)" -match 'Up|Yes'
+                } | Select-Object -First 8 | ForEach-Object {
+                    "$($_.DnsName) online=$($_.Online) auth=$($_.Authorized)"
+                })
+            }
+            
+            $authCount = Get-SafeCount $authNames
+            if ($authCount -gt 0) {
+                $rogueFinding = "AD-authorized DHCP servers ($authCount): $(($authNames | Select-Object -First 6) -join '; ')$(if ($authCount -gt 6) { ' ...' }). Connected target: $server."
+            } else {
+                $rogueFinding = "Could not enumerate AD-authorized DHCP servers from this host. Connected target: $server."
+            }
+            if ((Get-SafeCount $scanExtra) -gt 0) {
+                $rogueFinding += " Recent domain-scan sample: $($scanExtra -join '; ')."
+            }
+            $rogueFinding += " In-app packet capture on the VLAN is not available — confirm no unauthorized offeror on this subnet."
+            $rogueStatus = 'Warn'
+            $rogueRec = "Ensure only the intended DHCP server/failover pair serves this VLAN. Disable unauthorized appliances (firewall DHCP, IP helpers to wrong servers, consumer routers). Use Scan Domain for AD inventory, then capture DHCP Offers on-VLAN."
+            [void]$likelyCauses.Add('Possible additional DHCP server on VLAN (verify with capture)')
+        } catch {
+            $rogueStatus = 'Error'
+            $rogueFinding = "Rogue DHCP check failed: $_"
+        }
+        Add-BadAddressFinding -Step 8 -Check 'Other DHCP on VLAN' -Status $rogueStatus -Finding $rogueFinding -Recommendation $rogueRec
+        
+        # --- Step 9: Gateway / proxy ARP ---
+        Wait-TaskProgressIfPaused
+        if (Test-TaskCancelRequested) { throw "Canceled" }
+        Update-TaskProgress -Processed 9 -Message "Checking gateway / proxy ARP indicators..."
+        
+        $gwStatus = 'Info'
+        $gwFinding = ''
+        $gwRec = 'On the gateway/firewall: disable proxy ARP unless required; verify no DHCP service; confirm HSRP/VRRP VIP is not overlapping the dynamic pool; check IP helper-address targets.'
+        $gateways = @()
+        try {
+            $opt = @(Get-DhcpServerv4OptionValue -ComputerName $server -ScopeId $ScopeId -OptionId 3 -ErrorAction SilentlyContinue)
+            if ((Get-SafeCount $opt) -eq 0) {
+                $opt = @(Get-DhcpServerv4OptionValue -ComputerName $server -OptionId 3 -ErrorAction SilentlyContinue)
+            }
+            foreach ($o in $opt) {
+                foreach ($v in @($o.Value)) {
+                    $vip = "$v".Trim()
+                    if (Test-IPAddress $vip) { $gateways += $vip }
+                }
+            }
+            $gateways = @($gateways | Select-Object -Unique)
+        } catch {}
+        
+        if ((Get-SafeCount $gateways) -eq 0) {
+            $gwStatus = 'Warn'
+            $gwFinding = "No Router (003) option found for scope $ScopeId (scope or server level)."
+            $gwRec = "Set the correct gateway option, then re-check proxy ARP on that gateway/firewall."
+        } else {
+            $gwBits = [System.Collections.Generic.List[string]]::new()
+            foreach ($gw in $gateways) {
+                $gwPing = Test-HostPingStatus -ComputerName $gw -TimeoutMs 1500
+                $gwArp = Get-ArpNeighborInfo -IPAddress $gw
+                $sameAsProbe = $false
+                if ($gwArp.Mac) {
+                    $gwNorm = Get-NormalizedCompareMac $gwArp.Mac
+                    if ($gwNorm -and $probeMacs.Contains($gwNorm)) { $sameAsProbe = $true }
+                }
+                $bit = "GW $gw ping=$($gwPing.Status)"
+                if ($gwArp.Mac) { $bit += " ARP=$($gwArp.Mac)" }
+                if ($sameAsProbe) {
+                    $bit += ' ★ same MAC as BAD probe(s)'
+                    $gwStatus = 'Warn'
+                    [void]$likelyCauses.Add("Gateway/firewall MAC matches BAD_ADDRESS probes (proxy ARP likely) — $gw")
+                }
+                [void]$gwBits.Add($bit)
+            }
+            if ($gwStatus -ne 'Warn') { $gwStatus = 'Info' }
+            $gwFinding = ($gwBits -join ' | ')
+            $gwFinding += ' | Checklist: proxy-ARP off (unless required), no DHCP on firewall, helpers point only to authorized DHCP, VIP/HSRP not inside dynamic range.'
+            if ($macCount -eq 1 -and $arpHits -ge 2) {
+                $gwStatus = 'Warn'
+                $gwRec = 'Multiple BAD IPs share one MAC — treat as proxy ARP / L3 middlebox until proven otherwise. Compare that MAC to the gateway ARP MAC above and to firewall interface MACs.'
+            }
+        }
+        Add-BadAddressFinding -Step 9 -Check 'Gateway / proxy ARP' -Status $gwStatus -Finding $gwFinding -Recommendation $gwRec
+        
+        # --- Wrap-up: allow clear only after review ---
+        $Global:BadAddressDiag.CanClear = $true
+        $Global:BadAddressDiag.RanAt = Get-Date
+        
+        $causeText = if ((Get-SafeCount $likelyCauses) -gt 0) {
+            "Likely causes: $(($likelyCauses | Select-Object -Unique) -join '; ')."
+        } else {
+            "No single strong cause auto-detected — use findings above and on-VLAN capture before clearing."
+        }
+        
+        $summary = "Scope $ScopeId on $server — $($summaryParts -join ' | '). $causeText Clear is gated until you confirm the root cause was corrected."
+        $Global:BadAddressDiag.Summary = $summary
+        if ($null -ne $script:TxtTroubleshootSummary) {
+            $script:TxtTroubleshootSummary.Text = $summary
+        }
+        
+        Add-BadAddressFinding -Step 10 -Check 'Clear readiness' -Status 'Info' -Finding "Diagnostics complete for $badCount BAD_ADDRESS lease(s). Clear remains locked until you check the confirmation box." -Recommendation "Correct the cause (conflict sources, failover, rogue DHCP, proxy ARP, static overlaps), then check the box and clear BAD_ADDRESS leases for this scope only."
+        
+        Update-TroubleshootClearUi
+        Complete-TaskProgress -Message "BAD_ADDRESS diagnostics complete for $ScopeId"
+        Set-Status "BAD_ADDRESS diagnostics complete: $badCount finding(s) in $ScopeId"
+        Write-ActionLog "BAD_ADDRESS diagnostics complete for $ScopeId — $badCount bad lease(s), pattern=$($Global:BadAddressDiag.Pattern)" "SUCCESS"
+        Update-LogDisplay
+        
+    } catch {
+        if ("$_" -match 'Canceled') {
+            Write-ActionLog "BAD_ADDRESS diagnostics canceled" "WARN"
+            Complete-TaskProgress -Message "BAD_ADDRESS diagnostics canceled"
+            Set-Status "BAD_ADDRESS diagnostics canceled"
+        } else {
+            Write-ActionLog "BAD_ADDRESS diagnostics failed: $_" "ERROR"
+            Complete-TaskProgress -Message "BAD_ADDRESS diagnostics failed"
+            Set-Status "BAD_ADDRESS diagnostics failed"
+            Show-MessageBox "Diagnostics failed: $_" "Troubleshoot Error" OK Error
+        }
+        Update-TroubleshootClearUi
+        Update-LogDisplay
+    }
+}
+
+function Export-BadAddressReport {
+    if ((Get-SafeCount $Global:BadAddressFindings) -eq 0 -and (Get-SafeCount $Global:BadAddressLeases) -eq 0) {
+        Show-MessageBox "Run diagnostics before exporting." "Nothing to Export" OK Information
+        return
+    }
+    
+    try {
+        $saveDialog = New-Object System.Windows.Forms.SaveFileDialog
+        $saveDialog.Filter = "CSV files (*.csv)|*.csv|All files (*.*)|*.*"
+        $saveDialog.Title = "Export BAD_ADDRESS Troubleshoot Report"
+        $scopePart = if ($Global:BadAddressDiag.ScopeId) { ($Global:BadAddressDiag.ScopeId -replace '[^\d\.]', '_') } else { 'scope' }
+        $saveDialog.FileName = "BAD_ADDRESS_$scopePart`_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+        
+        if ($saveDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            $rows = [System.Collections.Generic.List[object]]::new()
+            foreach ($f in @($Global:BadAddressFindings)) {
+                [void]$rows.Add([PSCustomObject]@{
+                    Section        = 'Finding'
+                    Step           = $f.Step
+                    Check          = $f.Check
+                    Status         = $f.Status
+                    Finding        = $f.Finding
+                    Recommendation = $f.Recommendation
+                    IPAddress      = ''
+                    PingStatus     = ''
+                    ArpMac         = ''
+                    HostName       = ''
+                    AddressState   = ''
+                })
+            }
+            foreach ($l in @($Global:BadAddressLeases)) {
+                [void]$rows.Add([PSCustomObject]@{
+                    Section        = 'BadLease'
+                    Step           = ''
+                    Check          = ''
+                    Status         = ''
+                    Finding        = ''
+                    Recommendation = ''
+                    IPAddress      = $l.IPAddress
+                    PingStatus     = ''
+                    ArpMac         = $l.ClientId
+                    HostName       = $l.HostName
+                    AddressState   = $l.AddressState
+                })
+            }
+            foreach ($p in @($Global:BadAddressProbes)) {
+                [void]$rows.Add([PSCustomObject]@{
+                    Section        = 'Probe'
+                    Step           = ''
+                    Check          = ''
+                    Status         = ''
+                    Finding        = $p.Notes
+                    Recommendation = ''
+                    IPAddress      = $p.IPAddress
+                    PingStatus     = $p.PingStatus
+                    ArpMac         = $p.ArpMac
+                    HostName       = ''
+                    AddressState   = $p.ArpState
+                })
+            }
+            
+            $rows | Export-Csv -Path $saveDialog.FileName -NoTypeInformation -Encoding UTF8
+            Write-ActionLog "Exported BAD_ADDRESS report: $($saveDialog.FileName)" "SUCCESS"
+            Show-MessageBox "Exported report to:`n$($saveDialog.FileName)" "Export Complete" OK Information
+            Update-LogDisplay
+        }
+    } catch {
+        Write-ActionLog "BAD_ADDRESS export failed: $_" "ERROR"
+        Show-MessageBox "Export failed: $_" "Export Error" OK Error
+    }
+}
+
+function Clear-BadAddressLeasesForScope {
+    <#
+    .SYNOPSIS
+        Clears BAD_ADDRESS leases only after diagnostics + operator confirmation
+    #>
+    
+    if ([string]::IsNullOrWhiteSpace($Global:DHCPServer)) {
+        Show-MessageBox "Connect to a DHCP server first." "Not Connected" OK Warning
+        return
+    }
+    
+    $scopeId = "$($Global:BadAddressDiag.ScopeId)"
+    if (-not $scopeId) { $scopeId = Get-TroubleshootScopeIdFromUi }
+    
+    if (-not $Global:BadAddressDiag.CanClear -or -not $Global:BadAddressDiag.RanAt) {
+        Show-MessageBox "Run diagnostics for this scope before clearing BAD_ADDRESS leases." "Diagnostics Required" OK Warning
+        return
+    }
+    
+    $uiScope = Get-TroubleshootScopeIdFromUi
+    if ($uiScope -and $Global:BadAddressDiag.ScopeId -and $uiScope -ne $Global:BadAddressDiag.ScopeId) {
+        Show-MessageBox "Selected scope ($uiScope) does not match the last diagnostics scope ($($Global:BadAddressDiag.ScopeId)). Re-run diagnostics for the selected scope." "Scope Mismatch" OK Warning
+        return
+    }
+    
+    $reviewed = $false
+    try { $reviewed = [bool]$script:ChkTroubleshootReviewed.IsChecked } catch {}
+    if (-not $reviewed) {
+        Show-MessageBox "Confirm you reviewed the findings and corrected the root cause before clearing." "Confirmation Required" OK Warning
+        return
+    }
+    
+    $badCount = [int]$Global:BadAddressDiag.BadCount
+    if ($badCount -le 0) {
+        Show-MessageBox "No BAD_ADDRESS leases to clear." "Nothing to Clear" OK Information
+        return
+    }
+    
+    $confirm = Show-MessageBox "Clear $badCount BAD_ADDRESS lease(s) on scope $scopeId from server $($Global:DHCPServer)?`n`nOnly proceed if the root cause is fixed — otherwise BAD_ADDRESS entries will return." "Confirm Clear BAD_ADDRESS" YesNo Warning
+    if ($confirm -ne [System.Windows.MessageBoxResult]::Yes) { return }
+    
+    Write-ActionLog "Clearing $badCount BAD_ADDRESS lease(s) on $scopeId..." "INFO"
+    Set-Status "Clearing BAD_ADDRESS leases on $scopeId..."
+    
+    $ips = @($Global:BadAddressLeases | ForEach-Object { "$($_.IPAddress)" } | Where-Object { $_ })
+    if ((Get-SafeCount $ips) -eq 0) {
+        try {
+            $ips = @(Get-BadAddressLeasesForScope -Server $Global:DHCPServer -ScopeId $scopeId | ForEach-Object { "$($_.IPAddress)" })
+        } catch {
+            Show-MessageBox "Failed to reload BAD_ADDRESS leases: $_" "Clear Failed" OK Error
+            return
+        }
+    }
+    
+    $total = Get-SafeCount $ips
+    Start-TaskProgress -Name 'ClearBadAddress' -Message "Clearing BAD_ADDRESS leases..." -CanPause -Total $total
+    $ok = 0
+    $fail = 0
+    
+    try {
+        $i = 0
+        foreach ($ip in $ips) {
+            Wait-TaskProgressIfPaused
+            if (Test-TaskCancelRequested) { break }
+            $i++
+            Update-TaskProgress -Processed $i -Message "Removing BAD_ADDRESS $ip..."
+            try {
+                Remove-DhcpServerv4Lease -ComputerName $Global:DHCPServer -IPAddress $ip -ErrorAction Stop
+                $ok++
+                Write-ActionLog "Removed BAD_ADDRESS lease $ip" "SUCCESS"
+            } catch {
+                $fail++
+                Write-ActionLog "Failed to remove BAD_ADDRESS $ip : $_" "ERROR"
+            }
+        }
+        
+        Complete-TaskProgress -Message "Clear BAD_ADDRESS finished: $ok ok, $fail failed"
+        Set-Status "Cleared BAD_ADDRESS: $ok ok, $fail failed"
+        Show-MessageBox "Removed $ok BAD_ADDRESS lease(s). Failed: $fail." "Clear Complete" OK Information
+        
+        # Refresh diagnostics inventory for the same scope
+        Invoke-BadAddressDiagnostics -ScopeId $scopeId -SampleSize (Get-TroubleshootSampleSize)
+    } catch {
+        Complete-TaskProgress -Message "Clear BAD_ADDRESS failed"
+        Write-ActionLog "Clear BAD_ADDRESS failed: $_" "ERROR"
+        Show-MessageBox "Clear failed: $_" "Clear Error" OK Error
+    }
+    Update-LogDisplay
+}
+
+function Initialize-TroubleshootTab {
+    try {
+        if ($null -ne $script:GridTroubleshootFindings) {
+            $script:GridTroubleshootFindings.ItemsSource = $Global:BadAddressFindings
+        }
+        if ($null -ne $script:GridTroubleshootBadLeases) {
+            $script:GridTroubleshootBadLeases.ItemsSource = $Global:BadAddressLeases
+        }
+        if ($null -ne $script:GridTroubleshootProbes) {
+            $script:GridTroubleshootProbes.ItemsSource = $Global:BadAddressProbes
+        }
+        if (-not [string]::IsNullOrWhiteSpace($Global:DHCPServer)) {
+            Update-TroubleshootScopeList
+            if ($Global:SelectedScope) { [void](Set-TroubleshootScopeSelection -ScopeId $Global:SelectedScope) }
+        }
+    } catch {
+        Write-ActionLog "Initialize-TroubleshootTab: $_" "WARN"
+    }
+}
+#endregion
 
 function Get-ScopeUtilThresholdPercent {
     $threshold = 90
@@ -7989,6 +9161,7 @@ $BtnConnect.add_Click({
         # Load initial data
         Build-NavTree
         Load-Scopes
+        Update-TroubleshootScopeList
         Update-CompareReadyState
         
         Update-LogDisplay
@@ -8024,6 +9197,10 @@ $BtnDisconnect.add_Click({
         $script:GridFilters.ItemsSource = $null
         $script:GridPolicies.ItemsSource = $null
         $script:GridCompare.ItemsSource = $null
+        try {
+            Reset-BadAddressDiagState
+            if ($null -ne $script:CboTroubleshootScope) { $script:CboTroubleshootScope.Items.Clear() }
+        } catch {}
         
         $script:NavTree.Items.Clear()
         try {
@@ -8060,6 +9237,10 @@ $BtnRefresh.add_Click({
         "TabOptions"      { Load-Options }
         "TabFilters"      { Load-Filters }
         "TabPolicies"     { Load-Policies }
+        "TabTroubleshoot" {
+            Initialize-TroubleshootTab
+            Update-TroubleshootScopeList
+        }
         "TabStats"        { Load-Statistics }
         "TabCompare"      { Invoke-DhcpServerCompare }
         "TabMigrate"      { Update-MigrateReadyState }
@@ -8136,6 +9317,13 @@ function Handle-NavSelect {
         Write-ActionLog "Loading policies view" "INFO"
         $script:MainTabs.SelectedItem = $script:TabPolicies
         Load-Policies
+    }
+    elseif ($tag -eq "Troubleshoot") {
+        Write-ActionLog "Loading Troubleshoot view" "INFO"
+        $script:MainTabs.SelectedItem = $script:TabTroubleshoot
+        Initialize-TroubleshootTab
+        Update-TroubleshootScopeList
+        if ($Global:SelectedScope) { [void](Set-TroubleshootScopeSelection -ScopeId $Global:SelectedScope) }
     }
     elseif ($tag -eq "Statistics") {
         Write-ActionLog "Loading statistics view" "INFO"
@@ -8515,6 +9703,68 @@ $GridPolicies.add_SelectionChanged({
     $script:BtnPolicyEdit.IsEnabled = ($null -ne $script:GridPolicies.SelectedItem)
     $script:BtnPolicyDelete.IsEnabled = ($null -ne $script:GridPolicies.SelectedItem)
 })
+#endregion
+
+#region Event Handlers - Troubleshoot BAD_ADDRESS
+if ($null -ne $script:BtnViewTroubleshoot) {
+    $script:BtnViewTroubleshoot.add_Click({
+        Write-ActionLog "Switching to Troubleshoot tab..." "INFO"
+        $script:MainTabs.SelectedItem = $script:TabTroubleshoot
+        Initialize-TroubleshootTab
+        if (-not [string]::IsNullOrWhiteSpace($Global:DHCPServer)) {
+            Update-TroubleshootScopeList
+            if ($Global:SelectedScope) { [void](Set-TroubleshootScopeSelection -ScopeId $Global:SelectedScope) }
+        }
+    })
+}
+
+if ($null -ne $script:BtnTroubleshootRefreshScopes) {
+    $script:BtnTroubleshootRefreshScopes.add_Click({
+        Write-ActionLog "Troubleshoot refresh scopes clicked" "INFO"
+        Update-TroubleshootScopeList
+    })
+}
+
+if ($null -ne $script:BtnTroubleshootUseSelected) {
+    $script:BtnTroubleshootUseSelected.add_Click({
+        $sid = Get-SelectedScopeId
+        if (-not $sid) {
+            Show-MessageBox "Select a scope in the navigation tree or Scopes tab first." "No Scope Selected" OK Warning
+            return
+        }
+        Update-TroubleshootScopeList
+        if (Set-TroubleshootScopeSelection -ScopeId $sid) {
+            Write-ActionLog "Troubleshoot scope set to selected: $sid" "INFO"
+        } else {
+            Show-MessageBox "Scope $sid was not found in the Troubleshoot scope list." "Scope Not Found" OK Warning
+        }
+    })
+}
+
+if ($null -ne $script:BtnTroubleshootRun) {
+    $script:BtnTroubleshootRun.add_Click({
+        $sid = Get-TroubleshootScopeIdFromUi
+        $sample = Get-TroubleshootSampleSize
+        Invoke-BadAddressDiagnostics -ScopeId $sid -SampleSize $sample
+    })
+}
+
+if ($null -ne $script:BtnTroubleshootExport) {
+    $script:BtnTroubleshootExport.add_Click({
+        Export-BadAddressReport
+    })
+}
+
+if ($null -ne $script:ChkTroubleshootReviewed) {
+    $script:ChkTroubleshootReviewed.add_Checked({ Update-TroubleshootClearUi })
+    $script:ChkTroubleshootReviewed.add_Unchecked({ Update-TroubleshootClearUi })
+}
+
+if ($null -ne $script:BtnTroubleshootClearBad) {
+    $script:BtnTroubleshootClearBad.add_Click({
+        Clear-BadAddressLeasesForScope
+    })
+}
 #endregion
 
 #region Event Handlers - Statistics
@@ -9237,6 +10487,7 @@ $Window.add_Loaded({
         if ($null -ne $script:GridScopeStats) {
             $script:GridScopeStats.ItemsSource = $Global:ScopeStatEntries
         }
+        Initialize-TroubleshootTab
         Update-EventWatchStatus
         Update-MigrateReadyState
     } catch {}
