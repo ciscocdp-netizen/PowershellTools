@@ -100,7 +100,7 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.5.5'
+$Global:AppVersion       = '2.5.6'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:DhcpEventEntriesAll = [System.Collections.Generic.List[object]]::new()
 $Global:ScopeStatEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
@@ -651,7 +651,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                      HorizontalAlignment="Center"/>
           
           <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-            <Run Text="v2.5.5  |  "/>
+            <Run Text="v2.5.6  |  "/>
             <Run Text="Created by Anthony Blake" Foreground="#90CAF9"/>
             <Run Text="  |  "/>
             <Run x:Name="StatusTime" Text=""/>
@@ -686,39 +686,41 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
     <!-- MAIN CONTENT AREA with Navigation and Tabs -->
     <Grid DockPanel.Dock="Top" Margin="0">
       <Grid.ColumnDefinitions>
-        <ColumnDefinition Width="260" MinWidth="200"/>
+        <ColumnDefinition Width="280" MinWidth="240"/>
         <ColumnDefinition Width="Auto"/>
         <ColumnDefinition Width="*" MinWidth="400"/>
       </Grid.ColumnDefinitions>
 
       <!-- LEFT NAVIGATION PANEL -->
       <Border Grid.Column="0" Background="{StaticResource BgCard}"
-              BorderThickness="0,0,1,0" BorderBrush="{StaticResource Border}">
+              BorderThickness="0,0,1,0" BorderBrush="{StaticResource Border}"
+              ClipToBounds="True">
         <DockPanel>
           <Border DockPanel.Dock="Top" Background="{StaticResource BgPanel}"
-                  Padding="10,10" BorderThickness="0,0,0,1" BorderBrush="{StaticResource Border}">
+                  Padding="8,10" BorderThickness="0,0,0,1" BorderBrush="{StaticResource Border}">
             <StackPanel>
               <TextBlock Text="📡 DHCP Navigation" Foreground="{StaticResource TextPrimary}"
-                         FontWeight="SemiBold" FontSize="13" Margin="0,0,0,8"/>
-              <Grid>
-                <Grid.ColumnDefinitions>
-                  <ColumnDefinition Width="*"/>
-                  <ColumnDefinition Width="Auto"/>
-                  <ColumnDefinition Width="Auto"/>
-                </Grid.ColumnDefinitions>
-                <TextBox x:Name="TxtNavScopeSearch" Grid.Column="0" Height="28"
-                         Style="{StaticResource DarkTextBox}" Margin="0,0,6,0"
-                         ToolTip="Search scopes by name or Scope ID (Enter = next match)"/>
-                <Button x:Name="BtnNavScopeFind" Grid.Column="1" Content="Find" Width="48" Height="28"
-                        Margin="0,0,4,0" Style="{StaticResource BtnSecondary}"
-                        ToolTip="Jump to the next matching scope"/>
-                <Button x:Name="BtnNavScopeSearchClear" Grid.Column="2" Content="✕" Width="28" Height="28"
+                         FontWeight="SemiBold" FontSize="13" Margin="0,0,0,8"
+                         TextTrimming="CharacterEllipsis"/>
+              <!-- Dock buttons first so the TextBox cannot shove them off-screen as text grows -->
+              <DockPanel LastChildFill="True" Margin="0,0,0,6">
+                <Button x:Name="BtnNavScopeSearchClear" DockPanel.Dock="Right"
+                        Content="✕" Width="30" Height="28" Margin="6,0,0,0"
                         Style="{StaticResource BtnSecondary}"
                         ToolTip="Clear scope search"/>
-              </Grid>
-              <TextBlock x:Name="TxtNavScopeSearchStatus" Margin="0,6,0,0"
+                <TextBox x:Name="TxtNavScopeSearch" Height="28" MinWidth="0"
+                         HorizontalAlignment="Stretch"
+                         Style="{StaticResource DarkTextBox}"
+                         ToolTip="Search scopes by name or Scope ID (Enter = next match)"/>
+              </DockPanel>
+              <Button x:Name="BtnNavScopeFind" Content="Find next match" Height="28"
+                      HorizontalAlignment="Stretch" Margin="0,0,0,6"
+                      Style="{StaticResource BtnSecondary}"
+                      ToolTip="Jump to the next matching scope"/>
+              <TextBlock x:Name="TxtNavScopeSearchStatus"
                          Foreground="{StaticResource TextSecond}" FontSize="10"
-                         Text="Search by scope name or ID" TextWrapping="Wrap"/>
+                         Text="Search by scope name or ID"
+                         TextWrapping="Wrap"/>
             </StackPanel>
           </Border>
           
@@ -3369,12 +3371,12 @@ function Update-NavScopeSearchStatus {
         
         if (-not $query) {
             $script:TxtNavScopeSearchStatus.Text = if ($TotalCount -gt 0) {
-                "$TotalCount scope(s) — search by name or Scope ID"
+                "$TotalCount scope(s) — type a name or Scope ID"
             } else {
                 "Connect and refresh to load scopes"
             }
         } else {
-            $script:TxtNavScopeSearchStatus.Text = "Showing $MatchCount of $TotalCount scope(s) matching '$query'"
+            $script:TxtNavScopeSearchStatus.Text = "$MatchCount of $TotalCount match '$query'"
         }
     } catch {}
 }
