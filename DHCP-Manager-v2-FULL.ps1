@@ -100,7 +100,7 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.5.7'
+$Global:AppVersion       = '2.5.8'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:DhcpEventEntriesAll = [System.Collections.Generic.List[object]]::new()
 $Global:ScopeStatEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
@@ -651,7 +651,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                      HorizontalAlignment="Center"/>
           
           <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-            <Run Text="v2.5.7  |  "/>
+            <Run Text="v2.5.8  |  "/>
             <Run Text="Created by Anthony Blake" Foreground="#90CAF9"/>
             <Run Text="  |  "/>
             <Run x:Name="StatusTime" Text=""/>
@@ -2412,7 +2412,9 @@ function Get-DhcpRelatedConnectCandidates {
         })
     }
     
-    $sorted = @($related | Sort-Object Score -Descending, DnsName)
+    $sorted = @($related | Sort-Object `
+        @{ Expression = 'Score'; Descending = $true }, `
+        @{ Expression = 'DnsName'; Descending = $false })
     if ((Get-SafeCount $sorted) -gt $MaxCandidates) {
         $sorted = @($sorted | Select-Object -First $MaxCandidates)
     }
