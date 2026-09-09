@@ -1,4 +1,4 @@
-# BAD_ADDRESS Troubleshooting (v2.6.1)
+# BAD_ADDRESS Troubleshooting (v2.6.2)
 
 Footer: **Created by Anthony Blake**
 

@@ -34,7 +34,7 @@
     
 .NOTES
     File Name      : DHCP-Manager-v2-FULL.ps1
-    Version        : 2.6.1 (BAD_ADDRESS Troubleshoot)
+    Version        : 2.6.2 (BAD_ADDRESS Troubleshoot)
     Date           : 2026-09-09
     Author         : Anthony Blake
     Prerequisite   : PowerShell 5.1+
@@ -101,7 +101,7 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.6.1'
+$Global:AppVersion       = '2.6.2'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:DhcpEventEntriesAll = [System.Collections.Generic.List[object]]::new()
 $Global:ScopeStatEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
@@ -666,7 +666,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                      HorizontalAlignment="Center"/>
           
           <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-            <Run Text="v2.6.1  |  "/>
+            <Run Text="v2.6.2  |  "/>
             <Run Text="Created by Anthony Blake" Foreground="#90CAF9"/>
             <Run Text="  |  "/>
             <Run x:Name="StatusTime" Text=""/>
@@ -5156,15 +5156,14 @@ function Invoke-BadAddressDiagnostics {
                 if ($norm -and -not $probeMacs.Contains($norm)) { [void]$probeMacs.Add($norm) }
             }
             
-            $notes = @()
             if ($ping.Status -eq 'Up' -and $arp.Mac) {
-                [void]$notes.Add('Live host with ARP — address is in use on this L2 path')
+                $notes = 'Live host with ARP — address is in use on this L2 path'
             } elseif ($ping.Status -eq 'Up' -and -not $arp.Mac) {
-                [void]$notes.Add('Ping OK but no local ARP — may be routed/remote or filtered ARP')
+                $notes = 'Ping OK but no local ARP — may be routed/remote or filtered ARP'
             } elseif ($ping.Status -ne 'Up' -and $arp.Mac) {
-                [void]$notes.Add('ARP present, ICMP blocked — device may still own the IP')
+                $notes = 'ARP present, ICMP blocked — device may still own the IP'
             } else {
-                [void]$notes.Add('No live response from this workstation — conflict may be stale or on another segment')
+                $notes = 'No live response from this workstation — conflict may be stale or on another segment'
             }
             
             [void]$Global:BadAddressProbes.Add([PSCustomObject]@{
@@ -5173,7 +5172,7 @@ function Invoke-BadAddressDiagnostics {
                 LatencyMs  = $(if ($null -ne $ping.LatencyMs) { "$($ping.LatencyMs) ms" } else { '' })
                 ArpMac     = $(if ($arp.Mac) { $arp.Mac } else { '' })
                 ArpState   = $arp.State
-                Notes      = ($notes -join '; ')
+                Notes      = $notes
             })
         }
         
