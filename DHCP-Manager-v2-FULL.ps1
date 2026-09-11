@@ -35,7 +35,7 @@
     
 .NOTES
     File Name      : DHCP-Manager-v2-FULL.ps1
-    Version        : 2.7.0 (IPAM-style Dashboard)
+    Version        : 2.7.1 (IPAM-style Dashboard)
     Date           : 2026-09-09
     Author         : Anthony Blake
     Prerequisite   : PowerShell 5.1+
@@ -102,7 +102,7 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.7.0'
+$Global:AppVersion       = '2.7.1'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:DhcpEventEntriesAll = [System.Collections.Generic.List[object]]::new()
 $Global:ScopeStatEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
@@ -325,18 +325,30 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
       <Setter Property="Padding"       Value="8,5"/>
       <Setter Property="FontSize"      Value="12"/>
       <Setter Property="CaretBrush"    Value="{StaticResource TextPrimary}"/>
+      <Setter Property="SelectionBrush" Value="{StaticResource Accent}"/>
+      <Setter Property="SelectionOpacity" Value="0.45"/>
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="TextBox">
             <Border Background="{TemplateBinding Background}"
                     BorderBrush="{TemplateBinding BorderBrush}"
                     BorderThickness="{TemplateBinding BorderThickness}"
-                    CornerRadius="4">
-              <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}" VerticalAlignment="Center"/>
+                    CornerRadius="4"
+                    SnapsToDevicePixels="True">
+              <!-- Foreground must be set on PART_ContentHost or WPF falls back to black text -->
+              <ScrollViewer x:Name="PART_ContentHost"
+                            Margin="{TemplateBinding Padding}"
+                            VerticalAlignment="Center"
+                            Focusable="False"
+                            Foreground="{TemplateBinding Foreground}"
+                            TextElement.Foreground="{TemplateBinding Foreground}"/>
             </Border>
             <ControlTemplate.Triggers>
               <Trigger Property="IsFocused" Value="True">
                 <Setter Property="BorderBrush" Value="{StaticResource Accent}"/>
+              </Trigger>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter Property="Opacity" Value="0.55"/>
               </Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
@@ -682,7 +694,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                      HorizontalAlignment="Center"/>
           
           <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-            <Run Text="v2.7.0  |  "/>
+            <Run Text="v2.7.1  |  "/>
             <Run Text="Created by Anthony Blake" Foreground="#90CAF9"/>
             <Run Text="  |  "/>
             <Run x:Name="StatusTime" Text=""/>
@@ -742,6 +754,9 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                 <TextBox x:Name="TxtNavScopeSearch" Height="28" MinWidth="0"
                          HorizontalAlignment="Stretch"
                          Style="{StaticResource DarkTextBox}"
+                         Background="{StaticResource BgDeep}"
+                         Foreground="{StaticResource TextPrimary}"
+                         CaretBrush="{StaticResource TextPrimary}"
                          ToolTip="Search scopes by name or Scope ID (Enter = next match)"/>
               </DockPanel>
               <Button x:Name="BtnNavScopeFind" Content="Find next match" Height="28"
