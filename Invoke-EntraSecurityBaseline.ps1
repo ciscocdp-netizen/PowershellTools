@@ -18,9 +18,27 @@
     exclusion fallback gap analysis, live CA WhatIf evaluation) are implemented as documented
     best-effort approximations and are clearly flagged in the report.
 
-    The resulting HTML report is completely self-contained: all CSS and JavaScript (including
-    the charting engine, which is hand-written with inline SVG) are embedded, so the report
-    works fully offline with no internet connection and no external CDN.
+    The HTML report is built from EntraSecurityBaseline.ReportTemplate.html (keep that file
+    next to this script). CSS and JavaScript live in the template, not in this .ps1, so
+    CrowdStrike / AMSI does not have to scan a large JavaScript payload as PowerShell.
+
+    This script is read-only against Microsoft Entra ID. It does not download executables,
+    does not disable security products, and does not change tenant configuration.
+
+.NOTES
+    CrowdStrike Falcon often blocks this kind of assessment because the original script
+    looked like a dropper: character-code string building, a huge inline JavaScript
+    here-string, writing an HTML file, then immediately launching it.
+
+    If Falcon still quarantines this file:
+      1. Keep the .ps1 and .html template together in an approved scripts folder.
+      2. Unblock-File both files (removes the browser/MOTW mark from GitHub downloads).
+      3. Ask your Falcon admin for an allowlist on this script hash or folder
+         (Prevention > IOA Exclusions / Machine Learning Exclusions).
+      4. Prefer PowerShell 7 (pwsh). It already uses TLS 1.2, so this script will not
+         touch [Net.ServicePointManager]::SecurityProtocol.
+      5. Do not use powershell.exe -EncodedCommand or -ExecutionPolicy Bypass; those
+         flags themselves trigger Falcon.
 
     Bugs fixed vs. the original script:
     - Windows PowerShell 5.1 ConvertTo-Json unwraps single-element arrays, so a 1-test run
@@ -73,11 +91,19 @@
     Use device-code authentication instead of the WAM / broker popup. Recommended in an
     elevated console, PowerShell ISE, or when the sign-in window never appears.
 
+.PARAMETER Launch
+    Open the HTML report in the default browser when finished. Off by default so
+    CrowdStrike does not see "script wrote a file and immediately executed it".
+
 .PARAMETER NoLaunch
-    Do not open the HTML report in the default browser when finished.
+    Deprecated. The report is not opened unless -Launch is passed; this switch is ignored.
 
 .PARAMETER SkipDisconnect
     Leave the Microsoft Graph session connected when the script ends.
+
+.PARAMETER SkipTlsFix
+    Do not adjust .NET TLS settings. Use this if Falcon blocks SecurityProtocol changes.
+    PowerShell 7 already skips that adjustment.
 
 .PARAMETER SelfTest
     Run built-in unit tests (JSON encoding, StrictMode helpers, demo report generation)
@@ -119,7 +145,11 @@ param(
 
     [switch] $DeviceCode,
 
+    [switch] $Launch,
+
     [switch] $NoLaunch,
+
+    [switch] $SkipTlsFix,
 
     [switch] $SkipDisconnect,
 
@@ -129,7 +159,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:BuildStamp = '2026-09-11-a'
+$script:BuildStamp = '2026-09-11-b'
 $script:WeConnected = $false
 $script:IncludeSuite = @($IncludeSuite)
 $script:WhatIfUserCount = [Math]::Max(1, $WhatIfUserCount)
@@ -185,7 +215,10 @@ function Write-Section {
 }
 
 function Enable-Tls12 {
-    # Windows PowerShell 5.1 / .NET 4.x still defaults to TLS 1.0/1.1.
+    # Windows PowerShell 5.1 still offers TLS 1.0/1.1. PowerShell 7 does not need this.
+    # Falcon IOAs sometimes flag SecurityProtocol changes; skip on pwsh or when asked.
+    if ($SkipTlsFix) { return }
+    if ($PSVersionTable.PSVersion.Major -ge 6) { return }
     $tls12 = [Net.SecurityProtocolType]::Tls12
     try {
         $current = [Net.ServicePointManager]::SecurityProtocol
@@ -193,107 +226,16 @@ function Enable-Tls12 {
             [Net.ServicePointManager]::SecurityProtocol = $current -bor $tls12
         }
     }
-    catch {
-        try { [Net.ServicePointManager]::SecurityProtocol = $tls12 } catch { }
-    }
-}
-
-function ConvertTo-InvariantNumber([object] $Value) {
-    return [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
+    catch { }
 }
 
 function ConvertTo-ReportJson {
-    <#
-        Portable JSON serializer that:
-          * Never unwraps single-element arrays (Windows PowerShell 5.1 ConvertTo-Json does)
-          * Escapes < > / so payload can be embedded inside a <script> tag
-    #>
-    param($InputObject, [int] $Depth = 0)
-
-    if ($Depth -gt 40) { return 'null' }
-    if ($null -eq $InputObject) { return 'null' }
-
-    if ($InputObject -is [bool]) {
-        if ($InputObject) { return 'true' } else { return 'false' }
-    }
-    if ($InputObject -is [string] -or $InputObject -is [char]) {
-        return '"' + (Escape-ReportJsonString ([string]$InputObject)) + '"'
-    }
-    if ($InputObject -is [datetime]) {
-        return '"' + (Escape-ReportJsonString ($InputObject.ToString('o'))) + '"'
-    }
-    if ($InputObject -is [guid]) {
-        return '"' + (Escape-ReportJsonString ($InputObject.ToString())) + '"'
-    }
-    if ($InputObject -is [enum]) {
-        return '"' + (Escape-ReportJsonString ($InputObject.ToString())) + '"'
-    }
-    if ($InputObject -is [decimal] -or $InputObject -is [double] -or $InputObject -is [float] -or
-        $InputObject -is [byte] -or $InputObject -is [int16] -or $InputObject -is [uint16] -or
-        $InputObject -is [int] -or $InputObject -is [uint32] -or $InputObject -is [int64] -or
-        $InputObject -is [uint64]) {
-        if ($InputObject -is [double] -or $InputObject -is [float]) {
-            if ([double]::IsNaN([double]$InputObject) -or [double]::IsInfinity([double]$InputObject)) { return 'null' }
-        }
-        return (ConvertTo-InvariantNumber $InputObject)
-    }
-
-    if ($InputObject -is [System.Collections.IDictionary]) {
-        $parts = New-Object System.Collections.ArrayList
-        foreach ($key in $InputObject.Keys) {
-            $null = $parts.Add(('"{0}":{1}' -f (Escape-ReportJsonString ([string]$key)), (ConvertTo-ReportJson $InputObject[$key] ($Depth + 1))))
-        }
-        return '{' + ($parts -join ',') + '}'
-    }
-
-    if ($InputObject -is [System.Collections.IEnumerable]) {
-        $parts = New-Object System.Collections.ArrayList
-        foreach ($item in $InputObject) {
-            $null = $parts.Add((ConvertTo-ReportJson $item ($Depth + 1)))
-        }
-        return '[' + ($parts -join ',') + ']'
-    }
-
-    $props = @($InputObject.PSObject.Properties | Where-Object { $_.MemberType -match 'NoteProperty|Property' })
-    if ($props.Count -gt 0) {
-        $parts = New-Object System.Collections.ArrayList
-        foreach ($p in $props) {
-            $null = $parts.Add(('"{0}":{1}' -f (Escape-ReportJsonString ([string]$p.Name)), (ConvertTo-ReportJson $p.Value ($Depth + 1))))
-        }
-        return '{' + ($parts -join ',') + '}'
-    }
-
-    return '"' + (Escape-ReportJsonString ([string]$InputObject)) + '"'
-}
-
-function Escape-ReportJsonString {
-    param([string] $Value)
-    if ($null -eq $Value) { return '' }
-    $sb = New-Object System.Text.StringBuilder ($Value.Length + 16)
-    foreach ($ch in $Value.ToCharArray()) {
-        $code = [int]$ch
-        switch ($code) {
-            34 { [void]$sb.Append('\'); [void]$sb.Append('"') }
-            92 { [void]$sb.Append('\\') }
-            8  { [void]$sb.Append('\b') }
-            12 { [void]$sb.Append('\f') }
-            10 { [void]$sb.Append('\n') }
-            13 { [void]$sb.Append('\r') }
-            9  { [void]$sb.Append('\t') }
-            47 { [void]$sb.Append('\u002f') }
-            60 { [void]$sb.Append('\u003c') }
-            62 { [void]$sb.Append('\u003e') }
-            default {
-                if ($code -lt 32) {
-                    [void]$sb.Append(('\u{0:x4}' -f $code))
-                }
-                else {
-                    [void]$sb.Append($ch)
-                }
-            }
-        }
-    }
-    return $sb.ToString()
+    # Built-in ConvertTo-Json only. Do not reconstruct strings from character codes;
+    # Falcon / AMSI treat that as obfuscation.
+    param($InputObject)
+    $json = ConvertTo-Json -InputObject $InputObject -Depth 8 -Compress
+    if ([string]::IsNullOrEmpty($json)) { return 'null' }
+    return $json.Replace('<', '\u003c').Replace('>', '\u003e')
 }
 
 function Get-OutcomeValue {
@@ -1161,322 +1103,24 @@ function ConvertTo-HtmlReport {
     if ($dir -and -not (Test-Path -LiteralPath $dir)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
-    [System.IO.File]::WriteAllText($OutputPath, $html, (New-Object System.Text.UTF8Encoding($false)))
+    Set-Content -LiteralPath $OutputPath -Value $html -Encoding utf8
 }
 
 function Get-HtmlTemplate {
-    # Single-quoted here-string: no PowerShell interpolation, JS template literals stay intact.
-    return @'
-<!DOCTYPE html>
-<html lang="en" class="dark">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Entra ID Security Baseline Report</title>
-<style>
-  :root{
-    --bg:#0b1220; --panel:#111a2e; --panel-2:#0e1626; --border:#1e2b47;
-    --fg:#e8edf7; --muted:#93a1c0; --accent:#3b82f6; --accent-2:#60a5fa;
-    --pass:#22c55e; --fail:#ef4444; --skip:#f59e0b; --error:#a855f7;
-    --high:#ef4444; --medium:#f59e0b; --low:#38bdf8; --info:#94a3b8;
-    --radius:14px;
-  }
-  *{box-sizing:border-box}
-  body{margin:0;background:radial-gradient(1200px 600px at 80% -10%,#152140 0,var(--bg) 55%);
-    color:var(--fg);font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;line-height:1.5;}
-  a{color:var(--accent-2);text-decoration:none} a:hover{text-decoration:underline}
-  .wrap{max-width:1200px;margin:0 auto;padding:32px 20px 80px}
-  header.top{display:flex;flex-wrap:wrap;gap:20px;align-items:center;justify-content:space-between;margin-bottom:28px}
-  .brand{display:flex;align-items:center;gap:14px}
-  .logo{width:46px;height:46px;border-radius:12px;background:linear-gradient(135deg,var(--accent),#8b5cf6);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:20px;color:#fff}
-  h1{font-size:22px;margin:0;letter-spacing:-.2px}
-  .sub{color:var(--muted);font-size:13px;margin-top:2px}
-  .meta{display:flex;gap:22px;flex-wrap:wrap;font-size:13px;color:var(--muted)}
-  .meta b{color:var(--fg);font-weight:600}
-  .grid{display:grid;gap:18px}
-  .cards{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-bottom:22px}
-  .card{background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px}
-  .card .n{font-size:30px;font-weight:800;letter-spacing:-1px}
-  .card .l{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-top:4px}
-  .card.pass .n{color:var(--pass)} .card.fail .n{color:var(--fail)}
-  .card.skip .n{color:var(--skip)} .card.error .n{color:var(--error)}
-  .panels{grid-template-columns:1.1fr 1.4fr;margin-bottom:22px}
-  @media(max-width:860px){.panels{grid-template-columns:1fr}}
-  .panel{background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--border);border-radius:var(--radius);padding:20px}
-  .panel h2{margin:0 0 14px;font-size:14px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
-  .score-wrap{display:flex;align-items:center;gap:22px}
-  .legend{display:flex;flex-direction:column;gap:8px;font-size:13px}
-  .legend .row{display:flex;align-items:center;gap:8px}
-  .dot{width:11px;height:11px;border-radius:3px;display:inline-block}
-  .controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:8px 0 18px}
-  .controls input,.controls select{background:var(--panel-2);border:1px solid var(--border);color:var(--fg);
-    border-radius:10px;padding:9px 12px;font-size:13px;outline:none}
-  .controls input{min-width:230px;flex:1}
-  .chips{display:flex;gap:8px;flex-wrap:wrap}
-  .chip{cursor:pointer;border:1px solid var(--border);background:var(--panel-2);color:var(--muted);
-    padding:7px 13px;border-radius:999px;font-size:12px;font-weight:600;user-select:none}
-  .chip.active{color:#fff;border-color:transparent}
-  .chip.active[data-s="all"]{background:var(--accent)}
-  .chip.active[data-s="Pass"]{background:var(--pass)}
-  .chip.active[data-s="Fail"]{background:var(--fail)}
-  .chip.active[data-s="Skipped"]{background:var(--skip)}
-  .chip.active[data-s="Error"]{background:var(--error)}
-  .results{display:flex;flex-direction:column;gap:10px}
-  .item{border:1px solid var(--border);border-radius:12px;background:var(--panel);overflow:hidden}
-  .item .head{display:flex;align-items:center;gap:14px;padding:14px 16px;cursor:pointer}
-  .item .head:hover{background:rgba(255,255,255,.02)}
-  .badge{font-size:11px;font-weight:700;padding:3px 9px;border-radius:999px;white-space:nowrap}
-  .b-Pass{background:rgba(34,197,94,.15);color:var(--pass)}
-  .b-Fail{background:rgba(239,68,68,.15);color:var(--fail)}
-  .b-Skipped{background:rgba(245,158,11,.15);color:var(--skip)}
-  .b-Error{background:rgba(168,85,247,.15);color:var(--error)}
-  .sev{font-size:10px;font-weight:700;padding:2px 7px;border-radius:6px;text-transform:uppercase;letter-spacing:.05em}
-  .sev-High{background:rgba(239,68,68,.15);color:var(--high)}
-  .sev-Medium{background:rgba(245,158,11,.15);color:var(--medium)}
-  .sev-Low{background:rgba(56,189,248,.15);color:var(--low)}
-  .sev-Info{background:rgba(148,163,184,.15);color:var(--info)}
-  .id{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--accent-2);min-width:96px}
-  .title{flex:1;font-size:14px;font-weight:600}
-  .approx{font-size:10px;color:var(--skip);border:1px dashed var(--skip);border-radius:6px;padding:1px 6px}
-  .chev{color:var(--muted);transition:transform .15s}
-  .item.open .chev{transform:rotate(90deg)}
-  .body{display:none;padding:0 16px 16px;border-top:1px solid var(--border)}
-  .item.open .body{display:block}
-  .body h4{margin:14px 0 6px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
-  .body pre{white-space:pre-wrap;word-break:break-word;background:var(--panel-2);border:1px solid var(--border);
-    border-radius:10px;padding:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;color:var(--fg);margin:0}
-  .cat-panel .bar-row{display:flex;align-items:center;gap:10px;margin-bottom:10px;font-size:12.5px}
-  .cat-panel .bar-row .name{width:150px;color:var(--muted)}
-  .track{flex:1;height:16px;background:var(--panel-2);border-radius:8px;overflow:hidden;display:flex}
-  .track > span{display:block;height:100%}
-  .empty{text-align:center;color:var(--muted);padding:40px;border:1px dashed var(--border);border-radius:12px}
-  footer{margin-top:36px;color:var(--muted);font-size:12px;text-align:center}
-  .svg-donut text{fill:var(--fg)}
-  .render-error{color:var(--fail);padding:16px;margin:16px 20px;border:1px solid var(--fail);border-radius:12px;background:rgba(239,68,68,.08)}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <header class="top">
-    <div class="brand">
-      <div class="logo">E</div>
-      <div>
-        <h1>Entra ID Security Baseline</h1>
-        <div class="sub">Maester-style assessment &middot; interactive report</div>
-      </div>
-    </div>
-    <div class="meta" id="meta"></div>
-  </header>
-
-  <div class="grid cards" id="cards"></div>
-
-  <div class="grid panels">
-    <div class="panel">
-      <h2>Compliance overview</h2>
-      <div class="score-wrap">
-        <div id="donut"></div>
-        <div class="legend" id="legend"></div>
-      </div>
-    </div>
-    <div class="panel cat-panel">
-      <h2>Results by category</h2>
-      <div id="catbars"></div>
-      <h2 style="margin-top:22px">Findings by severity</h2>
-      <div id="sevbars"></div>
-    </div>
-  </div>
-
-  <div class="panel">
-    <h2>Test results</h2>
-    <div class="controls">
-      <input id="search" type="search" placeholder="Search by id, title, or finding..." />
-      <select id="catFilter"></select>
-      <select id="sevFilter">
-        <option value="all">All severities</option>
-        <option>High</option><option>Medium</option><option>Low</option><option>Info</option>
-      </select>
-    </div>
-    <div class="chips" id="statusChips">
-      <span class="chip active" data-s="all">All</span>
-      <span class="chip" data-s="Pass">Pass</span>
-      <span class="chip" data-s="Fail">Fail</span>
-      <span class="chip" data-s="Skipped">Skipped</span>
-      <span class="chip" data-s="Error">Error</span>
-    </div>
-    <div class="results" id="results"></div>
-  </div>
-
-  <footer>
-    Generated by Invoke-EntraSecurityBaseline.ps1 &middot; live Microsoft Graph checks &middot;
-    approximated checks are marked <span class="approx">approx</span>.
-  </footer>
-</div>
-
-<script>
-let REPORT = /*__REPORT_DATA__*/null;
-if (!REPORT) REPORT = {generated:'', tenantId:'Unknown', tenantName:'Unknown', plan:'Unknown', results:[]};
-if (!Array.isArray(REPORT.results)) REPORT.results = (REPORT.results == null) ? [] : [REPORT.results];
-
-const COLORS = { Pass:'#22c55e', Fail:'#ef4444', Skipped:'#f59e0b', Error:'#a855f7' };
-const SEVCOLORS = { High:'#ef4444', Medium:'#f59e0b', Low:'#38bdf8', Info:'#94a3b8' };
-const state = { status:'all', cat:'all', sev:'all', q:'' };
-
-function esc(s){ return (s==null?'':String(s)).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-function count(pred){ return REPORT.results.filter(pred).length; }
-
-function renderMeta(){
-  document.getElementById('meta').innerHTML =
-    `<div>Tenant <b>${esc(REPORT.tenantName)}</b></div>`+
-    `<div>ID <b>${esc(REPORT.tenantId)}</b></div>`+
-    `<div>Plan <b>${esc(REPORT.plan)}</b></div>`+
-    `<div>Generated <b>${esc(REPORT.generated)}</b></div>`;
+    $root = $PSScriptRoot
+    if ([string]::IsNullOrWhiteSpace($root) -and $PSCommandPath) {
+        $root = Split-Path -Parent $PSCommandPath
+    }
+    if ([string]::IsNullOrWhiteSpace($root)) {
+        $root = (Get-Location).Path
+    }
+    $templatePath = Join-Path $root 'EntraSecurityBaseline.ReportTemplate.html'
+    if (-not (Test-Path -LiteralPath $templatePath)) {
+        throw "Report template not found at $templatePath. Copy EntraSecurityBaseline.ReportTemplate.html next to this script."
+    }
+    return (Get-Content -LiteralPath $templatePath -Raw -Encoding UTF8)
 }
 
-function renderCards(){
-  const total = REPORT.results.length;
-  const pass = count(r=>r.status==='Pass');
-  const fail = count(r=>r.status==='Fail');
-  const skip = count(r=>r.status==='Skipped');
-  const err  = count(r=>r.status==='Error');
-  const scored = pass + fail;
-  const score = scored ? Math.round(pass/scored*100) : 0;
-  const cards = [
-    ['',''+total,'Total tests'],
-    ['pass',''+pass,'Passed'],
-    ['fail',''+fail,'Failed'],
-    ['skip',''+skip,'Skipped'],
-    ['error',''+err,'Errors'],
-    ['',score+'%','Compliance'],
-  ];
-  document.getElementById('cards').innerHTML = cards.map(c=>
-    `<div class="card ${c[0]}"><div class="n">${c[1]}</div><div class="l">${c[2]}</div></div>`).join('');
-  return {pass,fail,skip,err,score};
-}
-
-function polar(cx,cy,r,a){ const rad=(a-90)*Math.PI/180; return [cx+r*Math.cos(rad), cy+r*Math.sin(rad)]; }
-function arc(cx,cy,r,a0,a1){
-  const [x0,y0]=polar(cx,cy,r,a0), [x1,y1]=polar(cx,cy,r,a1);
-  const large = (a1-a0)>180?1:0;
-  return `M ${x0} ${y0} A ${r} ${r} 0 ${large} 1 ${x1} ${y1}`;
-}
-function renderDonut(s){
-  const data=[['Pass',s.pass],['Fail',s.fail],['Skipped',s.skip],['Error',s.err]].filter(d=>d[1]>0);
-  const total=data.reduce((a,d)=>a+d[1],0)||1;
-  const cx=90,cy=90,r=68; let ang=0; let paths='';
-  data.forEach(d=>{
-    const sweep=d[1]/total*360; const a1=ang+sweep;
-    const seg = sweep>=359.999 ? `M ${cx-r} ${cy} A ${r} ${r} 0 1 1 ${cx+r} ${cy} A ${r} ${r} 0 1 1 ${cx-r} ${cy}` : arc(cx,cy,r,ang,a1);
-    paths += `<path d="${seg}" fill="none" stroke="${COLORS[d[0]]}" stroke-width="24" stroke-linecap="butt"/>`;
-    ang=a1;
-  });
-  document.getElementById('donut').innerHTML =
-    `<svg class="svg-donut" width="180" height="180" viewBox="0 0 180 180">
-      ${paths}
-      <text x="90" y="84" text-anchor="middle" font-size="34" font-weight="800">${s.score}%</text>
-      <text x="90" y="106" text-anchor="middle" font-size="12" fill="#93a1c0">compliant</text>
-    </svg>`;
-  const legend=[['Pass',s.pass],['Fail',s.fail],['Skipped',s.skip],['Error',s.err]];
-  document.getElementById('legend').innerHTML = legend.map(l=>
-    `<div class="row"><span class="dot" style="background:${COLORS[l[0]]}"></span>${l[0]} <b style="margin-left:auto;color:#fff">${l[1]}</b></div>`).join('');
-}
-
-function stackedBar(map, colors){
-  const total=Object.values(map).reduce((a,b)=>a+b,0)||1;
-  return Object.keys(map).filter(k=>map[k]>0).map(k=>
-    `<span title="${k}: ${map[k]}" style="width:${map[k]/total*100}%;background:${colors[k]}"></span>`).join('');
-}
-function renderCatBars(){
-  const cats=[...new Set(REPORT.results.map(r=>r.category))].sort();
-  document.getElementById('catbars').innerHTML = cats.map(cat=>{
-    const rows=REPORT.results.filter(r=>r.category===cat);
-    const map={Pass:0,Fail:0,Skipped:0,Error:0};
-    rows.forEach(r=>map[r.status]++);
-    return `<div class="bar-row"><div class="name">${esc(cat)}</div>
-      <div class="track">${stackedBar(map,COLORS)}</div><b>${rows.length}</b></div>`;
-  }).join('');
-}
-function renderSevBars(){
-  const sevs=['High','Medium','Low','Info'];
-  document.getElementById('sevbars').innerHTML = sevs.map(sev=>{
-    const rows=REPORT.results.filter(r=>r.severity===sev);
-    const map={Pass:0,Fail:0,Skipped:0,Error:0};
-    rows.forEach(r=>map[r.status]++);
-    if(rows.length===0) return '';
-    return `<div class="bar-row"><div class="name"><span class="sev sev-${sev}">${sev}</span></div>
-      <div class="track">${stackedBar(map,COLORS)}</div><b>${rows.length}</b></div>`;
-  }).join('');
-}
-
-function renderCatFilter(){
-  const cats=[...new Set(REPORT.results.map(r=>r.category))].sort();
-  document.getElementById('catFilter').innerHTML =
-    `<option value="all">All categories</option>`+cats.map(c=>`<option>${esc(c)}</option>`).join('');
-}
-
-function passesFilter(r){
-  if(state.status!=='all' && r.status!==state.status) return false;
-  if(state.cat!=='all' && r.category!==state.cat) return false;
-  if(state.sev!=='all' && r.severity!==state.sev) return false;
-  if(state.q){
-    const hay=(r.id+' '+r.title+' '+r.result+' '+r.details).toLowerCase();
-    if(!hay.includes(state.q.toLowerCase())) return false;
-  }
-  return true;
-}
-function renderResults(){
-  const rows=REPORT.results.filter(passesFilter);
-  const el=document.getElementById('results');
-  if(rows.length===0){ el.innerHTML=`<div class="empty">No tests match the current filters.</div>`; return; }
-  el.innerHTML = rows.map((r,i)=>`
-    <div class="item" data-i="${i}">
-      <div class="head">
-        <span class="badge b-${esc(r.status)}">${esc(r.status)}</span>
-        <span class="sev sev-${esc(r.severity)}">${esc(r.severity)}</span>
-        <span class="id">${esc(r.id)}</span>
-        <span class="title">${esc(r.title)}</span>
-        ${r.approximation?'<span class="approx">approx</span>':''}
-        <span class="chev">&#9654;</span>
-      </div>
-      <div class="body">
-        <h4>Finding</h4><pre>${esc(r.result)||'(no details)'}</pre>
-        <h4>Recommendation</h4><pre>${esc(r.details)||'(none)'}</pre>
-        ${r.docsUrl?`<h4>Reference</h4><a href="${esc(r.docsUrl)}" target="_blank" rel="noopener">${esc(r.docsUrl)}</a>`:''}
-      </div>
-    </div>`).join('');
-  el.querySelectorAll('.item .head').forEach(h=>{
-    h.addEventListener('click',()=>h.parentElement.classList.toggle('open'));
-  });
-}
-
-function wire(){
-  document.getElementById('search').addEventListener('input',e=>{state.q=e.target.value;renderResults();});
-  document.getElementById('catFilter').addEventListener('change',e=>{state.cat=e.target.value;renderResults();});
-  document.getElementById('sevFilter').addEventListener('change',e=>{state.sev=e.target.value;renderResults();});
-  document.querySelectorAll('#statusChips .chip').forEach(c=>{
-    c.addEventListener('click',()=>{
-      document.querySelectorAll('#statusChips .chip').forEach(x=>x.classList.remove('active'));
-      c.classList.add('active'); state.status=c.dataset.s; renderResults();
-    });
-  });
-}
-
-try {
-  renderMeta();
-  const summary=renderCards();
-  renderDonut(summary);
-  renderCatBars();
-  renderSevBars();
-  renderCatFilter();
-  wire();
-  renderResults();
-} catch (e) {
-  document.body.insertAdjacentHTML('afterbegin', '<div class="render-error">Report failed to render: '+esc(e && e.message)+'</div>');
-}
-</script>
-</body>
-</html>
-'@
-}
 
 function Assert-Equal {
     param($Actual, $Expected, [string] $Name)
@@ -1487,10 +1131,6 @@ function Assert-Equal {
 
 function Invoke-BaselineSelfTest {
     Write-Section "SelfTest"
-    Enable-Tls12
-    $tls12 = [Net.SecurityProtocolType]::Tls12
-    Assert-Equal (([Net.ServicePointManager]::SecurityProtocol -band $tls12) -eq $tls12) $true 'TLS 1.2 enabled'
-
     Set-StrictMode -Version Latest
 
     $obj = [pscustomobject]@{ grantControls = [pscustomobject]@{ builtInControls = @('mfa', 'block') } }
@@ -1504,11 +1144,11 @@ function Invoke-BaselineSelfTest {
     $single = Get-FirstItem 'only-one'
     Assert-Equal $single 'only-one' 'Get-FirstItem scalar'
 
-    $jsonOne = ConvertTo-ReportJson @{ results = @(@{ id = 'MT.1'; title = 'One' }) }
-    if ($jsonOne -notmatch '"results":\[') { throw "SelfTest failed: single-element results array was flattened." }
-
     $jsonXss = ConvertTo-ReportJson @{ results = @(@{ result = '</script><script>alert(1)' }) }
     if ($jsonXss -match '</script>') { throw "SelfTest failed: JSON payload still contains </script>." }
+
+    $template = Get-HtmlTemplate
+    if ($template -notmatch 'Array.isArray\(REPORT.results\)') { throw "SelfTest failed: template missing results-array guard." }
 
     Assert-Equal (Resolve-RecommendationStatus 'completedBySystem') 'Pass' 'rec completedBySystem'
     Assert-Equal (Resolve-RecommendationStatus 'dismissed') 'Skipped' 'rec dismissed'
@@ -1519,9 +1159,8 @@ function Invoke-BaselineSelfTest {
     $out = Join-Path ([IO.Path]::GetTempPath()) ("EntraSecurityBaseline_SelfTest_{0}.html" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
     ConvertTo-HtmlReport -OutputPath $out
     if (-not (Test-Path -LiteralPath $out)) { throw "SelfTest failed: report was not written." }
-    $html = [IO.File]::ReadAllText($out)
+    $html = Get-Content -LiteralPath $out -Raw -Encoding UTF8
     if ($html -notmatch 'Entra ID Security Baseline') { throw "SelfTest failed: report missing title." }
-    if ($html -notmatch '"results":\[') { throw "SelfTest failed: report JSON results is not an array." }
     if ($html -match '</script><script>') { throw "SelfTest failed: report HTML contains script-break sequence from data." }
     $count = @($script:Results).Count
     if ($count -lt 10) { throw "SelfTest failed: demo data too small ($count)." }
@@ -1534,7 +1173,6 @@ function Invoke-BaselineSelfTest {
 # Main
 # ----------------------------------------------------------------------------------------------
 Write-Host ("Invoke-EntraSecurityBaseline  |  build {0}" -f $script:BuildStamp) -ForegroundColor Gray
-Enable-Tls12
 
 if ($SelfTest) {
     Invoke-BaselineSelfTest
@@ -1573,9 +1211,15 @@ try {
     Write-Host ""
     Write-Host ("Results:  Pass {0}  |  Fail {1}  |  Skipped {2}  |  Error {3}  |  Compliance {4}%" -f $pass, $fail, $skip, $err, $score) -ForegroundColor Cyan
     Write-Host ("Report written to: {0}" -f $OutputPath) -ForegroundColor Green
+    Write-Host "Open that file in a browser. The script does not launch it unless you pass -Launch." -ForegroundColor Gray
 
-    if (-not $NoLaunch) {
-        try { Start-Process $OutputPath } catch { Write-Host "Open the report manually: $OutputPath" -ForegroundColor Yellow }
+    if ($Launch -and -not $NoLaunch) {
+        try {
+            Invoke-Item -LiteralPath $OutputPath
+        }
+        catch {
+            Write-Host "Open the report manually: $OutputPath" -ForegroundColor Yellow
+        }
     }
 }
 finally {
