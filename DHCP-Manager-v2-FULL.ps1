@@ -35,7 +35,7 @@
     
 .NOTES
     File Name      : DHCP-Manager-v2-FULL.ps1
-    Version        : 2.7.1 (IPAM-style Dashboard)
+    Version        : 2.7.2 (IPAM-style Dashboard)
     Date           : 2026-09-09
     Author         : Anthony Blake
     Prerequisite   : PowerShell 5.1+
@@ -102,7 +102,7 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.7.1'
+$Global:AppVersion       = '2.7.2'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:DhcpEventEntriesAll = [System.Collections.Generic.List[object]]::new()
 $Global:ScopeStatEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
@@ -319,33 +319,38 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
     <!-- TextBox Style -->
     <Style x:Key="DarkTextBox" TargetType="TextBox">
       <Setter Property="Background"    Value="{StaticResource BgDeep}"/>
-      <Setter Property="Foreground"    Value="{StaticResource TextPrimary}"/>
+      <Setter Property="Foreground"    Value="#F2F4F8"/>
       <Setter Property="BorderBrush"   Value="{StaticResource Border}"/>
       <Setter Property="BorderThickness" Value="1"/>
-      <Setter Property="Padding"       Value="8,5"/>
-      <Setter Property="FontSize"      Value="12"/>
-      <Setter Property="CaretBrush"    Value="{StaticResource TextPrimary}"/>
+      <Setter Property="Padding"       Value="8,4"/>
+      <Setter Property="MinHeight"     Value="30"/>
+      <Setter Property="FontSize"      Value="13"/>
+      <Setter Property="VerticalContentAlignment" Value="Center"/>
+      <Setter Property="CaretBrush"    Value="#F2F4F8"/>
       <Setter Property="SelectionBrush" Value="{StaticResource Accent}"/>
       <Setter Property="SelectionOpacity" Value="0.45"/>
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="TextBox">
-            <Border Background="{TemplateBinding Background}"
+            <Border x:Name="Bd"
+                    Background="{TemplateBinding Background}"
                     BorderBrush="{TemplateBinding BorderBrush}"
                     BorderThickness="{TemplateBinding BorderThickness}"
                     CornerRadius="4"
-                    SnapsToDevicePixels="True">
-              <!-- Foreground must be set on PART_ContentHost or WPF falls back to black text -->
+                    SnapsToDevicePixels="True"
+                    Padding="{TemplateBinding Padding}">
+              <!-- Do NOT use VerticalAlignment=Center here — it clips glyphs in fixed-height boxes -->
               <ScrollViewer x:Name="PART_ContentHost"
-                            Margin="{TemplateBinding Padding}"
-                            VerticalAlignment="Center"
                             Focusable="False"
-                            Foreground="{TemplateBinding Foreground}"
-                            TextElement.Foreground="{TemplateBinding Foreground}"/>
+                            HorizontalScrollBarVisibility="Hidden"
+                            VerticalScrollBarVisibility="Disabled"
+                            Background="Transparent"
+                            TextElement.Foreground="{TemplateBinding Foreground}"
+                            TextElement.FontSize="{TemplateBinding FontSize}"/>
             </Border>
             <ControlTemplate.Triggers>
               <Trigger Property="IsFocused" Value="True">
-                <Setter Property="BorderBrush" Value="{StaticResource Accent}"/>
+                <Setter TargetName="Bd" Property="BorderBrush" Value="{StaticResource Accent}"/>
               </Trigger>
               <Trigger Property="IsEnabled" Value="False">
                 <Setter Property="Opacity" Value="0.55"/>
@@ -694,7 +699,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                      HorizontalAlignment="Center"/>
           
           <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-            <Run Text="v2.7.1  |  "/>
+            <Run Text="v2.7.2  |  "/>
             <Run Text="Created by Anthony Blake" Foreground="#90CAF9"/>
             <Run Text="  |  "/>
             <Run x:Name="StatusTime" Text=""/>
@@ -748,18 +753,21 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
               <!-- Dock buttons first so the TextBox cannot shove them off-screen as text grows -->
               <DockPanel LastChildFill="True" Margin="0,0,0,6">
                 <Button x:Name="BtnNavScopeSearchClear" DockPanel.Dock="Right"
-                        Content="✕" Width="30" Height="28" Margin="6,0,0,0"
+                        Content="✕" Width="32" Height="32" Margin="6,0,0,0"
                         Style="{StaticResource BtnSecondary}"
                         ToolTip="Clear scope search"/>
-                <TextBox x:Name="TxtNavScopeSearch" Height="28" MinWidth="0"
+                <TextBox x:Name="TxtNavScopeSearch" Height="32" MinHeight="32" MinWidth="0"
                          HorizontalAlignment="Stretch"
                          Style="{StaticResource DarkTextBox}"
-                         Background="{StaticResource BgDeep}"
-                         Foreground="{StaticResource TextPrimary}"
-                         CaretBrush="{StaticResource TextPrimary}"
+                         Background="#12151A"
+                         Foreground="#F2F4F8"
+                         CaretBrush="#F2F4F8"
+                         FontSize="13"
+                         Padding="8,4"
+                         VerticalContentAlignment="Center"
                          ToolTip="Search scopes by name or Scope ID (Enter = next match)"/>
               </DockPanel>
-              <Button x:Name="BtnNavScopeFind" Content="Find next match" Height="28"
+              <Button x:Name="BtnNavScopeFind" Content="Find next match" Height="32"
                       HorizontalAlignment="Stretch" Margin="0,0,0,6"
                       Style="{StaticResource BtnSecondary}"
                       ToolTip="Jump to the next matching scope"/>
