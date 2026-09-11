@@ -31,10 +31,11 @@
     ✓ Scope migration (scopes, options, reservations/clients, exclusions)
     ✓ Domain DHCP server discovery with ping up/down status
     ✓ BAD_ADDRESS troubleshooting (conflict detection, ping/ARP, failover, clear gating)
+    ✓ IPAM-style monitoring dashboard (KPIs, Top 10 util, active alerts, estate snapshot)
     
 .NOTES
     File Name      : DHCP-Manager-v2-FULL.ps1
-    Version        : 2.6.3 (BAD_ADDRESS Troubleshoot)
+    Version        : 2.7.0 (IPAM-style Dashboard)
     Date           : 2026-09-09
     Author         : Anthony Blake
     Prerequisite   : PowerShell 5.1+
@@ -101,7 +102,7 @@ $Global:Credential       = $null
 $Global:CompareResults   = [System.Collections.Generic.List[object]]::new()
 $Global:CompareFilter    = 'All'
 $Global:AppAuthor        = 'Anthony Blake'
-$Global:AppVersion       = '2.6.3'
+$Global:AppVersion       = '2.7.0'
 $Global:DhcpEventEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
 $Global:DhcpEventEntriesAll = [System.Collections.Generic.List[object]]::new()
 $Global:ScopeStatEntries = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
@@ -122,6 +123,19 @@ $Global:BadAddressDiag = @{
     Pattern     = ''
     CanClear    = $false
     Summary     = ''
+}
+$Global:DashboardTopScopes = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
+$Global:DashboardAlerts = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
+$Global:DashboardEstate = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
+$Global:DashboardHealth = @{
+    Server          = ''
+    RefreshedAt     = $null
+    FailoverSummary = ''
+    ConflictDetection = ''
+    CriticalCount   = 0
+    WarningCount    = 0
+    EstateOnline    = 0
+    EstateTotal     = 0
 }
 $Global:LogWatchState    = @{
     Local  = @{ Enabled = $false; Path = $null; Offset = 0L }
@@ -214,7 +228,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
 <Window
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    Title="DHCP Manager v2.4"
+    Title="DHCP Manager v2.7 — Monitoring &amp; Management"
     Height="780" Width="1260"
     MinHeight="600" MinWidth="900"
     WindowStartupLocation="CenterScreen"
@@ -627,6 +641,8 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
 
         <!-- Quick Action Buttons -->
         <StackPanel Grid.Column="2" Orientation="Horizontal" HorizontalAlignment="Right">
+          <Button x:Name="BtnViewDashboard" Content="📡 Dashboard" Margin="0,0,8,0"
+                  Style="{StaticResource BtnSecondary}" ToolTip="IPAM-style DHCP monitoring dashboard"/>
           <Button x:Name="BtnViewMigrate" Content="🚚 Migrate" Margin="0,0,8,0"
                   Style="{StaticResource BtnSecondary}" ToolTip="Migrate scopes to another DHCP server"/>
           <Button x:Name="BtnViewEvents" Content="📡 Events" Margin="0,0,8,0"
@@ -666,7 +682,7 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                      HorizontalAlignment="Center"/>
           
           <TextBlock Grid.Column="2" Foreground="{StaticResource TextSecond}" FontSize="11">
-            <Run Text="v2.6.3  |  "/>
+            <Run Text="v2.7.0  |  "/>
             <Run Text="Created by Anthony Blake" Foreground="#90CAF9"/>
             <Run Text="  |  "/>
             <Run x:Name="StatusTime" Text=""/>
@@ -760,6 +776,156 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
       <Border Grid.Column="2" Background="{StaticResource BgPanel}" Padding="0">
         <TabControl x:Name="MainTabs" Padding="0">
           
+
+          <!-- TAB: Monitoring Dashboard (IPAM-style) -->
+          <TabItem x:Name="TabDashboard" Header="📡 Dashboard">
+            <ScrollViewer VerticalScrollBarVisibility="Auto" Background="{StaticResource BgPanel}">
+              <Grid Margin="12">
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="320"/>
+                  <RowDefinition Height="200"/>
+                  <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+
+                <Border Grid.Row="0" Background="{StaticResource BgCard}" CornerRadius="6" Padding="14,12" Margin="0,0,0,10">
+                  <Grid>
+                    <Grid.ColumnDefinitions>
+                      <ColumnDefinition Width="*"/>
+                      <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Grid.Column="0">
+                      <TextBlock Text="DHCP Monitoring Dashboard" Style="{StaticResource SectionHeader}" Margin="0,0,0,4"/>
+                      <TextBlock x:Name="TxtDashboardSubtitle" TextWrapping="Wrap"
+                                 Foreground="{StaticResource TextSecond}" FontSize="12"
+                                 Text="Connect to a server and Refresh Monitoring for a SolarWinds-style summary: capacity, alerts, top scopes, failover, and estate health."/>
+                    </StackPanel>
+                    <WrapPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center" HorizontalAlignment="Right">
+                      <Button x:Name="BtnDashboardRefresh" Content="🔄 Refresh Monitoring" Margin="0,0,8,4"
+                              Style="{StaticResource BtnPrimary}" IsEnabled="False"
+                              ToolTip="Poll server statistics, failover, and rebuild Top 10 / Active Alerts"/>
+                      <Button x:Name="BtnDashboardOpenStats" Content="📊 Statistics" Margin="0,0,8,4"
+                              Style="{StaticResource BtnSecondary}" IsEnabled="False"/>
+                      <Button x:Name="BtnDashboardScanEstate" Content="🌐 Scan Estate" Margin="0,0,0,4"
+                              Style="{StaticResource BtnSecondary}"
+                              ToolTip="Open Domain DHCP scan for multi-server estate inventory"/>
+                    </WrapPanel>
+                  </Grid>
+                </Border>
+
+                <UniformGrid Grid.Row="1" Rows="1" Columns="6" Margin="0,0,0,10">
+                  <Border Background="{StaticResource BgCard}" CornerRadius="6" Padding="12" Margin="0,0,6,0">
+                    <StackPanel>
+                      <TextBlock Text="SCOPES" Style="{StaticResource FormLabel}"/>
+                      <TextBlock x:Name="DashKpiScopes" Text="—" FontSize="28" FontWeight="Bold" Foreground="{StaticResource Accent}"/>
+                    </StackPanel>
+                  </Border>
+                  <Border Background="{StaticResource BgCard}" CornerRadius="6" Padding="12" Margin="3,0">
+                    <StackPanel>
+                      <TextBlock Text="ACTIVE LEASES" Style="{StaticResource FormLabel}"/>
+                      <TextBlock x:Name="DashKpiLeases" Text="—" FontSize="28" FontWeight="Bold" Foreground="{StaticResource Success}"/>
+                    </StackPanel>
+                  </Border>
+                  <Border Background="{StaticResource BgCard}" CornerRadius="6" Padding="12" Margin="3,0">
+                    <StackPanel>
+                      <TextBlock Text="AVAILABLE IPs" Style="{StaticResource FormLabel}"/>
+                      <TextBlock x:Name="DashKpiAvailable" Text="—" FontSize="28" FontWeight="Bold" Foreground="{StaticResource TextPrimary}"/>
+                    </StackPanel>
+                  </Border>
+                  <Border Background="{StaticResource BgCard}" CornerRadius="6" Padding="12" Margin="3,0">
+                    <StackPanel>
+                      <TextBlock Text="UTILIZATION" Style="{StaticResource FormLabel}"/>
+                      <TextBlock x:Name="DashKpiUtil" Text="—" FontSize="28" FontWeight="Bold" Foreground="{StaticResource Accent}"/>
+                    </StackPanel>
+                  </Border>
+                  <Border Background="{StaticResource BgCard}" CornerRadius="6" Padding="12" Margin="3,0">
+                    <StackPanel>
+                      <TextBlock Text="CRITICAL" Style="{StaticResource FormLabel}"/>
+                      <TextBlock x:Name="DashKpiCritical" Text="—" FontSize="28" FontWeight="Bold" Foreground="{StaticResource Danger}"/>
+                    </StackPanel>
+                  </Border>
+                  <Border Background="{StaticResource BgCard}" CornerRadius="6" Padding="12" Margin="6,0,0,0">
+                    <StackPanel>
+                      <TextBlock Text="WARNINGS" Style="{StaticResource FormLabel}"/>
+                      <TextBlock x:Name="DashKpiWarning" Text="—" FontSize="28" FontWeight="Bold" Foreground="{StaticResource Warning}"/>
+                    </StackPanel>
+                  </Border>
+                </UniformGrid>
+
+                <Border Grid.Row="2" Background="{StaticResource BgCard}" CornerRadius="6" Padding="12,10" Margin="0,0,0,10">
+                  <StackPanel>
+                    <TextBlock Text="Server health" Style="{StaticResource FormLabel}" Margin="0,0,0,6"/>
+                    <TextBlock x:Name="TxtDashboardHealth" TextWrapping="Wrap" FontSize="12"
+                               Foreground="{StaticResource TextPrimary}"
+                               Text="Health details appear after Refresh Monitoring."/>
+                  </StackPanel>
+                </Border>
+
+                <Grid Grid.Row="3" Margin="0,0,0,10">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="*"/>
+                  </Grid.ColumnDefinitions>
+                  <DockPanel Grid.Column="0" Margin="0,0,6,0">
+                    <TextBlock DockPanel.Dock="Top" Text="Active alerts" Style="{StaticResource FormLabel}" Margin="0,0,0,6"/>
+                    <DataGrid x:Name="GridDashboardAlerts" Style="{StaticResource DarkGrid}"
+                              IsReadOnly="True" SelectionMode="Single"
+                              ToolTip="Double-click to open Statistics for the scope">
+                      <DataGrid.Columns>
+                        <DataGridTextColumn Header="Severity" Binding="{Binding Severity}" Width="80"/>
+                        <DataGridTextColumn Header="Type" Binding="{Binding AlertType}" Width="110"/>
+                        <DataGridTextColumn Header="Scope" Binding="{Binding ScopeId}" Width="110"/>
+                        <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="140"/>
+                        <DataGridTextColumn Header="Detail" Binding="{Binding Detail}" Width="*"/>
+                      </DataGrid.Columns>
+                    </DataGrid>
+                  </DockPanel>
+                  <DockPanel Grid.Column="1" Margin="6,0,0,0">
+                    <TextBlock DockPanel.Dock="Top" Text="Top 10 scopes by utilization" Style="{StaticResource FormLabel}" Margin="0,0,0,6"/>
+                    <DataGrid x:Name="GridDashboardTopScopes" Style="{StaticResource DarkGrid}"
+                              IsReadOnly="True" SelectionMode="Single"
+                              ToolTip="Double-click for scope statistics details">
+                      <DataGrid.Columns>
+                        <DataGridTextColumn Header="#" Binding="{Binding Rank}" Width="36"/>
+                        <DataGridTextColumn Header="Util %" Binding="{Binding PercentDisplay}" Width="70"/>
+                        <DataGridTextColumn Header="Status" Binding="{Binding Status}" Width="110"/>
+                        <DataGridTextColumn Header="Scope ID" Binding="{Binding ScopeId}" Width="110"/>
+                        <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="*"/>
+                        <DataGridTextColumn Header="Free" Binding="{Binding Free}" Width="60"/>
+                      </DataGrid.Columns>
+                    </DataGrid>
+                  </DockPanel>
+                </Grid>
+
+                <DockPanel Grid.Row="4" Margin="0,0,0,8">
+                  <DockPanel DockPanel.Dock="Top" Margin="0,0,0,6" LastChildFill="True">
+                    <TextBlock Text="Estate snapshot (from Domain Scan)" Style="{StaticResource FormLabel}" VerticalAlignment="Center"/>
+                    <TextBlock x:Name="TxtDashboardEstateHint" DockPanel.Dock="Right"
+                               Foreground="{StaticResource TextSecond}" FontSize="11"
+                               Text="Run Scan Domain to populate multi-server health"/>
+                  </DockPanel>
+                  <DataGrid x:Name="GridDashboardEstate" Style="{StaticResource DarkGrid}"
+                            IsReadOnly="True" SelectionMode="Single">
+                    <DataGrid.Columns>
+                      <DataGridTextColumn Header="Server" Binding="{Binding DnsName}" Width="200"/>
+                      <DataGridTextColumn Header="IP" Binding="{Binding IPAddress}" Width="120"/>
+                      <DataGridTextColumn Header="Online" Binding="{Binding Online}" Width="70"/>
+                      <DataGridTextColumn Header="Authorized" Binding="{Binding Authorized}" Width="90"/>
+                      <DataGridTextColumn Header="Latency" Binding="{Binding LatencyMs}" Width="80"/>
+                      <DataGridTextColumn Header="Detail" Binding="{Binding Detail}" Width="*"/>
+                    </DataGrid.Columns>
+                  </DataGrid>
+                </DockPanel>
+
+                <TextBlock Grid.Row="5" x:Name="TxtDashboardStatus" Style="{StaticResource FormLabel}"
+                           TextWrapping="Wrap"
+                           Text="Tip: This dashboard mirrors SolarWinds IPAM Summary widgets (capacity KPIs, active alerts, Top 10 utilization, estate inventory). Full CRUD remains on the management tabs."/>
+              </Grid>
+            </ScrollViewer>
+          </TabItem>
+
           <!-- TAB: Scopes -->
           <TabItem x:Name="TabScopes" Header="🌐 Scopes">
             <Grid Background="{StaticResource BgPanel}">
@@ -771,7 +937,8 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
               <!-- Scope Toolbar -->
               <Border Grid.Row="0" Background="{StaticResource BgCard}"
                       BorderThickness="0,0,0,1" BorderBrush="{StaticResource Border}" Padding="12,10">
-                <StackPanel Orientation="Horizontal">
+                <StackPanel>
+                <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
                   <Button x:Name="BtnScopeAdd" Content="➕ New Scope" Margin="0,0,8,0"
                           Style="{StaticResource BtnSuccess}" IsEnabled="False"/>
                   <Button x:Name="BtnScopeEdit" Content="✏️ Edit" Margin="0,0,8,0"
@@ -783,6 +950,14 @@ Write-ActionLog "Loading XAML interface definition..." "INFO"
                           Style="{StaticResource BtnSuccess}" IsEnabled="False"/>
                   <Button x:Name="BtnScopeDeactivate" Content="⏸️ Deactivate" Margin="0,0,8,0"
                           Style="{StaticResource BtnSecondary}" IsEnabled="False"/>
+                </StackPanel>
+                <StackPanel Orientation="Horizontal">
+                  <TextBlock Text="Filter:" Style="{StaticResource FormLabel}" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                  <TextBox x:Name="TxtScopeFilter" Width="260" Style="{StaticResource DarkTextBox}"
+                           ToolTip="Filter scopes by ID, name, or range (SolarWinds-style dynamic filter)"/>
+                  <TextBlock x:Name="TxtScopeFilterCount" Text="" Style="{StaticResource FormLabel}"
+                             VerticalAlignment="Center" Margin="12,0,0,0"/>
+                </StackPanel>
                 </StackPanel>
               </Border>
 
@@ -1831,6 +2006,7 @@ try {
     $script:BtnViewCompare   = $Window.FindName("BtnViewCompare")
     $script:BtnViewEvents    = $Window.FindName("BtnViewEvents")
     $script:BtnViewTroubleshoot = $Window.FindName("BtnViewTroubleshoot")
+    $script:BtnViewDashboard = $Window.FindName("BtnViewDashboard")
     $script:BtnViewMigrate   = $Window.FindName("BtnViewMigrate")
     
     # Status Bar
@@ -1858,6 +2034,7 @@ try {
     $script:MainTabs         = $Window.FindName("MainTabs")
     
     # Tabs
+    $script:TabDashboard     = $Window.FindName("TabDashboard")
     $script:TabScopes        = $Window.FindName("TabScopes")
     $script:TabLeases        = $Window.FindName("TabLeases")
     $script:TabReservations  = $Window.FindName("TabReservations")
@@ -1879,6 +2056,26 @@ try {
     $script:BtnScopeDelete   = $Window.FindName("BtnScopeDelete")
     $script:BtnScopeActivate = $Window.FindName("BtnScopeActivate")
     $script:BtnScopeDeactivate = $Window.FindName("BtnScopeDeactivate")
+    $script:TxtScopeFilter   = $Window.FindName("TxtScopeFilter")
+    $script:TxtScopeFilterCount = $Window.FindName("TxtScopeFilterCount")
+    
+    # Dashboard Tab
+    $script:TxtDashboardSubtitle = $Window.FindName("TxtDashboardSubtitle")
+    $script:BtnDashboardRefresh = $Window.FindName("BtnDashboardRefresh")
+    $script:BtnDashboardOpenStats = $Window.FindName("BtnDashboardOpenStats")
+    $script:BtnDashboardScanEstate = $Window.FindName("BtnDashboardScanEstate")
+    $script:DashKpiScopes = $Window.FindName("DashKpiScopes")
+    $script:DashKpiLeases = $Window.FindName("DashKpiLeases")
+    $script:DashKpiAvailable = $Window.FindName("DashKpiAvailable")
+    $script:DashKpiUtil = $Window.FindName("DashKpiUtil")
+    $script:DashKpiCritical = $Window.FindName("DashKpiCritical")
+    $script:DashKpiWarning = $Window.FindName("DashKpiWarning")
+    $script:TxtDashboardHealth = $Window.FindName("TxtDashboardHealth")
+    $script:GridDashboardAlerts = $Window.FindName("GridDashboardAlerts")
+    $script:GridDashboardTopScopes = $Window.FindName("GridDashboardTopScopes")
+    $script:GridDashboardEstate = $Window.FindName("GridDashboardEstate")
+    $script:TxtDashboardEstateHint = $Window.FindName("TxtDashboardEstateHint")
+    $script:TxtDashboardStatus = $Window.FindName("TxtDashboardStatus")
     
     # Leases Tab
     $script:GridLeases       = $Window.FindName("GridLeases")
@@ -2798,6 +2995,8 @@ function Enable-ConnectedControls {
             if ($null -ne $script:BtnTroubleshootUseSelected) { $script:BtnTroubleshootUseSelected.IsEnabled = $Connected }
             if ($null -ne $script:BtnTroubleshootRun) { $script:BtnTroubleshootRun.IsEnabled = $Connected }
             if ($null -ne $script:BtnTroubleshootExport) { $script:BtnTroubleshootExport.IsEnabled = $Connected }
+            if ($null -ne $script:BtnDashboardRefresh) { $script:BtnDashboardRefresh.IsEnabled = $Connected }
+            if ($null -ne $script:BtnDashboardOpenStats) { $script:BtnDashboardOpenStats.IsEnabled = $Connected }
             if ($null -ne $script:CboTroubleshootScope) { $script:CboTroubleshootScope.IsEnabled = $Connected }
             if ($null -ne $script:CboTroubleshootSample) { $script:CboTroubleshootSample.IsEnabled = $Connected }
             if (-not $Connected) {
@@ -4065,6 +4264,11 @@ function Build-NavTree {
             [void]$serverNode.Items.Add($scopesContainer)
             
             # Other server items
+            $dashboardNode = New-Object System.Windows.Controls.TreeViewItem
+            $dashboardNode.Header = "📡 Dashboard"
+            $dashboardNode.Tag = "Dashboard"
+            [void]$serverNode.Items.Add($dashboardNode)
+            
             $filtersNode = New-Object System.Windows.Controls.TreeViewItem
             $filtersNode.Header = "🔒 MAC Filters"
             $filtersNode.Tag = "Filters"
@@ -4131,7 +4335,9 @@ function Load-Scopes {
         $count = Get-SafeCount $scopes
         
         $script:GridScopes.Dispatcher.Invoke([action]{
+            $script:GridScopes.Tag = $scopes
             $script:GridScopes.ItemsSource = $scopes
+            Apply-ScopeGridFilter
         }, [System.Windows.Threading.DispatcherPriority]::Normal)
         
         Write-ActionLog "Loaded $count scopes successfully" "SUCCESS"
@@ -5869,6 +6075,261 @@ function Get-ScopeStatFilterMode {
     return $mode
 }
 
+
+#region IPAM-style Monitoring Dashboard
+function Initialize-DashboardBindings {
+    try {
+        if ($null -ne $script:GridDashboardAlerts) {
+            $script:GridDashboardAlerts.ItemsSource = $Global:DashboardAlerts
+        }
+        if ($null -ne $script:GridDashboardTopScopes) {
+            $script:GridDashboardTopScopes.ItemsSource = $Global:DashboardTopScopes
+        }
+        if ($null -ne $script:GridDashboardEstate) {
+            $script:GridDashboardEstate.ItemsSource = $Global:DashboardEstate
+        }
+    } catch {
+        Write-ActionLog "Initialize-DashboardBindings: $_" "WARN"
+    }
+}
+
+function Sync-DashboardEstatePanel {
+    try {
+        $Global:DashboardEstate.Clear()
+        $rows = @($Global:DomainScanResults)
+        $total = Get-SafeCount $rows
+        $up = Get-SafeCount @($rows | Where-Object { "$($_.Online)" -match 'Up|Yes' })
+        $Global:DashboardHealth.EstateTotal = $total
+        $Global:DashboardHealth.EstateOnline = $up
+        
+        foreach ($r in @($rows | Select-Object -First 40)) {
+            [void]$Global:DashboardEstate.Add([PSCustomObject]@{
+                DnsName     = "$($r.DnsName)"
+                IPAddress   = "$($r.IPAddress)"
+                Online      = "$($r.Online)"
+                Authorized  = "$($r.Authorized)"
+                LatencyMs   = "$(if ($null -ne $r.LatencyMs) { $r.LatencyMs } else { '' })"
+                Detail      = "$(if ($r.Detail) { $r.Detail } elseif ($r.AuthDetail) { $r.AuthDetail } else { '' })"
+            })
+        }
+        
+        if ($null -ne $script:TxtDashboardEstateHint) {
+            if ($total -gt 0) {
+                $script:TxtDashboardEstateHint.Text = "Estate: $up Up / $total scanned  ·  showing up to 40"
+            } else {
+                $script:TxtDashboardEstateHint.Text = "Run Scan Domain to populate multi-server health"
+            }
+        }
+    } catch {
+        Write-ActionLog "Sync-DashboardEstatePanel: $_" "WARN"
+    }
+}
+
+function Get-DashboardFailoverSummary {
+    param([string]$Server)
+    if ([string]::IsNullOrWhiteSpace($Server)) { return 'Not connected' }
+    try {
+        $failovers = @(Get-DhcpServerv4Failover -ComputerName $Server -ErrorAction SilentlyContinue)
+        if ((Get-SafeCount $failovers) -eq 0) {
+            return 'No failover relationships (standalone or not configured).'
+        }
+        $bits = [System.Collections.Generic.List[string]]::new()
+        foreach ($fo in $failovers) {
+            [void]$bits.Add("$($fo.Name): partner=$($fo.PartnerServer); mode=$($fo.Mode); state=$($fo.State)")
+        }
+        return ($bits -join ' | ')
+    } catch {
+        return "Failover query unavailable: $_"
+    }
+}
+
+function Get-DashboardConflictSummary {
+    param([string]$Server)
+    if ([string]::IsNullOrWhiteSpace($Server)) { return 'Not connected' }
+    try {
+        $settings = Get-DhcpServerSetting -ComputerName $Server -ErrorAction Stop
+        return "ConflictDetectionAttempts=$($settings.ConflictDetectionAttempts)"
+    } catch {
+        return "Conflict detection setting unavailable"
+    }
+}
+
+function Sync-DashboardUi {
+    <#
+    .SYNOPSIS
+        Rebuilds IPAM-style dashboard widgets from current stats / scan / health
+    #>
+    param(
+        [switch]$RefreshHealth
+    )
+    
+    Initialize-DashboardBindings
+    
+    $threshold = Get-ScopeUtilThresholdPercent
+    $all = @($Global:ScopeStatEntriesAll)
+    $critical = @($all | Where-Object { "$($_.Level)" -eq 'Critical' })
+    $warning = @($all | Where-Object { "$($_.Level)" -eq 'Warning' })
+    $criticalCount = Get-SafeCount $critical
+    $warningCount = Get-SafeCount $warning
+    
+    $Global:DashboardHealth.CriticalCount = $criticalCount
+    $Global:DashboardHealth.WarningCount = $warningCount
+    $Global:DashboardHealth.Server = "$($Global:DHCPServer)"
+    $Global:DashboardHealth.RefreshedAt = Get-Date
+    
+    if ($RefreshHealth -and -not [string]::IsNullOrWhiteSpace($Global:DHCPServer)) {
+        $Global:DashboardHealth.FailoverSummary = Get-DashboardFailoverSummary -Server $Global:DHCPServer
+        $Global:DashboardHealth.ConflictDetection = Get-DashboardConflictSummary -Server $Global:DHCPServer
+    }
+    
+    try {
+        $script:Window.Dispatcher.Invoke([action]{
+            # KPIs — prefer Statistics card values when present
+            if ($null -ne $script:DashKpiScopes) {
+                $script:DashKpiScopes.Text = if ($null -ne $script:StatTotalScopes -and $script:StatTotalScopes.Text) { $script:StatTotalScopes.Text } else { "$(Get-SafeCount $all)" }
+            }
+            if ($null -ne $script:DashKpiLeases -and $null -ne $script:StatActiveLeases) {
+                $script:DashKpiLeases.Text = "$($script:StatActiveLeases.Text)"
+            }
+            if ($null -ne $script:DashKpiAvailable -and $null -ne $script:StatAvailableIPs) {
+                $script:DashKpiAvailable.Text = "$($script:StatAvailableIPs.Text)"
+            }
+            if ($null -ne $script:DashKpiUtil -and $null -ne $script:StatUtilization) {
+                $script:DashKpiUtil.Text = "$($script:StatUtilization.Text)"
+                try { $script:DashKpiUtil.Foreground = $script:StatUtilization.Foreground } catch {}
+            }
+            if ($null -ne $script:DashKpiCritical) { $script:DashKpiCritical.Text = "$criticalCount" }
+            if ($null -ne $script:DashKpiWarning) { $script:DashKpiWarning.Text = "$warningCount" }
+            
+            $Global:DashboardAlerts.Clear()
+            foreach ($row in $critical) {
+                [void]$Global:DashboardAlerts.Add([PSCustomObject]@{
+                    Severity  = 'Critical'
+                    AlertType = 'Scope utilization'
+                    ScopeId   = "$($row.ScopeId)"
+                    Name      = "$($row.Name)"
+                    Detail    = "$($row.PercentDisplay) in use · Free=$($row.Free) · Threshold ≥$threshold%"
+                    Level     = 'Critical'
+                    SourceRow = $row
+                })
+            }
+            foreach ($row in @($warning | Select-Object -First 25)) {
+                [void]$Global:DashboardAlerts.Add([PSCustomObject]@{
+                    Severity  = 'Warning'
+                    AlertType = 'Scope utilization'
+                    ScopeId   = "$($row.ScopeId)"
+                    Name      = "$($row.Name)"
+                    Detail    = "$($row.PercentDisplay) in use · Free=$($row.Free) · approaching capacity"
+                    Level     = 'Warning'
+                    SourceRow = $row
+                })
+            }
+            
+            $Global:DashboardTopScopes.Clear()
+            $rank = 0
+            foreach ($row in @($all | Select-Object -First 10)) {
+                $rank++
+                [void]$Global:DashboardTopScopes.Add([PSCustomObject]@{
+                    Rank           = $rank
+                    PercentDisplay = "$($row.PercentDisplay)"
+                    Status         = "$($row.Status)"
+                    ScopeId        = "$($row.ScopeId)"
+                    Name           = "$($row.Name)"
+                    Free           = $row.Free
+                    PercentInUse   = $row.PercentInUse
+                    Level          = "$($row.Level)"
+                    SourceRow      = $row
+                })
+            }
+            
+            $server = if ($Global:DHCPServer) { $Global:DHCPServer } else { '(not connected)' }
+            $when = if ($Global:DashboardHealth.RefreshedAt) { Get-Date $Global:DashboardHealth.RefreshedAt -Format 'HH:mm:ss' } else { '—' }
+            $fo = "$($Global:DashboardHealth.FailoverSummary)"
+            if (-not $fo) { $fo = 'Refresh Monitoring to load failover state.' }
+            $cd = "$($Global:DashboardHealth.ConflictDetection)"
+            if (-not $cd) { $cd = '—' }
+            
+            if ($null -ne $script:TxtDashboardHealth) {
+                $script:TxtDashboardHealth.Text = "Server: $server  ·  Refreshed: $when  ·  $cd  ·  Failover: $fo"
+            }
+            if ($null -ne $script:TxtDashboardSubtitle) {
+                $script:TxtDashboardSubtitle.Text = "Monitoring $server — Critical $criticalCount / Warning $warningCount (flag ≥${threshold}%). Top 10 and Active Alerts update with each refresh."
+            }
+            if ($null -ne $script:TxtDashboardStatus) {
+                $estateNote = if ($Global:DashboardHealth.EstateTotal -gt 0) {
+                    "Estate snapshot: $($Global:DashboardHealth.EstateOnline)/$($Global:DashboardHealth.EstateTotal) online."
+                } else {
+                    "Estate snapshot empty — use Scan Estate for multi-server inventory."
+                }
+                $script:TxtDashboardStatus.Text = "IPAM-style summary ready. $estateNote Double-click an alert or Top 10 row for scope details. Use Troubleshoot for BAD_ADDRESS root cause."
+            }
+        }, [System.Windows.Threading.DispatcherPriority]::Normal)
+    } catch {
+        Write-ActionLog "Sync-DashboardUi: $_" "ERROR"
+    }
+    
+    Sync-DashboardEstatePanel
+}
+
+function Invoke-DashboardRefresh {
+    <#
+    .SYNOPSIS
+        Full monitoring refresh — statistics poll + dashboard widgets + health
+    #>
+    if ([string]::IsNullOrWhiteSpace($Global:DHCPServer)) {
+        Show-MessageBox "Connect to a DHCP server first." "Dashboard" OK Warning
+        return
+    }
+    
+    Write-ActionLog "Dashboard monitoring refresh starting..." "INFO"
+    Load-Statistics
+    Sync-DashboardUi -RefreshHealth
+    Set-Status "Dashboard monitoring refreshed"
+}
+
+function Apply-ScopeGridFilter {
+    if ($null -eq $script:GridScopes) { return }
+    $query = ''
+    try {
+        if ($null -ne $script:TxtScopeFilter) { $query = "$($script:TxtScopeFilter.Text)".Trim() }
+    } catch {}
+    
+    $all = @()
+    try {
+        # Prefer last full load stored on Tag, else current ItemsSource
+        if ($null -ne $script:GridScopes.Tag) {
+            $all = @($script:GridScopes.Tag)
+        } elseif ($null -ne $script:GridScopes.ItemsSource) {
+            $all = @($script:GridScopes.ItemsSource)
+            $script:GridScopes.Tag = $all
+        }
+    } catch {}
+    
+    if ((Get-SafeCount $all) -eq 0) {
+        if ($null -ne $script:TxtScopeFilterCount) { $script:TxtScopeFilterCount.Text = '' }
+        return
+    }
+    
+    if (-not $query) {
+        $script:GridScopes.ItemsSource = $all
+        if ($null -ne $script:TxtScopeFilterCount) {
+            $script:TxtScopeFilterCount.Text = "$(Get-SafeCount $all) scope(s)"
+        }
+        return
+    }
+    
+    $q = $query.ToLowerInvariant()
+    $filtered = @($all | Where-Object {
+        $blob = ("$($_.ScopeId) $($_.Name) $($_.StartRange) $($_.EndRange) $($_.SubnetMask) $($_.State)").ToLowerInvariant()
+        $blob.Contains($q)
+    })
+    $script:GridScopes.ItemsSource = $filtered
+    if ($null -ne $script:TxtScopeFilterCount) {
+        $script:TxtScopeFilterCount.Text = "$(Get-SafeCount $filtered) of $(Get-SafeCount $all) scope(s)"
+    }
+}
+#endregion
+
 function Update-ScopeUtilAlertBanner {
     param(
         [int]$CriticalCount = 0,
@@ -6396,6 +6857,7 @@ function Load-Statistics {
         
         Apply-ScopeStatFilter
         Update-ScopeUtilAlertBanner -CriticalCount $criticalCount -WarningCount $warningCount -Threshold $threshold -CriticalScopes $critical
+        Sync-DashboardUi
         
         $msg = "Scope statistics: $(Get-SafeCount $sorted) scope(s); $criticalCount critical (≥${threshold}%); $warningCount warning"
         Write-ActionLog $msg "SUCCESS"
@@ -9444,6 +9906,10 @@ $BtnRefresh.add_Click({
     if ($null -eq $selectedTab) { return }
     
     switch ($selectedTab.Name) {
+        "TabDashboard"    {
+            if ($Global:DHCPServer) { Invoke-DashboardRefresh }
+            else { Initialize-DashboardBindings; Sync-DashboardUi }
+        }
         "TabScopes"       { Load-Scopes }
         "TabLeases"       { Load-Leases }
         "TabReservations" { Load-Reservations }
@@ -9521,6 +9987,17 @@ function Handle-NavSelect {
         Write-ActionLog "Loading scopes view" "INFO"
         $script:MainTabs.SelectedItem = $script:TabScopes
         Load-Scopes
+    }
+    elseif ($tag -eq "Dashboard") {
+        Write-ActionLog "Loading monitoring dashboard" "INFO"
+        $script:MainTabs.SelectedItem = $script:TabDashboard
+        Initialize-DashboardBindings
+        Sync-DashboardEstatePanel
+        if ((Get-SafeCount $Global:ScopeStatEntriesAll) -eq 0 -and $Global:DHCPServer) {
+            Invoke-DashboardRefresh
+        } else {
+            Sync-DashboardUi
+        }
     }
     elseif ($tag -eq "Filters") {
         Write-ActionLog "Loading filters view" "INFO"
@@ -9919,6 +10396,85 @@ $GridPolicies.add_SelectionChanged({
 })
 #endregion
 
+
+#region Event Handlers - Dashboard
+if ($null -ne $script:BtnViewDashboard) {
+    $script:BtnViewDashboard.add_Click({
+        Write-ActionLog "Switching to Dashboard..." "INFO"
+        $script:MainTabs.SelectedItem = $script:TabDashboard
+        Initialize-DashboardBindings
+        Sync-DashboardEstatePanel
+        Sync-DashboardUi
+    })
+}
+
+if ($null -ne $script:BtnDashboardRefresh) {
+    $script:BtnDashboardRefresh.add_Click({
+        Invoke-DashboardRefresh
+    })
+}
+
+if ($null -ne $script:BtnDashboardOpenStats) {
+    $script:BtnDashboardOpenStats.add_Click({
+        $script:MainTabs.SelectedItem = $script:TabStats
+        if ((Get-SafeCount $Global:ScopeStatEntriesAll) -eq 0 -and $Global:DHCPServer) {
+            Load-Statistics
+        }
+    })
+}
+
+if ($null -ne $script:BtnDashboardScanEstate) {
+    $script:BtnDashboardScanEstate.add_Click({
+        Show-DomainDhcpScanDialog
+        Sync-DashboardEstatePanel
+        Sync-DashboardUi
+    })
+}
+
+if ($null -ne $script:GridDashboardAlerts) {
+    $script:GridDashboardAlerts.add_MouseDoubleClick({
+        $item = $null
+        try { $item = $script:GridDashboardAlerts.SelectedItem } catch {}
+        if ($null -eq $item) { return }
+        $row = $null
+        try { $row = $item.SourceRow } catch {}
+        if ($null -eq $row) {
+            $sid = "$($item.ScopeId)"
+            $match = @($Global:ScopeStatEntriesAll | Where-Object { "$($_.ScopeId)" -eq $sid } | Select-Object -First 1)
+            if ((Get-SafeCount $match) -gt 0) { $row = $match[0] }
+        }
+        if ($null -ne $row) {
+            $script:MainTabs.SelectedItem = $script:TabStats
+            Show-ScopeStatDetailDialog -Entry $row
+        }
+    })
+}
+
+if ($null -ne $script:GridDashboardTopScopes) {
+    $script:GridDashboardTopScopes.add_MouseDoubleClick({
+        $item = $null
+        try { $item = $script:GridDashboardTopScopes.SelectedItem } catch {}
+        if ($null -eq $item) { return }
+        $row = $null
+        try { $row = $item.SourceRow } catch {}
+        if ($null -eq $row) {
+            $sid = "$($item.ScopeId)"
+            $match = @($Global:ScopeStatEntriesAll | Where-Object { "$($_.ScopeId)" -eq $sid } | Select-Object -First 1)
+            if ((Get-SafeCount $match) -gt 0) { $row = $match[0] }
+        }
+        if ($null -ne $row) {
+            Show-ScopeStatDetailDialog -Entry $row
+        }
+    })
+}
+
+if ($null -ne $script:TxtScopeFilter) {
+    $script:TxtScopeFilter.add_TextChanged({
+        Apply-ScopeGridFilter
+    })
+}
+#endregion
+
 #region Event Handlers - Troubleshoot BAD_ADDRESS
 if ($null -ne $script:BtnViewTroubleshoot) {
     $script:BtnViewTroubleshoot.add_Click({
@@ -10108,6 +10664,7 @@ if ($null -ne $script:CboUtilThreshold) {
         $warning = @($sorted | Where-Object { "$($_.Level)" -eq 'Warning' })
         Apply-ScopeStatFilter
         Update-ScopeUtilAlertBanner -CriticalCount (Get-SafeCount $critical) -WarningCount (Get-SafeCount $warning) -Threshold $threshold -CriticalScopes $critical
+        Sync-DashboardUi
     })
 }
 
@@ -10778,6 +11335,7 @@ $Window.add_Loaded({
             $script:GridScopeStats.ItemsSource = $Global:ScopeStatEntries
         }
         Initialize-TroubleshootTab
+        Initialize-DashboardBindings
         Update-EventWatchStatus
         Update-MigrateReadyState
     } catch {}
