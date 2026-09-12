@@ -59,6 +59,11 @@
       only if this script created the connection.
     - The "Not100GB" CSV name ignored -TargetStorageQuotaGB.
     - StrictMode could throw on missing Graph @odata.nextLink / null UPNs.
+    - StrictMode Latest threw "The property 'Count' cannot be found" while paging
+      Graph users (Get-MgUser -All / Invoke-MgGraphRequest). Module cmdlets now
+      run with StrictMode off, and collection counts no longer use raw .Count.
+    - An omitted -Identity was treated as one $null identity because
+      @($null).Count is 1, so the tenant-wide Graph query never ran.
 
 .PARAMETER OutputFolder
     Folder where CSV and HTML reports are written. Defaults to the current directory.
@@ -149,7 +154,7 @@ param(
     [int]        $QuotaToleranceMB     = 2,
     [string[]]   $E3SkuPartNumber      = @('ENTERPRISEPACK', 'SPE_E3'),
     [string[]]   $E5SkuPartNumber      = @('ENTERPRISEPREMIUM', 'SPE_E5'),
-    [string[]]   $Identity,
+    [string[]]   $Identity             = @(),
     [string[]]   $RecipientTypeDetails = @('UserMailbox'),
     [string]     $UserPrincipalName,
     [string]     $TenantId,
@@ -210,24 +215,73 @@ function Get-PropertyValue {
     return $Default
 }
 
+# StrictMode Latest throws on .Count for $null, a single PSCustomObject, or a string.
+# Graph JSON objects are often hashtables; @($hashtable) enumerates KEYS, not "one object".
+function Get-CollectionCount {
+    param($InputObject)
+
+    if ($null -eq $InputObject) {
+        return 0
+    }
+    if ($InputObject -is [string]) {
+        return 1
+    }
+    if ($InputObject -is [System.Array]) {
+        return $InputObject.Length
+    }
+    if ($InputObject -is [System.Collections.ICollection]) {
+        return [int]$InputObject.Count
+    }
+
+    $countProp = $InputObject.PSObject.Properties['Count']
+    if ($null -ne $countProp -and $null -ne $countProp.Value) {
+        try {
+            return [int]$countProp.Value
+        }
+        catch {
+            return 1
+        }
+    }
+    return 1
+}
+
+function ConvertTo-ObjectArray {
+    param($InputObject)
+
+    $list = New-Object System.Collections.Generic.List[object]
+    if ($null -eq $InputObject) {
+        return , $list.ToArray()
+    }
+
+    # Strings, dictionaries, and scalars must NOT be enumerated (@($hash) yields KEYS).
+    $enumerate = $InputObject -is [System.Collections.IEnumerable] -and
+        $InputObject -isnot [string] -and
+        $InputObject -isnot [System.Collections.IDictionary]
+
+    if ($enumerate) {
+        foreach ($item in $InputObject) {
+            if ($null -ne $item) {
+                [void]$list.Add($item)
+            }
+        }
+    }
+    else {
+        [void]$list.Add($InputObject)
+    }
+
+    return , $list.ToArray()
+}
+
 function ConvertTo-StringArray {
     param($Value)
 
-    if ($null -eq $Value) {
-        return @()
-    }
-
-    if ($Value -is [string] -or $Value -is [ValueType]) {
-        return @([string]$Value)
-    }
-
     $items = New-Object System.Collections.Generic.List[string]
-    foreach ($item in @($Value)) {
+    foreach ($item in (ConvertTo-ObjectArray $Value)) {
         if ($null -ne $item -and -not [string]::IsNullOrWhiteSpace([string]$item)) {
             [void]$items.Add([string]$item)
         }
     }
-    return @($items.ToArray())
+    return , $items.ToArray()
 }
 
 function ConvertTo-NormalizedGuid {
@@ -468,7 +522,15 @@ function Invoke-WithRetry {
     while ($true) {
         $attempt++
         try {
-            return & $ScriptBlock
+            # Microsoft.Graph and EXO cmdlets are not StrictMode-safe; they read .Count
+            # on scalars and throw PropertyNotFoundStrict back into this script.
+            Set-StrictMode -Off
+            try {
+                return & $ScriptBlock
+            }
+            finally {
+                Set-StrictMode -Version Latest
+            }
         }
         catch {
             $msg = Get-ExceptionMessageChain -Exception $_.Exception
@@ -884,9 +946,9 @@ function Get-LicenseLookupTables {
     foreach ($id in @($E3SkuIds)) { if ($id) { [void]$e3Set.Add($id) } }
     foreach ($id in @($E5SkuIds)) { if ($id) { [void]$e5Set.Add($id) } }
 
-    foreach ($user in @($Users)) {
-        $assigned = @(Get-PropertyValue $user 'AssignedLicenses')
-        if ($assigned.Count -eq 0) {
+    foreach ($user in (ConvertTo-ObjectArray $Users)) {
+        $assigned = ConvertTo-ObjectArray (Get-PropertyValue $user 'AssignedLicenses')
+        if ((Get-CollectionCount $assigned) -eq 0) {
             continue
         }
 
@@ -927,7 +989,7 @@ function Get-LicenseLookupTables {
     return @{
         ByObjectId = $byObjectId
         ByUpn      = $byUpn
-        Count      = $byObjectId.Count
+        UserCount  = [int]$byObjectId.Count
         SkuMap     = $SkuMap
     }
 }
@@ -999,7 +1061,25 @@ function Invoke-MailboxQuotaSelfTest {
     Assert-Equal ((Get-MailboxQuotaPropertySets) -contains 'Minimum') $true 'Minimum property set required'
     Assert-Equal ((Get-MailboxQuotaPropertySets) -contains 'Quota') $true 'Quota property set required'
 
+    Assert-Equal (Get-CollectionCount $null) 0 'null collection count'
+    Assert-Equal (Get-CollectionCount @()) 0 'empty array count'
+    Assert-Equal (Get-CollectionCount @(1, 2)) 2 'array count'
+    Assert-Equal (Get-CollectionCount 'jane@contoso.com') 1 'string is one item, not characters'
+    $oneHash = @{ skuId = 'abc'; disabledPlans = @() }
+    Assert-Equal (Get-CollectionCount (ConvertTo-ObjectArray $oneHash)) 1 'hashtable is one object, not its keys'
+    $hashUsers = ConvertTo-ObjectArray $oneHash
+    Assert-Equal ($hashUsers[0].skuId) 'abc' 'hashtable element preserved'
+    Assert-Equal (Get-CollectionCount (ConvertTo-StringArray $null)) 0 'omitted Identity is empty, not one null'
+
     $e3Sku = [guid]'6fd2c87f-b296-42f0-b197-1e91e994b900'
+    $graphUser = @{
+        id                = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+        userPrincipalName = 'single@contoso.com'
+        displayName       = 'Single'
+        assignedLicenses  = @{ skuId = $e3Sku }
+    }
+    $singleLookup = Get-LicenseLookupTables -Users $graphUser -SkuMap @{} -E3SkuIds @($e3Sku.ToString()) -E5SkuIds @()
+    Assert-Equal $singleLookup.UserCount 1 'single Graph hashtable user is not enumerated by key'
     $otherSku = [guid]'f245ecc8-75af-4f8e-b61f-27d8114de5f3'
     $users = @(
         [pscustomobject]@{
@@ -1017,7 +1097,7 @@ function Invoke-MailboxQuotaSelfTest {
         }
     )
     $lookup = Get-LicenseLookupTables -Users $users -SkuMap @{} -E3SkuIds @($e3Sku.ToString()) -E5SkuIds @()
-    Assert-Equal $lookup.Count 1 'one E3 user indexed'
+    Assert-Equal $lookup.UserCount 1 'one E3 user indexed'
     Assert-Equal $lookup.ByUpn.ContainsKey('jane@contoso.com') $true 'UPN indexed lowercase'
     Assert-Equal $lookup.ByObjectId.ContainsKey('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa') $true 'object id indexed'
 
@@ -1206,16 +1286,20 @@ function Get-MailboxQuotaDemoRows {
 #--------------------------------------------------------------------
 
 function Test-ExchangeOnlineConnected {
+    Set-StrictMode -Off
     try {
         if (Get-Command Get-ConnectionInformation -ErrorAction SilentlyContinue) {
             $info = @(Get-ConnectionInformation -ErrorAction Stop)
-            return ($info.Count -gt 0)
+            return ((Get-CollectionCount $info) -gt 0)
         }
         Get-OrganizationConfig -ErrorAction Stop | Out-Null
         return $true
     }
     catch {
         return $false
+    }
+    finally {
+        Set-StrictMode -Version Latest
     }
 }
 
@@ -1240,7 +1324,7 @@ function Connect-QuotaExchangeOnline {
         $connectParams['DisableWAM'] = $true
     }
 
-    Connect-ExchangeOnline @connectParams
+    Invoke-WithRetry -Activity 'Connect-ExchangeOnline' -ScriptBlock { Connect-ExchangeOnline @connectParams }
     $script:ExoConnectedByThisScript = $true
     Write-Ok 'Connected to Exchange Online.'
 }
@@ -1249,7 +1333,7 @@ function Test-GraphHasRequiredScopes {
     param([string[]]$Required)
 
     try {
-        $ctx = Get-MgContext -ErrorAction Stop
+        $ctx = Invoke-WithRetry -Activity 'Get-MgContext' -ScriptBlock { Get-MgContext -ErrorAction Stop }
     }
     catch {
         return $false
@@ -1259,8 +1343,8 @@ function Test-GraphHasRequiredScopes {
         return $false
     }
 
-    $have = @(Get-PropertyValue $ctx 'Scopes')
-    if ($have.Count -eq 0) {
+    $have = ConvertTo-StringArray (Get-PropertyValue $ctx 'Scopes')
+    if ((Get-CollectionCount $have) -eq 0) {
         return $false
     }
 
@@ -1289,7 +1373,7 @@ function Connect-QuotaGraph {
 
     $hasContext = $false
     try {
-        $ctx = Get-MgContext -ErrorAction SilentlyContinue
+        $ctx = Invoke-WithRetry -Activity 'Get-MgContext' -ScriptBlock { Get-MgContext -ErrorAction SilentlyContinue }
         $hasContext = ($null -ne $ctx)
     }
     catch {
@@ -1312,7 +1396,7 @@ function Connect-QuotaGraph {
         $connectParams['NoWelcome'] = $true
     }
 
-    Connect-MgGraph @connectParams
+    Invoke-WithRetry -Activity 'Connect-MgGraph' -ScriptBlock { Connect-MgGraph @connectParams }
     $script:GraphConnectedByThisScript = $true
     Write-Ok 'Connected to Microsoft Graph.'
 }
@@ -1340,11 +1424,8 @@ function Invoke-GraphGetPaged {
         }
 
         $resp = Invoke-WithRetry -Activity "GET $Uri" -ScriptBlock { Invoke-MgGraphRequest @params }
-        $page = Get-PropertyValue $resp 'value'
-        foreach ($item in @($page)) {
-            if ($null -ne $item) {
-                [void]$items.Add($item)
-            }
+        foreach ($item in (ConvertTo-ObjectArray (Get-PropertyValue $resp 'value'))) {
+            [void]$items.Add($item)
         }
 
         $next = Get-PropertyValue $resp '@odata.nextLink'
@@ -1352,13 +1433,13 @@ function Invoke-GraphGetPaged {
             $next = $null
         }
     }
-    return $items
+    return , $items.ToArray()
 }
 
 function Get-GraphSubscribedSkuMap {
     $skus = Invoke-GraphGetPaged -Uri 'https://graph.microsoft.com/v1.0/subscribedSkus'
     $map = @{}
-    foreach ($sku in @($skus)) {
+    foreach ($sku in (ConvertTo-ObjectArray $skus)) {
         $id = ConvertTo-NormalizedGuid (Get-PropertyValue $sku 'SkuId')
         $part = Get-PropertyValue $sku 'SkuPartNumber'
         if ($id -and $part) {
@@ -1391,12 +1472,10 @@ function Get-SkuIdsByPartNumber {
 function Get-GraphLicensedUsers {
     param([string[]]$Identity)
 
-    if (@($Identity).Count -gt 0) {
+    $requested = ConvertTo-StringArray $Identity
+    if ((Get-CollectionCount $requested) -gt 0) {
         $users = New-Object System.Collections.Generic.List[object]
-        foreach ($id in @($Identity)) {
-            if ([string]::IsNullOrWhiteSpace($id)) {
-                continue
-            }
+        foreach ($id in $requested) {
             $encoded = [uri]::EscapeDataString($id)
             $uri = "https://graph.microsoft.com/v1.0/users/${encoded}?`$select=id,userPrincipalName,displayName,assignedLicenses,accountEnabled"
             $params = @{
@@ -1415,7 +1494,7 @@ function Get-GraphLicensedUsers {
                 Write-Warn "Graph user '$id' was not found: $(Get-ExceptionMessageChain $_.Exception)"
             }
         }
-        return $users
+        return , $users.ToArray()
     }
 
     $select = 'id,userPrincipalName,displayName,assignedLicenses,accountEnabled'
@@ -1445,17 +1524,14 @@ function Get-ExoMailboxesForQuota {
         $base['Properties'] = @('ExternalDirectoryObjectId', 'MailboxPlan', 'UseDatabaseQuotaDefaults')
     }
 
-    if (@($Identity).Count -gt 0) {
+    if ((Get-CollectionCount (ConvertTo-StringArray $Identity)) -gt 0) {
         $found = New-Object System.Collections.Generic.List[object]
-        foreach ($id in @($Identity)) {
-            if ([string]::IsNullOrWhiteSpace($id)) {
-                continue
-            }
+        foreach ($id in (ConvertTo-StringArray $Identity)) {
             try {
                 $mbx = Invoke-WithRetry -Activity "Get-EXOMailbox $id" -ScriptBlock {
                     Get-EXOMailbox -Identity $id @base
                 }
-                foreach ($item in @($mbx)) {
+                foreach ($item in (ConvertTo-ObjectArray $mbx)) {
                     [void]$found.Add($item)
                 }
             }
@@ -1468,7 +1544,7 @@ function Get-ExoMailboxesForQuota {
                 Write-Warn "Get-EXOMailbox failed for ${id}: $msg"
             }
         }
-        return $found
+        return , $found.ToArray()
     }
 
     $query = @{
@@ -1479,22 +1555,22 @@ function Get-ExoMailboxesForQuota {
     if ($base.ContainsKey('Properties')) {
         $query['Properties'] = $base['Properties']
     }
-    if ((@($RecipientTypeDetails).Count -gt 0) -and (Test-HasCmdletParameter -CommandName 'Get-EXOMailbox' -ParameterName 'RecipientTypeDetails')) {
+    if (((Get-CollectionCount $RecipientTypeDetails) -gt 0) -and (Test-HasCmdletParameter -CommandName 'Get-EXOMailbox' -ParameterName 'RecipientTypeDetails')) {
         $query['RecipientTypeDetails'] = $RecipientTypeDetails
     }
 
-    return Invoke-WithRetry -Activity 'Get-EXOMailbox (bulk)' -ScriptBlock { Get-EXOMailbox @query }
+    return , (ConvertTo-ObjectArray (Invoke-WithRetry -Activity 'Get-EXOMailbox (bulk)' -ScriptBlock { Get-EXOMailbox @query }))
 }
 
 function Get-MailboxUsedBytes {
     param($Mailbox)
 
-    $candidates = @(
+    $candidates = ConvertTo-ObjectArray (@(
         Get-PropertyValue $Mailbox 'UserPrincipalName'
         Get-PropertyValue $Mailbox 'PrimarySmtpAddress'
         Get-PropertyValue $Mailbox 'ExternalDirectoryObjectId'
         Get-PropertyValue $Mailbox 'Identity'
-    ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
 
     $lastError = $null
     foreach ($id in $candidates) {
@@ -1686,29 +1762,29 @@ try {
     $e3SkuIds = Get-SkuIdsByPartNumber -SkuMap $skuMap -PartNumbers $E3SkuPartNumber
     $e5SkuIds = Get-SkuIdsByPartNumber -SkuMap $skuMap -PartNumbers $E5SkuPartNumber
 
-    if (@($e3SkuIds).Count -eq 0) {
+    if ((Get-CollectionCount $e3SkuIds) -eq 0) {
         Write-Warn ("E3 SKU(s) '{0}' not found in this tenant." -f ($E3SkuPartNumber -join ', '))
     }
-    if (@($e5SkuIds).Count -eq 0) {
+    if ((Get-CollectionCount $e5SkuIds) -eq 0) {
         Write-Warn ("E5 SKU(s) '{0}' not found in this tenant." -f ($E5SkuPartNumber -join ', '))
     }
 
     Write-Info 'Retrieving licensed users from Microsoft Graph (this can take a while)...'
     $allUsers = Get-GraphLicensedUsers -Identity $Identity
     $lookup = Get-LicenseLookupTables -Users $allUsers -SkuMap $skuMap -E3SkuIds $e3SkuIds -E5SkuIds $e5SkuIds
-    Write-Ok ("Found {0} users with an E3 and/or E5 license." -f $lookup.Count)
+    Write-Ok ("Found {0} users with an E3 and/or E5 license." -f $lookup.UserCount)
 
-    if ($lookup.Count -eq 0) {
+    if ([int]$lookup.UserCount -eq 0) {
         Write-Warn 'No E3/E5 licensed users were found. Reports will be empty.'
     }
     else {
         Write-Info 'Retrieving Exchange Online mailboxes (Minimum + Quota property sets)...'
-        $mailboxes = @(Get-ExoMailboxesForQuota -Identity $Identity -RecipientTypeDetails $RecipientTypeDetails)
-        Write-Ok ("Retrieved {0} mailbox object(s)." -f $mailboxes.Count)
+        $mailboxes = ConvertTo-ObjectArray (Get-ExoMailboxesForQuota -Identity $Identity -RecipientTypeDetails $RecipientTypeDetails)
+        Write-Ok ("Retrieved {0} mailbox object(s)." -f (Get-CollectionCount $mailboxes))
 
         $matchedObjectIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
         $index = 0
-        $total = $mailboxes.Count
+        $total = Get-CollectionCount $mailboxes
 
         foreach ($mbx in $mailboxes) {
             $index++
