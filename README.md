@@ -32,4 +32,4 @@ Requires the `ExchangeOnlineManagement` and `Microsoft.Graph.Authentication` mod
 
 On **Windows PowerShell 5.1**, `Connect-ExchangeOnline` often fails with `An error occurred while sending the request` unless TLS 1.2 is enabled. The script does that automatically before the modules load. If it still fails, update the modules or run the script in PowerShell 7.
 
-If you saved the script as `MailboxSize.ps1`, copy the latest `Report-MailboxQuotaCompliance.ps1` over it (or run the repo filename). The Graph "property Count cannot be found" crash under `Set-StrictMode` is fixed in this revision.
+If you saved the script as `MailboxSize.ps1`, copy the latest `Report-MailboxQuotaCompliance.ps1` over it (or run the repo filename). On a large tenant, a single `Get-EXOMailbox -ResultSize Unlimited` often fails with `The underlying connection was closed`; this revision shards by UPN prefix and reconnects.

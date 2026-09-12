@@ -64,6 +64,9 @@
       run with StrictMode off, and collection counts no longer use raw .Count.
     - An omitted -Identity was treated as one $null identity because
       @($null).Count is 1, so the tenant-wide Graph query never ran.
+    - Get-EXOMailbox -ResultSize Unlimited with the full Quota property set
+      drops on large tenants ("The underlying connection was closed"). Mailboxes
+      are pulled in UPN-prefix shards, with reconnect + per-identity fallback.
 
 .PARAMETER OutputFolder
     Folder where CSV and HTML reports are written. Defaults to the current directory.
@@ -170,6 +173,10 @@ Set-StrictMode -Version Latest
 
 $script:ExoConnectedByThisScript   = $false
 $script:GraphConnectedByThisScript = $false
+$script:ExoConnectParams           = @{
+    ShowBanner  = $false
+    ErrorAction = 'Stop'
+}
 
 #--------------------------------------------------------------------
 # Helpers
@@ -497,7 +504,17 @@ function Test-IsTransientError {
         return $false
     }
 
-    return [bool]($Message -match 'throttl|429|503|timeout|temporarily|too many requests|server cannot service|Try again|busy|rate limit')
+    return [bool]($Message -match 'throttl|429|503|timeout|timed out|temporarily|too many requests|server cannot service|Try again|busy|rate limit|underlying connection was closed|unexpected error occurred on a receive|connection was closed|forcibly closed|The request was aborted|Unable to read data from the transport|SendFailure|KeepAliveFailure|existing connection|receive')
+}
+
+function Test-IsTransportError {
+    param([string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message)) {
+        return $false
+    }
+
+    return [bool]($Message -match 'underlying connection was closed|unexpected error occurred on a receive|connection was closed|forcibly closed|The request was aborted|Unable to read data from the transport|SendFailure|KeepAliveFailure|SSL/TLS|secure channel')
 }
 
 function Test-IsMissingMailboxError {
@@ -538,7 +555,15 @@ function Invoke-WithRetry {
             if (-not $transient -or $attempt -ge $MaxAttempts) {
                 throw
             }
-            $delay = [Math]::Min(60, [int][Math]::Pow(2, $attempt))
+            if ((Test-IsTransportError -Message $msg) -and ($Activity -match 'Get-EXOMailbox|Set-Mailbox|Get-EXOMailboxStatistics')) {
+                try {
+                    Reset-QuotaExchangeOnline
+                }
+                catch {
+                    Write-Warn ("Reconnect after transport error failed: {0}" -f (Get-ExceptionMessageChain $_.Exception))
+                }
+            }
+            $delay = [Math]::Min(60, [int][Math]::Pow(2, $attempt) + 3)
             Write-Warn ("Transient error on {0} (attempt {1}/{2}), retrying in {3}s: {4}" -f $Activity, $attempt, $MaxAttempts, $delay, $msg)
             Start-Sleep -Seconds $delay
         }
@@ -628,6 +653,68 @@ function Get-CsvEncodingName {
 
 function Get-MailboxQuotaPropertySets {
     return @('Minimum', 'Quota')
+}
+
+function Get-ExoMailboxSelectParams {
+    $params = @{
+        ErrorAction  = 'Stop'
+        PropertySets = @('Minimum')
+    }
+    if (Test-HasCmdletParameter -CommandName 'Get-EXOMailbox' -ParameterName 'Properties') {
+        # Prefer named quota properties over PropertySets=Quota. The full Quota
+        # set is a large REST payload and often drops on tenants with 10k+ mailboxes.
+        $params['Properties'] = @(
+            'ProhibitSendReceiveQuota',
+            'ProhibitSendQuota',
+            'IssueWarningQuota',
+            'UseDatabaseQuotaDefaults',
+            'ExternalDirectoryObjectId',
+            'MailboxPlan'
+        )
+    }
+    else {
+        $params['PropertySets'] = @('Minimum', 'Quota')
+    }
+    return $params
+}
+
+function Get-UpnPrefixList {
+    param(
+        $Upns,
+        [int]$Length = 1,
+        [string]$StartsWith = ''
+    )
+
+    $set = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($upn in (ConvertTo-ObjectArray $Upns)) {
+        $text = [string]$upn
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            continue
+        }
+        $local = ($text.Split('@')[0])
+        if ($local.Length -lt 1) {
+            continue
+        }
+        if ($StartsWith -and -not $local.StartsWith($StartsWith, [System.StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+        $len = [Math]::Min($Length, $local.Length)
+        if ($len -lt 1) {
+            continue
+        }
+        [void]$set.Add($local.Substring(0, $len).ToLowerInvariant())
+    }
+    return , @($set)
+}
+
+function ConvertTo-ExoLikeFilter {
+    param([Parameter(Mandatory)][string]$Prefix)
+
+    $escaped = $Prefix.Replace("'", "''").Replace('*', '').Replace('?', '')
+    if ([string]::IsNullOrWhiteSpace($escaped)) {
+        return $null
+    }
+    return "UserPrincipalName -like '$escaped*'"
 }
 
 function ConvertTo-Bool {
@@ -1061,6 +1148,12 @@ function Invoke-MailboxQuotaSelfTest {
     Assert-Equal ((Get-MailboxQuotaPropertySets) -contains 'Minimum') $true 'Minimum property set required'
     Assert-Equal ((Get-MailboxQuotaPropertySets) -contains 'Quota') $true 'Quota property set required'
 
+    Assert-Equal (Test-IsTransientError 'The underlying connection was closed: An unexpected error occurred on a receive.') $true 'EXO receive drop is transient'
+    Assert-Equal (Test-IsTransportError 'The underlying connection was closed: An unexpected error occurred on a receive.') $true 'EXO receive drop is transport'
+    $prefixList = Get-UpnPrefixList -Upns @('Alex@contoso.com', 'amy@contoso.com', 'bob@contoso.com')
+    Assert-Equal ((Get-CollectionCount $prefixList) -ge 2) $true 'UPN prefixes include a and b'
+    Assert-Equal (ConvertTo-ExoLikeFilter -Prefix 'al') "UserPrincipalName -like 'al*'" 'EXO like filter'
+
     Assert-Equal (Get-CollectionCount $null) 0 'null collection count'
     Assert-Equal (Get-CollectionCount @()) 0 'empty array count'
     Assert-Equal (Get-CollectionCount @(1, 2)) 2 'array count'
@@ -1306,11 +1399,6 @@ function Test-ExchangeOnlineConnected {
 function Connect-QuotaExchangeOnline {
     param([string]$UserPrincipalName)
 
-    if (Test-ExchangeOnlineConnected) {
-        Write-Ok 'Reusing existing Exchange Online session.'
-        return
-    }
-
     $connectParams = @{
         ShowBanner  = $false
         ErrorAction = 'Stop'
@@ -1323,10 +1411,41 @@ function Connect-QuotaExchangeOnline {
     if ($isWindowsPowerShell -and (Test-HasCmdletParameter -CommandName 'Connect-ExchangeOnline' -ParameterName 'DisableWAM')) {
         $connectParams['DisableWAM'] = $true
     }
+    $script:ExoConnectParams = $connectParams
 
-    Invoke-WithRetry -Activity 'Connect-ExchangeOnline' -ScriptBlock { Connect-ExchangeOnline @connectParams }
+    if (Test-ExchangeOnlineConnected) {
+        Write-Ok 'Reusing existing Exchange Online session.'
+        return
+    }
+
+    Invoke-WithRetry -Activity 'Connect-ExchangeOnline' -ScriptBlock { Connect-ExchangeOnline @script:ExoConnectParams }
     $script:ExoConnectedByThisScript = $true
     Write-Ok 'Connected to Exchange Online.'
+}
+
+function Reset-QuotaExchangeOnline {
+    Write-Warn 'Exchange Online connection dropped. Reconnecting...'
+    Set-StrictMode -Off
+    try {
+        if (Get-Command Disconnect-ExchangeOnline -ErrorAction SilentlyContinue) {
+            Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Seconds 4
+        Enable-Tls12
+        Enable-DefaultProxyCredentials
+        if ($null -eq $script:ExoConnectParams) {
+            $script:ExoConnectParams = @{
+                ShowBanner  = $false
+                ErrorAction = 'Stop'
+            }
+        }
+        Connect-ExchangeOnline @script:ExoConnectParams
+        $script:ExoConnectedByThisScript = $true
+        Write-Ok 'Reconnected to Exchange Online.'
+    }
+    finally {
+        Set-StrictMode -Version Latest
+    }
 }
 
 function Test-GraphHasRequiredScopes {
@@ -1512,54 +1631,226 @@ function Get-GraphLicensedUsers {
 function Get-ExoMailboxesForQuota {
     param(
         [string[]]$Identity,
+        [string[]]$RecipientTypeDetails,
+        [string[]]$LicensedUpn
+    )
+
+    $base = Get-ExoMailboxSelectParams
+    $requested = ConvertTo-StringArray $Identity
+    if ((Get-CollectionCount $requested) -gt 0) {
+        return , (Get-ExoMailboxByIdentityList -Identities $requested -QueryBase $base)
+    }
+
+    $licensed = ConvertTo-StringArray $LicensedUpn
+    $licensedCount = Get-CollectionCount $licensed
+
+    # A single Unlimited pull of Minimum+Quota drops on large tenants
+    # ("underlying connection was closed"). Prefer UPN-prefix shards, and
+    # only attempt a tenant-wide pull when the licensed set is small.
+    if ($licensedCount -gt 0 -and $licensedCount -le 2000) {
+        try {
+            Write-Info 'Trying a single tenant-wide Get-EXOMailbox query...'
+            return , (Get-ExoMailboxBulk -QueryBase $base -RecipientTypeDetails $RecipientTypeDetails)
+        }
+        catch {
+            Write-Warn ("Tenant-wide mailbox query failed ({0}). Switching to UPN-prefix shards." -f (Get-ExceptionMessageChain $_.Exception))
+        }
+    }
+    elseif ($licensedCount -gt 2000) {
+        Write-Info ("Large licensed set ({0}). Skipping tenant-wide Get-EXOMailbox and using UPN-prefix shards." -f $licensedCount)
+    }
+
+    if ($licensedCount -gt 0) {
+        return , (Get-ExoMailboxByUpnPrefix -LicensedUpn $licensed -QueryBase $base -RecipientTypeDetails $RecipientTypeDetails)
+    }
+
+    return , (Get-ExoMailboxBulk -QueryBase $base -RecipientTypeDetails $RecipientTypeDetails)
+}
+
+function Get-ExoMailboxBulk {
+    param(
+        [Parameter(Mandatory)][hashtable]$QueryBase,
         [string[]]$RecipientTypeDetails
     )
 
-    $propertySets = Get-MailboxQuotaPropertySets
-    $base = @{
-        PropertySets = $propertySets
-        ErrorAction  = 'Stop'
+    $query = @{}
+    foreach ($key in $QueryBase.Keys) {
+        $query[$key] = $QueryBase[$key]
     }
-    if (Test-HasCmdletParameter -CommandName 'Get-EXOMailbox' -ParameterName 'Properties') {
-        $base['Properties'] = @('ExternalDirectoryObjectId', 'MailboxPlan', 'UseDatabaseQuotaDefaults')
-    }
-
-    if ((Get-CollectionCount (ConvertTo-StringArray $Identity)) -gt 0) {
-        $found = New-Object System.Collections.Generic.List[object]
-        foreach ($id in (ConvertTo-StringArray $Identity)) {
-            try {
-                $mbx = Invoke-WithRetry -Activity "Get-EXOMailbox $id" -ScriptBlock {
-                    Get-EXOMailbox -Identity $id @base
-                }
-                foreach ($item in (ConvertTo-ObjectArray $mbx)) {
-                    [void]$found.Add($item)
-                }
-            }
-            catch {
-                $msg = Get-ExceptionMessageChain $_.Exception
-                if (Test-IsMissingMailboxError -Message $msg) {
-                    Write-Verbose "No mailbox for $id - skipping."
-                    continue
-                }
-                Write-Warn "Get-EXOMailbox failed for ${id}: $msg"
-            }
-        }
-        return , $found.ToArray()
-    }
-
-    $query = @{
-        ResultSize   = 'Unlimited'
-        PropertySets = $propertySets
-        ErrorAction  = 'Stop'
-    }
-    if ($base.ContainsKey('Properties')) {
-        $query['Properties'] = $base['Properties']
-    }
+    $query['ResultSize'] = 'Unlimited'
     if (((Get-CollectionCount $RecipientTypeDetails) -gt 0) -and (Test-HasCmdletParameter -CommandName 'Get-EXOMailbox' -ParameterName 'RecipientTypeDetails')) {
         $query['RecipientTypeDetails'] = $RecipientTypeDetails
     }
 
-    return , (ConvertTo-ObjectArray (Invoke-WithRetry -Activity 'Get-EXOMailbox (bulk)' -ScriptBlock { Get-EXOMailbox @query }))
+    return , (ConvertTo-ObjectArray (Invoke-WithRetry -Activity 'Get-EXOMailbox (bulk)' -MaxAttempts 3 -ScriptBlock { Get-EXOMailbox @query }))
+}
+
+function Get-ExoMailboxByIdentityList {
+    param(
+        [Parameter(Mandatory)]$Identities,
+        [Parameter(Mandatory)][hashtable]$QueryBase
+    )
+
+    $found = New-Object System.Collections.Generic.List[object]
+    $list = ConvertTo-StringArray $Identities
+    $total = Get-CollectionCount $list
+    $index = 0
+    foreach ($id in $list) {
+        $index++
+        Write-Progress -Activity 'Get-EXOMailbox by identity' -Status $id -PercentComplete (($index / [Math]::Max($total, 1)) * 100)
+        try {
+            $mbx = Invoke-WithRetry -Activity "Get-EXOMailbox $id" -ScriptBlock {
+                Get-EXOMailbox -Identity $id @QueryBase
+            }
+            foreach ($item in (ConvertTo-ObjectArray $mbx)) {
+                [void]$found.Add($item)
+            }
+        }
+        catch {
+            $msg = Get-ExceptionMessageChain $_.Exception
+            if (Test-IsMissingMailboxError -Message $msg) {
+                Write-Verbose "No mailbox for $id - skipping."
+                continue
+            }
+            Write-Warn "Get-EXOMailbox failed for ${id}: $msg"
+        }
+    }
+    Write-Progress -Activity 'Get-EXOMailbox by identity' -Completed
+    return , $found.ToArray()
+}
+
+function Get-ExoMailboxByUpnPrefix {
+    param(
+        [Parameter(Mandatory)]$LicensedUpn,
+        [Parameter(Mandatory)][hashtable]$QueryBase,
+        [string[]]$RecipientTypeDetails,
+        [int]$PrefixLength = 1
+    )
+
+    $found = New-Object System.Collections.Generic.List[object]
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $unmatched = New-Object System.Collections.Generic.List[string]
+    $prefixes = Get-UpnPrefixList -Upns $LicensedUpn -Length $PrefixLength
+    $prefixCount = Get-CollectionCount $prefixes
+    $prefixIndex = 0
+
+    foreach ($prefix in $prefixes) {
+        $prefixIndex++
+        $filter = ConvertTo-ExoLikeFilter -Prefix $prefix
+        if (-not $filter) {
+            continue
+        }
+
+        Write-Info ("Mailbox shard {0}/{1}: {2}" -f $prefixIndex, $prefixCount, $filter)
+        $query = @{}
+        foreach ($key in $QueryBase.Keys) {
+            $query[$key] = $QueryBase[$key]
+        }
+        $query['ResultSize'] = 'Unlimited'
+        $query['Filter'] = $filter
+        if (((Get-CollectionCount $RecipientTypeDetails) -gt 0) -and (Test-HasCmdletParameter -CommandName 'Get-EXOMailbox' -ParameterName 'RecipientTypeDetails')) {
+            $query['RecipientTypeDetails'] = $RecipientTypeDetails
+        }
+
+        $batch = @()
+        $shardFailed = $false
+        try {
+            $batch = ConvertTo-ObjectArray (Invoke-WithRetry -Activity "Get-EXOMailbox shard $prefix" -MaxAttempts 4 -ScriptBlock { Get-EXOMailbox @query })
+        }
+        catch {
+            $shardFailed = $true
+            Write-Warn ("Shard '{0}' failed ({1})." -f $prefix, (Get-ExceptionMessageChain $_.Exception))
+        }
+
+        if ($shardFailed) {
+            if ($PrefixLength -lt 2) {
+                $subset = New-Object System.Collections.Generic.List[string]
+                foreach ($upn in (ConvertTo-StringArray $LicensedUpn)) {
+                    $local = ($upn.Split('@')[0])
+                    if ($local.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        [void]$subset.Add($upn)
+                    }
+                }
+                $subPrefixes = Get-UpnPrefixList -Upns $subset -Length 2
+                if ((Get-CollectionCount $subPrefixes) -gt 1) {
+                    Write-Info ("Splitting '{0}*' into {1} two-character shards..." -f $prefix, (Get-CollectionCount $subPrefixes))
+                    $nested = Get-ExoMailboxByUpnPrefix -LicensedUpn $subset.ToArray() -QueryBase $QueryBase -RecipientTypeDetails $RecipientTypeDetails -PrefixLength 2
+                    foreach ($item in (ConvertTo-ObjectArray $nested)) {
+                        $key = [string](Get-PropertyValue $item 'ExternalDirectoryObjectId')
+                        if ([string]::IsNullOrWhiteSpace($key)) {
+                            $key = [string](Get-PropertyValue $item 'UserPrincipalName')
+                        }
+                        if ($key -and $seen.Add($key)) {
+                            [void]$found.Add($item)
+                        }
+                    }
+                    continue
+                }
+            }
+
+            $fallbackIds = New-Object System.Collections.Generic.List[string]
+            foreach ($upn in (ConvertTo-StringArray $LicensedUpn)) {
+                $local = ($upn.Split('@')[0])
+                if ($local.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    [void]$fallbackIds.Add($upn)
+                }
+            }
+            Write-Info ("Falling back to per-mailbox Get-EXOMailbox for {0} licensed UPN(s) in '{1}*'." -f (Get-CollectionCount $fallbackIds), $prefix)
+            foreach ($item in (ConvertTo-ObjectArray (Get-ExoMailboxByIdentityList -Identities $fallbackIds.ToArray() -QueryBase $QueryBase))) {
+                $key = [string](Get-PropertyValue $item 'ExternalDirectoryObjectId')
+                if ([string]::IsNullOrWhiteSpace($key)) {
+                    $key = [string](Get-PropertyValue $item 'UserPrincipalName')
+                }
+                if ($key -and $seen.Add($key)) {
+                    [void]$found.Add($item)
+                }
+            }
+            continue
+        }
+
+        foreach ($item in $batch) {
+            $key = [string](Get-PropertyValue $item 'ExternalDirectoryObjectId')
+            if ([string]::IsNullOrWhiteSpace($key)) {
+                $key = [string](Get-PropertyValue $item 'UserPrincipalName')
+            }
+            if ($key -and $seen.Add($key)) {
+                [void]$found.Add($item)
+            }
+        }
+    }
+
+    $foundUpns = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($item in $found) {
+        $upn = Get-PropertyValue $item 'UserPrincipalName'
+        if (-not [string]::IsNullOrWhiteSpace([string]$upn)) {
+            [void]$foundUpns.Add(([string]$upn).Trim())
+        }
+        $smtp = Get-PropertyValue $item 'PrimarySmtpAddress'
+        if (-not [string]::IsNullOrWhiteSpace([string]$smtp)) {
+            [void]$foundUpns.Add(([string]$smtp).Trim())
+        }
+    }
+
+    foreach ($upn in (ConvertTo-StringArray $LicensedUpn)) {
+        if (-not $foundUpns.Contains($upn)) {
+            [void]$unmatched.Add($upn)
+        }
+    }
+
+    if ((Get-CollectionCount $unmatched) -gt 0) {
+        Write-Info ("Filling {0} licensed UPN(s) that prefix shards did not return..." -f (Get-CollectionCount $unmatched))
+        foreach ($item in (ConvertTo-ObjectArray (Get-ExoMailboxByIdentityList -Identities $unmatched.ToArray() -QueryBase $QueryBase))) {
+            $key = [string](Get-PropertyValue $item 'ExternalDirectoryObjectId')
+            if ([string]::IsNullOrWhiteSpace($key)) {
+                $key = [string](Get-PropertyValue $item 'UserPrincipalName')
+            }
+            if ($key -and $seen.Add($key)) {
+                [void]$found.Add($item)
+            }
+        }
+    }
+
+    return , $found.ToArray()
 }
 
 function Get-MailboxUsedBytes {
@@ -1778,8 +2069,8 @@ try {
         Write-Warn 'No E3/E5 licensed users were found. Reports will be empty.'
     }
     else {
-        Write-Info 'Retrieving Exchange Online mailboxes (Minimum + Quota property sets)...'
-        $mailboxes = ConvertTo-ObjectArray (Get-ExoMailboxesForQuota -Identity $Identity -RecipientTypeDetails $RecipientTypeDetails)
+        Write-Info 'Retrieving Exchange Online mailboxes (sharded Get-EXOMailbox; this can take a while)...'
+        $mailboxes = ConvertTo-ObjectArray (Get-ExoMailboxesForQuota -Identity $Identity -RecipientTypeDetails $RecipientTypeDetails -LicensedUpn @($lookup.ByUpn.Keys))
         Write-Ok ("Retrieved {0} mailbox object(s)." -f (Get-CollectionCount $mailboxes))
 
         $matchedObjectIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
