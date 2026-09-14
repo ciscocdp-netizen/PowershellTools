@@ -1219,6 +1219,9 @@ function Invoke-MailboxQuotaSelfTest {
     Assert-Equal ($skuUri -match '\$top=999') $true 'licensed-user URI pages 999'
     $anyUri = New-GraphLicensedUsersUri -AnyLicense
     Assert-Equal ($anyUri -match 'assignedLicenses') $true 'any-license URI still filters assigned licenses'
+    Assert-Equal ($anyUri -match '\$top=999') $true 'any-license URI pages 999'
+    $skuListUri = 'https://graph.microsoft.com/v1.0/subscribedSkus'
+    Assert-Equal ($skuListUri -notmatch '\$top=') $true 'subscribedSkus URI has no custom page size'
     $withTop = Add-GraphQueryParameter -Uri 'https://graph.microsoft.com/v1.0/users?$select=id' -Name '$top' -Value '999'
     Assert-Equal ($withTop -match '\$top=999') $true 'adds $top when missing'
     $already = Add-GraphQueryParameter -Uri $withTop -Name '$top' -Value '999'
@@ -1733,8 +1736,11 @@ function Invoke-GraphGetPaged {
         [hashtable]$Headers
     )
 
+    # Do not inject $top here. /subscribedSkus (and several other Graph
+    # resources) return 400 Request_UnsupportedQuery: "This resource does not
+    # support custom page sizes." User list URIs already include $top=999.
     $items = New-Object System.Collections.Generic.List[object]
-    $next = Add-GraphQueryParameter -Uri $Uri -Name '$top' -Value '999'
+    $next = $Uri
     $page = 0
     while (-not [string]::IsNullOrWhiteSpace($next)) {
         $page++
