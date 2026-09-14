@@ -25,9 +25,15 @@
          threshold (default 90% = 45 GB). That is a reporting signal; remediation
          still only rewrites quota misconfiguration (which a 50 GB cap is).
 
-    License data is read from Microsoft Graph. Mailbox data is read from Exchange
-    Online. Nothing is changed unless you pass -Remediate (which honors -WhatIf
-    and -Confirm via ShouldProcess).
+    License data is read from Microsoft Graph. By default, mailbox quotas and
+    usage come from the Graph mailbox usage report (one download for the whole
+    tenant — typically minutes even at 30,000+ mailboxes). That report can lag
+    24-48 hours. Pass -DataSource ExchangeLive for real-time Get-EXOMailbox
+    values (much slower; tokens are refreshed before the one-hour expiry).
+
+    Nothing is changed unless you pass -Remediate (which honors -WhatIf and
+    -Confirm via ShouldProcess). Remediation uses Exchange Online only for the
+    mailboxes that actually need a quota fix.
 
     Bugs fixed vs. the original script:
     - Get-EXOMailbox / Get-EXOMailboxStatistics were called once per licensed
@@ -67,6 +73,11 @@
     - Get-EXOMailbox -ResultSize Unlimited with the full Quota property set
       drops on large tenants ("The underlying connection was closed"). Mailboxes
       are pulled in UPN-prefix shards, with reconnect + per-identity fallback.
+    - Per-mailbox Get-EXOMailbox / Get-EXOMailboxStatistics on 16k-31k mailboxes
+      runs for hours and outlives a one-hour auth token. Default data source is
+      now the Graph mailbox usage report (quotas + size in one CSV). Exchange
+      live queries remain available via -DataSource ExchangeLive, with token
+      refresh and optional app-only certificate auth.
 
 .PARAMETER OutputFolder
     Folder where CSV and HTML reports are written. Defaults to the current directory.
@@ -105,15 +116,42 @@
     Optional UPN passed to Connect-ExchangeOnline (useful for modern auth / MFA).
 
 .PARAMETER TenantId
-    Optional tenant ID passed to Connect-MgGraph.
+    Optional tenant ID passed to Connect-MgGraph. Required for app-only auth.
+
+.PARAMETER Organization
+    Exchange Online organization domain (contoso.onmicrosoft.com). Required for
+    app-only Connect-ExchangeOnline.
+
+.PARAMETER AppId
+    Optional Entra app (client) ID for app-only certificate authentication.
+    Avoids interactive MFA and is the reliable way to run past one-hour token
+    lifetimes. Grant the app User.Read.All, Organization.Read.All,
+    Reports.Read.All, and (for -Remediate) Exchange.ManageAsApp plus the
+    Exchange Administrator role.
+
+.PARAMETER CertificateThumbprint
+    Certificate thumbprint in the current-user or local-machine store, used with
+    -AppId for app-only auth.
+
+.PARAMETER DataSource
+    GraphReports (default) uses GET /reports/getMailboxUsageDetail — one
+    download with storage used and the three quota values. ExchangeLive queries
+    Exchange Online in UPN shards (real-time, much slower).
+
+.PARAMETER MailboxUsagePeriod
+    Graph report window: D7, D30, D90, or D180. Default D7.
+
+.PARAMETER TokenRefreshMinutes
+    When using ExchangeLive, reconnect before this many minutes (default 45)
+    so a one-hour delegated token does not expire mid-run.
 
 .PARAMETER Remediate
     Switch. When present, the script sets non-compliant quotas to the target values.
     Supports -WhatIf and -Confirm.
 
 .PARAMETER SkipStatistics
-    Switch. Do not call Get-EXOMailboxStatistics. Faster; near-legacy-limit
-    detection and size columns are skipped.
+    Switch. ExchangeLive only. Do not call Get-EXOMailboxStatistics. GraphReports
+    already includes storage used, so this switch has no effect there.
 
 .PARAMETER SkipDisconnect
     Switch. Leave EXO / Graph sessions connected when the script ends.
@@ -128,6 +166,12 @@
 
 .EXAMPLE
     .\Report-MailboxQuotaCompliance.ps1 -OutputFolder C:\Reports
+
+.EXAMPLE
+    .\Report-MailboxQuotaCompliance.ps1 -DataSource ExchangeLive -SkipStatistics
+
+.EXAMPLE
+    .\Report-MailboxQuotaCompliance.ps1 -AppId '<app-id>' -TenantId '<tenant-id>' -CertificateThumbprint '<thumbprint>' -Organization contoso.onmicrosoft.com
 
 .EXAMPLE
     .\Report-MailboxQuotaCompliance.ps1 -Remediate -WhatIf
@@ -161,6 +205,15 @@ param(
     [string[]]   $RecipientTypeDetails = @('UserMailbox'),
     [string]     $UserPrincipalName,
     [string]     $TenantId,
+    [string]     $Organization,
+    [string]     $AppId,
+    [string]     $CertificateThumbprint,
+    [ValidateSet('GraphReports', 'ExchangeLive')]
+    [string]     $DataSource           = 'GraphReports',
+    [ValidateSet('D7', 'D30', 'D90', 'D180')]
+    [string]     $MailboxUsagePeriod   = 'D7',
+    [ValidateRange(10, 90)]
+    [int]        $TokenRefreshMinutes  = 45,
     [switch]     $Remediate,
     [switch]     $SkipStatistics,
     [switch]     $SkipDisconnect,
@@ -177,6 +230,9 @@ $script:ExoConnectParams           = @{
     ShowBanner  = $false
     ErrorAction = 'Stop'
 }
+$script:GraphConnectParams         = $null
+$script:LastTokenRefresh           = [datetime]::MinValue
+$script:TokenRefreshMinutes        = 45
 
 #--------------------------------------------------------------------
 # Helpers
@@ -214,7 +270,11 @@ function Get-PropertyValue {
     }
 
     foreach ($candidate in @($Object.PSObject.Properties)) {
-        if ([string]::Equals($candidate.Name, $Name, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $candidateName = [string]$candidate.Name
+        if ($candidateName.Length -gt 0 -and [int][char]$candidateName[0] -eq 0xFEFF) {
+            $candidateName = $candidateName.Substring(1)
+        }
+        if ([string]::Equals($candidateName, $Name, [System.StringComparison]::OrdinalIgnoreCase)) {
             return $candidate.Value
         }
     }
@@ -989,7 +1049,7 @@ function New-HtmlReport {
 <body>
 <header>
   <h1>Mailbox Quota Compliance Report</h1>
-  <p>Generated $(ConvertTo-HtmlEncoded $generated) &middot; Mode: $(ConvertTo-HtmlEncoded $mode) &middot; Target storage cap: $($Summary.TargetStorageQuotaGB) GB</p>
+  <p>Generated $(ConvertTo-HtmlEncoded $generated) &middot; Mode: $(ConvertTo-HtmlEncoded $mode) &middot; Source: $(ConvertTo-HtmlEncoded ([string](Get-PropertyValue $Summary 'DataSource'))) &middot; Target storage cap: $($Summary.TargetStorageQuotaGB) GB</p>
 </header>
 <main>
   <div class="cards">
@@ -1153,6 +1213,51 @@ function Invoke-MailboxQuotaSelfTest {
     $prefixList = Get-UpnPrefixList -Upns @('Alex@contoso.com', 'amy@contoso.com', 'bob@contoso.com')
     Assert-Equal ((Get-CollectionCount $prefixList) -ge 2) $true 'UPN prefixes include a and b'
     Assert-Equal (ConvertTo-ExoLikeFilter -Prefix 'al') "UserPrincipalName -like 'al*'" 'EXO like filter'
+
+    $skuUri = New-GraphLicensedUsersUri -SkuIds @('6fd2c87f-b296-42f0-b197-1e91e994b900', 'c7df2760-2c81-4ef7-b578-5b5392b571df')
+    Assert-Equal ($skuUri -match 'assignedLicenses%2Fany') $true 'licensed-user URI uses SKU any() filter'
+    Assert-Equal ($skuUri -match '\$top=999') $true 'licensed-user URI pages 999'
+    $anyUri = New-GraphLicensedUsersUri -AnyLicense
+    Assert-Equal ($anyUri -match 'assignedLicenses') $true 'any-license URI still filters assigned licenses'
+    $withTop = Add-GraphQueryParameter -Uri 'https://graph.microsoft.com/v1.0/users?$select=id' -Name '$top' -Value '999'
+    Assert-Equal ($withTop -match '\$top=999') $true 'adds $top when missing'
+    $already = Add-GraphQueryParameter -Uri $withTop -Name '$top' -Value '999'
+    Assert-Equal $already $withTop 'does not duplicate $top'
+
+    $usageRow = [pscustomobject]@{
+        'User Principal Name'                = 'alex@contoso.com'
+        'Display Name'                       = 'Alex Rivera'
+        'Is Deleted'                         = 'False'
+        'Storage Used (Byte)'                = [string](46.2 * 1GB)
+        'Prohibit Send/Receive Quota (Byte)' = [string](50 * 1GB)
+        'Prohibit Send Quota (Byte)'         = [string](49 * 1GB)
+        'Issue Warning Quota (Byte)'         = [string](47.5 * 1GB)
+    }
+    $parsedUsage = ConvertFrom-MailboxUsageRow -Row $usageRow
+    Assert-Equal $parsedUsage.Mailbox.UserPrincipalName 'alex@contoso.com' 'usage CSV UPN'
+    Assert-Equal (Test-QuotaEquals -ActualBytes $parsedUsage.UsedBytes -ExpectedBytes (46.2 * 1GB) -ToleranceBytes 1MB) $true 'usage CSV used bytes'
+    $deletedRow = [pscustomobject]@{ 'User Principal Name' = 'gone@contoso.com'; 'Is Deleted' = 'True' }
+    Assert-Equal (ConvertFrom-MailboxUsageRow -Row $deletedRow) $null 'deleted usage rows skipped'
+    $bomName = ([string][char]0xFEFF) + 'User Principal Name'
+    $bomRow = New-Object psobject
+    $bomRow | Add-Member -NotePropertyName $bomName -NotePropertyValue 'bom@contoso.com'
+    $bomRow | Add-Member -NotePropertyName 'Is Deleted' -NotePropertyValue 'False'
+    $bomRow | Add-Member -NotePropertyName 'Prohibit Send/Receive Quota (Byte)' -NotePropertyValue '1000'
+    Assert-Equal (Get-CsvColumnValue -Row $bomRow -Names @('User Principal Name')) 'bom@contoso.com' 'BOM-prefixed CSV column'
+
+    $csvTmp = Join-Path ([System.IO.Path]::GetTempPath()) ('QuotaSelfTest-' + [guid]::NewGuid().ToString('N') + '.csv')
+    try {
+        $utf8 = New-Object System.Text.UTF8Encoding $true
+        $csvText = "User Principal Name,Display Name,Is Deleted,Storage Used (Byte),Prohibit Send/Receive Quota (Byte),Prohibit Send Quota (Byte),Issue Warning Quota (Byte)`r`nalex@contoso.com,Alex,False,100,200,150,140`r`n"
+        [System.IO.File]::WriteAllText($csvTmp, $csvText, $utf8)
+        $imported = ConvertTo-ObjectArray (Import-GraphReportCsv -LiteralPath $csvTmp)
+        Assert-Equal (Get-CollectionCount $imported) 1 'UTF8 BOM usage CSV imports one row'
+        Assert-Equal (Get-CsvColumnValue -Row $imported[0] -Names @('User Principal Name')) 'alex@contoso.com' 'imported usage CSV UPN'
+        Assert-Equal (Get-CsvFileEncodingName -LiteralPath $csvTmp) 'UTF8' 'detects UTF8 BOM'
+    }
+    finally {
+        Remove-Item -LiteralPath $csvTmp -Force -ErrorAction SilentlyContinue
+    }
 
     Assert-Equal (Get-CollectionCount $null) 0 'null collection count'
     Assert-Equal (Get-CollectionCount @()) 0 'empty array count'
@@ -1397,13 +1502,26 @@ function Test-ExchangeOnlineConnected {
 }
 
 function Connect-QuotaExchangeOnline {
-    param([string]$UserPrincipalName)
+    param(
+        [string]$UserPrincipalName,
+        [string]$AppId,
+        [string]$CertificateThumbprint,
+        [string]$Organization
+    )
 
     $connectParams = @{
         ShowBanner  = $false
         ErrorAction = 'Stop'
     }
-    if (-not [string]::IsNullOrWhiteSpace($UserPrincipalName)) {
+    if (-not [string]::IsNullOrWhiteSpace($AppId)) {
+        if ([string]::IsNullOrWhiteSpace($CertificateThumbprint) -or [string]::IsNullOrWhiteSpace($Organization)) {
+            throw 'App-only Exchange Online auth requires -AppId, -CertificateThumbprint, and -Organization.'
+        }
+        $connectParams['AppId'] = $AppId
+        $connectParams['CertificateThumbprint'] = $CertificateThumbprint
+        $connectParams['Organization'] = $Organization
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($UserPrincipalName)) {
         $connectParams['UserPrincipalName'] = $UserPrincipalName
     }
 
@@ -1412,6 +1530,7 @@ function Connect-QuotaExchangeOnline {
         $connectParams['DisableWAM'] = $true
     }
     $script:ExoConnectParams = $connectParams
+    $script:LastTokenRefresh = Get-Date
 
     if (Test-ExchangeOnlineConnected) {
         Write-Ok 'Reusing existing Exchange Online session.'
@@ -1441,11 +1560,53 @@ function Reset-QuotaExchangeOnline {
         }
         Connect-ExchangeOnline @script:ExoConnectParams
         $script:ExoConnectedByThisScript = $true
+        $script:LastTokenRefresh = Get-Date
         Write-Ok 'Reconnected to Exchange Online.'
     }
     finally {
         Set-StrictMode -Version Latest
     }
+}
+
+function Confirm-QuotaTokens {
+    param([switch]$Exchange)
+
+    if ($script:TokenRefreshMinutes -le 0) {
+        return
+    }
+    if ($script:LastTokenRefresh -eq [datetime]::MinValue) {
+        $script:LastTokenRefresh = Get-Date
+        return
+    }
+
+    $age = ((Get-Date) - $script:LastTokenRefresh).TotalMinutes
+    if ($age -lt $script:TokenRefreshMinutes) {
+        return
+    }
+
+    Write-Info ("Refreshing authentication after {0:N0} minutes (delegated tokens typically last 60 minutes)..." -f $age)
+    $refreshExo = $Exchange -or [bool]$script:ExoConnectedByThisScript
+    if ($refreshExo) {
+        Reset-QuotaExchangeOnline
+    }
+    if ($null -ne $script:GraphConnectParams) {
+        try {
+            Set-StrictMode -Off
+            if (Get-Command Disconnect-MgGraph -ErrorAction SilentlyContinue) {
+                Disconnect-MgGraph -ErrorAction SilentlyContinue
+            }
+            Set-StrictMode -Version Latest
+            Invoke-WithRetry -Activity 'Connect-MgGraph' -ScriptBlock { Connect-MgGraph @script:GraphConnectParams }
+            $script:GraphConnectedByThisScript = $true
+        }
+        catch {
+            Write-Warn ("Graph re-auth failed: {0}" -f (Get-ExceptionMessageChain $_.Exception))
+        }
+        finally {
+            Set-StrictMode -Version Latest
+        }
+    }
+    $script:LastTokenRefresh = Get-Date
 }
 
 function Test-GraphHasRequiredScopes {
@@ -1472,14 +1633,26 @@ function Test-GraphHasRequiredScopes {
         if ($scope) { [void]$haveSet.Add([string]$scope) }
     }
 
-    if ($haveSet.Contains('.default') -or $haveSet.Contains('Directory.Read.All') -or $haveSet.Contains('Directory.ReadWrite.All')) {
-        return $true
-    }
+    $directoryRead = $haveSet.Contains('.default') -or
+        $haveSet.Contains('Directory.Read.All') -or
+        $haveSet.Contains('Directory.ReadWrite.All')
 
     foreach ($need in $Required) {
-        if (-not $haveSet.Contains($need)) {
-            return $false
+        if ([string]::IsNullOrWhiteSpace($need)) {
+            continue
         }
+        if ($haveSet.Contains($need)) {
+            continue
+        }
+        # Directory.Read.All covers user/org reads, not Reports.Read.All.
+        if ($directoryRead -and (
+                [string]::Equals($need, 'User.Read.All', [System.StringComparison]::OrdinalIgnoreCase) -or
+                [string]::Equals($need, 'Organization.Read.All', [System.StringComparison]::OrdinalIgnoreCase) -or
+                [string]::Equals($need, '.default', [System.StringComparison]::OrdinalIgnoreCase)
+            )) {
+            continue
+        }
+        return $false
     }
     return $true
 }
@@ -1487,8 +1660,34 @@ function Test-GraphHasRequiredScopes {
 function Connect-QuotaGraph {
     param(
         [string]$TenantId,
-        [string[]]$Scopes
+        [string[]]$Scopes,
+        [string]$AppId,
+        [string]$CertificateThumbprint
     )
+
+    $connectParams = @{
+        ErrorAction = 'Stop'
+    }
+    if (Test-HasCmdletParameter -CommandName 'Connect-MgGraph' -ParameterName 'NoWelcome') {
+        $connectParams['NoWelcome'] = $true
+    }
+    if (-not [string]::IsNullOrWhiteSpace($TenantId)) {
+        $connectParams['TenantId'] = $TenantId
+    }
+
+    $appOnly = -not [string]::IsNullOrWhiteSpace($AppId)
+    if ($appOnly) {
+        if ([string]::IsNullOrWhiteSpace($CertificateThumbprint) -or [string]::IsNullOrWhiteSpace($TenantId)) {
+            throw 'App-only Graph auth requires -AppId, -CertificateThumbprint, and -TenantId.'
+        }
+        $connectParams['ClientId'] = $AppId
+        $connectParams['CertificateThumbprint'] = $CertificateThumbprint
+    }
+    else {
+        $connectParams['Scopes'] = $Scopes
+    }
+
+    $script:GraphConnectParams = $connectParams
 
     $hasContext = $false
     try {
@@ -1499,25 +1698,32 @@ function Connect-QuotaGraph {
         $hasContext = $false
     }
 
-    if ($hasContext -and (Test-GraphHasRequiredScopes -Required $Scopes)) {
+    if (-not $appOnly -and $hasContext -and (Test-GraphHasRequiredScopes -Required $Scopes)) {
         Write-Ok 'Reusing existing Microsoft Graph session.'
+        $script:LastTokenRefresh = Get-Date
         return
     }
 
-    $connectParams = @{
-        Scopes      = $Scopes
-        ErrorAction = 'Stop'
-    }
-    if (-not [string]::IsNullOrWhiteSpace($TenantId)) {
-        $connectParams['TenantId'] = $TenantId
-    }
-    if (Test-HasCmdletParameter -CommandName 'Connect-MgGraph' -ParameterName 'NoWelcome') {
-        $connectParams['NoWelcome'] = $true
-    }
-
-    Invoke-WithRetry -Activity 'Connect-MgGraph' -ScriptBlock { Connect-MgGraph @connectParams }
+    Invoke-WithRetry -Activity 'Connect-MgGraph' -ScriptBlock { Connect-MgGraph @script:GraphConnectParams }
     $script:GraphConnectedByThisScript = $true
+    $script:LastTokenRefresh = Get-Date
     Write-Ok 'Connected to Microsoft Graph.'
+}
+
+function Add-GraphQueryParameter {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Value
+    )
+
+    if ($Uri -match ('(\?|&)' + [regex]::Escape($Name) + '=')) {
+        return $Uri
+    }
+    if ($Uri -match '\?') {
+        return ($Uri + '&' + $Name + '=' + $Value)
+    }
+    return ($Uri + '?' + $Name + '=' + $Value)
 }
 
 function Invoke-GraphGetPaged {
@@ -1528,8 +1734,13 @@ function Invoke-GraphGetPaged {
     )
 
     $items = New-Object System.Collections.Generic.List[object]
-    $next = $Uri
+    $next = Add-GraphQueryParameter -Uri $Uri -Name '$top' -Value '999'
+    $page = 0
     while (-not [string]::IsNullOrWhiteSpace($next)) {
+        $page++
+        Confirm-QuotaTokens
+        Write-Progress -Activity 'Microsoft Graph paging' -Status ("Page {0}; {1} item(s) so far" -f $page, $items.Count)
+
         $params = @{
             Method      = 'GET'
             Uri         = $next
@@ -1552,7 +1763,171 @@ function Invoke-GraphGetPaged {
             $next = $null
         }
     }
+    Write-Progress -Activity 'Microsoft Graph paging' -Completed
     return , $items.ToArray()
+}
+
+function Get-CsvColumnValue {
+    param(
+        $Row,
+        [string[]]$Names
+    )
+
+    foreach ($name in $Names) {
+        $value = Get-PropertyValue $Row $name
+        if ($null -ne $value -and -not [string]::IsNullOrWhiteSpace([string]$value)) {
+            return $value
+        }
+    }
+    return $null
+}
+
+function Get-CsvFileEncodingName {
+    param([Parameter(Mandatory)][string]$LiteralPath)
+
+    $bytes = [System.IO.File]::ReadAllBytes($LiteralPath)
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        return 'UTF8'
+    }
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) {
+        return 'Unicode'
+    }
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) {
+        return 'BigEndianUnicode'
+    }
+    return 'UTF8'
+}
+
+function Import-GraphReportCsv {
+    param([Parameter(Mandatory)][string]$LiteralPath)
+
+    if (-not (Test-Path -LiteralPath $LiteralPath)) {
+        throw "Graph mailbox usage report was not written to '$LiteralPath'."
+    }
+
+    $item = Get-Item -LiteralPath $LiteralPath
+    if ($item.Length -lt 20) {
+        throw 'Graph mailbox usage report file is empty. Grant Reports.Read.All (and wait a minute after consent) or use -DataSource ExchangeLive.'
+    }
+
+    $encoding = Get-CsvFileEncodingName -LiteralPath $LiteralPath
+    $rows = @(Import-Csv -LiteralPath $LiteralPath -Encoding $encoding)
+    if ((Get-CollectionCount $rows) -eq 0) {
+        throw 'Graph mailbox usage report CSV had headers but no rows.'
+    }
+
+    $sample = $rows[0]
+    $columnNames = New-Object System.Collections.Generic.List[string]
+    foreach ($prop in @($sample.PSObject.Properties)) {
+        $name = [string]$prop.Name
+        if ($name.Length -gt 0 -and [int][char]$name[0] -eq 0xFEFF) {
+            $name = $name.Substring(1)
+        }
+        [void]$columnNames.Add($name)
+    }
+    $joined = [string]::Join('|', $columnNames.ToArray())
+    if ($joined -notmatch 'User Principal Name|UserPrincipalName') {
+        throw ("Unexpected Graph mailbox usage CSV columns: {0}. Grant Reports.Read.All or use -DataSource ExchangeLive." -f [string]::Join(', ', $columnNames.ToArray()))
+    }
+    return , $rows
+}
+
+function ConvertFrom-MailboxUsageRow {
+    param($Row)
+
+    $deleted = ConvertTo-Bool (Get-CsvColumnValue -Row $Row -Names @('Is Deleted', 'IsDeleted'))
+    if ($deleted) {
+        return $null
+    }
+
+    $upn = Get-CsvColumnValue -Row $Row -Names @('User Principal Name', 'UserPrincipalName', 'UPN')
+    if ([string]::IsNullOrWhiteSpace([string]$upn)) {
+        return $null
+    }
+
+    $mailbox = [pscustomobject]@{
+        UserPrincipalName         = $upn
+        DisplayName               = Get-CsvColumnValue -Row $Row -Names @('Display Name', 'DisplayName')
+        ExternalDirectoryObjectId = $null
+        RecipientTypeDetails      = 'UserMailbox'
+        ProhibitSendReceiveQuota  = Get-CsvColumnValue -Row $Row -Names @('Prohibit Send/Receive Quota (Byte)', 'Prohibit Send/Receive Quota (Bytes)', 'ProhibitSendReceiveQuota')
+        ProhibitSendQuota         = Get-CsvColumnValue -Row $Row -Names @('Prohibit Send Quota (Byte)', 'Prohibit Send Quota (Bytes)', 'ProhibitSendQuota')
+        IssueWarningQuota         = Get-CsvColumnValue -Row $Row -Names @('Issue Warning Quota (Byte)', 'Issue Warning Quota (Bytes)', 'IssueWarningQuota')
+        UseDatabaseQuotaDefaults  = $null
+    }
+
+    $used = Get-CsvColumnValue -Row $Row -Names @('Storage Used (Byte)', 'Storage Used (Bytes)', 'StorageUsed')
+    return [pscustomobject]@{
+        Mailbox   = $mailbox
+        UsedBytes = $(if ($null -eq $used) { $null } else { ConvertTo-Bytes $used })
+    }
+}
+
+function Save-GraphReportCsv {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][string]$LiteralPath
+    )
+
+    Set-StrictMode -Off
+    try {
+        if (Test-HasCmdletParameter -CommandName 'Invoke-MgGraphRequest' -ParameterName 'OutputFilePath') {
+            Invoke-WithRetry -Activity 'GET mailbox usage report' -ScriptBlock {
+                Invoke-MgGraphRequest -Method GET -Uri $Uri -OutputFilePath $LiteralPath -ErrorAction Stop
+            }
+            if ((Test-Path -LiteralPath $LiteralPath) -and ((Get-Item -LiteralPath $LiteralPath).Length -gt 50)) {
+                return
+            }
+        }
+
+        $resp = Invoke-WithRetry -Activity 'GET mailbox usage report' -ScriptBlock {
+            Invoke-MgGraphRequest -Method GET -Uri $Uri -ErrorAction Stop
+        }
+
+        if ($resp -is [string] -and $resp -match 'User Principal Name|Prohibit Send') {
+            $utf8 = New-Object System.Text.UTF8Encoding $false
+            [System.IO.File]::WriteAllText($LiteralPath, $resp, $utf8)
+            return
+        }
+
+        if ($resp -is [byte[]]) {
+            [System.IO.File]::WriteAllBytes($LiteralPath, $resp)
+            return
+        }
+
+        $location = Get-PropertyValue $resp 'Location'
+        if ([string]::IsNullOrWhiteSpace([string]$location)) {
+            $location = Get-PropertyValue $resp '@odata.mediaReadLink'
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$location)) {
+            Invoke-WebRequest -Uri $location -OutFile $LiteralPath -UseBasicParsing -ErrorAction Stop
+            return
+        }
+
+        throw "Unexpected Graph mailbox usage report response ($($resp.GetType().FullName)). Grant Reports.Read.All or use -DataSource ExchangeLive."
+    }
+    finally {
+        Set-StrictMode -Version Latest
+    }
+}
+
+function Get-GraphMailboxUsageRows {
+    param(
+        [Parameter(Mandatory)][string]$Period
+    )
+
+    $uri = "https://graph.microsoft.com/v1.0/reports/getMailboxUsageDetail(period='$Period')"
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('MailboxUsageDetail-' + [guid]::NewGuid().ToString('N') + '.csv')
+    try {
+        Write-Info ("Downloading Graph mailbox usage report ({0})..." -f $Period)
+        Save-GraphReportCsv -Uri $uri -LiteralPath $tmp
+        $rows = ConvertTo-ObjectArray (Import-GraphReportCsv -LiteralPath $tmp)
+        Write-Ok ("Mailbox usage report rows: {0}" -f (Get-CollectionCount $rows))
+        return , $rows
+    }
+    finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Get-GraphSubscribedSkuMap {
@@ -1588,13 +1963,39 @@ function Get-SkuIdsByPartNumber {
     return @($ids.ToArray())
 }
 
+function New-GraphLicensedUsersUri {
+    param(
+        [string[]]$SkuIds,
+        [switch]$AnyLicense
+    )
+
+    $select = 'id,userPrincipalName,displayName,assignedLicenses,accountEnabled'
+    $skuList = ConvertTo-StringArray $SkuIds
+    if ((-not $AnyLicense) -and ((Get-CollectionCount $skuList) -gt 0)) {
+        $parts = New-Object System.Collections.Generic.List[string]
+        foreach ($id in $skuList) {
+            [void]$parts.Add(('assignedLicenses/any(x:x/skuId eq {0})' -f $id))
+        }
+        $filter = [string]::Join(' or ', $parts.ToArray())
+    }
+    else {
+        $filter = 'assignedLicenses/$count ne 0'
+    }
+    $encodedFilter = [uri]::EscapeDataString($filter)
+    return "https://graph.microsoft.com/v1.0/users?`$count=true&`$filter=$encodedFilter&`$select=$select&`$top=999"
+}
+
 function Get-GraphLicensedUsers {
-    param([string[]]$Identity)
+    param(
+        [string[]]$Identity,
+        [string[]]$SkuIds
+    )
 
     $requested = ConvertTo-StringArray $Identity
     if ((Get-CollectionCount $requested) -gt 0) {
         $users = New-Object System.Collections.Generic.List[object]
         foreach ($id in $requested) {
+            Confirm-QuotaTokens
             $encoded = [uri]::EscapeDataString($id)
             $uri = "https://graph.microsoft.com/v1.0/users/${encoded}?`$select=id,userPrincipalName,displayName,assignedLicenses,accountEnabled"
             $params = @{
@@ -1616,14 +2017,25 @@ function Get-GraphLicensedUsers {
         return , $users.ToArray()
     }
 
-    $select = 'id,userPrincipalName,displayName,assignedLicenses,accountEnabled'
-    $filterUri = "https://graph.microsoft.com/v1.0/users?`$count=true&`$filter=assignedLicenses/`$count ne 0&`$select=$select"
+    $headers = @{ ConsistencyLevel = 'eventual' }
+    $skuList = ConvertTo-StringArray $SkuIds
+    if ((Get-CollectionCount $skuList) -gt 0) {
+        try {
+            Write-Info 'Retrieving E3/E5 users from Microsoft Graph (paged, $top=999)...'
+            return Invoke-GraphGetPaged -Uri (New-GraphLicensedUsersUri -SkuIds $skuList) -Headers $headers
+        }
+        catch {
+            Write-Warn ("E3/E5 SKU filter was not accepted ({0}). Retrying with any assigned license..." -f (Get-ExceptionMessageChain $_.Exception))
+        }
+    }
+
     try {
-        return Invoke-GraphGetPaged -Uri $filterUri -Headers @{ ConsistencyLevel = 'eventual' }
+        Write-Info 'Retrieving licensed users from Microsoft Graph (paged, $top=999)...'
+        return Invoke-GraphGetPaged -Uri (New-GraphLicensedUsersUri -AnyLicense) -Headers $headers
     }
     catch {
-        Write-Warn "Licensed-user Graph filter was not accepted ($($_.Exception.Message)). Falling back to a full user scan..."
-        $fallback = "https://graph.microsoft.com/v1.0/users?`$select=$select"
+        Write-Warn ("Licensed-user Graph filter was not accepted ({0}). Falling back to a full user scan..." -f (Get-ExceptionMessageChain $_.Exception))
+        $fallback = "https://graph.microsoft.com/v1.0/users?`$select=id,userPrincipalName,displayName,assignedLicenses,accountEnabled&`$top=999"
         return Invoke-GraphGetPaged -Uri $fallback
     }
 }
@@ -1698,6 +2110,9 @@ function Get-ExoMailboxByIdentityList {
     foreach ($id in $list) {
         $index++
         Write-Progress -Activity 'Get-EXOMailbox by identity' -Status $id -PercentComplete (($index / [Math]::Max($total, 1)) * 100)
+        if (($index % 20) -eq 0) {
+            Confirm-QuotaTokens -Exchange
+        }
         try {
             $mbx = Invoke-WithRetry -Activity "Get-EXOMailbox $id" -ScriptBlock {
                 Get-EXOMailbox -Identity $id @QueryBase
@@ -1742,6 +2157,7 @@ function Get-ExoMailboxByUpnPrefix {
         }
 
         Write-Info ("Mailbox shard {0}/{1}: {2}" -f $prefixIndex, $prefixCount, $filter)
+        Confirm-QuotaTokens -Exchange
         $query = @{}
         foreach ($key in $QueryBase.Keys) {
             $query[$key] = $QueryBase[$key]
@@ -1936,6 +2352,7 @@ function Write-QuotaReportSet {
         [Parameter(Mandatory)] [hashtable] $Policy,
         [Parameter(Mandatory)] [string] $OutputFolder,
         [int] $LicensedWithoutMailbox = 0,
+        [string] $DataSource = '',
         [switch] $Remediated,
         [switch] $SkipRemediateHint
     )
@@ -1976,6 +2393,7 @@ function Write-QuotaReportSet {
         LegacyQuotaGB        = $Policy.LegacyQuotaGB
         NearLimitPercent     = $Policy.NearLimitPercent
         Remediated           = [bool]$Remediated
+        DataSource           = $DataSource
     }
 
     Write-Host ''
@@ -2025,24 +2443,40 @@ $policy = New-QuotaPolicy `
 if ($DemoReport) {
     Write-Info 'Writing a sample report (no tenant connection)...'
     $results = Get-MailboxQuotaDemoRows -Policy $policy
-    Write-QuotaReportSet -Results $results -Policy $policy -OutputFolder $OutputFolder -SkipRemediateHint | Out-Null
+    Write-QuotaReportSet -Results $results -Policy $policy -OutputFolder $OutputFolder -DataSource 'Demo' -SkipRemediateHint | Out-Null
     return
 }
 #--------------------------------------------------------------------
 # Connect
 #--------------------------------------------------------------------
 
+$script:TokenRefreshMinutes = $TokenRefreshMinutes
+$useGraphReports = ($DataSource -eq 'GraphReports')
+$needExo = $Remediate -or ($DataSource -eq 'ExchangeLive')
+$sourceLabel = $DataSource
+
 Write-Info 'Checking required modules...'
 Enable-Tls12
 Enable-DefaultProxyCredentials
-Import-RequiredModule -Name 'ExchangeOnlineManagement'
 Import-RequiredModule -Name 'Microsoft.Graph.Authentication'
+if ($needExo) {
+    Import-RequiredModule -Name 'ExchangeOnlineManagement'
+}
 
-Write-Info 'Connecting to Exchange Online...'
-Connect-QuotaExchangeOnline -UserPrincipalName $UserPrincipalName
+$graphScopes = New-Object System.Collections.Generic.List[string]
+[void]$graphScopes.Add('User.Read.All')
+[void]$graphScopes.Add('Organization.Read.All')
+if ($useGraphReports) {
+    [void]$graphScopes.Add('Reports.Read.All')
+}
 
 Write-Info 'Connecting to Microsoft Graph...'
-Connect-QuotaGraph -TenantId $TenantId -Scopes @('User.Read.All', 'Organization.Read.All')
+Connect-QuotaGraph -TenantId $TenantId -Scopes @($graphScopes.ToArray()) -AppId $AppId -CertificateThumbprint $CertificateThumbprint
+
+if ($needExo) {
+    Write-Info 'Connecting to Exchange Online...'
+    Connect-QuotaExchangeOnline -UserPrincipalName $UserPrincipalName -AppId $AppId -CertificateThumbprint $CertificateThumbprint -Organization $Organization
+}
 
 $results = New-Object System.Collections.Generic.List[object]
 $licensedWithoutMailbox = 0
@@ -2060,15 +2494,90 @@ try {
         Write-Warn ("E5 SKU(s) '{0}' not found in this tenant." -f ($E5SkuPartNumber -join ', '))
     }
 
+    $usageRows = @()
+    if ($useGraphReports) {
+        Write-Info 'Using Microsoft Graph mailbox usage report (one tenant download; typically minutes for 30k+ mailboxes). Data can lag 24-48 hours.'
+        try {
+            $usageRows = ConvertTo-ObjectArray (Get-GraphMailboxUsageRows -Period $MailboxUsagePeriod)
+            $sourceLabel = "GraphReports ($MailboxUsagePeriod, ~24-48h delay)"
+        }
+        catch {
+            Write-Warn ("Graph mailbox usage report failed ({0}). Falling back to ExchangeLive — that path can take hours and may outlive a 1-hour token. Grant Reports.Read.All and re-run, or use app-only certificate auth." -f (Get-ExceptionMessageChain $_.Exception))
+            $useGraphReports = $false
+            $needExo = $true
+            Import-RequiredModule -Name 'ExchangeOnlineManagement'
+            if (-not (Test-ExchangeOnlineConnected)) {
+                Connect-QuotaExchangeOnline -UserPrincipalName $UserPrincipalName -AppId $AppId -CertificateThumbprint $CertificateThumbprint -Organization $Organization
+            }
+        }
+    }
+
     Write-Info 'Retrieving licensed users from Microsoft Graph (this can take a while)...'
-    $allUsers = Get-GraphLicensedUsers -Identity $Identity
+    $skuIdsForFilter = ConvertTo-StringArray (@(ConvertTo-ObjectArray $e3SkuIds) + @(ConvertTo-ObjectArray $e5SkuIds))
+    $allUsers = Get-GraphLicensedUsers -Identity $Identity -SkuIds $skuIdsForFilter
     $lookup = Get-LicenseLookupTables -Users $allUsers -SkuMap $skuMap -E3SkuIds $e3SkuIds -E5SkuIds $e5SkuIds
     Write-Ok ("Found {0} users with an E3 and/or E5 license." -f $lookup.UserCount)
 
     if ([int]$lookup.UserCount -eq 0) {
         Write-Warn 'No E3/E5 licensed users were found. Reports will be empty.'
     }
-    else {
+    elseif ($useGraphReports) {
+        $matchedUpns = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $index = 0
+        $total = Get-CollectionCount $usageRows
+        foreach ($csvRow in $usageRows) {
+            $index++
+            if (($index % 500) -eq 0) {
+                Write-Progress -Activity 'Evaluating mailbox usage report' -Status "$index of $total" -PercentComplete (($index / [Math]::Max($total, 1)) * 100)
+            }
+            $parsed = ConvertFrom-MailboxUsageRow -Row $csvRow
+            if ($null -eq $parsed) {
+                continue
+            }
+            $lic = Resolve-MailboxLicense -Mailbox $parsed.Mailbox -LicenseByObjectId $lookup.ByObjectId -LicenseByUpn $lookup.ByUpn
+            if ($null -eq $lic) {
+                continue
+            }
+            $upnKey = [string]$parsed.Mailbox.UserPrincipalName
+            if (-not [string]::IsNullOrWhiteSpace($upnKey)) {
+                [void]$matchedUpns.Add($upnKey.Trim())
+            }
+
+            $row = Get-MailboxQuotaEvaluation -Mailbox $parsed.Mailbox -UsedBytes $parsed.UsedBytes -License $lic -Policy $policy
+            [void]$results.Add($row)
+
+            if ($Remediate -and $row.NeedsRemediation) {
+                Confirm-QuotaTokens -Exchange
+                $target = "SR=$TargetStorageQuotaGB GB, Send=$ProhibitSendQuotaGB GB, Warn=$IssueWarningQuotaGB GB"
+                $identityForSet = $row.UserPrincipalName
+                if ($PSCmdlet.ShouldProcess($identityForSet, "Set quotas to $target")) {
+                    try {
+                        Invoke-WithRetry -Activity "Set-Mailbox $identityForSet" -ScriptBlock {
+                            Set-Mailbox -Identity $identityForSet `
+                                -UseDatabaseQuotaDefaults $false `
+                                -ProhibitSendReceiveQuota ("{0}GB" -f $TargetStorageQuotaGB) `
+                                -ProhibitSendQuota        ("{0}GB" -f $ProhibitSendQuotaGB) `
+                                -IssueWarningQuota        ("{0}GB" -f $IssueWarningQuotaGB) `
+                                -ErrorAction Stop
+                        }
+                        Write-Ok "Remediated quotas for $identityForSet."
+                    }
+                    catch {
+                        Write-Err "Failed to remediate ${identityForSet}: $(Get-ExceptionMessageChain $_.Exception)"
+                    }
+                }
+            }
+        }
+
+        foreach ($upn in @($lookup.ByUpn.Keys)) {
+            if (-not $matchedUpns.Contains($upn)) {
+                $licensedWithoutMailbox++
+            }
+        }
+    }
+
+    if (-not $useGraphReports -and [int]$lookup.UserCount -gt 0) {
+        $sourceLabel = 'ExchangeLive'
         Write-Info 'Retrieving Exchange Online mailboxes (sharded Get-EXOMailbox; this can take a while)...'
         $mailboxes = ConvertTo-ObjectArray (Get-ExoMailboxesForQuota -Identity $Identity -RecipientTypeDetails $RecipientTypeDetails -LicensedUpn @($lookup.ByUpn.Keys))
         Write-Ok ("Retrieved {0} mailbox object(s)." -f (Get-CollectionCount $mailboxes))
@@ -2079,6 +2588,9 @@ try {
 
         foreach ($mbx in $mailboxes) {
             $index++
+            if (($index % 25) -eq 0) {
+                Confirm-QuotaTokens -Exchange
+            }
             $status = [string](Get-PropertyValue $mbx 'UserPrincipalName')
             if ([string]::IsNullOrWhiteSpace($status)) {
                 $status = [string](Get-PropertyValue $mbx 'PrimarySmtpAddress')
@@ -2104,6 +2616,7 @@ try {
             [void]$results.Add($row)
 
             if ($Remediate -and $row.NeedsRemediation) {
+                Confirm-QuotaTokens -Exchange
                 $target = "SR=$TargetStorageQuotaGB GB, Send=$ProhibitSendQuotaGB GB, Warn=$IssueWarningQuotaGB GB"
                 $identityForSet = $row.UserPrincipalName
                 if ([string]::IsNullOrWhiteSpace([string]$identityForSet)) {
@@ -2137,6 +2650,7 @@ try {
 }
 finally {
     Write-Progress -Activity 'Evaluating mailboxes' -Completed
+    Write-Progress -Activity 'Evaluating mailbox usage report' -Completed
     Disconnect-QuotaSessions -SkipDisconnect:$SkipDisconnect
 }
 
@@ -2149,5 +2663,6 @@ Write-QuotaReportSet `
     -Policy $policy `
     -OutputFolder $OutputFolder `
     -LicensedWithoutMailbox $licensedWithoutMailbox `
+    -DataSource $sourceLabel `
     -Remediated:$Remediate `
     -SkipRemediateHint:$Remediate | Out-Null
