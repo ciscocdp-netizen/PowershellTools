@@ -119,7 +119,7 @@ $script:ProgressLabel = $null
 $script:ProgressDetail = $null
 $script:GraphScopeList = @('UserAuthenticationMethod.Read.All', 'User.Read.All')
 $script:GraphScopeString = 'UserAuthenticationMethod.Read.All User.Read.All offline_access openid profile'
-$script:ScriptBuild = '2026-09-16-b'
+$script:ScriptBuild = '2026-09-16-c'
 # Current Connect-MgGraph / Microsoft Graph Command Line Tools public client.
 $script:GraphPowerShellClientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
 # Older Microsoft Graph PowerShell public client. Still present in some tenants.
@@ -818,25 +818,51 @@ function New-AuthParentForm {
     return $form
 }
 
-function Get-PublicClientIdList {
-    $ids = New-Object System.Collections.Generic.List[string]
-    # Known public Microsoft apps first. A custom -ClientId is often a web
-    # app with a secret (AADSTS7000218), so it is tried last.
-    [void]$ids.Add($script:GraphPowerShellClientId)
-    [void]$ids.Add($script:GraphPowerShellLegacyClientId)
-    if (-not [string]::IsNullOrWhiteSpace($ClientId)) {
-        [void]$ids.Add($ClientId.Trim())
-    }
+function Add-GuidToList {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[string]]$Target,
 
-    $seen = @{}
-    $unique = New-Object System.Collections.Generic.List[string]
-    foreach ($id in $ids) {
-        $key = $id.ToLowerInvariant()
-        if ($seen.ContainsKey($key)) { continue }
-        $seen[$key] = $true
-        [void]$unique.Add($id)
+        [string]$Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return }
+
+    # Extract GUIDs explicitly. Do not use string[].Split() — a single
+    # result unrolls to a [string] in Windows PowerShell 5.1, and then [0]
+    # is the first character.
+    $matches = [regex]::Matches(
+        [string]$Value,
+        '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+    )
+    for ($m = 0; $m -lt $matches.Count; $m++) {
+        $part = [string]$matches[$m].Value
+        if (-not (Test-LooksLikeGuid $part)) { continue }
+        $key = $part.ToLowerInvariant()
+        $exists = $false
+        for ($i = 0; $i -lt $Target.Count; $i++) {
+            if ($Target[$i].ToLowerInvariant() -eq $key) {
+                $exists = $true
+                break
+            }
+        }
+        if (-not $exists) {
+            [void]$Target.Add($part)
+        }
     }
-    return ,$unique
+}
+
+function New-PublicClientIdList {
+    $ids = New-Object System.Collections.Generic.List[string]
+    Add-GuidToList -Target $ids -Value $script:GraphPowerShellClientId
+    Add-GuidToList -Target $ids -Value $script:GraphPowerShellLegacyClientId
+    Add-GuidToList -Target $ids -Value $ClientId
+    return $ids
+}
+
+function Get-PublicClientIdList {
+    return (New-PublicClientIdList)
 }
 
 function Get-GraphAdminConsentUrl {
@@ -1485,19 +1511,21 @@ function Connect-ViaRestDeviceCode {
     $tenant = Resolve-DeviceCodeTenant
     $authority = "https://login.microsoftonline.com/$tenant"
 
+    # Never wrap List[string] in @() and Add() it — Windows PowerShell 5.1
+    # turns the whole list into one space-separated client_id (AADSTS700016).
     $clientIds = New-Object System.Collections.Generic.List[string]
-    foreach ($id in @(Get-PublicClientIdList)) {
-        [void]$clientIds.Add($id)
+    Add-GuidToList -Target $clientIds -Value $script:GraphPowerShellClientId
+    Add-GuidToList -Target $clientIds -Value $script:GraphPowerShellLegacyClientId
+    Add-GuidToList -Target $clientIds -Value $ClientId
+    Add-GuidToList -Target $clientIds -Value $AppClientId
+
+    if ($clientIds.Count -lt 1) {
+        throw 'No valid application (client) IDs are available for device-code sign-in.'
     }
-    if (-not [string]::IsNullOrWhiteSpace($AppClientId)) {
-        $extra = $AppClientId.Trim()
-        $already = $false
-        foreach ($existing in $clientIds) {
-            if ($existing.ToLowerInvariant() -eq $extra.ToLowerInvariant()) { $already = $true; break }
-        }
-        if (-not $already) {
-            [void]$clientIds.Add($extra)
-        }
+
+    Write-Host ("Will try {0} app(s), one GUID at a time." -f $clientIds.Count) -ForegroundColor Gray
+    for ($n = 0; $n -lt $clientIds.Count; $n++) {
+        Write-Host ("  {0}. {1}" -f ($n + 1), $clientIds[$n]) -ForegroundColor Gray
     }
 
     # Never use the Graph SDK device-code switch or the PowerShell web cmdlets here.
@@ -1509,8 +1537,13 @@ function Connect-ViaRestDeviceCode {
     $usedClientId = $null
     $lastDetail = ''
 
-    foreach ($candidateId in $clientIds) {
-        Write-Host "Trying app $candidateId ..." -ForegroundColor Gray
+    for ($i = 0; $i -lt $clientIds.Count; $i++) {
+        $candidateId = $clientIds[$i]
+        if (-not (Test-LooksLikeGuid $candidateId)) {
+            Write-Host "Skipping invalid client id '$candidateId'." -ForegroundColor Yellow
+            continue
+        }
+        Write-Host ("Trying app {0} of {1}: {2}" -f ($i + 1), $clientIds.Count, $candidateId) -ForegroundColor Gray
         $dcBody = ConvertTo-FormUrlEncoded -Data @{
             client_id = $candidateId
             scope     = $script:GraphScopeString
@@ -2231,6 +2264,19 @@ function Invoke-SelfTest {
     Assert-Equal $script:GraphPowerShellClientId $pubIds[0] 'graph command line tools client is default'
     Assert-Equal $script:GraphPowerShellLegacyClientId $pubIds[1] 'legacy graph powershell client is fallback'
     Assert-Equal 2 $pubIds.Count 'default public clients are current then legacy Graph PowerShell'
+    Assert-False ([string]$pubIds[0] -match ' ') 'first client id is a single GUID'
+
+    $splitIds = New-Object System.Collections.Generic.List[string]
+    Add-GuidToList -Target $splitIds -Value '14d82eec-204b-4c2f-b7e8-296a70dab67e 14d82eec-204b-4c2f-b113-9d477e6ee18c 75bb6448-1dfa-4d95-9752-d030642a554c'
+    Assert-Equal 3 $splitIds.Count 'space-separated client ids are split'
+    Assert-Equal '14d82eec-204b-4c2f-b7e8-296a70dab67e' $splitIds[0] 'split client id 0'
+    Assert-Equal '75bb6448-1dfa-4d95-9752-d030642a554c' $splitIds[2] 'split client id 2'
+    Assert-True (Test-LooksLikeGuid $splitIds[0]) 'split id 0 is guid'
+    Assert-False ($splitIds[0] -match ' ') 'split id 0 has no spaces'
+
+    $stringified = New-Object System.Collections.Generic.List[string]
+    Add-GuidToList -Target $stringified -Value ([string]$splitIds)
+    Assert-Equal 3 $stringified.Count 'stringified list is split back into guids'
 
     $consent = Get-GraphAdminConsentUrl
     Assert-True ($consent -match 'adminconsent') 'admin consent url'
@@ -2267,7 +2313,8 @@ function Invoke-SelfTest {
     Assert-True ($restFn -match 'Invoke-EntraFormPost') 'REST device code uses timed HttpWebRequest'
     Assert-True ($restFn -notmatch 'Invoke-RestMethod') 'REST device code does not use Invoke-RestMethod'
     Assert-True ($restFn -notmatch 'Connect-MgGraph') 'REST device code does not call Connect-MgGraph'
-    Assert-True ($restFn -match 'Test-ShouldTryNextDeviceCodeClient') 'REST device code skips confidential clients'
+    Assert-True ($restFn -match 'Add-GuidToList') 'REST device code adds GUIDs individually'
+    Assert-True ($restFn -notmatch '@\(Get-PublicClientIdList\)') 'REST device code does not wrap client list in @()'
 
     $hangPhrase = 'a URL and code will appear' + ' below'
     $wamFn = ${function:Invoke-ConnectMgGraph}.ToString()
