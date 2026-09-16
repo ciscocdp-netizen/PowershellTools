@@ -1,19 +1,21 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Reports which users from an imported CSV do NOT have a strong authentication
-    method registered in Entra ID (Azure AD) — only a password, or nothing at all.
+    Reports every Entra ID authentication method registered for users in a CSV,
+    flags accounts with no method registered, and shows each user's default
+    sign-in method.
 
 .DESCRIPTION
     Fully interactive, PowerShell 5.1 and Windows PowerShell ISE compatible.
       * Prompts you (via a GUI file picker) to select the input CSV of users.
       * Prompts you (via a GUI save dialog) to choose where the report is saved.
-      * Connects to Microsoft Graph and inspects each user's registered
-        authentication methods.
-      * A user is flagged as "missing" when they have NO authentication methods
-        registered, or only a password (i.e. no Microsoft Authenticator, phone,
-        FIDO2, Windows Hello, software OATH, email, TAP, passkey, or any other
-        non-password method).
+      * Connects to Microsoft Graph and lists each user's registered
+        authentication methods (Authenticator, phone, FIDO2, Windows Hello,
+        OATH, email, TAP, passkey, password, and others).
+      * Flags accounts with NO authentication methods, or only a password.
+      * Records the default / preferred sign-in method from Entra
+        (system-preferred MFA when enabled, otherwise the user's preferred
+        default method).
 
     Password methods are identified by Graph @odata.type AND by the well-known
     password method id (28c10230-6103-485e-b985-444c60001490), so users are not
@@ -28,8 +30,11 @@
     Optional path for the report CSV. When omitted, a Save File dialog is shown.
 
 .PARAMETER IncludeAll
-    Also write users who DO have a non-password method. Default report contains
-    only password-only / no-method users, plus not-found / error / skipped rows.
+    Compatibility switch. The report already includes every CSV user by default.
+
+.PARAMETER MissingOnly
+    Write only users with no authentication method or only a password, plus
+    not-found / error / skipped rows.
 
 .PARAMETER DeviceCode
     Use device-code sign-in instead of Windows Web Account Manager (WAM).
@@ -53,7 +58,7 @@
     .\Get-EntraUsersWithoutAuthMethod.ps1 -InputCsv .\users.csv -OutputCsv .\report.csv
 
 .EXAMPLE
-    .\Get-EntraUsersWithoutAuthMethod.ps1 -IncludeAll
+    .\Get-EntraUsersWithoutAuthMethod.ps1 -MissingOnly
 
 .EXAMPLE
     .\Get-EntraUsersWithoutAuthMethod.ps1 -SelfTest
@@ -97,6 +102,8 @@ param(
 
     [switch]$IncludeAll,
 
+    [switch]$MissingOnly,
+
     [switch]$DeviceCode,
 
     [Parameter()]
@@ -119,7 +126,7 @@ $script:ProgressLabel = $null
 $script:ProgressDetail = $null
 $script:GraphScopeList = @('UserAuthenticationMethod.Read.All', 'User.Read.All')
 $script:GraphScopeString = 'UserAuthenticationMethod.Read.All User.Read.All offline_access openid profile'
-$script:ScriptBuild = '2026-09-16-c'
+$script:ScriptBuild = '2026-09-16-d'
 # Current Connect-MgGraph / Microsoft Graph Command Line Tools public client.
 $script:GraphPowerShellClientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
 # Older Microsoft Graph PowerShell public client. Still present in some tenants.
@@ -128,6 +135,7 @@ $script:AzurePowerShellClientId = '1950a258-227b-4e31-a9cf-717495945fc2'
 $script:AzureCliClientId = '04b07795-8ddb-461a-bbee-02f9e1bf7b46'
 $script:PasswordMethodId = '28c10230-6103-485e-b985-444c60001490'
 $script:GraphBase = 'https://graph.microsoft.com/v1.0'
+$script:GraphBetaBase = 'https://graph.microsoft.com/beta'
 $script:AccessToken = $null
 $script:RefreshToken = $null
 $script:TokenClientId = $null
@@ -176,6 +184,9 @@ if ($script:UseGui -and -not $script:IsPowerShellIse -and [System.Threading.Thre
     }
     if ($IncludeAll) {
         [void]$argParts.Add('-IncludeAll')
+    }
+    if ($MissingOnly) {
+        [void]$argParts.Add('-MissingOnly')
     }
     if ($DeviceCode) {
         [void]$argParts.Add('-DeviceCode')
@@ -277,7 +288,7 @@ function Select-OutputFile {
     $dialog.OverwritePrompt  = $true
     $dialog.RestoreDirectory = $true
     $dialog.InitialDirectory = Get-DefaultPickerDirectory
-    $dialog.FileName         = "EntraID_UsersWithoutAuthMethod_{0:yyyyMMdd_HHmmss}.csv" -f (Get-Date)
+    $dialog.FileName         = "EntraID_AuthMethods_{0:yyyyMMdd_HHmmss}.csv" -f (Get-Date)
 
     try {
         if ((Show-OwnedDialog -Dialog $dialog) -eq [System.Windows.Forms.DialogResult]::OK) {
@@ -548,12 +559,114 @@ function ConvertTo-FriendlyMethodName {
     return $normalized
 }
 
+function ConvertTo-FriendlyDefaultMethod {
+    param([AllowNull()][string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    $key = $Value.Trim().ToLowerInvariant()
+    $map = @{
+        'push'                     = 'Microsoft Authenticator (push)'
+        'phoneappnotification'     = 'Microsoft Authenticator (push)'
+        'microsoftauthenticator'   = 'Microsoft Authenticator'
+        'oath'                     = 'OATH (Authenticator app or hardware token)'
+        'phoneapptotp'             = 'OATH (Authenticator app)'
+        'sms'                      = 'SMS'
+        'voicemobile'              = 'Voice (mobile)'
+        'voicealternatemobile'     = 'Voice (alternate mobile)'
+        'voiceoffice'              = 'Voice (office)'
+        'phone'                    = 'Phone'
+        'fido'                     = 'FIDO2'
+        'fido2'                    = 'FIDO2'
+        'password'                 = 'Password'
+        'email'                    = 'Email'
+        'temporaryaccesspass'      = 'Temporary Access Pass'
+        'windowshelloforbusiness'  = 'Windows Hello for Business'
+        'softwareoath'             = 'Software OATH'
+        'hardwareoath'             = 'Hardware OATH'
+        'unknownfuturevalue'       = 'Unknown (future value)'
+    }
+    if ($map.ContainsKey($key)) {
+        return $map[$key]
+    }
+    return $Value.Trim()
+}
+
+function Test-IsBooleanTrue {
+    param($Value)
+
+    if ($Value -is [bool]) { return [bool]$Value }
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) { return $false }
+    return ($text.Trim() -match '^(true|1|yes)$')
+}
+
+function Get-EffectiveDefaultMethod {
+    param(
+        [string]$UserPreferred = '',
+        [string]$SystemPreferred = '',
+        $SystemPreferredEnabled = $false
+    )
+
+    $systemOn = Test-IsBooleanTrue -Value $SystemPreferredEnabled
+    if ($systemOn -and -not [string]::IsNullOrWhiteSpace($SystemPreferred)) {
+        return [pscustomobject]@{
+            DefaultMethod = (ConvertTo-FriendlyDefaultMethod -Value $SystemPreferred)
+            Source        = 'System preferred'
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($UserPreferred)) {
+        return [pscustomobject]@{
+            DefaultMethod = (ConvertTo-FriendlyDefaultMethod -Value $UserPreferred)
+            Source        = 'User preferred'
+        }
+    }
+    return [pscustomobject]@{
+        DefaultMethod = 'Not set'
+        Source        = ''
+    }
+}
+
+function Get-AuthenticationMethodDetail {
+    param($Method)
+
+    if ($null -eq $Method) { return '' }
+
+    $odataType = Get-AuthMethodOdataType -Method $Method
+    $label = ConvertTo-FriendlyMethodName -OdataType $odataType
+    if (Test-IsPasswordAuthenticationMethod -Method $Method) {
+        $label = 'Password'
+    }
+    elseif ([string]::IsNullOrWhiteSpace($odataType)) {
+        $id = [string](Get-GraphResponseProperty -Response $Method -Name 'id')
+        if (-not [string]::IsNullOrWhiteSpace($id)) {
+            $label = "Unknown (id $id)"
+        }
+        else {
+            $label = 'Unknown'
+        }
+    }
+
+    $extras = New-Object System.Collections.Generic.List[string]
+    foreach ($name in @('displayName', 'phoneType', 'phoneNumber', 'emailAddress', 'model', 'deviceTag')) {
+        $value = [string](Get-GraphResponseProperty -Response $Method -Name $name)
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            [void]$extras.Add($value.Trim())
+        }
+    }
+
+    if ($extras.Count -gt 0) {
+        return ('{0} ({1})' -f $label, ($extras.ToArray() -join ', '))
+    }
+    return $label
+}
+
 function Get-AuthenticationMethodInventory {
     param($Methods)
 
     # foreach / List — not @() — so empty and generic collections stay intact.
     $items = ConvertTo-ObjectList -Value $Methods
     $friendly = New-Object System.Collections.Generic.List[string]
+    $details = New-Object System.Collections.Generic.List[string]
     $hasNonPassword = $false
     $passwordCount = 0
     $unknownCount = 0
@@ -564,6 +677,7 @@ function Get-AuthenticationMethodInventory {
         $isPassword = Test-IsPasswordAuthenticationMethod -Method $method
         $odataType = Get-AuthMethodOdataType -Method $method
         $label = ConvertTo-FriendlyMethodName -OdataType $odataType
+        $detail = Get-AuthenticationMethodDetail -Method $method
 
         if ($isPassword) {
             $passwordCount++
@@ -583,24 +697,41 @@ function Get-AuthenticationMethodInventory {
         if (-not [string]::IsNullOrWhiteSpace($label) -and -not $friendly.Contains($label)) {
             [void]$friendly.Add($label)
         }
+        if (-not [string]::IsNullOrWhiteSpace($detail)) {
+            [void]$details.Add($detail)
+        }
     }
 
     $sorted = @($friendly | Sort-Object)
-    $detail = 'Password only - no other method registered'
-    if ($items.Count -eq 0) {
-        $detail = 'No methods registered'
+    $noMethods = ($items.Count -eq 0)
+    $passwordOnly = ((-not $noMethods) -and (-not $hasNonPassword))
+    $detailText = 'Has a non-password authentication method'
+    if ($noMethods) {
+        $detailText = 'No methods registered'
     }
-    elseif ($hasNonPassword) {
-        $detail = 'Has a non-password authentication method'
+    elseif ($passwordOnly) {
+        $detailText = 'Password only - no other method registered'
+    }
+
+    $status = 'Has registered methods'
+    if ($noMethods) {
+        $status = 'NO AUTH METHOD REGISTERED'
+    }
+    elseif ($passwordOnly) {
+        $status = 'Password only'
     }
 
     return [pscustomobject]@{
-        HasNonPasswordMethod = [bool]$hasNonPassword
-        RegisteredMethods    = ($sorted -join '; ')
-        MethodCount          = [int]$items.Count
-        PasswordCount        = [int]$passwordCount
-        UnknownCount         = [int]$unknownCount
-        Detail               = $detail
+        HasNonPasswordMethod     = [bool]$hasNonPassword
+        HasNoMethodRegistered    = [bool]$noMethods
+        PasswordOnly             = [bool]$passwordOnly
+        Status                   = $status
+        RegisteredMethods        = ($sorted -join '; ')
+        RegisteredMethodDetails  = ($details.ToArray() -join '; ')
+        MethodCount              = [int]$items.Count
+        PasswordCount            = [int]$passwordCount
+        UnknownCount             = [int]$unknownCount
+        Detail                   = $detailText
     }
 }
 
@@ -628,7 +759,7 @@ function Show-ProgressUi {
     Initialize-WinForms
 
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = 'Entra ID - Users Without Auth Method'
+    $form.Text = 'Entra ID - Authentication Methods'
     $form.Width = 560
     $form.Height = 160
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
@@ -735,22 +866,51 @@ function New-ReportRow {
         [string]$DisplayName = '',
         $AccountEnabled = '',
         [string]$Status = '',
+        $NoAuthMethodRegistered = '',
+        $PasswordOnly = '',
         $HasNonPasswordMethod = '',
         [string]$RegisteredMethods = '',
+        [string]$RegisteredMethodDetails = '',
         $MethodCount = '',
+        [string]$DefaultSignInMethod = '',
+        [string]$DefaultSignInMethodSource = '',
+        [string]$UserPreferredDefaultMethod = '',
+        [string]$SystemPreferredDefaultMethod = '',
+        $SystemPreferredMfaEnabled = '',
         [string]$Detail = ''
     )
 
+    $noAuth = $NoAuthMethodRegistered
+    if ($noAuth -is [bool]) {
+        if ($noAuth) { $noAuth = 'Yes' } else { $noAuth = 'No' }
+    }
+    $pwdOnly = $PasswordOnly
+    if ($pwdOnly -is [bool]) {
+        if ($pwdOnly) { $pwdOnly = 'Yes' } else { $pwdOnly = 'No' }
+    }
+    $hasOther = $HasNonPasswordMethod
+    if ($hasOther -is [bool]) {
+        if ($hasOther) { $hasOther = 'Yes' } else { $hasOther = 'No' }
+    }
+
     return [pscustomobject][ordered]@{
-        CsvIdentifier        = $CsvIdentifier
-        UserPrincipalName    = $UserPrincipalName
-        DisplayName          = $DisplayName
-        AccountEnabled       = $AccountEnabled
-        Status               = $Status
-        HasNonPasswordMethod = $HasNonPasswordMethod
-        RegisteredMethods    = $RegisteredMethods
-        MethodCount          = $MethodCount
-        Detail               = $Detail
+        CsvIdentifier                 = $CsvIdentifier
+        UserPrincipalName             = $UserPrincipalName
+        DisplayName                   = $DisplayName
+        AccountEnabled                = $AccountEnabled
+        Status                        = $Status
+        NoAuthMethodRegistered        = $noAuth
+        PasswordOnly                  = $pwdOnly
+        HasNonPasswordMethod          = $hasOther
+        RegisteredMethods             = $RegisteredMethods
+        RegisteredMethodDetails       = $RegisteredMethodDetails
+        MethodCount                   = $MethodCount
+        DefaultSignInMethod           = $DefaultSignInMethod
+        DefaultSignInMethodSource     = $DefaultSignInMethodSource
+        UserPreferredDefaultMethod    = $UserPreferredDefaultMethod
+        SystemPreferredDefaultMethod  = $SystemPreferredDefaultMethod
+        SystemPreferredMfaEnabled     = $SystemPreferredMfaEnabled
+        Detail                        = $Detail
     }
 }
 
@@ -2057,6 +2217,58 @@ function Get-EntraUserAuthMethods {
     return ,$methods
 }
 
+function Get-EntraUserSignInPreferences {
+    param(
+        [Parameter(Mandatory)]
+        [string]$UserId
+    )
+
+    $empty = [pscustomobject]@{
+        UserPreferredRaw     = ''
+        SystemPreferredRaw   = ''
+        SystemPreferredOn    = ''
+        UserPreferredMethod  = ''
+        SystemPreferredMethod = ''
+        DefaultMethod        = 'Not set'
+        DefaultMethodSource  = ''
+        Detail               = ''
+    }
+
+    $uri = "{0}/users/{1}/authentication/signInPreferences" -f $script:GraphBetaBase, [uri]::EscapeDataString($UserId)
+    try {
+        $resp = Invoke-GraphGetWithRetry -Uri $uri
+    }
+    catch {
+        $msg = Get-GraphErrorMessage -ErrorRecord $_
+        $empty.Detail = $msg
+        if (Test-IsNotFoundMessage -Message $msg) {
+            $empty.Detail = 'Sign-in preferences not found'
+        }
+        return $empty
+    }
+
+    $userRaw = [string](Get-GraphResponseProperty -Response $resp -Name 'userPreferredMethodForSecondaryAuthentication')
+    $systemRaw = [string](Get-GraphResponseProperty -Response $resp -Name 'systemPreferredAuthenticationMethod')
+    $systemOnRaw = Get-GraphResponseProperty -Response $resp -Name 'isSystemPreferredAuthenticationMethodEnabled'
+    $effective = Get-EffectiveDefaultMethod -UserPreferred $userRaw -SystemPreferred $systemRaw -SystemPreferredEnabled $systemOnRaw
+
+    $systemOnText = ''
+    if ($null -ne $systemOnRaw -and [string]$systemOnRaw -ne '') {
+        if (Test-IsBooleanTrue -Value $systemOnRaw) { $systemOnText = 'Yes' } else { $systemOnText = 'No' }
+    }
+
+    return [pscustomobject]@{
+        UserPreferredRaw      = $userRaw
+        SystemPreferredRaw    = $systemRaw
+        SystemPreferredOn     = $systemOnText
+        UserPreferredMethod   = (ConvertTo-FriendlyDefaultMethod -Value $userRaw)
+        SystemPreferredMethod = (ConvertTo-FriendlyDefaultMethod -Value $systemRaw)
+        DefaultMethod         = $effective.DefaultMethod
+        DefaultMethodSource   = $effective.Source
+        Detail                = ''
+    }
+}
+
 function Test-IsNotFoundMessage {
     param([string]$Message)
     if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
@@ -2144,6 +2356,9 @@ function Invoke-SelfTest {
     Assert-False $invPassword.HasNonPasswordMethod 'password-only has no other method'
     Assert-Equal 'Password' $invPassword.RegisteredMethods 'password-only friendly name'
     Assert-Equal 'Password only - no other method registered' $invPassword.Detail 'password-only detail'
+    Assert-True $invPassword.PasswordOnly 'password-only flag'
+    Assert-False $invPassword.HasNoMethodRegistered 'password-only is not zero methods'
+    Assert-Equal 'Password only' $invPassword.Status 'password-only status'
 
     $passwordNoType = @(
         @{ id = $script:PasswordMethodId }
@@ -2156,6 +2371,8 @@ function Invoke-SelfTest {
     Assert-False $emptyInv.HasNonPasswordMethod 'empty methods is missing'
     Assert-Equal 'No methods registered' $emptyInv.Detail 'empty methods detail'
     Assert-Equal 0 $emptyInv.MethodCount 'empty methods count'
+    Assert-True $emptyInv.HasNoMethodRegistered 'empty methods flagged as none registered'
+    Assert-Equal 'NO AUTH METHOD REGISTERED' $emptyInv.Status 'empty methods status'
 
     $listPassword = New-Object System.Collections.Generic.List[object]
     [void]$listPassword.Add(@{
@@ -2189,6 +2406,7 @@ function Invoke-SelfTest {
     Assert-True $invAuth.HasNonPasswordMethod 'authenticator counts as non-password'
     Assert-True ($invAuth.RegisteredMethods -match 'Microsoft Authenticator') 'authenticator friendly name present'
     Assert-Equal 2 $invAuth.MethodCount 'authenticator+password count'
+    Assert-True ($invAuth.RegisteredMethodDetails -match 'iPhone') 'authenticator detail includes display name'
 
     $phoneOnly = @(
         [pscustomobject]@{
@@ -2198,6 +2416,7 @@ function Invoke-SelfTest {
     )
     $invPhone = Get-AuthenticationMethodInventory -Methods $phoneOnly
     Assert-True $invPhone.HasNonPasswordMethod 'phone without password still counts'
+    Assert-True ($invPhone.RegisteredMethodDetails -match 'Phone') 'phone detail label'
 
     $typeNoHash = @{
         '@odata.type' = 'microsoft.graph.fido2AuthenticationMethod'
@@ -2234,6 +2453,35 @@ function Invoke-SelfTest {
 
     Assert-Equal 'password' (Get-NormalizedMethodType '#microsoft.graph.passwordAuthenticationMethod') 'normalize password type'
     Assert-Equal 'microsoftauthenticator' (Get-NormalizedMethodType '#microsoft.graph.microsoftAuthenticatorAuthenticationMethod') 'normalize authenticator type'
+
+    Assert-Equal 'Microsoft Authenticator (push)' (ConvertTo-FriendlyDefaultMethod 'push') 'friendly default push'
+    Assert-Equal 'SMS' (ConvertTo-FriendlyDefaultMethod 'sms') 'friendly default sms'
+    Assert-Equal 'OATH (Authenticator app or hardware token)' (ConvertTo-FriendlyDefaultMethod 'oath') 'friendly default oath'
+    Assert-Equal '' (ConvertTo-FriendlyDefaultMethod '') 'friendly default empty'
+
+    $sysDefault = Get-EffectiveDefaultMethod -UserPreferred 'sms' -SystemPreferred 'push' -SystemPreferredEnabled $true
+    Assert-Equal 'Microsoft Authenticator (push)' $sysDefault.DefaultMethod 'system preferred wins when enabled'
+    Assert-Equal 'System preferred' $sysDefault.Source 'system preferred source'
+
+    $userDefault = Get-EffectiveDefaultMethod -UserPreferred 'sms' -SystemPreferred 'push' -SystemPreferredEnabled $false
+    Assert-Equal 'SMS' $userDefault.DefaultMethod 'user preferred used when system preferred is off'
+    Assert-Equal 'User preferred' $userDefault.Source 'user preferred source'
+
+    $noneDefault = Get-EffectiveDefaultMethod -UserPreferred '' -SystemPreferred '' -SystemPreferredEnabled $false
+    Assert-Equal 'Not set' $noneDefault.DefaultMethod 'no default method'
+
+    $phoneDetail = Get-AuthenticationMethodDetail -Method @{
+        '@odata.type' = '#microsoft.graph.phoneAuthenticationMethod'
+        phoneType     = 'mobile'
+        phoneNumber   = '+15555550100'
+    }
+    Assert-True ($phoneDetail -match 'Phone') 'phone method detail label'
+    Assert-True ($phoneDetail -match 'mobile') 'phone method detail type'
+    Assert-True ($phoneDetail -match '\+15555550100') 'phone method detail number'
+
+    $row = New-ReportRow -Status 'NO AUTH METHOD REGISTERED' -NoAuthMethodRegistered $true -PasswordOnly $false -HasNonPasswordMethod $false
+    Assert-Equal 'Yes' $row.NoAuthMethodRegistered 'report row maps no-method flag to Yes'
+    Assert-Equal 'No' $row.PasswordOnly 'report row maps password-only false to No'
 
     $singleCsv = [PSCustomObject]@{ UserPrincipalName = 'only@contoso.com' }
     $wrapped = @($singleCsv)
@@ -2363,7 +2611,7 @@ if ($SelfTest) {
     Invoke-SelfTest
 }
 
-Write-Section "Entra ID - Users Without a Registered Authentication Method"
+Write-Section "Entra ID - Authentication Methods Report"
 Write-Host "Script build: $($script:ScriptBuild)  (overwrite Documents\AuthMethodReport.ps1 with this file if you do not see this line)" -ForegroundColor Yellow
 
 if ($script:UseGui) {
@@ -2471,7 +2719,10 @@ try {
             [void]$report.Add((New-ReportRow `
                 -CsvIdentifier $upn `
                 -Status 'Skipped' `
+                -NoAuthMethodRegistered $false `
+                -PasswordOnly $false `
                 -HasNonPasswordMethod $false `
+                -DefaultSignInMethod '' `
                 -Detail 'Empty/blank identifier in CSV row'))
             continue
         }
@@ -2482,6 +2733,8 @@ try {
                 [void]$report.Add((New-ReportRow `
                     -CsvIdentifier $upn `
                     -Status 'User not found' `
+                    -NoAuthMethodRegistered $false `
+                    -PasswordOnly $false `
                     -HasNonPasswordMethod $false `
                     -Detail 'No Entra ID user matched this UPN, mail, or object id'))
                 continue
@@ -2489,31 +2742,36 @@ try {
 
             $methods = Get-EntraUserAuthMethods -UserId $entraUser.Id
             $inventory = Get-AuthenticationMethodInventory -Methods $methods
+            $prefs = Get-EntraUserSignInPreferences -UserId $entraUser.Id
 
-            if (-not $inventory.HasNonPasswordMethod) {
-                [void]$report.Add((New-ReportRow `
-                    -CsvIdentifier $upn `
-                    -UserPrincipalName $entraUser.UserPrincipalName `
-                    -DisplayName $entraUser.DisplayName `
-                    -AccountEnabled $entraUser.AccountEnabled `
-                    -Status 'MISSING auth method' `
-                    -HasNonPasswordMethod $false `
-                    -RegisteredMethods $inventory.RegisteredMethods `
-                    -MethodCount $inventory.MethodCount `
-                    -Detail $inventory.Detail))
+            $isMissing = ($inventory.HasNoMethodRegistered -or $inventory.PasswordOnly)
+            if ($MissingOnly -and -not $isMissing) {
+                continue
             }
-            elseif ($IncludeAll) {
-                [void]$report.Add((New-ReportRow `
-                    -CsvIdentifier $upn `
-                    -UserPrincipalName $entraUser.UserPrincipalName `
-                    -DisplayName $entraUser.DisplayName `
-                    -AccountEnabled $entraUser.AccountEnabled `
-                    -Status 'Has other method' `
-                    -HasNonPasswordMethod $true `
-                    -RegisteredMethods $inventory.RegisteredMethods `
-                    -MethodCount $inventory.MethodCount `
-                    -Detail $inventory.Detail))
+
+            $detail = $inventory.Detail
+            if (-not [string]::IsNullOrWhiteSpace([string]$prefs.Detail) -and $prefs.DefaultMethod -eq 'Not set') {
+                $detail = ($detail + ' | Default method: ' + $prefs.Detail)
             }
+
+            [void]$report.Add((New-ReportRow `
+                -CsvIdentifier $upn `
+                -UserPrincipalName $entraUser.UserPrincipalName `
+                -DisplayName $entraUser.DisplayName `
+                -AccountEnabled $entraUser.AccountEnabled `
+                -Status $inventory.Status `
+                -NoAuthMethodRegistered $inventory.HasNoMethodRegistered `
+                -PasswordOnly $inventory.PasswordOnly `
+                -HasNonPasswordMethod $inventory.HasNonPasswordMethod `
+                -RegisteredMethods $inventory.RegisteredMethods `
+                -RegisteredMethodDetails $inventory.RegisteredMethodDetails `
+                -MethodCount $inventory.MethodCount `
+                -DefaultSignInMethod $prefs.DefaultMethod `
+                -DefaultSignInMethodSource $prefs.DefaultMethodSource `
+                -UserPreferredDefaultMethod $prefs.UserPreferredMethod `
+                -SystemPreferredDefaultMethod $prefs.SystemPreferredMethod `
+                -SystemPreferredMfaEnabled $prefs.SystemPreferredOn `
+                -Detail $detail))
         }
         catch {
             $msg = Get-GraphErrorMessage -ErrorRecord $_
@@ -2521,6 +2779,8 @@ try {
             [void]$report.Add((New-ReportRow `
                 -CsvIdentifier $upn `
                 -Status $status `
+                -NoAuthMethodRegistered $false `
+                -PasswordOnly $false `
                 -HasNonPasswordMethod $false `
                 -Detail $msg))
         }
@@ -2553,20 +2813,23 @@ catch {
     exit 1
 }
 
-$missingCount = @($report | Where-Object { $_.Status -eq 'MISSING auth method' }).Count
-$notFound     = @($report | Where-Object { $_.Status -eq 'User not found' }).Count
-$errors       = @($report | Where-Object { $_.Status -eq 'Error' }).Count
-$skipped      = @($report | Where-Object { $_.Status -eq 'Skipped' }).Count
-$hasOther     = @($report | Where-Object { $_.Status -eq 'Has other method' }).Count
+$noMethodCount = @($report | Where-Object { $_.Status -eq 'NO AUTH METHOD REGISTERED' }).Count
+$passwordOnly  = @($report | Where-Object { $_.Status -eq 'Password only' }).Count
+$hasMethods    = @($report | Where-Object { $_.Status -eq 'Has registered methods' }).Count
+$notFound      = @($report | Where-Object { $_.Status -eq 'User not found' }).Count
+$errors        = @($report | Where-Object { $_.Status -eq 'Error' }).Count
+$skipped       = @($report | Where-Object { $_.Status -eq 'Skipped' }).Count
 
 Write-Host ""
-Write-Host "Total users checked        : $total"
-Write-Host "Missing an auth method     : $missingCount" -ForegroundColor Yellow
-Write-Host "Users not found in Entra ID: $notFound"
-Write-Host "Errors                     : $errors"
-Write-Host "Skipped (blank CSV rows)   : $skipped"
-if ($IncludeAll) {
-    Write-Host "Has a non-password method  : $hasOther"
+Write-Host "Total users checked              : $total"
+Write-Host "NO auth method registered        : $noMethodCount" -ForegroundColor Yellow
+Write-Host "Password only (no MFA method)    : $passwordOnly" -ForegroundColor Yellow
+Write-Host "Has registered methods           : $hasMethods"
+Write-Host "Users not found in Entra ID      : $notFound"
+Write-Host "Errors                           : $errors"
+Write-Host "Skipped (blank CSV rows)         : $skipped"
+if ($MissingOnly) {
+    Write-Host "MissingOnly was set; users who already have a non-password method were omitted from the CSV." -ForegroundColor Gray
 }
 Write-Host ""
 Write-Host "Report saved to: $OutputCsv" -ForegroundColor Green
