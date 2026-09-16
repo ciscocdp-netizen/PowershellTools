@@ -13,9 +13,41 @@
 
 .NOTES
     Author: v0
-    Version: 1.14
+    Version: 1.15
     Requires: Microsoft.Graph PowerShell SDK
     Authentication: Interactive (Delegated Permissions via browser)
+
+    Changelog v1.15:
+    - Fixed: A folder whose display name contains an apostrophe (O'Brien Ltd) was
+      never created. Its name went unescaped into $filter=displayName eq '...',
+      Graph answered 400, and because the catch block left $parentFolderId at the
+      previous value the folder's mail was written to its PARENT and its child
+      folders were created one level too high. Names are now escaped ('' per
+      OData), and a lookup failure falls back to a client-side name match instead
+      of being treated as "folder does not exist".
+    - Fixed: Mail from an unresolvable folder is no longer posted to
+      /users/{id}/messages, which silently filed it in the target's Drafts folder
+      (and made the duplicate-detection query enumerate the whole target mailbox).
+      Such folders are now reported and skipped.
+    - Fixed: Empty folders were never created, so the target hierarchy was missing
+      every folder that held no mail. Folders are now mirrored before the
+      item-count check.
+    - Fixed: A failed folder listing (throttling, 403) dropped whole subtrees from
+      the copy while only writing to the console via Write-Host, invisible in the
+      GUI, and the run still reported success. Failures now go to the status log
+      and set $script:FolderScanIncomplete, which downgrades the completion
+      message.
+    - Fixed: Well-known folders were matched by display name, so a target mailbox
+      in another language (or with renamed folders) got a second "Inbox" and
+      "Sent Items" beside its real ones. Root segments now resolve through the
+      target's well-known folder names.
+    - Fixed: A display name containing a backslash (HR\Payroll) was split into a
+      nested path. Folder paths are carried as segment arrays instead of a joined
+      string.
+    - Changed: Resolved folder paths are cached, so a deep tree no longer re-walks
+      every ancestor for each folder.
+    - New: Verification compares the source and target folder structures and lists
+      folders that are missing from the target.
 
     Changelog v1.14:
     - Changed: The GUI is resizable (including maximize). Controls stay docked in a
@@ -150,6 +182,16 @@ Add-Type -AssemblyName System.Drawing
 $script:Connected       = $false
 $script:CancelRequested = $false
 $script:GraphBase       = 'https://graph.microsoft.com/v1.0'
+
+# Set when a folder listing fails, so the run cannot claim a complete copy.
+$script:FolderScanIncomplete = $false
+
+# Well-known folder names are resolved on the TARGET so a localized or renamed
+# mailbox does not end up with a duplicate "Inbox" / "Sent Items".
+$script:WellKnownFolderNames = @(
+    'inbox', 'drafts', 'sentitems', 'deleteditems', 'junkemail',
+    'outbox', 'archive', 'conversationhistory', 'clutter', 'scheduled'
+)
 
 # MAPI / Outlook named-property identifiers
 $script:PsetAppointment   = '{00062002-0000-0000-C000-000000000046}'
@@ -1249,11 +1291,31 @@ function Connect-ToGraph {
 # ------------------------------------------------------------------------------
 # Folder helpers
 # ------------------------------------------------------------------------------
+function Get-WellKnownFolderMap {
+    param([string]$UserId)
+
+    $map = @{}
+    foreach ($name in $script:WellKnownFolderNames) {
+        $id = Get-WellKnownFolderId -UserId $UserId -WellKnownName $name
+        if ($id -and -not $map.ContainsKey($id)) { $map[$id] = $name }
+    }
+    return $map
+}
+
+function Get-FolderPathKey {
+    param([string[]]$PathParts)
+    # [char]1 cannot appear in an Exchange folder name, so it is a safe separator
+    # for cache keys; '\' is not, because a display name may contain one.
+    return (@($PathParts) -join ([string][char]1))
+}
+
 function Get-AllMailFolders {
     param(
         [string]$UserId,
         [string]$ParentFolderId = $null,
-        [string]$ParentPath    = ""
+        [string[]]$ParentPath = @(),
+        [hashtable]$WellKnownMap = @{},
+        [System.Windows.Forms.TextBox]$StatusBox
     )
 
     $allFolders = @()
@@ -1269,94 +1331,194 @@ function Get-AllMailFolders {
                 Get-MgUserMailFolder -UserId $UserId -All
             }
         }
-
-        foreach ($folder in $folders) {
-            $folderPath = if ($ParentPath) { "$ParentPath\$($folder.DisplayName)" } else { $folder.DisplayName }
-
-            $allFolders += [PSCustomObject]@{
-                Id               = $folder.Id
-                DisplayName      = $folder.DisplayName
-                FullPath         = $folderPath
-                TotalItemCount   = $folder.TotalItemCount
-                UnreadItemCount  = $folder.UnreadItemCount
-                ChildFolderCount = $folder.ChildFolderCount
-            }
-
-            if ($folder.ChildFolderCount -gt 0) {
-                $allFolders += Get-AllMailFolders -UserId $UserId -ParentFolderId $folder.Id -ParentPath $folderPath
-            }
-        }
     }
     catch {
-        Write-Host "Error getting folders: $($_.Exception.Message)"
+        # A dropped listing means part of the mailbox is invisible to the copy.
+        # Write-Host alone hid this: the GUI showed nothing and the run still
+        # reported success.
+        $script:FolderScanIncomplete = $true
+        $where = 'mailbox root'
+        if ($ParentPath.Count -gt 0) { $where = ($ParentPath -join '\') }
+        $message = "  WARNING: could not list child folders of '$where': $($_.Exception.Message)"
+        Write-Host $message
+        if ($StatusBox) {
+            $StatusBox.AppendText("$message`r`n")
+            $StatusBox.AppendText("  WARNING: that subtree will NOT be copied.`r`n")
+            Update-CopyUi -StatusBox $StatusBox
+        }
+        return $allFolders
+    }
+
+    foreach ($folder in $folders) {
+        $pathParts = @($ParentPath) + @($folder.DisplayName)
+
+        $wellKnown = $null
+        if ($WellKnownMap.ContainsKey($folder.Id)) { $wellKnown = $WellKnownMap[$folder.Id] }
+
+        $allFolders += [PSCustomObject]@{
+            Id               = $folder.Id
+            DisplayName      = $folder.DisplayName
+            PathParts        = $pathParts
+            FullPath         = ($pathParts -join '\')
+            WellKnownName    = $wellKnown
+            TotalItemCount   = $folder.TotalItemCount
+            UnreadItemCount  = $folder.UnreadItemCount
+            ChildFolderCount = $folder.ChildFolderCount
+        }
+
+        if ($folder.ChildFolderCount -gt 0) {
+            $allFolders += Get-AllMailFolders -UserId $UserId -ParentFolderId $folder.Id `
+                -ParentPath $pathParts -WellKnownMap $WellKnownMap -StatusBox $StatusBox
+        }
     }
 
     return $allFolders
 }
 
-function Ensure-FolderStructure {
+function Find-ChildFolderByName {
+    param(
+        [string]$UserId,
+        [string]$ParentId,
+        [string]$Name
+    )
+
+    # An OData string literal escapes a single quote by doubling it. Without this,
+    # "O'Brien Ltd" produces a 400 and the folder looks like it does not exist.
+    $escaped = $Name.Replace("'", "''")
+    $filter  = "displayName eq '$escaped'"
+
+    try {
+        if ($ParentId) {
+            $hit = Invoke-WithRetry -ScriptBlock {
+                Get-MgUserMailFolderChildFolder -UserId $UserId -MailFolderId $ParentId `
+                    -Filter $filter -ErrorAction Stop |
+                    Select-Object -First 1
+            }
+        }
+        else {
+            $hit = Invoke-WithRetry -ScriptBlock {
+                Get-MgUserMailFolder -UserId $UserId -Filter $filter -ErrorAction Stop |
+                    Select-Object -First 1
+            }
+        }
+        if ($hit) { return $hit }
+    }
+    catch {
+        # Fall through to a client-side match: a lookup that errors out must never
+        # be read as "the folder is not there", or a duplicate gets created.
+    }
+
+    if ($ParentId) {
+        $all = Invoke-GraphPagedRequest -CommandBlock {
+            Get-MgUserMailFolderChildFolder -UserId $UserId -MailFolderId $ParentId -All
+        }
+    }
+    else {
+        $all = Invoke-GraphPagedRequest -CommandBlock {
+            Get-MgUserMailFolder -UserId $UserId -All
+        }
+    }
+    return (@($all) | Where-Object { $_.DisplayName -eq $Name } | Select-Object -First 1)
+}
+
+<#
+.SYNOPSIS
+    Mirrors one source folder's path into the target mailbox and returns the id of
+    the deepest folder. Throws if a segment cannot be resolved, so the caller can
+    skip the folder instead of filing its mail somewhere unexpected.
+#>
+function Resolve-TargetFolder {
     param(
         [string]$TargetUserId,
-        [string]$FolderPath,
+        $SourceFolder,
+        [hashtable]$WellKnownByPath = @{},
+        [hashtable]$Cache = @{},
         [System.Windows.Forms.TextBox]$StatusBox
     )
 
-    $pathParts      = $FolderPath -split '\\'
-    $currentPath    = ""
-    $parentFolderId = $null
+    $segments = @($SourceFolder.PathParts)
+    $parentId = $null
+    $walked   = @()
 
-    foreach ($part in $pathParts) {
-        $currentPath = if ($currentPath) { "$currentPath\$part" } else { $part }
+    for ($i = 0; $i -lt $segments.Count; $i++) {
+        $part    = $segments[$i]
+        $walked += $part
+        $key     = Get-FolderPathKey -PathParts $walked
 
+        if ($Cache.ContainsKey($key)) {
+            $parentId = $Cache[$key]
+            continue
+        }
+
+        # Map a source well-known folder onto the TARGET's well-known folder rather
+        # than onto whatever folder shares its display name.
+        $wellKnownName = $null
+        if ($WellKnownByPath.ContainsKey($key)) { $wellKnownName = $WellKnownByPath[$key] }
+        if ($wellKnownName) {
+            $wkId = Get-WellKnownFolderId -UserId $TargetUserId -WellKnownName $wellKnownName
+            if ($wkId) {
+                $parentId    = $wkId
+                $Cache[$key] = $wkId
+                continue
+            }
+        }
+
+        $existing = Find-ChildFolderByName -UserId $TargetUserId -ParentId $parentId -Name $part
+        if ($existing) {
+            $parentId    = $existing.Id
+            $Cache[$key] = $existing.Id
+            continue
+        }
+
+        $newFolderParams = @{ DisplayName = $part }
+        $created = $null
         try {
-            if ($parentFolderId) {
-                $existingFolder = Invoke-WithRetry -ScriptBlock {
-                    Get-MgUserMailFolderChildFolder -UserId $TargetUserId `
-                        -MailFolderId $parentFolderId `
-                        -Filter "displayName eq '$part'" `
-                        -ErrorAction SilentlyContinue |
-                        Select-Object -First 1
+            if ($parentId) {
+                $created = Invoke-WithRetry -ScriptBlock {
+                    New-MgUserMailFolderChildFolder -UserId $TargetUserId -MailFolderId $parentId `
+                        -BodyParameter $newFolderParams -ErrorAction Stop
                 }
             }
             else {
-                $existingFolder = Invoke-WithRetry -ScriptBlock {
-                    Get-MgUserMailFolder -UserId $TargetUserId `
-                        -Filter "displayName eq '$part'" `
-                        -ErrorAction SilentlyContinue |
-                        Select-Object -First 1
+                $created = Invoke-WithRetry -ScriptBlock {
+                    New-MgUserMailFolder -UserId $TargetUserId -BodyParameter $newFolderParams -ErrorAction Stop
                 }
-            }
-
-            if ($existingFolder) {
-                $parentFolderId = $existingFolder.Id
-            }
-            else {
-                $newFolderParams = @{ DisplayName = $part }
-
-                if ($parentFolderId) {
-                    $newFolder = Invoke-WithRetry -ScriptBlock {
-                        New-MgUserMailFolderChildFolder -UserId $TargetUserId `
-                            -MailFolderId $parentFolderId `
-                            -BodyParameter $newFolderParams
-                    }
-                }
-                else {
-                    $newFolder = Invoke-WithRetry -ScriptBlock {
-                        New-MgUserMailFolder -UserId $TargetUserId -BodyParameter $newFolderParams
-                    }
-                }
-
-                $parentFolderId = $newFolder.Id
-                $StatusBox.AppendText("  Created folder: $currentPath`r`n")
-                $StatusBox.Refresh()
             }
         }
         catch {
-            $StatusBox.AppendText("  Error creating folder $currentPath : $($_.Exception.Message)`r`n")
+            if ("$($_.Exception.Message)" -match 'ErrorFolderExists|already exists') {
+                $created = Find-ChildFolderByName -UserId $TargetUserId -ParentId $parentId -Name $part
+            }
+            if (-not $created) {
+                throw "Could not create target folder '$($walked -join '\')': $(Get-CopyErrorDetail $_)"
+            }
+        }
+
+        if (-not $created -or -not $created.Id) {
+            throw "Could not create target folder '$($walked -join '\')' (Graph returned no folder id)."
+        }
+
+        $parentId    = $created.Id
+        $Cache[$key] = $created.Id
+        if ($StatusBox) {
+            $StatusBox.AppendText("  Created folder: $($walked -join '\')`r`n")
+            $StatusBox.Refresh()
         }
     }
 
-    return $parentFolderId
+    return $parentId
+}
+
+function Get-WellKnownPathMap {
+    param($SourceFolders)
+
+    $map = @{}
+    foreach ($f in $SourceFolders) {
+        if ($f.WellKnownName) {
+            $map[(Get-FolderPathKey -PathParts $f.PathParts)] = $f.WellKnownName
+        }
+    }
+    return $map
 }
 
 # ------------------------------------------------------------------------------
@@ -1376,13 +1538,43 @@ function Copy-Emails {
 
         $StatusBox.AppendText("Scanning folder structure from $SourceEmail...`r`n")
         $StatusBox.Refresh()
-        $sourceFolders = Get-AllMailFolders -UserId $SourceEmail
+        $script:FolderScanIncomplete = $false
+        $sourceWellKnown = Get-WellKnownFolderMap -UserId $SourceEmail
+        $sourceFolders   = Get-AllMailFolders -UserId $SourceEmail -WellKnownMap $sourceWellKnown -StatusBox $StatusBox
+        $wellKnownByPath = Get-WellKnownPathMap -SourceFolders $sourceFolders
+        $folderIdCache   = @{}
 
         $StatusBox.AppendText("Found $($sourceFolders.Count) folders:`r`n`r`n--- FOLDER STRUCTURE ---`r`n")
         foreach ($f in $sourceFolders) {
             $StatusBox.AppendText("  $($f.FullPath) ($($f.TotalItemCount) items)`r`n")
         }
         $StatusBox.AppendText("`r`n")
+        $StatusBox.Refresh()
+
+        # The whole hierarchy is mirrored up front, including folders that hold no
+        # mail, so the target structure matches even where there is nothing to copy.
+        $StatusBox.AppendText("Mirroring folder structure into $TargetEmail...`r`n")
+        Update-CopyUi -StatusBox $StatusBox
+        $targetFolderIds = @{}
+        foreach ($sourceFolder in $sourceFolders) {
+            if ($script:CancelRequested) {
+                $StatusBox.AppendText("`r`n*** COPY CANCELLED BY USER ***`r`n")
+                Update-CopyUi -StatusBox $StatusBox
+                return @{ Success = $true; Copied = 0; Failed = 0; Folders = 0; Skipped = 0; Cancelled = $true }
+            }
+            try {
+                $resolvedId = Resolve-TargetFolder -TargetUserId $TargetEmail -SourceFolder $sourceFolder `
+                    -WellKnownByPath $wellKnownByPath -Cache $folderIdCache -StatusBox $StatusBox
+                if ($resolvedId) {
+                    $targetFolderIds[(Get-FolderPathKey -PathParts $sourceFolder.PathParts)] = $resolvedId
+                }
+            }
+            catch {
+                $StatusBox.AppendText("  ERROR: $($_.Exception.Message)`r`n")
+            }
+            Update-CopyUi -StatusBox $StatusBox
+        }
+        $StatusBox.AppendText("Folder structure ready: $($targetFolderIds.Count) / $($sourceFolders.Count) folders available in target.`r`n`r`n")
         $StatusBox.Refresh()
 
         $totalMessages = ($sourceFolders | Measure-Object -Property TotalItemCount -Sum).Sum
@@ -1409,10 +1601,17 @@ function Copy-Emails {
             $StatusBox.AppendText("--- Processing Folder: $($sourceFolder.FullPath) ---`r`n")
             $StatusBox.Refresh()
 
-            $StatusBox.AppendText("  Ensuring folder structure in target mailbox...`r`n")
-            $targetFolderId = Ensure-FolderStructure -TargetUserId $TargetEmail `
-                                                     -FolderPath $sourceFolder.FullPath `
-                                                     -StatusBox $StatusBox
+            $targetFolderId = $targetFolderIds[(Get-FolderPathKey -PathParts $sourceFolder.PathParts)]
+            if (-not $targetFolderId) {
+                # Posting to /users/{id}/messages instead would silently file these
+                # messages as drafts in the target mailbox.
+                $StatusBox.AppendText("  SKIPPED: no target folder, $($sourceFolder.TotalItemCount) messages not copied.`r`n`r`n")
+                $totalFailed += $sourceFolder.TotalItemCount
+                $overallProgress += $sourceFolder.TotalItemCount
+                Set-CopyProgress -ProgressBar $ProgressBar -Current $overallProgress -Total $totalMessages
+                Update-CopyUi -StatusBox $StatusBox -ProgressBar $ProgressBar
+                continue
+            }
 
             $StatusBox.AppendText("  Checking for existing messages in destination folder...`r`n")
             $StatusBox.Refresh()
@@ -1582,11 +1781,8 @@ function Copy-Emails {
                             }
 
                             $uEnc      = [uri]::EscapeDataString($TargetEmail)
-                            $createUri = if ($targetFolderId) {
-                                "$script:GraphBase/users/$uEnc/mailFolders/$targetFolderId/messages"
-                            } else {
-                                "$script:GraphBase/users/$uEnc/messages"
-                            }
+                            $fEnc      = [uri]::EscapeDataString($targetFolderId)
+                            $createUri = "$script:GraphBase/users/$uEnc/mailFolders/$fEnc/messages"
 
                             try {
                                 $created = Invoke-GraphJsonPost -Uri $createUri -BodyObject $msgBody
@@ -2001,12 +2197,65 @@ function Verify-CopiedItems {
         $StatusBox.AppendText("`r`n--- Verifying Copied Items ---`r`n")
 
         if ($CheckEmails) {
-            $srcFolders = Get-AllMailFolders -UserId $SourceEmail
-            $tgtFolders = Get-AllMailFolders -UserId $TargetEmail
+            $srcWellKnown = Get-WellKnownFolderMap -UserId $SourceEmail
+            $tgtWellKnown = Get-WellKnownFolderMap -UserId $TargetEmail
+            $srcFolders = Get-AllMailFolders -UserId $SourceEmail -WellKnownMap $srcWellKnown -StatusBox $StatusBox
+            $tgtFolders = Get-AllMailFolders -UserId $TargetEmail -WellKnownMap $tgtWellKnown -StatusBox $StatusBox
             $srcCount = ($srcFolders | Measure-Object -Property TotalItemCount -Sum).Sum
             $tgtCount = ($tgtFolders | Measure-Object -Property TotalItemCount -Sum).Sum
             $StatusBox.AppendText("Source mailbox emails: $srcCount`r`n")
             $StatusBox.AppendText("Target mailbox emails: $tgtCount`r`n")
+            Update-CopyUi -StatusBox $StatusBox
+
+            # Item totals alone cannot show a structure problem: compare the paths.
+            # A source well-known folder counts as present when the target's own
+            # well-known folder exists, whatever it is called there.
+            $tgtPaths = @{}
+            foreach ($tf in $tgtFolders) { $tgtPaths[(Get-FolderPathKey -PathParts $tf.PathParts)] = $true }
+            $tgtWellKnownNames = @{}
+            foreach ($tf in $tgtFolders) {
+                if ($tf.WellKnownName) { $tgtWellKnownNames[$tf.WellKnownName] = $tf.PathParts }
+            }
+
+            $srcRootWellKnown = @{}
+            foreach ($sf in $srcFolders) {
+                if ($sf.WellKnownName -and $sf.PathParts.Count -eq 1) {
+                    $srcRootWellKnown[$sf.PathParts[0]] = $sf.WellKnownName
+                }
+            }
+
+            $missing = New-Object System.Collections.Generic.List[string]
+            foreach ($sf in $srcFolders) {
+                $segments = @($sf.PathParts)
+                $rootName = $segments[0]
+                if ($srcRootWellKnown.ContainsKey($rootName) -and
+                    $tgtWellKnownNames.ContainsKey($srcRootWellKnown[$rootName])) {
+                    $segments = @($tgtWellKnownNames[$srcRootWellKnown[$rootName]])
+                    if ($sf.PathParts.Count -gt 1) {
+                        $segments += @($sf.PathParts[1..($sf.PathParts.Count - 1)])
+                    }
+                }
+                if (-not $tgtPaths.ContainsKey((Get-FolderPathKey -PathParts $segments))) {
+                    $missing.Add($sf.FullPath)
+                }
+            }
+
+            $StatusBox.AppendText("Source folders: $($srcFolders.Count)  |  present in target: $($srcFolders.Count - $missing.Count)`r`n")
+            if ($missing.Count -gt 0) {
+                $StatusBox.AppendText("Folders MISSING from target ($($missing.Count)):`r`n")
+                $shown = 0
+                foreach ($m in $missing) {
+                    if ($shown -ge 25) {
+                        $StatusBox.AppendText("  ... and $($missing.Count - $shown) more`r`n")
+                        break
+                    }
+                    $StatusBox.AppendText("  $m`r`n")
+                    $shown++
+                }
+            }
+            else {
+                $StatusBox.AppendText("Folder structure matches.`r`n")
+            }
             Update-CopyUi -StatusBox $StatusBox
         }
 
@@ -2118,7 +2367,7 @@ $fontButton  = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.Fo
 $fontStatus  = New-Object System.Drawing.Font('Consolas', 9)
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text            = "Microsoft 365 Mailbox Copy Tool v1.14 (Interactive Login)"
+$form.Text            = "Microsoft 365 Mailbox Copy Tool v1.15 (Interactive Login)"
 $form.Size            = New-Object System.Drawing.Size(780, 820)
 $form.MinimumSize     = New-Object System.Drawing.Size(600, 700)
 $form.StartPosition   = "CenterScreen"
@@ -2357,11 +2606,24 @@ $copyButton.Add_Click({
                 $progressBar.Value = 100
                 $statusBox.AppendText("`r`n=== COPY OPERATION COMPLETED ===`r`n")
                 $statusBox.AppendText("Remember to remove FullAccess permissions from both mailboxes.`r`n")
-                [System.Windows.Forms.MessageBox]::Show(
-                    "Copy operation completed!`r`n`r`nRemember to remove FullAccess permissions from both mailboxes.",
-                    "Success",
-                    [System.Windows.Forms.MessageBoxButtons]::OK,
-                    [System.Windows.Forms.MessageBoxIcon]::Information)
+
+                if ($script:FolderScanIncomplete) {
+                    $statusBox.AppendText("WARNING: at least one folder listing failed, so the source was not fully`r`n")
+                    $statusBox.AppendText("         enumerated. Review the log above and re-run before you rely on`r`n")
+                    $statusBox.AppendText("         this copy - it is NOT complete.`r`n")
+                    [System.Windows.Forms.MessageBox]::Show(
+                        "Copy finished, but the source mailbox could not be fully enumerated, so some folders were NOT copied.`r`n`r`nReview the status log and re-run before relying on this copy.`r`n`r`nRemember to remove FullAccess permissions from both mailboxes.",
+                        "Completed With Warnings",
+                        [System.Windows.Forms.MessageBoxButtons]::OK,
+                        [System.Windows.Forms.MessageBoxIcon]::Warning)
+                }
+                else {
+                    [System.Windows.Forms.MessageBox]::Show(
+                        "Copy operation completed!`r`n`r`nRemember to remove FullAccess permissions from both mailboxes.",
+                        "Success",
+                        [System.Windows.Forms.MessageBoxButtons]::OK,
+                        [System.Windows.Forms.MessageBoxIcon]::Information)
+                }
             }
             else {
                 $statusBox.AppendText("`r`n=== COPY OPERATION CANCELLED ===`r`n")
