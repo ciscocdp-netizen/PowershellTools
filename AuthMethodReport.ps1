@@ -118,8 +118,11 @@ $script:ProgressLabel = $null
 $script:ProgressDetail = $null
 $script:GraphScopeList = @('UserAuthenticationMethod.Read.All', 'User.Read.All')
 $script:GraphScopeString = 'UserAuthenticationMethod.Read.All User.Read.All offline_access openid profile'
-$script:ScriptBuild = '2026-09-07-d'
-$script:GraphPowerShellClientId = '14d82eec-204b-4c2f-b113-9d477e6ee18c'
+$script:ScriptBuild = '2026-09-16-a'
+# Current Connect-MgGraph / Microsoft Graph Command Line Tools public client.
+$script:GraphPowerShellClientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
+# Older Microsoft Graph PowerShell public client. Still present in some tenants.
+$script:GraphPowerShellLegacyClientId = '14d82eec-204b-4c2f-b113-9d477e6ee18c'
 $script:AzurePowerShellClientId = '1950a258-227b-4e31-a9cf-717495945fc2'
 $script:AzureCliClientId = '04b07795-8ddb-461a-bbee-02f9e1bf7b46'
 $script:PasswordMethodId = '28c10230-6103-485e-b985-444c60001490'
@@ -821,8 +824,9 @@ function Get-PublicClientIdList {
     }
     # Azure CLI / Azure PowerShell first-party apps cannot request
     # UserAuthenticationMethod.Read.All (AADSTS65002). Only Graph PowerShell
-    # or a custom public client in this tenant can.
+    # / Graph Command Line Tools, or a custom public client in this tenant, can.
     [void]$ids.Add($script:GraphPowerShellClientId)
+    [void]$ids.Add($script:GraphPowerShellLegacyClientId)
 
     $seen = @{}
     $unique = New-Object System.Collections.Generic.List[string]
@@ -1471,16 +1475,22 @@ function Connect-ViaRestDeviceCode {
         [string]$AppClientId
     )
 
-    if ([string]::IsNullOrWhiteSpace($AppClientId)) {
-        $AppClientId = $script:GraphPowerShellClientId
-    }
-
     $tenant = Resolve-DeviceCodeTenant
     $authority = "https://login.microsoftonline.com/$tenant"
 
-    $dcBody = ConvertTo-FormUrlEncoded -Data @{
-        client_id = $AppClientId
-        scope     = $script:GraphScopeString
+    $clientIds = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace($AppClientId)) {
+        [void]$clientIds.Add($AppClientId.Trim())
+    }
+    foreach ($id in @(Get-PublicClientIdList)) {
+        $key = $id.ToLowerInvariant()
+        $already = $false
+        foreach ($existing in $clientIds) {
+            if ($existing.ToLowerInvariant() -eq $key) { $already = $true; break }
+        }
+        if (-not $already) {
+            [void]$clientIds.Add($id)
+        }
     }
 
     # Never use the Graph SDK device-code switch or the PowerShell web cmdlets here.
@@ -1488,19 +1498,47 @@ function Connect-ViaRestDeviceCode {
     Write-Host "Contacting login.microsoftonline.com for a device code (20 second timeout)..." -ForegroundColor Cyan
     try { [Console]::Out.Flush() } catch { }
 
-    $dcResult = Invoke-EntraFormPost -Uri "$authority/oauth2/v2.0/devicecode" -Body $dcBody -TimeoutMs 20000
-    $dc = $dcResult.Object
-    $dcError = Get-OAuthErrorCode -Result $dcResult
-    if ($dcResult.StatusCode -lt 200 -or $dcResult.StatusCode -ge 300 -or -not $dc -or -not [string]::IsNullOrWhiteSpace($dcError)) {
-        $detail = $dcResult.Text
-        if ([string]::IsNullOrWhiteSpace($detail)) { $detail = "HTTP $($dcResult.StatusCode)" }
-        if ($detail -match 'AADSTS700016|AADSTS65002|unauthorized_client') {
-            Show-GraphConsentGuidance
+    $dc = $null
+    $dcResult = $null
+    $lastDetail = ''
+    foreach ($candidateId in $clientIds) {
+        Write-Host "Trying app $candidateId ..." -ForegroundColor Gray
+        $dcBody = ConvertTo-FormUrlEncoded -Data @{
+            client_id = $candidateId
+            scope     = $script:GraphScopeString
         }
-        if ($detail -match 'AADSTS50059') {
-            throw "Microsoft did not issue a device code because the tenant was missing. Re-run with -TenantId <your-tenant-guid-or-domain>. Raw response: $detail"
+        $dcResult = Invoke-EntraFormPost -Uri "$authority/oauth2/v2.0/devicecode" -Body $dcBody -TimeoutMs 20000
+        $dcError = Get-OAuthErrorCode -Result $dcResult
+        $okObject = $dcResult.Object
+        $issued = ($dcResult.StatusCode -ge 200 -and $dcResult.StatusCode -lt 300 -and $okObject -and [string]::IsNullOrWhiteSpace($dcError))
+        if ($issued) {
+            $userCodeProbe = [string](Get-GraphResponseProperty -Response $okObject -Name 'user_code')
+            if (-not [string]::IsNullOrWhiteSpace($userCodeProbe)) {
+                $dc = $okObject
+                $AppClientId = $candidateId
+                break
+            }
         }
-        throw "Microsoft did not issue a device code: $detail"
+
+        $lastDetail = $dcResult.Text
+        if ([string]::IsNullOrWhiteSpace($lastDetail)) { $lastDetail = "HTTP $($dcResult.StatusCode)" }
+        if ($lastDetail -match 'AADSTS50059') {
+            throw "Microsoft did not issue a device code because the tenant was missing. Re-run with -TenantId <your-tenant-guid-or-domain>."
+        }
+        if ($lastDetail -match 'AADSTS700016') {
+            Write-Host "That Microsoft app is not registered in this tenant. Trying the next app..." -ForegroundColor Yellow
+            continue
+        }
+        if ($lastDetail -match 'AADSTS65002') {
+            Write-Host "That Microsoft app is not allowed to read authentication methods. Trying the next app..." -ForegroundColor Yellow
+            continue
+        }
+        Write-Host "Microsoft did not issue a code for that app. Trying the next app..." -ForegroundColor Yellow
+    }
+
+    if (-not $dc) {
+        Show-GraphConsentGuidance
+        throw "Microsoft Graph PowerShell is not available in this tenant yet (AADSTS700016). An Entra admin must consent it, or re-run with -ClientId of a public-client app from this tenant."
     }
 
     $verifyUrl = [string](Get-GraphResponseProperty -Response $dc -Name 'verification_uri')
@@ -1629,11 +1667,6 @@ function Invoke-ConnectMgGraph {
 }
 
 function Connect-WithDeviceCodeFlow {
-    $appId = $script:GraphPowerShellClientId
-    if (-not [string]::IsNullOrWhiteSpace($ClientId)) {
-        $appId = $ClientId
-    }
-
     # Do not call the Graph SDK connect cmdlet here. On elevated Windows / ISE it
     # prints that a URL and code will appear, then hangs forever.
     $env:AZURE_IDENTITY_DISABLE_CP1 = 'true'
@@ -1641,7 +1674,12 @@ function Connect-WithDeviceCodeFlow {
 
     Write-Host "Requesting a sign-in code from Microsoft (REST device code, not WAM)..." -ForegroundColor Cyan
     try { [Console]::Out.Flush() } catch { }
-    [void](Connect-ViaRestDeviceCode -AppClientId $appId)
+    if ([string]::IsNullOrWhiteSpace($ClientId)) {
+        [void](Connect-ViaRestDeviceCode)
+    }
+    else {
+        [void](Connect-ViaRestDeviceCode -AppClientId $ClientId)
+    }
 }
 
 function Connect-EntraGraph {
@@ -2188,8 +2226,9 @@ function Invoke-SelfTest {
     Assert-True ($authUrl -match 'redirect_uri=http%3A%2F%2Flocalhost%3A8400%2F') 'authorize url redirect'
 
     $pubIds = Get-PublicClientIdList
-    Assert-Equal $script:GraphPowerShellClientId $pubIds[0] 'graph powershell client is default'
-    Assert-Equal 1 $pubIds.Count 'only graph powershell is used by default'
+    Assert-Equal $script:GraphPowerShellClientId $pubIds[0] 'graph command line tools client is default'
+    Assert-Equal $script:GraphPowerShellLegacyClientId $pubIds[1] 'legacy graph powershell client is fallback'
+    Assert-Equal 2 $pubIds.Count 'default public clients are current then legacy Graph PowerShell'
 
     $consent = Get-GraphAdminConsentUrl
     Assert-True ($consent -match 'adminconsent') 'admin consent url'
