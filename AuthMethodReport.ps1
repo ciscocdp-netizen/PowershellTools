@@ -38,8 +38,9 @@
     Optional Entra tenant (contoso.onmicrosoft.com or a Tenant ID GUID).
 
 .PARAMETER ClientId
-    Optional public-client app ID. Leave blank to use the Microsoft Graph
-    PowerShell app (the default WAM client).
+    Optional public-client app ID. Leave blank to use Microsoft Graph Command
+    Line Tools. Do not pass a web app or an app that has a client secret
+    (that fails with AADSTS7000218).
 
 .PARAMETER SelfTest
     Runs built-in unit tests for classification helpers and exits
@@ -118,7 +119,7 @@ $script:ProgressLabel = $null
 $script:ProgressDetail = $null
 $script:GraphScopeList = @('UserAuthenticationMethod.Read.All', 'User.Read.All')
 $script:GraphScopeString = 'UserAuthenticationMethod.Read.All User.Read.All offline_access openid profile'
-$script:ScriptBuild = '2026-09-16-a'
+$script:ScriptBuild = '2026-09-16-b'
 # Current Connect-MgGraph / Microsoft Graph Command Line Tools public client.
 $script:GraphPowerShellClientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
 # Older Microsoft Graph PowerShell public client. Still present in some tenants.
@@ -819,14 +820,13 @@ function New-AuthParentForm {
 
 function Get-PublicClientIdList {
     $ids = New-Object System.Collections.Generic.List[string]
+    # Known public Microsoft apps first. A custom -ClientId is often a web
+    # app with a secret (AADSTS7000218), so it is tried last.
+    [void]$ids.Add($script:GraphPowerShellClientId)
+    [void]$ids.Add($script:GraphPowerShellLegacyClientId)
     if (-not [string]::IsNullOrWhiteSpace($ClientId)) {
         [void]$ids.Add($ClientId.Trim())
     }
-    # Azure CLI / Azure PowerShell first-party apps cannot request
-    # UserAuthenticationMethod.Read.All (AADSTS65002). Only Graph PowerShell
-    # / Graph Command Line Tools, or a custom public client in this tenant, can.
-    [void]$ids.Add($script:GraphPowerShellClientId)
-    [void]$ids.Add($script:GraphPowerShellLegacyClientId)
 
     $seen = @{}
     $unique = New-Object System.Collections.Generic.List[string]
@@ -861,8 +861,8 @@ function Show-GraphConsentGuidance {
     Write-Host "     - Redirect URI: http://localhost" -ForegroundColor Gray
     Write-Host "     - Allow public client flows: Yes" -ForegroundColor Gray
     Write-Host "     - Delegated permissions: User.Read.All, UserAuthenticationMethod.Read.All" -ForegroundColor Gray
-    Write-Host "     - Grant admin consent, then re-run:" -ForegroundColor Gray
-    Write-Host "       .\AuthMethodReport.ps1 -DeviceCode -ClientId <app-id> -TenantId <tenant-id>" -ForegroundColor White
+    Write-Host "     - Grant admin consent. Prefer re-running WITHOUT -ClientId:" -ForegroundColor Gray
+    Write-Host "       .\AuthMethodReport.ps1 -DeviceCode -TenantId <tenant-id>" -ForegroundColor White
 }
 
 function Test-IsSpecificEntraTenant {
@@ -1011,6 +1011,13 @@ function Get-OAuthErrorCode {
     }
     if ($null -eq $obj) { return '' }
     return [string](Get-GraphResponseProperty -Response $obj -Name 'error')
+}
+
+function Test-ShouldTryNextDeviceCodeClient {
+    param([string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
+    return ($Message -match 'AADSTS7000218|AADSTS700016|AADSTS65002|AADSTS50105|client_secret|client_assertion|unauthorized_client|invalid_client')
 }
 
 function Invoke-EntraFormPost {
@@ -1479,17 +1486,17 @@ function Connect-ViaRestDeviceCode {
     $authority = "https://login.microsoftonline.com/$tenant"
 
     $clientIds = New-Object System.Collections.Generic.List[string]
-    if (-not [string]::IsNullOrWhiteSpace($AppClientId)) {
-        [void]$clientIds.Add($AppClientId.Trim())
-    }
     foreach ($id in @(Get-PublicClientIdList)) {
-        $key = $id.ToLowerInvariant()
+        [void]$clientIds.Add($id)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($AppClientId)) {
+        $extra = $AppClientId.Trim()
         $already = $false
         foreach ($existing in $clientIds) {
-            if ($existing.ToLowerInvariant() -eq $key) { $already = $true; break }
+            if ($existing.ToLowerInvariant() -eq $extra.ToLowerInvariant()) { $already = $true; break }
         }
         if (-not $already) {
-            [void]$clientIds.Add($id)
+            [void]$clientIds.Add($extra)
         }
     }
 
@@ -1498,9 +1505,10 @@ function Connect-ViaRestDeviceCode {
     Write-Host "Contacting login.microsoftonline.com for a device code (20 second timeout)..." -ForegroundColor Cyan
     try { [Console]::Out.Flush() } catch { }
 
-    $dc = $null
-    $dcResult = $null
+    $token = $null
+    $usedClientId = $null
     $lastDetail = ''
+
     foreach ($candidateId in $clientIds) {
         Write-Host "Trying app $candidateId ..." -ForegroundColor Gray
         $dcBody = ConvertTo-FormUrlEncoded -Data @{
@@ -1509,120 +1517,119 @@ function Connect-ViaRestDeviceCode {
         }
         $dcResult = Invoke-EntraFormPost -Uri "$authority/oauth2/v2.0/devicecode" -Body $dcBody -TimeoutMs 20000
         $dcError = Get-OAuthErrorCode -Result $dcResult
-        $okObject = $dcResult.Object
-        $issued = ($dcResult.StatusCode -ge 200 -and $dcResult.StatusCode -lt 300 -and $okObject -and [string]::IsNullOrWhiteSpace($dcError))
+        $dc = $dcResult.Object
+        $issued = ($dcResult.StatusCode -ge 200 -and $dcResult.StatusCode -lt 300 -and $dc -and [string]::IsNullOrWhiteSpace($dcError))
+        $userCode = ''
         if ($issued) {
-            $userCodeProbe = [string](Get-GraphResponseProperty -Response $okObject -Name 'user_code')
-            if (-not [string]::IsNullOrWhiteSpace($userCodeProbe)) {
-                $dc = $okObject
-                $AppClientId = $candidateId
+            $userCode = [string](Get-GraphResponseProperty -Response $dc -Name 'user_code')
+        }
+        if ([string]::IsNullOrWhiteSpace($userCode)) {
+            $lastDetail = $dcResult.Text
+            if ([string]::IsNullOrWhiteSpace($lastDetail)) { $lastDetail = "HTTP $($dcResult.StatusCode)" }
+            if ($lastDetail -match 'AADSTS50059') {
+                throw "Microsoft did not issue a device code because the tenant was missing. Re-run with -TenantId <your-tenant-guid-or-domain>."
+            }
+            if (Test-ShouldTryNextDeviceCodeClient -Message $lastDetail) {
+                Write-Host "That app cannot be used for device-code sign-in. Trying the next app..." -ForegroundColor Yellow
+                continue
+            }
+            Write-Host "Microsoft did not issue a code for that app. Trying the next app..." -ForegroundColor Yellow
+            continue
+        }
+
+        $verifyUrl = [string](Get-GraphResponseProperty -Response $dc -Name 'verification_uri')
+        $completeUrl = [string](Get-GraphResponseProperty -Response $dc -Name 'verification_uri_complete')
+        $openUrl = $verifyUrl
+        if (-not [string]::IsNullOrWhiteSpace($completeUrl)) {
+            $openUrl = $completeUrl
+        }
+        if ([string]::IsNullOrWhiteSpace($openUrl)) {
+            $openUrl = 'https://microsoft.com/devicelogin'
+        }
+
+        Write-Host ""
+        Write-Host "============================================================" -ForegroundColor Cyan
+        Write-Host "  Sign in at:  $openUrl" -ForegroundColor Yellow
+        Write-Host "  Enter code:  $userCode" -ForegroundColor Yellow
+        Write-Host "============================================================" -ForegroundColor Cyan
+        Write-Host "Leave this window open until sign-in finishes." -ForegroundColor Gray
+        try { [Console]::Out.Flush() } catch { }
+
+        if ($script:WinFormsLoaded) {
+            try { [System.Windows.Forms.Clipboard]::SetText($userCode) } catch { }
+        }
+
+        $opened = Start-SystemBrowser -Url $openUrl
+        if (-not $opened) {
+            Write-Host "The browser did not open automatically. Copy this URL:" -ForegroundColor Yellow
+            Write-Host $openUrl -ForegroundColor White
+        }
+
+        $expiresRaw = Get-GraphResponseProperty -Response $dc -Name 'expires_in'
+        $expiresSec = 900
+        if ($null -ne $expiresRaw -and [string]$expiresRaw -match '^\d+$') {
+            $expiresSec = [Math]::Max(60, [int]$expiresRaw)
+        }
+        $deadline = [datetime]::UtcNow.AddSeconds($expiresSec)
+        $intervalRaw = Get-GraphResponseProperty -Response $dc -Name 'interval'
+        $interval = 5
+        if ($null -ne $intervalRaw -and [string]$intervalRaw -match '^\d+$') {
+            $interval = [Math]::Max(5, [int]$intervalRaw)
+        }
+        $deviceCode = [string](Get-GraphResponseProperty -Response $dc -Name 'device_code')
+
+        Write-Host "Waiting for you to finish signing in (polling Microsoft)..." -ForegroundColor Gray
+        try { [Console]::Out.Flush() } catch { }
+
+        $token = $null
+        $tryNextClient = $false
+        while ([datetime]::UtcNow -lt $deadline) {
+            Start-Sleep -Seconds $interval
+            try { [void][System.Windows.Forms.Application]::DoEvents() } catch { }
+            $tokBody = ConvertTo-FormUrlEncoded -Data @{
+                grant_type  = 'urn:ietf:params:oauth:grant-type:device_code'
+                client_id   = $candidateId
+                device_code = $deviceCode
+            }
+            $tokResult = Invoke-EntraFormPost -Uri "$authority/oauth2/v2.0/token" -Body $tokBody -TimeoutMs 20000
+            $errCode = Get-OAuthErrorCode -Result $tokResult
+            if ($errCode -match 'authorization_pending') {
+                Write-Host "Still waiting for you to complete sign-in in the browser..." -ForegroundColor Gray
+                continue
+            }
+            if ($errCode -match 'slow_down') {
+                $interval = $interval + 5
+                Write-Host "Microsoft asked the script to wait a bit longer..." -ForegroundColor Gray
+                continue
+            }
+            if ($tokResult.StatusCode -ge 200 -and $tokResult.StatusCode -lt 300 -and $tokResult.Object) {
+                $accessProbe = [string](Get-GraphResponseProperty -Response $tokResult.Object -Name 'access_token')
+                if (-not [string]::IsNullOrWhiteSpace($accessProbe)) {
+                    $token = $tokResult.Object
+                    $usedClientId = $candidateId
+                    break
+                }
+            }
+            $lastDetail = $tokResult.Text
+            if ([string]::IsNullOrWhiteSpace($lastDetail)) { $lastDetail = "HTTP $($tokResult.StatusCode) $errCode" }
+            if (Test-ShouldTryNextDeviceCodeClient -Message $lastDetail) {
+                Write-Host ""
+                Write-Host "That app cannot finish device-code sign-in (it is not a public client, or it needs a secret)." -ForegroundColor Yellow
+                Write-Host "Requesting a new code from the next public Microsoft Graph app. Sign in again with the new code." -ForegroundColor Yellow
+                $tryNextClient = $true
                 break
             }
+            throw "Device code token exchange failed: $lastDetail"
         }
 
-        $lastDetail = $dcResult.Text
-        if ([string]::IsNullOrWhiteSpace($lastDetail)) { $lastDetail = "HTTP $($dcResult.StatusCode)" }
-        if ($lastDetail -match 'AADSTS50059') {
-            throw "Microsoft did not issue a device code because the tenant was missing. Re-run with -TenantId <your-tenant-guid-or-domain>."
-        }
-        if ($lastDetail -match 'AADSTS700016') {
-            Write-Host "That Microsoft app is not registered in this tenant. Trying the next app..." -ForegroundColor Yellow
-            continue
-        }
-        if ($lastDetail -match 'AADSTS65002') {
-            Write-Host "That Microsoft app is not allowed to read authentication methods. Trying the next app..." -ForegroundColor Yellow
-            continue
-        }
-        Write-Host "Microsoft did not issue a code for that app. Trying the next app..." -ForegroundColor Yellow
-    }
-
-    if (-not $dc) {
-        Show-GraphConsentGuidance
-        throw "Microsoft Graph PowerShell is not available in this tenant yet (AADSTS700016). An Entra admin must consent it, or re-run with -ClientId of a public-client app from this tenant."
-    }
-
-    $verifyUrl = [string](Get-GraphResponseProperty -Response $dc -Name 'verification_uri')
-    $userCode  = [string](Get-GraphResponseProperty -Response $dc -Name 'user_code')
-    $completeUrl = [string](Get-GraphResponseProperty -Response $dc -Name 'verification_uri_complete')
-    $openUrl = $verifyUrl
-    if (-not [string]::IsNullOrWhiteSpace($completeUrl)) {
-        $openUrl = $completeUrl
-    }
-    if ([string]::IsNullOrWhiteSpace($openUrl)) {
-        $openUrl = 'https://microsoft.com/devicelogin'
-    }
-    if ([string]::IsNullOrWhiteSpace($userCode)) {
-        throw "Microsoft returned a device-code response without a user_code: $($dcResult.Text)"
-    }
-
-    Write-Host ""
-    Write-Host "============================================================" -ForegroundColor Cyan
-    Write-Host "  Sign in at:  $openUrl" -ForegroundColor Yellow
-    Write-Host "  Enter code:  $userCode" -ForegroundColor Yellow
-    Write-Host "============================================================" -ForegroundColor Cyan
-    Write-Host "Leave this window open until sign-in finishes." -ForegroundColor Gray
-    try { [Console]::Out.Flush() } catch { }
-
-    if ($script:WinFormsLoaded) {
-        try { [System.Windows.Forms.Clipboard]::SetText($userCode) } catch { }
-    }
-
-    $opened = Start-SystemBrowser -Url $openUrl
-    if (-not $opened) {
-        Write-Host "The browser did not open automatically. Copy this URL:" -ForegroundColor Yellow
-        Write-Host $openUrl -ForegroundColor White
-    }
-
-    $expiresRaw = Get-GraphResponseProperty -Response $dc -Name 'expires_in'
-    $expiresSec = 900
-    if ($null -ne $expiresRaw -and [string]$expiresRaw -match '^\d+$') {
-        $expiresSec = [Math]::Max(60, [int]$expiresRaw)
-    }
-    $deadline = [datetime]::UtcNow.AddSeconds($expiresSec)
-    $intervalRaw = Get-GraphResponseProperty -Response $dc -Name 'interval'
-    $interval = 5
-    if ($null -ne $intervalRaw -and [string]$intervalRaw -match '^\d+$') {
-        $interval = [Math]::Max(5, [int]$intervalRaw)
-    }
-    $deviceCode = [string](Get-GraphResponseProperty -Response $dc -Name 'device_code')
-    $token = $null
-
-    Write-Host "Waiting for you to finish signing in (polling Microsoft)..." -ForegroundColor Gray
-    try { [Console]::Out.Flush() } catch { }
-
-    while ([datetime]::UtcNow -lt $deadline) {
-        Start-Sleep -Seconds $interval
-        try { [void][System.Windows.Forms.Application]::DoEvents() } catch { }
-        $tokBody = ConvertTo-FormUrlEncoded -Data @{
-            grant_type  = 'urn:ietf:params:oauth:grant-type:device_code'
-            client_id   = $AppClientId
-            device_code = $deviceCode
-        }
-        $tokResult = Invoke-EntraFormPost -Uri "$authority/oauth2/v2.0/token" -Body $tokBody -TimeoutMs 20000
-        $errCode = Get-OAuthErrorCode -Result $tokResult
-        if ($errCode -match 'authorization_pending') {
-            Write-Host "Still waiting for you to complete sign-in in the browser..." -ForegroundColor Gray
-            continue
-        }
-        if ($errCode -match 'slow_down') {
-            $interval = $interval + 5
-            Write-Host "Microsoft asked the script to wait a bit longer..." -ForegroundColor Gray
-            continue
-        }
-        if ($tokResult.StatusCode -ge 200 -and $tokResult.StatusCode -lt 300 -and $tokResult.Object) {
-            $accessProbe = [string](Get-GraphResponseProperty -Response $tokResult.Object -Name 'access_token')
-            if (-not [string]::IsNullOrWhiteSpace($accessProbe)) {
-                $token = $tokResult.Object
-                break
-            }
-        }
-        $detail = $tokResult.Text
-        if ([string]::IsNullOrWhiteSpace($detail)) { $detail = "HTTP $($tokResult.StatusCode) $errCode" }
-        throw "Device code token exchange failed: $detail"
+        if ($token) { break }
+        if ($tryNextClient) { continue }
+        throw 'Sign-in timed out or was cancelled.'
     }
 
     if (-not $token) {
-        throw 'Sign-in timed out or was cancelled.'
+        Show-GraphConsentGuidance
+        throw "Could not complete device-code sign-in with a public Microsoft Graph app. If you passed -ClientId, omit it and run again. $lastDetail"
     }
 
     $accessToken = [string](Get-GraphResponseProperty -Response $token -Name 'access_token')
@@ -1630,7 +1637,7 @@ function Connect-ViaRestDeviceCode {
         throw 'Device code sign-in succeeded but no access_token was returned.'
     }
 
-    return (Complete-GraphTokenResponse -Token $token -AppClientId $AppClientId -Tenant $tenant)
+    return (Complete-GraphTokenResponse -Token $token -AppClientId $usedClientId -Tenant $tenant)
 }
 
 function Invoke-ConnectMgGraph {
@@ -1674,12 +1681,7 @@ function Connect-WithDeviceCodeFlow {
 
     Write-Host "Requesting a sign-in code from Microsoft (REST device code, not WAM)..." -ForegroundColor Cyan
     try { [Console]::Out.Flush() } catch { }
-    if ([string]::IsNullOrWhiteSpace($ClientId)) {
-        [void](Connect-ViaRestDeviceCode)
-    }
-    else {
-        [void](Connect-ViaRestDeviceCode -AppClientId $ClientId)
-    }
+    [void](Connect-ViaRestDeviceCode)
 }
 
 function Connect-EntraGraph {
@@ -2253,6 +2255,9 @@ function Invoke-SelfTest {
         Object     = ($pendingJson | ConvertFrom-Json)
     }
     Assert-Equal 'authorization_pending' (Get-OAuthErrorCode -Result $pendingResult) 'oauth pending error code'
+    Assert-True (Test-ShouldTryNextDeviceCodeClient 'AADSTS7000218: client_secret') 'secret-required client is skipped'
+    Assert-True (Test-ShouldTryNextDeviceCodeClient 'AADSTS700016: Application was not found') 'missing app is skipped'
+    Assert-False (Test-ShouldTryNextDeviceCodeClient 'authorization_pending') 'pending sign-in is not skipped'
 
     $deviceFn = ${function:Connect-WithDeviceCodeFlow}.ToString()
     Assert-True ($deviceFn -notmatch 'Connect-MgGraph') 'device-code flow does not call Connect-MgGraph'
@@ -2262,6 +2267,7 @@ function Invoke-SelfTest {
     Assert-True ($restFn -match 'Invoke-EntraFormPost') 'REST device code uses timed HttpWebRequest'
     Assert-True ($restFn -notmatch 'Invoke-RestMethod') 'REST device code does not use Invoke-RestMethod'
     Assert-True ($restFn -notmatch 'Connect-MgGraph') 'REST device code does not call Connect-MgGraph'
+    Assert-True ($restFn -match 'Test-ShouldTryNextDeviceCodeClient') 'REST device code skips confidential clients'
 
     $hangPhrase = 'a URL and code will appear' + ' below'
     $wamFn = ${function:Invoke-ConnectMgGraph}.ToString()
