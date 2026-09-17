@@ -4,11 +4,12 @@
 
 .DESCRIPTION
     Several functions in M365-Mailbox-Copy-Tool.ps1 constrain parameters to
-    [System.Windows.Forms.TextBox] / [System.Windows.Forms.ProgressBar]. On
-    Windows the real assembly is loaded; anywhere else these minimal stand-ins
-    are defined under the same names so the functions can be called unchanged.
-    The stand-in TextBox accumulates everything appended to it in .Text, exactly
-    like the real control, so a test can read the status log either way.
+    [System.Windows.Forms.TextBox] / [System.Windows.Forms.ProgressBar] /
+    [System.Windows.Forms.Label]. On Windows the real assembly is loaded;
+    anywhere else these minimal stand-ins are defined under the same names so the
+    functions can be called unchanged. The stand-in TextBox accumulates
+    everything appended to it in .Text, exactly like the real control, so a test
+    can read the status log either way.
 #>
 
 if ([type]::GetType('System.Windows.Forms.TextBox') -or
@@ -44,9 +45,25 @@ namespace System.Windows.Forms
         public void Refresh() { }
     }
 
+    public class Label
+    {
+        public string Text { get; set; }
+    }
+
+    public enum ProgressBarStyle
+    {
+        Blocks = 0,
+        Continuous = 1,
+        Marquee = 2
+    }
+
     public class ProgressBar
     {
         public int Value { get; set; }
+        public int Minimum { get; set; }
+        public int Maximum { get; set; }
+        public int MarqueeAnimationSpeed { get; set; }
+        public ProgressBarStyle Style { get; set; }
         public void Refresh() { }
     }
 

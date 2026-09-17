@@ -28,6 +28,10 @@ $script:FailFilterQueries = $false
 # Counts $filter clauses Graph's OData parser would reject, so a test can prove
 # the tool escapes folder names rather than relying on its own error fallback.
 $script:FilterSyntaxErrors = 0
+# Call counters, so a test can prove the tool only writes what is missing and
+# does not fall back to a lookup per path segment.
+$script:CreatedFolderNames = New-Object System.Collections.Generic.List[string]
+$script:FilterQueryCount   = 0
 
 function Reset-FakeGraph {
     $script:Store.Clear()
@@ -35,6 +39,8 @@ function Reset-FakeGraph {
     $script:HideFromFilter.Clear()
     $script:FailFilterQueries  = $false
     $script:FilterSyntaxErrors = 0
+    $script:FilterQueryCount   = 0
+    $script:CreatedFolderNames.Clear()
 }
 
 function New-FakeMailbox {
@@ -124,6 +130,7 @@ function Select-FakeFolders {
     param($Folders, [string]$Filter, [string]$UserId)
     $set = @($Folders)
     if ($Filter) {
+        $script:FilterQueryCount++
         $name = Resolve-FakeFilterValue -Filter $Filter
         if ($script:FailFilterQueries) {
             throw "Status: 400 (BadRequest) Code: ErrorInvalidProperty Message: The property cannot be used in a restriction."
@@ -187,6 +194,7 @@ function New-MgUserMailFolder {
         throw "Status: 409 (Conflict) Code: ErrorFolderExists Message: A folder with the specified name already exists."
     }
     $id = Add-FakeFolder -UserId $UserId -DisplayName $name
+    $script:CreatedFolderNames.Add($name)
     return (ConvertTo-FakeSdkFolder -Folder $script:Store[$UserId].Folders[$id] -UserId $UserId)
 }
 
@@ -197,5 +205,6 @@ function New-MgUserMailFolderChildFolder {
         throw "Status: 409 (Conflict) Code: ErrorFolderExists Message: A folder with the specified name already exists."
     }
     $id = Add-FakeFolder -UserId $UserId -DisplayName $name -ParentId $MailFolderId
+    $script:CreatedFolderNames.Add($name)
     return (ConvertTo-FakeSdkFolder -Folder $script:Store[$UserId].Folders[$id] -UserId $UserId)
 }

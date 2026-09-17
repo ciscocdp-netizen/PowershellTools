@@ -30,45 +30,14 @@ $ErrorActionPreference = 'Stop'
 
 . "$PSScriptRoot/WinFormsShim.ps1"
 . "$PSScriptRoot/GraphMocks.ps1"
-
-# ------------------------------------------------------------------------------
-# Load the tool's functions without running its bootstrap or GUI
-# ------------------------------------------------------------------------------
-function Import-ToolDefinitions {
-    param([string]$Path)
-
-    $errors = $null
-    $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$errors)
-    if ($errors) {
-        throw "$Path has $($errors.Count) parse error(s); first: $($errors[0].Message)"
-    }
-
-    $wanted = New-Object System.Collections.Generic.List[string]
-    foreach ($statement in $ast.EndBlock.Statements) {
-        if ($statement -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
-            $wanted.Add($statement.Extent.Text)
-            continue
-        }
-        # $script:-scoped state the functions rely on (GraphBase, MAPI property
-        # set guids, well-known folder names, FolderScanIncomplete).
-        if ($statement -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-            $statement.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
-            $statement.Left.VariablePath.UserPath -like 'script:*') {
-            $wanted.Add($statement.Extent.Text)
-        }
-    }
-
-    return ($wanted -join "`r`n")
-}
-
+. "$PSScriptRoot/ToolLoader.ps1"
 . ([scriptblock]::Create((Import-ToolDefinitions -Path $ToolPath)))
 
-foreach ($required in @('Get-AllMailFolders', 'Resolve-TargetFolder', 'Find-ChildFolderByName',
-                        'Get-WellKnownFolderMap', 'Get-WellKnownPathMap', 'Get-FolderPathKey')) {
-    if (-not (Get-Command $required -ErrorAction SilentlyContinue)) {
-        throw "$required was not found in $ToolPath"
-    }
-}
+Assert-ToolFunctionsPresent -ToolPath $ToolPath -Names @(
+    'Get-AllMailFolders', 'Compare-MailFolderStructure', 'Sync-MailFolderStructure',
+    'Find-ChildFolderByName', 'New-TargetMailFolder', 'Get-WellKnownFolderMap',
+    'Get-CanonicalFolderParts', 'Get-IndexedFolderId', 'Get-FolderPathKey'
+)
 
 # ------------------------------------------------------------------------------
 # Test plumbing
@@ -129,8 +98,8 @@ function Add-DefaultTargetMailbox {
 
 <#
 .SYNOPSIS
-    Runs the same folder pass Copy-Emails performs: enumerate the source, then
-    mirror every folder (empty ones included) into the target.
+    Runs the same folder pass Copy-Emails performs: enumerate both mailboxes,
+    diff them, and create only the folders the target is missing.
 #>
 function Invoke-FolderMirror {
     param([string]$SourceEmail, [string]$TargetEmail, $StatusBox)
@@ -138,39 +107,43 @@ function Invoke-FolderMirror {
     $script:FolderScanIncomplete = $false
 
     $sourceWellKnown = Get-WellKnownFolderMap -UserId $SourceEmail
-    $sourceFolders   = Get-AllMailFolders -UserId $SourceEmail -WellKnownMap $sourceWellKnown -StatusBox $StatusBox
-    $wellKnownByPath = Get-WellKnownPathMap -SourceFolders $sourceFolders
+    $sourceFolders   = @(Get-AllMailFolders -UserId $SourceEmail -WellKnownMap $sourceWellKnown -StatusBox $StatusBox)
+    $targetWellKnown = Get-WellKnownFolderMap -UserId $TargetEmail
+    $targetFolders   = @(Get-AllMailFolders -UserId $TargetEmail -WellKnownMap $targetWellKnown -StatusBox $StatusBox)
 
-    $cache  = @{}
-    $ids    = @{}
-    $errors = New-Object System.Collections.Generic.List[string]
+    $sync = Sync-MailFolderStructure -TargetUserId $TargetEmail -SourceFolders $sourceFolders `
+        -TargetFolders $targetFolders -StatusBox $StatusBox
 
+    # What Copy-Emails would actually use per source folder.
+    $resolved = @{}
     foreach ($folder in $sourceFolders) {
-        try {
-            $id = Resolve-TargetFolder -TargetUserId $TargetEmail -SourceFolder $folder `
-                -WellKnownByPath $wellKnownByPath -Cache $cache -StatusBox $StatusBox
-            if ($id) { $ids[(Get-FolderPathKey -PathParts $folder.PathParts)] = $id }
-        }
-        catch {
-            $errors.Add($_.Exception.Message)
-        }
+        $id = Get-IndexedFolderId -Index $sync.Index -Folder $folder
+        if ($id) { $resolved[$folder.FullPath] = $id }
     }
 
     return @{
-        SourceFolders  = @($sourceFolders)
-        TargetIds      = $ids
-        Errors         = $errors
+        SourceFolders  = $sourceFolders
+        TargetFolders  = $targetFolders
+        Sync           = $sync
+        Comparison     = $sync.Comparison
+        Resolved       = $resolved
         ScanIncomplete = $script:FolderScanIncomplete
         Log            = $StatusBox.Text
     }
 }
 
+function Get-MirroredId {
+    param($Result, [string]$FullPath)
+    if ($Result.Resolved.ContainsKey($FullPath)) { return $Result.Resolved[$FullPath] }
+    return $null
+}
+
 function Assert-EveryFolderMirrored {
     param($Result)
-    $total   = $Result.SourceFolders.Count
-    $mapped  = $Result.TargetIds.Count
+    $total  = $Result.SourceFolders.Count
+    $mapped = $Result.Resolved.Count
     Assert-That "all $total source folders resolved to a target folder" ($mapped -eq $total) `
-        "resolved $mapped of $total; errors: $($Result.Errors -join ' | ')"
+        "resolved $mapped of $total; folder errors: $($Result.Sync.Unavailable.Values -join ' | ')"
 }
 
 # ==============================================================================
@@ -295,8 +268,106 @@ $result = Invoke-FolderMirror -SourceEmail $src -TargetEmail $tgt -StatusBox (Ne
 Assert-That 'the scan is flagged incomplete' ([bool]$result.ScanIncomplete)
 Assert-That 'the status log warns about the unreadable subtree' ($result.Log -match 'WARNING' -and $result.Log -match 'Legal') `
     "log: $($result.Log)"
-Assert-That 'the readable folders were still mirrored' ($result.TargetIds.Count -eq 3) `
-    "mirrored $($result.TargetIds.Count)"
+Assert-That 'the readable folders were still mirrored' ($result.Resolved.Count -eq 3) `
+    "mirrored $($result.Resolved.Count)"
+
+# ==============================================================================
+Start-Case 'A target that already matches the source is left completely alone'
+Reset-FakeGraph
+$src = 'src10@contoso.com'; $tgt = 'tgt10@contoso.com'
+New-FakeMailbox -UserId $src
+$inbox = Add-FakeFolder -UserId $src -DisplayName 'Inbox' -ItemCount 9 -WellKnownName 'inbox'
+$clients = Add-FakeFolder -UserId $src -DisplayName 'Clients' -ParentId $inbox -ItemCount 3
+Add-FakeFolder -UserId $src -DisplayName 'Invoices' -ParentId $clients -ItemCount 2 | Out-Null
+Add-FakeFolder -UserId $src -DisplayName 'Sent Items' -ItemCount 4 -WellKnownName 'sentitems' | Out-Null
+Add-DefaultTargetMailbox -UserId $tgt
+$tgtInbox = $script:Store[$tgt].WellKnown['inbox']
+$tgtClients = Add-FakeFolder -UserId $tgt -DisplayName 'Clients' -ParentId $tgtInbox
+Add-FakeFolder -UserId $tgt -DisplayName 'Invoices' -ParentId $tgtClients | Out-Null
+$before = @(Get-FakeFolderPaths -UserId $tgt)
+$result = Invoke-FolderMirror -SourceEmail $src -TargetEmail $tgt -StatusBox (New-TestStatusBox)
+Assert-EveryFolderMirrored -Result $result
+Assert-That 'the comparison finds nothing missing' ($result.Comparison.Missing.Count -eq 0) `
+    ("missing: " + (($result.Comparison.Missing | ForEach-Object { $_.FullPath }) -join ', '))
+Assert-That 'no folder was created' ($script:CreatedFolderNames.Count -eq 0) `
+    ("created: " + ($script:CreatedFolderNames -join ', '))
+Assert-That 'no per-segment name lookup was needed' ($script:FilterQueryCount -eq 0) `
+    "$script:FilterQueryCount filter queries were sent"
+Assert-That 'the target tree is byte-for-byte unchanged' `
+    ((@(Get-FakeFolderPaths -UserId $tgt) -join '|') -eq ($before -join '|')) `
+    ("before: " + ($before -join ', ') + "  after: " + (@(Get-FakeFolderPaths -UserId $tgt) -join ', '))
+
+# ==============================================================================
+Start-Case 'Only the folders missing from the target are added'
+Reset-FakeGraph
+$src = 'src11@contoso.com'; $tgt = 'tgt11@contoso.com'
+New-FakeMailbox -UserId $src
+$inbox = Add-FakeFolder -UserId $src -DisplayName 'Inbox' -ItemCount 5 -WellKnownName 'inbox'
+$clients = Add-FakeFolder -UserId $src -DisplayName 'Clients' -ParentId $inbox -ItemCount 2
+Add-FakeFolder -UserId $src -DisplayName 'Invoices' -ParentId $clients -ItemCount 4 | Out-Null
+Add-FakeFolder -UserId $src -DisplayName 'Quotes'   -ParentId $clients -ItemCount 1 | Out-Null
+Add-FakeFolder -UserId $src -DisplayName 'Archive'  -ItemCount 7 | Out-Null
+Add-DefaultTargetMailbox -UserId $tgt
+$tgtInbox   = $script:Store[$tgt].WellKnown['inbox']
+$tgtClients = Add-FakeFolder -UserId $tgt -DisplayName 'Clients' -ParentId $tgtInbox
+$tgtInvoices = Add-FakeFolder -UserId $tgt -DisplayName 'Invoices' -ParentId $tgtClients
+$result = Invoke-FolderMirror -SourceEmail $src -TargetEmail $tgt -StatusBox (New-TestStatusBox)
+Assert-EveryFolderMirrored -Result $result
+Assert-That 'exactly the two absent folders are reported missing' ($result.Comparison.Missing.Count -eq 2) `
+    ("missing: " + (($result.Comparison.Missing | ForEach-Object { $_.FullPath }) -join ', '))
+Assert-That 'exactly two folders were created' ($script:CreatedFolderNames.Count -eq 2) `
+    ("created: " + ($script:CreatedFolderNames -join ', '))
+Assert-That "the created folders are 'Quotes' and 'Archive'" `
+    ((($script:CreatedFolderNames | Sort-Object) -join ',') -eq 'Archive,Quotes') `
+    ("created: " + ($script:CreatedFolderNames -join ', '))
+Assert-That 'the pre-existing Invoices folder was reused, not replaced' `
+    ((Get-MirroredId -Result $result -FullPath 'Inbox\Clients\Invoices') -eq $tgtInvoices)
+Assert-PathsPresent -UserId $tgt -ExpectedPaths @(
+    'Inbox\Clients', 'Inbox\Clients\Invoices', 'Inbox\Clients\Quotes', 'Archive'
+)
+
+# ==============================================================================
+Start-Case 'Folders that exist only in the target are reported and kept'
+Reset-FakeGraph
+$src = 'src12@contoso.com'; $tgt = 'tgt12@contoso.com'
+New-FakeMailbox -UserId $src
+$inbox = Add-FakeFolder -UserId $src -DisplayName 'Inbox' -ItemCount 3 -WellKnownName 'inbox'
+Add-FakeFolder -UserId $src -DisplayName 'Clients' -ParentId $inbox -ItemCount 1 | Out-Null
+Add-DefaultTargetMailbox -UserId $tgt
+$tgtInbox = $script:Store[$tgt].WellKnown['inbox']
+Add-FakeFolder -UserId $tgt -DisplayName 'Personal'      -ParentId $tgtInbox | Out-Null
+Add-FakeFolder -UserId $tgt -DisplayName 'Old Mailbox'   -ParentId $null     | Out-Null
+$result = Invoke-FolderMirror -SourceEmail $src -TargetEmail $tgt -StatusBox (New-TestStatusBox)
+Assert-EveryFolderMirrored -Result $result
+$extraPaths = @($result.Comparison.TargetOnly | ForEach-Object { $_.FullPath })
+Assert-That "'Inbox\Personal' is reported as target-only" ($extraPaths -contains 'Inbox\Personal') `
+    ("target-only: " + ($extraPaths -join ', '))
+Assert-That "'Old Mailbox' is reported as target-only" ($extraPaths -contains 'Old Mailbox') `
+    ("target-only: " + ($extraPaths -join ', '))
+Assert-PathsPresent -UserId $tgt -ExpectedPaths @('Inbox\Personal', 'Old Mailbox', 'Inbox\Clients')
+
+# ==============================================================================
+Start-Case 'A display name colliding with a target well-known folder is adopted, not duplicated'
+Reset-FakeGraph
+$src = 'src13@contoso.com'; $tgt = 'tgt13@contoso.com'
+New-FakeMailbox -UserId $src
+Add-FakeFolder -UserId $src -DisplayName 'Inbox' -ItemCount 2 -WellKnownName 'inbox' | Out-Null
+# 'Archive' is an ordinary folder in the source but the well-known archive in the
+# target, so the two canonical paths do not match and a create is attempted.
+$srcArchive = Add-FakeFolder -UserId $src -DisplayName 'Archive' -ItemCount 30
+Add-FakeFolder -UserId $src -DisplayName '2022' -ParentId $srcArchive -ItemCount 12 | Out-Null
+Add-DefaultTargetMailbox -UserId $tgt
+$tgtArchiveId = Add-FakeFolder -UserId $tgt -DisplayName 'Archive' -WellKnownName 'archive'
+$script:FailFilterQueries = $true    # force the client-side fallback as well
+$result = Invoke-FolderMirror -SourceEmail $src -TargetEmail $tgt -StatusBox (New-TestStatusBox)
+Assert-EveryFolderMirrored -Result $result
+$archiveFolders = @(Get-FakeChildren -UserId $tgt -ParentId $null | Where-Object { $_.DisplayName -eq 'Archive' })
+Assert-That 'the target keeps a single Archive folder' ($archiveFolders.Count -eq 1) "found $($archiveFolders.Count)"
+Assert-That 'the existing well-known Archive folder was adopted' `
+    ((Get-MirroredId -Result $result -FullPath 'Archive') -eq $tgtArchiveId)
+Assert-That 'the adoption is reported as a reuse, not a creation' ($result.Sync.Adopted -eq 1) `
+    "created $($result.Sync.Created), adopted $($result.Sync.Adopted)"
+Assert-PathsPresent -UserId $tgt -ExpectedPaths @('Archive\2022')
 
 # ==============================================================================
 Start-Case 'A name lookup that returns nothing still finds the existing folder'
@@ -314,7 +385,7 @@ Assert-EveryFolderMirrored -Result $result
 $vendorFolders = @(Get-FakeChildren -UserId $tgt -ParentId $targetInboxId | Where-Object { $_.DisplayName -eq 'Vendors' })
 Assert-That 'the existing folder was reused, not duplicated' ($vendorFolders.Count -eq 1) "found $($vendorFolders.Count)"
 Assert-That 'the reused folder is the pre-existing one' `
-    ($result.TargetIds[(Get-FolderPathKey -PathParts @('Inbox', 'Vendors'))] -eq $existingId)
+    ((Get-MirroredId -Result $result -FullPath 'Inbox\Vendors') -eq $existingId)
 
 # ==============================================================================
 Start-Case 'A name lookup that errors falls back to matching client-side'
@@ -332,7 +403,7 @@ Assert-EveryFolderMirrored -Result $result
 $vendorFolders = @(Get-FakeChildren -UserId $tgt -ParentId $targetInboxId | Where-Object { $_.DisplayName -eq 'Vendors' })
 Assert-That 'the existing folder was reused despite the failing lookup' ($vendorFolders.Count -eq 1) "found $($vendorFolders.Count)"
 Assert-That 'the reused folder is the pre-existing one' `
-    ($result.TargetIds[(Get-FolderPathKey -PathParts @('Inbox', 'Vendors'))] -eq $existingId)
+    ((Get-MirroredId -Result $result -FullPath 'Inbox\Vendors') -eq $existingId)
 
 # ==============================================================================
 Write-Host ''

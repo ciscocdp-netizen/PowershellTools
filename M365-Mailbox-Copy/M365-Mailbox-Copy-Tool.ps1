@@ -13,9 +13,34 @@
 
 .NOTES
     Author: v0
-    Version: 1.15
+    Version: 1.16
     Requires: Microsoft.Graph PowerShell SDK
     Authentication: Interactive (Delegated Permissions via browser)
+
+    Changelog v1.16:
+    - New: The target folder tree is enumerated and compared against the source
+      before anything is created, and only the folders the target is missing are
+      added. Folders that already exist are reused as they are, and folders that
+      exist only in the target are reported and left alone. Nothing is renamed,
+      moved or deleted.
+    - Changed: Folder resolution no longer walks a path segment at a time with a
+      lookup per segment; both trees are read once and diffed in memory, so a
+      target that is already in sync costs no create/lookup calls at all.
+    - New: Live status line above the progress bar naming the current phase
+      (scanning source, scanning target, creating missing folders, copying email,
+      copying calendar, verifying), the folder being worked on with its position
+      in the run, and the item counter within that folder.
+    - New: ETA line showing elapsed time, estimated time remaining, the wall-clock
+      time the copy is expected to finish, throughput, and running copied /
+      skipped / failed totals. The estimate uses recent throughput rather than the
+      average since the start, so throttling is reflected instead of averaged out.
+    - Changed: The progress bar is a marquee during phases whose size is not yet
+      known and switches to a percentage once a total exists. The message total is
+      corrected mid-run when a folder returns a different count than its
+      TotalItemCount claimed, so the percentage and ETA stay honest.
+    - Changed: Per-page and per-batch chatter moved out of the status log and into
+      the live status line, so the log holds folder-level events instead of
+      thousands of paging lines.
 
     Changelog v1.15:
     - Fixed: A folder whose display name contains an apostrophe (O'Brien Ltd) was
@@ -278,6 +303,267 @@ function Update-CopyUi {
     catch { }
 }
 
+# ------------------------------------------------------------------------------
+# Live status, progress and ETA
+#
+# The copy runs on the UI thread, so everything here is deliberately cheap and
+# repaints are throttled: the point is to show where the run is without slowing
+# it down. Every function is a no-op until Initialize-CopyUi has run, which
+# keeps the folder logic callable from tests with no UI at all.
+# ------------------------------------------------------------------------------
+$script:Ui   = $null
+$script:Prog = $null
+
+# Single source of "now" for the progress engine, so the ETA maths can be
+# exercised against a controlled clock instead of the wall clock.
+function Get-CopyClockNow {
+    return (Get-Date)
+}
+
+function Initialize-CopyUi {
+    param(
+        [System.Windows.Forms.TextBox]$StatusBox,
+        [System.Windows.Forms.ProgressBar]$ProgressBar,
+        [System.Windows.Forms.Label]$PhaseLabel,
+        [System.Windows.Forms.Label]$EtaLabel
+    )
+
+    $script:Ui = @{
+        StatusBox   = $StatusBox
+        ProgressBar = $ProgressBar
+        PhaseLabel  = $PhaseLabel
+        EtaLabel    = $EtaLabel
+    }
+    $now = Get-CopyClockNow
+    $script:Prog = @{
+        OverallStart  = $now
+        PhaseName     = ''
+        PhaseStart    = $now
+        Detail        = ''
+        Total         = 0.0
+        Done          = 0.0
+        Copied        = 0
+        Skipped       = 0
+        Failed        = 0
+        Indeterminate = $true
+        Samples       = New-Object System.Collections.ArrayList
+        LastPaint     = [datetime]::MinValue
+    }
+}
+
+function Write-CopyLog {
+    param([string]$Message, [switch]$NoNewline)
+
+    if (-not $script:Ui -or -not $script:Ui.StatusBox) {
+        Write-Host $Message
+        return
+    }
+    if ($NoNewline) { $script:Ui.StatusBox.AppendText($Message) }
+    else            { $script:Ui.StatusBox.AppendText("$Message`r`n") }
+    Update-CopyUi -StatusBox $script:Ui.StatusBox
+}
+
+function Format-CopyDuration {
+    param([double]$Seconds)
+
+    if ($Seconds -lt 0 -or [double]::IsNaN($Seconds) -or [double]::IsInfinity($Seconds)) { return '--' }
+    # Floor, not [int]: a cast rounds, which turns 90 seconds into "2m 30s".
+    $span = [timespan]::FromSeconds([math]::Round($Seconds))
+    if ($span.TotalDays -ge 1) { return ('{0}d {1:00}h {2:00}m' -f [math]::Floor($span.TotalDays), $span.Hours, $span.Minutes) }
+    if ($span.TotalHours -ge 1) { return ('{0}h {1:00}m {2:00}s' -f [math]::Floor($span.TotalHours), $span.Minutes, $span.Seconds) }
+    if ($span.TotalMinutes -ge 1) { return ('{0}m {1:00}s' -f [math]::Floor($span.TotalMinutes), $span.Seconds) }
+    return ('{0}s' -f [math]::Floor($span.TotalSeconds))
+}
+
+function Start-CopyPhase {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [double]$Total = 0,
+        [string]$Detail = '',
+        [switch]$Indeterminate
+    )
+
+    if (-not $script:Prog) { return }
+
+    $script:Prog.PhaseName     = $Name
+    $script:Prog.PhaseStart    = Get-CopyClockNow
+    $script:Prog.Detail        = $Detail
+    $script:Prog.Total         = [double]$Total
+    $script:Prog.Done          = 0.0
+    $script:Prog.Copied        = 0
+    $script:Prog.Skipped       = 0
+    $script:Prog.Failed        = 0
+    $script:Prog.Indeterminate = [bool]$Indeterminate -or ($Total -le 0)
+    $script:Prog.Samples.Clear()
+    Update-CopyStatusDisplay -Force
+}
+
+function Set-CopyPhaseTotal {
+    param([double]$Total)
+
+    if (-not $script:Prog) { return }
+    $script:Prog.Total = [double]$Total
+    $script:Prog.Indeterminate = ($Total -le 0)
+    Update-CopyStatusDisplay -Force
+}
+
+function Set-CopyDetail {
+    param([string]$Detail, [switch]$Force)
+
+    if (-not $script:Prog) { return }
+    $script:Prog.Detail = $Detail
+    Update-CopyStatusDisplay -Force:$Force
+}
+
+function Add-CopyWork {
+    param(
+        [double]$Done = 0,
+        [int]$Copied = 0,
+        [int]$Skipped = 0,
+        [int]$Failed = 0,
+        [string]$Detail
+    )
+
+    if (-not $script:Prog) { return }
+    $script:Prog.Done    += $Done
+    $script:Prog.Copied  += $Copied
+    $script:Prog.Skipped += $Skipped
+    $script:Prog.Failed  += $Failed
+    if ($PSBoundParameters.ContainsKey('Detail')) { $script:Prog.Detail = $Detail }
+    Update-CopyStatusDisplay
+}
+
+<#
+.SYNOPSIS
+    Items per second for the current phase.
+
+.DESCRIPTION
+    Uses the throughput over the last couple of minutes once there is enough of
+    a window for it to mean anything, because Graph throttling makes the average
+    since the phase started a poor predictor. Falls back to that average early on.
+#>
+function Get-CopyRate {
+    if (-not $script:Prog) { return 0 }
+
+    $now     = Get-CopyClockNow
+    $elapsed = ($now - $script:Prog.PhaseStart).TotalSeconds
+    $overall = 0
+    if ($elapsed -gt 0) { $overall = $script:Prog.Done / $elapsed }
+
+    $samples = $script:Prog.Samples
+    if ($samples.Count -ge 2) {
+        $first = $samples[0]
+        $span  = ($now - $first.Time).TotalSeconds
+        if ($span -ge 15) {
+            $windowed = ($script:Prog.Done - $first.Done) / $span
+            if ($windowed -gt 0) { return $windowed }
+        }
+    }
+    return $overall
+}
+
+function Update-CopyStatusDisplay {
+    param([switch]$Force)
+
+    if (-not $script:Prog -or -not $script:Ui) { return }
+
+    $now = Get-CopyClockNow
+    if (-not $Force -and ($now - $script:Prog.LastPaint).TotalMilliseconds -lt 250) { return }
+    $script:Prog.LastPaint = $now
+
+    # Keep a ~2 minute trailing window of (time, done) for the rate estimate.
+    $samples = $script:Prog.Samples
+    [void]$samples.Add([pscustomobject]@{ Time = $now; Done = $script:Prog.Done })
+    while ($samples.Count -gt 2 -and ($now - $samples[0].Time).TotalSeconds -gt 120) {
+        $samples.RemoveAt(0)
+    }
+
+    $phaseElapsed   = ($now - $script:Prog.PhaseStart).TotalSeconds
+    $overallElapsed = ($now - $script:Prog.OverallStart).TotalSeconds
+
+    if ($script:Prog.Indeterminate) {
+        $position = ''
+        if ($script:Prog.Done -gt 0) { $position = ('{0:N0} so far' -f $script:Prog.Done) }
+        $etaText = ('Elapsed {0}   |   working...' -f (Format-CopyDuration $overallElapsed))
+    }
+    else {
+        $total = $script:Prog.Total
+        $done  = $script:Prog.Done
+        if ($done -gt $total) { $done = $total }
+        $pct = 0
+        if ($total -gt 0) { $pct = [int](($done / $total) * 100) }
+        if ($pct -lt 0)   { $pct = 0 }
+        if ($pct -gt 100) { $pct = 100 }
+        $position = ('{0:N0} / {1:N0}  ({2}%)' -f $done, $total, $pct)
+
+        $rate      = Get-CopyRate
+        $remaining = $total - $done
+        $etaText   = ''
+        if ($rate -gt 0 -and $remaining -gt 0) {
+            $secondsLeft = $remaining / $rate
+            $finishAt    = $now.AddSeconds($secondsLeft)
+            $etaText = ('Elapsed {0}   |   remaining ~{1}   |   done by {2}   |   {3}' -f `
+                (Format-CopyDuration $overallElapsed),
+                (Format-CopyDuration $secondsLeft),
+                $finishAt.ToString('HH:mm'),
+                (Format-CopyRateText $rate))
+        }
+        elseif ($remaining -le 0) {
+            $etaText = ('Elapsed {0}   |   phase complete in {1}' -f `
+                (Format-CopyDuration $overallElapsed), (Format-CopyDuration $phaseElapsed))
+        }
+        else {
+            $etaText = ('Elapsed {0}   |   estimating...' -f (Format-CopyDuration $overallElapsed))
+        }
+
+        if ($script:Prog.Copied -gt 0 -or $script:Prog.Skipped -gt 0 -or $script:Prog.Failed -gt 0) {
+            $etaText += ('   |   copied {0:N0}, skipped {1:N0}, failed {2:N0}' -f `
+                $script:Prog.Copied, $script:Prog.Skipped, $script:Prog.Failed)
+        }
+
+        if ($script:Ui.ProgressBar) {
+            try {
+                if ($script:Ui.ProgressBar.Style -ne [System.Windows.Forms.ProgressBarStyle]::Continuous) {
+                    $script:Ui.ProgressBar.Style = [System.Windows.Forms.ProgressBarStyle]::Continuous
+                }
+                $script:Ui.ProgressBar.Value = $pct
+            }
+            catch { }
+        }
+    }
+
+    if ($script:Prog.Indeterminate -and $script:Ui.ProgressBar) {
+        try {
+            if ($script:Ui.ProgressBar.Style -ne [System.Windows.Forms.ProgressBarStyle]::Marquee) {
+                $script:Ui.ProgressBar.MarqueeAnimationSpeed = 30
+                $script:Ui.ProgressBar.Style = [System.Windows.Forms.ProgressBarStyle]::Marquee
+            }
+        }
+        catch { }
+    }
+
+    $phaseText = $script:Prog.PhaseName
+    if ($script:Prog.Detail)  { $phaseText += "  -  $($script:Prog.Detail)" }
+    if ($position)            { $phaseText += "  -  $position" }
+
+    if ($script:Ui.PhaseLabel) {
+        try { $script:Ui.PhaseLabel.Text = $phaseText } catch { }
+    }
+    if ($script:Ui.EtaLabel) {
+        try { $script:Ui.EtaLabel.Text = $etaText } catch { }
+    }
+
+    Update-CopyUi -StatusBox $script:Ui.StatusBox -ProgressBar $script:Ui.ProgressBar
+}
+
+function Format-CopyRateText {
+    param([double]$Rate)
+
+    if ($Rate -ge 1) { return ('{0:N1} items/s' -f $Rate) }
+    if ($Rate -gt 0) { return ('{0:N1} items/min' -f ($Rate * 60)) }
+    return 'rate unknown'
+}
+
 function Get-GraphProperty {
     param(
         $Object,
@@ -351,9 +637,13 @@ function Get-GraphCollection {
         foreach ($it in (Get-GraphItemList $pageItems)) {
             [void]$items.Add($it)
         }
-        if ($StatusBox -and $ProgressPrefix) {
-            $of = if ($ExpectedCount -gt 0) { " / $ExpectedCount" } else { '' }
-            $StatusBox.AppendText("    $ProgressPrefix page $page : $($items.Count)$of items`r`n")
+        # Paging goes to the live status line rather than the log: a 16k-item
+        # folder would otherwise bury everything else under page counters.
+        if ($ProgressPrefix) {
+            $of = if ($ExpectedCount -gt 0) { " of $ExpectedCount" } else { '' }
+            Set-CopyDetail -Detail "$ProgressPrefix - page $page, $($items.Count)$of retrieved"
+        }
+        elseif ($StatusBox) {
             Update-CopyUi -StatusBox $StatusBox
         }
         $next = Get-GraphNextLink -Response $resp
@@ -646,20 +936,6 @@ function Get-CopyErrorDetail {
     if ($parts.Count -eq 0) { return 'Unknown error' }
     $unique = @($parts | Select-Object -Unique)
     return ($unique -join ' | ')
-}
-
-function Set-CopyProgress {
-    param(
-        [System.Windows.Forms.ProgressBar]$ProgressBar,
-        [double]$Current,
-        [double]$Total
-    )
-    if (-not $ProgressBar) { return }
-    if ($Total -le 0) { $ProgressBar.Value = 0; return }
-    $pct = [int](($Current / $Total) * 100)
-    if ($pct -lt 0)   { $pct = 0 }
-    if ($pct -gt 100) { $pct = 100 }
-    $ProgressBar.Value = $pct
 }
 
 function New-ExtPropList {
@@ -1315,6 +1591,7 @@ function Get-AllMailFolders {
         [string]$ParentFolderId = $null,
         [string[]]$ParentPath = @(),
         [hashtable]$WellKnownMap = @{},
+        [string]$RootWellKnownName = $null,
         [System.Windows.Forms.TextBox]$StatusBox
     )
 
@@ -1355,24 +1632,120 @@ function Get-AllMailFolders {
         $wellKnown = $null
         if ($WellKnownMap.ContainsKey($folder.Id)) { $wellKnown = $WellKnownMap[$folder.Id] }
 
+        # The well-known name of the top-level ancestor travels down the tree, so
+        # 'Inbox\Clients' and 'Postvak IN\Clients' can be recognised as the same
+        # folder in two mailboxes with different display languages.
+        $rootWellKnown = $RootWellKnownName
+        if ($ParentPath.Count -eq 0) { $rootWellKnown = $wellKnown }
+
         $allFolders += [PSCustomObject]@{
-            Id               = $folder.Id
-            DisplayName      = $folder.DisplayName
-            PathParts        = $pathParts
-            FullPath         = ($pathParts -join '\')
-            WellKnownName    = $wellKnown
-            TotalItemCount   = $folder.TotalItemCount
-            UnreadItemCount  = $folder.UnreadItemCount
-            ChildFolderCount = $folder.ChildFolderCount
+            Id                = $folder.Id
+            DisplayName       = $folder.DisplayName
+            PathParts         = $pathParts
+            FullPath          = ($pathParts -join '\')
+            WellKnownName     = $wellKnown
+            RootWellKnownName = $rootWellKnown
+            TotalItemCount    = $folder.TotalItemCount
+            UnreadItemCount   = $folder.UnreadItemCount
+            ChildFolderCount  = $folder.ChildFolderCount
         }
+
+        Add-CopyWork -Done 1 -Detail ($pathParts -join '\')
 
         if ($folder.ChildFolderCount -gt 0) {
             $allFolders += Get-AllMailFolders -UserId $UserId -ParentFolderId $folder.Id `
-                -ParentPath $pathParts -WellKnownMap $WellKnownMap -StatusBox $StatusBox
+                -ParentPath $pathParts -WellKnownMap $WellKnownMap `
+                -RootWellKnownName $rootWellKnown -StatusBox $StatusBox
         }
     }
 
     return $allFolders
+}
+
+<#
+.SYNOPSIS
+    Path of a folder in a form that can be compared across two mailboxes.
+
+.DESCRIPTION
+    A well-known root is represented by its well-known name instead of its
+    display name, so the source Inbox matches the target Inbox even when the two
+    mailboxes are in different display languages or a folder has been renamed.
+#>
+function Get-CanonicalFolderParts {
+    param($Folder)
+
+    $segments = @($Folder.PathParts)
+    if ($segments.Count -eq 0) { return @() }
+
+    $root = $segments[0]
+    if ($Folder.RootWellKnownName) { $root = "wellknown:$($Folder.RootWellKnownName)" }
+
+    $parts = @($root)
+    if ($segments.Count -gt 1) { $parts += $segments[1..($segments.Count - 1)] }
+    return $parts
+}
+
+function Get-CanonicalFolderKey {
+    param($Folder)
+    return (Get-FolderPathKey -PathParts (Get-CanonicalFolderParts -Folder $Folder))
+}
+
+function New-MailFolderIndex {
+    param($Folders)
+
+    $index = @{}
+    foreach ($folder in @($Folders)) {
+        $key = Get-CanonicalFolderKey -Folder $folder
+        if (-not $index.ContainsKey($key)) { $index[$key] = $folder.Id }
+    }
+    return $index
+}
+
+function Get-IndexedFolderId {
+    param([hashtable]$Index, $Folder)
+
+    $key = Get-CanonicalFolderKey -Folder $Folder
+    if ($Index.ContainsKey($key)) { return $Index[$key] }
+    return $null
+}
+
+<#
+.SYNOPSIS
+    Diffs the source folder tree against the target folder tree.
+
+.OUTPUTS
+    Hashtable with TargetIndex (canonical path -> target folder id), Present and
+    Missing (source folder objects) and TargetOnly (folders the target has that
+    the source does not; these are reported but never touched).
+#>
+function Compare-MailFolderStructure {
+    param($SourceFolders, $TargetFolders)
+
+    $targetIndex = New-MailFolderIndex -Folders $TargetFolders
+    $sourceKeys  = @{}
+    $present     = New-Object System.Collections.ArrayList
+    $missing     = New-Object System.Collections.ArrayList
+
+    foreach ($folder in @($SourceFolders)) {
+        $key = Get-CanonicalFolderKey -Folder $folder
+        $sourceKeys[$key] = $true
+        if ($targetIndex.ContainsKey($key)) { [void]$present.Add($folder) }
+        else                                { [void]$missing.Add($folder) }
+    }
+
+    $targetOnly = New-Object System.Collections.ArrayList
+    foreach ($folder in @($TargetFolders)) {
+        if (-not $sourceKeys.ContainsKey((Get-CanonicalFolderKey -Folder $folder))) {
+            [void]$targetOnly.Add($folder)
+        }
+    }
+
+    return @{
+        TargetIndex = $targetIndex
+        Present     = $present
+        Missing     = $missing
+        TargetOnly  = $targetOnly
+    }
 }
 
 function Find-ChildFolderByName {
@@ -1423,102 +1796,154 @@ function Find-ChildFolderByName {
 
 <#
 .SYNOPSIS
-    Mirrors one source folder's path into the target mailbox and returns the id of
-    the deepest folder. Throws if a segment cannot be resolved, so the caller can
-    skip the folder instead of filing its mail somewhere unexpected.
+    Creates one folder in the target mailbox, tolerating a stale index.
+
+.DESCRIPTION
+    ErrorFolderExists means the folder is already there but was not in the index
+    we compared against - a display name that collides with a well-known folder,
+    or another client creating it. Either way the existing folder is adopted
+    rather than reported as a failure.
+
+.OUTPUTS
+    Hashtable with Folder and Adopted ($true when an existing folder was reused).
 #>
-function Resolve-TargetFolder {
+function New-TargetMailFolder {
     param(
         [string]$TargetUserId,
-        $SourceFolder,
-        [hashtable]$WellKnownByPath = @{},
-        [hashtable]$Cache = @{},
+        [string]$ParentFolderId,
+        [string]$DisplayName
+    )
+
+    $newFolderParams = @{ DisplayName = $DisplayName }
+    $folder  = $null
+    $adopted = $false
+
+    try {
+        if ($ParentFolderId) {
+            $folder = Invoke-WithRetry -ScriptBlock {
+                New-MgUserMailFolderChildFolder -UserId $TargetUserId -MailFolderId $ParentFolderId `
+                    -BodyParameter $newFolderParams -ErrorAction Stop
+            }
+        }
+        else {
+            $folder = Invoke-WithRetry -ScriptBlock {
+                New-MgUserMailFolder -UserId $TargetUserId -BodyParameter $newFolderParams -ErrorAction Stop
+            }
+        }
+    }
+    catch {
+        if ("$($_.Exception.Message)" -match 'ErrorFolderExists|already exists') {
+            $folder  = Find-ChildFolderByName -UserId $TargetUserId -ParentId $ParentFolderId -Name $DisplayName
+            $adopted = [bool]$folder
+        }
+        if (-not $folder) {
+            throw "Could not create folder '$DisplayName': $(Get-CopyErrorDetail $_)"
+        }
+    }
+
+    if (-not $folder -or -not $folder.Id) {
+        throw "Could not create folder '$DisplayName' (Graph returned no folder id)."
+    }
+    return @{ Folder = $folder; Adopted = $adopted }
+}
+
+<#
+.SYNOPSIS
+    Brings the target folder tree in line with the source by adding only what is
+    missing. Nothing in the target is renamed, moved or deleted.
+
+.DESCRIPTION
+    Both trees are enumerated once and diffed, so a folder that already exists in
+    the target costs no extra Graph calls. Missing folders are created in the
+    source's own depth-first order, which guarantees a parent exists before its
+    children. When a folder cannot be created its whole subtree is marked
+    unavailable, so the caller skips that mail instead of filing it elsewhere.
+
+.OUTPUTS
+    Hashtable with Index (canonical path -> target folder id), Comparison,
+    Created, Failed, Unavailable and Cancelled.
+#>
+function Sync-MailFolderStructure {
+    param(
+        [string]$TargetUserId,
+        $SourceFolders,
+        $TargetFolders,
         [System.Windows.Forms.TextBox]$StatusBox
     )
 
-    $segments = @($SourceFolder.PathParts)
-    $parentId = $null
-    $walked   = @()
+    $comparison  = Compare-MailFolderStructure -SourceFolders $SourceFolders -TargetFolders $TargetFolders
+    $index       = $comparison.TargetIndex
+    $unavailable = @{}
+    $created     = 0
+    $adopted     = 0
+    $failed      = 0
+    $cancelled   = $false
 
-    for ($i = 0; $i -lt $segments.Count; $i++) {
-        $part    = $segments[$i]
-        $walked += $part
-        $key     = Get-FolderPathKey -PathParts $walked
+    $missing = @($comparison.Missing)
+    Start-CopyPhase -Name 'Creating missing folders' -Total $missing.Count
 
-        if ($Cache.ContainsKey($key)) {
-            $parentId = $Cache[$key]
+    foreach ($folder in $missing) {
+        if ($script:CancelRequested) { $cancelled = $true; break }
+
+        $parts = Get-CanonicalFolderParts -Folder $folder
+        $key   = Get-FolderPathKey -PathParts $parts
+
+        if ($index.ContainsKey($key)) {
+            Add-CopyWork -Done 1
             continue
         }
 
-        # Map a source well-known folder onto the TARGET's well-known folder rather
-        # than onto whatever folder shares its display name.
-        $wellKnownName = $null
-        if ($WellKnownByPath.ContainsKey($key)) { $wellKnownName = $WellKnownByPath[$key] }
-        if ($wellKnownName) {
-            $wkId = Get-WellKnownFolderId -UserId $TargetUserId -WellKnownName $wellKnownName
-            if ($wkId) {
-                $parentId    = $wkId
-                $Cache[$key] = $wkId
+        $parentId  = $null
+        $parentKey = $null
+        if ($parts.Count -gt 1) {
+            $parentKey = Get-FolderPathKey -PathParts @($parts[0..($parts.Count - 2)])
+            if ($unavailable.ContainsKey($parentKey)) {
+                $unavailable[$key] = "parent folder is unavailable"
+                $failed++
+                Add-CopyWork -Done 1
                 continue
             }
+            if (-not $index.ContainsKey($parentKey)) {
+                $unavailable[$key] = "parent folder was never created"
+                $failed++
+                Write-CopyLog "  ERROR: cannot create '$($folder.FullPath)': its parent folder is missing from the target."
+                Add-CopyWork -Done 1
+                continue
+            }
+            $parentId = $index[$parentKey]
         }
 
-        $existing = Find-ChildFolderByName -UserId $TargetUserId -ParentId $parentId -Name $part
-        if ($existing) {
-            $parentId    = $existing.Id
-            $Cache[$key] = $existing.Id
-            continue
-        }
-
-        $newFolderParams = @{ DisplayName = $part }
-        $created = $null
+        Set-CopyDetail -Detail $folder.FullPath
         try {
-            if ($parentId) {
-                $created = Invoke-WithRetry -ScriptBlock {
-                    New-MgUserMailFolderChildFolder -UserId $TargetUserId -MailFolderId $parentId `
-                        -BodyParameter $newFolderParams -ErrorAction Stop
-                }
+            $result = New-TargetMailFolder -TargetUserId $TargetUserId -ParentFolderId $parentId `
+                -DisplayName $folder.DisplayName
+            $index[$key] = $result.Folder.Id
+            if ($result.Adopted) {
+                $adopted++
+                Write-CopyLog "  = reused existing: $($folder.FullPath)"
             }
             else {
-                $created = Invoke-WithRetry -ScriptBlock {
-                    New-MgUserMailFolder -UserId $TargetUserId -BodyParameter $newFolderParams -ErrorAction Stop
-                }
+                $created++
+                Write-CopyLog "  + created: $($folder.FullPath)"
             }
         }
         catch {
-            if ("$($_.Exception.Message)" -match 'ErrorFolderExists|already exists') {
-                $created = Find-ChildFolderByName -UserId $TargetUserId -ParentId $parentId -Name $part
-            }
-            if (-not $created) {
-                throw "Could not create target folder '$($walked -join '\')': $(Get-CopyErrorDetail $_)"
-            }
+            $unavailable[$key] = "$($_.Exception.Message)"
+            $failed++
+            Write-CopyLog "  ERROR creating '$($folder.FullPath)': $($_.Exception.Message)"
         }
-
-        if (-not $created -or -not $created.Id) {
-            throw "Could not create target folder '$($walked -join '\')' (Graph returned no folder id)."
-        }
-
-        $parentId    = $created.Id
-        $Cache[$key] = $created.Id
-        if ($StatusBox) {
-            $StatusBox.AppendText("  Created folder: $($walked -join '\')`r`n")
-            $StatusBox.Refresh()
-        }
+        Add-CopyWork -Done 1
     }
 
-    return $parentId
-}
-
-function Get-WellKnownPathMap {
-    param($SourceFolders)
-
-    $map = @{}
-    foreach ($f in $SourceFolders) {
-        if ($f.WellKnownName) {
-            $map[(Get-FolderPathKey -PathParts $f.PathParts)] = $f.WellKnownName
-        }
+    return @{
+        Index       = $index
+        Comparison  = $comparison
+        Created     = $created
+        Adopted     = $adopted
+        Failed      = $failed
+        Unavailable = $unavailable
+        Cancelled   = $cancelled
     }
-    return $map
 }
 
 # ------------------------------------------------------------------------------
@@ -1533,58 +1958,82 @@ function Copy-Emails {
     )
 
     try {
-        $StatusBox.AppendText("`r`n=== STARTING EMAIL COPY ===`r`n")
-        $StatusBox.Refresh()
+        Write-CopyLog ''
+        Write-CopyLog '=== STARTING EMAIL COPY ==='
 
-        $StatusBox.AppendText("Scanning folder structure from $SourceEmail...`r`n")
-        $StatusBox.Refresh()
         $script:FolderScanIncomplete = $false
+
+        Start-CopyPhase -Name "Scanning source folders ($SourceEmail)" -Indeterminate
         $sourceWellKnown = Get-WellKnownFolderMap -UserId $SourceEmail
-        $sourceFolders   = Get-AllMailFolders -UserId $SourceEmail -WellKnownMap $sourceWellKnown -StatusBox $StatusBox
-        $wellKnownByPath = Get-WellKnownPathMap -SourceFolders $sourceFolders
-        $folderIdCache   = @{}
+        $sourceFolders   = @(Get-AllMailFolders -UserId $SourceEmail -WellKnownMap $sourceWellKnown -StatusBox $StatusBox)
+        Write-CopyLog "Source: $($sourceFolders.Count) folders, $('{0:N0}' -f (($sourceFolders | Measure-Object -Property TotalItemCount -Sum).Sum)) messages."
 
-        $StatusBox.AppendText("Found $($sourceFolders.Count) folders:`r`n`r`n--- FOLDER STRUCTURE ---`r`n")
-        foreach ($f in $sourceFolders) {
-            $StatusBox.AppendText("  $($f.FullPath) ($($f.TotalItemCount) items)`r`n")
+        if ($script:CancelRequested) {
+            Write-CopyLog ''
+            Write-CopyLog '*** COPY CANCELLED BY USER ***'
+            return @{ Success = $true; Copied = 0; Failed = 0; Folders = 0; Skipped = 0; Cancelled = $true }
         }
-        $StatusBox.AppendText("`r`n")
-        $StatusBox.Refresh()
 
-        # The whole hierarchy is mirrored up front, including folders that hold no
-        # mail, so the target structure matches even where there is nothing to copy.
-        $StatusBox.AppendText("Mirroring folder structure into $TargetEmail...`r`n")
-        Update-CopyUi -StatusBox $StatusBox
-        $targetFolderIds = @{}
-        foreach ($sourceFolder in $sourceFolders) {
-            if ($script:CancelRequested) {
-                $StatusBox.AppendText("`r`n*** COPY CANCELLED BY USER ***`r`n")
-                Update-CopyUi -StatusBox $StatusBox
-                return @{ Success = $true; Copied = 0; Failed = 0; Folders = 0; Skipped = 0; Cancelled = $true }
-            }
-            try {
-                $resolvedId = Resolve-TargetFolder -TargetUserId $TargetEmail -SourceFolder $sourceFolder `
-                    -WellKnownByPath $wellKnownByPath -Cache $folderIdCache -StatusBox $StatusBox
-                if ($resolvedId) {
-                    $targetFolderIds[(Get-FolderPathKey -PathParts $sourceFolder.PathParts)] = $resolvedId
+        Start-CopyPhase -Name "Scanning target folders ($TargetEmail)" -Indeterminate
+        $targetWellKnown = Get-WellKnownFolderMap -UserId $TargetEmail
+        $targetFolders   = @(Get-AllMailFolders -UserId $TargetEmail -WellKnownMap $targetWellKnown -StatusBox $StatusBox)
+        Write-CopyLog "Target: $($targetFolders.Count) folders already present."
+
+        if ($script:CancelRequested) {
+            Write-CopyLog ''
+            Write-CopyLog '*** COPY CANCELLED BY USER ***'
+            return @{ Success = $true; Copied = 0; Failed = 0; Folders = 0; Skipped = 0; Cancelled = $true }
+        }
+
+        # Compare the two trees first and add only what the target is missing.
+        # Folders the target already has are reused as they are, and folders it
+        # has that the source does not are listed but never touched.
+        Start-CopyPhase -Name 'Comparing folder structures' -Indeterminate
+        $sync = Sync-MailFolderStructure -TargetUserId $TargetEmail -SourceFolders $sourceFolders `
+            -TargetFolders $targetFolders -StatusBox $StatusBox
+        $folderIndex = $sync.Index
+
+        Write-CopyLog ''
+        Write-CopyLog '--- FOLDER STRUCTURE COMPARISON ---'
+        Write-CopyLog "  Source folders            : $($sourceFolders.Count)"
+        Write-CopyLog "  Already present in target : $($sync.Comparison.Present.Count)"
+        Write-CopyLog "  Missing from target       : $($sync.Comparison.Missing.Count)"
+        Write-CopyLog "  Created now               : $($sync.Created)"
+        if ($sync.Adopted -gt 0) {
+            Write-CopyLog "  Matched by name instead   : $($sync.Adopted)"
+        }
+        if ($sync.Failed -gt 0) {
+            Write-CopyLog "  Could NOT be created      : $($sync.Failed)"
+        }
+        if ($sync.Comparison.TargetOnly.Count -gt 0) {
+            Write-CopyLog "  Extra folders in target   : $($sync.Comparison.TargetOnly.Count) (left untouched)"
+            $shown = 0
+            foreach ($extra in $sync.Comparison.TargetOnly) {
+                if ($shown -ge 10) {
+                    Write-CopyLog "      ... and $($sync.Comparison.TargetOnly.Count - $shown) more"
+                    break
                 }
+                Write-CopyLog "      $($extra.FullPath)"
+                $shown++
             }
-            catch {
-                $StatusBox.AppendText("  ERROR: $($_.Exception.Message)`r`n")
-            }
-            Update-CopyUi -StatusBox $StatusBox
         }
-        $StatusBox.AppendText("Folder structure ready: $($targetFolderIds.Count) / $($sourceFolders.Count) folders available in target.`r`n`r`n")
-        $StatusBox.Refresh()
+        Write-CopyLog ''
+
+        if ($sync.Cancelled -or $script:CancelRequested) {
+            Write-CopyLog '*** COPY CANCELLED BY USER ***'
+            return @{ Success = $true; Copied = 0; Failed = 0; Folders = 0; Skipped = 0; Cancelled = $true }
+        }
 
         $totalMessages = ($sourceFolders | Measure-Object -Property TotalItemCount -Sum).Sum
         if ($totalMessages -eq 0) {
-            $StatusBox.AppendText("No emails found in source mailbox.`r`n")
+            Write-CopyLog 'No emails found in source mailbox; folder structure is in sync.'
             return @{ Success = $true; Copied = 0; Failed = 0; Folders = 0; Skipped = 0; Cancelled = $false }
         }
 
-        $StatusBox.AppendText("Total emails to process: $totalMessages across $($sourceFolders.Count) folders`r`n`r`n")
-        $StatusBox.Refresh()
+        $foldersWithMail = @($sourceFolders | Where-Object { $_.TotalItemCount -gt 0 })
+        Write-CopyLog "Copying $('{0:N0}' -f $totalMessages) messages from $($foldersWithMail.Count) folders..."
+        Start-CopyPhase -Name 'Copying email' -Total $totalMessages
+        $mailPhaseStart = Get-Date
 
         $sentItemsId = Get-WellKnownFolderId -UserId $SourceEmail -WellKnownName 'sentitems'
         $draftsId    = Get-WellKnownFolderId -UserId $SourceEmail -WellKnownName 'drafts'
@@ -1593,71 +2042,73 @@ function Copy-Emails {
         $totalFailed     = 0
         $totalSkipped    = 0
         $foldersCopied   = 0
-        $overallProgress = 0
+        $folderNumber    = 0
 
         foreach ($sourceFolder in $sourceFolders) {
             if ($sourceFolder.TotalItemCount -eq 0) { continue }
 
-            $StatusBox.AppendText("--- Processing Folder: $($sourceFolder.FullPath) ---`r`n")
-            $StatusBox.Refresh()
+            $folderNumber++
+            $folderPosition = "folder $folderNumber/$($foldersWithMail.Count) '$($sourceFolder.FullPath)'"
+            Write-CopyLog "--- $folderPosition : $('{0:N0}' -f $sourceFolder.TotalItemCount) messages ---"
+            Set-CopyDetail -Detail "$folderPosition - starting" -Force
 
-            $targetFolderId = $targetFolderIds[(Get-FolderPathKey -PathParts $sourceFolder.PathParts)]
+            $targetFolderId = Get-IndexedFolderId -Index $folderIndex -Folder $sourceFolder
             if (-not $targetFolderId) {
                 # Posting to /users/{id}/messages instead would silently file these
                 # messages as drafts in the target mailbox.
-                $StatusBox.AppendText("  SKIPPED: no target folder, $($sourceFolder.TotalItemCount) messages not copied.`r`n`r`n")
+                Write-CopyLog "  SKIPPED: no target folder, $($sourceFolder.TotalItemCount) messages not copied."
+                Write-CopyLog ''
                 $totalFailed += $sourceFolder.TotalItemCount
-                $overallProgress += $sourceFolder.TotalItemCount
-                Set-CopyProgress -ProgressBar $ProgressBar -Current $overallProgress -Total $totalMessages
-                Update-CopyUi -StatusBox $StatusBox -ProgressBar $ProgressBar
+                Add-CopyWork -Done $sourceFolder.TotalItemCount -Failed $sourceFolder.TotalItemCount
                 continue
             }
-
-            $StatusBox.AppendText("  Checking for existing messages in destination folder...`r`n")
-            $StatusBox.Refresh()
 
             $headerSelect = 'id,subject,from,receivedDateTime,sentDateTime,isRead,isDraft,hasAttachments,importance'
 
             $targetMessages = @{}
             try {
+                Set-CopyDetail -Detail "$folderPosition - indexing destination" -Force
                 $existingUri = New-FolderMessagesListUri -UserId $TargetEmail -FolderId $targetFolderId -Select $headerSelect
                 $existingMessages = Get-GraphCollection -Uri $existingUri -StatusBox $StatusBox `
-                    -ProgressPrefix 'Destination index' -ExpectedCount 0
+                    -ProgressPrefix "$folderPosition - indexing destination" -ExpectedCount 0
                 foreach ($msg in $existingMessages) {
                     if ($script:CancelRequested) {
-                        $StatusBox.AppendText("`r`n*** COPY CANCELLED BY USER ***`r`n")
-                        Update-CopyUi -StatusBox $StatusBox
+                        Write-CopyLog ''
+                        Write-CopyLog '*** COPY CANCELLED BY USER ***'
                         return @{ Copied = $totalCopied; Skipped = $totalSkipped; Failed = $totalFailed; Cancelled = $true }
                     }
                     $targetMessages[(Get-MessageDedupeKey -Message $msg)] = $true
                 }
-                $StatusBox.AppendText("  Found $($targetMessages.Count) existing messages in destination`r`n")
+                Write-CopyLog "  destination already holds $($targetMessages.Count) messages"
             }
             catch {
-                $StatusBox.AppendText("  Could not retrieve existing messages: $($_.Exception.Message)`r`n")
+                Write-CopyLog "  Could not retrieve existing messages: $($_.Exception.Message)"
             }
-            Update-CopyUi -StatusBox $StatusBox
-
-            $StatusBox.AppendText("  Listing $($sourceFolder.TotalItemCount) source messages (headers only, no body)...`r`n")
-            Update-CopyUi -StatusBox $StatusBox
 
             try {
                 $folderCopied  = 0
                 $folderFailed  = 0
                 $folderSkipped = 0
 
+                Set-CopyDetail -Detail "$folderPosition - listing source" -Force
                 $sourceUri = New-FolderMessagesListUri -UserId $SourceEmail -FolderId $sourceFolder.Id -Select $headerSelect
                 $sourceMessages = Get-GraphCollection -Uri $sourceUri -StatusBox $StatusBox `
-                    -ProgressPrefix 'Source list' -ExpectedCount ([int]$sourceFolder.TotalItemCount)
+                    -ProgressPrefix "$folderPosition - listing source" -ExpectedCount ([int]$sourceFolder.TotalItemCount)
 
                 if ($script:CancelRequested) {
-                    $StatusBox.AppendText("`r`n*** COPY CANCELLED BY USER ***`r`n")
-                    Update-CopyUi -StatusBox $StatusBox
+                    Write-CopyLog ''
+                    Write-CopyLog '*** COPY CANCELLED BY USER ***'
                     return @{ Copied = $totalCopied; Skipped = $totalSkipped; Failed = $totalFailed; Cancelled = $true }
                 }
 
-                $StatusBox.AppendText("  Listed $($sourceMessages.Count) messages. Starting copy...`r`n")
-                Update-CopyUi -StatusBox $StatusBox
+                # TotalItemCount can disagree with what the folder actually returns
+                # (hidden associated items, mail arriving mid-run). Correct the
+                # overall total so the percentage and ETA stay honest.
+                $listed = $sourceMessages.Count
+                if ($listed -ne [int]$sourceFolder.TotalItemCount) {
+                    $totalMessages = $totalMessages - [int]$sourceFolder.TotalItemCount + $listed
+                    Set-CopyPhaseTotal -Total $totalMessages
+                }
 
                 $batchSize   = 100
                 $batchNumber = 0
@@ -1666,8 +2117,8 @@ function Copy-Emails {
 
                 for ($i = 0; $i -lt $sourceMessages.Count; $i += $batchSize) {
                     if ($script:CancelRequested) {
-                        $StatusBox.AppendText("`r`n*** COPY CANCELLED BY USER ***`r`n")
-                        Update-CopyUi -StatusBox $StatusBox
+                        Write-CopyLog ''
+                        Write-CopyLog '*** COPY CANCELLED BY USER ***'
                         return @{ Copied = $totalCopied; Skipped = $totalSkipped; Failed = $totalFailed; Cancelled = $true }
                     }
 
@@ -1677,25 +2128,21 @@ function Copy-Emails {
                     $batchEnd = $batchEnd - 1
                     $batchCount = ($batchEnd - $i) + 1
 
-                    $StatusBox.AppendText("  Batch $batchNumber : Processing $batchCount messages ($($i + 1)-$($batchEnd + 1) of $($sourceMessages.Count))...`r`n")
-                    Update-CopyUi -StatusBox $StatusBox -ProgressBar $ProgressBar
-
                     for ($j = $i; $j -le $batchEnd; $j++) {
                         if ($script:CancelRequested) {
-                            $StatusBox.AppendText("`r`n*** COPY CANCELLED BY USER ***`r`n")
-                            Update-CopyUi -StatusBox $StatusBox
+                            Write-CopyLog ''
+                            Write-CopyLog '*** COPY CANCELLED BY USER ***'
                             return @{ Copied = $totalCopied; Skipped = $totalSkipped; Failed = $totalFailed; Cancelled = $true }
                         }
 
                         $summary    = $sourceMessages[$j]
                         $messageKey = Get-MessageDedupeKey -Message $summary
 
+                        Set-CopyDetail -Detail ("{0} - message {1:N0}/{2:N0}" -f $folderPosition, ($j + 1), $sourceMessages.Count)
+
                         if ($targetMessages.ContainsKey($messageKey)) {
-                            $folderSkipped++; $totalSkipped++; $overallProgress++
-                            if (($overallProgress % 25) -eq 0) {
-                                Set-CopyProgress -ProgressBar $ProgressBar -Current $overallProgress -Total $totalMessages
-                                Update-CopyUi -StatusBox $StatusBox -ProgressBar $ProgressBar
-                            }
+                            $folderSkipped++; $totalSkipped++
+                            Add-CopyWork -Done 1 -Skipped 1
                             continue
                         }
 
@@ -1818,47 +2265,54 @@ function Copy-Emails {
 
                             $folderCopied++; $totalCopied++
                             $targetMessages[$messageKey] = $true
+                            Add-CopyWork -Done 1 -Copied 1
                         }
                         catch {
                             $folderFailed++; $totalFailed++
+                            Add-CopyWork -Done 1 -Failed 1
                             if ($folderFailed -le 8) {
                                 $failSubj = Get-GraphProperty -Object $summary -Names @('subject', 'Subject')
-                                $StatusBox.AppendText("    Failed '$failSubj': $(Get-CopyErrorDetail $_ )`r`n")
-                                Update-CopyUi -StatusBox $StatusBox
+                                Write-CopyLog "    Failed '$failSubj': $(Get-CopyErrorDetail $_ )"
                             }
-                        }
-
-                        $overallProgress++
-                        Set-CopyProgress -ProgressBar $ProgressBar -Current $overallProgress -Total $totalMessages
-                        if (($overallProgress % 10) -eq 0) {
-                            Update-CopyUi -StatusBox $StatusBox -ProgressBar $ProgressBar
                         }
                     }
 
-                    $StatusBox.AppendText("  Batch $batchNumber complete: $folderCopied copied, $folderSkipped skipped, $folderFailed failed`r`n")
-                    Update-CopyUi -StatusBox $StatusBox -ProgressBar $ProgressBar
+                    Write-CopyLog ("  batch {0} of {1} done ({2:N0} copied, {3:N0} skipped, {4:N0} failed so far in this folder)" -f `
+                        $batchNumber, [math]::Ceiling($sourceMessages.Count / $batchSize), $folderCopied, $folderSkipped, $folderFailed)
                 }
 
-                $StatusBox.AppendText("  Folder '$($sourceFolder.FullPath)' done:`r`n")
-                $StatusBox.AppendText("    - $folderCopied new messages copied`r`n")
-                $StatusBox.AppendText("    - $folderSkipped duplicates skipped`r`n")
-                $StatusBox.AppendText("    - $folderFailed failed`r`n`r`n")
+                Write-CopyLog "  '$($sourceFolder.FullPath)' done: $folderCopied copied, $folderSkipped duplicates skipped, $folderFailed failed"
+                Write-CopyLog ''
                 $foldersCopied++
             }
             catch {
-                $StatusBox.AppendText("  Error processing folder: $($_.Exception.Message)`r`n`r`n")
+                Write-CopyLog "  Error processing folder: $($_.Exception.Message)"
+                Write-CopyLog ''
             }
-
-            $StatusBox.Refresh()
         }
 
-        $StatusBox.AppendText("`r`n=== EMAIL COPY COMPLETED ===`r`n")
-        $StatusBox.AppendText("Folders processed : $foldersCopied / $($sourceFolders.Count)`r`n")
-        $StatusBox.AppendText("New messages copied: $totalCopied`r`n")
-        $StatusBox.AppendText("Duplicates skipped : $totalSkipped`r`n")
-        $StatusBox.AppendText("Failed             : $totalFailed`r`n")
+        Set-CopyDetail -Detail 'email copy finished' -Force
+        Write-CopyLog ''
+        Write-CopyLog '=== EMAIL COPY COMPLETED ==='
+        Write-CopyLog "Folders created    : $($sync.Created) (of $($sync.Comparison.Missing.Count) missing)"
+        Write-CopyLog "Folders processed  : $foldersCopied / $($foldersWithMail.Count) with mail"
+        Write-CopyLog "New messages copied: $('{0:N0}' -f $totalCopied)"
+        Write-CopyLog "Duplicates skipped : $('{0:N0}' -f $totalSkipped)"
+        Write-CopyLog "Failed             : $('{0:N0}' -f $totalFailed)"
+        Write-CopyLog "Email phase took   : $(Format-CopyDuration ((Get-Date) - $mailPhaseStart).TotalSeconds)"
 
-        return @{ Success = $true; Copied = $totalCopied; Failed = $totalFailed; Folders = $foldersCopied; Skipped = $totalSkipped; Cancelled = $false }
+        return @{
+            Success        = $true
+            Copied         = $totalCopied
+            Failed         = $totalFailed
+            Folders        = $foldersCopied
+            Skipped        = $totalSkipped
+            Cancelled      = $false
+            FoldersCreated = $sync.Created
+            FoldersExisted = $sync.Comparison.Present.Count
+            FoldersMissing = $sync.Comparison.Missing.Count
+            FoldersFailed  = $sync.Failed
+        }
     }
     catch {
         $StatusBox.AppendText("Error copying emails: $($_.Exception.Message)`r`n")
@@ -1878,13 +2332,12 @@ function Copy-CalendarItems {
     )
 
     try {
-        $StatusBox.AppendText("`r`n=== STARTING CALENDAR COPY ===`r`n")
-        $StatusBox.AppendText("Attendees will be copied silently (no invitation emails).`r`n")
-        $StatusBox.AppendText("Teams meetings keep the original join link (no new meeting is created).`r`n")
-        $StatusBox.Refresh()
+        Write-CopyLog ''
+        Write-CopyLog '=== STARTING CALENDAR COPY ==='
+        Write-CopyLog 'Attendees will be copied silently (no invitation emails).'
+        Write-CopyLog 'Teams meetings keep the original join link (no new meeting is created).'
 
-        $StatusBox.AppendText("Getting source calendar from $SourceEmail...`r`n")
-        $StatusBox.Refresh()
+        Start-CopyPhase -Name 'Reading source calendar' -Detail $SourceEmail -Indeterminate
 
         $sourceCalendar = Invoke-WithRetry -ScriptBlock {
             Get-MgUserCalendar -UserId $SourceEmail -Filter "name eq 'Calendar'" -ErrorAction Stop |
@@ -1896,12 +2349,9 @@ function Copy-CalendarItems {
             }
         }
         if (-not $sourceCalendar) {
-            $StatusBox.AppendText("ERROR: Could not find calendar for $SourceEmail`r`n")
+            Write-CopyLog "ERROR: Could not find calendar for $SourceEmail"
             return @{ Copied = 0; Skipped = 0; Failed = 0; Cancelled = $false }
         }
-
-        $StatusBox.AppendText("Retrieving calendar items from source...`r`n")
-        Update-CopyUi -StatusBox $StatusBox
 
         $eventSelect = @(
             'id','subject','start','end','isAllDay','body','location','locations','attendees',
@@ -1915,33 +2365,30 @@ function Copy-CalendarItems {
         $srcCalIdEnc = [uri]::EscapeDataString($sourceCalendar.Id)
         $eventUri  = "$script:GraphBase/users/$srcCalEnc/calendars/$srcCalIdEnc/events?`$top=50&`$select=$eventSelect"
         try {
-            $events = Get-GraphCollection -Uri $eventUri -StatusBox $StatusBox -ProgressPrefix 'Source calendar'
+            $events = Get-GraphCollection -Uri $eventUri -StatusBox $StatusBox -ProgressPrefix 'Reading source calendar'
         }
         catch {
-            $StatusBox.AppendText("  Full property select failed ($($_.Exception.Message)); retrying with a reduced set...`r`n")
-            Update-CopyUi -StatusBox $StatusBox
+            Write-CopyLog "  Full property select failed ($($_.Exception.Message)); retrying with a reduced set..."
             $reducedSelect = 'id,subject,start,end,isAllDay,body,location,attendees,recurrence,showAs,importance,sensitivity,isReminderOn,reminderMinutesBeforeStart,isOnlineMeeting,onlineMeeting,onlineMeetingUrl,organizer,type,isCancelled,categories'
             $eventUri = "$script:GraphBase/users/$srcCalEnc/calendars/$srcCalIdEnc/events?`$top=50&`$select=$reducedSelect"
-            $events = Get-GraphCollection -Uri $eventUri -StatusBox $StatusBox -ProgressPrefix 'Source calendar'
+            $events = Get-GraphCollection -Uri $eventUri -StatusBox $StatusBox -ProgressPrefix 'Reading source calendar (reduced)'
         }
         $totalEvents = $events.Count
 
-        $StatusBox.AppendText("Found $totalEvents calendar items.`r`n")
-        $StatusBox.Refresh()
+        Write-CopyLog "Source calendar holds $('{0:N0}' -f $totalEvents) items."
 
         if ($script:CancelRequested) {
-            $StatusBox.AppendText("`r`n*** COPY CANCELLED BY USER ***`r`n")
-            $StatusBox.Refresh()
+            Write-CopyLog ''
+            Write-CopyLog '*** COPY CANCELLED BY USER ***'
             return @{ Copied = 0; Skipped = 0; Failed = 0; Cancelled = $true }
         }
 
         if ($totalEvents -eq 0) {
-            $StatusBox.AppendText("No calendar items to copy.`r`n")
+            Write-CopyLog 'No calendar items to copy.'
             return @{ Copied = 0; Skipped = 0; Failed = 0; Cancelled = $false }
         }
 
-        $StatusBox.AppendText("Checking for existing calendar items in $TargetEmail...`r`n")
-        $StatusBox.Refresh()
+        Start-CopyPhase -Name 'Indexing target calendar' -Detail $TargetEmail -Indeterminate
 
         $targetCalendar = Invoke-WithRetry -ScriptBlock {
             Get-MgUserCalendar -UserId $TargetEmail -Filter "name eq 'Calendar'" -ErrorAction Stop |
@@ -1953,34 +2400,31 @@ function Copy-CalendarItems {
             }
         }
         if (-not $targetCalendar) {
-            $StatusBox.AppendText("ERROR: Could not find calendar for $TargetEmail`r`n")
+            Write-CopyLog "ERROR: Could not find calendar for $TargetEmail"
             return @{ Copied = 0; Skipped = 0; Failed = 0; Cancelled = $false }
         }
-
-        $StatusBox.AppendText("Fetching target calendar index...`r`n")
-        Update-CopyUi -StatusBox $StatusBox
 
         $tgtCalEnc = [uri]::EscapeDataString($TargetEmail)
         $tgtCalIdEnc = [uri]::EscapeDataString($targetCalendar.Id)
         $targetIndexUri = "$script:GraphBase/users/$tgtCalEnc/calendars/$tgtCalIdEnc/events?`$top=100&`$select=subject,start"
-        $targetCalendarItems = Get-GraphCollection -Uri $targetIndexUri -StatusBox $StatusBox -ProgressPrefix 'Target calendar index'
+        $targetCalendarItems = Get-GraphCollection -Uri $targetIndexUri -StatusBox $StatusBox -ProgressPrefix 'Indexing target calendar'
 
-        $StatusBox.AppendText("Found $($targetCalendarItems.Count) existing items in target. Building duplicate index...`r`n")
-        $StatusBox.Refresh()
+        Write-CopyLog "Target calendar already holds $('{0:N0}' -f $targetCalendarItems.Count) items."
 
         $targetEvents = @{}
         foreach ($te in $targetCalendarItems) {
             if ($script:CancelRequested) {
-                $StatusBox.AppendText("`r`n*** COPY CANCELLED BY USER ***`r`n")
-                $StatusBox.Refresh()
+                Write-CopyLog ''
+                Write-CopyLog '*** COPY CANCELLED BY USER ***'
                 return @{ Copied = 0; Skipped = 0; Failed = 0; Cancelled = $true }
             }
             $startTime = if ($te.Start.DateTime) { $te.Start.DateTime } else { "nodate" }
             $targetEvents["$($te.Subject)|$startTime"] = $true
         }
 
-        $StatusBox.AppendText("Index complete. Starting copy...`r`n`r`n")
-        $StatusBox.Refresh()
+        Write-CopyLog "Copying $('{0:N0}' -f $totalEvents) calendar items..."
+        Start-CopyPhase -Name 'Copying calendar' -Total $totalEvents
+        $calendarPhaseStart = Get-Date
 
         $copiedCount  = 0
         $skippedCount = 0
@@ -1993,8 +2437,8 @@ function Copy-CalendarItems {
 
         for ($i = 0; $i -lt $totalEvents; $i += $batchSize) {
             if ($script:CancelRequested) {
-                $StatusBox.AppendText("`r`n*** COPY CANCELLED BY USER ***`r`n")
-                $StatusBox.Refresh()
+                Write-CopyLog ''
+                Write-CopyLog '*** COPY CANCELLED BY USER ***'
                 return @{ Copied = $copiedCount; Skipped = $skippedCount; Failed = $failedCount; Cancelled = $true }
             }
 
@@ -2004,22 +2448,22 @@ function Copy-CalendarItems {
             $batchEnd = $batchEnd - 1
             $batchCount = ($batchEnd - $i) + 1
 
-            $StatusBox.AppendText("  Batch $batchNumber : Processing $batchCount calendar items...`r`n")
-            Update-CopyUi -StatusBox $StatusBox -ProgressBar $ProgressBar
-
             for ($j = $i; $j -le $batchEnd; $j++) {
                 $event = $events[$j]
                 if ($script:CancelRequested) {
-                    $StatusBox.AppendText("`r`n*** COPY CANCELLED BY USER ***`r`n")
-                    $StatusBox.Refresh()
+                    Write-CopyLog ''
+                    Write-CopyLog '*** COPY CANCELLED BY USER ***'
                     return @{ Copied = $copiedCount; Skipped = $skippedCount; Failed = $failedCount; Cancelled = $true }
                 }
+
+                Set-CopyDetail -Detail ("item {0:N0}/{1:N0}: {2}" -f ($j + 1), $totalEvents, $event.Subject)
 
                 $eventType = (Convert-GraphEnumString -Value $event.Type -Fallback 'singleInstance').ToLowerInvariant()
                 if ($eventType -eq 'occurrence') {
                     # Expanded instances of a recurring series. The series master is copied once.
                     $occurrenceSkip++
                     $skippedCount++
+                    Add-CopyWork -Done 1 -Skipped 1
                     continue
                 }
 
@@ -2028,6 +2472,7 @@ function Copy-CalendarItems {
 
                 if ($targetEvents.ContainsKey($eventKey)) {
                     $skippedCount++
+                    Add-CopyWork -Done 1 -Skipped 1
                     continue
                 }
 
@@ -2146,37 +2591,37 @@ function Copy-CalendarItems {
                         }
                     }
                     $copiedCount++
+                    Add-CopyWork -Done 1 -Copied 1
                 }
                 catch {
                     $failedCount++
+                    Add-CopyWork -Done 1 -Failed 1
                     if ($failedCount -le 8) {
-                        $StatusBox.AppendText("    Failed '$($event.Subject)': $(Get-CopyErrorDetail $_ )`r`n")
-                        $StatusBox.Refresh()
+                        Write-CopyLog "    Failed '$($event.Subject)': $(Get-CopyErrorDetail $_ )"
                     }
-                }
-
-                Set-CopyProgress -ProgressBar $ProgressBar -Current ($copiedCount + $failedCount + $skippedCount) -Total $totalEvents
-                if ((($copiedCount + $failedCount + $skippedCount) % 10) -eq 0) {
-                    Update-CopyUi -StatusBox $StatusBox -ProgressBar $ProgressBar
                 }
             }
 
-            $StatusBox.AppendText("  Batch $batchNumber : $copiedCount copied, $skippedCount skipped, $failedCount failed`r`n")
-            $StatusBox.Refresh()
+            Write-CopyLog ("  batch {0} of {1} done ({2:N0} copied, {3:N0} skipped, {4:N0} failed so far)" -f `
+                $batchNumber, [math]::Ceiling($totalEvents / $batchSize), $copiedCount, $skippedCount, $failedCount)
         }
 
-        $StatusBox.AppendText("`r`n=== CALENDAR COPY COMPLETED ===`r`n")
-        $StatusBox.AppendText("New items copied  : $copiedCount`r`n")
-        $StatusBox.AppendText("Duplicates skipped: $skippedCount`r`n")
+        Set-CopyDetail -Detail 'calendar copy finished' -Force
+        Write-CopyLog ''
+        Write-CopyLog '=== CALENDAR COPY COMPLETED ==='
+        Write-CopyLog "New items copied  : $('{0:N0}' -f $copiedCount)"
+        Write-CopyLog "Duplicates skipped: $('{0:N0}' -f $skippedCount)"
         if ($occurrenceSkip -gt 0) {
-            $StatusBox.AppendText("  (includes $occurrenceSkip recurring occurrences skipped; series masters were copied)`r`n")
+            Write-CopyLog "  (includes $occurrenceSkip recurring occurrences skipped; series masters were copied)"
         }
-        $StatusBox.AppendText("Failed            : $failedCount`r`n`r`n")
+        Write-CopyLog "Failed            : $('{0:N0}' -f $failedCount)"
+        Write-CopyLog "Calendar phase took: $(Format-CopyDuration ((Get-Date) - $calendarPhaseStart).TotalSeconds)"
+        Write-CopyLog ''
 
         return @{ Copied = $copiedCount; Skipped = $skippedCount; Failed = $failedCount; Cancelled = $false }
     }
     catch {
-        $StatusBox.AppendText("ERROR during calendar copy: $($_.Exception.Message)`r`n")
+        Write-CopyLog "ERROR during calendar copy: $($_.Exception.Message)"
         return @{ Copied = 0; Skipped = 0; Failed = 0; Cancelled = $false }
     }
 }
@@ -2194,72 +2639,43 @@ function Verify-CopiedItems {
     )
 
     try {
-        $StatusBox.AppendText("`r`n--- Verifying Copied Items ---`r`n")
+        Write-CopyLog ''
+        Write-CopyLog '--- Verifying Copied Items ---'
 
         if ($CheckEmails) {
+            Start-CopyPhase -Name 'Verifying folder structure' -Indeterminate
             $srcWellKnown = Get-WellKnownFolderMap -UserId $SourceEmail
             $tgtWellKnown = Get-WellKnownFolderMap -UserId $TargetEmail
-            $srcFolders = Get-AllMailFolders -UserId $SourceEmail -WellKnownMap $srcWellKnown -StatusBox $StatusBox
-            $tgtFolders = Get-AllMailFolders -UserId $TargetEmail -WellKnownMap $tgtWellKnown -StatusBox $StatusBox
+            $srcFolders = @(Get-AllMailFolders -UserId $SourceEmail -WellKnownMap $srcWellKnown -StatusBox $StatusBox)
+            $tgtFolders = @(Get-AllMailFolders -UserId $TargetEmail -WellKnownMap $tgtWellKnown -StatusBox $StatusBox)
             $srcCount = ($srcFolders | Measure-Object -Property TotalItemCount -Sum).Sum
             $tgtCount = ($tgtFolders | Measure-Object -Property TotalItemCount -Sum).Sum
-            $StatusBox.AppendText("Source mailbox emails: $srcCount`r`n")
-            $StatusBox.AppendText("Target mailbox emails: $tgtCount`r`n")
-            Update-CopyUi -StatusBox $StatusBox
+            Write-CopyLog "Source mailbox emails: $('{0:N0}' -f $srcCount)"
+            Write-CopyLog "Target mailbox emails: $('{0:N0}' -f $tgtCount)"
 
-            # Item totals alone cannot show a structure problem: compare the paths.
-            # A source well-known folder counts as present when the target's own
-            # well-known folder exists, whatever it is called there.
-            $tgtPaths = @{}
-            foreach ($tf in $tgtFolders) { $tgtPaths[(Get-FolderPathKey -PathParts $tf.PathParts)] = $true }
-            $tgtWellKnownNames = @{}
-            foreach ($tf in $tgtFolders) {
-                if ($tf.WellKnownName) { $tgtWellKnownNames[$tf.WellKnownName] = $tf.PathParts }
-            }
-
-            $srcRootWellKnown = @{}
-            foreach ($sf in $srcFolders) {
-                if ($sf.WellKnownName -and $sf.PathParts.Count -eq 1) {
-                    $srcRootWellKnown[$sf.PathParts[0]] = $sf.WellKnownName
-                }
-            }
-
-            $missing = New-Object System.Collections.Generic.List[string]
-            foreach ($sf in $srcFolders) {
-                $segments = @($sf.PathParts)
-                $rootName = $segments[0]
-                if ($srcRootWellKnown.ContainsKey($rootName) -and
-                    $tgtWellKnownNames.ContainsKey($srcRootWellKnown[$rootName])) {
-                    $segments = @($tgtWellKnownNames[$srcRootWellKnown[$rootName]])
-                    if ($sf.PathParts.Count -gt 1) {
-                        $segments += @($sf.PathParts[1..($sf.PathParts.Count - 1)])
-                    }
-                }
-                if (-not $tgtPaths.ContainsKey((Get-FolderPathKey -PathParts $segments))) {
-                    $missing.Add($sf.FullPath)
-                }
-            }
-
-            $StatusBox.AppendText("Source folders: $($srcFolders.Count)  |  present in target: $($srcFolders.Count - $missing.Count)`r`n")
-            if ($missing.Count -gt 0) {
-                $StatusBox.AppendText("Folders MISSING from target ($($missing.Count)):`r`n")
+            # Item totals alone cannot show a structure problem, so re-run the same
+            # comparison the copy used and report anything still missing.
+            $check = Compare-MailFolderStructure -SourceFolders $srcFolders -TargetFolders $tgtFolders
+            Write-CopyLog "Source folders: $($srcFolders.Count)  |  present in target: $($check.Present.Count)"
+            if ($check.Missing.Count -gt 0) {
+                Write-CopyLog "Folders MISSING from target ($($check.Missing.Count)):"
                 $shown = 0
-                foreach ($m in $missing) {
+                foreach ($m in $check.Missing) {
                     if ($shown -ge 25) {
-                        $StatusBox.AppendText("  ... and $($missing.Count - $shown) more`r`n")
+                        Write-CopyLog "  ... and $($check.Missing.Count - $shown) more"
                         break
                     }
-                    $StatusBox.AppendText("  $m`r`n")
+                    Write-CopyLog "  $($m.FullPath)"
                     $shown++
                 }
             }
             else {
-                $StatusBox.AppendText("Folder structure matches.`r`n")
+                Write-CopyLog 'Folder structure matches: every source folder exists in the target.'
             }
-            Update-CopyUi -StatusBox $StatusBox
         }
 
         if ($CheckCalendar) {
+            Start-CopyPhase -Name 'Verifying calendars' -Indeterminate
             $srcCal = Invoke-WithRetry -ScriptBlock {
                 Get-MgUserCalendar -UserId $SourceEmail -Filter "name eq 'Calendar'" -Top 1
             }
@@ -2270,20 +2686,22 @@ function Verify-CopiedItems {
             if ($srcCal -and $tgtCal) {
                 $srcEnc = [uri]::EscapeDataString($SourceEmail)
                 $tgtEnc = [uri]::EscapeDataString($TargetEmail)
-                $srcEvtCount = (Get-GraphCollection -Uri "$script:GraphBase/users/$srcEnc/calendars/$([uri]::EscapeDataString($srcCal.Id))/events?`$top=100&`$select=id" -StatusBox $StatusBox -ProgressPrefix 'Verify source calendar').Count
-                $tgtEvtCount = (Get-GraphCollection -Uri "$script:GraphBase/users/$tgtEnc/calendars/$([uri]::EscapeDataString($tgtCal.Id))/events?`$top=100&`$select=id" -StatusBox $StatusBox -ProgressPrefix 'Verify target calendar').Count
-                $StatusBox.AppendText("Source calendar items: $srcEvtCount`r`n")
-                $StatusBox.AppendText("Target calendar items: $tgtEvtCount`r`n")
+                $srcEvtCount = (Get-GraphCollection -Uri "$script:GraphBase/users/$srcEnc/calendars/$([uri]::EscapeDataString($srcCal.Id))/events?`$top=100&`$select=id" -StatusBox $StatusBox -ProgressPrefix 'Verifying source calendar').Count
+                $tgtEvtCount = (Get-GraphCollection -Uri "$script:GraphBase/users/$tgtEnc/calendars/$([uri]::EscapeDataString($tgtCal.Id))/events?`$top=100&`$select=id" -StatusBox $StatusBox -ProgressPrefix 'Verifying target calendar').Count
+                Write-CopyLog "Source calendar items: $('{0:N0}' -f $srcEvtCount)"
+                Write-CopyLog "Target calendar items: $('{0:N0}' -f $tgtEvtCount)"
             }
             else {
-                $StatusBox.AppendText("Could not retrieve calendar for verification.`r`n")
+                Write-CopyLog 'Could not retrieve calendar for verification.'
             }
         }
 
-        $StatusBox.AppendText("`r`nVerification completed!`r`n")
+        Set-CopyDetail -Detail 'verification finished' -Force
+        Write-CopyLog ''
+        Write-CopyLog 'Verification completed!'
     }
     catch {
-        $StatusBox.AppendText("Verification error: $($_.Exception.Message)`r`n")
+        Write-CopyLog "Verification error: $($_.Exception.Message)"
     }
 }
 
@@ -2367,7 +2785,7 @@ $fontButton  = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.Fo
 $fontStatus  = New-Object System.Drawing.Font('Consolas', 9)
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text            = "Microsoft 365 Mailbox Copy Tool v1.15 (Interactive Login)"
+$form.Text            = "Microsoft 365 Mailbox Copy Tool v1.16 (Interactive Login)"
 $form.Size            = New-Object System.Drawing.Size(780, 820)
 $form.MinimumSize     = New-Object System.Drawing.Size(600, 700)
 $form.StartPosition   = "CenterScreen"
@@ -2380,11 +2798,11 @@ $form.Padding         = New-Object System.Windows.Forms.Padding(0)
 $root = New-Object System.Windows.Forms.TableLayoutPanel
 $root.Dock = [System.Windows.Forms.DockStyle]::Fill
 $root.ColumnCount = 1
-$root.RowCount = 16
+$root.RowCount = 18
 $root.Padding = New-Object System.Windows.Forms.Padding(16)
 $root.GrowStyle = [System.Windows.Forms.TableLayoutPanelGrowStyle]::FixedSize
 [void]$root.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-for ($guiRow = 0; $guiRow -lt 15; $guiRow++) {
+for ($guiRow = 0; $guiRow -lt 17; $guiRow++) {
     [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
 }
 [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
@@ -2482,12 +2900,36 @@ $cancelButton.ForeColor = [System.Drawing.Color]::White
 $buttonRow.Controls.Add($cancelButton)
 $root.Controls.Add($buttonRow, 0, 13)
 
+# Two labels above the bar carry the live position and the ETA. They are updated
+# in place so the scrolling log stays readable, and are deliberately fixed-height
+# single lines with an ellipsis so a long folder path cannot reflow the layout.
+$phaseLabel = New-Object System.Windows.Forms.Label
+$phaseLabel.Text = "Idle."
+$phaseLabel.Font = $fontBody
+$phaseLabel.AutoSize = $false
+$phaseLabel.AutoEllipsis = $true
+$phaseLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
+$phaseLabel.Height = 20
+$phaseLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 0)
+$root.Controls.Add($phaseLabel, 0, 14)
+
+$etaLabel = New-Object System.Windows.Forms.Label
+$etaLabel.Text = ""
+$etaLabel.Font = $fontHint
+$etaLabel.ForeColor = [System.Drawing.Color]::FromArgb(70, 70, 70)
+$etaLabel.AutoSize = $false
+$etaLabel.AutoEllipsis = $true
+$etaLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
+$etaLabel.Height = 18
+$etaLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 4)
+$root.Controls.Add($etaLabel, 0, 15)
+
 $progressBar = New-Object System.Windows.Forms.ProgressBar
 $progressBar.Dock = [System.Windows.Forms.DockStyle]::Fill
 $progressBar.Height = 22
 $progressBar.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 8)
 $progressBar.MinimumSize = New-Object System.Drawing.Size(100, 18)
-$root.Controls.Add($progressBar, 0, 14)
+$root.Controls.Add($progressBar, 0, 16)
 
 $statusBox = New-Object System.Windows.Forms.TextBox
 $statusBox.Multiline = $true
@@ -2499,7 +2941,7 @@ $statusBox.Dock = [System.Windows.Forms.DockStyle]::Fill
 $statusBox.Margin = New-Object System.Windows.Forms.Padding(0)
 $statusBox.MinimumSize = New-Object System.Drawing.Size(100, 80)
 $statusBox.Text = "Welcome! Click 'Sign In to Microsoft 365' to begin.`r`n"
-$root.Controls.Add($statusBox, 0, 15)
+$root.Controls.Add($statusBox, 0, 17)
 
 $form.Add_Resize({ Update-GuiWrapWidths })
 $form.Add_Shown({ Update-GuiWrapWidths })
@@ -2583,13 +3025,16 @@ $copyButton.Add_Click({
         $emailLabel.Enabled            = $false
         $calendarCheckbox.Enabled      = $false
         $calendarLabel.Enabled         = $false
+        $progressBar.Style             = [System.Windows.Forms.ProgressBarStyle]::Continuous
         $progressBar.Value             = 0
 
         $statusBox.Clear()
-        $statusBox.AppendText("=== COPY OPERATION STARTED ===`r`n")
-        $statusBox.AppendText("Source : $sourceEmail`r`n")
-        $statusBox.AppendText("Target : $targetEmail`r`n")
-        $statusBox.Refresh()
+        Initialize-CopyUi -StatusBox $statusBox -ProgressBar $progressBar -PhaseLabel $phaseLabel -EtaLabel $etaLabel
+        $runStart = Get-Date
+        Write-CopyLog "=== COPY OPERATION STARTED $($runStart.ToString('yyyy-MM-dd HH:mm:ss')) ==="
+        Write-CopyLog "Source : $sourceEmail"
+        Write-CopyLog "Target : $targetEmail"
+        Start-CopyPhase -Name 'Starting' -Indeterminate
 
         try {
             if ($emailCheckbox.Checked -and -not $script:CancelRequested) {
@@ -2603,9 +3048,14 @@ $copyButton.Add_Click({
                 Verify-CopiedItems -SourceEmail $sourceEmail -TargetEmail $targetEmail `
                     -CheckEmails $emailCheckbox.Checked -CheckCalendar $calendarCheckbox.Checked `
                     -StatusBox $statusBox
+                $progressBar.Style = [System.Windows.Forms.ProgressBarStyle]::Continuous
                 $progressBar.Value = 100
-                $statusBox.AppendText("`r`n=== COPY OPERATION COMPLETED ===`r`n")
-                $statusBox.AppendText("Remember to remove FullAccess permissions from both mailboxes.`r`n")
+                $phaseLabel.Text   = "Finished."
+                $etaLabel.Text     = "Total run time $(Format-CopyDuration ((Get-Date) - $runStart).TotalSeconds)."
+                Write-CopyLog ''
+                Write-CopyLog '=== COPY OPERATION COMPLETED ==='
+                Write-CopyLog "Total run time: $(Format-CopyDuration ((Get-Date) - $runStart).TotalSeconds)"
+                Write-CopyLog 'Remember to remove FullAccess permissions from both mailboxes.'
 
                 if ($script:FolderScanIncomplete) {
                     $statusBox.AppendText("WARNING: at least one folder listing failed, so the source was not fully`r`n")
@@ -2626,15 +3076,22 @@ $copyButton.Add_Click({
                 }
             }
             else {
-                $statusBox.AppendText("`r`n=== COPY OPERATION CANCELLED ===`r`n")
+                $phaseLabel.Text = "Cancelled."
+                $etaLabel.Text   = "Stopped after $(Format-CopyDuration ((Get-Date) - $runStart).TotalSeconds)."
+                Write-CopyLog ''
+                Write-CopyLog '=== COPY OPERATION CANCELLED ==='
                 [System.Windows.Forms.MessageBox]::Show("Copy operation was cancelled by user.", "Cancelled", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
             }
         }
         catch {
-            $statusBox.AppendText("`r`nERROR: $($_.Exception.Message)`r`n")
+            $phaseLabel.Text = "Failed."
+            $etaLabel.Text   = "See the status log for details."
+            Write-CopyLog ''
+            Write-CopyLog "ERROR: $($_.Exception.Message)"
             [System.Windows.Forms.MessageBox]::Show("An error occurred. Check the status window for details.", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
         }
         finally {
+            $progressBar.Style             = [System.Windows.Forms.ProgressBarStyle]::Continuous
             $copyButton.Enabled            = $true
             $sourceTextbox.Enabled         = $true
             $targetTextbox.Enabled         = $true

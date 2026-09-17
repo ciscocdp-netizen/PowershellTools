@@ -7,9 +7,12 @@ copied, never moved: the source mailbox is left untouched.
 | File | Purpose |
 |------|---------|
 | `M365-Mailbox-Copy-Tool.ps1` | The tool. Run it, sign in, fill in the two mailboxes, copy. |
-| `tests/Invoke-FolderStructureTests.ps1` | Folder-replication regression tests against a mocked Graph. |
+| `tests/Invoke-AllTests.ps1` | Runs every suite below; exits non-zero on failure. |
+| `tests/Invoke-FolderStructureTests.ps1` | Folder comparison and replication tests against a mocked Graph. |
+| `tests/Invoke-ProgressTests.ps1` | Live status, progress and ETA tests against a virtual clock. |
 | `tests/GraphMocks.ps1` | In-memory stand-in for the Graph mail-folder endpoints. |
 | `tests/WinFormsShim.ps1` | Lets the tool's WinForms-typed functions load off Windows. |
+| `tests/ToolLoader.ps1` | Loads the tool's functions without running its bootstrap or GUI. |
 
 ## Requirements
 
@@ -59,15 +62,27 @@ skipped; the series master is copied once.
 
 ## Folder replication
 
-The target hierarchy is built before any mail is copied, so it matches the source even
-for folders that hold no mail. Path segments are resolved one at a time, with results
-cached, and each source well-known folder (Inbox, Sent Items, Drafts, ...) is resolved
-through the *target's* well-known folder rather than by display name, so a mailbox in
-another display language does not end up with a second "Inbox".
+Both hierarchies are enumerated up front and compared, then **only the folders the
+target is missing are created** — before any mail moves, so the structure matches the
+source even for folders that hold no mail. Nothing in the target is renamed, moved or
+deleted:
 
-If a folder cannot be created or found, its messages are **skipped and reported**. They
-are deliberately not posted to `/users/{id}/messages`, which would silently file them
-as drafts in the target mailbox.
+- Folders that already exist are reused exactly as they are.
+- Folders that exist only in the target are listed in the log and left alone.
+- Folders are compared by canonical path, where a well-known root (Inbox, Sent Items,
+  Drafts, ...) is represented by its well-known name rather than its display name. A
+  Dutch target mailbox therefore matches `Inbox\Clients` to `Postvak IN\Clients`
+  instead of growing a second "Inbox".
+- A display name that collides with an existing folder anyway (Graph answers 409
+  `ErrorFolderExists`) is adopted rather than reported as a failure, and the log says
+  it was reused rather than created.
+
+The comparison is also re-run during verification at the end of the copy, which lists
+anything still missing.
+
+If a folder cannot be created or found, its messages are **skipped and reported**, and
+so is its whole subtree. They are deliberately not posted to `/users/{id}/messages`,
+which would silently file them as drafts in the target mailbox.
 
 v1.15 fixed six defects here; see the changelog in the script header. In short: empty
 folders were dropped, a name containing an apostrophe broke the OData lookup and got
@@ -75,6 +90,36 @@ its mail written to the parent folder (children were re-parented one level up), 
 backslash in a name was expanded into a nested path, well-known folders were matched
 by display name, failed folder listings silently dropped whole subtrees while the run
 still reported success, and unresolvable folders had their mail drafted.
+
+## Progress and ETA
+
+Two lines above the progress bar are updated in place while the copy runs:
+
+```
+Copying email  -  folder 12/48 'Inbox\Projects\2024' - message 1,204/3,867  -  14,312 / 61,904  (23%)
+Elapsed 21m 14s   |   remaining ~1h 09m 02s   |   done by 15:47   |   11.2 items/s   |   copied 13,900, skipped 400, failed 12
+```
+
+- The phase line names what the run is doing (scanning the source, scanning the
+  target, comparing structures, creating missing folders, copying email, copying
+  calendar, verifying), which folder it is on and that folder's position in the run,
+  and the item counter inside it. Graph paging shows up here too, so a folder with
+  tens of thousands of messages no longer floods the log with page counters.
+- The ETA line shows elapsed time, estimated time remaining, the wall-clock time the
+  copy is expected to finish, throughput, and the running copied / skipped / failed
+  totals. The estimate uses throughput over a trailing two-minute window rather than
+  the average since the start, so it reacts when Graph starts throttling instead of
+  smoothing it away.
+- The progress bar is a marquee while a phase's size is unknown, and a percentage once
+  a total exists. If a folder returns a different number of messages than its
+  `TotalItemCount` claimed, the overall total is corrected mid-run so the percentage
+  and the estimate stay honest.
+- Repaints are throttled to four per second: the copy runs on the UI thread, so
+  painting every item would slow the copy down measurably.
+
+The status log keeps folder-level events: what was created or reused, how many
+messages the destination already held, per-batch results, per-folder totals, and any
+failure detail.
 
 ## Known limitations
 
@@ -89,22 +134,34 @@ still reported success, and unresolvable folders had their mail drafted.
 
 ## Tests
 
-The folder-replication logic has regression tests that run without a tenant. They load
-the function definitions out of `M365-Mailbox-Copy-Tool.ps1` itself with the PowerShell
-parser (so they cannot drift from the shipped code, and the GUI never starts) and drive
-them against a fake mailbox store.
+The folder logic and the progress engine have regression tests that run without a
+tenant. They load the function definitions out of `M365-Mailbox-Copy-Tool.ps1` itself
+with the PowerShell parser (so they cannot drift from the shipped code, and the GUI
+never starts) and drive them against a fake mailbox store and a virtual clock.
 
 ```powershell
 # Windows PowerShell 5.1 or PowerShell 7, any OS
-pwsh -File .\tests\Invoke-FolderStructureTests.ps1
+pwsh -File .\tests\Invoke-AllTests.ps1
 ```
 
-43 assertions across nine cases: empty folders, apostrophes in nested and top-level
-names, backslashes in names, a localized target mailbox, repeated names under
-different parents, a folder listing that fails partway through, and name lookups that
-return nothing or error out. The script exits non-zero on failure, so it works as a
-build check.
+111 assertions. The folder suite covers empty folders, apostrophes in nested and
+top-level names, backslashes in names, a localized target mailbox, repeated names
+under different parents, a folder listing that fails partway through, name lookups
+that return nothing or error out, a target that already matches the source (which must
+issue no writes and no lookups at all), a partially populated target (only the absent
+folders may be created), folders that exist only in the target, and a display name
+that collides with a well-known folder in the target.
+
+The progress suite covers duration formatting, the phase/detail/position status line,
+the marquee and percentage states of the bar, the estimate itself — including that it
+follows recent throughput rather than the average since the start — repaint
+throttling, mid-run total corrections, and that every progress call is inert when
+there is no UI.
+
+Both suites exit non-zero on failure, so they work as a build check.
 
 Coverage was checked by mutation: re-introducing any of the original defects (dropping
 the OData escaping, skipping empty folders, matching well-known folders by display
-name, treating a failed lookup as "not found") makes the suite fail.
+name, treating a failed lookup as "not found", creating every source folder instead of
+only the missing ones, or estimating from the average rate instead of the recent one)
+makes the suite fail.
