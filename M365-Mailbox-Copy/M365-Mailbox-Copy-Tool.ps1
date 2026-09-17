@@ -2922,6 +2922,7 @@ $phaseLabel.AutoSize = $false
 $phaseLabel.AutoEllipsis = $true
 $phaseLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
 $phaseLabel.Height = 20
+$phaseLabel.MinimumSize = New-Object System.Drawing.Size(100, 20)
 $phaseLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 0)
 $root.Controls.Add($phaseLabel, 0, 14)
 
@@ -2933,6 +2934,7 @@ $etaLabel.AutoSize = $false
 $etaLabel.AutoEllipsis = $true
 $etaLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
 $etaLabel.Height = 18
+$etaLabel.MinimumSize = New-Object System.Drawing.Size(100, 18)
 $etaLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 4)
 $root.Controls.Add($etaLabel, 0, 15)
 
