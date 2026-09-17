@@ -27,11 +27,15 @@
 
     Direct assignments use AssignmentPath = Direct.
 
+    Signs in with the OAuth 2.0 device code flow (no local browser is required).
+    The device code is printed in the console and, by default, copied to the clipboard
+    so it can be pasted at the verification URL.
+
     Compatible with Windows PowerShell 5.1 and PowerShell 7+.
 
 .PARAMETER TenantId
-    Optional. The tenant (directory) ID or domain to connect to. If omitted, the
-    default tenant of the signing-in account is used.
+    Optional. The tenant (directory) ID or domain to connect to. If omitted,
+    work/school accounts from any organization can be used to sign in.
 
 .PARAMETER IncludeActive
     Include active role assignments (permanent, time-bound, and currently activated).
@@ -56,6 +60,10 @@
 .PARAMETER ExportCsvPath
     Optional. If supplied, results are also written to this CSV path.
 
+.PARAMETER CopyDeviceCodeToClipboard
+    Copy the device login code to the clipboard so it can be pasted at the
+    Microsoft device-login page. Default: $true.
+
 .EXAMPLE
     .\Get-PrivilegedEntraUsers.ps1
 
@@ -72,6 +80,10 @@
     .\Get-PrivilegedEntraUsers.ps1 | Where-Object { $_.PrincipalType -eq 'ServicePrincipal' }
 
 .NOTES
+    Signs in using the OAuth 2.0 device code flow. The user code is copied to the
+    clipboard by default. Open the displayed URL, paste the code, and complete
+    sign-in; the script waits until authentication finishes.
+
     Requires the following delegated permissions (consented at first interactive sign-in):
         RoleManagement.Read.Directory
         Directory.Read.All
@@ -93,7 +105,8 @@ param(
     [bool]   $IncludeServicePrincipals  = $true,
     [bool]   $IncludeGroups             = $true,
     [bool]   $ExpandGroupMembers        = $true,
-    [string] $ExportCsvPath
+    [string] $ExportCsvPath,
+    [bool]   $CopyDeviceCodeToClipboard = $true
 )
 
 Set-StrictMode -Version Latest
@@ -120,16 +133,297 @@ foreach ($module in $requiredModules) {
 
 #region Connect ------------------------------------------------------------------
 
-$scopes = @('RoleManagement.Read.Directory', 'Directory.Read.All')
+# Microsoft Graph PowerShell public client (same app Connect-MgGraph uses).
+$script:GraphPowerShellClientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
+$script:GraphDelegatedScopes    = 'https://graph.microsoft.com/RoleManagement.Read.Directory https://graph.microsoft.com/Directory.Read.All offline_access openid profile'
 
-$connectParams = @{ Scopes = $scopes }
-if ($TenantId) { $connectParams['TenantId'] = $TenantId }
+function Get-NotePropertyValue {
+    param(
+        [AllowNull()] $Object,
+        [Parameter(Mandatory)] [string[]] $Name
+    )
 
-Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
-Connect-MgGraph @connectParams | Out-Null
+    if ($null -eq $Object) { return $null }
+
+    foreach ($n in $Name) {
+        if ($Object -is [System.Collections.IDictionary]) {
+            if ($Object.Contains($n)) { return $Object[$n] }
+        }
+        else {
+            $prop = $Object.PSObject.Properties[$n]
+            if ($null -ne $prop) { return $prop.Value }
+        }
+    }
+
+    return $null
+}
+
+function Copy-TextToClipboard {
+    param([Parameter(Mandatory)] [string] $Text)
+
+    # Prefer native Set-Clipboard (Windows PowerShell 5+ / PowerShell 7+).
+    $setClipboard = Get-Command -Name Set-Clipboard -ErrorAction SilentlyContinue
+    if ($setClipboard) {
+        try {
+            Set-Clipboard -Value $Text
+            return $true
+        }
+        catch {
+            # Fall through to other methods.
+        }
+    }
+
+    # clip.exe is available on most Windows SKUs and works from the console.
+    $clip = Get-Command -Name clip.exe -ErrorAction SilentlyContinue
+    if ($clip) {
+        try {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName               = $clip.Source
+            $psi.RedirectStandardInput  = $true
+            $psi.UseShellExecute        = $false
+            $psi.CreateNoWindow         = $true
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            $proc.StandardInput.Write($Text)
+            $proc.StandardInput.Close()
+            $proc.WaitForExit()
+            if ($proc.ExitCode -eq 0) { return $true }
+        }
+        catch {
+            # Fall through to Windows Forms.
+        }
+    }
+
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        [System.Windows.Forms.Clipboard]::SetText($Text)
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-OAuthErrorFromException {
+    param($ErrorRecord)
+
+    $raw = $null
+    $details = Get-NotePropertyValue -Object $ErrorRecord -Name @('ErrorDetails')
+    $detailMessage = Get-NotePropertyValue -Object $details -Name @('Message')
+    if ($detailMessage) {
+        $raw = [string]$detailMessage
+    }
+    else {
+        $exception = Get-NotePropertyValue -Object $ErrorRecord -Name @('Exception')
+        $response  = Get-NotePropertyValue -Object $exception -Name @('Response')
+        if ($response) {
+            try {
+                $stream = $response.GetResponseStream()
+                if ($stream) {
+                    if ($stream.CanSeek) { [void]$stream.Seek(0, [System.IO.SeekOrigin]::Begin) }
+                    $reader = New-Object System.IO.StreamReader($stream)
+                    $raw = $reader.ReadToEnd()
+                    $reader.Dispose()
+                }
+            }
+            catch {
+                $raw = $null
+            }
+        }
+    }
+
+    if ([string]::IsNullOrEmpty($raw)) { return $null }
+
+    try {
+        return ($raw | ConvertFrom-Json)
+    }
+    catch {
+        return $null
+    }
+}
+
+function Invoke-EntraDeviceCodeAuth {
+    param(
+        [string] $Tenant,
+        [bool]   $CopyCodeToClipboard
+    )
+
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    }
+    catch {
+        # Best-effort; modern Windows already uses TLS 1.2+.
+    }
+
+    $deviceCodeUri = "https://login.microsoftonline.com/{0}/oauth2/v2.0/devicecode" -f $Tenant
+    $tokenUri      = "https://login.microsoftonline.com/{0}/oauth2/v2.0/token" -f $Tenant
+
+    $device = Invoke-RestMethod -Method POST -Uri $deviceCodeUri -ContentType 'application/x-www-form-urlencoded' -Body @{
+        client_id = $script:GraphPowerShellClientId
+        scope     = $script:GraphDelegatedScopes
+    }
+
+    $userCode = [string](Get-NotePropertyValue -Object $device -Name @('user_code', 'userCode'))
+    $verifyUrl = [string](Get-NotePropertyValue -Object $device -Name @('verification_uri', 'verificationUri'))
+    if ([string]::IsNullOrEmpty($verifyUrl)) { $verifyUrl = 'https://microsoft.com/devicelogin' }
+
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "  Device code sign-in required" -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ("  URL:  {0}" -f $verifyUrl)
+    Write-Host ("  Code: {0}" -f $userCode) -ForegroundColor Yellow
+    Write-Host "============================================================" -ForegroundColor Cyan
+
+    $message = Get-NotePropertyValue -Object $device -Name @('message')
+    if ($message) {
+        Write-Host ([string]$message)
+    }
+    else {
+        Write-Host ("Open {0} and enter the code {1} to authenticate." -f $verifyUrl, $userCode)
+    }
+
+    if ($CopyCodeToClipboard) {
+        if (Copy-TextToClipboard -Text $userCode) {
+            Write-Host ("Device code '{0}' copied to the clipboard. Paste it in the browser, then sign in." -f $userCode) -ForegroundColor Green
+        }
+        else {
+            Write-Host "Could not copy the device code to the clipboard. Copy the code shown above." -ForegroundColor Yellow
+        }
+    }
+
+    Write-Host "Waiting for you to complete sign-in in the browser..." -ForegroundColor Cyan
+
+    $interval = 5
+    $intervalRaw = Get-NotePropertyValue -Object $device -Name @('interval')
+    if ($null -ne $intervalRaw) {
+        try { $interval = [int]$intervalRaw } catch { $interval = 5 }
+    }
+    if ($interval -lt 5) { $interval = 5 }
+
+    $expiresIn = 900
+    $expiresRaw = Get-NotePropertyValue -Object $device -Name @('expires_in', 'expiresIn')
+    if ($null -ne $expiresRaw) {
+        try { $expiresIn = [int]$expiresRaw } catch { $expiresIn = 900 }
+    }
+    $deadline = (Get-Date).AddSeconds($expiresIn)
+
+    $deviceCode = Get-NotePropertyValue -Object $device -Name @('device_code', 'deviceCode')
+    $accessToken = $null
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds $interval
+
+        try {
+            $token = Invoke-RestMethod -Method POST -Uri $tokenUri -ContentType 'application/x-www-form-urlencoded' -Body @{
+                grant_type  = 'urn:ietf:params:oauth:grant-type:device_code'
+                client_id   = $script:GraphPowerShellClientId
+                device_code = $deviceCode
+            }
+            $accessToken = [string](Get-NotePropertyValue -Object $token -Name @('access_token', 'accessToken'))
+            if (-not [string]::IsNullOrEmpty($accessToken)) { break }
+        }
+        catch {
+            $oauthErr = Get-OAuthErrorFromException -ErrorRecord $_
+            $errCode  = $null
+            if ($oauthErr) {
+                $errProp = $oauthErr.PSObject.Properties['error']
+                if ($errProp) { $errCode = [string]$errProp.Value }
+            }
+
+            if ($errCode -eq 'authorization_pending') { continue }
+            if ($errCode -eq 'slow_down') { $interval += 5; continue }
+            if ($errCode -eq 'expired_token' -or $errCode -eq 'code_expired') {
+                throw "The device code expired before sign-in completed. Run the script again."
+            }
+            if ($errCode -eq 'authorization_declined' -or $errCode -eq 'access_denied') {
+                throw "Sign-in was declined in the browser."
+            }
+            if ($errCode) {
+                $desc = $null
+                $descProp = $oauthErr.PSObject.Properties['error_description']
+                if ($descProp) { $desc = [string]$descProp.Value }
+                throw ("Device code sign-in failed ({0}): {1}" -f $errCode, $desc)
+            }
+            throw
+        }
+    }
+
+    if ([string]::IsNullOrEmpty($accessToken)) {
+        throw "Timed out waiting for device code sign-in. Run the script again."
+    }
+
+    $secureToken = ConvertTo-SecureString -String $accessToken -AsPlainText -Force
+    try {
+        Connect-MgGraph -AccessToken $secureToken | Out-Null
+    }
+    catch {
+        # Microsoft.Graph.Authentication 1.x accepted a raw string.
+        Connect-MgGraph -AccessToken $accessToken | Out-Null
+    }
+
+    return $accessToken
+}
+
+function Get-ConnectedAccountName {
+    param([string] $AccessToken)
+
+    $context = Get-MgContext
+    if ($context) {
+        $accountProp = $context.PSObject.Properties['Account']
+        if ($accountProp -and $accountProp.Value) { return [string]$accountProp.Value }
+    }
+
+    try {
+        $me = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/me?$select=userPrincipalName,displayName' -OutputType Hashtable
+        if ($me.ContainsKey('userPrincipalName') -and $me['userPrincipalName']) {
+            return [string]$me['userPrincipalName']
+        }
+        if ($me.ContainsKey('displayName') -and $me['displayName']) {
+            return [string]$me['displayName']
+        }
+    }
+    catch {
+        # Token may not include User.Read; fall through to JWT.
+    }
+
+    if ([string]::IsNullOrEmpty($AccessToken)) { return '(signed in)' }
+
+    try {
+        $payload = $AccessToken.Split('.')[1]
+        $payload = $payload.Replace('-', '+').Replace('_', '/')
+        switch ($payload.Length % 4) {
+            2 { $payload += '==' }
+            3 { $payload += '=' }
+        }
+        $json = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload))
+        $claims = $json | ConvertFrom-Json
+        foreach ($name in @('upn', 'preferred_username', 'unique_name', 'name')) {
+            $prop = $claims.PSObject.Properties[$name]
+            if ($prop -and $prop.Value) { return [string]$prop.Value }
+        }
+    }
+    catch {
+        # Ignore decode failures.
+    }
+
+    return '(signed in)'
+}
+
+$authTenant = 'organizations'
+if ($TenantId) { $authTenant = $TenantId }
+
+Write-Host "Connecting to Microsoft Graph with device code authentication..." -ForegroundColor Cyan
+$script:GraphAccessToken = Invoke-EntraDeviceCodeAuth -Tenant $authTenant -CopyCodeToClipboard $CopyDeviceCodeToClipboard
 
 $context = Get-MgContext
-Write-Host ("Connected to tenant '{0}' as '{1}'." -f $context.TenantId, $context.Account) -ForegroundColor Green
+$accountName = Get-ConnectedAccountName -AccessToken $script:GraphAccessToken
+$tenantName = $null
+if ($context) {
+    $tidProp = $context.PSObject.Properties['TenantId']
+    if ($tidProp) { $tenantName = [string]$tidProp.Value }
+}
+if ([string]::IsNullOrEmpty($tenantName)) { $tenantName = $authTenant }
+
+Write-Host ("Connected to tenant '{0}' as '{1}'." -f $tenantName, $accountName) -ForegroundColor Green
 
 #endregion
 
