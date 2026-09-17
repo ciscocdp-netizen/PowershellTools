@@ -31,6 +31,10 @@
     The device code is printed in the console and, by default, copied to the clipboard
     so it can be pasted at the verification URL.
 
+    After the inventory completes, a Save As dialog is shown so you can choose
+    where to write the CSV. Pass -ExportCsvPath to skip the dialog, or
+    -PromptForCsvPath $false to skip CSV export unless a path is supplied.
+
     Compatible with Windows PowerShell 5.1 and PowerShell 7+.
 
 .PARAMETER TenantId
@@ -58,7 +62,12 @@
     user and service-principal members. Default: $true.
 
 .PARAMETER ExportCsvPath
-    Optional. If supplied, results are also written to this CSV path.
+    Optional. Full path of the CSV file to write. If supplied, the Save As
+    dialog is skipped and this path is used.
+
+.PARAMETER PromptForCsvPath
+    Show a Save As file picker for the CSV output when -ExportCsvPath is not
+    supplied. Default: $true.
 
 .PARAMETER CopyDeviceCodeToClipboard
     Copy the device login code to the clipboard so it can be pasted at the
@@ -69,6 +78,10 @@
 
 .EXAMPLE
     .\Get-PrivilegedEntraUsers.ps1 -TenantId contoso.onmicrosoft.com -ExportCsvPath .\privileged.csv
+
+.EXAMPLE
+    # Skip the Save As dialog (pipeline output only):
+    .\Get-PrivilegedEntraUsers.ps1 -PromptForCsvPath $false
 
 .EXAMPLE
     # Groups that hold privileged roles, and whether each grant is eligible or permanent:
@@ -83,6 +96,9 @@
     Signs in using the OAuth 2.0 device code flow. The user code is copied to the
     clipboard by default. Open the displayed URL, paste the code, and complete
     sign-in; the script waits until authentication finishes.
+
+    When inventory is complete, a Save As dialog lets you choose the CSV path
+    unless -ExportCsvPath is already supplied.
 
     Requires the following delegated permissions (consented at first interactive sign-in):
         RoleManagement.Read.Directory
@@ -106,6 +122,7 @@ param(
     [bool]   $IncludeGroups             = $true,
     [bool]   $ExpandGroupMembers        = $true,
     [string] $ExportCsvPath,
+    [bool]   $PromptForCsvPath          = $true,
     [bool]   $CopyDeviceCodeToClipboard = $true
 )
 
@@ -1015,6 +1032,82 @@ if ($ExpandGroupMembers -and $script:GroupAssignmentsForExpansion.Count -gt 0) {
 
 #region 3. Output ----------------------------------------------------------------
 
+function Get-CsvPathFromSaveDialog {
+    param(
+        [string] $DefaultFileName,
+        [string] $InitialDirectory
+    )
+
+    $dialogScript = {
+        param($DefaultFileName, $InitialDirectory)
+
+        Add-Type -AssemblyName System.Windows.Forms | Out-Null
+        [System.Windows.Forms.Application]::EnableVisualStyles()
+
+        $dialog = New-Object System.Windows.Forms.SaveFileDialog
+        $dialog.Title            = 'Save privileged Entra role assignments'
+        $dialog.Filter           = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*'
+        $dialog.FilterIndex      = 1
+        $dialog.DefaultExt       = 'csv'
+        $dialog.AddExtension     = $true
+        $dialog.OverwritePrompt  = $true
+        $dialog.RestoreDirectory = $true
+        $dialog.FileName         = $DefaultFileName
+        if (-not [string]::IsNullOrEmpty($InitialDirectory) -and (Test-Path -LiteralPath $InitialDirectory)) {
+            $dialog.InitialDirectory = $InitialDirectory
+        }
+
+        $owner = New-Object System.Windows.Forms.Form
+        $owner.TopMost       = $true
+        $owner.ShowInTaskbar = $false
+        $owner.StartPosition = 'CenterScreen'
+        $owner.Size          = New-Object System.Drawing.Size(1, 1)
+        $owner.Opacity       = 0
+        [void]$owner.Show()
+        $owner.Activate()
+
+        try {
+            $result = $dialog.ShowDialog($owner)
+            if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+                return $dialog.FileName
+            }
+            return $null
+        }
+        finally {
+            $owner.Close()
+            $owner.Dispose()
+            $dialog.Dispose()
+        }
+    }
+
+    $apartment = [System.Threading.Thread]::CurrentThread.GetApartmentState()
+    if ($apartment -eq [System.Threading.ApartmentState]::STA) {
+        return & $dialogScript $DefaultFileName $InitialDirectory
+    }
+
+    $runspace = [runspacefactory]::CreateRunspace()
+    $runspace.ApartmentState = 'STA'
+    $runspace.ThreadOptions  = 'ReuseThread'
+    $runspace.Open()
+    try {
+        $ps = [powershell]::Create()
+        $ps.Runspace = $runspace
+        [void]$ps.AddScript($dialogScript).AddArgument($DefaultFileName).AddArgument($InitialDirectory)
+        $invokeResult = $ps.Invoke()
+        if ($ps.Streams.Error.Count -gt 0) {
+            throw ($ps.Streams.Error[0].Exception)
+        }
+        if ($invokeResult -and @($invokeResult).Count -gt 0) {
+            return [string]@($invokeResult)[0]
+        }
+        return $null
+    }
+    finally {
+        $runspace.Close()
+        $runspace.Dispose()
+    }
+}
+
 $final = @($script:Results | Sort-Object PrincipalType, PrincipalDisplayName, RoleName, AssignmentState, AssignmentPath, AssignedVia)
 
 $userCount  = @($final | Where-Object { $_.PrincipalType -eq 'User' }).Count
@@ -1042,7 +1135,33 @@ if ($groupRows.Count -gt 0) {
         Format-Table -AutoSize | Out-String | Write-Host
 }
 
-if ($ExportCsvPath) {
+if ([string]::IsNullOrWhiteSpace($ExportCsvPath) -and $PromptForCsvPath) {
+    $defaultName = 'PrivilegedEntraAssignments-{0:yyyyMMdd-HHmmss}.csv' -f (Get-Date)
+    $initialDir  = [Environment]::GetFolderPath('MyDocuments')
+    if ([string]::IsNullOrEmpty($initialDir)) {
+        $initialDir = (Get-Location).Path
+    }
+
+    Write-Host ""
+    Write-Host "Choose where to save the CSV export..." -ForegroundColor Cyan
+    try {
+        $ExportCsvPath = Get-CsvPathFromSaveDialog -DefaultFileName $defaultName -InitialDirectory $initialDir
+    }
+    catch {
+        Write-Warning ("Could not open the Save As dialog ({0}). Pass -ExportCsvPath to save without a picker." -f $_.Exception.Message)
+        $ExportCsvPath = $null
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ExportCsvPath)) {
+        Write-Warning "CSV export cancelled. Results will only be returned to the pipeline."
+    }
+}
+
+if (-not [string]::IsNullOrWhiteSpace($ExportCsvPath)) {
+    $exportDir = Split-Path -Parent $ExportCsvPath
+    if (-not [string]::IsNullOrEmpty($exportDir) -and -not (Test-Path -LiteralPath $exportDir)) {
+        New-Item -ItemType Directory -Path $exportDir -Force | Out-Null
+    }
     $final | Export-Csv -Path $ExportCsvPath -NoTypeInformation -Encoding UTF8
     Write-Host ("Results exported to: {0}" -f $ExportCsvPath) -ForegroundColor Green
 }
