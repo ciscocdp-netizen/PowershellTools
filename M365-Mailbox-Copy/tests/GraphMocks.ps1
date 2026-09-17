@@ -19,11 +19,20 @@
       $script:FailChildListing[<folderId>] = '<error message>'   # listing fails
       $script:HideFromFilter['<name>']     = $true               # $filter finds nothing
       $script:FailFilterQueries            = $true               # $filter itself errors
+      $script:HideFromListing[<folderId>]  = $true               # exists, but is not
+                                                                 # returned by a plain
+                                                                 # listing (hidden, or
+                                                                 # created after the
+                                                                 # scan); creating over
+                                                                 # it is still a 409
+      $script:FailFolderCreate['<name>']   = '<error message>'   # creating fails
 #>
 
 $script:Store             = @{}
 $script:FailChildListing  = @{}
 $script:HideFromFilter    = @{}
+$script:HideFromListing   = @{}
+$script:FailFolderCreate  = @{}
 $script:FailFilterQueries = $false
 # Counts $filter clauses Graph's OData parser would reject, so a test can prove
 # the tool escapes folder names rather than relying on its own error fallback.
@@ -37,6 +46,8 @@ function Reset-FakeGraph {
     $script:Store.Clear()
     $script:FailChildListing.Clear()
     $script:HideFromFilter.Clear()
+    $script:HideFromListing.Clear()
+    $script:FailFolderCreate.Clear()
     $script:FailFilterQueries  = $false
     $script:FilterSyntaxErrors = 0
     $script:FilterQueryCount   = 0
@@ -129,6 +140,10 @@ function Resolve-FakeFilterValue {
 function Select-FakeFolders {
     param($Folders, [string]$Filter, [string]$UserId)
     $set = @($Folders)
+    if (-not $Filter) {
+        # A plain listing does not necessarily show every folder in the mailbox.
+        $set = @($set | Where-Object { -not $script:HideFromListing.ContainsKey($_.Id) })
+    }
     if ($Filter) {
         $script:FilterQueryCount++
         $name = Resolve-FakeFilterValue -Filter $Filter
@@ -190,6 +205,7 @@ function Get-MgUserMailFolderChildFolder {
 function New-MgUserMailFolder {
     param([string]$UserId, $BodyParameter, $ErrorAction)
     $name = $BodyParameter.DisplayName
+    if ($script:FailFolderCreate.ContainsKey($name)) { throw $script:FailFolderCreate[$name] }
     if (Get-FakeChildren -UserId $UserId -ParentId $null | Where-Object { $_.DisplayName -ieq $name }) {
         throw "Status: 409 (Conflict) Code: ErrorFolderExists Message: A folder with the specified name already exists."
     }
@@ -201,6 +217,7 @@ function New-MgUserMailFolder {
 function New-MgUserMailFolderChildFolder {
     param([string]$UserId, [string]$MailFolderId, $BodyParameter, $ErrorAction)
     $name = $BodyParameter.DisplayName
+    if ($script:FailFolderCreate.ContainsKey($name)) { throw $script:FailFolderCreate[$name] }
     if (Get-FakeChildren -UserId $UserId -ParentId $MailFolderId | Where-Object { $_.DisplayName -ieq $name }) {
         throw "Status: 409 (Conflict) Code: ErrorFolderExists Message: A folder with the specified name already exists."
     }

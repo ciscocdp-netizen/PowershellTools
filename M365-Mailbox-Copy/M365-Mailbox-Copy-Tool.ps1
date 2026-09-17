@@ -1968,6 +1968,19 @@ function Copy-Emails {
         $sourceFolders   = @(Get-AllMailFolders -UserId $SourceEmail -WellKnownMap $sourceWellKnown -StatusBox $StatusBox)
         Write-CopyLog "Source: $($sourceFolders.Count) folders, $('{0:N0}' -f (($sourceFolders | Measure-Object -Property TotalItemCount -Sum).Sum)) messages."
 
+        Write-CopyLog ''
+        Write-CopyLog '--- SOURCE FOLDER STRUCTURE ---'
+        $shownFolders = 0
+        foreach ($f in $sourceFolders) {
+            if ($shownFolders -ge 200) {
+                Write-CopyLog "  ... and $($sourceFolders.Count - $shownFolders) more folders"
+                break
+            }
+            Write-CopyLog ("  {0} ({1:N0} items)" -f $f.FullPath, $f.TotalItemCount)
+            $shownFolders++
+        }
+        Write-CopyLog ''
+
         if ($script:CancelRequested) {
             Write-CopyLog ''
             Write-CopyLog '*** COPY CANCELLED BY USER ***'
@@ -2104,11 +2117,12 @@ function Copy-Emails {
                 # TotalItemCount can disagree with what the folder actually returns
                 # (hidden associated items, mail arriving mid-run). Correct the
                 # overall total so the percentage and ETA stay honest.
-                $listed = $sourceMessages.Count
-                if ($listed -ne [int]$sourceFolder.TotalItemCount) {
-                    $totalMessages = $totalMessages - [int]$sourceFolder.TotalItemCount + $listed
+                $listedCount = $sourceMessages.Count
+                if ($listedCount -ne [int]$sourceFolder.TotalItemCount) {
+                    $totalMessages = $totalMessages - [int]$sourceFolder.TotalItemCount + $listedCount
                     Set-CopyPhaseTotal -Total $totalMessages
                 }
+                Write-CopyLog "  source folder listed $('{0:N0}' -f $listedCount) messages"
 
                 $batchSize   = 100
                 $batchNumber = 0
@@ -2126,7 +2140,6 @@ function Copy-Emails {
                     $batchEnd = $i + $batchSize
                     if ($batchEnd -gt $sourceMessages.Count) { $batchEnd = $sourceMessages.Count }
                     $batchEnd = $batchEnd - 1
-                    $batchCount = ($batchEnd - $i) + 1
 
                     for ($j = $i; $j -le $batchEnd; $j++) {
                         if ($script:CancelRequested) {
@@ -2315,7 +2328,7 @@ function Copy-Emails {
         }
     }
     catch {
-        $StatusBox.AppendText("Error copying emails: $($_.Exception.Message)`r`n")
+        Write-CopyLog "Error copying emails: $($_.Exception.Message)"
         return @{ Success = $false; Copied = 0; Failed = 0; Folders = 0; Skipped = 0; Cancelled = $false }
     }
 }
@@ -2446,7 +2459,6 @@ function Copy-CalendarItems {
             $batchEnd = $i + $batchSize
             if ($batchEnd -gt $totalEvents) { $batchEnd = $totalEvents }
             $batchEnd = $batchEnd - 1
-            $batchCount = ($batchEnd - $i) + 1
 
             for ($j = $i; $j -le $batchEnd; $j++) {
                 $event = $events[$j]
@@ -3054,6 +3066,16 @@ $copyButton.Add_Click({
                 $etaLabel.Text     = "Total run time $(Format-CopyDuration ((Get-Date) - $runStart).TotalSeconds)."
                 Write-CopyLog ''
                 Write-CopyLog '=== COPY OPERATION COMPLETED ==='
+                if ($emailResult) {
+                    Write-CopyLog ("Mail     : {0:N0} copied, {1:N0} skipped, {2:N0} failed" -f `
+                        [int]$emailResult.Copied, [int]$emailResult.Skipped, [int]$emailResult.Failed)
+                    Write-CopyLog ("Folders  : {0} already matched, {1} added, {2} could not be created" -f `
+                        [int]$emailResult.FoldersExisted, [int]$emailResult.FoldersCreated, [int]$emailResult.FoldersFailed)
+                }
+                if ($calendarResult) {
+                    Write-CopyLog ("Calendar : {0:N0} copied, {1:N0} skipped, {2:N0} failed" -f `
+                        [int]$calendarResult.Copied, [int]$calendarResult.Skipped, [int]$calendarResult.Failed)
+                }
                 Write-CopyLog "Total run time: $(Format-CopyDuration ((Get-Date) - $runStart).TotalSeconds)"
                 Write-CopyLog 'Remember to remove FullAccess permissions from both mailboxes.'
 

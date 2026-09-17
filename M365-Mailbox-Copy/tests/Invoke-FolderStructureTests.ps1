@@ -370,6 +370,34 @@ Assert-That 'the adoption is reported as a reuse, not a creation' ($result.Sync.
 Assert-PathsPresent -UserId $tgt -ExpectedPaths @('Archive\2022')
 
 # ==============================================================================
+Start-Case "A folder that appears only when Graph reports the conflict is matched by name"
+Reset-FakeGraph
+$src = 'src14@contoso.com'; $tgt = 'tgt14@contoso.com'
+New-FakeMailbox -UserId $src
+Add-FakeFolder -UserId $src -DisplayName 'Inbox' -ItemCount 1 -WellKnownName 'inbox' | Out-Null
+$srcObrien = Add-FakeFolder -UserId $src -DisplayName "O'Brien Ltd" -ItemCount 14
+Add-FakeFolder -UserId $src -DisplayName 'Invoices' -ParentId $srcObrien -ItemCount 6 | Out-Null
+Add-DefaultTargetMailbox -UserId $tgt
+# The folder is in the target but absent from the listing the diff was built
+# from, so the create returns 409 and the name lookup has to find it. That
+# lookup is the only place a folder name reaches an OData $filter.
+$hiddenId = Add-FakeFolder -UserId $tgt -DisplayName "O'Brien Ltd"
+$script:HideFromListing[$hiddenId] = $true
+$result = Invoke-FolderMirror -SourceEmail $src -TargetEmail $tgt -StatusBox (New-TestStatusBox)
+Assert-EveryFolderMirrored -Result $result
+Assert-That 'no malformed $filter was sent to Graph' ($script:FilterSyntaxErrors -eq 0) `
+    "Graph rejected $script:FilterSyntaxErrors filter clause(s); the name was not OData-escaped"
+Assert-That 'the folder already in the target was matched by name' `
+    ((Get-MirroredId -Result $result -FullPath "O'Brien Ltd") -eq $hiddenId) `
+    "resolved to '$(Get-MirroredId -Result $result -FullPath "O'Brien Ltd")', expected '$hiddenId'"
+Assert-That 'it is reported as a reuse' ($result.Sync.Adopted -eq 1) `
+    "created $($result.Sync.Created), adopted $($result.Sync.Adopted)"
+$obrienCount = @(Get-FakeChildren -UserId $tgt -ParentId $null | Where-Object { $_.DisplayName -eq "O'Brien Ltd" }).Count
+Assert-That 'the target did not gain a duplicate' ($obrienCount -eq 1) "found $obrienCount"
+Assert-PathsPresent -UserId $tgt -ExpectedPaths @("O'Brien Ltd\Invoices")
+Assert-PathsAbsent  -UserId $tgt -UnexpectedPaths @('Invoices')
+
+# ==============================================================================
 Start-Case 'A name lookup that returns nothing still finds the existing folder'
 Reset-FakeGraph
 $src = 'src8@contoso.com'; $tgt = 'tgt8@contoso.com'

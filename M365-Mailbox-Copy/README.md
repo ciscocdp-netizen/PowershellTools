@@ -10,7 +10,9 @@ copied, never moved: the source mailbox is left untouched.
 | `tests/Invoke-AllTests.ps1` | Runs every suite below; exits non-zero on failure. |
 | `tests/Invoke-FolderStructureTests.ps1` | Folder comparison and replication tests against a mocked Graph. |
 | `tests/Invoke-ProgressTests.ps1` | Live status, progress and ETA tests against a virtual clock. |
+| `tests/Invoke-CopyEmailsTests.ps1` | End-to-end `Copy-Emails` tests against a fake mailbox. |
 | `tests/GraphMocks.ps1` | In-memory stand-in for the Graph mail-folder endpoints. |
+| `tests/MessageMocks.ps1` | In-memory stand-in for the Graph message endpoints. |
 | `tests/WinFormsShim.ps1` | Lets the tool's WinForms-typed functions load off Windows. |
 | `tests/ToolLoader.ps1` | Loads the tool's functions without running its bootstrap or GUI. |
 
@@ -125,6 +127,9 @@ failure detail.
 
 - Hidden folders are not enumerated (`GET /mailFolders` omits them unless
   `includeHiddenFolders=true` is requested).
+- Duplicate detection keys on subject + received minute + sender, so two genuinely
+  distinct messages that agree on all three (a double delivery, or two automated
+  notices in the same minute) are treated as one and only the first is copied.
 - The online archive is a separate mailbox and is not touched.
 - Search folders are not copied.
 - The copy runs on the UI thread. It pumps the message loop so progress paints and
@@ -144,24 +149,36 @@ never starts) and drive them against a fake mailbox store and a virtual clock.
 pwsh -File .\tests\Invoke-AllTests.ps1
 ```
 
-111 assertions. The folder suite covers empty folders, apostrophes in nested and
-top-level names, backslashes in names, a localized target mailbox, repeated names
-under different parents, a folder listing that fails partway through, name lookups
-that return nothing or error out, a target that already matches the source (which must
-issue no writes and no lookups at all), a partially populated target (only the absent
-folders may be created), folders that exist only in the target, and a display name
-that collides with a well-known folder in the target.
+161 assertions across three suites.
 
-The progress suite covers duration formatting, the phase/detail/position status line,
-the marquee and percentage states of the bar, the estimate itself — including that it
-follows recent throughput rather than the average since the start — repaint
+The **folder** suite covers empty folders, apostrophes in nested and top-level names,
+backslashes in names, a localized target mailbox, repeated names under different
+parents, a folder listing that fails partway through, name lookups that return nothing
+or error out, a target that already matches the source (which must issue no writes and
+no lookups at all), a partially populated target (only the absent folders may be
+created), folders that exist only in the target, and a display name that collides with
+a well-known folder in the target.
+
+The **progress** suite covers duration formatting, the phase/detail/position status
+line, the marquee and percentage states of the bar, the estimate itself — including
+that it follows recent throughput rather than the average since the start — repaint
 throttling, mid-run total corrections, and that every progress call is inert when
 there is no UI.
 
-Both suites exit non-zero on failure, so they work as a build check.
+The **copy** suite runs the real `Copy-Emails` end to end against fake message
+endpoints: a full copy (every message must land in its own folder and nothing may be
+posted to the mailbox root, which Graph would file as drafts), a second run that must
+copy and create nothing, a partially populated target, a folder that cannot be created
+(its mail is skipped, not drafted, and its subtree is not created), a folder whose
+`TotalItemCount` disagrees with its message list, a message Graph rejects, and
+cancelling mid-copy.
 
-Coverage was checked by mutation: re-introducing any of the original defects (dropping
-the OData escaping, skipping empty folders, matching well-known folders by display
-name, treating a failed lookup as "not found", creating every source folder instead of
-only the missing ones, or estimating from the average rate instead of the recent one)
-makes the suite fail.
+All three suites exit non-zero on failure, so they work as a build check.
+
+Coverage was checked by mutation: re-introducing any of fourteen defects makes the
+suites fail, including dropping the OData escaping, matching well-known folders by
+display name, treating a failed lookup as "not found", creating every source folder
+instead of only the missing ones, looking the target folder up by display-name path,
+posting mail with no target folder to `/users/{id}/messages`, swallowing a failed
+folder listing, skipping the mid-run total correction, estimating from the average
+rate instead of the recent one, and removing the repaint throttle.
