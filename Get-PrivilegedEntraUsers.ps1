@@ -32,8 +32,12 @@
     so it can be pasted at the verification URL.
 
     After the inventory completes, a Save As dialog is shown so you can choose
-    where to write the CSV. Pass -ExportCsvPath to skip the dialog, or
-    -PromptForCsvPath $false to skip CSV export unless a path is supplied.
+    a base file name and folder. Three CSV files are written from that choice:
+        - *-GroupRoleAssignments.csv
+        - *-UserRoleAssignments.csv
+        - *-GroupMembers.csv
+    Pass -ExportCsvPath to skip the dialog, or -PromptForCsvPath $false to skip
+    CSV export unless a path is supplied.
 
     Compatible with Windows PowerShell 5.1 and PowerShell 7+.
 
@@ -62,8 +66,12 @@
     user and service-principal members. Default: $true.
 
 .PARAMETER ExportCsvPath
-    Optional. Full path of the CSV file to write. If supplied, the Save As
-    dialog is skipped and this path is used.
+    Optional. Base path used to name the three CSV reports. If you pass
+    C:\Reports\PrivilegedEntra.csv the files written are:
+        C:\Reports\PrivilegedEntra-GroupRoleAssignments.csv
+        C:\Reports\PrivilegedEntra-UserRoleAssignments.csv
+        C:\Reports\PrivilegedEntra-GroupMembers.csv
+    If supplied, the Save As dialog is skipped.
 
 .PARAMETER PromptForCsvPath
     Show a Save As file picker for the CSV output when -ExportCsvPath is not
@@ -78,6 +86,10 @@
 
 .EXAMPLE
     .\Get-PrivilegedEntraUsers.ps1 -TenantId contoso.onmicrosoft.com -ExportCsvPath .\privileged.csv
+    # Writes:
+    #   .\privileged-GroupRoleAssignments.csv
+    #   .\privileged-UserRoleAssignments.csv
+    #   .\privileged-GroupMembers.csv
 
 .EXAMPLE
     # Skip the Save As dialog (pipeline output only):
@@ -97,8 +109,10 @@
     clipboard by default. Open the displayed URL, paste the code, and complete
     sign-in; the script waits until authentication finishes.
 
-    When inventory is complete, a Save As dialog lets you choose the CSV path
-    unless -ExportCsvPath is already supplied.
+    When inventory is complete, a Save As dialog lets you choose a base CSV
+    path unless -ExportCsvPath is already supplied. Three reports are written
+    from that path: group role assignments, user role assignments, and users
+    (members) of each group that holds a privileged role.
 
     Requires the following delegated permissions (consented at first interactive sign-in):
         RoleManagement.Read.Directory
@@ -1045,7 +1059,7 @@ function Get-CsvPathFromSaveDialog {
         [System.Windows.Forms.Application]::EnableVisualStyles()
 
         $dialog = New-Object System.Windows.Forms.SaveFileDialog
-        $dialog.Title            = 'Save privileged Entra role assignments'
+        $dialog.Title            = 'Choose a base file name (three CSV reports will be created)'
         $dialog.Filter           = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*'
         $dialog.FilterIndex      = 1
         $dialog.DefaultExt       = 'csv'
@@ -1108,6 +1122,132 @@ function Get-CsvPathFromSaveDialog {
     }
 }
 
+function Get-SplitCsvPaths {
+    param([Parameter(Mandatory)] [string] $BasePath)
+
+    $directory = Split-Path -Parent $BasePath
+    if ([string]::IsNullOrEmpty($directory)) {
+        $directory = (Get-Location).Path
+    }
+
+    $leaf = [System.IO.Path]::GetFileNameWithoutExtension($BasePath)
+    if ([string]::IsNullOrEmpty($leaf)) {
+        $leaf = 'PrivilegedEntraAssignments'
+    }
+
+    return [pscustomobject]@{
+        Directory = $directory
+        Groups    = Join-Path $directory ($leaf + '-GroupRoleAssignments.csv')
+        Users     = Join-Path $directory ($leaf + '-UserRoleAssignments.csv')
+        Members   = Join-Path $directory ($leaf + '-GroupMembers.csv')
+    }
+}
+
+function Export-ReportCsv {
+    param(
+        $Rows,
+        [Parameter(Mandatory)] [string] $Path,
+        [Parameter(Mandatory)] $HeaderTemplate
+    )
+
+    $directory = Split-Path -Parent $Path
+    if (-not [string]::IsNullOrEmpty($directory) -and -not (Test-Path -LiteralPath $directory)) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+
+    $data = @($Rows)
+    if ($data.Count -gt 0) {
+        $data | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
+    }
+    else {
+        $headerLine = ($HeaderTemplate | ConvertTo-Csv -NoTypeInformation | Select-Object -First 1)
+        Set-Content -Path $Path -Value $headerLine -Encoding UTF8
+    }
+
+    Write-Host ("  {0}  ({1} row(s))" -f $Path, $data.Count) -ForegroundColor Green
+}
+
+function New-GroupMemberReportRows {
+    $rows = New-Object System.Collections.Generic.List[object]
+
+    $groupsById = @{}
+    foreach ($assignment in $script:GroupAssignmentsForExpansion) {
+        $groupId = [string](Get-GraphHashValue -Object $assignment -Name @('PrincipalId'))
+        if ([string]::IsNullOrEmpty($groupId)) { continue }
+
+        if (-not $groupsById.ContainsKey($groupId)) {
+            $groupsById[$groupId] = [pscustomobject]@{
+                GroupId          = $groupId
+                GroupDisplayName = Get-GraphHashValue -Object $assignment -Name @('PrincipalDisplayName')
+                Roles            = New-Object System.Collections.Generic.List[object]
+            }
+        }
+        $groupsById[$groupId].Roles.Add($assignment)
+    }
+
+    foreach ($groupId in @($groupsById.Keys)) {
+        $info = $groupsById[$groupId]
+        $principal = Resolve-DirectoryPrincipal -PrincipalId $groupId
+        $groupName = $info.GroupDisplayName
+        if ([string]::IsNullOrEmpty($groupName) -and $principal) {
+            $groupName = $principal.DisplayName
+        }
+
+        $roleLabels = New-Object System.Collections.Generic.List[string]
+        foreach ($roleAssignment in $info.Roles) {
+            $label = '{0} [{1}/{2}]' -f `
+                (Get-GraphHashValue -Object $roleAssignment -Name @('RoleName')), `
+                (Get-GraphHashValue -Object $roleAssignment -Name @('AssignmentState')), `
+                (Get-GraphHashValue -Object $roleAssignment -Name @('DurationType'))
+            if (-not $roleLabels.Contains($label)) { $roleLabels.Add($label) }
+        }
+        $roleSummary = [string]::Join('; ', $roleLabels.ToArray())
+
+        $members = @(Get-GroupTransitivePrincipals -GroupId $groupId)
+        $emitted = 0
+        foreach ($member in $members) {
+            $memberType = [string]$member.PrincipalType
+            if ($memberType -eq 'ServicePrincipal' -and -not $IncludeServicePrincipals) { continue }
+            if ($memberType -ne 'User' -and $memberType -ne 'ServicePrincipal') { continue }
+
+            $rows.Add([pscustomobject]@{
+                GroupDisplayName     = $groupName
+                GroupId              = $groupId
+                GroupSubtype         = $principal.Subtype
+                PrivilegedRoles      = $roleSummary
+                PrivilegedRoleCount  = $roleLabels.Count
+                MemberType           = $memberType
+                MemberDisplayName    = $member.DisplayName
+                MemberId             = $member.PrincipalId
+                UserPrincipalName    = $member.UserPrincipalName
+                AppId                = $member.AppId
+                AccountEnabled       = $member.AccountEnabled
+                MemberSubtype        = $member.Subtype
+            })
+            $emitted++
+        }
+
+        if ($emitted -eq 0) {
+            $rows.Add([pscustomobject]@{
+                GroupDisplayName     = $groupName
+                GroupId              = $groupId
+                GroupSubtype         = $principal.Subtype
+                PrivilegedRoles      = $roleSummary
+                PrivilegedRoleCount  = $roleLabels.Count
+                MemberType           = $null
+                MemberDisplayName    = '(no members)'
+                MemberId             = $null
+                UserPrincipalName    = $null
+                AppId                = $null
+                AccountEnabled       = $null
+                MemberSubtype        = $null
+            })
+        }
+    }
+
+    return $rows
+}
+
 $final = @($script:Results | Sort-Object PrincipalType, PrincipalDisplayName, RoleName, AssignmentState, AssignmentPath, AssignedVia)
 
 $userCount  = @($final | Where-Object { $_.PrincipalType -eq 'User' }).Count
@@ -1136,14 +1276,17 @@ if ($groupRows.Count -gt 0) {
 }
 
 if ([string]::IsNullOrWhiteSpace($ExportCsvPath) -and $PromptForCsvPath) {
-    $defaultName = 'PrivilegedEntraAssignments-{0:yyyyMMdd-HHmmss}.csv' -f (Get-Date)
+    $defaultName = 'PrivilegedEntra-{0:yyyyMMdd-HHmmss}.csv' -f (Get-Date)
     $initialDir  = [Environment]::GetFolderPath('MyDocuments')
     if ([string]::IsNullOrEmpty($initialDir)) {
         $initialDir = (Get-Location).Path
     }
 
     Write-Host ""
-    Write-Host "Choose where to save the CSV export..." -ForegroundColor Cyan
+    Write-Host "Choose a base file name. Three CSV reports will be created:" -ForegroundColor Cyan
+    Write-Host "  <name>-GroupRoleAssignments.csv"
+    Write-Host "  <name>-UserRoleAssignments.csv"
+    Write-Host "  <name>-GroupMembers.csv"
     try {
         $ExportCsvPath = Get-CsvPathFromSaveDialog -DefaultFileName $defaultName -InitialDirectory $initialDir
     }
@@ -1158,12 +1301,35 @@ if ([string]::IsNullOrWhiteSpace($ExportCsvPath) -and $PromptForCsvPath) {
 }
 
 if (-not [string]::IsNullOrWhiteSpace($ExportCsvPath)) {
-    $exportDir = Split-Path -Parent $ExportCsvPath
-    if (-not [string]::IsNullOrEmpty($exportDir) -and -not (Test-Path -LiteralPath $exportDir)) {
-        New-Item -ItemType Directory -Path $exportDir -Force | Out-Null
+    $paths = Get-SplitCsvPaths -BasePath $ExportCsvPath
+
+    $groupAssignmentRows = @($final | Where-Object { $_.PrincipalType -eq 'Group' } |
+        Sort-Object PrincipalDisplayName, RoleName, AssignmentState)
+
+    $userAssignmentRows = @($final | Where-Object { $_.PrincipalType -eq 'User' -or $_.PrincipalType -eq 'ServicePrincipal' } |
+        Sort-Object PrincipalType, PrincipalDisplayName, RoleName, AssignmentState, AssignmentPath, AssignedVia)
+
+    Write-Host ""
+    Write-Host "Building group membership report..." -ForegroundColor Cyan
+    $groupMemberRows = @(New-GroupMemberReportRows | Sort-Object GroupDisplayName, MemberType, MemberDisplayName)
+
+    $groupHeader = [pscustomobject]@{
+        PrincipalType = $null; PrincipalDisplayName = $null; PrincipalId = $null; UserPrincipalName = $null
+        AppId = $null; AccountEnabled = $null; PrincipalSubtype = $null; RoleName = $null; RoleDefinitionId = $null
+        AssignmentState = $null; DurationType = $null; AssignmentPath = $null; AssignedVia = $null
+        AssignedViaGroup = $null; AssignedViaGroupId = $null; IsPimActivated = $null; DirectoryScopeId = $null
+        StartDateTime = $null; EndDateTime = $null; GraphMemberType = $null
     }
-    $final | Export-Csv -Path $ExportCsvPath -NoTypeInformation -Encoding UTF8
-    Write-Host ("Results exported to: {0}" -f $ExportCsvPath) -ForegroundColor Green
+    $memberHeader = [pscustomobject]@{
+        GroupDisplayName = $null; GroupId = $null; GroupSubtype = $null; PrivilegedRoles = $null
+        PrivilegedRoleCount = $null; MemberType = $null; MemberDisplayName = $null; MemberId = $null
+        UserPrincipalName = $null; AppId = $null; AccountEnabled = $null; MemberSubtype = $null
+    }
+
+    Write-Host "Writing CSV reports:" -ForegroundColor Cyan
+    Export-ReportCsv -Rows $groupAssignmentRows -Path $paths.Groups  -HeaderTemplate $groupHeader
+    Export-ReportCsv -Rows $userAssignmentRows  -Path $paths.Users   -HeaderTemplate $groupHeader
+    Export-ReportCsv -Rows $groupMemberRows     -Path $paths.Members -HeaderTemplate $memberHeader
 }
 
 Disconnect-MgGraph | Out-Null
