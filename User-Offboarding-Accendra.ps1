@@ -37,16 +37,18 @@
     Anthony Blake (Enhanced version) - split into Accendra/Apria/Byram scope
 
 .VERSION
-    2.8.1-ACC - Accendra (main) + Apria + Byram AD scope with full Entra/Exchange actions
-                Exchange Online service account is loaded from an Export-Clixml credential file
+    2.8.2-ACC - Accendra (main) + Apria + Byram AD scope with full Entra/Exchange actions
+                Exchange Online service account is loaded from a DPAPI credential file
+                (machine-wide or current-user; chosen in Set-ExchangeOnlineCredentialFile.ps1)
 
 .NOTES
     - Requires ActiveDirectory module
     - Requires ExchangeOnlineManagement module
     - Requires Graph API App Registration with appropriate permissions
-    - Exchange Online credentials: Export-Clixml PSCredential (same Windows user + computer).
-      Run Set-ExchangeOnlineCredentialFile.ps1 for a menu to create a new file or
-      pick an existing file and change username/password (do not edit the XML by hand).
+    - Exchange Online credentials: Windows DPAPI file created with
+      Set-ExchangeOnlineCredentialFile.ps1. The menu lets you choose whether the
+      file can be decrypted by any user on this computer, or only the current
+      Windows user on this computer.
     - Run with appropriate administrative privileges
 
 .EXAMPLE
@@ -74,6 +76,10 @@ param(
 )
 
 $script:ScriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$script:CredentialHelperPath = Join-Path $script:ScriptRoot 'Set-ExchangeOnlineCredentialFile.ps1'
+if (Test-Path -LiteralPath $script:CredentialHelperPath) {
+    . $script:CredentialHelperPath
+}
 
 # ============================================================================
 # CONFIGURATION
@@ -117,13 +123,12 @@ $script:Config = @{
   }
     
     # ------------------------------------------------------------------------
-    # Exchange Online credentials (Export-Clixml / DPAPI)
-    # Create or change username/password with the interactive menu:
+    # Exchange Online credentials (Windows DPAPI)
+    # Create or change the file, and choose machine vs user encryption, with:
     #   .\Set-ExchangeOnlineCredentialFile.ps1
-    # File is readable only by the Windows user that created it, on this computer.
     # ------------------------------------------------------------------------
     ExchangeAccount   = "svcIAM@owens-minor.com"
-    PasswordFile      = "E:\Scripts\Passwords\ExchangeOnline.xml"
+    PasswordFile      = "E:\Scripts\Passwords\ExchangeOnline.json"
     
     # Validation Settings
     ValidationDelaySeconds     = 10
@@ -532,6 +537,10 @@ function Get-GraphAccessToken {
         }
     }
     catch {
+        $detail = $_.Exception.Message
+        if ($detail -match 'AADSTS90002') {
+            Write-LogMessage "Graph tenant '$TenantId' was not found (AADSTS90002). Use the Directory (tenant) ID from Entra admin center > Overview — not a Subscription ID. Update TenantId in this script's `$script:Config." -Level Error
+        }
         Write-LogMessage "Failed to acquire Graph token: $_" -Level Error
         throw
     }
@@ -588,6 +597,15 @@ function Connect-ExchangeOnlineSecure {
         
         Import-Module ExchangeOnlineManagement -ErrorAction Stop
 
+        if (-not (Get-Command Import-OffboardingCredentialFile -ErrorAction SilentlyContinue)) {
+            if (Test-Path -LiteralPath $script:CredentialHelperPath) {
+                . $script:CredentialHelperPath
+            }
+            else {
+                throw "Required helper not found: $($script:CredentialHelperPath)"
+            }
+        }
+
         $passwordFile = $script:Config.PasswordFile
         if ($passwordFile -and -not (Test-Path -LiteralPath $passwordFile)) {
             $localCred = Join-Path $script:ScriptRoot (Split-Path -Leaf $passwordFile)
@@ -596,15 +614,12 @@ function Connect-ExchangeOnlineSecure {
             }
         }
         if (-not $passwordFile -or -not (Test-Path -LiteralPath $passwordFile)) {
-            throw "Exchange credential file not found: $($script:Config.PasswordFile). Run Set-ExchangeOnlineCredentialFile.ps1 to create or update it."
+            throw "Exchange credential file not found: $($script:Config.PasswordFile). Run Set-ExchangeOnlineCredentialFile.ps1 to create it and choose machine or user encryption."
         }
 
-        $credentials = Import-Clixml -Path $passwordFile
-        if (-not $credentials -or -not $credentials.UserName) {
-            throw "Credential file '$passwordFile' did not contain a PSCredential. Recreate it with Set-ExchangeOnlineCredentialFile.ps1."
-        }
-
-        Write-LogMessage "Exchange credentials loaded for $($credentials.UserName)" -Level Debug -Indent 1
+        $secrets = Import-OffboardingCredentialFile -FilePath $passwordFile
+        $credentials = ConvertTo-OffboardingPSCredential -SecretRecord $secrets
+        Write-LogMessage "Exchange credentials loaded for $($credentials.UserName) [$($secrets.Protection)]" -Level Debug -Indent 1
         
         Connect-ExchangeOnline -Credential $credentials -ShowBanner:$false -ErrorAction Stop
         
@@ -2235,7 +2250,7 @@ function Start-Offboarding {
         Write-Host ("=" * 70) -ForegroundColor Cyan
         Write-Host "  USER OFFBOARDING SCRIPT v2.8 - Accendra / Apria / Byram" -ForegroundColor Cyan
         Write-Host "  Author: Anthony Blake | Enhanced: $(Get-Date -Format 'yyyy-MM-dd')" -ForegroundColor DarkCyan
-        Write-Host "  Exchange creds: Export-Clixml (Set-ExchangeOnlineCredentialFile.ps1)" -ForegroundColor DarkCyan
+        Write-Host "  Exchange creds: DPAPI file (machine or current-user; Set-ExchangeOnlineCredentialFile.ps1)" -ForegroundColor DarkCyan
         Write-Host ("=" * 70) -ForegroundColor Cyan
         
         # Import required modules
