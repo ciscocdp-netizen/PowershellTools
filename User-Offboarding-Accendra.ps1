@@ -45,8 +45,8 @@
     - Requires ExchangeOnlineManagement module
     - Requires Graph API App Registration with appropriate permissions
     - Exchange Online credentials: Export-Clixml PSCredential (same Windows user + computer).
-      Create or change username/password with Set-ExchangeOnlineCredentialFile.ps1
-      (do not edit the XML by hand).
+      Run Set-ExchangeOnlineCredentialFile.ps1 for a menu to create a new file or
+      pick an existing file and change username/password (do not edit the XML by hand).
     - Run with appropriate administrative privileges
 
 .EXAMPLE
@@ -118,7 +118,7 @@ $script:Config = @{
     
     # ------------------------------------------------------------------------
     # Exchange Online credentials (Export-Clixml / DPAPI)
-    # Create or change username/password with:
+    # Create or change username/password with the interactive menu:
     #   .\Set-ExchangeOnlineCredentialFile.ps1
     # File is readable only by the Windows user that created it, on this computer.
     # ------------------------------------------------------------------------

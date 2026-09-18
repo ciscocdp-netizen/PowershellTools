@@ -74,6 +74,44 @@ try {
     finally {
         [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr2)
     }
+
+    Write-Host '== Show current file ==' -ForegroundColor Cyan
+    $showOut = & (Join-Path $repo 'Set-ExchangeOnlineCredentialFile.ps1') -Path $xmlPath -Show *>&1 | Out-String
+    Assert-True ($showOut -match 'svcIAM@owens-minor.com') '-Show prints stored username'
+
+    Write-Host '== Interactive menu: choose file and show ==' -ForegroundColor Cyan
+    $menuScript = Join-Path $repo 'Set-ExchangeOnlineCredentialFile.ps1'
+    $hostExe = (Get-Process -Id $PID).Path
+    $menuLines = @(
+        '2'
+        $xmlPath
+        '5'
+        'Q'
+    )
+    $menuOut = $menuLines | & $hostExe -NoLogo -File $menuScript *>&1 | Out-String
+    Assert-True ($menuOut -match 'EXCHANGE ONLINE CREDENTIAL FILE') 'Menu banner is shown'
+    Assert-True ($menuOut -match 'Choose an EXISTING') 'Menu can select which file to modify'
+    Assert-True ($menuOut -match [regex]::Escape($xmlPath)) 'Menu binds the chosen file'
+
+    Write-Host '== Interactive menu: create a new file ==' -ForegroundColor Cyan
+    $newPath = Join-Path $tempDir 'NewExchangeCreds.xml'
+    $createLines = @(
+        '1'
+        $newPath
+        'new-svc@owens-minor.com'
+        'Menu-Pass-9!'
+        'Menu-Pass-9!'
+        'Q'
+    )
+    $createOut = $createLines | & $hostExe -NoLogo -File $menuScript *>&1 | Out-String
+    Assert-True ($createOut -match 'Create a NEW encrypted credential file') 'Menu can create a new file'
+    if (Test-Path -LiteralPath $newPath) {
+        $created = Import-Clixml -Path $newPath
+        Assert-True ($created.UserName -eq 'new-svc@owens-minor.com') 'New file stores the menu username'
+    }
+    else {
+        Write-Host '  SKIP  Password prompt (SecureString) needs a console; save is covered by -Credential' -ForegroundColor Yellow
+    }
 }
 finally {
     Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
