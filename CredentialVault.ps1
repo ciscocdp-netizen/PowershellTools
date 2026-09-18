@@ -17,12 +17,12 @@
 # JSON object, which makes the file unreadable. Always use -InputObject.
 #
 # Usage:
-#   . .\CredentialVault.ps1          # dot-source to load the functions
-#   New-EncryptedCredentialFile      # interactive builder (prints paste-ready code)
-#   Unprotect-CredentialFile ...     # read the file back in your scripts
-#
-#   .\CredentialVault.ps1            # run directly to launch the builder
+#   .\CredentialVault.ps1            # fully interactive menu (create / decrypt / usage code)
 #   .\CredentialVault.ps1 -SelfTest  # encrypt/decrypt round-trip self-test
+#
+#   . .\CredentialVault.ps1          # dot-source to load the functions into another script
+#   Start-CredentialVault            # same interactive menu after dot-sourcing
+#   Unprotect-CredentialFile ...     # programmatic decrypt for your own scripts
 # ============================================================================
 
 [CmdletBinding(DefaultParameterSetName = 'Interactive')]
@@ -42,6 +42,7 @@ if (-not $script:CredentialVaultScriptPath) {
 }
 
 $script:IsDotSourced = ($MyInvocation.InvocationName -eq '.')
+$script:LastCredentialPath = $null
 
 # ----------------------------------------------------------------------------
 # Internals
@@ -162,6 +163,258 @@ function Test-VaultHasField {
         }
     }
     return $null
+}
+
+function Get-VaultObjectFieldNames {
+    param($Object)
+    if ($null -eq $Object) { return @() }
+    if ($Object -is [System.Collections.IDictionary]) {
+        return @($Object.Keys | ForEach-Object { [string]$_ })
+    }
+    return @($Object.PSObject.Properties.Name)
+}
+
+function Test-VaultSecretFieldName {
+    param([string]$Name)
+    return [bool]($Name -match '(Secret|Password|Token|Key|Pass$|Thumbprint)')
+}
+
+function Get-VaultCredentialTemplates {
+    return @(
+        [pscustomobject]@{
+            Id          = 'OAuth'
+            Title       = 'OAuth / Entra app registration'
+            Summary     = 'TenantId, ClientId, ClientSecret'
+            DefaultFile = 'oauth-app.enc'
+            Fields      = @(
+                [pscustomobject]@{ Name = 'TenantId';     Secret = $false; Prompt = 'Tenant ID (GUID or domain)' }
+                [pscustomobject]@{ Name = 'ClientId';     Secret = $false; Prompt = 'Application (client) ID' }
+                [pscustomobject]@{ Name = 'ClientSecret'; Secret = $true;  Prompt = 'Client secret' }
+            )
+        }
+        [pscustomobject]@{
+            Id          = 'EntraID'
+            Title       = 'Entra ID user'
+            Summary     = 'UserName, Password, TenantId'
+            DefaultFile = 'entra-user.enc'
+            Fields      = @(
+                [pscustomobject]@{ Name = 'UserName'; Secret = $false; Prompt = 'User principal name (user@domain)' }
+                [pscustomobject]@{ Name = 'Password'; Secret = $true;  Prompt = 'Password' }
+                [pscustomobject]@{ Name = 'TenantId'; Secret = $false; Prompt = 'Tenant ID (GUID or domain)' }
+            )
+        }
+        [pscustomobject]@{
+            Id          = 'OnPremAD'
+            Title       = 'On-prem Active Directory'
+            Summary     = 'UserName, Password, Domain'
+            DefaultFile = 'ad-creds.enc'
+            Fields      = @(
+                [pscustomobject]@{ Name = 'UserName'; Secret = $false; Prompt = 'User name (DOMAIN\user or UPN)' }
+                [pscustomobject]@{ Name = 'Password'; Secret = $true;  Prompt = 'Password' }
+                [pscustomobject]@{ Name = 'Domain';   Secret = $false; Prompt = 'AD domain (e.g. CONTOSO or contoso.local)' }
+            )
+        }
+        [pscustomobject]@{
+            Id          = 'Custom'
+            Title       = 'Custom fields'
+            Summary     = 'enter your own field names'
+            DefaultFile = 'creds.enc'
+            Fields      = @()
+        }
+    )
+}
+
+function Read-VaultYesNo {
+    param(
+        [Parameter(Mandatory)][string]$Prompt,
+        [bool]$Default = $true
+    )
+    $defaultLabel = if ($Default) { 'Y' } else { 'N' }
+    while ($true) {
+        $answer = Read-Host "$Prompt (Y/N) [$defaultLabel]"
+        if ([string]::IsNullOrWhiteSpace($answer)) { return [bool]$Default }
+        if ($answer -match '^(y|yes)$') { return $true }
+        if ($answer -match '^(n|no)$') { return $false }
+        Write-Host 'Please enter Y or N.' -ForegroundColor Yellow
+    }
+}
+
+function Read-VaultMenuChoice {
+    param(
+        [Parameter(Mandatory)][string]$Prompt,
+        [Parameter(Mandatory)][string[]]$Valid
+    )
+    while ($true) {
+        $answer = (Read-Host $Prompt)
+        if ($null -eq $answer) { $answer = '' }
+        $answer = $answer.Trim()
+        if ($answer -match '^(q|quit|exit)$') { return 'Q' }
+        foreach ($item in $Valid) {
+            if ([string]::Equals($answer, $item, [StringComparison]::OrdinalIgnoreCase)) {
+                return $item
+            }
+        }
+        Write-Host "Please enter one of: $($Valid -join ', ')" -ForegroundColor Yellow
+    }
+}
+
+function Read-VaultFilePath {
+    param(
+        [string]$Prompt = 'Encrypted file path',
+        [string]$Default,
+        [switch]$MustExist
+    )
+    if (-not $Default) { $Default = $script:LastCredentialPath }
+    if (-not $Default) { $Default = Join-Path (Get-Location).ProviderPath 'creds.enc' }
+    while ($true) {
+        $answer = Read-Host "$Prompt [$Default]"
+        if ([string]::IsNullOrWhiteSpace($answer)) { $answer = $Default }
+        try {
+            $full = Get-VaultFullPath -Path $answer
+        } catch {
+            Write-Warning $_.Exception.Message
+            continue
+        }
+        if ($MustExist -and -not (Test-Path -LiteralPath $full)) {
+            Write-Warning "File not found: $full"
+            continue
+        }
+        $script:LastCredentialPath = $full
+        return $full
+    }
+}
+
+function Read-VaultSecureInput {
+    param([Parameter(Mandatory)][string]$Prompt)
+    # Read-Host -AsSecureString needs a real console. When stdin is redirected
+    # (tests, piped input) fall back to a normal Read-Host and wrap it.
+    $redirected = $false
+    try { $redirected = [Console]::IsInputRedirected } catch { $redirected = $false }
+
+    if (-not $redirected) {
+        return Read-Host $Prompt -AsSecureString
+    }
+
+    $plain = Read-Host $Prompt
+    if ([string]::IsNullOrEmpty($plain)) {
+        return New-Object System.Security.SecureString
+    }
+    ConvertTo-SecureString $plain -AsPlainText -Force
+}
+
+function Read-VaultFieldValue {
+    param(
+        [Parameter(Mandatory)][string]$Prompt,
+        [bool]$Secret = $false,
+        [bool]$AllowEmpty = $false
+    )
+    while ($true) {
+        if ($Secret) {
+            $sec = Read-VaultSecureInput -Prompt $Prompt
+            $val = ConvertFrom-SecureStringToPlain $sec
+            if ($sec) { $sec.Dispose() }
+        } else {
+            $val = Read-Host $Prompt
+        }
+        if (-not [string]::IsNullOrWhiteSpace($val) -or $AllowEmpty) {
+            if ($null -eq $val) { $val = '' }
+            return $val
+        }
+        Write-Warning 'Value cannot be empty.'
+    }
+}
+
+function Read-VaultPassphraseConfirmed {
+    while ($true) {
+        $p1 = Read-VaultSecureInput -Prompt 'Encryption passphrase'
+        $p2 = Read-VaultSecureInput -Prompt 'Confirm passphrase'
+        $plain1 = ConvertFrom-SecureStringToPlain $p1
+        $plain2 = ConvertFrom-SecureStringToPlain $p2
+        if ($p2) { $p2.Dispose() }
+        if ([string]::IsNullOrEmpty($plain1)) {
+            Write-Warning 'Passphrase cannot be empty.'
+            if ($p1) { $p1.Dispose() }
+            continue
+        }
+        if ($plain1 -cne $plain2) {
+            Write-Warning 'Passphrases do not match. Try again.'
+            if ($p1) { $p1.Dispose() }
+            continue
+        }
+        if ($plain1.Length -lt 8) {
+            Write-Warning 'Passphrase is shorter than 8 characters. Use a longer one for production files.'
+        }
+        return $p1
+    }
+}
+
+function Add-VaultCustomFields {
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Data)
+    Write-Host ''
+    Write-Host 'Add extra fields. Leave the field name blank to finish.' -ForegroundColor Cyan
+    while ($true) {
+        $name = Read-Host 'Field name (blank to finish)'
+        if ([string]::IsNullOrWhiteSpace($name)) { break }
+        if ($name -eq '_Type') {
+            Write-Warning '_Type is reserved. Choose a different field name.'
+            continue
+        }
+        if ($Data.Contains($name)) {
+            Write-Warning "Field '$name' already exists."
+            continue
+        }
+        $secretDefault = Test-VaultSecretFieldName $name
+        $secret = Read-VaultYesNo -Prompt "Mask input for '$name'?" -Default $secretDefault
+        $Data[$name] = Read-VaultFieldValue -Prompt "Value for '$name'" -Secret $secret -AllowEmpty $true
+    }
+}
+
+function Show-VaultDecryptedFields {
+    param(
+        $CredentialObject,
+        [bool]$RevealSecrets = $false
+    )
+    $names = Get-VaultObjectFieldNames $CredentialObject
+    Write-Host ''
+    Write-Host 'Stored fields:' -ForegroundColor Cyan
+    foreach ($name in $names) {
+        $value = [string]($CredentialObject.$name)
+        if ($name -ne '_Type' -and (Test-VaultSecretFieldName $name) -and -not $RevealSecrets) {
+            $value = '********'
+        }
+        Write-Host ("  {0,-16} {1}" -f $name, $value)
+    }
+}
+
+function Save-VaultUsageSnippet {
+    param(
+        [Parameter(Mandatory)][string]$Snippet,
+        [Parameter(Mandatory)][string]$CredentialPath
+    )
+    if (-not (Read-VaultYesNo -Prompt 'Save this snippet to a .ps1 file you can paste from?' -Default $false)) {
+        return
+    }
+    $dir  = Split-Path -Parent $CredentialPath
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($CredentialPath)
+    $default = Join-Path $dir "$base.usage.ps1"
+    $out = Read-Host "Snippet file path [$default]"
+    if ([string]::IsNullOrWhiteSpace($out)) { $out = $default }
+    $out = Get-VaultFullPath -Path $out
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($out, $snippet, $utf8NoBom)
+    Write-Host "Wrote usage snippet to: $out" -ForegroundColor Green
+}
+
+function Invoke-VaultUsageDisplay {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string[]]$FieldNames = @(),
+        [string]$TypeLabel
+    )
+    $snippet = Show-CredentialUsageSnippet -Path $Path -FieldNames $FieldNames -TypeLabel $TypeLabel -PassThru
+    if ($snippet) {
+        Save-VaultUsageSnippet -Snippet $snippet -CredentialPath $Path
+    }
 }
 
 # ----------------------------------------------------------------------------
@@ -547,7 +800,7 @@ function Show-CredentialUsageSnippet {
 function New-EncryptedCredentialFile {
     <#
     .SYNOPSIS
-        Interactive builder: collect fields, encrypt them, print paste-ready usage code.
+        Interactive builder: pick a credential type, enter fields, encrypt, print paste-ready usage code.
     #>
     [CmdletBinding()]
     param(
@@ -557,38 +810,36 @@ function New-EncryptedCredentialFile {
 
     Set-StrictMode -Version Latest
 
-    if (-not $Path) {
-        $Path = Read-Host 'Output file path (blank = .\creds.enc)'
-        if ([string]::IsNullOrWhiteSpace($Path)) {
-            $Path = Join-Path (Get-Location).ProviderPath 'creds.enc'
-        }
-    }
-    $Path = Get-VaultFullPath -Path $Path
-
-    if (Test-Path -LiteralPath $Path) {
-        $overwrite = Read-Host "File exists: $Path  Overwrite? (Y/N)"
-        if ($overwrite -notmatch '^(y|yes)$') {
-            Write-Warning 'Aborted.'
-            return
-        }
-    }
-
-    $data = [ordered]@{}
-    $type = Read-Host 'Credential type label (e.g. OAuth, EntraID, OnPremAD) [optional]'
-    if ($type) { $data['_Type'] = $type }
+    $templates = @(Get-VaultCredentialTemplates)
 
     Write-Host ''
-    Write-Host 'Enter each credential field. Leave the field name blank to finish.' -ForegroundColor Cyan
-    while ($true) {
-        $name = Read-Host 'Field name (blank to finish)'
-        if ([string]::IsNullOrWhiteSpace($name)) { break }
+    Write-Host 'Create a new encrypted credential file' -ForegroundColor Cyan
+    Write-Host ''
+    for ($i = 0; $i -lt $templates.Count; $i++) {
+        $n = $i + 1
+        Write-Host ("  [{0}] {1,-34} ({2})" -f $n, $templates[$i].Title, $templates[$i].Summary)
+    }
+    $typeChoice = Read-VaultMenuChoice -Prompt 'Select credential type' -Valid @('1', '2', '3', '4', 'Q')
+    if ($typeChoice -eq 'Q') {
+        Write-Warning 'Aborted.'
+        return
+    }
+    $template = $templates[[int]$typeChoice - 1]
 
-        $isSecret = Read-Host "Mask input for '$name'? (Y/N)"
-        if ($isSecret -match '^(y|yes)$') {
-            $sec = Read-Host "Value for '$name'" -AsSecureString
-            $data[$name] = ConvertFrom-SecureStringToPlain $sec
-        } else {
-            $data[$name] = Read-Host "Value for '$name'"
+    $data = [ordered]@{}
+    if ($template.Id -eq 'Custom') {
+        $type = Read-Host 'Credential type label (e.g. OAuth, EntraID, OnPremAD) [optional]'
+        if ($type) { $data['_Type'] = $type }
+        Add-VaultCustomFields -Data $data
+    } else {
+        $data['_Type'] = $template.Id
+        Write-Host ''
+        Write-Host ("Enter values for {0}:" -f $template.Title) -ForegroundColor Cyan
+        foreach ($field in @($template.Fields)) {
+            $data[$field.Name] = Read-VaultFieldValue -Prompt $field.Prompt -Secret ([bool]$field.Secret)
+        }
+        if (Read-VaultYesNo -Prompt 'Add extra custom fields?' -Default $false) {
+            Add-VaultCustomFields -Data $data
         }
     }
 
@@ -597,32 +848,185 @@ function New-EncryptedCredentialFile {
         return
     }
 
-    $p1 = $null
-    $p2 = $null
-    try {
-        while ($true) {
-            $p1 = Read-Host 'Encryption passphrase' -AsSecureString
-            $p2 = Read-Host 'Confirm passphrase'    -AsSecureString
-            $plain1 = ConvertFrom-SecureStringToPlain $p1
-            $plain2 = ConvertFrom-SecureStringToPlain $p2
-            if ($plain1 -ceq $plain2) {
-                if ($plain1.Length -lt 8) {
-                    Write-Warning 'Passphrase is shorter than 8 characters. Use a longer one for production files.'
-                }
-                break
-            }
-            Write-Warning 'Passphrases do not match. Try again.'
-        }
+    if (-not $Path) {
+        $defaultPath = Join-Path (Get-Location).ProviderPath $template.DefaultFile
+        $Path = Read-VaultFilePath -Prompt 'Output file path' -Default $defaultPath
+    } else {
+        $Path = Get-VaultFullPath -Path $Path
+        $script:LastCredentialPath = $Path
+    }
 
-        Protect-CredentialFile -Data $data -Path $Path -Passphrase $p1 -Iterations $Iterations
+    if (Test-Path -LiteralPath $Path) {
+        if (-not (Read-VaultYesNo -Prompt "File exists: $Path  Overwrite?" -Default $false)) {
+            Write-Warning 'Aborted.'
+            return
+        }
+    }
+
+    $passphrase = $null
+    try {
+        $passphrase = Read-VaultPassphraseConfirmed
+        Protect-CredentialFile -Data $data -Path $Path -Passphrase $passphrase -Iterations $Iterations
     }
     finally {
-        if ($p1) { $p1.Dispose() }
-        if ($p2) { $p2.Dispose() }
+        if ($passphrase) { $passphrase.Dispose() }
     }
 
+    Write-Host ''
     Write-Host "Encrypted credentials written to: $Path" -ForegroundColor Green
-    Show-CredentialUsageSnippet -Path $Path -FieldNames @($data.Keys) -TypeLabel $type
+
+    $typeLabel = $null
+    if ($data.Contains('_Type')) { $typeLabel = [string]$data['_Type'] }
+    Invoke-VaultUsageDisplay -Path $Path -FieldNames @($data.Keys) -TypeLabel $typeLabel
+
+    if (Read-VaultYesNo -Prompt 'Decrypt now to verify the file?' -Default $true) {
+        $verify = $null
+        try {
+            $verify = Read-VaultSecureInput -Prompt 'Passphrase'
+            $roundTrip = Unprotect-CredentialFile -Path $Path -Passphrase $verify
+            Write-Host 'Decrypt succeeded.' -ForegroundColor Green
+            $reveal = Read-VaultYesNo -Prompt 'Show secret values on screen?' -Default $false
+            Show-VaultDecryptedFields -CredentialObject $roundTrip -RevealSecrets $reveal
+        } catch {
+            Write-Host "Verify failed: $($_.Exception.Message)" -ForegroundColor Red
+        } finally {
+            if ($verify) { $verify.Dispose() }
+        }
+    }
+}
+
+function Open-EncryptedCredentialFile {
+    <#
+    .SYNOPSIS
+        Interactive decrypt: prompt for path and passphrase, show fields, print paste-ready usage code.
+    #>
+    [CmdletBinding()]
+    param([string]$Path)
+
+    Set-StrictMode -Version Latest
+
+    Write-Host ''
+    Write-Host 'Decrypt an existing credential file' -ForegroundColor Cyan
+    if (-not $Path) {
+        $Path = Read-VaultFilePath -Prompt 'Encrypted file path' -MustExist
+    } else {
+        $Path = Get-VaultFullPath -Path $Path
+        if (-not (Test-Path -LiteralPath $Path)) {
+            throw "Credential file not found: $Path"
+        }
+        $script:LastCredentialPath = $Path
+    }
+
+    $passphrase = $null
+    try {
+        $passphrase = Read-VaultSecureInput -Prompt 'Passphrase'
+        $creds = Unprotect-CredentialFile -Path $Path -Passphrase $passphrase
+    } catch {
+        Write-Host "Decrypt failed: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    } finally {
+        if ($passphrase) { $passphrase.Dispose() }
+    }
+
+    Write-Host 'Decrypt succeeded.' -ForegroundColor Green
+    $reveal = Read-VaultYesNo -Prompt 'Show secret values on screen?' -Default $false
+    Show-VaultDecryptedFields -CredentialObject $creds -RevealSecrets $reveal
+
+    $typeLabel = $null
+    $names = Get-VaultObjectFieldNames $creds
+    if ($names -contains '_Type') { $typeLabel = [string]$creds._Type }
+    Invoke-VaultUsageDisplay -Path $Path -FieldNames $names -TypeLabel $typeLabel
+}
+
+function Show-EncryptedCredentialUsage {
+    <#
+    .SYNOPSIS
+        Interactive helper: decrypt just enough to print paste-ready usage code (values stay hidden).
+    #>
+    [CmdletBinding()]
+    param([string]$Path)
+
+    Set-StrictMode -Version Latest
+
+    Write-Host ''
+    Write-Host 'Show paste-ready usage code' -ForegroundColor Cyan
+    if (-not $Path) {
+        $Path = Read-VaultFilePath -Prompt 'Encrypted file path' -MustExist
+    } else {
+        $Path = Get-VaultFullPath -Path $Path
+        if (-not (Test-Path -LiteralPath $Path)) {
+            throw "Credential file not found: $Path"
+        }
+        $script:LastCredentialPath = $Path
+    }
+
+    $passphrase = $null
+    try {
+        $passphrase = Read-VaultSecureInput -Prompt 'Passphrase (needed to discover field names; values are not printed)'
+        $creds = Unprotect-CredentialFile -Path $Path -Passphrase $passphrase
+    } catch {
+        Write-Host "Decrypt failed: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    } finally {
+        if ($passphrase) { $passphrase.Dispose() }
+    }
+
+    $typeLabel = $null
+    $names = Get-VaultObjectFieldNames $creds
+    if ($names -contains '_Type') { $typeLabel = [string]$creds._Type }
+    Invoke-VaultUsageDisplay -Path $Path -FieldNames $names -TypeLabel $typeLabel
+}
+
+function Start-CredentialVault {
+    <#
+    .SYNOPSIS
+        Fully interactive menu: create, decrypt, or generate usage code for encrypted credentials.
+    #>
+    [CmdletBinding()]
+    param([string]$Path)
+
+    Set-StrictMode -Version Latest
+
+    if ($Path) {
+        $script:LastCredentialPath = Get-VaultFullPath -Path $Path
+    }
+
+    Write-Host ''
+    Write-Host '================================================================' -ForegroundColor Cyan
+    Write-Host ' Credential Vault' -ForegroundColor Cyan
+    Write-Host ' AES-256-CBC + HMAC-SHA256  |  PBKDF2-SHA256' -ForegroundColor DarkCyan
+    Write-Host ' Create an encrypted file, then paste the generated code into' -ForegroundColor DarkCyan
+    Write-Host ' another script to use those credentials.' -ForegroundColor DarkCyan
+    Write-Host '================================================================' -ForegroundColor Cyan
+
+    while ($true) {
+        Write-Host ''
+        Write-Host '  [1] Create a new encrypted credential file'
+        Write-Host '  [2] Decrypt an existing file and show usage code'
+        Write-Host '  [3] Show paste-ready usage code for a file'
+        Write-Host '  [4] Run self-test'
+        Write-Host '  [Q] Quit'
+        Write-Host ''
+        $choice = Read-VaultMenuChoice -Prompt 'Select an option' -Valid @('1', '2', '3', '4', 'Q')
+        if ($choice -eq 'Q') {
+            Write-Host 'Bye.'
+            break
+        }
+
+        try {
+            switch ($choice) {
+                '1' { New-EncryptedCredentialFile }
+                '2' { Open-EncryptedCredentialFile }
+                '3' { Show-EncryptedCredentialUsage }
+                '4' { Test-CredentialVault | Out-Null }
+            }
+        } catch {
+            Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+        }
+
+        Write-Host ''
+        [void](Read-Host 'Press Enter to return to the menu')
+    }
 }
 
 function Test-CredentialVault {
@@ -718,6 +1122,23 @@ function Test-CredentialVault {
             throw 'ConvertTo-PSCredential failed.'
         }
 
+        $templates = @(Get-VaultCredentialTemplates)
+        if ($templates.Count -ne 4) {
+            throw "Expected 4 credential templates, got $($templates.Count)."
+        }
+        $oauthNames = @($templates[0].Fields | ForEach-Object { $_.Name })
+        foreach ($need in @('TenantId', 'ClientId', 'ClientSecret')) {
+            if ($oauthNames -notcontains $need) {
+                throw "OAuth template missing field $need"
+            }
+        }
+        if (-not (Test-VaultSecretFieldName 'ClientSecret')) {
+            throw 'ClientSecret should be treated as a secret field name.'
+        }
+        if (Test-VaultSecretFieldName 'TenantId') {
+            throw 'TenantId should not be treated as a secret field name.'
+        }
+
         Write-Host 'CredentialVault self-test passed.' -ForegroundColor Green
         return $true
     }
@@ -727,12 +1148,12 @@ function Test-CredentialVault {
     }
 }
 
-# Launch the builder when the file is executed (not dot-sourced).
+# Launch the interactive menu when the file is executed (not dot-sourced).
 if (-not $script:IsDotSourced) {
     Set-StrictMode -Version Latest
     if ($SelfTest) {
         Test-CredentialVault | Out-Null
     } else {
-        New-EncryptedCredentialFile -Path $Path
+        Start-CredentialVault -Path $Path
     }
 }
