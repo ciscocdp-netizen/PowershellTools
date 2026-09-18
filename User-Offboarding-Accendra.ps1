@@ -37,18 +37,16 @@
     Anthony Blake (Enhanced version) - split into Accendra/Apria/Byram scope
 
 .VERSION
-    2.8.0-ACC - Accendra (main) + Apria + Byram AD scope with full Entra/Exchange actions
-                Exchange Online service account is loaded from a CredentialVault .enc file
+    2.8.1-ACC - Accendra (main) + Apria + Byram AD scope with full Entra/Exchange actions
+                Exchange Online service account is loaded from an Export-Clixml credential file
 
 .NOTES
     - Requires ActiveDirectory module
     - Requires ExchangeOnlineManagement module
     - Requires Graph API App Registration with appropriate permissions
-    - Requires CredentialVault.ps1 (or Encrypt_Creds.ps1) beside this script, or a
-      configured CredentialVaultScript path
-    - Exchange Online credentials are decrypted with Unprotect-CredentialFile
-      (AES-256-CBC + HMAC-SHA256). Create the file with CredentialVault.ps1 using
-      the ExchangeCreds template (Username + Password).
+    - Exchange Online credentials: Export-Clixml PSCredential (same Windows user + computer).
+      Create or change username/password with Set-ExchangeOnlineCredentialFile.ps1
+      (do not edit the XML by hand).
     - Run with appropriate administrative privileges
 
 .EXAMPLE
@@ -76,11 +74,6 @@ param(
 )
 
 $script:ScriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
-$vaultHelper = Join-Path $script:ScriptRoot 'Get-ExchangeOnlineVaultCredential.ps1'
-if (-not (Test-Path -LiteralPath $vaultHelper)) {
-    throw "Required helper not found: $vaultHelper"
-}
-. $vaultHelper
 
 # ============================================================================
 # CONFIGURATION
@@ -124,15 +117,13 @@ $script:Config = @{
   }
     
     # ------------------------------------------------------------------------
-    # Exchange Online credentials (CredentialVault)
-    # Create/rotate the .enc file with CredentialVault.ps1 (ExchangeCreds type)
-    # or Encrypt_Creds.ps1. Username + Password stay encrypted on disk.
-    # Leave CredentialPassphrase empty to prompt (or set EXCHANGE_CRED_PASSPHRASE).
+    # Exchange Online credentials (Export-Clixml / DPAPI)
+    # Create or change username/password with:
+    #   .\Set-ExchangeOnlineCredentialFile.ps1
+    # File is readable only by the Windows user that created it, on this computer.
     # ------------------------------------------------------------------------
-    ExchangeAccount        = "svcIAM@owens-minor.com"
-    CredentialVaultScript  = "E:\Scripts\Encrypt_Creds.ps1"
-    CredentialFile         = "E:\Scripts\Passwords\creds.enc"
-    CredentialPassphrase   = ""
+    ExchangeAccount   = "svcIAM@owens-minor.com"
+    PasswordFile      = "E:\Scripts\Passwords\ExchangeOnline.xml"
     
     # Validation Settings
     ValidationDelaySeconds     = 10
@@ -597,35 +588,23 @@ function Connect-ExchangeOnlineSecure {
         
         Import-Module ExchangeOnlineManagement -ErrorAction Stop
 
-        # Decrypt ExchangeCreds from the CredentialVault .enc file.
-        # Matches the generated usage snippet:
-        #   . '...\Encrypt_Creds.ps1'
-        #   $creds = Unprotect-CredentialFile -Path '...\creds.enc' -Passphrase $pass
-        #   $psCred = ConvertTo-PSCredential -UserName $creds.Username -Password $creds.Password
-        $searchRoot = $script:ScriptRoot
-        $vaultScript = $script:Config.CredentialVaultScript
-        if ($vaultScript -and -not (Test-Path -LiteralPath $vaultScript)) {
-            Write-LogMessage "Configured vault script not found ($vaultScript); searching beside this script." -Level Debug -Indent 1
-            $vaultScript = $null
-        }
-
-        $credentialFile = $script:Config.CredentialFile
-        if ($credentialFile -and -not (Test-Path -LiteralPath $credentialFile)) {
-            $localCred = Join-Path $searchRoot (Split-Path -Leaf $credentialFile)
+        $passwordFile = $script:Config.PasswordFile
+        if ($passwordFile -and -not (Test-Path -LiteralPath $passwordFile)) {
+            $localCred = Join-Path $script:ScriptRoot (Split-Path -Leaf $passwordFile)
             if (Test-Path -LiteralPath $localCred) {
-                $credentialFile = $localCred
+                $passwordFile = $localCred
             }
         }
+        if (-not $passwordFile -or -not (Test-Path -LiteralPath $passwordFile)) {
+            throw "Exchange credential file not found: $($script:Config.PasswordFile). Run Set-ExchangeOnlineCredentialFile.ps1 to create or update it."
+        }
 
-        $passphrase = $script:Config.CredentialPassphrase
-        $credentials = Get-ExchangeOnlineVaultCredential `
-            -CredentialFile $credentialFile `
-            -VaultScript $vaultScript `
-            -SearchRoot $searchRoot `
-            -Passphrase $passphrase `
-            -FallbackUserName $script:Config.ExchangeAccount
+        $credentials = Import-Clixml -Path $passwordFile
+        if (-not $credentials -or -not $credentials.UserName) {
+            throw "Credential file '$passwordFile' did not contain a PSCredential. Recreate it with Set-ExchangeOnlineCredentialFile.ps1."
+        }
 
-        Write-LogMessage "Exchange credentials decrypted for $($credentials.UserName)" -Level Debug -Indent 1
+        Write-LogMessage "Exchange credentials loaded for $($credentials.UserName)" -Level Debug -Indent 1
         
         Connect-ExchangeOnline -Credential $credentials -ShowBanner:$false -ErrorAction Stop
         
@@ -2256,7 +2235,7 @@ function Start-Offboarding {
         Write-Host ("=" * 70) -ForegroundColor Cyan
         Write-Host "  USER OFFBOARDING SCRIPT v2.8 - Accendra / Apria / Byram" -ForegroundColor Cyan
         Write-Host "  Author: Anthony Blake | Enhanced: $(Get-Date -Format 'yyyy-MM-dd')" -ForegroundColor DarkCyan
-        Write-Host "  Exchange creds: CredentialVault (Unprotect-CredentialFile)" -ForegroundColor DarkCyan
+        Write-Host "  Exchange creds: Export-Clixml (Set-ExchangeOnlineCredentialFile.ps1)" -ForegroundColor DarkCyan
         Write-Host ("=" * 70) -ForegroundColor Cyan
         
         # Import required modules
