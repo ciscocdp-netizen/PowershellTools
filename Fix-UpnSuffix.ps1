@@ -9,10 +9,11 @@
     - GUI file picker to choose the CSV, with a path-prompt fallback (Server Core,
       remoting, or MTA sessions where WinForms dialogs fail).
     - Lets you map which CSV column identifies the user.
-    - Supports three ways to determine the CORRECT value:
-        1) a column that contains just the suffix        (e.g. "omi.com")
-        2) a column that contains the full correct UPN    (e.g. "user@omi.com")
-        3) a single suffix you type, applied to everyone   (e.g. "omi.com")
+    - Auto-detects every UPN suffix AD will accept in this forest
+      (current domain, every forest domain, and suffixes registered under
+      AD Domains and Trusts / CN=Partitions) and lets you pick ONE to apply
+      to every account in the CSV.
+    - Alternate path: a CSV column with the per-row suffix or full UPN.
     - Dry-run preview first. Nothing is written until you confirm.
     - Optional per-account confirmation.
     - Writes a text log and a results CSV next to the source file.
@@ -38,6 +39,10 @@
     discovery still runs unless it fails, in which case this server is used
     for reads as well.
 
+.PARAMETER Suffix
+    Apply this suffix to every account and skip the suffix picker.
+    Example: omi.com
+
 .PARAMETER SkipPause
     Skip the "Press ENTER to close" prompt (useful for automation).
 
@@ -46,6 +51,9 @@
 
 .EXAMPLE
     powershell -STA -ExecutionPolicy Bypass -File .\Fix-UpnSuffix.ps1 -CsvPath C:\Temp\users.csv
+
+.EXAMPLE
+    powershell -STA -ExecutionPolicy Bypass -File .\Fix-UpnSuffix.ps1 -CsvPath C:\Temp\users.csv -Suffix omi.com
 
 .NOTES
     Run from an elevated PowerShell session as an account with rights to modify users.
@@ -56,6 +64,7 @@
 param(
     [string]$CsvPath,
     [string]$Server,
+    [string]$Suffix,
     [switch]$SkipPause
 )
 
@@ -82,6 +91,8 @@ $script:DomainDcCache = @{}    # domain DNS -> writable DC hostname
 $script:WinFormsAvailable = $false
 $script:BatchSize    = 50
 $script:UserProperties = @("UserPrincipalName", "SamAccountName", "DistinguishedName", "Name")
+$script:CurrentDomainDns = $null
+$script:AvailableSuffixInfo = @()
 
 function Log {
     param([string]$Message, [string]$Level = "INFO")
@@ -452,6 +463,126 @@ function Get-WritableServerForUser {
     }
 }
 
+# ---------------------------------------------------- suffix discovery --------
+
+function Add-DiscoveredSuffix {
+    <# Merge a suffix + source label into a case-insensitive map of lists. #>
+    param(
+        [Parameter(Mandatory)] $Map,
+        [string] $Suffix,
+        [string] $Source
+    )
+    $normalized = Get-NormalizedSuffix -Value $Suffix
+    if ([string]::IsNullOrWhiteSpace($normalized) -or [string]::IsNullOrWhiteSpace($Source)) { return }
+
+    if (-not $Map.ContainsKey($normalized)) {
+        $Map[$normalized] = New-Object System.Collections.Generic.List[string]
+    }
+    foreach ($existing in $Map[$normalized]) {
+        if ($existing.Equals($Source, [StringComparison]::OrdinalIgnoreCase)) { return }
+    }
+    [void]$Map[$normalized].Add($Source)
+}
+
+function ConvertTo-SuffixInfoObjects {
+    <# Turn the discovery map into objects sorted with the current domain first. #>
+    param(
+        [Parameter(Mandatory)] $Map,
+        [string] $CurrentDomain
+    )
+    $items = foreach ($key in $Map.Keys) {
+        $sources = @($Map[$key])
+        $isCurrent = -not [string]::IsNullOrWhiteSpace($CurrentDomain) -and $key.Equals($CurrentDomain, [StringComparison]::OrdinalIgnoreCase)
+        [pscustomobject]@{
+            Suffix          = $key
+            Sources         = $sources
+            SourceLabel     = ($sources -join "; ")
+            IsCurrentDomain = [bool]$isCurrent
+        }
+    }
+    return @(
+        $items |
+            Sort-Object @{ Expression = { -not $_.IsCurrentDomain } }, @{ Expression = { $_.Suffix.ToLowerInvariant() } }
+    )
+}
+
+function Get-RegisteredPartitionUpnSuffixes {
+    <# Extra suffixes live on CN=Partitions in the configuration naming context. #>
+    param($Forest, [string] $Server)
+
+    $dn = $null
+    if ($Forest -and $Forest.PartitionsContainer) {
+        $dn = $Forest.PartitionsContainer
+    }
+    else {
+        try {
+            $dseParams = @{ ErrorAction = "Stop" }
+            if ($Server) { $dseParams.Server = $Server }
+            $dse = Get-ADRootDSE @dseParams
+            if ($dse.configurationNamingContext) {
+                $dn = "CN=Partitions,$($dse.configurationNamingContext)"
+            }
+        }
+        catch {
+            Log ("Could not read RootDSE for Partitions DN: {0}" -f $_.Exception.Message) "WARN"
+            return @()
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($dn)) { return @() }
+
+    try {
+        $params = @{
+            Identity   = $dn
+            Properties = @("uPNSuffixes")
+            ErrorAction = "Stop"
+        }
+        if ($Server) { $params.Server = $Server }
+        $obj = Get-ADObject @params
+        return @($obj.uPNSuffixes | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    }
+    catch {
+        Log ("Could not read Partitions uPNSuffixes: {0}" -f $_.Exception.Message) "WARN"
+        return @()
+    }
+}
+
+function Get-AvailableUpnSuffixes {
+    <#
+        Discover every UPN suffix Active Directory will accept:
+          - current domain DNS name
+          - every forest domain DNS name (implicit suffixes)
+          - additional suffixes registered on the forest / Partitions container
+        Returns Suffix / Sources / SourceLabel / IsCurrentDomain objects.
+    #>
+    param($Domain, $Forest)
+
+    $map = @{}
+    $current = $null
+    if ($Domain -and $Domain.DNSRoot) { $current = $Domain.DNSRoot }
+
+    if ($current) {
+        Add-DiscoveredSuffix -Map $map -Suffix $current -Source "Current domain"
+    }
+
+    if ($Forest) {
+        foreach ($d in @($Forest.Domains)) {
+            if ($current -and $d -and $d.Equals($current, [StringComparison]::OrdinalIgnoreCase)) {
+                continue
+            }
+            Add-DiscoveredSuffix -Map $map -Suffix $d -Source "Forest domain"
+        }
+        foreach ($s in @($Forest.UPNSuffixes)) {
+            Add-DiscoveredSuffix -Map $map -Suffix $s -Source "Forest UPN suffix"
+        }
+    }
+
+    foreach ($s in @(Get-RegisteredPartitionUpnSuffixes -Forest $Forest -Server $script:WriteServer)) {
+        Add-DiscoveredSuffix -Map $map -Suffix $s -Source "Registered on Partitions container"
+    }
+
+    return (ConvertTo-SuffixInfoObjects -Map $map -CurrentDomain $current)
+}
+
 # ---------------------------------------------------------------- prereqs -----
 
 function Assert-Prerequisites {
@@ -471,6 +602,7 @@ function Assert-Prerequisites {
     try {
         $domain = Get-ADDomain -ErrorAction Stop
         $script:WriteServer = if ($Server) { $Server } else { $domain.PDCEmulator }
+        $script:CurrentDomainDns = $domain.DNSRoot
         Write-Ok ("Connected to domain: {0} (NetBIOS: {1})" -f $domain.DNSRoot, $domain.NetBIOSName)
         Write-Ok ("Writable DC (this domain): {0}" -f $script:WriteServer)
         Log ("Connected to domain {0} / {1}; write DC {2}" -f $domain.DNSRoot, $domain.NetBIOSName, $script:WriteServer)
@@ -496,25 +628,34 @@ function Assert-Prerequisites {
         Log "GC discovery failed: $($_.Exception.Message)" "WARN"
     }
 
+    $forest = $null
     try {
         $forest = Get-ADForest -ErrorAction Stop
-        # Every domain DNS name is a valid UPN suffix, plus any explicitly added suffixes.
-        $raw = @($forest.Domains) + @($forest.UPNSuffixes)
-        $validSuffixes = @(
-            $raw |
-                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-                Sort-Object { $_.ToLowerInvariant() } -Unique
-        )
-        Write-Info "UPN suffixes available in this forest:"
-        $validSuffixes | ForEach-Object { Write-Host ("  - {0}" -f $_) }
-        Log ("Forest UPN suffixes: {0}" -f ($validSuffixes -join ", "))
-        return $validSuffixes
     }
     catch {
-        Write-Warn "Could not enumerate forest UPN suffixes (continuing anyway)."
-        Log "Could not enumerate forest UPN suffixes: $($_.Exception.Message)" "WARN"
-        return @()
+        Write-Warn "Could not read forest metadata (continuing with the current domain only)."
+        Log "Get-ADForest failed: $($_.Exception.Message)" "WARN"
     }
+
+    $script:AvailableSuffixInfo = @(Get-AvailableUpnSuffixes -Domain $domain -Forest $forest)
+    $validSuffixes = @($script:AvailableSuffixInfo | ForEach-Object { $_.Suffix })
+
+    if ($validSuffixes.Count -gt 0) {
+        Write-Info ("Auto-detected {0} available UPN suffix(es):" -f $validSuffixes.Count)
+        foreach ($item in $script:AvailableSuffixInfo) {
+            $marker = if ($item.IsCurrentDomain) { "  [current domain]" } else { "" }
+            Write-Host ("  @{0,-32} {1}{2}" -f $item.Suffix, $item.SourceLabel, $marker)
+        }
+        Log ("Available UPN suffixes: {0}" -f (
+            ($script:AvailableSuffixInfo | ForEach-Object { "{0} ({1})" -f $_.Suffix, $_.SourceLabel }) -join "; "
+        ))
+    }
+    else {
+        Write-Warn "No UPN suffixes could be auto-detected. You can type one later."
+        Log "No UPN suffixes auto-detected." "WARN"
+    }
+
+    return $validSuffixes
 }
 
 function Initialize-WinForms {
@@ -621,23 +762,67 @@ function Select-Column {
     }
 }
 
-function Select-Suffix {
-    param([string[]] $ValidSuffixes)
+function New-TargetChoice {
+    param(
+        [Parameter(Mandatory)] [string] $Mode,
+        [string] $Suffix,
+        [string] $ValueCol
+    )
+    return [pscustomobject]@{
+        Mode     = $Mode
+        Suffix   = $Suffix
+        ValueCol = $ValueCol
+    }
+}
 
-    $list = @(
-        $ValidSuffixes |
-            Where-Object { $_ } |
-            Sort-Object { $_.ToLowerInvariant() } -Unique
+function Select-CsvValueMode {
+    param([Parameter(Mandatory)] [string[]] $Columns)
+
+    Write-Section "Use a value from the CSV"
+    Write-Host "  [1] A column contains just the suffix          (e.g. omi.com)"
+    Write-Host "  [2] A column contains the full correct UPN     (e.g. user@omi.com)"
+    Write-Host "  [C] Cancel"
+    $sub = Read-Choice -Prompt "Choose 1 or 2" -Valid @("1", "2", "C")
+    if ($sub -eq "C") { return $null }
+
+    if ($sub -eq "1") {
+        $col = Select-Column -Columns $Columns -Purpose "correct suffix" `
+            -AutoDetect @("Suffix", "UPNSuffix", "NewSuffix", "CorrectSuffix", "Domain")
+        return (New-TargetChoice -Mode "SuffixColumn" -ValueCol $col)
+    }
+
+    $col = Select-Column -Columns $Columns -Purpose "full correct UPN" `
+        -AutoDetect @("NewUPN", "CorrectUPN", "NewUserPrincipalName", "TargetUPN")
+    return (New-TargetChoice -Mode "FullUpnColumn" -ValueCol $col)
+}
+
+function Select-TargetSuffix {
+    <#
+        Primary path: pick one auto-detected suffix and apply it to every CSV row.
+        Alternate path: type a custom suffix, or read the value from a CSV column.
+    #>
+    param(
+        $SuffixInfo,
+        [Parameter(Mandatory)] [string[]] $Columns
     )
 
-    Write-Section "Choose the suffix to apply to ALL accounts in the CSV"
+    $list = @($SuffixInfo | Where-Object { $_ -and $_.Suffix })
+    $validNames = @($list | ForEach-Object { $_.Suffix })
+
+    Write-Section "Choose the UPN suffix to apply to ALL accounts"
 
     if ($list.Count -gt 0) {
+        Write-Info ("Auto-detected {0} available suffix(es). Pick one to apply to every account." -f $list.Count)
         for ($i = 0; $i -lt $list.Count; $i++) {
-            Write-Host ("  [{0}] @{1}" -f ($i + 1), $list[$i])
+            $item = $list[$i]
+            $marker = if ($item.IsCurrentDomain) { " [current domain]" } else { "" }
+            Write-Host ("  [{0}] @{1}" -f ($i + 1), $item.Suffix) -NoNewline
+            Write-Host ("    {0}{1}" -f $item.SourceLabel, $marker) -ForegroundColor DarkGray
         }
         $customOption = $list.Count + 1
+        $csvOption    = $list.Count + 2
         Write-Host ("  [{0}] Type a custom suffix" -f $customOption)
+        Write-Host ("  [{0}] Use a CSV column instead (per-row suffix or full UPN)" -f $csvOption)
         Write-Host "  [C] Cancel"
 
         while ($true) {
@@ -650,22 +835,34 @@ function Select-Suffix {
             $n = 0
             if ([int]::TryParse($answer, [ref]$n)) {
                 if ($n -ge 1 -and $n -le $list.Count) {
-                    $chosen = $list[$n - 1]
-                    Write-Ok ("Selected suffix: @{0}" -f $chosen)
-                    Log ("Selected suffix from list: {0}" -f $chosen)
-                    return $chosen
+                    $chosen = $list[$n - 1].Suffix
+                    Write-Ok ("Selected suffix: @{0}  (applied to every account)" -f $chosen)
+                    Log ("Selected auto-detected suffix: {0}" -f $chosen)
+                    return (New-TargetChoice -Mode "SingleSuffix" -Suffix $chosen)
                 }
-                elseif ($n -eq $customOption) {
-                    return Read-CustomSuffix -ValidSuffixes $list
+                if ($n -eq $customOption) {
+                    $typed = Read-CustomSuffix -ValidSuffixes $validNames
+                    if (-not $typed) { return $null }
+                    return (New-TargetChoice -Mode "SingleSuffix" -Suffix $typed)
+                }
+                if ($n -eq $csvOption) {
+                    return (Select-CsvValueMode -Columns $Columns)
                 }
             }
-            Write-Warn ("Enter a number between 1 and {0}, or C to cancel." -f $customOption)
+            Write-Warn ("Enter a number between 1 and {0}, or C to cancel." -f $csvOption)
         }
     }
-    else {
-        Write-Warn "No forest UPN suffixes could be listed. Please type one."
-        return Read-CustomSuffix -ValidSuffixes @()
-    }
+
+    Write-Warn "No UPN suffixes could be auto-detected. You can type one or use a CSV column."
+    Write-Host "  [1] Type a suffix to apply to every account"
+    Write-Host "  [2] Use a CSV column instead (per-row suffix or full UPN)"
+    Write-Host "  [C] Cancel"
+    $fallback = Read-Choice -Prompt "Choose 1 or 2" -Valid @("1", "2", "C")
+    if ($fallback -eq "C") { return $null }
+    if ($fallback -eq "2") { return (Select-CsvValueMode -Columns $Columns) }
+    $typed = Read-CustomSuffix -ValidSuffixes @()
+    if (-not $typed) { return $null }
+    return (New-TargetChoice -Mode "SingleSuffix" -Suffix $typed)
 }
 
 function Read-CustomSuffix {
@@ -838,32 +1035,29 @@ function Main {
     $identityCol = Select-Column -Columns $columns -Purpose "user identity (UPN, sAMAccountName, or DN)" `
         -AutoDetect @("UserPrincipalName", "UPN", "SamAccountName", "sAMAccountName", "User", "Username", "LogonName", "DistinguishedName")
 
-    Write-Section "How should the correct UPN be determined?"
-    Write-Host "  [1] A column contains just the suffix          (e.g. omi.com)"
-    Write-Host "  [2] A column contains the full correct UPN     (e.g. user@omi.com)"
-    Write-Host "  [3] Apply one suffix I type to every account   (e.g. omi.com)"
-    $modeChoice = Read-Choice -Prompt "Choose 1, 2, or 3" -Valid @("1", "2", "3")
-
     $mode         = $null
     $valueCol     = $null
     $singleSuffix = $null
 
-    switch ($modeChoice) {
-        "1" {
-            $mode     = "SuffixColumn"
-            $valueCol = Select-Column -Columns $columns -Purpose "correct suffix" `
-                -AutoDetect @("Suffix", "UPNSuffix", "NewSuffix", "CorrectSuffix", "Domain")
+    if (-not [string]::IsNullOrWhiteSpace($Suffix)) {
+        $singleSuffix = Get-NormalizedSuffix -Value $Suffix
+        if ([string]::IsNullOrWhiteSpace($singleSuffix)) {
+            Write-Err "The -Suffix parameter is empty after normalization."
+            return
         }
-        "2" {
-            $mode     = "FullUpnColumn"
-            $valueCol = Select-Column -Columns $columns -Purpose "full correct UPN" `
-                -AutoDetect @("NewUPN", "CorrectUPN", "NewUserPrincipalName", "TargetUPN")
+        if ($suffixSet.Count -gt 0 -and -not (Test-SetContains -Set $suffixSet -Value $singleSuffix)) {
+            Write-Warn ("'{0}' was not in the auto-detected UPN suffix list. AD may reject it." -f $singleSuffix)
+            if (-not (Confirm-YesNo "Continue anyway?")) { return }
         }
-        "3" {
-            $mode         = "SingleSuffix"
-            $singleSuffix = Select-Suffix -ValidSuffixes $validSuffixes
-            if (-not $singleSuffix) { return }
-        }
+        $mode = "SingleSuffix"
+        Write-Ok ("Using suffix from -Suffix: @{0}  (applied to every account)" -f $singleSuffix)
+    }
+    else {
+        $choice = Select-TargetSuffix -SuffixInfo $script:AvailableSuffixInfo -Columns $columns
+        if (-not $choice) { return }
+        $mode         = $choice.Mode
+        $valueCol     = $choice.ValueCol
+        $singleSuffix = $choice.Suffix
     }
     Log ("Mode: {0}; IdentityCol: {1}; ValueCol: {2}; SingleSuffix: {3}" -f $mode, $identityCol, $valueCol, $singleSuffix)
 

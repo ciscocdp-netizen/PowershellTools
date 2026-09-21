@@ -91,6 +91,51 @@ def get_csv_delimiter(first_line: str) -> str:
     return ","
 
 
+def add_discovered_suffix(mapping: dict, suffix: str | None, source: str) -> None:
+    """Port of Add-DiscoveredSuffix (case-insensitive merge, first casing wins)."""
+    normalized = get_normalized_suffix(suffix)
+    if not normalized or not source or not source.strip():
+        return
+    key = normalized.lower()
+    if key not in mapping:
+        mapping[key] = {"suffix": normalized, "sources": []}
+    if source.lower() not in [s.lower() for s in mapping[key]["sources"]]:
+        mapping[key]["sources"].append(source)
+
+
+def convert_to_suffix_info_objects(mapping: dict, current_domain: str | None) -> list[dict]:
+    items = []
+    for entry in mapping.values():
+        suffix = entry["suffix"]
+        is_current = bool(current_domain and suffix.lower() == current_domain.lower())
+        items.append({
+            "Suffix": suffix,
+            "Sources": list(entry["sources"]),
+            "SourceLabel": "; ".join(entry["sources"]),
+            "IsCurrentDomain": is_current,
+        })
+    items.sort(key=lambda i: (not i["IsCurrentDomain"], i["Suffix"].lower()))
+    return items
+
+
+def discover_available_suffixes(current_dns: str | None, forest_domains: list[str],
+                                forest_upn_suffixes: list[str],
+                                partition_suffixes: list[str]) -> list[dict]:
+    """Port of Get-AvailableUpnSuffixes merge rules (no AD calls)."""
+    mapping: dict = {}
+    if current_dns:
+        add_discovered_suffix(mapping, current_dns, "Current domain")
+    for domain in forest_domains:
+        if current_dns and domain and domain.lower() == current_dns.lower():
+            continue
+        add_discovered_suffix(mapping, domain, "Forest domain")
+    for suffix in forest_upn_suffixes:
+        add_discovered_suffix(mapping, suffix, "Forest UPN suffix")
+    for suffix in partition_suffixes:
+        add_discovered_suffix(mapping, suffix, "Registered on Partitions container")
+    return convert_to_suffix_info_objects(mapping, current_dns)
+
+
 def get_normalized_suffix(value: str | None) -> str | None:
     if value is None or not str(value).strip():
         return None
@@ -302,6 +347,49 @@ class CsvDelimiterTests(unittest.TestCase):
         self.assertEqual(get_csv_delimiter("UserPrincipalName\tSuffix"), "\t")
 
 
+class SuffixDiscoveryTests(unittest.TestCase):
+    def test_merges_duplicate_sources_case_insensitively(self):
+        mapping: dict = {}
+        add_discovered_suffix(mapping, "@OMI.com", "Current domain")
+        add_discovered_suffix(mapping, "omi.com", "Current domain")
+        add_discovered_suffix(mapping, "omi.com", "Forest UPN suffix")
+        self.assertEqual(list(mapping), ["omi.com"])
+        self.assertEqual(mapping["omi.com"]["suffix"], "OMI.com")
+        self.assertEqual(
+            mapping["omi.com"]["sources"],
+            ["Current domain", "Forest UPN suffix"],
+        )
+
+    def test_current_domain_is_listed_first(self):
+        items = discover_available_suffixes(
+            current_dns="child.omi.com",
+            forest_domains=["omi.com", "CHILD.omi.com"],
+            forest_upn_suffixes=["contoso.com"],
+            partition_suffixes=["contoso.com", "partners.omi.com"],
+        )
+        self.assertEqual(
+            [i["Suffix"].lower() for i in items],
+            ["child.omi.com", "contoso.com", "omi.com", "partners.omi.com"],
+        )
+        self.assertTrue(items[0]["IsCurrentDomain"])
+        self.assertEqual(items[0]["Sources"], ["Current domain"])
+        # child domain is not also tagged as a forest domain
+        self.assertNotIn("Forest domain", items[0]["Sources"])
+        contoso = next(i for i in items if i["Suffix"].lower() == "contoso.com")
+        self.assertEqual(
+            contoso["Sources"],
+            ["Forest UPN suffix", "Registered on Partitions container"],
+        )
+
+    def test_strips_leading_at_and_full_upn(self):
+        mapping: dict = {}
+        add_discovered_suffix(mapping, "user@omi.com", "Forest UPN suffix")
+        self.assertEqual(mapping["omi.com"]["suffix"], "omi.com")
+
+    def test_empty_inputs_yield_empty_list(self):
+        self.assertEqual(discover_available_suffixes(None, [], [], []), [])
+
+
 class CollisionTests(unittest.TestCase):
     def test_duplicate_target_upn_flags_both_rows(self):
         rows = [
@@ -366,6 +454,10 @@ class ScriptSourceTests(unittest.TestCase):
             "Set-CollisionFlags",
             "Get-WritableServerForUser",
             "Import-UpnCsv",
+            "Get-AvailableUpnSuffixes",
+            "Add-DiscoveredSuffix",
+            "Select-TargetSuffix",
+            "Get-RegisteredPartitionUpnSuffixes",
         ):
             self.assertIn(f"function {name}", self.source)
 
@@ -403,7 +495,11 @@ class ScriptSourceTests(unittest.TestCase):
     def test_csv_import_is_array_wrapped_and_utf8(self):
         self.assertIn("@(Import-Csv", self.source)
         self.assertIn("-Encoding UTF8", self.source)
-        self.assertIn("forest.Domains", self.source)
+        self.assertIn("Forest.Domains", self.source)
+        self.assertIn("UPNSuffixes", self.source)
+        self.assertIn("PartitionsContainer", self.source)
+        self.assertIn("Select-TargetSuffix", self.source)
+        self.assertIn("applied to every account", self.source)
 
     def test_winforms_has_fallback(self):
         self.assertIn("Initialize-WinForms", self.source)
