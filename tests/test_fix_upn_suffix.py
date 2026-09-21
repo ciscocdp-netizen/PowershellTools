@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+"""Regression tests for Fix-UpnSuffix.ps1 helper logic and safeguards.
+
+PowerShell 5.1 / Active Directory are not available in this environment, so the
+pure helper algorithms are ported here and kept in lock-step with the script.
+The script source is also inspected to make sure the original bugs stay fixed.
+"""
+
+from __future__ import annotations
+
+import re
+import unittest
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = REPO_ROOT / "Fix-UpnSuffix.ps1"
+
+
+# ---------------------------------------------------------------------------
+# Ports of the PowerShell helpers (must match Fix-UpnSuffix.ps1)
+# ---------------------------------------------------------------------------
+
+def convert_to_ldap_filter_value(value: str) -> str:
+    out: list[str] = []
+    for ch in value:
+        code = ord(ch)
+        if code == 92:
+            out.append("\\5c")
+        elif code == 42:
+            out.append("\\2a")
+        elif code == 40:
+            out.append("\\28")
+        elif code == 41:
+            out.append("\\29")
+        elif code == 0:
+            out.append("\\00")
+        elif code < 32:
+            out.append(f"\\{code:02x}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def test_looks_like_dn(value: str) -> bool:
+    if not value or not value.strip():
+        return False
+    return bool(re.match(r"^(CN|OU|DC)=", value, re.I) and re.search(r",DC=", value, re.I))
+
+
+def get_sam_from_identity(value: str) -> str:
+    if not value:
+        return value
+    if "\\" in value:
+        return value.split("\\")[-1]
+    return value
+
+
+def test_upn_format(upn: str) -> bool:
+    if not upn or not upn.strip():
+        return False
+    return bool(re.match(r"^[^@\s]+@[^@\s]+$", upn))
+
+
+def get_upn_suffix(upn: str) -> str | None:
+    if not upn or "@" not in upn:
+        return None
+    return upn.split("@")[-1]
+
+
+def get_domain_dns_from_dn(dn: str) -> str | None:
+    if not dn or not dn.strip():
+        return None
+    parts = re.split(r"(?<!\\),", dn)
+    dcs = [re.sub(r"^DC=", "", p, flags=re.I) for p in parts if re.match(r"^DC=", p, re.I)]
+    if not dcs:
+        return None
+    return ".".join(dcs)
+
+
+def get_csv_delimiter(first_line: str) -> str:
+    if not first_line or not first_line.strip():
+        return ","
+    comma = first_line.count(",")
+    semi = first_line.count(";")
+    tab = first_line.count("\t")
+    if semi > comma and semi > tab:
+        return ";"
+    if tab > comma and tab > semi:
+        return "\t"
+    return ","
+
+
+def get_normalized_suffix(value: str | None) -> str | None:
+    if value is None or not str(value).strip():
+        return None
+    raw = str(value).strip().lstrip("@")
+    if not raw:
+        return None
+    if "@" in raw:
+        return raw.split("@")[-1]
+    return raw
+
+
+def get_new_upn(user_upn: str | None, user_sam: str | None, mode: str,
+                row_value: str | None = None, single_suffix: str | None = None) -> str | None:
+    prefix = None
+    if user_upn and "@" in user_upn:
+        prefix = user_upn.split("@")[0]
+    elif user_sam:
+        prefix = user_sam
+
+    if mode == "FullUpnColumn":
+        if row_value is None or not str(row_value).strip():
+            return None
+        return str(row_value).strip()
+
+    if mode == "SuffixColumn":
+        suffix = get_normalized_suffix(row_value)
+        if not suffix or not prefix:
+            return None
+        return f"{prefix}@{suffix}"
+
+    if mode == "SingleSuffix":
+        suffix = get_normalized_suffix(single_suffix)
+        if not suffix or not prefix:
+            return None
+        return f"{prefix}@{suffix}"
+
+    return None
+
+
+def classify_identity(value: str) -> str:
+    trimmed = value.strip()
+    if test_looks_like_dn(trimmed):
+        return "dn"
+    if "@" in trimmed:
+        return "upn"
+    return "sam"
+
+
+def flag_csv_collisions(rows: list[dict]) -> list[dict]:
+    """Mirror Set-CollisionFlags in-CSV pass (case-insensitive UPN keys)."""
+    first_row_by_upn: dict[str, int] = {}
+    by_row = {r["Row"]: r for r in rows}
+
+    for r in [x for x in rows if x["Status"] == "WillChange"]:
+        key = r["NewUPN"].lower()
+        if key in first_row_by_upn:
+            other = first_row_by_upn[key]
+            r["Status"] = "Collision"
+            r["Detail"] = f"Duplicate target UPN in this CSV (also row {other})"
+            first = by_row[other]
+            if first["Status"] == "WillChange":
+                first["Status"] = "Collision"
+                first["Detail"] = f"Duplicate target UPN in this CSV (also row {r['Row']})"
+        else:
+            first_row_by_upn[key] = r["Row"]
+    return rows
+
+
+def estimate_lookup_round_trips(identities: list[str], batch_size: int = 50) -> int:
+    """How many LDAP searches the batched resolver needs (no UPN-prefix fallback)."""
+    upns, sams, dns = set(), set(), set()
+    for raw in identities:
+        if not raw or not raw.strip():
+            continue
+        kind = classify_identity(raw)
+        value = raw.strip()
+        if kind == "dn":
+            dns.add(value.lower())
+        elif kind == "upn":
+            upns.add(value.lower())
+        else:
+            sams.add(get_sam_from_identity(value).lower())
+
+    def batches(n: int) -> int:
+        return 0 if n == 0 else (n + batch_size - 1) // batch_size
+
+    return batches(len(upns)) + batches(len(sams)) + batches(len(dns))
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+class LdapEscapeTests(unittest.TestCase):
+    def test_plain_value_unchanged(self):
+        self.assertEqual(convert_to_ldap_filter_value("jsmith"), "jsmith")
+
+    def test_escapes_rfc4515_metacharacters(self):
+        self.assertEqual(convert_to_ldap_filter_value(r"a*b(c)d\e"), r"a\2ab\28c\29d\5ce")
+
+    def test_escapes_nul_and_controls(self):
+        self.assertEqual(convert_to_ldap_filter_value("a\x00b\x1fc"), r"a\00b\1fc")
+
+    def test_apostrophe_is_literal(self):
+        # PowerShell -Filter "'O'Brien'" breaks; LDAP filter keeps the apostrophe.
+        self.assertEqual(convert_to_ldap_filter_value("O'Brien"), "O'Brien")
+
+    def test_upn_with_plus_and_dot(self):
+        self.assertEqual(
+            convert_to_ldap_filter_value("first.last+tag@omi.com"),
+            "first.last+tag@omi.com",
+        )
+
+
+class IdentityTests(unittest.TestCase):
+    def test_dn_cn(self):
+        self.assertTrue(test_looks_like_dn("CN=Jane Doe,OU=Users,DC=omi,DC=com"))
+        self.assertEqual(classify_identity("CN=Jane Doe,OU=Users,DC=omi,DC=com"), "dn")
+
+    def test_dn_ou_root(self):
+        self.assertTrue(test_looks_like_dn("OU=Contractors,DC=omi,DC=com"))
+
+    def test_original_dn_regex_missed_ou(self):
+        # The original script only accepted ^CN=.+,DC= so an OU= identity was treated as a SAM.
+        self.assertTrue(test_looks_like_dn("OU=People,DC=child,DC=omi,DC=com"))
+
+    def test_not_a_dn(self):
+        self.assertFalse(test_looks_like_dn("jsmith"))
+        self.assertFalse(test_looks_like_dn("jsmith@omi.com"))
+        self.assertFalse(test_looks_like_dn("CN=only"))
+
+    def test_sam_strips_domain_prefix(self):
+        self.assertEqual(get_sam_from_identity(r"OMI\jsmith"), "jsmith")
+        self.assertEqual(get_sam_from_identity("jsmith"), "jsmith")
+        self.assertEqual(classify_identity(r"OMI\jsmith"), "sam")
+
+    def test_upn_classification(self):
+        self.assertEqual(classify_identity("jane@old.omi.com"), "upn")
+
+
+class DomainFromDnTests(unittest.TestCase):
+    def test_child_domain(self):
+        dn = "CN=Joe,OU=Users,DC=child,DC=contoso,DC=com"
+        self.assertEqual(get_domain_dns_from_dn(dn), "child.contoso.com")
+
+    def test_escaped_comma_in_cn(self):
+        dn = r"CN=Doe\, John,OU=Users,DC=omi,DC=com"
+        self.assertEqual(get_domain_dns_from_dn(dn), "omi.com")
+
+    def test_empty(self):
+        self.assertIsNone(get_domain_dns_from_dn(""))
+
+
+class UpnBuilderTests(unittest.TestCase):
+    def test_suffix_column_keeps_existing_prefix(self):
+        self.assertEqual(
+            get_new_upn("jane.doe@old.local", "jdoe", "SuffixColumn", row_value="omi.com"),
+            "jane.doe@omi.com",
+        )
+
+    def test_suffix_column_falls_back_to_sam(self):
+        self.assertEqual(
+            get_new_upn(None, "jdoe", "SuffixColumn", row_value="omi.com"),
+            "jdoe@omi.com",
+        )
+
+    def test_suffix_column_strips_leading_at(self):
+        self.assertEqual(
+            get_new_upn("jane@old.local", "jdoe", "SuffixColumn", row_value="@omi.com"),
+            "jane@omi.com",
+        )
+
+    def test_suffix_column_accepts_full_upn_by_mistake(self):
+        self.assertEqual(
+            get_new_upn("jane@old.local", "jdoe", "SuffixColumn", row_value="someone@omi.com"),
+            "jane@omi.com",
+        )
+
+    def test_suffix_column_empty(self):
+        self.assertIsNone(get_new_upn("jane@old.local", "jdoe", "SuffixColumn", row_value="  "))
+
+    def test_full_upn_column(self):
+        self.assertEqual(
+            get_new_upn("jane@old.local", "jdoe", "FullUpnColumn", row_value=" jane@omi.com "),
+            "jane@omi.com",
+        )
+
+    def test_single_suffix(self):
+        self.assertEqual(
+            get_new_upn("jane@old.local", "jdoe", "SingleSuffix", single_suffix="omi.com"),
+            "jane@omi.com",
+        )
+
+    def test_upn_format(self):
+        self.assertTrue(test_upn_format("user@omi.com"))
+        self.assertFalse(test_upn_format("not-an-upn"))
+        self.assertFalse(test_upn_format("user@omi.com@extra"))
+        self.assertFalse(test_upn_format("user @omi.com"))
+
+
+class CsvDelimiterTests(unittest.TestCase):
+    def test_comma(self):
+        self.assertEqual(get_csv_delimiter("UserPrincipalName,Suffix"), ",")
+
+    def test_semicolon_excel(self):
+        self.assertEqual(get_csv_delimiter("UserPrincipalName;Suffix;Comment"), ";")
+
+    def test_tab(self):
+        self.assertEqual(get_csv_delimiter("UserPrincipalName\tSuffix"), "\t")
+
+
+class CollisionTests(unittest.TestCase):
+    def test_duplicate_target_upn_flags_both_rows(self):
+        rows = [
+            {"Row": 1, "NewUPN": "shared@omi.com", "Status": "WillChange", "Detail": ""},
+            {"Row": 2, "NewUPN": "SHARED@omi.com", "Status": "WillChange", "Detail": ""},
+            {"Row": 3, "NewUPN": "unique@omi.com", "Status": "WillChange", "Detail": ""},
+        ]
+        flag_csv_collisions(rows)
+        self.assertEqual(rows[0]["Status"], "Collision")
+        self.assertEqual(rows[1]["Status"], "Collision")
+        self.assertEqual(rows[2]["Status"], "WillChange")
+        self.assertIn("row 2", rows[0]["Detail"])
+        self.assertIn("row 1", rows[1]["Detail"])
+
+
+class EfficiencyTests(unittest.TestCase):
+    def test_batching_beats_per_row_lookups(self):
+        identities = [f"user{i:04d}@old.local" for i in range(200)]
+        # Original script: at least one Get-ADUser per row (often 2).
+        original_min = len(identities)
+        batched = estimate_lookup_round_trips(identities, batch_size=50)
+        self.assertEqual(batched, 4)
+        self.assertLess(batched, original_min / 10)
+
+    def test_mixed_identities_are_grouped(self):
+        ids = (
+            [f"u{i}@old.local" for i in range(10)]
+            + [f"sam{i}" for i in range(10)]
+            + [f"CN=User{i},DC=omi,DC=com" for i in range(3)]
+        )
+        # 1 UPN batch + 1 SAM batch + 1 DN batch
+        self.assertEqual(estimate_lookup_round_trips(ids, batch_size=50), 3)
+
+    def test_duplicates_do_not_add_queries(self):
+        ids = ["jane@old.local"] * 80
+        self.assertEqual(estimate_lookup_round_trips(ids, batch_size=50), 1)
+
+
+class ScriptSourceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = SCRIPT.read_text(encoding="utf-8")
+
+    def test_script_exists(self):
+        self.assertTrue(SCRIPT.is_file())
+        self.assertGreater(len(self.source), 5000)
+
+    def test_balanced_braces(self):
+        # Ignore braces inside single-quoted strings at a coarse level.
+        stripped = re.sub(r"'[^']*'", "''", self.source)
+        stripped = re.sub(r'"[^"]*"', '""', stripped)
+        self.assertEqual(stripped.count("{"), stripped.count("}"), "Unbalanced braces in script")
+
+    def test_required_functions_present(self):
+        for name in (
+            "ConvertTo-LdapFilterValue",
+            "Invoke-AdUserBatchLookup",
+            "Resolve-AdUsersFromIdentities",
+            "Get-NewUpn",
+            "Get-DomainDnsFromDn",
+            "Get-CsvDelimiter",
+            "Set-CollisionFlags",
+            "Get-WritableServerForUser",
+            "Import-UpnCsv",
+        ):
+            self.assertIn(f"function {name}", self.source)
+
+    def test_ldap_escape_sequences_present(self):
+        for token in (r"\5c", r"\2a", r"\28", r"\29", r"\00"):
+            self.assertIn(token, self.source)
+
+    def test_no_unescaped_filter_interpolation(self):
+        # Original bug: Get-ADUser -Filter "UserPrincipalName -eq '$id'"
+        self.assertNotRegex(
+            self.source,
+            r"""-Filter\s+["'][^"']*\$id""",
+            "Identity values must not be interpolated into an AD filter string",
+        )
+
+    def test_uses_ldap_batches_and_progress(self):
+        self.assertIn("LDAPFilter", self.source)
+        self.assertIn("$script:BatchSize", self.source)
+        self.assertIn("Write-Progress", self.source)
+        self.assertIn("ResultPageSize", self.source)
+
+    def test_pins_dc_and_uses_global_catalog(self):
+        self.assertIn("PDCEmulator", self.source)
+        self.assertIn("GlobalCatalog", self.source)
+        self.assertIn(":3268", self.source)
+        self.assertIn("Get-WritableServerForUser", self.source)
+
+    def test_set_aduser_uses_distinguished_name(self):
+        self.assertRegex(
+            self.source,
+            r"if \(\$r\.DistinguishedName\) \{ \$r\.DistinguishedName \} else \{ \$r\.SamAccount \}",
+        )
+        self.assertIn("Set-ADUser @setParams", self.source)
+
+    def test_csv_import_is_array_wrapped_and_utf8(self):
+        self.assertIn("@(Import-Csv", self.source)
+        self.assertIn("-Encoding UTF8", self.source)
+        self.assertIn("forest.Domains", self.source)
+
+    def test_winforms_has_fallback(self):
+        self.assertIn("Initialize-WinForms", self.source)
+        self.assertIn("Enter the full path to the CSV file", self.source)
+        self.assertIn("SkipPause", self.source)
+
+    def test_original_rootdomain_only_suffix_list_is_gone(self):
+        self.assertNotIn("forest.RootDomain", self.source)
+
+    def test_requires_powershell_51(self):
+        self.assertIn("#Requires -Version 5.1", self.source)
+        self.assertNotRegex(self.source, r"\?\?", "Null-coalescing ?? is PowerShell 7+")
+        self.assertNotIn("?.", self.source)
+
+
+if __name__ == "__main__":
+    unittest.main()
