@@ -20,10 +20,9 @@
           - Cross-domain     : corporate.apria.com (Apria)
                                corp.byramhealthcare.com (Byram)
           - Cloud            : ALL Entra ID + Exchange Online actions
-          - Accendra is now the anchor domain. Per configuration, the Accendra AD user
-            object carries the SAME cross-domain SID attributes as the old OMI object
-            (omiApriaSID / omiByramSID), so the Apria and Byram accounts are located
-            from those attributes read off the Accendra user.
+          - Accendra is now the anchor domain. The Accendra AD user object carries
+            cross-domain SID attributes (accAapriaSID / accByramSID) used to locate
+            the Apria and Byram accounts.
 
       * SISTER SCRIPT (User-Offboarding-OMI-Halyard.ps1):
           - Handles OMI (omi.com, its main domain) and Halyard (hcus.corp),
@@ -104,8 +103,15 @@ $script:Config = @{
   # ------------------------------------------------------------------------
   Domains           = @{
   Main     = "corporateacc.com"          # Accendra - primary/anchor domain
-  Apria    = "corporate.apria.com"       # Apria - cross-domain (via omiApriaSID)
-  Byram    = "corp.byramhealthcare.com"  # Byram - cross-domain (via omiByramSID)
+  Apria    = "corporate.apria.com"       # Apria - cross-domain (via accAapriaSID)
+  Byram    = "corp.byramhealthcare.com"  # Byram - cross-domain (via accByramSID)
+  }
+
+  # SID attributes on the Accendra user that point at the linked Apria/Byram accounts.
+  # Empty values mean the user has no account in that domain; that is not an error.
+  CrossDomainSidAttributes = @{
+      Apria = 'accAapriaSID'
+      Byram = 'accByramSID'
   }
   
   # Cross-Domain IAM Hold OUs (Apria + Byram are in scope for this script)
@@ -658,20 +664,21 @@ function Get-ADUserDetailedInfo {
         [string]$PDCEmulator
     )
     
-    # Accendra is the anchor object for this script. If the schema still has
-    # omiApriaSID / omiByramSID, those values locate the Apria and Byram accounts.
-    # Those attributes are optional: they are not in every Accendra domain schema.
+    # Accendra is the anchor object. accAapriaSID / accByramSID locate the linked
+    # Apria and Byram accounts when those attributes have values.
+    $apriaAttr = $script:Config.CrossDomainSidAttributes.Apria
+    $byramAttr = $script:Config.CrossDomainSidAttributes.Byram
     $coreProperties = @(
         'Enabled', 'Description', 'PasswordLastSet', 'LastLogonDate',
         'Manager', 'DistinguishedName', 'SID', 'whenCreated', 'whenChanged',
         'memberOf'
     )
-    $optionalSidProperties = @('omiApriaSID', 'omiByramSID')
+    $sidProperties = @($apriaAttr, $byramAttr)
     
     try {
         $properties = @($coreProperties)
         if ($script:CrossDomainSidAttributesAvailable -ne $false) {
-            $properties += $optionalSidProperties
+            $properties += $sidProperties
         }
 
         try {
@@ -679,9 +686,7 @@ function Get-ADUserDetailedInfo {
             $script:CrossDomainSidAttributesAvailable = $true
         }
         catch {
-            $message = $_.Exception.Message
-            if ($message -match 'omiApriaSID|omiByramSID|properties are invalid') {
-                Write-LogMessage "Cross-domain SID attributes are not in this domain schema ($message). Continuing with Accendra only." -Level Warning
+            if ($_.Exception.Message -match 'properties are invalid') {
                 $script:CrossDomainSidAttributesAvailable = $false
                 $user = Get-ADUser -Identity $SamAccountName -Server $PDCEmulator -Properties $coreProperties -ErrorAction Stop
             }
@@ -692,14 +697,13 @@ function Get-ADUserDetailedInfo {
 
         $apriaSid = $null
         $byramSid = $null
-        if ($user.PSObject.Properties['omiApriaSID'] -and $user.omiApriaSID) {
-            $apriaSid = $user.omiApriaSID
+        if ($user.PSObject.Properties[$apriaAttr] -and $user.$apriaAttr) {
+            $apriaSid = $user.$apriaAttr
         }
-        if ($user.PSObject.Properties['omiByramSID'] -and $user.omiByramSID) {
-            $byramSid = $user.omiByramSID
+        if ($user.PSObject.Properties[$byramAttr] -and $user.$byramAttr) {
+            $byramSid = $user.$byramAttr
         }
         
-        # Get manager details if available
         $managerName = "Not Assigned"
         if ($user.Manager) {
             try {
@@ -1771,8 +1775,8 @@ function Process-SingleUser {
         }
         
         # Cross-domain operations (this script: Apria + Byram).
-        # Both accounts are located via the omiApriaSID / omiByramSID attributes read
-        # off the Accendra (main) user object above in Get-ADUserDetailedInfo.
+        # Accounts are located via accAapriaSID / accByramSID on the Accendra user.
+        # No SID value means no linked account in that domain; skip quietly.
         $domains = $script:Config.Domains
         
         if ($adDetails.CrossDomainSIDs.Apria -and $script:PDCEmulators.ContainsKey($domains.Apria)) {
