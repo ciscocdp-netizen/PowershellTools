@@ -38,6 +38,7 @@ $updater = Get-Content -Raw -Path (Join-Path $repo 'Set-ExchangeOnlineCredential
 Assert-True ($offboard -match 'CertificateThumbprint') 'Offboarding uses certificate thumbprint for Exchange'
 Assert-True ($offboard -match 'accAapriaSID') 'Apria SID attribute is accAapriaSID'
 Assert-True ($offboard -match 'accByramSID') 'Byram SID attribute is accByramSID'
+Assert-True ($offboard -match 'Get-ADUserSidAttribute') 'SID attributes are loaded independently'
 Assert-True ($offboard -match '-AppId') 'Offboarding passes Exchange AppId'
 Assert-True ($offboard -match '-Organization') 'Offboarding passes Exchange organization'
 Assert-True ($offboard -notmatch 'Connect-ExchangeOnline -Credential') 'Offboarding no longer uses a stored Exchange password'

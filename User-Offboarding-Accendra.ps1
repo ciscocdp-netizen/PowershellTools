@@ -152,7 +152,6 @@ $script:ExchangeConnected = $false
 $script:ScriptStartTime = Get-Date
 $script:ErrorCount = 0
 $script:WarningCount = 0
-$script:CrossDomainSidAttributesAvailable = $null
 
 # ============================================================================
 # ENUMERATIONS FOR STATUS TRACKING
@@ -654,6 +653,52 @@ function Get-GraphUserInfo {
     }
 }
 
+function Get-ADAttributeText {
+    param($User, [string]$AttributeName)
+    if (-not $User -or [string]::IsNullOrWhiteSpace($AttributeName)) {
+        return $null
+    }
+
+    $prop = $User.PSObject.Properties | Where-Object { $_.Name -ieq $AttributeName } | Select-Object -First 1
+    $value = $null
+    if ($prop) {
+        $value = $prop.Value
+    }
+    else {
+        try { $value = $User.$AttributeName } catch { $value = $null }
+    }
+
+    if ($null -eq $value -or $value -eq '') {
+        return $null
+    }
+    if ($value -is [System.Security.Principal.SecurityIdentifier]) {
+        return $value.Value
+    }
+    $text = [string]$value
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return $null
+    }
+    return $text
+}
+
+function Get-ADUserSidAttribute {
+    param(
+        [string]$SamAccountName,
+        [string]$PDCEmulator,
+        [string]$AttributeName
+    )
+    if ([string]::IsNullOrWhiteSpace($AttributeName)) {
+        return $null
+    }
+    try {
+        $extra = Get-ADUser -Identity $SamAccountName -Server $PDCEmulator -Properties $AttributeName -ErrorAction Stop
+        return (Get-ADAttributeText -User $extra -AttributeName $AttributeName)
+    }
+    catch {
+        return $null
+    }
+}
+
 function Get-ADUserDetailedInfo {
     [CmdletBinding()]
     param(
@@ -682,36 +727,14 @@ function Get-ADUserDetailedInfo {
         'Manager', 'DistinguishedName', 'SID', 'whenCreated', 'whenChanged',
         'memberOf'
     )
-    $sidProperties = @($apriaAttr, $byramAttr) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
     
     try {
-        $properties = @($coreProperties)
-        if ($script:CrossDomainSidAttributesAvailable -ne $false -and $sidProperties.Count -gt 0) {
-            $properties = @($coreProperties + $sidProperties)
-        }
+        $user = Get-ADUser -Identity $SamAccountName -Server $PDCEmulator -Properties $coreProperties -ErrorAction Stop
 
-        try {
-            $user = Get-ADUser -Identity $SamAccountName -Server $PDCEmulator -Properties $properties -ErrorAction Stop
-            $script:CrossDomainSidAttributesAvailable = $true
-        }
-        catch {
-            if ($_.Exception.Message -match 'properties are invalid|null value') {
-                $script:CrossDomainSidAttributesAvailable = $false
-                $user = Get-ADUser -Identity $SamAccountName -Server $PDCEmulator -Properties $coreProperties -ErrorAction Stop
-            }
-            else {
-                throw
-            }
-        }
-
-        $apriaSid = $null
-        $byramSid = $null
-        if ($apriaAttr -and $user.PSObject.Properties[$apriaAttr] -and $user.$apriaAttr) {
-            $apriaSid = $user.$apriaAttr
-        }
-        if ($byramAttr -and $user.PSObject.Properties[$byramAttr] -and $user.$byramAttr) {
-            $byramSid = $user.$byramAttr
-        }
+        # Load each SID attribute separately so a missing Apria attribute does
+        # not hide a populated Byram SID (or the other way around).
+        $apriaSid = Get-ADUserSidAttribute -SamAccountName $SamAccountName -PDCEmulator $PDCEmulator -AttributeName $apriaAttr
+        $byramSid = Get-ADUserSidAttribute -SamAccountName $SamAccountName -PDCEmulator $PDCEmulator -AttributeName $byramAttr
         
         $managerName = "Not Assigned"
         if ($user.Manager) {
