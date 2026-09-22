@@ -91,6 +91,27 @@ def get_csv_delimiter(first_line: str) -> str:
     return ","
 
 
+def get_adws_server_name(server: str | None) -> str | None:
+    if server is None or not str(server).strip():
+        return None
+    name = str(server).strip()
+    if name.lower().endswith(":3268"):
+        return name[:-5]
+    return name
+
+
+def get_ad_lookup_servers(preferred: str | None, query_server: str | None,
+                          write_server: str | None) -> list[str]:
+    names: list[str] = []
+    for raw in (preferred, query_server, write_server):
+        name = get_adws_server_name(raw)
+        if not name:
+            continue
+        if not any(existing.lower() == name.lower() for existing in names):
+            names.append(name)
+    return names
+
+
 def add_discovered_suffix(mapping: dict, suffix: str | None, source: str) -> None:
     """Port of Add-DiscoveredSuffix (case-insensitive merge, first casing wins)."""
     normalized = get_normalized_suffix(suffix)
@@ -347,6 +368,27 @@ class CsvDelimiterTests(unittest.TestCase):
         self.assertEqual(get_csv_delimiter("UserPrincipalName\tSuffix"), "\t")
 
 
+class AdwsServerTests(unittest.TestCase):
+    def test_strips_gc_ldap_port(self):
+        self.assertEqual(get_adws_server_name("dc01.omi.com:3268"), "dc01.omi.com")
+        self.assertEqual(get_adws_server_name("DC01.OMI.COM:3268"), "DC01.OMI.COM")
+
+    def test_leaves_plain_hostname(self):
+        self.assertEqual(get_adws_server_name("dc01.omi.com"), "dc01.omi.com")
+
+    def test_empty(self):
+        self.assertIsNone(get_adws_server_name(""))
+        self.assertIsNone(get_adws_server_name(None))
+
+    def test_lookup_server_list_dedupes_and_strips_port(self):
+        servers = get_ad_lookup_servers(
+            preferred="gc.omi.com:3268",
+            query_server="gc.omi.com",
+            write_server="pdc.omi.com",
+        )
+        self.assertEqual(servers, ["gc.omi.com", "pdc.omi.com"])
+
+
 class SuffixDiscoveryTests(unittest.TestCase):
     def test_merges_duplicate_sources_case_insensitively(self):
         mapping: dict = {}
@@ -438,9 +480,11 @@ class ScriptSourceTests(unittest.TestCase):
         self.assertGreater(len(self.source), 5000)
 
     def test_balanced_braces(self):
-        # Ignore braces inside single-quoted strings at a coarse level.
-        stripped = re.sub(r"'[^']*'", "''", self.source)
+        # Ignore comment-based help, line comments, and quoted strings.
+        stripped = re.sub(r"<#.*?#>", "", self.source, flags=re.S)
+        stripped = re.sub(r"'[^']*'", "''", stripped)
         stripped = re.sub(r'"[^"]*"', '""', stripped)
+        stripped = re.sub(r"#[^\n]*", "", stripped)
         self.assertEqual(stripped.count("{"), stripped.count("}"), "Unbalanced braces in script")
 
     def test_required_functions_present(self):
@@ -458,6 +502,8 @@ class ScriptSourceTests(unittest.TestCase):
             "Add-DiscoveredSuffix",
             "Select-TargetSuffix",
             "Get-RegisteredPartitionUpnSuffixes",
+            "Get-AdwsServerName",
+            "Get-AdLookupServers",
         ):
             self.assertIn(f"function {name}", self.source)
 
@@ -479,11 +525,14 @@ class ScriptSourceTests(unittest.TestCase):
         self.assertIn("Write-Progress", self.source)
         self.assertIn("ResultPageSize", self.source)
 
-    def test_pins_dc_and_uses_global_catalog(self):
+    def test_pins_dc_and_uses_adws_not_gc_ldap_port(self):
         self.assertIn("PDCEmulator", self.source)
         self.assertIn("GlobalCatalog", self.source)
-        self.assertIn(":3268", self.source)
         self.assertIn("Get-WritableServerForUser", self.source)
+        self.assertIn("Get-AdwsServerName", self.source)
+        self.assertNotIn('"{0}:3268"', self.source)
+        self.assertNotIn("List[object]", self.source)
+        self.assertIn("System.Collections.ArrayList", self.source)
 
     def test_set_aduser_uses_distinguished_name(self):
         self.assertRegex(

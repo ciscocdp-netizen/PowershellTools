@@ -20,8 +20,9 @@
 
     Performance and correctness (vs. the original per-row Get-ADUser loop):
     - Resolves users in LDAP batches (default 50) instead of 1-3 queries per row.
-    - Pins reads to a Global Catalog and writes to a writable DC so multi-domain
-      forests resolve correctly and changes are not lost to replication lag.
+    - Pins reads and writes to a reachable DC over ADWS (not LDAP port 3268,
+      which Get-ADUser cannot use). Writes still go to a writable DC for the
+      user's domain so changes are not lost to replication lag.
     - Escapes LDAP filter metacharacters so identities with * ( ) \ or quotes
       cannot break or broaden the search.
     - Detects in-CSV and in-AD UPN collisions before applying anything.
@@ -85,7 +86,7 @@ function Write-Section { param([string]$Message)
 
 $script:LogLines     = New-Object System.Collections.Generic.List[string]
 $script:LastResults  = $null
-$script:QueryServer  = $null   # Global Catalog host:port for reads
+$script:QueryServer  = $null   # DC hostname for Get-AD* reads (ADWS, no :3268)
 $script:WriteServer  = $null   # Writable DC for the connected domain
 $script:DomainDcCache = @{}    # domain DNS -> writable DC hostname
 $script:WinFormsAvailable = $false
@@ -277,10 +278,40 @@ function Get-NewUpn {
     return $null
 }
 
+function Get-AdwsServerName {
+    <#
+        Get-ADUser talks to Active Directory Web Services (TCP 9389), not LDAP.
+        "host:3268" (the GC LDAP port) makes ADWS fail with "Unable to contact
+        the server" / "does not have the Active Directory Web Services running".
+    #>
+    param([string]$Server)
+    if ([string]::IsNullOrWhiteSpace($Server)) { return $null }
+    $name = $Server.Trim()
+    if ($name -match '^(.+):3268$') { return $Matches[1] }
+    return $name
+}
+
+function Get-AdLookupServers {
+    param([string]$Preferred)
+    $names = New-Object System.Collections.Generic.List[string]
+    foreach ($raw in @($Preferred, $script:QueryServer, $script:WriteServer)) {
+        $name = Get-AdwsServerName -Server $raw
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+        $dup = $false
+        foreach ($existing in $names) {
+            if ($existing.Equals($name, [StringComparison]::OrdinalIgnoreCase)) { $dup = $true; break }
+        }
+        if (-not $dup) { [void]$names.Add($name) }
+    }
+    return @($names)
+}
+
 function Invoke-AdUserBatchLookup {
     <#
         Look up users in chunks with a single LDAP OR filter per chunk.
         Returns a case-insensitive hashtable keyed by the requested attribute value.
+        If the preferred server is unreachable, retries the same batch on the
+        writable DC before falling back to one-by-one.
     #>
     param(
         [Parameter(Mandatory)] [string]   $AttributeName,
@@ -300,6 +331,8 @@ function Invoke-AdUserBatchLookup {
 
     $props = if ($Properties) { $Properties } else { $script:UserProperties }
     $total = $unique.Count
+    $servers = @(Get-AdLookupServers -Preferred $Server)
+    if ($servers.Count -eq 0) { $servers = @($null) }
 
     for ($i = 0; $i -lt $unique.Count; $i += $script:BatchSize) {
         $end   = [Math]::Min($i + $script:BatchSize - 1, $unique.Count - 1)
@@ -313,22 +346,37 @@ function Invoke-AdUserBatchLookup {
         }
         $ldap = "(|{0})" -f ($parts -join "")
 
-        $params = @{
-            LDAPFilter     = $ldap
-            Properties     = $props
-            ResultPageSize = 200
-            ErrorAction    = "Stop"
-        }
-        if ($Server) { $params.Server = $Server }
-
         $users = $null
-        try {
-            $users = @(Get-ADUser @params)
+        $lastError = $null
+        foreach ($candidate in $servers) {
+            $params = @{
+                LDAPFilter     = $ldap
+                Properties     = $props
+                ResultPageSize = 200
+                ErrorAction    = "Stop"
+            }
+            if ($candidate) { $params.Server = $candidate }
+            try {
+                $users = @(Get-ADUser @params)
+                $lastError = $null
+                if ($candidate) {
+                    $script:QueryServer = $candidate
+                    $servers = @($candidate) + @($servers | Where-Object { $_ -and -not $_.Equals($candidate, [StringComparison]::OrdinalIgnoreCase) })
+                }
+                break
+            }
+            catch {
+                $lastError = $_
+                Write-Warn ("Batch {0} lookup failed on {1}: {2}" -f $AttributeName, $candidate, $_.Exception.Message)
+                Log ("Batch lookup failed for {0} on {1}: {2}" -f $AttributeName, $candidate, $_.Exception.Message) "WARN"
+            }
         }
-        catch {
-            Write-Warn ("Batch {0} lookup failed: {1}. Falling back to one-by-one." -f $AttributeName, $_.Exception.Message)
-            Log ("Batch lookup failed for {0}: {1}" -f $AttributeName, $_.Exception.Message) "WARN"
-            $users = New-Object System.Collections.Generic.List[object]
+
+        if ($lastError -and $null -eq $users) {
+            Write-Warn ("Falling back to one-by-one {0} lookup." -f $AttributeName)
+            $fallbackServer = $null
+            if ($servers.Count -gt 0) { $fallbackServer = $servers[-1] }
+            $collected = New-Object System.Collections.ArrayList
             foreach ($v in $batch) {
                 try {
                     $one = @{
@@ -336,18 +384,19 @@ function Invoke-AdUserBatchLookup {
                         Properties  = $props
                         ErrorAction = "Stop"
                     }
-                    if ($Server) { $one.Server = $Server }
-                    $u = Get-ADUser @one
-                    if ($u) { [void]$users.Add($u) }
+                    if ($fallbackServer) { $one.Server = $fallbackServer }
+                    foreach ($u in @(Get-ADUser @one)) {
+                        if ($u) { [void]$collected.Add($u) }
+                    }
                 }
                 catch {
                     # Not found or inaccessible — leave it unresolved.
                 }
             }
-            $users = @($users)
+            $users = @($collected)
         }
 
-        foreach ($u in $users) {
+        foreach ($u in @($users)) {
             if (-not $u) { continue }
             $key = $null
             switch ($AttributeName) {
@@ -618,13 +667,14 @@ function Assert-Prerequisites {
     try {
         $gc = Get-ADDomainController -Discover -Service GlobalCatalog -ErrorAction Stop
         if ($gc -and $gc.HostName) {
-            $script:QueryServer = "{0}:3268" -f $gc.HostName
-            Write-Ok ("Global Catalog (reads): {0}" -f $script:QueryServer)
-            Log ("Using Global Catalog {0} for reads" -f $script:QueryServer)
+            # Hostname only. Do not append :3268 — Get-ADUser uses ADWS (9389), not LDAP GC.
+            $script:QueryServer = $gc.HostName
+            Write-Ok ("Global Catalog host for reads (ADWS): {0}" -f $script:QueryServer)
+            Log ("Using GC host {0} for reads via ADWS" -f $script:QueryServer)
         }
     }
     catch {
-        Write-Warn "Could not discover a Global Catalog. Lookups are limited to the connected domain."
+        Write-Warn "Could not discover a Global Catalog. Lookups use the writable DC."
         Log "GC discovery failed: $($_.Exception.Message)" "WARN"
     }
 
@@ -1078,7 +1128,7 @@ function Main {
         @{}
     }
 
-    $results = New-Object System.Collections.Generic.List[object]
+    $results = New-Object System.Collections.ArrayList
     $counter = 0
     $total   = $rows.Count
 
