@@ -31,6 +31,10 @@
     24-48 hours. Pass -DataSource ExchangeLive for real-time Get-EXOMailbox
     values (much slower; tokens are refreshed before the one-hour expiry).
 
+    F1 (frontline) licensed mailboxes are reported as a separate tier. They are
+    expected to sit on the -F1QuotaGB cap (default 50 GB), are listed in their
+    own CSV with usage, and are never remediated to 100 GB.
+
     Nothing is changed unless you pass -Remediate (which honors -WhatIf and
     -Confirm via ShouldProcess). Remediation uses Exchange Online only for the
     mailboxes that actually need a quota fix.
@@ -78,6 +82,16 @@
       now the Graph mailbox usage report (quotas + size in one CSV). Exchange
       live queries remain available via -DataSource ExchangeLive, with token
       refresh and optional app-only certificate auth.
+    - Evaluating ~30k report rows made ~100 small helper calls per mailbox
+      (Get-PropertyValue / ConvertTo-Bytes / Format-GB ...). Windows PowerShell
+      5.1 spends most of the run there. The usage-report path now resolves CSV
+      columns once and parses numbers with TryParse, and the license lookup
+      reads Graph objects directly. Every phase prints its elapsed time.
+    - A missing Reports.Read.All grant silently fell back to the multi-hour
+      ExchangeLive path. The script now stops with instructions unless
+      -AllowExchangeLiveFallback is set.
+    - F1 licensed users were ignored (or would have been flagged as "not
+      100 GB"). They are tracked separately against -F1QuotaGB (50 GB).
 
 .PARAMETER OutputFolder
     Folder where CSV and HTML reports are written. Defaults to the current directory.
@@ -105,6 +119,27 @@
 
 .PARAMETER E5SkuPartNumber
     Graph SkuPartNumber values treated as E5. Default ENTERPRISEPREMIUM, SPE_E5.
+
+.PARAMETER F1SkuPartNumber
+    Graph SkuPartNumber values treated as frontline (F1) licenses. Default
+    M365_F1 (Microsoft 365 F1), SPE_F1 (Microsoft 365 F3, formerly F1) and
+    DESKLESSPACK (Office 365 F3). F1 mailboxes are reported against
+    -F1QuotaGB instead of the 100 GB target and are never remediated.
+
+.PARAMETER F1QuotaGB
+    Expected ProhibitSendReceiveQuota for F1-licensed mailboxes. Default 50.
+    F1 mailboxes at or above -NearLimitPercent of their cap are listed in the
+    near-limit report and in a dedicated F1 CSV.
+
+.PARAMETER AllowExchangeLiveFallback
+    Switch. When the Graph mailbox usage report cannot be downloaded (usually a
+    missing Reports.Read.All grant), fall back to the slow ExchangeLive path
+    instead of stopping. Off by default so a permissions problem does not
+    silently turn a five-minute run into a multi-hour one.
+
+.PARAMETER HtmlMaxRows
+    Maximum rows rendered per table in the HTML summary. Default 1000. The CSV
+    files always contain every row.
 
 .PARAMETER Identity
     Optional UPN / SMTP / alias list. When set, only those mailboxes are evaluated.
@@ -168,6 +203,9 @@
     .\Report-MailboxQuotaCompliance.ps1 -OutputFolder C:\Reports
 
 .EXAMPLE
+    .\Report-MailboxQuotaCompliance.ps1 -F1SkuPartNumber M365_F1, SPE_F1 -F1QuotaGB 50 -OutputFolder C:\Reports
+
+.EXAMPLE
     .\Report-MailboxQuotaCompliance.ps1 -DataSource ExchangeLive -SkipStatistics
 
 .EXAMPLE
@@ -201,6 +239,12 @@ param(
     [int]        $QuotaToleranceMB     = 2,
     [string[]]   $E3SkuPartNumber      = @('ENTERPRISEPACK', 'SPE_E3'),
     [string[]]   $E5SkuPartNumber      = @('ENTERPRISEPREMIUM', 'SPE_E5'),
+    [string[]]   $F1SkuPartNumber      = @('M365_F1', 'SPE_F1', 'DESKLESSPACK'),
+    [ValidateRange(1, 1024)]
+    [int]        $F1QuotaGB            = 50,
+    [switch]     $AllowExchangeLiveFallback,
+    [ValidateRange(50, 100000)]
+    [int]        $HtmlMaxRows          = 1000,
     [string[]]   $Identity             = @(),
     [string[]]   $RecipientTypeDetails = @('UserMailbox'),
     [string]     $UserPrincipalName,
@@ -801,7 +845,8 @@ function New-QuotaPolicy {
         [int]$IssueWarningQuotaGB,
         [int]$LegacyQuotaGB,
         [int]$NearLimitPercent,
-        [int]$QuotaToleranceMB
+        [int]$QuotaToleranceMB,
+        [int]$F1QuotaGB = 50
     )
 
     if ($IssueWarningQuotaGB -ge $ProhibitSendQuotaGB -or $ProhibitSendQuotaGB -ge $TargetStorageQuotaGB) {
@@ -813,13 +858,161 @@ function New-QuotaPolicy {
         ProhibitSendQuotaGB  = $ProhibitSendQuotaGB
         IssueWarningQuotaGB  = $IssueWarningQuotaGB
         LegacyQuotaGB        = $LegacyQuotaGB
+        F1QuotaGB            = $F1QuotaGB
         NearLimitPercent     = $NearLimitPercent
         TargetStorageBytes   = [double]$TargetStorageQuotaGB * 1GB
         TargetSendBytes      = [double]$ProhibitSendQuotaGB * 1GB
         TargetWarnBytes      = [double]$IssueWarningQuotaGB * 1GB
         LegacyBytes          = [double]$LegacyQuotaGB * 1GB
+        F1Bytes              = [double]$F1QuotaGB * 1GB
         NearLimitBytes       = ([double]$LegacyQuotaGB * 1GB) * ($NearLimitPercent / 100.0)
+        NearLimitFraction    = $NearLimitPercent / 100.0
         ToleranceBytes       = [double]$QuotaToleranceMB * 1MB
+    }
+}
+
+function Get-LicenseFlag {
+    param($License, [string]$Name)
+
+    if ($null -eq $License) {
+        return $false
+    }
+    if ($License -is [System.Collections.IDictionary]) {
+        if ($License.Contains($Name)) { return [bool]$License[$Name] }
+        return $false
+    }
+    $prop = $License.PSObject.Properties[$Name]
+    if ($null -eq $prop -or $null -eq $prop.Value) {
+        return $false
+    }
+    return [bool]$prop.Value
+}
+
+# Core compliance logic. Takes already-parsed byte values so the hot loops
+# (30k+ rows) do not pay for ConvertTo-Bytes / Format-GB / Test-QuotaEquals
+# calls per column. Get-MailboxQuotaEvaluation wraps this for mailbox objects.
+function New-MailboxQuotaResult {
+    param(
+        $UserPrincipalName,
+        $DisplayName,
+        $ExternalDirectoryObjectId,
+        $RecipientTypeDetails,
+        [Parameter(Mandatory)] $License,
+        $SrBytes,
+        $SendBytes,
+        $WarnBytes,
+        $UsedBytes,
+        [bool]$UseDefaults,
+        [Parameter(Mandatory)] [hashtable]$Policy
+    )
+
+    if ($License -is [System.Collections.IDictionary]) {
+        $hasE3 = Get-LicenseFlag $License 'HasE3'
+        $hasE5 = Get-LicenseFlag $License 'HasE5'
+        $hasF1 = Get-LicenseFlag $License 'HasF1'
+    }
+    else {
+        $lp = $License.PSObject.Properties
+        $p = $lp['HasE3']; $hasE3 = ($null -ne $p -and $null -ne $p.Value -and [bool]$p.Value)
+        $p = $lp['HasE5']; $hasE5 = ($null -ne $p -and $null -ne $p.Value -and [bool]$p.Value)
+        $p = $lp['HasF1']; $hasF1 = ($null -ne $p -and $null -ne $p.Value -and [bool]$p.Value)
+    }
+    $isEnterprise = $hasE3 -or $hasE5
+    $tier = if ($hasE5) { 'E5' } elseif ($hasE3) { 'E3' } elseif ($hasF1) { 'F1' } else { 'Other' }
+
+    $tol = [double]$Policy.ToleranceBytes
+    $srKnown   = ($null -ne $SrBytes)   -and -not [double]::IsInfinity([double]$SrBytes)
+    $sendKnown = ($null -ne $SendBytes) -and -not [double]::IsInfinity([double]$SendBytes)
+    $warnKnown = ($null -ne $WarnBytes) -and -not [double]::IsInfinity([double]$WarnBytes)
+
+    $srText   = if ($null -eq $SrBytes)   { 'Unknown' } elseif ([double]::IsInfinity([double]$SrBytes))   { 'Unlimited' } else { '{0:N2} GB' -f ([double]$SrBytes / 1GB) }
+    $sendText = if ($null -eq $SendBytes) { 'Unknown' } elseif ([double]::IsInfinity([double]$SendBytes)) { 'Unlimited' } else { '{0:N2} GB' -f ([double]$SendBytes / 1GB) }
+    $warnText = if ($null -eq $WarnBytes) { 'Unknown' } elseif ([double]::IsInfinity([double]$WarnBytes)) { 'Unlimited' } else { '{0:N2} GB' -f ([double]$WarnBytes / 1GB) }
+    $usedText = if ($null -eq $UsedBytes) { 'Unknown' } elseif ([double]::IsInfinity([double]$UsedBytes)) { 'Unlimited' } else { '{0:N2} GB' -f ([double]$UsedBytes / 1GB) }
+
+    $issues = [System.Collections.Generic.List[string]]::new()
+    $nearLimit = $false
+
+    if ($isEnterprise -or -not $hasF1) {
+        $expectedCapGB = [int]$Policy.TargetStorageQuotaGB
+        $storageCompliant = $srKnown   -and ([Math]::Abs([double]$SrBytes   - [double]$Policy.TargetStorageBytes) -le $tol)
+        $sendCompliant    = $sendKnown -and ([Math]::Abs([double]$SendBytes - [double]$Policy.TargetSendBytes)    -le $tol)
+        $warnCompliant    = $warnKnown -and ([Math]::Abs([double]$WarnBytes - [double]$Policy.TargetWarnBytes)    -le $tol)
+
+        if (-not $storageCompliant) { [void]$issues.Add("ProhibitSendReceiveQuota is $srText, expected $($Policy.TargetStorageQuotaGB) GB") }
+        if (-not $sendCompliant)    { [void]$issues.Add("ProhibitSendQuota is $sendText, expected $($Policy.ProhibitSendQuotaGB) GB") }
+        if (-not $warnCompliant)    { [void]$issues.Add("IssueWarningQuota is $warnText, expected $($Policy.IssueWarningQuotaGB) GB") }
+        if ($UseDefaults -and $issues.Count -gt 0) {
+            [void]$issues.Add('UseDatabaseQuotaDefaults is True (custom quota values may be ignored until it is set to False)')
+        }
+
+        if ($hasE3 -and $srKnown -and ($null -ne $UsedBytes) -and
+            ([Math]::Abs([double]$SrBytes - [double]$Policy.LegacyBytes) -le $tol) -and
+            ([double]$UsedBytes -ge [double]$Policy.NearLimitBytes)) {
+            $nearLimit = $true
+            [void]$issues.Add("E3 mailbox on $($Policy.LegacyQuotaGB) GB cap at $usedText (>= $($Policy.NearLimitPercent)%)")
+        }
+
+        $quotasAligned = $storageCompliant -and $sendCompliant -and $warnCompliant
+        $needsFix = -not $quotasAligned
+    }
+    else {
+        # F1 only: expected to sit on the frontline cap; never pushed to 100 GB.
+        $expectedCapGB = [int]$Policy.F1QuotaGB
+        $storageCompliant = $srKnown -and ([Math]::Abs([double]$SrBytes - [double]$Policy.F1Bytes) -le $tol)
+        $sendCompliant = $true
+        $warnCompliant = $true
+        if (-not $storageCompliant) {
+            [void]$issues.Add("F1 ProhibitSendReceiveQuota is $srText, expected $($Policy.F1QuotaGB) GB")
+        }
+        if ($srKnown -and ($null -ne $UsedBytes) -and [double]$SrBytes -gt 0 -and
+            ([double]$UsedBytes -ge ([double]$SrBytes * [double]$Policy.NearLimitFraction))) {
+            $nearLimit = $true
+            [void]$issues.Add("F1 mailbox at $usedText of $srText cap (>= $($Policy.NearLimitPercent)%)")
+        }
+        $quotasAligned = $storageCompliant
+        $needsFix = $false
+    }
+
+    $percentUsed = $null
+    if ($null -ne $UsedBytes -and $srKnown -and [double]$SrBytes -gt 0) {
+        $percentUsed = [Math]::Round(([double]$UsedBytes / [double]$SrBytes) * 100, 1)
+    }
+
+    $upn = $UserPrincipalName
+    if ([string]::IsNullOrWhiteSpace([string]$upn)) {
+        $upn = Get-PropertyValue $License 'UserPrincipalName'
+    }
+    $name = $DisplayName
+    if ([string]::IsNullOrWhiteSpace([string]$name)) {
+        $name = Get-PropertyValue $License 'DisplayName'
+    }
+
+    return [pscustomobject]@{
+        UserPrincipalName         = $upn
+        DisplayName               = $name
+        ExternalDirectoryObjectId = $ExternalDirectoryObjectId
+        RecipientTypeDetails      = $RecipientTypeDetails
+        LicenseTier               = $tier
+        LicenseE3                 = $hasE3
+        LicenseE5                 = $hasE5
+        LicenseF1                 = $hasF1
+        ExpectedCapGB             = $expectedCapGB
+        UseDatabaseQuotaDefaults  = $UseDefaults
+        ProhibitSendReceiveGB     = $srText
+        ProhibitSendGB            = $sendText
+        IssueWarningGB            = $warnText
+        TotalItemSizeGB           = $usedText
+        PercentOfCapUsed          = $percentUsed
+        StorageCompliant          = $storageCompliant
+        QuotasAligned             = $quotasAligned
+        NearLegacyLimit           = $nearLimit
+        Issues                    = ($issues -join '; ')
+        NeedsRemediation          = $needsFix
+        StorageBytes              = $SrBytes
+        SendBytes                 = $SendBytes
+        WarnBytes                 = $WarnBytes
+        UsedBytes                 = $UsedBytes
     }
 }
 
@@ -834,82 +1027,18 @@ function Get-MailboxQuotaEvaluation {
         [hashtable]$Policy
     )
 
-    $srBytes   = ConvertTo-Bytes (Get-PropertyValue $Mailbox 'ProhibitSendReceiveQuota')
-    $sendBytes = ConvertTo-Bytes (Get-PropertyValue $Mailbox 'ProhibitSendQuota')
-    $warnBytes = ConvertTo-Bytes (Get-PropertyValue $Mailbox 'IssueWarningQuota')
-    $useDefaults = ConvertTo-Bool (Get-PropertyValue $Mailbox 'UseDatabaseQuotaDefaults')
-
-    $issues = New-Object System.Collections.Generic.List[string]
-
-    $storageCompliant = Test-QuotaEquals -ActualBytes $srBytes -ExpectedBytes $Policy.TargetStorageBytes -ToleranceBytes $Policy.ToleranceBytes
-    if (-not $storageCompliant) {
-        [void]$issues.Add("ProhibitSendReceiveQuota is $(Format-GB $srBytes), expected $($Policy.TargetStorageQuotaGB) GB")
-    }
-
-    $sendCompliant = Test-QuotaEquals -ActualBytes $sendBytes -ExpectedBytes $Policy.TargetSendBytes -ToleranceBytes $Policy.ToleranceBytes
-    if (-not $sendCompliant) {
-        [void]$issues.Add("ProhibitSendQuota is $(Format-GB $sendBytes), expected $($Policy.ProhibitSendQuotaGB) GB")
-    }
-
-    $warnCompliant = Test-QuotaEquals -ActualBytes $warnBytes -ExpectedBytes $Policy.TargetWarnBytes -ToleranceBytes $Policy.ToleranceBytes
-    if (-not $warnCompliant) {
-        [void]$issues.Add("IssueWarningQuota is $(Format-GB $warnBytes), expected $($Policy.IssueWarningQuotaGB) GB")
-    }
-
-    if ($useDefaults -and $issues.Count -gt 0) {
-        [void]$issues.Add('UseDatabaseQuotaDefaults is True (custom quota values may be ignored until it is set to False)')
-    }
-
-    $nearLegacyLimit = $false
-    $hasE3 = ConvertTo-Bool (Get-PropertyValue $License 'HasE3')
-    if ($hasE3 -and (Test-QuotaEquals -ActualBytes $srBytes -ExpectedBytes $Policy.LegacyBytes -ToleranceBytes $Policy.ToleranceBytes) -and ($null -ne $UsedBytes)) {
-        if ([double]$UsedBytes -ge $Policy.NearLimitBytes) {
-            $nearLegacyLimit = $true
-            [void]$issues.Add("E3 mailbox on $($Policy.LegacyQuotaGB) GB cap at $(Format-GB $UsedBytes) (>= $($Policy.NearLimitPercent)%)")
-        }
-    }
-
-    $percentUsed = $null
-    if ($null -ne $UsedBytes -and $null -ne $srBytes -and -not [double]::IsInfinity([double]$srBytes) -and [double]$srBytes -gt 0) {
-        $percentUsed = [Math]::Round(([double]$UsedBytes / [double]$srBytes) * 100, 1)
-    }
-
-    $quotasAligned = $storageCompliant -and $sendCompliant -and $warnCompliant
-    $needsQuotaFix = -not $quotasAligned
-
-    $upn = Get-PropertyValue $Mailbox 'UserPrincipalName'
-    if ([string]::IsNullOrWhiteSpace([string]$upn)) {
-        $upn = Get-PropertyValue $License 'UserPrincipalName'
-    }
-
-    $displayName = Get-PropertyValue $Mailbox 'DisplayName'
-    if ([string]::IsNullOrWhiteSpace([string]$displayName)) {
-        $displayName = Get-PropertyValue $License 'DisplayName'
-    }
-
-    return [pscustomobject]@{
-        UserPrincipalName        = $upn
-        DisplayName              = $displayName
-        ExternalDirectoryObjectId = Get-PropertyValue $Mailbox 'ExternalDirectoryObjectId'
-        RecipientTypeDetails     = Get-PropertyValue $Mailbox 'RecipientTypeDetails'
-        LicenseE3                = $hasE3
-        LicenseE5                = ConvertTo-Bool (Get-PropertyValue $License 'HasE5')
-        UseDatabaseQuotaDefaults = $useDefaults
-        ProhibitSendReceiveGB    = Format-GB $srBytes
-        ProhibitSendGB           = Format-GB $sendBytes
-        IssueWarningGB           = Format-GB $warnBytes
-        TotalItemSizeGB          = Format-GB $UsedBytes
-        PercentOfCapUsed         = $percentUsed
-        StorageCompliant         = $storageCompliant
-        QuotasAligned            = $quotasAligned
-        NearLegacyLimit          = $nearLegacyLimit
-        Issues                   = ($issues -join '; ')
-        NeedsRemediation         = $needsQuotaFix
-        StorageBytes             = $srBytes
-        SendBytes                = $sendBytes
-        WarnBytes                = $warnBytes
-        UsedBytes                = $UsedBytes
-    }
+    return New-MailboxQuotaResult `
+        -UserPrincipalName (Get-PropertyValue $Mailbox 'UserPrincipalName') `
+        -DisplayName (Get-PropertyValue $Mailbox 'DisplayName') `
+        -ExternalDirectoryObjectId (Get-PropertyValue $Mailbox 'ExternalDirectoryObjectId') `
+        -RecipientTypeDetails (Get-PropertyValue $Mailbox 'RecipientTypeDetails') `
+        -License $License `
+        -SrBytes (ConvertTo-Bytes (Get-PropertyValue $Mailbox 'ProhibitSendReceiveQuota')) `
+        -SendBytes (ConvertTo-Bytes (Get-PropertyValue $Mailbox 'ProhibitSendQuota')) `
+        -WarnBytes (ConvertTo-Bytes (Get-PropertyValue $Mailbox 'IssueWarningQuota')) `
+        -UsedBytes $UsedBytes `
+        -UseDefaults (ConvertTo-Bool (Get-PropertyValue $Mailbox 'UseDatabaseQuotaDefaults')) `
+        -Policy $Policy
 }
 
 function Resolve-MailboxLicense {
@@ -941,14 +1070,27 @@ function New-HtmlReport {
     param(
         [Parameter(Mandatory)] $Results,
         [Parameter(Mandatory)] [hashtable] $Summary,
-        [Parameter(Mandatory)] [string] $Path
+        [Parameter(Mandatory)] [string] $Path,
+        [int] $MaxRows = 1000
     )
 
-    $notCompliant = @($Results | Where-Object { -not $_.StorageCompliant } | Sort-Object UserPrincipalName)
-    $nearLimit    = @($Results | Where-Object { $_.NearLegacyLimit } | Sort-Object PercentOfCapUsed -Descending)
+    $all = ConvertTo-ObjectArray $Results
+    $notCompliantList = New-Object System.Collections.Generic.List[object]
+    $nearList = New-Object System.Collections.Generic.List[object]
+    $f1NearList = New-Object System.Collections.Generic.List[object]
+    foreach ($r in $all) {
+        $isF1Only = (Get-LicenseFlag $r 'LicenseF1') -and -not ((Get-LicenseFlag $r 'LicenseE3') -or (Get-LicenseFlag $r 'LicenseE5'))
+        if (-not $r.StorageCompliant -and -not $isF1Only) { [void]$notCompliantList.Add($r) }
+        if ($r.NearLegacyLimit) {
+            if ($isF1Only) { [void]$f1NearList.Add($r) } else { [void]$nearList.Add($r) }
+        }
+    }
+    $notCompliant = @($notCompliantList | Sort-Object UserPrincipalName)
+    $nearLimit    = @($nearList | Sort-Object PercentOfCapUsed -Descending)
+    $f1Near       = @($f1NearList | Sort-Object PercentOfCapUsed -Descending)
 
     function Build-Table {
-        param($Rows, [string[]]$Columns, [hashtable]$Headers, [string]$EmptyMessage)
+        param($Rows, [string[]]$Columns, [hashtable]$Headers, [string]$EmptyMessage, [int]$Limit)
 
         $rowList = @($Rows)
         if ($rowList.Count -eq 0) {
@@ -963,9 +1105,14 @@ function New-HtmlReport {
             "<th>$(ConvertTo-HtmlEncoded $label)</th>"
         }
         $bodyRows = New-Object System.Collections.Generic.List[string]
+        $shown = 0
         foreach ($row in $rowList) {
+            if ($Limit -gt 0 -and $shown -ge $Limit) { break }
+            $shown++
+            $props = $row.PSObject.Properties
             $cells = foreach ($col in $Columns) {
-                $value = Get-PropertyValue $row $col
+                $prop = $props[$col]
+                $value = if ($null -ne $prop) { $prop.Value } else { $null }
                 $extraClass = if ($col -eq 'Issues') { ' issues' } else { '' }
                 if ($value -is [bool]) {
                     $cls  = if ($value) { 'yes' } else { 'no' }
@@ -978,14 +1125,20 @@ function New-HtmlReport {
             }
             [void]$bodyRows.Add("<tr>$($cells -join '')</tr>")
         }
-        return "<table><thead><tr>$($head -join '')</tr></thead><tbody>$($bodyRows -join '')</tbody></table>"
+        $note = ''
+        if ($shown -lt $rowList.Count) {
+            $note = "<p class='empty'>Showing first $shown of $($rowList.Count) rows. The CSV files contain every row.</p>"
+        }
+        return "<table><thead><tr>$($head -join '')</tr></thead><tbody>$($bodyRows -join '')</tbody></table>$note"
     }
 
     $columnHeaders = @{
         UserPrincipalName     = 'UPN'
         DisplayName           = 'Name'
+        LicenseTier           = 'Tier'
         LicenseE3             = 'E3'
         LicenseE5             = 'E5'
+        LicenseF1             = 'F1'
         ProhibitSendReceiveGB = 'Cap'
         ProhibitSendGB        = 'Send'
         IssueWarningGB        = 'Warn'
@@ -994,14 +1147,20 @@ function New-HtmlReport {
         Issues                = 'Issues'
     }
     $detailColumns = @(
-        'UserPrincipalName', 'DisplayName', 'LicenseE3', 'LicenseE5',
+        'UserPrincipalName', 'DisplayName', 'LicenseTier',
         'ProhibitSendReceiveGB', 'ProhibitSendGB', 'IssueWarningGB',
         'TotalItemSizeGB', 'PercentOfCapUsed', 'Issues'
     )
     $nearColumns = @(
-        'UserPrincipalName', 'DisplayName', 'ProhibitSendReceiveGB',
+        'UserPrincipalName', 'DisplayName', 'LicenseTier', 'ProhibitSendReceiveGB',
         'TotalItemSizeGB', 'PercentOfCapUsed'
     )
+
+    $f1Total     = [int](Get-PropertyValue $Summary 'F1Total' 0)
+    $f1NearCount = [int](Get-PropertyValue $Summary 'F1NearLimit' 0)
+    $f1QuotaGB   = [int](Get-PropertyValue $Summary 'F1QuotaGB' 50)
+    $enterpriseNotCompliant = Get-PropertyValue $Summary 'EnterpriseNotCompliant' $null
+    if ($null -eq $enterpriseNotCompliant) { $enterpriseNotCompliant = $Summary.NotCompliant }
 
     $generated = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $mode      = if ($Summary.Remediated) { 'Remediation' } else { 'Report only' }
@@ -1054,19 +1213,27 @@ function New-HtmlReport {
 <main>
   <div class="cards">
     <div class="card"><div class="value">$($Summary.Total)</div><div class="label">Licensed mailboxes</div></div>
-    <div class="card alert"><div class="value">$($Summary.NotCompliant)</div><div class="label">Not $($Summary.TargetStorageQuotaGB) GB storage</div></div>
-    <div class="card warn"><div class="value">$($Summary.NearLimit)</div><div class="label">E3 near $($Summary.LegacyQuotaGB) GB cap</div></div>
+    <div class="card alert"><div class="value">$enterpriseNotCompliant</div><div class="label">E3/E5 not $($Summary.TargetStorageQuotaGB) GB storage</div></div>
+    <div class="card warn"><div class="value">$($nearLimit.Count)</div><div class="label">E3 near $($Summary.LegacyQuotaGB) GB cap</div></div>
+    <div class="card"><div class="value">$f1Total</div><div class="label">F1 mailboxes ($f1QuotaGB GB cap)</div></div>
+    <div class="card warn"><div class="value">$f1NearCount</div><div class="label">F1 near cap</div></div>
     <div class="card ok"><div class="value">$($Summary.Compliant)</div><div class="label">Storage compliant</div></div>
   </div>
 
   <section>
-    <h2>Mailboxes not configured for $($Summary.TargetStorageQuotaGB) GB storage</h2>
-    <div class="scroll">$(Build-Table -Rows $notCompliant -Columns $detailColumns -Headers $columnHeaders -EmptyMessage 'All licensed mailboxes meet the storage target.')</div>
+    <h2>E3/E5 mailboxes not configured for $($Summary.TargetStorageQuotaGB) GB storage</h2>
+    <div class="scroll">$(Build-Table -Rows $notCompliant -Columns $detailColumns -Headers $columnHeaders -Limit $MaxRows -EmptyMessage 'All E3/E5 mailboxes meet the storage target.')</div>
   </section>
 
   <section>
     <h2>E3 mailboxes approaching the $($Summary.LegacyQuotaGB) GB limit (&ge; $($Summary.NearLimitPercent)%)</h2>
-    <div class="scroll">$(Build-Table -Rows $nearLimit -Columns $nearColumns -Headers $columnHeaders -EmptyMessage 'No E3 mailboxes are near the legacy cap.')</div>
+    <div class="scroll">$(Build-Table -Rows $nearLimit -Columns $nearColumns -Headers $columnHeaders -Limit $MaxRows -EmptyMessage 'No E3 mailboxes are near the legacy cap.')</div>
+  </section>
+
+  <section>
+    <h2>F1 mailboxes approaching their $f1QuotaGB GB cap (&ge; $($Summary.NearLimitPercent)%)</h2>
+    <p class='empty'>F1 licenses are limited to $f1QuotaGB GB and are never remediated to $($Summary.TargetStorageQuotaGB) GB. All $f1Total F1 mailboxes are listed in the F1 CSV.</p>
+    <div class="scroll">$(Build-Table -Rows $f1Near -Columns $nearColumns -Headers $columnHeaders -Limit $MaxRows -EmptyMessage 'No F1 mailboxes are near their cap.')</div>
   </section>
 </main>
 <footer>Generated by Report-MailboxQuotaCompliance.ps1</footer>
@@ -1078,55 +1245,126 @@ function New-HtmlReport {
     [System.IO.File]::WriteAllText($Path, $html, $utf8NoBom)
 }
 
+# Reads one member from a Graph object (hashtable or PSObject) without going
+# through Get-PropertyValue. Used only inside the 30k-user hot loop.
+function Get-GraphMemberFast {
+    param($Object, [string]$Name)
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        if ($Object.Contains($Name)) { return $Object[$Name] }
+        foreach ($key in $Object.Keys) {
+            if ([string]::Equals([string]$key, $Name, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $Object[$key]
+            }
+        }
+        return $null
+    }
+    $prop = $Object.PSObject.Properties[$Name]
+    if ($null -ne $prop) { return $prop.Value }
+    return $null
+}
+
 function Get-LicenseLookupTables {
     param(
         $Users,
         [hashtable]$SkuMap,
         [string[]]$E3SkuIds,
-        [string[]]$E5SkuIds
+        [string[]]$E5SkuIds,
+        [string[]]$F1SkuIds = @()
     )
 
     $byObjectId = @{}
     $byUpn      = @{}
     $e3Set = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $e5Set = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $f1Set = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($id in @($E3SkuIds)) { if ($id) { [void]$e3Set.Add($id) } }
     foreach ($id in @($E5SkuIds)) { if ($id) { [void]$e5Set.Add($id) } }
+    foreach ($id in @($F1SkuIds)) { if ($id) { [void]$f1Set.Add($id) } }
+
+    $e3Count = 0
+    $e5Count = 0
+    $f1Count = 0
 
     foreach ($user in (ConvertTo-ObjectArray $Users)) {
-        $assigned = ConvertTo-ObjectArray (Get-PropertyValue $user 'AssignedLicenses')
-        if ((Get-CollectionCount $assigned) -eq 0) {
-            continue
+        if ($null -eq $user) { continue }
+
+        # Direct member access (hashtable from Invoke-MgGraphRequest, or
+        # PSObject); Get-GraphMemberFast only as a fallback for odd casing.
+        $isDict = $user -is [System.Collections.IDictionary]
+        if ($isDict) {
+            $assigned = $user['assignedLicenses']
+            if ($null -eq $assigned) { $assigned = Get-GraphMemberFast $user 'assignedLicenses' }
+        }
+        else {
+            $up = $user.PSObject.Properties
+            $p = $up['assignedLicenses']
+            $assigned = if ($null -ne $p) { $p.Value } else { $null }
+        }
+        if ($null -eq $assigned) { continue }
+
+        # A single license arrives as one dictionary/object, not a list.
+        if ($assigned -is [System.Collections.IDictionary] -or $assigned -is [string] -or $assigned -isnot [System.Collections.IEnumerable]) {
+            $assigned = @($assigned)
         }
 
         $hasE3 = $false
         $hasE5 = $false
+        $hasF1 = $false
         foreach ($lic in $assigned) {
-            $skuId = ConvertTo-NormalizedGuid (Get-PropertyValue $lic 'SkuId')
-            if (-not $skuId) {
-                continue
+            if ($null -eq $lic) { continue }
+            if ($lic -is [System.Collections.IDictionary]) {
+                $skuRaw = $lic['skuId']
+                if ($null -eq $skuRaw) { $skuRaw = Get-GraphMemberFast $lic 'skuId' }
             }
+            else {
+                $p = $lic.PSObject.Properties['skuId']
+                $skuRaw = if ($null -ne $p) { $p.Value } else { $null }
+            }
+            if ($null -eq $skuRaw) { continue }
+            $skuId = ([string]$skuRaw).Trim().Trim('{', '}')
+            if ($skuId.Length -eq 0) { continue }
             if ($e3Set.Contains($skuId)) { $hasE3 = $true }
-            if ($e5Set.Contains($skuId)) { $hasE5 = $true }
+            elseif ($e5Set.Contains($skuId)) { $hasE5 = $true }
+            elseif ($f1Set.Contains($skuId)) { $hasF1 = $true }
         }
 
-        if (-not ($hasE3 -or $hasE5)) {
+        if (-not ($hasE3 -or $hasE5 -or $hasF1)) {
             continue
         }
+        if ($hasE3) { $e3Count++ }
+        if ($hasE5) { $e5Count++ }
+        if ($hasF1) { $f1Count++ }
 
-        $upn = Get-PropertyValue $user 'UserPrincipalName'
+        if ($isDict) {
+            $upn = $user['userPrincipalName'];  if ($null -eq $upn) { $upn = Get-GraphMemberFast $user 'userPrincipalName' }
+            $graphId = $user['id'];             if ($null -eq $graphId) { $graphId = Get-GraphMemberFast $user 'id' }
+            $display = $user['displayName'];    if ($null -eq $display) { $display = Get-GraphMemberFast $user 'displayName' }
+            $enabledRaw = $user['accountEnabled']; if ($null -eq $enabledRaw) { $enabledRaw = Get-GraphMemberFast $user 'accountEnabled' }
+        }
+        else {
+            $p = $up['userPrincipalName']; $upn = if ($null -ne $p) { $p.Value } else { $null }
+            $p = $up['id'];                $graphId = if ($null -ne $p) { $p.Value } else { $null }
+            $p = $up['displayName'];       $display = if ($null -ne $p) { $p.Value } else { $null }
+            $p = $up['accountEnabled'];    $enabledRaw = if ($null -ne $p) { $p.Value } else { $null }
+        }
+        $enabled = if ($enabledRaw -is [bool]) { $enabledRaw } elseif ($null -eq $enabledRaw) { $false } else { ConvertTo-Bool $enabledRaw }
+
         $info = [pscustomobject]@{
-            GraphId            = Get-PropertyValue $user 'Id'
+            GraphId            = $graphId
             UserPrincipalName  = $upn
-            DisplayName        = Get-PropertyValue $user 'DisplayName'
-            AccountEnabled     = ConvertTo-Bool (Get-PropertyValue $user 'AccountEnabled')
+            DisplayName        = $display
+            AccountEnabled     = $enabled
             HasE3              = $hasE3
             HasE5              = $hasE5
+            HasF1              = $hasF1
         }
 
-        $objectId = ConvertTo-NormalizedGuid $info.GraphId
-        if ($objectId) {
-            $byObjectId[$objectId] = $info
+        if ($null -ne $graphId) {
+            $objectId = ([string]$graphId).Trim().Trim('{', '}').ToLowerInvariant()
+            if ($objectId.Length -gt 0) {
+                $byObjectId[$objectId] = $info
+            }
         }
         if (-not [string]::IsNullOrWhiteSpace([string]$upn)) {
             $byUpn[([string]$upn).Trim().ToLowerInvariant()] = $info
@@ -1137,8 +1375,155 @@ function Get-LicenseLookupTables {
         ByObjectId = $byObjectId
         ByUpn      = $byUpn
         UserCount  = [int]$byObjectId.Count
+        E3Count    = $e3Count
+        E5Count    = $e5Count
+        F1Count    = $f1Count
         SkuMap     = $SkuMap
     }
+}
+
+# Resolves the actual CSV header names once (BOM / spelling variants) so the
+# per-row loop uses direct property lookups.
+function Resolve-UsageReportColumns {
+    param($FirstRow)
+
+    $names = New-Object System.Collections.Generic.List[string]
+    foreach ($prop in @($FirstRow.PSObject.Properties)) {
+        [void]$names.Add([string]$prop.Name)
+    }
+
+    $wanted = @{
+        Upn       = @('User Principal Name', 'UserPrincipalName', 'UPN')
+        Display   = @('Display Name', 'DisplayName')
+        Deleted   = @('Is Deleted', 'IsDeleted')
+        Used      = @('Storage Used (Byte)', 'Storage Used (Bytes)', 'StorageUsed')
+        Sr        = @('Prohibit Send/Receive Quota (Byte)', 'Prohibit Send/Receive Quota (Bytes)', 'ProhibitSendReceiveQuota')
+        Send      = @('Prohibit Send Quota (Byte)', 'Prohibit Send Quota (Bytes)', 'ProhibitSendQuota')
+        Warn      = @('Issue Warning Quota (Byte)', 'Issue Warning Quota (Bytes)', 'IssueWarningQuota')
+        Recipient = @('Recipient Type', 'RecipientType', 'RecipientTypeDetails')
+    }
+
+    $map = @{}
+    foreach ($key in $wanted.Keys) {
+        $map[$key] = $null
+        foreach ($candidate in $wanted[$key]) {
+            foreach ($actual in $names) {
+                $clean = $actual
+                if ($clean.Length -gt 0 -and [int][char]$clean[0] -eq 0xFEFF) { $clean = $clean.Substring(1) }
+                if ([string]::Equals($clean, $candidate, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $map[$key] = $actual
+                    break
+                }
+            }
+            if ($null -ne $map[$key]) { break }
+        }
+    }
+
+    if ($null -eq $map['Upn']) {
+        throw ("Graph mailbox usage CSV has no User Principal Name column. Columns: {0}" -f [string]::Join(', ', $names.ToArray()))
+    }
+    return $map
+}
+
+# Evaluates every usage-report row for a licensed user. One pass, minimal
+# helper calls; adds result rows to $Results and matched UPNs to $MatchedUpns.
+function Invoke-UsageReportEvaluation {
+    param(
+        $Rows,
+        [Parameter(Mandatory)] [hashtable]$Lookup,
+        [Parameter(Mandatory)] [hashtable]$Policy,
+        [AllowEmptyCollection()] [System.Collections.Generic.List[object]]$Results,
+        [AllowEmptyCollection()] [System.Collections.Generic.HashSet[string]]$MatchedUpns,
+        [int]$ProgressEvery = 1000
+    )
+
+    if ($null -eq $Results) { throw 'Invoke-UsageReportEvaluation requires -Results.' }
+    if ($null -eq $MatchedUpns) { throw 'Invoke-UsageReportEvaluation requires -MatchedUpns.' }
+
+    $rowList = ConvertTo-ObjectArray $Rows
+    $total = $rowList.Length
+    if ($total -eq 0) { return 0 }
+
+    $cols = Resolve-UsageReportColumns -FirstRow $rowList[0]
+    $upnCol = $cols['Upn']; $nameCol = $cols['Display']; $delCol = $cols['Deleted']
+    $usedCol = $cols['Used']; $srCol = $cols['Sr']; $sendCol = $cols['Send']; $warnCol = $cols['Warn']; $rcptCol = $cols['Recipient']
+    $byUpn = $Lookup.ByUpn
+
+    $styles  = [System.Globalization.NumberStyles]::Float
+    $culture = [System.Globalization.CultureInfo]::InvariantCulture
+    $num = [double]0
+    $added = 0
+    $index = 0
+
+    foreach ($row in $rowList) {
+        $index++
+        if (($index % $ProgressEvery) -eq 0) {
+            Write-Progress -Activity 'Evaluating mailbox usage report' -Status "$index of $total" -PercentComplete (($index / $total) * 100)
+        }
+
+        $props = $row.PSObject.Properties
+        $upnProp = $props[$upnCol]
+        if ($null -eq $upnProp) { continue }
+        $upn = [string]$upnProp.Value
+        if ([string]::IsNullOrWhiteSpace($upn)) { continue }
+        $upn = $upn.Trim()
+
+        if ($null -ne $delCol) {
+            $delProp = $props[$delCol]
+            if ($null -ne $delProp -and ([string]$delProp.Value) -match '^(true|1|yes)$') { continue }
+        }
+
+        $lic = $byUpn[$upn.ToLowerInvariant()]
+        if ($null -eq $lic) { continue }
+        [void]$MatchedUpns.Add($upn)
+
+        $sr = $null
+        if ($null -ne $srCol) {
+            $text = [string]$props[$srCol].Value
+            if ($text.Length -gt 0) {
+                if ([double]::TryParse($text, $styles, $culture, [ref]$num)) { $sr = $num } else { $sr = ConvertTo-Bytes $text }
+            }
+        }
+        $send = $null
+        if ($null -ne $sendCol) {
+            $text = [string]$props[$sendCol].Value
+            if ($text.Length -gt 0) {
+                if ([double]::TryParse($text, $styles, $culture, [ref]$num)) { $send = $num } else { $send = ConvertTo-Bytes $text }
+            }
+        }
+        $warn = $null
+        if ($null -ne $warnCol) {
+            $text = [string]$props[$warnCol].Value
+            if ($text.Length -gt 0) {
+                if ([double]::TryParse($text, $styles, $culture, [ref]$num)) { $warn = $num } else { $warn = ConvertTo-Bytes $text }
+            }
+        }
+        $used = $null
+        if ($null -ne $usedCol) {
+            $text = [string]$props[$usedCol].Value
+            if ($text.Length -gt 0) {
+                if ([double]::TryParse($text, $styles, $culture, [ref]$num)) { $used = $num } else { $used = ConvertTo-Bytes $text }
+            }
+        }
+
+        $name = if ($null -ne $nameCol) { $props[$nameCol].Value } else { $null }
+        $rcpt = if ($null -ne $rcptCol) { $props[$rcptCol].Value } else { 'UserMailbox' }
+
+        $result = New-MailboxQuotaResult `
+            -UserPrincipalName $upn `
+            -DisplayName $name `
+            -ExternalDirectoryObjectId $lic.GraphId `
+            -RecipientTypeDetails $rcpt `
+            -License $lic `
+            -SrBytes $sr -SendBytes $send -WarnBytes $warn -UsedBytes $used `
+            -UseDefaults $false `
+            -Policy $Policy
+        [void]$Results.Add($result)
+        $added++
+    }
+
+    Write-Progress -Activity 'Evaluating mailbox usage report' -Completed
+    return $added
 }
 
 function Test-SelfTestNumeric {
@@ -1182,7 +1567,7 @@ function Assert-Equal {
 function Invoke-MailboxQuotaSelfTest {
     Write-Info 'Running Report-MailboxQuotaCompliance self-tests...'
 
-    $policy = New-QuotaPolicy -TargetStorageQuotaGB 100 -ProhibitSendQuotaGB 99 -IssueWarningQuotaGB 98 -LegacyQuotaGB 50 -NearLimitPercent 90 -QuotaToleranceMB 2
+    $policy = New-QuotaPolicy -TargetStorageQuotaGB 100 -ProhibitSendQuotaGB 99 -IssueWarningQuotaGB 98 -LegacyQuotaGB 50 -NearLimitPercent 90 -QuotaToleranceMB 2 -F1QuotaGB 50
 
     Assert-Equal (ConvertTo-Bytes $null) $null 'null size'
     Assert-Equal (ConvertTo-Bytes 'Unlimited') ([double]::PositiveInfinity) 'unlimited string'
@@ -1301,6 +1686,61 @@ function Invoke-MailboxQuotaSelfTest {
     Assert-Equal $lookup.UserCount 1 'one E3 user indexed'
     Assert-Equal $lookup.ByUpn.ContainsKey('jane@contoso.com') $true 'UPN indexed lowercase'
     Assert-Equal $lookup.ByObjectId.ContainsKey('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa') $true 'object id indexed'
+    Assert-Equal $lookup.E3Count 1 'E3 count'
+
+    $f1Sku = [guid]'44575883-256e-4a79-9da4-ebe9acabe2b2'
+    $f1Users = @(
+        @{ id = 'ffffffff-ffff-ffff-ffff-ffffffffffff'; userPrincipalName = 'Front@Contoso.com'; displayName = 'Front Line'; accountEnabled = $true; assignedLicenses = @(@{ skuId = $f1Sku.ToString(); disabledPlans = @() }) },
+        @{ id = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'; userPrincipalName = 'both@contoso.com'; displayName = 'Both'; accountEnabled = $true; assignedLicenses = @(@{ skuId = $f1Sku }, @{ skuId = $e3Sku }) }
+    )
+    $f1Lookup = Get-LicenseLookupTables -Users $f1Users -SkuMap @{} -E3SkuIds @($e3Sku.ToString()) -E5SkuIds @() -F1SkuIds @($f1Sku.ToString())
+    Assert-Equal $f1Lookup.UserCount 2 'F1 and E3+F1 users indexed'
+    Assert-Equal $f1Lookup.F1Count 2 'F1 count includes mixed user'
+    Assert-Equal $f1Lookup.E3Count 1 'E3 count with mixed user'
+    Assert-Equal $f1Lookup.ByUpn['front@contoso.com'].HasF1 $true 'hashtable Graph user F1 flag'
+    Assert-Equal $f1Lookup.ByUpn['front@contoso.com'].HasE3 $false 'F1-only user not E3'
+
+    $f1Only = $f1Lookup.ByUpn['front@contoso.com']
+    $f1Eval = New-MailboxQuotaResult -UserPrincipalName 'front@contoso.com' -DisplayName 'Front Line' -License $f1Only `
+        -SrBytes (50 * 1GB) -SendBytes (49 * 1GB) -WarnBytes (49 * 1GB) -UsedBytes (46 * 1GB) -UseDefaults $true -Policy $policy
+    Assert-Equal $f1Eval.LicenseTier 'F1' 'F1 tier'
+    Assert-Equal $f1Eval.ExpectedCapGB 50 'F1 expected cap is F1QuotaGB'
+    Assert-Equal $f1Eval.StorageCompliant $true 'F1 on 50 GB is compliant'
+    Assert-Equal $f1Eval.QuotasAligned $true 'F1 send/warn not enforced'
+    Assert-Equal $f1Eval.NearLegacyLimit $true 'F1 46/50 GB is near cap'
+    Assert-Equal $f1Eval.NeedsRemediation $false 'F1 is never remediated'
+    $f1Big = New-MailboxQuotaResult -UserPrincipalName 'front@contoso.com' -License $f1Only `
+        -SrBytes (100 * 1GB) -SendBytes (99 * 1GB) -WarnBytes (98 * 1GB) -UsedBytes (10 * 1GB) -UseDefaults $false -Policy $policy
+    Assert-Equal $f1Big.StorageCompliant $false 'F1 on 100 GB is flagged'
+    Assert-Equal $f1Big.NeedsRemediation $false 'F1 on 100 GB still not remediated'
+    Assert-Equal $f1Big.NearLegacyLimit $false 'F1 10/100 GB not near'
+    $mixed = $f1Lookup.ByUpn['both@contoso.com']
+    $mixedEval = New-MailboxQuotaResult -UserPrincipalName 'both@contoso.com' -License $mixed `
+        -SrBytes (50 * 1GB) -SendBytes (49 * 1GB) -WarnBytes (48 * 1GB) -UsedBytes (1 * 1GB) -UseDefaults $false -Policy $policy
+    Assert-Equal $mixedEval.LicenseTier 'E3' 'E3+F1 user is treated as E3'
+    Assert-Equal $mixedEval.NeedsRemediation $true 'E3+F1 on 50 GB remediates'
+
+    $usageRows = @(
+        [pscustomobject]@{ 'User Principal Name' = 'Front@contoso.com'; 'Display Name' = 'Front Line'; 'Is Deleted' = 'False'; 'Storage Used (Byte)' = [string](47 * 1GB); 'Prohibit Send/Receive Quota (Byte)' = [string](50 * 1GB); 'Prohibit Send Quota (Byte)' = [string](49 * 1GB); 'Issue Warning Quota (Byte)' = [string](49 * 1GB); 'Recipient Type' = 'UserMailbox' },
+        [pscustomobject]@{ 'User Principal Name' = 'both@contoso.com'; 'Display Name' = 'Both'; 'Is Deleted' = 'False'; 'Storage Used (Byte)' = '1073741824'; 'Prohibit Send/Receive Quota (Byte)' = [string](100 * 1GB); 'Prohibit Send Quota (Byte)' = [string](99 * 1GB); 'Issue Warning Quota (Byte)' = [string](98 * 1GB); 'Recipient Type' = 'UserMailbox' },
+        [pscustomobject]@{ 'User Principal Name' = 'gone@contoso.com'; 'Display Name' = 'Gone'; 'Is Deleted' = 'True'; 'Storage Used (Byte)' = '1'; 'Prohibit Send/Receive Quota (Byte)' = '1'; 'Prohibit Send Quota (Byte)' = '1'; 'Issue Warning Quota (Byte)' = '1'; 'Recipient Type' = 'UserMailbox' },
+        [pscustomobject]@{ 'User Principal Name' = 'nolicense@contoso.com'; 'Display Name' = 'None'; 'Is Deleted' = 'False'; 'Storage Used (Byte)' = '1'; 'Prohibit Send/Receive Quota (Byte)' = '1'; 'Prohibit Send Quota (Byte)' = '1'; 'Issue Warning Quota (Byte)' = '1'; 'Recipient Type' = 'SharedMailbox' }
+    )
+    $fastResults = New-Object System.Collections.Generic.List[object]
+    $fastMatched = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $fastAdded = Invoke-UsageReportEvaluation -Rows $usageRows -Lookup $f1Lookup -Policy $policy -Results $fastResults -MatchedUpns $fastMatched
+    Assert-Equal $fastAdded 2 'fast evaluator keeps licensed, skips deleted and unlicensed'
+    Assert-Equal $fastMatched.Contains('front@contoso.com') $true 'fast evaluator records matched UPN case-insensitively'
+    $fastFront = $fastResults | Where-Object { $_.UserPrincipalName -eq 'Front@contoso.com' } | Select-Object -First 1
+    Assert-Equal $fastFront.LicenseTier 'F1' 'fast evaluator F1 tier'
+    Assert-Equal $fastFront.NearLegacyLimit $true 'fast evaluator F1 near cap'
+    Assert-Equal $fastFront.TotalItemSizeGB '47.00 GB' 'fast evaluator used bytes formatting'
+    Assert-Equal $fastFront.ExternalDirectoryObjectId 'ffffffff-ffff-ffff-ffff-ffffffffffff' 'fast evaluator carries Graph id'
+    $fastBoth = $fastResults | Where-Object { $_.UserPrincipalName -eq 'both@contoso.com' } | Select-Object -First 1
+    Assert-Equal $fastBoth.QuotasAligned $true 'fast evaluator 100/99/98 aligned'
+    Assert-Equal $fastBoth.PercentOfCapUsed 1 'fast evaluator percent of cap'
+    $colMap = Resolve-UsageReportColumns -FirstRow $bomRow
+    Assert-Equal $colMap['Upn'] $bomName 'column resolver maps BOM header'
 
     $mbxByGuid = [pscustomobject]@{
         UserPrincipalName         = 'alias-mismatch@contoso.com'
@@ -1410,7 +1850,12 @@ function Invoke-MailboxQuotaSelfTest {
     }
 
     $demo = @(Get-MailboxQuotaDemoRows -Policy $policy)
-    Assert-Equal $demo.Count 3 'demo report has three sample mailboxes'
+    Assert-Equal $demo.Count 4 'demo report has four sample mailboxes'
+    $priya = $demo | Where-Object { $_.UserPrincipalName -eq 'priya@contoso.com' } | Select-Object -First 1
+    Assert-Equal $priya.LicenseTier 'F1' 'demo Priya is F1'
+    Assert-Equal $priya.StorageCompliant $true 'demo Priya F1 on 50 GB is compliant for F1'
+    Assert-Equal $priya.NearLegacyLimit $true 'demo Priya F1 near 50 GB cap'
+    Assert-Equal $priya.NeedsRemediation $false 'demo Priya F1 never remediated'
     $alex = $demo | Where-Object { $_.UserPrincipalName -eq 'alex@contoso.com' } | Select-Object -First 1
     Assert-Equal $alex.NearLegacyLimit $true 'demo Alex is near the 50 GB cap'
     Assert-Equal $alex.StorageCompliant $false 'demo Alex is not at 100 GB'
@@ -1426,9 +1871,10 @@ function Invoke-MailboxQuotaSelfTest {
 function Get-MailboxQuotaDemoRows {
     param([hashtable]$Policy)
 
-    $licE3 = [pscustomobject]@{ HasE3 = $true; HasE5 = $false; UserPrincipalName = 'alex@contoso.com'; DisplayName = 'Alex Rivera' }
-    $licE5 = [pscustomobject]@{ HasE3 = $false; HasE5 = $true; UserPrincipalName = 'sam@contoso.com'; DisplayName = 'Sam Okonkwo' }
-    $licBoth = [pscustomobject]@{ HasE3 = $true; HasE5 = $true; UserPrincipalName = 'jordan@contoso.com'; DisplayName = 'Jordan Lee' }
+    $licE3 = [pscustomobject]@{ HasE3 = $true; HasE5 = $false; HasF1 = $false; UserPrincipalName = 'alex@contoso.com'; DisplayName = 'Alex Rivera' }
+    $licE5 = [pscustomobject]@{ HasE3 = $false; HasE5 = $true; HasF1 = $false; UserPrincipalName = 'sam@contoso.com'; DisplayName = 'Sam Okonkwo' }
+    $licBoth = [pscustomobject]@{ HasE3 = $true; HasE5 = $true; HasF1 = $false; UserPrincipalName = 'jordan@contoso.com'; DisplayName = 'Jordan Lee' }
+    $licF1 = [pscustomobject]@{ HasE3 = $false; HasE5 = $false; HasF1 = $true; UserPrincipalName = 'priya@contoso.com'; DisplayName = 'Priya Natarajan' }
 
     $rows = New-Object System.Collections.Generic.List[object]
     $samples = @(
@@ -1473,6 +1919,20 @@ function Get-MailboxQuotaDemoRows {
             }
             UsedBytes = 67.8 * 1GB
             License   = $licBoth
+        }
+        @{
+            Mailbox = [pscustomobject]@{
+                UserPrincipalName         = 'priya@contoso.com'
+                DisplayName               = 'Priya Natarajan'
+                ExternalDirectoryObjectId = 'dddddddd-dddd-dddd-dddd-dddddddddddd'
+                RecipientTypeDetails      = 'UserMailbox'
+                ProhibitSendReceiveQuota  = '50 GB (53,687,091,200 bytes)'
+                ProhibitSendQuota         = '49 GB (52,613,349,376 bytes)'
+                IssueWarningQuota         = '49 GB (52,613,349,376 bytes)'
+                UseDatabaseQuotaDefaults  = $true
+            }
+            UsedBytes = 47.1 * 1GB
+            License   = $licF1
         }
     )
 
@@ -2359,6 +2819,7 @@ function Write-QuotaReportSet {
         [Parameter(Mandatory)] [string] $OutputFolder,
         [int] $LicensedWithoutMailbox = 0,
         [string] $DataSource = '',
+        [int] $HtmlMaxRows = 1000,
         [switch] $Remediated,
         [switch] $SkipRemediateHint
     )
@@ -2371,49 +2832,78 @@ function Write-QuotaReportSet {
     $fullPath      = Join-Path $OutputFolder "MailboxQuota-Full-$stamp.csv"
     $notCompliant  = Join-Path $OutputFolder ("MailboxQuota-Not{0}GB-$stamp.csv" -f $Policy.TargetStorageQuotaGB)
     $nearLimitPath = Join-Path $OutputFolder "MailboxQuota-NearLegacyLimit-$stamp.csv"
+    $f1Path        = Join-Path $OutputFolder "MailboxQuota-F1-$stamp.csv"
     $htmlPath      = Join-Path $OutputFolder "MailboxQuota-Summary-$stamp.html"
 
     $exportColumns = @(
         'UserPrincipalName', 'DisplayName', 'ExternalDirectoryObjectId', 'RecipientTypeDetails',
-        'LicenseE3', 'LicenseE5', 'UseDatabaseQuotaDefaults',
+        'LicenseTier', 'LicenseE3', 'LicenseE5', 'LicenseF1', 'ExpectedCapGB', 'UseDatabaseQuotaDefaults',
         'ProhibitSendReceiveGB', 'ProhibitSendGB', 'IssueWarningGB',
         'TotalItemSizeGB', 'PercentOfCapUsed',
         'StorageCompliant', 'QuotasAligned', 'NearLegacyLimit',
         'Issues', 'NeedsRemediation'
     )
-    $sorted = @($Results | Sort-Object UserPrincipalName | Select-Object $exportColumns)
-    Export-QuotaCsv -InputObject $sorted -Path $fullPath
-    Export-QuotaCsv -InputObject @($Results | Where-Object { -not $_.StorageCompliant } | Sort-Object UserPrincipalName | Select-Object $exportColumns) -Path $notCompliant
-    Export-QuotaCsv -InputObject @($Results | Where-Object { $_.NearLegacyLimit } | Sort-Object PercentOfCapUsed -Descending | Select-Object $exportColumns) -Path $nearLimitPath
 
-    $notCompliantCount = @($Results | Where-Object { -not $_.StorageCompliant }).Count
-    $nearLimitCount    = @($Results | Where-Object { $_.NearLegacyLimit }).Count
-    $total = @($Results).Count
+    # One pass over the results instead of four Where-Object pipelines.
+    $all          = ConvertTo-ObjectArray $Results
+    $notCompliantList = New-Object System.Collections.Generic.List[object]
+    $nearList     = New-Object System.Collections.Generic.List[object]
+    $f1List       = New-Object System.Collections.Generic.List[object]
+    $f1NearCount  = 0
+    $enterpriseNotCompliant = 0
+    foreach ($r in $all) {
+        $isF1Only = (Get-LicenseFlag $r 'LicenseF1') -and -not ((Get-LicenseFlag $r 'LicenseE3') -or (Get-LicenseFlag $r 'LicenseE5'))
+        if (-not $r.StorageCompliant) {
+            [void]$notCompliantList.Add($r)
+            if (-not $isF1Only) { $enterpriseNotCompliant++ }
+        }
+        if ($r.NearLegacyLimit) {
+            [void]$nearList.Add($r)
+            if ($isF1Only) { $f1NearCount++ }
+        }
+        if ($isF1Only) { [void]$f1List.Add($r) }
+    }
 
-    New-HtmlReport -Results $Results -Path $htmlPath -Summary @{
-        Total                = $total
-        Compliant            = $total - $notCompliantCount
-        NotCompliant         = $notCompliantCount
-        NearLimit            = $nearLimitCount
-        TargetStorageQuotaGB = $Policy.TargetStorageQuotaGB
-        LegacyQuotaGB        = $Policy.LegacyQuotaGB
-        NearLimitPercent     = $Policy.NearLimitPercent
-        Remediated           = [bool]$Remediated
-        DataSource           = $DataSource
+    $total             = $all.Length
+    $notCompliantCount = $notCompliantList.Count
+    $nearLimitCount    = $nearList.Count
+    $f1Count           = $f1List.Count
+
+    Export-QuotaCsv -InputObject @($all | Sort-Object UserPrincipalName | Select-Object $exportColumns) -Path $fullPath
+    Export-QuotaCsv -InputObject @($notCompliantList | Sort-Object UserPrincipalName | Select-Object $exportColumns) -Path $notCompliant
+    Export-QuotaCsv -InputObject @($nearList | Sort-Object PercentOfCapUsed -Descending | Select-Object $exportColumns) -Path $nearLimitPath
+    Export-QuotaCsv -InputObject @($f1List | Sort-Object PercentOfCapUsed -Descending | Select-Object $exportColumns) -Path $f1Path
+
+    New-HtmlReport -Results $all -Path $htmlPath -MaxRows $HtmlMaxRows -Summary @{
+        Total                  = $total
+        Compliant              = $total - $notCompliantCount
+        NotCompliant           = $notCompliantCount
+        EnterpriseNotCompliant = $enterpriseNotCompliant
+        NearLimit              = $nearLimitCount
+        F1Total                = $f1Count
+        F1NearLimit            = $f1NearCount
+        F1QuotaGB              = $Policy.F1QuotaGB
+        TargetStorageQuotaGB   = $Policy.TargetStorageQuotaGB
+        LegacyQuotaGB          = $Policy.LegacyQuotaGB
+        NearLimitPercent       = $Policy.NearLimitPercent
+        Remediated             = [bool]$Remediated
+        DataSource             = $DataSource
     }
 
     Write-Host ''
-    Write-Ok  ("Evaluated {0} licensed mailboxes." -f $total)
+    Write-Ok  ("Evaluated {0} licensed mailboxes ({1} E3/E5, {2} F1-only)." -f $total, ($total - $f1Count), $f1Count)
     if ($LicensedWithoutMailbox -gt 0) {
-        Write-Warn ("Licensed E3/E5 users with no matching mailbox: {0}" -f $LicensedWithoutMailbox)
+        Write-Warn ("Licensed users with no matching mailbox in the data source: {0}" -f $LicensedWithoutMailbox)
     }
-    Write-Warn ("Not configured for {0} GB storage: {1}" -f $Policy.TargetStorageQuotaGB, $notCompliantCount)
-    Write-Warn ("E3 mailboxes near {0} GB cap (>= {1}%): {2}" -f $Policy.LegacyQuotaGB, $Policy.NearLimitPercent, $nearLimitCount)
+    Write-Warn ("E3/E5 mailboxes not configured for {0} GB storage: {1}" -f $Policy.TargetStorageQuotaGB, $enterpriseNotCompliant)
+    Write-Warn ("E3 mailboxes near {0} GB cap (>= {1}%): {2}" -f $Policy.LegacyQuotaGB, $Policy.NearLimitPercent, ($nearLimitCount - $f1NearCount))
+    Write-Warn ("F1 mailboxes ({0} GB cap): {1}; near cap (>= {2}%): {3}" -f $Policy.F1QuotaGB, $f1Count, $Policy.NearLimitPercent, $f1NearCount)
     Write-Host ''
     Write-Info 'Reports written to:'
     Write-Host "  $fullPath"
     Write-Host "  $notCompliant"
     Write-Host "  $nearLimitPath"
+    Write-Host "  $f1Path"
     Write-Host "  $htmlPath"
 
     if (-not $SkipRemediateHint) {
@@ -2425,6 +2915,7 @@ function Write-QuotaReportSet {
         FullCsv      = $fullPath
         NotCompliant = $notCompliant
         NearLimit    = $nearLimitPath
+        F1           = $f1Path
         Html         = $htmlPath
     }
 }
@@ -2444,12 +2935,13 @@ $policy = New-QuotaPolicy `
     -IssueWarningQuotaGB $IssueWarningQuotaGB `
     -LegacyQuotaGB $LegacyQuotaGB `
     -NearLimitPercent $NearLimitPercent `
-    -QuotaToleranceMB $QuotaToleranceMB
+    -QuotaToleranceMB $QuotaToleranceMB `
+    -F1QuotaGB $F1QuotaGB
 
 if ($DemoReport) {
     Write-Info 'Writing a sample report (no tenant connection)...'
     $results = Get-MailboxQuotaDemoRows -Policy $policy
-    Write-QuotaReportSet -Results $results -Policy $policy -OutputFolder $OutputFolder -DataSource 'Demo' -SkipRemediateHint | Out-Null
+    Write-QuotaReportSet -Results $results -Policy $policy -OutputFolder $OutputFolder -DataSource 'Demo' -HtmlMaxRows $HtmlMaxRows -SkipRemediateHint | Out-Null
     return
 }
 #--------------------------------------------------------------------
@@ -2460,6 +2952,15 @@ $script:TokenRefreshMinutes = $TokenRefreshMinutes
 $useGraphReports = ($DataSource -eq 'GraphReports')
 $needExo = $Remediate -or ($DataSource -eq 'ExchangeLive')
 $sourceLabel = $DataSource
+$runClock = [System.Diagnostics.Stopwatch]::StartNew()
+$phaseClock = [System.Diagnostics.Stopwatch]::StartNew()
+$script:QuotaCmdlet = $PSCmdlet
+
+function Write-Phase {
+    param([string]$Message)
+    Write-Ok ("{0} [{1:mm\:ss} this step, {2:hh\:mm\:ss} total]" -f $Message, $phaseClock.Elapsed, $runClock.Elapsed)
+    $phaseClock.Restart()
+}
 
 Write-Info 'Checking required modules...'
 Enable-Tls12
@@ -2483,15 +2984,74 @@ if ($needExo) {
     Write-Info 'Connecting to Exchange Online...'
     Connect-QuotaExchangeOnline -UserPrincipalName $UserPrincipalName -AppId $AppId -CertificateThumbprint $CertificateThumbprint -Organization $Organization
 }
+Write-Phase 'Connected.'
 
 $results = New-Object System.Collections.Generic.List[object]
 $licensedWithoutMailbox = 0
+
+function Invoke-QuotaRemediation {
+    param(
+        [Parameter(Mandatory)] $Rows,
+        $FallbackIdentityByUpn = $null
+    )
+
+    $targets = New-Object System.Collections.Generic.List[object]
+    foreach ($r in (ConvertTo-ObjectArray $Rows)) {
+        if ($r.NeedsRemediation) { [void]$targets.Add($r) }
+    }
+    if ($targets.Count -eq 0) {
+        Write-Info 'No E3/E5 mailboxes need quota remediation.'
+        return
+    }
+
+    Write-Info ("Remediating {0} mailbox(es) via Set-Mailbox..." -f $targets.Count)
+    if (-not (Test-ExchangeOnlineConnected)) {
+        Import-RequiredModule -Name 'ExchangeOnlineManagement'
+        Connect-QuotaExchangeOnline -UserPrincipalName $UserPrincipalName -AppId $AppId -CertificateThumbprint $CertificateThumbprint -Organization $Organization
+    }
+
+    $target = "SR=$TargetStorageQuotaGB GB, Send=$ProhibitSendQuotaGB GB, Warn=$IssueWarningQuotaGB GB"
+    $index = 0
+    foreach ($row in $targets) {
+        $index++
+        if (($index % 25) -eq 0) {
+            Confirm-QuotaTokens -Exchange
+        }
+        $identityForSet = [string]$row.UserPrincipalName
+        if ([string]::IsNullOrWhiteSpace($identityForSet) -and $null -ne $FallbackIdentityByUpn) {
+            $identityForSet = [string]$FallbackIdentityByUpn[$row.UserPrincipalName]
+        }
+        if ([string]::IsNullOrWhiteSpace($identityForSet)) {
+            Write-Warn 'Skipping a remediation row with no identity.'
+            continue
+        }
+        Write-Progress -Activity 'Remediating quotas' -Status $identityForSet -PercentComplete (($index / $targets.Count) * 100)
+        if ($script:QuotaCmdlet.ShouldProcess($identityForSet, "Set quotas to $target")) {
+            try {
+                Invoke-WithRetry -Activity "Set-Mailbox $identityForSet" -ScriptBlock {
+                    Set-Mailbox -Identity $identityForSet `
+                        -UseDatabaseQuotaDefaults $false `
+                        -ProhibitSendReceiveQuota ("{0}GB" -f $TargetStorageQuotaGB) `
+                        -ProhibitSendQuota        ("{0}GB" -f $ProhibitSendQuotaGB) `
+                        -IssueWarningQuota        ("{0}GB" -f $IssueWarningQuotaGB) `
+                        -ErrorAction Stop
+                }
+                Write-Ok "Remediated quotas for $identityForSet."
+            }
+            catch {
+                Write-Err "Failed to remediate ${identityForSet}: $(Get-ExceptionMessageChain $_.Exception)"
+            }
+        }
+    }
+    Write-Progress -Activity 'Remediating quotas' -Completed
+}
 
 try {
     Write-Info 'Resolving subscribed SKUs...'
     $skuMap = Get-GraphSubscribedSkuMap
     $e3SkuIds = Get-SkuIdsByPartNumber -SkuMap $skuMap -PartNumbers $E3SkuPartNumber
     $e5SkuIds = Get-SkuIdsByPartNumber -SkuMap $skuMap -PartNumbers $E5SkuPartNumber
+    $f1SkuIds = Get-SkuIdsByPartNumber -SkuMap $skuMap -PartNumbers $F1SkuPartNumber
 
     if ((Get-CollectionCount $e3SkuIds) -eq 0) {
         Write-Warn ("E3 SKU(s) '{0}' not found in this tenant." -f ($E3SkuPartNumber -join ', '))
@@ -2499,16 +3059,29 @@ try {
     if ((Get-CollectionCount $e5SkuIds) -eq 0) {
         Write-Warn ("E5 SKU(s) '{0}' not found in this tenant." -f ($E5SkuPartNumber -join ', '))
     }
+    if ((Get-CollectionCount $f1SkuIds) -eq 0) {
+        Write-Warn ("F1 SKU(s) '{0}' not found in this tenant. Tenant SKUs: {1}" -f ($F1SkuPartNumber -join ', '), (($skuMap.Values | Sort-Object -Unique) -join ', '))
+    }
+    Write-Phase ("Resolved {0} tenant SKU(s)." -f $skuMap.Count)
 
     $usageRows = @()
     if ($useGraphReports) {
-        Write-Info 'Using Microsoft Graph mailbox usage report (one tenant download; typically minutes for 30k+ mailboxes). Data can lag 24-48 hours.'
+        Write-Info 'Downloading the Microsoft Graph mailbox usage report (one tenant-wide CSV; data can lag 24-48 hours)...'
         try {
             $usageRows = ConvertTo-ObjectArray (Get-GraphMailboxUsageRows -Period $MailboxUsagePeriod)
             $sourceLabel = "GraphReports ($MailboxUsagePeriod, ~24-48h delay)"
+            Write-Phase ("Usage report downloaded: {0} row(s)." -f $usageRows.Length)
         }
         catch {
-            Write-Warn ("Graph mailbox usage report failed ({0}). Falling back to ExchangeLive — that path can take hours and may outlive a 1-hour token. Grant Reports.Read.All and re-run, or use app-only certificate auth." -f (Get-ExceptionMessageChain $_.Exception))
+            $reason = Get-ExceptionMessageChain $_.Exception
+            if (-not $AllowExchangeLiveFallback) {
+                throw ("The Graph mailbox usage report could not be downloaded: {0}`n" +
+                       "Fix: grant Reports.Read.All to the signed-in account (or the app registration) and re-run. " +
+                       "In Entra: Enterprise applications > Microsoft Graph Command Line Tools > Permissions, or ask a Global Admin to consent once.`n" +
+                       "Only if you really need it, re-run with -AllowExchangeLiveFallback (or -DataSource ExchangeLive) to use the slow per-mailbox Exchange path; " +
+                       "at ~30k mailboxes that takes hours and needs app-only certificate auth to survive token expiry.") -f $reason
+            }
+            Write-Warn ("Graph mailbox usage report failed ({0}). -AllowExchangeLiveFallback is set, so falling back to ExchangeLive (slow)." -f $reason)
             $useGraphReports = $false
             $needExo = $true
             Import-RequiredModule -Name 'ExchangeOnlineManagement'
@@ -2518,67 +3091,33 @@ try {
         }
     }
 
-    Write-Info 'Retrieving licensed users from Microsoft Graph (this can take a while)...'
-    $skuIdsForFilter = ConvertTo-StringArray (@(ConvertTo-ObjectArray $e3SkuIds) + @(ConvertTo-ObjectArray $e5SkuIds))
+    Write-Info 'Retrieving licensed users from Microsoft Graph...'
+    $skuIdsForFilter = ConvertTo-StringArray (@(ConvertTo-ObjectArray $e3SkuIds) + @(ConvertTo-ObjectArray $e5SkuIds) + @(ConvertTo-ObjectArray $f1SkuIds))
     $allUsers = Get-GraphLicensedUsers -Identity $Identity -SkuIds $skuIdsForFilter
-    $lookup = Get-LicenseLookupTables -Users $allUsers -SkuMap $skuMap -E3SkuIds $e3SkuIds -E5SkuIds $e5SkuIds
-    Write-Ok ("Found {0} users with an E3 and/or E5 license." -f $lookup.UserCount)
+    Write-Phase ("Graph returned {0} user object(s)." -f (Get-CollectionCount $allUsers))
+
+    $lookup = Get-LicenseLookupTables -Users $allUsers -SkuMap $skuMap -E3SkuIds $e3SkuIds -E5SkuIds $e5SkuIds -F1SkuIds $f1SkuIds
+    Write-Phase ("Indexed {0} licensed user(s): E3={1}, E5={2}, F1={3}." -f $lookup.UserCount, $lookup.E3Count, $lookup.E5Count, $lookup.F1Count)
+    $allUsers = $null
 
     if ([int]$lookup.UserCount -eq 0) {
-        Write-Warn 'No E3/E5 licensed users were found. Reports will be empty.'
+        Write-Warn 'No E3/E5/F1 licensed users were found. Reports will be empty.'
     }
     elseif ($useGraphReports) {
         $matchedUpns = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-        $index = 0
-        $total = Get-CollectionCount $usageRows
-        foreach ($csvRow in $usageRows) {
-            $index++
-            if (($index % 500) -eq 0) {
-                Write-Progress -Activity 'Evaluating mailbox usage report' -Status "$index of $total" -PercentComplete (($index / [Math]::Max($total, 1)) * 100)
-            }
-            $parsed = ConvertFrom-MailboxUsageRow -Row $csvRow
-            if ($null -eq $parsed) {
-                continue
-            }
-            $lic = Resolve-MailboxLicense -Mailbox $parsed.Mailbox -LicenseByObjectId $lookup.ByObjectId -LicenseByUpn $lookup.ByUpn
-            if ($null -eq $lic) {
-                continue
-            }
-            $upnKey = [string]$parsed.Mailbox.UserPrincipalName
-            if (-not [string]::IsNullOrWhiteSpace($upnKey)) {
-                [void]$matchedUpns.Add($upnKey.Trim())
-            }
-
-            $row = Get-MailboxQuotaEvaluation -Mailbox $parsed.Mailbox -UsedBytes $parsed.UsedBytes -License $lic -Policy $policy
-            [void]$results.Add($row)
-
-            if ($Remediate -and $row.NeedsRemediation) {
-                Confirm-QuotaTokens -Exchange
-                $target = "SR=$TargetStorageQuotaGB GB, Send=$ProhibitSendQuotaGB GB, Warn=$IssueWarningQuotaGB GB"
-                $identityForSet = $row.UserPrincipalName
-                if ($PSCmdlet.ShouldProcess($identityForSet, "Set quotas to $target")) {
-                    try {
-                        Invoke-WithRetry -Activity "Set-Mailbox $identityForSet" -ScriptBlock {
-                            Set-Mailbox -Identity $identityForSet `
-                                -UseDatabaseQuotaDefaults $false `
-                                -ProhibitSendReceiveQuota ("{0}GB" -f $TargetStorageQuotaGB) `
-                                -ProhibitSendQuota        ("{0}GB" -f $ProhibitSendQuotaGB) `
-                                -IssueWarningQuota        ("{0}GB" -f $IssueWarningQuotaGB) `
-                                -ErrorAction Stop
-                        }
-                        Write-Ok "Remediated quotas for $identityForSet."
-                    }
-                    catch {
-                        Write-Err "Failed to remediate ${identityForSet}: $(Get-ExceptionMessageChain $_.Exception)"
-                    }
-                }
-            }
-        }
+        $added = Invoke-UsageReportEvaluation -Rows $usageRows -Lookup $lookup -Policy $policy -Results $results -MatchedUpns $matchedUpns
+        Write-Phase ("Evaluated {0} licensed mailbox(es) from the usage report." -f $added)
+        $usageRows = $null
 
         foreach ($upn in @($lookup.ByUpn.Keys)) {
             if (-not $matchedUpns.Contains($upn)) {
                 $licensedWithoutMailbox++
             }
+        }
+
+        if ($Remediate) {
+            Invoke-QuotaRemediation -Rows $results
+            Write-Phase 'Remediation pass finished.'
         }
     }
 
@@ -2586,9 +3125,10 @@ try {
         $sourceLabel = 'ExchangeLive'
         Write-Info 'Retrieving Exchange Online mailboxes (sharded Get-EXOMailbox; this can take a while)...'
         $mailboxes = ConvertTo-ObjectArray (Get-ExoMailboxesForQuota -Identity $Identity -RecipientTypeDetails $RecipientTypeDetails -LicensedUpn @($lookup.ByUpn.Keys))
-        Write-Ok ("Retrieved {0} mailbox object(s)." -f (Get-CollectionCount $mailboxes))
+        Write-Phase ("Retrieved {0} mailbox object(s)." -f (Get-CollectionCount $mailboxes))
 
         $matchedObjectIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $smtpByUpn = @{}
         $index = 0
         $total = Get-CollectionCount $mailboxes
 
@@ -2596,12 +3136,9 @@ try {
             $index++
             if (($index % 25) -eq 0) {
                 Confirm-QuotaTokens -Exchange
+                $status = [string](Get-PropertyValue $mbx 'UserPrincipalName')
+                Write-Progress -Activity 'Evaluating mailboxes' -Status "$index of $total ($status)" -PercentComplete (($index / [Math]::Max($total, 1)) * 100)
             }
-            $status = [string](Get-PropertyValue $mbx 'UserPrincipalName')
-            if ([string]::IsNullOrWhiteSpace($status)) {
-                $status = [string](Get-PropertyValue $mbx 'PrimarySmtpAddress')
-            }
-            Write-Progress -Activity 'Evaluating mailboxes' -Status $status -PercentComplete (($index / [Math]::Max($total, 1)) * 100)
 
             $lic = Resolve-MailboxLicense -Mailbox $mbx -LicenseByObjectId $lookup.ByObjectId -LicenseByUpn $lookup.ByUpn
             if ($null -eq $lic) {
@@ -2621,36 +3158,23 @@ try {
             $row = Get-MailboxQuotaEvaluation -Mailbox $mbx -UsedBytes $usedBytes -License $lic -Policy $policy
             [void]$results.Add($row)
 
-            if ($Remediate -and $row.NeedsRemediation) {
-                Confirm-QuotaTokens -Exchange
-                $target = "SR=$TargetStorageQuotaGB GB, Send=$ProhibitSendQuotaGB GB, Warn=$IssueWarningQuotaGB GB"
-                $identityForSet = $row.UserPrincipalName
-                if ([string]::IsNullOrWhiteSpace([string]$identityForSet)) {
-                    $identityForSet = Get-PropertyValue $mbx 'PrimarySmtpAddress'
-                }
-                if ($PSCmdlet.ShouldProcess($identityForSet, "Set quotas to $target")) {
-                    try {
-                        Invoke-WithRetry -Activity "Set-Mailbox $identityForSet" -ScriptBlock {
-                            Set-Mailbox -Identity $identityForSet `
-                                -UseDatabaseQuotaDefaults $false `
-                                -ProhibitSendReceiveQuota ("{0}GB" -f $TargetStorageQuotaGB) `
-                                -ProhibitSendQuota        ("{0}GB" -f $ProhibitSendQuotaGB) `
-                                -IssueWarningQuota        ("{0}GB" -f $IssueWarningQuotaGB) `
-                                -ErrorAction Stop
-                        }
-                        Write-Ok "Remediated quotas for $identityForSet."
-                    }
-                    catch {
-                        Write-Err "Failed to remediate ${identityForSet}: $(Get-ExceptionMessageChain $_.Exception)"
-                    }
-                }
+            $smtp = [string](Get-PropertyValue $mbx 'PrimarySmtpAddress')
+            if ($row.NeedsRemediation -and -not [string]::IsNullOrWhiteSpace($smtp)) {
+                $smtpByUpn[[string]$row.UserPrincipalName] = $smtp
             }
         }
+        Write-Progress -Activity 'Evaluating mailboxes' -Completed
+        Write-Phase ("Evaluated {0} licensed mailbox(es) from Exchange Online." -f $results.Count)
 
         foreach ($key in @($lookup.ByObjectId.Keys)) {
             if (-not $matchedObjectIds.Contains($key)) {
                 $licensedWithoutMailbox++
             }
+        }
+
+        if ($Remediate) {
+            Invoke-QuotaRemediation -Rows $results -FallbackIdentityByUpn $smtpByUpn
+            Write-Phase 'Remediation pass finished.'
         }
     }
 }
@@ -2670,5 +3194,7 @@ Write-QuotaReportSet `
     -OutputFolder $OutputFolder `
     -LicensedWithoutMailbox $licensedWithoutMailbox `
     -DataSource $sourceLabel `
+    -HtmlMaxRows $HtmlMaxRows `
     -Remediated:$Remediate `
     -SkipRemediateHint:$Remediate | Out-Null
+Write-Phase 'Reports written.'

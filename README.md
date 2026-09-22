@@ -15,7 +15,13 @@ A live `Get-EXOMailbox` / `Get-EXOMailboxStatistics` walk of ~31,000 mailboxes t
 1. **`GraphReports` (default)** — one Microsoft Graph download of `GET /reports/getMailboxUsageDetail(period='D7')`. That CSV already includes storage used and the three quota values. Join it in memory to E3/E5 licensed users. This is usually minutes, not hours, and finishes inside a one-hour token. The report can lag **24–48 hours**.
 2. **`ExchangeLive`** — real-time `Get-EXOMailbox` in UPN-prefix shards. Use this only when you need current quotas. Tokens are refreshed about every 45 minutes (`-TokenRefreshMinutes`). Prefer **app-only certificate auth** so the job is not tied to an interactive MFA token.
 
-Required Graph permission for the default path: **`Reports.Read.All`** (in addition to `User.Read.All` and `Organization.Read.All`).
+Required Graph permission for the default path: **`Reports.Read.All`** (in addition to `User.Read.All` and `Organization.Read.All`). If that grant is missing the script **stops with instructions** instead of silently dropping into the multi-hour Exchange path; pass `-AllowExchangeLiveFallback` if you really want the fallback.
+
+Every phase prints its elapsed time (`[ OK ] Usage report downloaded: 31,204 row(s). [00:41 this step, 01:12 total]`), so if a run is slow you can see exactly which step it was. On a ~31k mailbox tenant the expected shape is: SKUs seconds, usage report download under a couple of minutes, Graph users a few minutes (paged 999 at a time), evaluation well under a minute, reports a few seconds.
+
+### F1 (frontline) mailboxes
+
+F1-licensed users are tracked as their own tier. They are expected to sit on a **50 GB** cap (`-F1QuotaGB`), are listed with usage in `MailboxQuota-F1-<stamp>.csv`, get a card and a near-cap table in the HTML summary, and are **never remediated** to 100 GB. Default SKU part numbers: `M365_F1` (Microsoft 365 F1), `SPE_F1` (Microsoft 365 F3, formerly F1), `DESKLESSPACK` (Office 365 F3). Adjust with `-F1SkuPartNumber`; the script prints the tenant's SKU list if none match. A user holding both E3/E5 and F1 is treated as E3/E5.
 
 ### Features
 
@@ -25,7 +31,8 @@ Required Graph permission for the default path: **`Reports.Read.All`** (in addit
 - Compares quotas with a byte tolerance so `99.99 GB` is not flagged as non-compliant
 - Handles `ByteQuantifiedSize`, numeric REST sizes, Graph report byte columns, and `"99 GB (106,300,440,576 bytes)"` strings
 - Treats Microsoft 365 E3/E5 (`SPE_E3` / `SPE_E5`) as well as Office 365 E3/E5 (`ENTERPRISEPACK` / `ENTERPRISEPREMIUM`)
-- Writes CSV reports plus a self-contained HTML summary (includes the data source)
+- Writes CSV reports (full, not-100 GB, near-limit, F1) plus a self-contained HTML summary (includes the data source; tables capped at `-HtmlMaxRows`)
+- Prints elapsed time per phase so slow steps are visible
 - `-Remediate` honors `-WhatIf` / `-Confirm` and only calls `Set-Mailbox` for mailboxes that need a quota fix
 - Optional app-only auth: `-AppId`, `-CertificateThumbprint`, `-TenantId`, `-Organization`
 
@@ -34,6 +41,9 @@ Required Graph permission for the default path: **`Reports.Read.All`** (in addit
 ```powershell
 # Fast path for ~30k mailboxes (default). Needs Reports.Read.All.
 .\Report-MailboxQuotaCompliance.ps1 -OutputFolder C:\Reports
+
+# Your tenant calls its frontline SKU something else? Pass it explicitly.
+.\Report-MailboxQuotaCompliance.ps1 -F1SkuPartNumber M365_F1, SPE_F1 -F1QuotaGB 50 -OutputFolder C:\Reports
 
 # Real-time Exchange Online quotas (slow). Skip per-mailbox statistics if you only care about the cap.
 .\Report-MailboxQuotaCompliance.ps1 -DataSource ExchangeLive -SkipStatistics -OutputFolder C:\Reports
