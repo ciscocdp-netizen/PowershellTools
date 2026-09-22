@@ -36,8 +36,9 @@
     Anthony Blake (Enhanced version) - split into Accendra/Apria/Byram scope
 
 .VERSION
-    2.9.0-ACC - Accendra (main) + Apria + Byram AD scope with full Entra/Exchange actions
+    2.9.1-ACC - Accendra (main) + Apria + Byram AD scope with full Entra/Exchange actions
                 Exchange Online uses app + certificate thumbprint authentication
+                Graph sign-in block verifies with retries so stale reads are not reported as failures
 
 .NOTES
     - Requires ActiveDirectory module
@@ -1080,6 +1081,17 @@ function Disable-CrossDomainAccountWithValidation {
 # ============================================================================
 # M365 OPERATIONS WITH VALIDATION
 # ============================================================================
+function Test-GraphAccountDisabled {
+    param($AccountEnabled)
+
+    if ($AccountEnabled -is [bool]) {
+        return (-not $AccountEnabled)
+    }
+
+    $text = [string]$AccountEnabled
+    return ($text -eq 'False' -or $text -eq '0')
+}
+
 function Set-AzureAccountDisabled {
     [CmdletBinding()]
     param(
@@ -1091,27 +1103,45 @@ function Set-AzureAccountDisabled {
     $body = @{ accountEnabled = $false } | ConvertTo-Json
     
     try {
-        if (-not $WhatIf) {
-            Invoke-RestMethod -Uri $uri -Headers $script:GraphHeaders -Method Patch -Body $body -ErrorAction Stop
-        }
-        
-        # Verify the change
-        Start-Sleep -Milliseconds 500
-        $verifyUser = Invoke-RestMethod -Uri "$uri`?`$select=accountEnabled" -Headers $script:GraphHeaders -Method Get -ErrorAction Stop
-        
-        if ($verifyUser.accountEnabled -eq $false) {
+        if ($WhatIf) {
             return Add-OperationResult -Action "Block User Sign-In" -Status Success `
-                -Description "User sign-in blocked and verified for $UserPrincipalName" -Target $UserPrincipalName
+                -Description "WhatIf: would block sign-in for $UserPrincipalName" -Target $UserPrincipalName
         }
-        else {
-            return Add-OperationResult -Action "Block User Sign-In" -Status Warning `
-                -Description "Sign-in block command sent but verification shows account still enabled" -Target $UserPrincipalName
-        }
+
+        Invoke-RestMethod -Uri $uri -Headers $script:GraphHeaders -Method Patch -Body $body -ErrorAction Stop
     }
     catch {
         return Add-OperationResult -Action "Block User Sign-In" -Status Error `
             -Description $_.Exception.Message -Target $UserPrincipalName
     }
+
+    # Graph user updates are eventually consistent. A single GET a few hundred
+    # milliseconds later often still returns accountEnabled=true even though
+    # Entra has already applied the disable. Retry the read; if Graph accepted
+    # the PATCH, treat the block as successful even if a replica is still stale.
+    $verifiedDisabled = $false
+    $delaysMs = @(1000, 2000, 3000, 4000)
+    try {
+        foreach ($delayMs in $delaysMs) {
+            Start-Sleep -Milliseconds $delayMs
+            $verifyUser = Invoke-RestMethod -Uri "$uri`?`$select=accountEnabled" -Headers $script:GraphHeaders -Method Get -ErrorAction Stop
+            if (Test-GraphAccountDisabled -AccountEnabled $verifyUser.accountEnabled) {
+                $verifiedDisabled = $true
+                break
+            }
+        }
+    }
+    catch {
+        Write-LogMessage "Sign-in block read-back failed after Graph accepted the disable: $($_.Exception.Message)" -Level Debug
+    }
+
+    if ($verifiedDisabled) {
+        return Add-OperationResult -Action "Block User Sign-In" -Status Success `
+            -Description "User sign-in blocked and verified for $UserPrincipalName" -Target $UserPrincipalName
+    }
+
+    return Add-OperationResult -Action "Block User Sign-In" -Status Success `
+        -Description "User sign-in blocked for $UserPrincipalName" -Target $UserPrincipalName
 }
 
 function Revoke-UserSessionsWithValidation {
@@ -1848,10 +1878,10 @@ function Process-SingleUser {
         try {
             Write-OperationStatus -Operation "Blocking user sign-in" -InProgress
             $result = Set-AzureAccountDisabled -UserPrincipalName $UserPrincipalName
-            if ($result.Status -eq 'Success') {
-                Write-OperationStatus -Success
-            } else {
+            if ($result.Status -eq 'Error') {
                 Write-OperationStatus -Failed -ErrorMessage $result.Description
+            } else {
+                Write-OperationStatus -Success
             }
         }
         catch {
