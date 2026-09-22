@@ -35,9 +35,11 @@ Test-ScriptParses -Path (Join-Path $repo 'Set-ExchangeOnlineCredentialFile.ps1')
 
 $offboard = Get-Content -Raw -Path (Join-Path $repo 'User-Offboarding-Accendra.ps1')
 $updater = Get-Content -Raw -Path (Join-Path $repo 'Set-ExchangeOnlineCredentialFile.ps1')
-Assert-True ($offboard -match 'Import-OffboardingCredentialFile') 'Offboarding loads DPAPI helper'
-Assert-True ($offboard -notmatch 'Import-Clixml -Path \$passwordFile') 'Offboarding no longer uses Import-Clixml for Exchange'
-Assert-True ($updater -match 'Change encryption scope') 'Menu offers encryption-scope option'
+Assert-True ($offboard -match 'CertificateThumbprint') 'Offboarding uses certificate thumbprint for Exchange'
+Assert-True ($offboard -match '-AppId') 'Offboarding passes Exchange AppId'
+Assert-True ($offboard -match '-Organization') 'Offboarding passes Exchange organization'
+Assert-True ($offboard -notmatch 'Connect-ExchangeOnline -Credential') 'Offboarding no longer uses a stored Exchange password'
+Assert-True ($updater -match 'Change encryption scope') 'Credential-file menu still offers encryption-scope option'
 Assert-True ($updater -match 'Any user on this computer') 'Menu can choose machine-wide decrypt'
 Assert-True ($updater -match 'Only the current Windows user') 'Menu can choose user\+machine decrypt'
 

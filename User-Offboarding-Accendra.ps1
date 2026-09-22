@@ -37,18 +37,16 @@
     Anthony Blake (Enhanced version) - split into Accendra/Apria/Byram scope
 
 .VERSION
-    2.8.2-ACC - Accendra (main) + Apria + Byram AD scope with full Entra/Exchange actions
-                Exchange Online service account is loaded from a DPAPI credential file
-                (machine-wide or current-user; chosen in Set-ExchangeOnlineCredentialFile.ps1)
+    2.9.0-ACC - Accendra (main) + Apria + Byram AD scope with full Entra/Exchange actions
+                Exchange Online uses app + certificate thumbprint authentication
 
 .NOTES
     - Requires ActiveDirectory module
     - Requires ExchangeOnlineManagement module
     - Requires Graph API App Registration with appropriate permissions
-    - Exchange Online credentials: Windows DPAPI file created with
-      Set-ExchangeOnlineCredentialFile.ps1. The menu lets you choose whether the
-      file can be decrypted by any user on this computer, or only the current
-      Windows user on this computer.
+    - Exchange Online: Connect-ExchangeOnline -AppId -CertificateThumbprint -Organization.
+      The app certificate must be installed in the local certificate store
+      (typically CurrentUser\My) and the app needs Exchange admin permissions.
     - Run with appropriate administrative privileges
 
 .EXAMPLE
@@ -76,10 +74,6 @@ param(
 )
 
 $script:ScriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
-$script:CredentialHelperPath = Join-Path $script:ScriptRoot 'Set-ExchangeOnlineCredentialFile.ps1'
-if (Test-Path -LiteralPath $script:CredentialHelperPath) {
-    . $script:CredentialHelperPath
-}
 
 # ============================================================================
 # CONFIGURATION
@@ -123,12 +117,12 @@ $script:Config = @{
   }
     
     # ------------------------------------------------------------------------
-    # Exchange Online credentials (Windows DPAPI)
-    # Create or change the file, and choose machine vs user encryption, with:
-    #   .\Set-ExchangeOnlineCredentialFile.ps1
+    # Exchange Online — app + certificate (no stored password)
+    # The certificate identified by thumbprint must be in the cert store.
     # ------------------------------------------------------------------------
-    ExchangeAccount   = "svcIAM@owens-minor.com"
-    PasswordFile      = "E:\Scripts\Passwords\ExchangeOnline.json"
+    ExchangeOrganization          = "accendra.onmicrosoft.com"
+    ExchangeAppId                 = "056fd019-2f2e-409sjndyey436433w"
+    ExchangeCertificateThumbprint = "a70caee3205f6e452f435sjnhdye6645efaqwe"
     
     # Validation Settings
     ValidationDelaySeconds     = 10
@@ -597,31 +591,17 @@ function Connect-ExchangeOnlineSecure {
         
         Import-Module ExchangeOnlineManagement -ErrorAction Stop
 
-        if (-not (Get-Command Import-OffboardingCredentialFile -ErrorAction SilentlyContinue)) {
-            if (Test-Path -LiteralPath $script:CredentialHelperPath) {
-                . $script:CredentialHelperPath
-            }
-            else {
-                throw "Required helper not found: $($script:CredentialHelperPath)"
-            }
+        $organization = $script:Config.ExchangeOrganization
+        $appId = $script:Config.ExchangeAppId
+        $certThumbprint = $script:Config.ExchangeCertificateThumbprint
+        if ([string]::IsNullOrWhiteSpace($organization) -or
+            [string]::IsNullOrWhiteSpace($appId) -or
+            [string]::IsNullOrWhiteSpace($certThumbprint)) {
+            throw "Exchange app authentication is not configured. Set ExchangeOrganization, ExchangeAppId, and ExchangeCertificateThumbprint in `$script:Config."
         }
 
-        $passwordFile = $script:Config.PasswordFile
-        if ($passwordFile -and -not (Test-Path -LiteralPath $passwordFile)) {
-            $localCred = Join-Path $script:ScriptRoot (Split-Path -Leaf $passwordFile)
-            if (Test-Path -LiteralPath $localCred) {
-                $passwordFile = $localCred
-            }
-        }
-        if (-not $passwordFile -or -not (Test-Path -LiteralPath $passwordFile)) {
-            throw "Exchange credential file not found: $($script:Config.PasswordFile). Run Set-ExchangeOnlineCredentialFile.ps1 to create it and choose machine or user encryption."
-        }
-
-        $secrets = Import-OffboardingCredentialFile -FilePath $passwordFile
-        $credentials = ConvertTo-OffboardingPSCredential -SecretRecord $secrets
-        Write-LogMessage "Exchange credentials loaded for $($credentials.UserName) [$($secrets.Protection)]" -Level Debug -Indent 1
-        
-        Connect-ExchangeOnline -Credential $credentials -ShowBanner:$false -ErrorAction Stop
+        Write-LogMessage "Connecting to Exchange Online as app $appId ($organization)" -Level Debug -Indent 1
+        Connect-ExchangeOnline -AppId $appId -CertificateThumbprint $certThumbprint -Organization $organization -ShowBanner:$false -ErrorAction Stop
         
         Write-LogMessage "Exchange Online connection established" -Level Success -Indent 1
         $script:ExchangeConnected = $true
@@ -2248,9 +2228,9 @@ function Start-Offboarding {
         
         Write-Host ""
         Write-Host ("=" * 70) -ForegroundColor Cyan
-        Write-Host "  USER OFFBOARDING SCRIPT v2.8 - Accendra / Apria / Byram" -ForegroundColor Cyan
+        Write-Host "  USER OFFBOARDING SCRIPT v2.9 - Accendra / Apria / Byram" -ForegroundColor Cyan
         Write-Host "  Author: Anthony Blake | Enhanced: $(Get-Date -Format 'yyyy-MM-dd')" -ForegroundColor DarkCyan
-        Write-Host "  Exchange creds: DPAPI file (machine or current-user; Set-ExchangeOnlineCredentialFile.ps1)" -ForegroundColor DarkCyan
+        Write-Host "  Exchange: app + certificate thumbprint ($($script:Config.ExchangeOrganization))" -ForegroundColor DarkCyan
         Write-Host ("=" * 70) -ForegroundColor Cyan
         
         # Import required modules
