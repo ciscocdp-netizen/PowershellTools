@@ -146,6 +146,7 @@ $script:ExchangeConnected = $false
 $script:ScriptStartTime = Get-Date
 $script:ErrorCount = 0
 $script:WarningCount = 0
+$script:CrossDomainSidAttributesAvailable = $null
 
 # ============================================================================
 # ENUMERATIONS FOR STATUS TRACKING
@@ -657,17 +658,46 @@ function Get-ADUserDetailedInfo {
         [string]$PDCEmulator
     )
     
-    # Accendra is the anchor object for this script and carries the same cross-domain
-    # SID attributes the OMI object used to hold. We read omiApriaSID / omiByramSID
-    # from the Accendra user to locate the Apria and Byram accounts.
-    $properties = @(
+    # Accendra is the anchor object for this script. If the schema still has
+    # omiApriaSID / omiByramSID, those values locate the Apria and Byram accounts.
+    # Those attributes are optional: they are not in every Accendra domain schema.
+    $coreProperties = @(
         'Enabled', 'Description', 'PasswordLastSet', 'LastLogonDate',
         'Manager', 'DistinguishedName', 'SID', 'whenCreated', 'whenChanged',
-        'omiApriaSID', 'omiByramSID', 'memberOf'
+        'memberOf'
     )
+    $optionalSidProperties = @('omiApriaSID', 'omiByramSID')
     
     try {
-        $user = Get-ADUser -Identity $SamAccountName -Server $PDCEmulator -Properties $properties -ErrorAction Stop
+        $properties = @($coreProperties)
+        if ($script:CrossDomainSidAttributesAvailable -ne $false) {
+            $properties += $optionalSidProperties
+        }
+
+        try {
+            $user = Get-ADUser -Identity $SamAccountName -Server $PDCEmulator -Properties $properties -ErrorAction Stop
+            $script:CrossDomainSidAttributesAvailable = $true
+        }
+        catch {
+            $message = $_.Exception.Message
+            if ($message -match 'omiApriaSID|omiByramSID|properties are invalid') {
+                Write-LogMessage "Cross-domain SID attributes are not in this domain schema ($message). Continuing with Accendra only." -Level Warning
+                $script:CrossDomainSidAttributesAvailable = $false
+                $user = Get-ADUser -Identity $SamAccountName -Server $PDCEmulator -Properties $coreProperties -ErrorAction Stop
+            }
+            else {
+                throw
+            }
+        }
+
+        $apriaSid = $null
+        $byramSid = $null
+        if ($user.PSObject.Properties['omiApriaSID'] -and $user.omiApriaSID) {
+            $apriaSid = $user.omiApriaSID
+        }
+        if ($user.PSObject.Properties['omiByramSID'] -and $user.omiByramSID) {
+            $byramSid = $user.omiByramSID
+        }
         
         # Get manager details if available
         $managerName = "Not Assigned"
@@ -685,8 +715,8 @@ function Get-ADUserDetailedInfo {
             User        = $user
             ManagerName = $managerName
             CrossDomainSIDs = @{
-                Apria    = $user.omiApriaSID
-                Byram    = $user.omiByramSID
+                Apria    = $apriaSid
+                Byram    = $byramSid
             }
         }
     }

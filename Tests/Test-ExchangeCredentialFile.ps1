@@ -36,6 +36,7 @@ Test-ScriptParses -Path (Join-Path $repo 'Set-ExchangeOnlineCredentialFile.ps1')
 $offboard = Get-Content -Raw -Path (Join-Path $repo 'User-Offboarding-Accendra.ps1')
 $updater = Get-Content -Raw -Path (Join-Path $repo 'Set-ExchangeOnlineCredentialFile.ps1')
 Assert-True ($offboard -match 'CertificateThumbprint') 'Offboarding uses certificate thumbprint for Exchange'
+Assert-True ($offboard -match 'CrossDomainSidAttributesAvailable') 'AD lookup retries without missing omiApriaSID attributes'
 Assert-True ($offboard -match '-AppId') 'Offboarding passes Exchange AppId'
 Assert-True ($offboard -match '-Organization') 'Offboarding passes Exchange organization'
 Assert-True ($offboard -notmatch 'Connect-ExchangeOnline -Credential') 'Offboarding no longer uses a stored Exchange password'
