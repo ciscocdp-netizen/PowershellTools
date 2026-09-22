@@ -666,19 +666,28 @@ function Get-ADUserDetailedInfo {
     
     # Accendra is the anchor object. accAapriaSID / accByramSID locate the linked
     # Apria and Byram accounts when those attributes have values.
-    $apriaAttr = $script:Config.CrossDomainSidAttributes.Apria
-    $byramAttr = $script:Config.CrossDomainSidAttributes.Byram
+    $apriaAttr = 'accAapriaSID'
+    $byramAttr = 'accByramSID'
+    if ($script:Config.ContainsKey('CrossDomainSidAttributes') -and $script:Config.CrossDomainSidAttributes) {
+        if ($script:Config.CrossDomainSidAttributes['Apria']) {
+            $apriaAttr = [string]$script:Config.CrossDomainSidAttributes['Apria']
+        }
+        if ($script:Config.CrossDomainSidAttributes['Byram']) {
+            $byramAttr = [string]$script:Config.CrossDomainSidAttributes['Byram']
+        }
+    }
+
     $coreProperties = @(
         'Enabled', 'Description', 'PasswordLastSet', 'LastLogonDate',
         'Manager', 'DistinguishedName', 'SID', 'whenCreated', 'whenChanged',
         'memberOf'
     )
-    $sidProperties = @($apriaAttr, $byramAttr)
+    $sidProperties = @($apriaAttr, $byramAttr) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
     
     try {
         $properties = @($coreProperties)
-        if ($script:CrossDomainSidAttributesAvailable -ne $false) {
-            $properties += $sidProperties
+        if ($script:CrossDomainSidAttributesAvailable -ne $false -and $sidProperties.Count -gt 0) {
+            $properties = @($coreProperties + $sidProperties)
         }
 
         try {
@@ -686,7 +695,7 @@ function Get-ADUserDetailedInfo {
             $script:CrossDomainSidAttributesAvailable = $true
         }
         catch {
-            if ($_.Exception.Message -match 'properties are invalid') {
+            if ($_.Exception.Message -match 'properties are invalid|null value') {
                 $script:CrossDomainSidAttributesAvailable = $false
                 $user = Get-ADUser -Identity $SamAccountName -Server $PDCEmulator -Properties $coreProperties -ErrorAction Stop
             }
@@ -697,10 +706,10 @@ function Get-ADUserDetailedInfo {
 
         $apriaSid = $null
         $byramSid = $null
-        if ($user.PSObject.Properties[$apriaAttr] -and $user.$apriaAttr) {
+        if ($apriaAttr -and $user.PSObject.Properties[$apriaAttr] -and $user.$apriaAttr) {
             $apriaSid = $user.$apriaAttr
         }
-        if ($user.PSObject.Properties[$byramAttr] -and $user.$byramAttr) {
+        if ($byramAttr -and $user.PSObject.Properties[$byramAttr] -and $user.$byramAttr) {
             $byramSid = $user.$byramAttr
         }
         
