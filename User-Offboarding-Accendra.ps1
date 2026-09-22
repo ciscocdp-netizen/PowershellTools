@@ -73,8 +73,6 @@ param(
     [switch]$SkipExchangeConnection
 )
 
-$script:ScriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
-
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
