@@ -19,9 +19,20 @@ Required Graph permission for the default path: **`Reports.Read.All`** (in addit
 
 Every phase prints its elapsed time (`[ OK ] Usage report downloaded: 31,204 row(s). [00:41 this step, 01:12 total]`), so if a run is slow you can see exactly which step it was. On a ~31k mailbox tenant the expected shape is: SKUs seconds, usage report download under a couple of minutes, Graph users a few minutes (paged 999 at a time), evaluation well under a minute, reports a few seconds.
 
-### F1 (frontline) mailboxes
+### License tiers and quota profiles
 
-F1-licensed users are tracked as their own tier. They are expected to sit on a **50 GB** cap (`-F1QuotaGB`), are listed with usage in `MailboxQuota-F1-<stamp>.csv`, get a card and a near-cap table in the HTML summary, and are **never remediated** to 100 GB. Default SKU part numbers: `M365_F1` (Microsoft 365 F1), `SPE_F1` (Microsoft 365 F3, formerly F1), `DESKLESSPACK` (Office 365 F3). Adjust with `-F1SkuPartNumber`; the script prints the tenant's SKU list if none match. A user holding both E3/E5 and F1 is treated as E3/E5.
+Exchange Online mailbox limits by license (Microsoft):
+
+| Tier | Warning | Prohibit Send | Prohibit Send/Receive | Default SKU part numbers |
+| --- | --- | --- | --- | --- |
+| E3 / E5 (Office 365 and Microsoft 365) | 98 GB | 99 GB | 100 GB | `ENTERPRISEPACK`, `SPE_E3`, `ENTERPRISEPREMIUM`, `SPE_E5` |
+| Office 365 E1 | 49 GB | 49.5 GB | 50 GB | `STANDARDPACK` |
+| F1 / F3 (frontline) | 1.96 GB | 1.98 GB | 2 GB | `M365_F1`, `SPE_F1`, `DESKLESSPACK`, `EXCHANGEDESKLESS` |
+
+- **E3/E5** are the remediation target (`-TargetStorageQuotaGB` / `-ProhibitSendQuotaGB` / `-IssueWarningQuotaGB`).
+- **E1** and **F1/F3** are checked against their own caps (`-E1QuotaGB`, `-F1QuotaGB`; send/warn derived at 99 % / 98 % of the cap), listed with usage in `MailboxQuota-E1-<stamp>.csv` and `MailboxQuota-F1-<stamp>.csv`, and shown in the HTML "By license tier" table plus near-cap tables. They are **never remediated** to 100 GB.
+- A user with more than one tier is placed in the highest: E5 > E3 > E1 > F1.
+- Adjust SKU names with `-E1SkuPartNumber` / `-F1SkuPartNumber`; the script prints the tenant's SKU list if none match.
 
 ### Features
 
@@ -31,7 +42,7 @@ F1-licensed users are tracked as their own tier. They are expected to sit on a *
 - Compares quotas with a byte tolerance so `99.99 GB` is not flagged as non-compliant
 - Handles `ByteQuantifiedSize`, numeric REST sizes, Graph report byte columns, and `"99 GB (106,300,440,576 bytes)"` strings
 - Treats Microsoft 365 E3/E5 (`SPE_E3` / `SPE_E5`) as well as Office 365 E3/E5 (`ENTERPRISEPACK` / `ENTERPRISEPREMIUM`)
-- Writes CSV reports (full, not-100 GB, near-limit, F1) plus a self-contained HTML summary (includes the data source; tables capped at `-HtmlMaxRows`)
+- Writes CSV reports (full, not-100 GB, near-limit, E1, F1) plus a self-contained HTML summary with a per-tier roll-up (tables capped at `-HtmlMaxRows`)
 - Prints elapsed time per phase so slow steps are visible
 - `-Remediate` honors `-WhatIf` / `-Confirm` and only calls `Set-Mailbox` for mailboxes that need a quota fix
 - Optional app-only auth: `-AppId`, `-CertificateThumbprint`, `-TenantId`, `-Organization`
@@ -42,8 +53,8 @@ F1-licensed users are tracked as their own tier. They are expected to sit on a *
 # Fast path for ~30k mailboxes (default). Needs Reports.Read.All.
 .\Report-MailboxQuotaCompliance.ps1 -OutputFolder C:\Reports
 
-# Your tenant calls its frontline SKU something else? Pass it explicitly.
-.\Report-MailboxQuotaCompliance.ps1 -F1SkuPartNumber M365_F1, SPE_F1 -F1QuotaGB 50 -OutputFolder C:\Reports
+# Your tenant calls its frontline / E1 SKUs something else? Pass them explicitly.
+.\Report-MailboxQuotaCompliance.ps1 -F1SkuPartNumber SPE_F1, DESKLESSPACK -E1SkuPartNumber STANDARDPACK -OutputFolder C:\Reports
 
 # Real-time Exchange Online quotas (slow). Skip per-mailbox statistics if you only care about the cap.
 .\Report-MailboxQuotaCompliance.ps1 -DataSource ExchangeLive -SkipStatistics -OutputFolder C:\Reports
