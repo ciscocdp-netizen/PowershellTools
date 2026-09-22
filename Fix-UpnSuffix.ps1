@@ -1052,12 +1052,18 @@ function Set-CollisionFlags {
         $key = $r.NewUPN
         if ($firstRowByUpn.ContainsKey($key)) {
             $otherRow = $firstRowByUpn[$key]
-            $r.Status = "Collision"
-            $r.Detail = "Duplicate target UPN in this CSV (also row $otherRow)"
             $first = $Results | Where-Object { $_.Row -eq $otherRow } | Select-Object -First 1
+            $otherSam = if ($first -and $first.SamAccount) { $first.SamAccount } else { "(row $otherRow)" }
+            $thisSam  = if ($r.SamAccount) { $r.SamAccount } else { "(row $($r.Row))" }
+
+            $r.Status = "Collision"
+            $r.InUseBySam = $otherSam
+            $r.Detail = "Duplicate target UPN in this CSV (also row {0}, sAMAccountName {1})" -f $otherRow, $otherSam
+
             if ($first -and $first.Status -eq "WillChange") {
                 $first.Status = "Collision"
-                $first.Detail = "Duplicate target UPN in this CSV (also row $($r.Row))"
+                $first.InUseBySam = $thisSam
+                $first.Detail = "Duplicate target UPN in this CSV (also row {0}, sAMAccountName {1})" -f $r.Row, $thisSam
             }
         }
         else {
@@ -1065,13 +1071,18 @@ function Set-CollisionFlags {
         }
     }
 
-    $still = @($Results | Where-Object { $_.Status -eq "WillChange" })
-    if ($still.Count -eq 0) { return }
+    # Check AD for anyone who already holds the planned UPN — including rows
+    # already flagged as CSV collisions, so InUseBySam can name the live account.
+    $candidates = @($Results | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_.NewUPN) -and
+        ($_.Status -eq "WillChange" -or $_.Status -eq "Collision")
+    })
+    if ($candidates.Count -eq 0) { return }
 
-    $planned = @($still | ForEach-Object { $_.NewUPN } | Select-Object -Unique)
+    $planned = @($candidates | ForEach-Object { $_.NewUPN } | Select-Object -Unique)
     $existing = Invoke-AdUserBatchLookup -AttributeName "userPrincipalName" -Values $planned -Server $script:QueryServer -Properties $script:UserProperties
 
-    foreach ($r in $still) {
+    foreach ($r in $candidates) {
         if (-not $existing.ContainsKey($r.NewUPN)) { continue }
         $other = $existing[$r.NewUPN]
         if (-not $other) { continue }
@@ -1079,8 +1090,26 @@ function Set-CollisionFlags {
             $other.DistinguishedName.Equals($r.DistinguishedName, [StringComparison]::OrdinalIgnoreCase)) {
             continue
         }
+
+        $occupantSam = $other.SamAccountName
+        if ([string]::IsNullOrWhiteSpace($occupantSam)) { $occupantSam = $other.Name }
+        if ([string]::IsNullOrWhiteSpace($occupantSam)) { continue }
+
         $r.Status = "Collision"
-        $r.Detail = "UPN already in use by {0}" -f $other.SamAccountName
+        if ([string]::IsNullOrWhiteSpace($r.InUseBySam)) {
+            $r.InUseBySam = $occupantSam
+        }
+        elseif ($r.InUseBySam.IndexOf($occupantSam, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+            $r.InUseBySam = "{0}; {1}" -f $r.InUseBySam, $occupantSam
+        }
+
+        $adDetail = "UPN already in use by sAMAccountName {0}" -f $occupantSam
+        if ($other.UserPrincipalName) {
+            $adDetail = "{0} (their current UPN: {1})" -f $adDetail, $other.UserPrincipalName
+        }
+        if ([string]::IsNullOrWhiteSpace($r.Detail) -or $r.Detail -notlike "*already in use*") {
+            Add-RecordDetail -Record $r -Message $adDetail
+        }
     }
 }
 
@@ -1163,7 +1192,7 @@ function Export-UpnPreviewReport {
     $htmlPath = Join-Path $dir ("{0}_{1}.html" -f $NamePrefix, $stamp)
     $csvOut   = Join-Path $dir ("{0}_{1}.csv"  -f $NamePrefix, $stamp)
     $buckets  = Get-PreviewBuckets -Results $Results
-    $cols     = @("Row", "Identity", "SamAccount", "CurrentUPN", "NewUPN", "Status", "Recommendation", "Detail")
+    $cols     = @("Row", "Identity", "SamAccount", "CurrentUPN", "NewUPN", "InUseBySam", "Status", "Recommendation", "Detail")
 
     $generated = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $readyCount = $buckets.Ready.Count
@@ -1219,7 +1248,7 @@ code{background:#eef0f3;padding:1px 4px;border-radius:3px}
     [void]$sb.AppendLine((ConvertTo-ReportTableHtml -Rows $buckets.Warning -Columns $cols))
 
     [void]$sb.AppendLine('<h2 class="bad">Collisions — will not be changed — ' + $collCount + '</h2>')
-    [void]$sb.AppendLine('<p>Two rows share a target UPN, the UPN is already used in AD, or the same account is listed twice with different targets.</p>')
+    [void]$sb.AppendLine('<p>Two rows share a target UPN, the UPN is already used in AD, or the same account is listed twice with different targets. <strong>InUseBySam</strong> is the sAMAccountName of the account that already holds that UPN.</p>')
     [void]$sb.AppendLine((ConvertTo-ReportTableHtml -Rows $buckets.Collision -Columns $cols))
 
     [void]$sb.AppendLine('<h2 class="bad">Cannot change — ' + (@($buckets.NotFound).Count + @($buckets.Invalid).Count + @($buckets.Skipped).Count + @($buckets.Failed).Count) + '</h2>')
@@ -1250,7 +1279,7 @@ code{background:#eef0f3;padding:1px 4px;border-radius:3px}
     }
 
     try {
-        $Results | Select-Object Row, Identity, SamAccount, DistinguishedName, CurrentUPN, NewUPN, Status, Recommendation, Detail |
+        $Results | Select-Object Row, Identity, SamAccount, DistinguishedName, CurrentUPN, NewUPN, InUseBySam, Status, Recommendation, Detail |
             Export-Csv -Path $csvOut -NoTypeInformation -Encoding UTF8
         $csvOutOut = $csvOut
         Write-Ok ("Preview report (CSV):  {0}" -f $csvOut)
@@ -1276,7 +1305,7 @@ function Show-PreviewReport {
         }
         $total = @($Rows).Count
         @($Rows | Select-Object -First $Limit) |
-            Format-Table Row, SamAccount, CurrentUPN, NewUPN, Recommendation, Detail -AutoSize |
+            Format-Table Row, SamAccount, CurrentUPN, NewUPN, InUseBySam, Recommendation, Detail -AutoSize |
             Out-Host
         if ($total -gt $Limit) {
             Write-Host ("  ... {0} more in the HTML/CSV report" -f ($total - $Limit)) -ForegroundColor DarkGray
@@ -1403,6 +1432,7 @@ function Main {
             DistinguishedName  = ""
             CurrentUPN         = ""
             NewUPN             = ""
+            InUseBySam         = ""
             Status             = ""
             Recommendation     = ""
             Detail             = ""
@@ -1603,7 +1633,7 @@ function Save-Output {
     $logTxt     = Join-Path $dir ("UpnFix_Log_{0}.txt"     -f $stamp)
 
     try {
-        $Results | Select-Object Row, Identity, SamAccount, DistinguishedName, CurrentUPN, NewUPN, Status, Recommendation, Detail |
+        $Results | Select-Object Row, Identity, SamAccount, DistinguishedName, CurrentUPN, NewUPN, InUseBySam, Status, Recommendation, Detail |
             Export-Csv -Path $resultsCsv -NoTypeInformation -Encoding UTF8
         Write-Ok ("Results written to: {0}" -f $resultsCsv)
     }

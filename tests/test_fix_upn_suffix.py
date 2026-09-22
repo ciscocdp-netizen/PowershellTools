@@ -482,6 +482,13 @@ class CollisionTests(unittest.TestCase):
         self.assertIn("row 2", rows[0]["Detail"])
         self.assertIn("row 1", rows[1]["Detail"])
 
+    def test_ad_occupant_message_includes_sam(self):
+        detail = "UPN already in use by sAMAccountName {0} (their current UPN: {1})".format(
+            "jsmith", "jsmith@omi.com"
+        )
+        self.assertIn("jsmith", detail)
+        self.assertIn("sAMAccountName", detail)
+
 
 class EfficiencyTests(unittest.TestCase):
     def test_batching_beats_per_row_lookups(self):
@@ -575,7 +582,8 @@ class ScriptSourceTests(unittest.TestCase):
         self.assertIn("Export-UpnPreviewReport", self.source)
         self.assertIn("OK to change", self.source)
         self.assertIn("Recommendation", self.source)
-        self.assertIn("UpnFix_Preview", self.source)
+        self.assertIn("InUseBySam", self.source)
+        self.assertIn("sAMAccountName", self.source)
 
     def test_set_aduser_uses_distinguished_name(self):
         self.assertRegex(
