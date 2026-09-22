@@ -91,6 +91,21 @@ def get_csv_delimiter(first_line: str) -> str:
     return ","
 
 
+def get_row_recommendation(status: str, detail: str | None) -> str:
+    """Port of Get-RowRecommendation."""
+    if status == "WillChange":
+        return "Warning" if (detail and str(detail).strip()) else "Ready"
+    if status in ("Collision", "InvalidUpn", "NotFound", "Failed"):
+        return "Blocked"
+    if status == "NoChange":
+        return "NoChange"
+    if status in ("Skipped", "SkippedByUser"):
+        return "Skipped"
+    if status == "Changed":
+        return "Changed"
+    return status
+
+
 def get_adws_server_name(server: str | None) -> str | None:
     if server is None or not str(server).strip():
         return None
@@ -432,6 +447,27 @@ class SuffixDiscoveryTests(unittest.TestCase):
         self.assertEqual(discover_available_suffixes(None, [], [], []), [])
 
 
+class RecommendationTests(unittest.TestCase):
+    def test_empty_detail_is_ready(self):
+        self.assertEqual(get_row_recommendation("WillChange", ""), "Ready")
+        self.assertEqual(get_row_recommendation("WillChange", None), "Ready")
+
+    def test_warning_detail_is_not_ready(self):
+        self.assertEqual(
+            get_row_recommendation("WillChange", "Suffix 'x.com' is not in the forest UPN suffix list"),
+            "Warning",
+        )
+        self.assertEqual(get_row_recommendation("WillChange", "Account is disabled"), "Warning")
+
+    def test_collisions_and_missing_are_blocked(self):
+        self.assertEqual(get_row_recommendation("Collision", "UPN already in use by jsmith"), "Blocked")
+        self.assertEqual(get_row_recommendation("NotFound", "No AD user matched"), "Blocked")
+        self.assertEqual(get_row_recommendation("InvalidUpn", "bad"), "Blocked")
+
+    def test_already_correct(self):
+        self.assertEqual(get_row_recommendation("NoChange", "Already correct"), "NoChange")
+
+
 class CollisionTests(unittest.TestCase):
     def test_duplicate_target_upn_flags_both_rows(self):
         rows = [
@@ -504,6 +540,10 @@ class ScriptSourceTests(unittest.TestCase):
             "Get-RegisteredPartitionUpnSuffixes",
             "Get-AdwsServerName",
             "Get-AdLookupServers",
+            "Get-RowRecommendation",
+            "Export-UpnPreviewReport",
+            "Get-PreviewBuckets",
+            "Set-DuplicateAccountFlags",
         ):
             self.assertIn(f"function {name}", self.source)
 
@@ -532,7 +572,10 @@ class ScriptSourceTests(unittest.TestCase):
         self.assertIn("Get-AdwsServerName", self.source)
         self.assertNotIn('"{0}:3268"', self.source)
         self.assertNotIn("List[object]", self.source)
-        self.assertIn("System.Collections.ArrayList", self.source)
+        self.assertIn("Export-UpnPreviewReport", self.source)
+        self.assertIn("OK to change", self.source)
+        self.assertIn("Recommendation", self.source)
+        self.assertIn("UpnFix_Preview", self.source)
 
     def test_set_aduser_uses_distinguished_name(self):
         self.assertRegex(

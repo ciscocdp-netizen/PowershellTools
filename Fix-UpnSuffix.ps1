@@ -15,6 +15,8 @@
       to every account in the CSV.
     - Alternate path: a CSV column with the per-row suffix or full UPN.
     - Dry-run preview first. Nothing is written until you confirm.
+    - Writes a grouped HTML + CSV preview report (ready / warnings /
+      collisions / cannot change) next to the source file before you apply.
     - Optional per-account confirmation.
     - Writes a text log and a results CSV next to the source file.
 
@@ -91,7 +93,8 @@ $script:WriteServer  = $null   # Writable DC for the connected domain
 $script:DomainDcCache = @{}    # domain DNS -> writable DC hostname
 $script:WinFormsAvailable = $false
 $script:BatchSize    = 50
-$script:UserProperties = @("UserPrincipalName", "SamAccountName", "DistinguishedName", "Name")
+$script:UserProperties = @("UserPrincipalName", "SamAccountName", "DistinguishedName", "Name", "Enabled")
+$script:OutputStamp    = $null
 $script:CurrentDomainDns = $null
 $script:AvailableSuffixInfo = @()
 
@@ -965,40 +968,77 @@ function Import-UpnCsv {
     return $rows
 }
 
-function Show-PreviewTable {
-    param($Results, $WillChange, $NotFound, $Invalid, $Collision)
+function Add-RecordDetail {
+    param($Record, [string]$Message)
+    if ([string]::IsNullOrWhiteSpace($Message)) { return }
+    if ([string]::IsNullOrWhiteSpace($Record.Detail)) {
+        $Record.Detail = $Message
+    }
+    else {
+        $Record.Detail = "{0}; {1}" -f $Record.Detail, $Message
+    }
+}
 
-    if ($Results.Count -le 40) {
-        $Results | Format-Table Row, SamAccount, CurrentUPN, NewUPN, Status -AutoSize | Out-Host
-        return
+function Get-RowRecommendation {
+    <# Ready = safe to change. Warning = can change but review first. Blocked = do not change. #>
+    param($Row)
+    switch ($Row.Status) {
+        "WillChange" {
+            if ([string]::IsNullOrWhiteSpace($Row.Detail)) { return "Ready" }
+            return "Warning"
+        }
+        "Collision"  { return "Blocked" }
+        "InvalidUpn" { return "Blocked" }
+        "NotFound"   { return "Blocked" }
+        "NoChange"   { return "NoChange" }
+        "Skipped"    { return "Skipped" }
+        "Changed"    { return "Changed" }
+        "Failed"     { return "Blocked" }
+        "SkippedByUser" { return "Skipped" }
+        default      { return $Row.Status }
+    }
+}
+
+function Set-RowRecommendations {
+    param($Results)
+    foreach ($r in $Results) {
+        $r.Recommendation = Get-RowRecommendation -Row $r
+    }
+}
+
+function Set-DuplicateAccountFlags {
+    <# Two CSV rows for the same AD account: keep the first, skip extras, or collide if target UPNs differ. #>
+    param($Results)
+
+    $byDn = @{}
+    foreach ($r in $Results) {
+        if ([string]::IsNullOrWhiteSpace($r.DistinguishedName)) { continue }
+        if ($r.Status -ne "WillChange") { continue }
+        if (-not $byDn.ContainsKey($r.DistinguishedName)) {
+            $byDn[$r.DistinguishedName] = New-Object System.Collections.ArrayList
+        }
+        [void]$byDn[$r.DistinguishedName].Add($r)
     }
 
-    Write-Info ("CSV has {0} rows. Showing the rows that need attention (not the full table)." -f $Results.Count)
-
-    if ($WillChange.Count -gt 0) {
-        Write-Host ""
-        Write-Info ("Will change (first 50 of {0}):" -f $WillChange.Count)
-        $WillChange | Select-Object -First 50 | Format-Table Row, SamAccount, CurrentUPN, NewUPN, Status -AutoSize | Out-Host
-    }
-    if ($Collision.Count -gt 0) {
-        Write-Host ""
-        Write-Warn ("Collisions (first 20 of {0}):" -f $Collision.Count)
-        $Collision | Select-Object -First 20 | Format-Table Row, SamAccount, CurrentUPN, NewUPN, Detail -AutoSize | Out-Host
-    }
-    if ($Invalid.Count -gt 0) {
-        Write-Host ""
-        Write-Warn ("Invalid UPN (first 20 of {0}):" -f $Invalid.Count)
-        $Invalid | Select-Object -First 20 | Format-Table Row, Identity, NewUPN, Detail -AutoSize | Out-Host
-    }
-    if ($NotFound.Count -gt 0) {
-        Write-Host ""
-        Write-Warn ("Not found (first 20 of {0}):" -f $NotFound.Count)
-        $NotFound | Select-Object -First 20 | Format-Table Row, Identity, Status, Detail -AutoSize | Out-Host
-    }
-    if ($WillChange.Count -eq 0 -and $Collision.Count -eq 0 -and $Invalid.Count -eq 0 -and $NotFound.Count -eq 0) {
-        Write-Host ""
-        Write-Info "First 20 rows:"
-        $Results | Select-Object -First 20 | Format-Table Row, SamAccount, CurrentUPN, NewUPN, Status -AutoSize | Out-Host
+    foreach ($dn in @($byDn.Keys)) {
+        $group = @($byDn[$dn])
+        if ($group.Count -lt 2) { continue }
+        $uniqueUpns = @($group | ForEach-Object { $_.NewUPN.ToLowerInvariant() } | Select-Object -Unique)
+        if ($uniqueUpns.Count -gt 1) {
+            $rows = ($group | ForEach-Object { $_.Row }) -join ", "
+            foreach ($r in $group) {
+                $r.Status = "Collision"
+                $r.Detail = "Same account appears on multiple CSV rows ($rows) with different target UPNs"
+            }
+        }
+        else {
+            $firstRow = $group[0].Row
+            Add-RecordDetail -Record $group[0] -Message "Duplicate CSV rows for this account (row $firstRow kept)"
+            for ($i = 1; $i -lt $group.Count; $i++) {
+                $group[$i].Status = "Skipped"
+                $group[$i].Detail = "Duplicate of row $firstRow"
+            }
+        }
     }
 }
 
@@ -1042,6 +1082,221 @@ function Set-CollisionFlags {
         $r.Status = "Collision"
         $r.Detail = "UPN already in use by {0}" -f $other.SamAccountName
     }
+}
+
+function ConvertTo-HtmlEncoded {
+    param($Value)
+    $text = if ($null -eq $Value) { "" } else { [string]$Value }
+    return [System.Net.WebUtility]::HtmlEncode($text)
+}
+
+function ConvertTo-ReportTableHtml {
+    param($Rows, [string[]]$Columns)
+
+    $sb = New-Object System.Text.StringBuilder
+    if (-not $Rows -or @($Rows).Count -eq 0) {
+        [void]$sb.AppendLine('<p class="empty">None</p>')
+        return $sb.ToString()
+    }
+
+    [void]$sb.AppendLine('<table><thead><tr>')
+    foreach ($c in $Columns) {
+        [void]$sb.Append('<th>')
+        [void]$sb.Append((ConvertTo-HtmlEncoded $c))
+        [void]$sb.AppendLine('</th>')
+    }
+    [void]$sb.AppendLine('</tr></thead><tbody>')
+    foreach ($row in @($Rows)) {
+        [void]$sb.Append('<tr>')
+        foreach ($c in $Columns) {
+            [void]$sb.Append('<td>')
+            [void]$sb.Append((ConvertTo-HtmlEncoded $row.$c))
+            [void]$sb.Append('</td>')
+        }
+        [void]$sb.AppendLine('</tr>')
+    }
+    [void]$sb.AppendLine('</tbody></table>')
+    return $sb.ToString()
+}
+
+function Get-PreviewBuckets {
+    param($Results)
+    return [pscustomobject]@{
+        Ready     = @($Results | Where-Object { $_.Recommendation -eq "Ready" })
+        Warning   = @($Results | Where-Object { $_.Recommendation -eq "Warning" })
+        Collision = @($Results | Where-Object { $_.Status -eq "Collision" })
+        NotFound  = @($Results | Where-Object { $_.Status -eq "NotFound" })
+        Invalid   = @($Results | Where-Object { $_.Status -eq "InvalidUpn" })
+        Skipped   = @($Results | Where-Object { $_.Status -eq "Skipped" -or $_.Status -eq "SkippedByUser" })
+        NoChange  = @($Results | Where-Object { $_.Status -eq "NoChange" })
+        Changed   = @($Results | Where-Object { $_.Status -eq "Changed" })
+        Failed    = @($Results | Where-Object { $_.Status -eq "Failed" })
+        Blocked   = @($Results | Where-Object { $_.Recommendation -eq "Blocked" })
+    }
+}
+
+function Get-OutputDirectory {
+    param([string]$CsvPath)
+    $dir = Split-Path -Path $CsvPath -Parent
+    if ([string]::IsNullOrWhiteSpace($dir)) { $dir = (Get-Location).Path }
+    return $dir
+}
+
+function Get-OutputStamp {
+    if (-not $script:OutputStamp) {
+        $script:OutputStamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
+    }
+    return $script:OutputStamp
+}
+
+function Export-UpnPreviewReport {
+    <# Writes an HTML report plus a CSV copy of the preview, grouped by recommendation. #>
+    param(
+        [Parameter(Mandatory)] [string] $CsvPath,
+        [Parameter(Mandatory)] $Results,
+        [string] $Title = "UPN suffix change preview",
+        [string] $NamePrefix = "UpnFix_Preview"
+    )
+
+    $dir   = Get-OutputDirectory -CsvPath $CsvPath
+    $stamp = Get-OutputStamp
+    $htmlPath = Join-Path $dir ("{0}_{1}.html" -f $NamePrefix, $stamp)
+    $csvOut   = Join-Path $dir ("{0}_{1}.csv"  -f $NamePrefix, $stamp)
+    $buckets  = Get-PreviewBuckets -Results $Results
+    $cols     = @("Row", "Identity", "SamAccount", "CurrentUPN", "NewUPN", "Status", "Recommendation", "Detail")
+
+    $generated = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $readyCount = $buckets.Ready.Count
+    $warnCount  = $buckets.Warning.Count
+    $collCount  = $buckets.Collision.Count
+    $blockCount = $buckets.Blocked.Count
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/>')
+    [void]$sb.AppendLine('<title>' + (ConvertTo-HtmlEncoded $Title) + '</title>')
+    [void]$sb.AppendLine(@'
+<style>
+body{font-family:Segoe UI,Tahoma,sans-serif;margin:24px;color:#1b1b1b;background:#f6f7f9}
+h1{margin:0 0 8px 0;font-size:22px}
+h2{margin:28px 0 8px 0;font-size:16px;padding:6px 10px;border-radius:4px}
+.meta{color:#555;margin-bottom:16px}
+.cards{display:flex;flex-wrap:wrap;gap:12px;margin:16px 0 8px 0}
+.card{min-width:140px;background:#fff;border:1px solid #d8dce3;border-radius:6px;padding:12px 14px}
+.card .n{font-size:28px;font-weight:700;line-height:1}
+.card .l{color:#555;font-size:12px;margin-top:4px}
+.ok{border-left:4px solid #0d7a3f}.ok .n{color:#0d7a3f}
+.warn{border-left:4px solid #9a6b00}.warn .n{color:#9a6b00}
+.bad{border-left:4px solid #b42318}.bad .n{color:#b42318}
+.neutral{border-left:4px solid #667085}.neutral .n{color:#667085}
+h2.ok{background:#e7f6ec;color:#0d7a3f}
+h2.warn{background:#fff6d9;color:#7a5600}
+h2.bad{background:#fde8e6;color:#b42318}
+h2.neutral{background:#eef0f3;color:#3f4c5a}
+table{border-collapse:collapse;width:100%;background:#fff;margin:8px 0 16px 0}
+th,td{border:1px solid #d8dce3;padding:6px 8px;text-align:left;font-size:13px;vertical-align:top}
+th{background:#eef0f3}
+.empty{color:#667085;font-style:italic}
+code{background:#eef0f3;padding:1px 4px;border-radius:3px}
+</style></head><body>
+'@)
+
+    [void]$sb.AppendLine('<h1>' + (ConvertTo-HtmlEncoded $Title) + '</h1>')
+    [void]$sb.AppendLine('<div class="meta">Generated ' + (ConvertTo-HtmlEncoded $generated) + ' from <code>' + (ConvertTo-HtmlEncoded $CsvPath) + '</code>. Nothing has been applied yet unless the Status column says Changed.</div>')
+    [void]$sb.AppendLine('<div class="cards">')
+    [void]$sb.AppendLine('<div class="card ok"><div class="n">' + $readyCount + '</div><div class="l">OK to change</div></div>')
+    [void]$sb.AppendLine('<div class="card warn"><div class="n">' + $warnCount + '</div><div class="l">Warnings (review)</div></div>')
+    [void]$sb.AppendLine('<div class="card bad"><div class="n">' + $collCount + '</div><div class="l">Collisions</div></div>')
+    [void]$sb.AppendLine('<div class="card bad"><div class="n">' + $blockCount + '</div><div class="l">Blocked / cannot change</div></div>')
+    [void]$sb.AppendLine('<div class="card neutral"><div class="n">' + $buckets.NoChange.Count + '</div><div class="l">Already correct</div></div>')
+    [void]$sb.AppendLine('</div>')
+
+    [void]$sb.AppendLine('<h2 class="ok">OK to change — ' + $readyCount + '</h2>')
+    [void]$sb.AppendLine('<p>These accounts have a valid new UPN, no collision, and no extra warnings. Safe to apply.</p>')
+    [void]$sb.AppendLine((ConvertTo-ReportTableHtml -Rows $buckets.Ready -Columns $cols))
+
+    [void]$sb.AppendLine('<h2 class="warn">Warnings — review before changing — ' + $warnCount + '</h2>')
+    [void]$sb.AppendLine('<p>The suffix can be written, but something needs a look (unregistered suffix, disabled account, local-part change, or duplicate rows). Apply these only if you intend to.</p>')
+    [void]$sb.AppendLine((ConvertTo-ReportTableHtml -Rows $buckets.Warning -Columns $cols))
+
+    [void]$sb.AppendLine('<h2 class="bad">Collisions — will not be changed — ' + $collCount + '</h2>')
+    [void]$sb.AppendLine('<p>Two rows share a target UPN, the UPN is already used in AD, or the same account is listed twice with different targets.</p>')
+    [void]$sb.AppendLine((ConvertTo-ReportTableHtml -Rows $buckets.Collision -Columns $cols))
+
+    [void]$sb.AppendLine('<h2 class="bad">Cannot change — ' + (@($buckets.NotFound).Count + @($buckets.Invalid).Count + @($buckets.Skipped).Count + @($buckets.Failed).Count) + '</h2>')
+    [void]$sb.AppendLine('<p>Not found, invalid UPN, skipped, or failed writes.</p>')
+    $cannot = @($buckets.NotFound) + @($buckets.Invalid) + @($buckets.Skipped) + @($buckets.Failed)
+    [void]$sb.AppendLine((ConvertTo-ReportTableHtml -Rows $cannot -Columns $cols))
+
+    [void]$sb.AppendLine('<h2 class="neutral">Already correct — ' + $buckets.NoChange.Count + '</h2>')
+    [void]$sb.AppendLine((ConvertTo-ReportTableHtml -Rows $buckets.NoChange -Columns $cols))
+
+    if ($buckets.Changed.Count -gt 0) {
+        [void]$sb.AppendLine('<h2 class="ok">Applied — ' + $buckets.Changed.Count + '</h2>')
+        [void]$sb.AppendLine((ConvertTo-ReportTableHtml -Rows $buckets.Changed -Columns $cols))
+    }
+
+    [void]$sb.AppendLine('</body></html>')
+
+    $htmlPathOut = $null
+    $csvOutOut   = $null
+    try {
+        [System.IO.File]::WriteAllText($htmlPath, $sb.ToString(), [System.Text.UTF8Encoding]::new($false))
+        $htmlPathOut = $htmlPath
+        Write-Ok ("Preview report (HTML): {0}" -f $htmlPath)
+        Log ("Preview HTML report: {0}" -f $htmlPath)
+    }
+    catch {
+        Write-Warn ("Could not write HTML report: {0}" -f $_.Exception.Message)
+    }
+
+    try {
+        $Results | Select-Object Row, Identity, SamAccount, DistinguishedName, CurrentUPN, NewUPN, Status, Recommendation, Detail |
+            Export-Csv -Path $csvOut -NoTypeInformation -Encoding UTF8
+        $csvOutOut = $csvOut
+        Write-Ok ("Preview report (CSV):  {0}" -f $csvOut)
+        Log ("Preview CSV report: {0}" -f $csvOut)
+    }
+    catch {
+        Write-Warn ("Could not write preview CSV: {0}" -f $_.Exception.Message)
+    }
+
+    return [pscustomobject]@{ HtmlPath = $htmlPathOut; CsvPath = $csvOutOut }
+}
+
+function Show-PreviewReport {
+    param($Buckets)
+
+    function Write-ReportSection {
+        param($Rows, [string]$Title, [string]$Color, [int]$Limit = 25)
+        Write-Host ""
+        Write-Host $Title -ForegroundColor $Color
+        if (-not $Rows -or @($Rows).Count -eq 0) {
+            Write-Host "  (none)" -ForegroundColor DarkGray
+            return
+        }
+        $total = @($Rows).Count
+        @($Rows | Select-Object -First $Limit) |
+            Format-Table Row, SamAccount, CurrentUPN, NewUPN, Recommendation, Detail -AutoSize |
+            Out-Host
+        if ($total -gt $Limit) {
+            Write-Host ("  ... {0} more in the HTML/CSV report" -f ($total - $Limit)) -ForegroundColor DarkGray
+        }
+    }
+
+    Write-Section "Preview report"
+    Write-Host ("  OK to change : {0}" -f $Buckets.Ready.Count)     -ForegroundColor Green
+    Write-Host ("  Warnings     : {0}" -f $Buckets.Warning.Count)   -ForegroundColor Yellow
+    Write-Host ("  Collisions   : {0}" -f $Buckets.Collision.Count) -ForegroundColor Red
+    Write-Host ("  Not found    : {0}" -f $Buckets.NotFound.Count)  -ForegroundColor Red
+    Write-Host ("  Invalid UPN  : {0}" -f $Buckets.Invalid.Count)   -ForegroundColor Red
+    Write-Host ("  Skipped      : {0}" -f $Buckets.Skipped.Count)   -ForegroundColor DarkYellow
+    Write-Host ("  Already OK   : {0}" -f $Buckets.NoChange.Count)  -ForegroundColor Green
+
+    Write-ReportSection $Buckets.Ready     ("OK to change ({0}) — these are safe to apply" -f $Buckets.Ready.Count) Green 25
+    Write-ReportSection $Buckets.Warning   ("Warnings ({0}) — review before changing" -f $Buckets.Warning.Count) Yellow 25
+    Write-ReportSection $Buckets.Collision ("Collisions ({0}) — will not be changed" -f $Buckets.Collision.Count) Red 25
+    $cannot = @($Buckets.NotFound) + @($Buckets.Invalid) + @($Buckets.Skipped)
+    Write-ReportSection $cannot            ("Cannot change ({0}) — not found, invalid, or skipped" -f $cannot.Count) DarkYellow 15
 }
 
 # --------------------------------------------------------------- main ---------
@@ -1149,6 +1404,7 @@ function Main {
             CurrentUPN         = ""
             NewUPN             = ""
             Status             = ""
+            Recommendation     = ""
             Detail             = ""
         }
 
@@ -1195,56 +1451,76 @@ function Main {
         }
 
         $newSuffix = Get-UpnSuffix -Upn $newUpn
+        $record.Status = "WillChange"
         if ($suffixSet.Count -gt 0 -and $newSuffix -and -not (Test-SetContains -Set $suffixSet -Value $newSuffix)) {
-            $record.Status = "WillChange"
-            $record.Detail = "Suffix '$newSuffix' is not in the forest UPN suffix list"
+            Add-RecordDetail -Record $record -Message ("Suffix '{0}' is not in the forest UPN suffix list" -f $newSuffix)
         }
-        else {
-            $record.Status = "WillChange"
+        if ($user.Enabled -eq $false) {
+            Add-RecordDetail -Record $record -Message "Account is disabled"
+        }
+        $oldPrefix = $null
+        if ($user.UserPrincipalName -and $user.UserPrincipalName -like '*@*') {
+            $oldPrefix = $user.UserPrincipalName.Split('@')[0]
+        }
+        $newPrefix = $newUpn.Split('@')[0]
+        if ($oldPrefix -and $newPrefix -and -not $oldPrefix.Equals($newPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            Add-RecordDetail -Record $record -Message ("Local-part will change from '{0}' to '{1}'" -f $oldPrefix, $newPrefix)
         }
         [void]$results.Add([pscustomobject]$record)
     }
 
     Write-Progress -Activity "Building preview" -Completed
 
-    Write-Info "Checking for UPN collisions..."
+    Write-Info "Checking for duplicate rows and UPN collisions..."
+    Set-DuplicateAccountFlags -Results $results
     Set-CollisionFlags -Results $results
+    Set-RowRecommendations -Results $results
     $script:LastResults = $results
 
-    $willChange = @($results | Where-Object { $_.Status -eq "WillChange" })
-    $noChange   = @($results | Where-Object { $_.Status -eq "NoChange" })
-    $notFound   = @($results | Where-Object { $_.Status -eq "NotFound" })
-    $skipped    = @($results | Where-Object { $_.Status -eq "Skipped" })
-    $invalid    = @($results | Where-Object { $_.Status -eq "InvalidUpn" })
-    $collision  = @($results | Where-Object { $_.Status -eq "Collision" })
+    $buckets = Get-PreviewBuckets -Results $results
+    Show-PreviewReport -Buckets $buckets
+    Log ("Preview: Ready={0} Warning={1} Collision={2} NotFound={3} InvalidUpn={4} Skipped={5} NoChange={6}" -f `
+        $buckets.Ready.Count, $buckets.Warning.Count, $buckets.Collision.Count, $buckets.NotFound.Count, $buckets.Invalid.Count, $buckets.Skipped.Count, $buckets.NoChange.Count)
 
-    Show-PreviewTable -Results $results -WillChange $willChange -NotFound $notFound -Invalid $invalid -Collision $collision
-
-    $unknownSuffix = @($willChange | Where-Object { $_.Detail -like "Suffix * is not in the forest UPN suffix list" })
-
-    Write-Section "Summary"
-    Write-Host ("  Will change : {0}" -f $willChange.Count) -ForegroundColor Yellow
-    Write-Host ("  No change   : {0}" -f $noChange.Count)   -ForegroundColor Green
-    Write-Host ("  Not found   : {0}" -f $notFound.Count)   -ForegroundColor Red
-    Write-Host ("  Collision   : {0}" -f $collision.Count)  -ForegroundColor Red
-    Write-Host ("  Invalid UPN : {0}" -f $invalid.Count)    -ForegroundColor Red
-    Write-Host ("  Skipped     : {0}" -f $skipped.Count)    -ForegroundColor DarkYellow
-    Log ("Preview: WillChange={0} NoChange={1} NotFound={2} Collision={3} InvalidUpn={4} Skipped={5}" -f `
-        $willChange.Count, $noChange.Count, $notFound.Count, $collision.Count, $invalid.Count, $skipped.Count)
-
-    if ($unknownSuffix.Count -gt 0) {
-        Write-Warn ("{0} planned UPN(s) use a suffix that is not defined on the forest. AD may reject those writes." -f $unknownSuffix.Count)
+    $reportFiles = Export-UpnPreviewReport -CsvPath $path -Results $results -Title "UPN suffix change preview"
+    if ($reportFiles -and $reportFiles.HtmlPath -and (Test-IsInteractive)) {
+        if (Confirm-YesNo "Open the HTML report in your browser?" -DefaultYes) {
+            try { Start-Process $reportFiles.HtmlPath } catch {
+                Write-Warn ("Could not open the report: {0}" -f $_.Exception.Message)
+            }
+        }
     }
 
-    if ($willChange.Count -eq 0) {
-        Write-Info "There is nothing to change. Exiting."
+    $ready   = $buckets.Ready
+    $warning = $buckets.Warning
+
+    if ($ready.Count -eq 0 -and $warning.Count -eq 0) {
+        Write-Info "There is nothing safe to change. See the report for collisions and other issues."
         Save-Output -CsvPath $path -Results $results
         return
     }
 
     Write-Section "Apply changes"
-    if (-not (Confirm-YesNo ("Apply {0} UPN change(s) now?" -f $willChange.Count))) {
-        Write-Warn "No changes applied (user declined)."
+    $toApply = @($ready)
+    if ($ready.Count -gt 0) {
+        if (-not (Confirm-YesNo ("Apply {0} account(s) marked OK to change?" -f $ready.Count))) {
+            $toApply = @()
+        }
+    }
+    else {
+        Write-Warn "No accounts are marked OK to change."
+        $toApply = @()
+    }
+
+    if ($warning.Count -gt 0) {
+        Write-Warn ("{0} account(s) have warnings (unregistered suffix, disabled, local-part change, or duplicates)." -f $warning.Count)
+        if (Confirm-YesNo "Also apply the warning account(s)?") {
+            $toApply = @($toApply) + @($warning)
+        }
+    }
+
+    if ($toApply.Count -eq 0) {
+        Write-Warn "No changes applied."
         Log "User declined to apply changes." "WARN"
         Save-Output -CsvPath $path -Results $results
         return
@@ -1254,10 +1530,10 @@ function Main {
 
     $applied = 0
     $failed  = 0
-    $applyTotal = $willChange.Count
+    $applyTotal = $toApply.Count
     $applyIdx = 0
 
-    foreach ($r in $willChange) {
+    foreach ($r in $toApply) {
         $applyIdx++
         if ($applyTotal -gt 5) {
             Write-Progress -Activity "Applying UPN changes" -Status ("{0} of {1}: {2}" -f $applyIdx, $applyTotal, $r.SamAccount) -PercentComplete ([int](($applyIdx / $applyTotal) * 100))
@@ -1310,6 +1586,8 @@ function Main {
     if ($failed -gt 0) { Write-Err ("Failed  : {0}" -f $failed) }
     Log ("Applied={0} Failed={1}" -f $applied, $failed)
 
+    Set-RowRecommendations -Results $results
+    Export-UpnPreviewReport -CsvPath $path -Results $results -Title "UPN suffix change results" -NamePrefix "UpnFix_Results" | Out-Null
     Save-Output -CsvPath $path -Results $results
 }
 
@@ -1318,15 +1596,15 @@ function Save-Output {
         [Parameter(Mandatory)] [string] $CsvPath,
         [Parameter(Mandatory)] $Results
     )
-    $dir   = Split-Path -Path $CsvPath -Parent
-    if ([string]::IsNullOrWhiteSpace($dir)) { $dir = (Get-Location).Path }
-    $stamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
+    $dir   = Get-OutputDirectory -CsvPath $CsvPath
+    $stamp = Get-OutputStamp
 
     $resultsCsv = Join-Path $dir ("UpnFix_Results_{0}.csv" -f $stamp)
     $logTxt     = Join-Path $dir ("UpnFix_Log_{0}.txt"     -f $stamp)
 
     try {
-        $Results | Export-Csv -Path $resultsCsv -NoTypeInformation -Encoding UTF8
+        $Results | Select-Object Row, Identity, SamAccount, DistinguishedName, CurrentUPN, NewUPN, Status, Recommendation, Detail |
+            Export-Csv -Path $resultsCsv -NoTypeInformation -Encoding UTF8
         Write-Ok ("Results written to: {0}" -f $resultsCsv)
     }
     catch {
