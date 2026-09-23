@@ -17,6 +17,8 @@
     - Dry-run preview first. Nothing is written until you confirm.
     - Writes a grouped HTML + CSV preview report (ready / warnings /
       collisions / cannot change) next to the source file before you apply.
+      The report includes each object's primary SMTP and proxyAddresses
+      when those attributes exist.
     - Optional per-account confirmation.
     - Writes a text log and a results CSV next to the source file.
 
@@ -93,7 +95,7 @@ $script:WriteServer  = $null   # Writable DC for the connected domain
 $script:DomainDcCache = @{}    # domain DNS -> writable DC hostname
 $script:WinFormsAvailable = $false
 $script:BatchSize    = 50
-$script:UserProperties = @("UserPrincipalName", "SamAccountName", "DistinguishedName", "Name", "Enabled")
+$script:UserProperties = @("UserPrincipalName", "SamAccountName", "DistinguishedName", "Name", "Enabled", "proxyAddresses", "mail")
 $script:OutputStamp    = $null
 $script:CurrentDomainDns = $null
 $script:AvailableSuffixInfo = @()
@@ -229,6 +231,37 @@ function Get-CsvDelimiter {
     if ($semi -gt $comma -and $semi -gt $tab) { return ';' }
     if ($tab -gt $comma -and $tab -gt $semi) { return "`t" }
     return ','
+}
+
+function Get-PrimarySmtpAddress {
+    <# Primary SMTP from proxyAddresses (SMTP: first, then smtp:), else mail. #>
+    param($User)
+    if (-not $User) { return "" }
+
+    $proxies = @()
+    if ($User.proxyAddresses) { $proxies = @($User.proxyAddresses | Where-Object { $_ }) }
+    foreach ($p in $proxies) {
+        if ([string]$p -clike 'SMTP:*') { return ([string]$p).Substring(5) }
+    }
+    foreach ($p in $proxies) {
+        if ([string]$p -like 'smtp:*') { return ([string]$p).Substring(5) }
+    }
+    if ($User.mail) { return [string]$User.mail }
+    return ""
+}
+
+function Format-ProxyAddressList {
+    <# All proxyAddresses, primary SMTP first, then aliases, then other types. #>
+    param($User)
+    if (-not $User -or -not $User.proxyAddresses) { return "" }
+
+    $proxies = @($User.proxyAddresses | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    if ($proxies.Count -eq 0) { return "" }
+
+    $primary = @($proxies | Where-Object { $_ -clike 'SMTP:*' } | Sort-Object)
+    $aliases = @($proxies | Where-Object { $_ -clike 'smtp:*' } | Sort-Object)
+    $other   = @($proxies | Where-Object { $_ -notlike 'smtp:*' } | Sort-Object)
+    return ((@($primary) + @($aliases) + @($other)) -join '; ')
 }
 
 function Get-NormalizedSuffix {
@@ -1192,7 +1225,7 @@ function Export-UpnPreviewReport {
     $htmlPath = Join-Path $dir ("{0}_{1}.html" -f $NamePrefix, $stamp)
     $csvOut   = Join-Path $dir ("{0}_{1}.csv"  -f $NamePrefix, $stamp)
     $buckets  = Get-PreviewBuckets -Results $Results
-    $cols     = @("Row", "Identity", "SamAccount", "CurrentUPN", "NewUPN", "InUseBySam", "Status", "Recommendation", "Detail")
+    $cols     = @("Row", "Identity", "SamAccount", "CurrentUPN", "NewUPN", "PrimarySmtp", "ProxyAddresses", "InUseBySam", "Status", "Recommendation", "Detail")
 
     $generated = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $readyCount = $buckets.Ready.Count
@@ -1238,6 +1271,7 @@ code{background:#eef0f3;padding:1px 4px;border-radius:3px}
     [void]$sb.AppendLine('<div class="card bad"><div class="n">' + $blockCount + '</div><div class="l">Blocked / cannot change</div></div>')
     [void]$sb.AppendLine('<div class="card neutral"><div class="n">' + $buckets.NoChange.Count + '</div><div class="l">Already correct</div></div>')
     [void]$sb.AppendLine('</div>')
+    [void]$sb.AppendLine('<p class="meta"><strong>PrimarySmtp</strong> is the uppercase SMTP: proxy (or the mail attribute if no proxy exists). <strong>ProxyAddresses</strong> lists every proxyAddresses value on the object. A UPN change does not rewrite these.</p>')
 
     [void]$sb.AppendLine('<h2 class="ok">OK to change — ' + $readyCount + '</h2>')
     [void]$sb.AppendLine('<p>These accounts have a valid new UPN, no collision, and no extra warnings. Safe to apply.</p>')
@@ -1279,7 +1313,7 @@ code{background:#eef0f3;padding:1px 4px;border-radius:3px}
     }
 
     try {
-        $Results | Select-Object Row, Identity, SamAccount, DistinguishedName, CurrentUPN, NewUPN, InUseBySam, Status, Recommendation, Detail |
+        $Results | Select-Object Row, Identity, SamAccount, DistinguishedName, CurrentUPN, NewUPN, PrimarySmtp, ProxyAddresses, InUseBySam, Status, Recommendation, Detail |
             Export-Csv -Path $csvOut -NoTypeInformation -Encoding UTF8
         $csvOutOut = $csvOut
         Write-Ok ("Preview report (CSV):  {0}" -f $csvOut)
@@ -1305,7 +1339,7 @@ function Show-PreviewReport {
         }
         $total = @($Rows).Count
         @($Rows | Select-Object -First $Limit) |
-            Format-Table Row, SamAccount, CurrentUPN, NewUPN, InUseBySam, Recommendation, Detail -AutoSize |
+            Format-Table Row, SamAccount, CurrentUPN, NewUPN, PrimarySmtp, InUseBySam, Recommendation, Detail -AutoSize |
             Out-Host
         if ($total -gt $Limit) {
             Write-Host ("  ... {0} more in the HTML/CSV report" -f ($total - $Limit)) -ForegroundColor DarkGray
@@ -1432,6 +1466,8 @@ function Main {
             DistinguishedName  = ""
             CurrentUPN         = ""
             NewUPN             = ""
+            PrimarySmtp        = ""
+            ProxyAddresses     = ""
             InUseBySam         = ""
             Status             = ""
             Recommendation     = ""
@@ -1456,6 +1492,8 @@ function Main {
         $record.SamAccount        = $user.SamAccountName
         $record.DistinguishedName = $user.DistinguishedName
         $record.CurrentUPN        = $user.UserPrincipalName
+        $record.PrimarySmtp       = Get-PrimarySmtpAddress -User $user
+        $record.ProxyAddresses    = Format-ProxyAddressList -User $user
 
         $newUpn = Get-NewUpn -User $user -Mode $mode -RowValue $rowValue -SingleSuffix $singleSuffix
         if ([string]::IsNullOrWhiteSpace($newUpn)) {
@@ -1633,7 +1671,7 @@ function Save-Output {
     $logTxt     = Join-Path $dir ("UpnFix_Log_{0}.txt"     -f $stamp)
 
     try {
-        $Results | Select-Object Row, Identity, SamAccount, DistinguishedName, CurrentUPN, NewUPN, InUseBySam, Status, Recommendation, Detail |
+        $Results | Select-Object Row, Identity, SamAccount, DistinguishedName, CurrentUPN, NewUPN, PrimarySmtp, ProxyAddresses, InUseBySam, Status, Recommendation, Detail |
             Export-Csv -Path $resultsCsv -NoTypeInformation -Encoding UTF8
         Write-Ok ("Results written to: {0}" -f $resultsCsv)
     }

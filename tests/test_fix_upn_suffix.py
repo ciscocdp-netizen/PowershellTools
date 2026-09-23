@@ -127,6 +127,31 @@ def get_ad_lookup_servers(preferred: str | None, query_server: str | None,
     return names
 
 
+def get_primary_smtp_address(proxies, mail=None):
+    """Port of Get-PrimarySmtpAddress (SMTP: first, then smtp:, else mail)."""
+    items = [str(p) for p in (proxies or []) if p]
+    for p in items:
+        if p.startswith("SMTP:"):
+            return p[5:]
+    for p in items:
+        if p.lower().startswith("smtp:"):
+            return p[5:]
+    if mail:
+        return str(mail)
+    return ""
+
+
+def format_proxy_address_list(proxies):
+    """Port of Format-ProxyAddressList."""
+    items = [str(p) for p in (proxies or []) if p]
+    if not items:
+        return ""
+    primary = sorted(p for p in items if p.startswith("SMTP:"))
+    aliases = sorted(p for p in items if p.startswith("smtp:"))
+    other = sorted(p for p in items if not p.lower().startswith("smtp:"))
+    return "; ".join(primary + aliases + other)
+
+
 def add_discovered_suffix(mapping: dict, suffix: str | None, source: str) -> None:
     """Port of Add-DiscoveredSuffix (case-insensitive merge, first casing wins)."""
     normalized = get_normalized_suffix(suffix)
@@ -490,6 +515,32 @@ class CollisionTests(unittest.TestCase):
         self.assertIn("sAMAccountName", detail)
 
 
+class ProxyAddressTests(unittest.TestCase):
+    def test_primary_prefers_uppercase_smtp(self):
+        self.assertEqual(
+            get_primary_smtp_address(["smtp:alias@omi.com", "SMTP:jane@omi.com"]),
+            "jane@omi.com",
+        )
+
+    def test_primary_falls_back_to_alias_then_mail(self):
+        self.assertEqual(get_primary_smtp_address(["smtp:alias@omi.com"]), "alias@omi.com")
+        self.assertEqual(get_primary_smtp_address([], mail="mail@omi.com"), "mail@omi.com")
+        self.assertEqual(get_primary_smtp_address([]), "")
+
+    def test_list_orders_primary_then_aliases_then_other(self):
+        formatted = format_proxy_address_list(
+            ["sip:jane@omi.com", "smtp:alias@omi.com", "SMTP:jane@omi.com"]
+        )
+        self.assertEqual(
+            formatted,
+            "SMTP:jane@omi.com; smtp:alias@omi.com; sip:jane@omi.com",
+        )
+
+    def test_empty_proxies(self):
+        self.assertEqual(format_proxy_address_list([]), "")
+        self.assertEqual(format_proxy_address_list(None), "")
+
+
 class EfficiencyTests(unittest.TestCase):
     def test_batching_beats_per_row_lookups(self):
         identities = [f"user{i:04d}@old.local" for i in range(200)]
@@ -551,6 +602,8 @@ class ScriptSourceTests(unittest.TestCase):
             "Export-UpnPreviewReport",
             "Get-PreviewBuckets",
             "Set-DuplicateAccountFlags",
+            "Get-PrimarySmtpAddress",
+            "Format-ProxyAddressList",
         ):
             self.assertIn(f"function {name}", self.source)
 
@@ -584,6 +637,9 @@ class ScriptSourceTests(unittest.TestCase):
         self.assertIn("Recommendation", self.source)
         self.assertIn("InUseBySam", self.source)
         self.assertIn("sAMAccountName", self.source)
+        self.assertIn("proxyAddresses", self.source)
+        self.assertIn("PrimarySmtp", self.source)
+        self.assertIn("Get-PrimarySmtpAddress", self.source)
 
     def test_set_aduser_uses_distinguished_name(self):
         self.assertRegex(
