@@ -9,13 +9,14 @@
     and export.
 
 .NOTES
-    Version:      2.0
+    Version:      2.1
     Compatible:   Windows PowerShell 5.1+ and PowerShell 7+ (Windows)
     UI:           System.Windows.Forms (STA)
 
     Changes in v2.0:
     - Modern layout aligned with AD Object Manager (header, cards, flat buttons)
     - Sizable / maximizable window with anchored, docking controls
+    - Compiled C# ingest loop (falls back to PowerShell if Add-Type fails)
     - Streaming ingest with byte-level progress, throughput, and cancel
     - Live status updates while the file is being read
     - Data grid with parsed Timestamp, Event, Account, Actor, Host columns
@@ -30,7 +31,7 @@ param(
     [switch]$SkipGui
 )
 
-$script:AppVersion = '2.0'
+$script:AppVersion = '2.1'
 $script:TimestampFormat = 'MM/dd/yyyy HH:mm:ss'
 $script:AccountCalledRegex = [regex]::new('AD user called:\s*([^,\s]+)', [System.Text.RegularExpressions.RegexOptions]::Compiled)
 $script:AccountWasRegex    = [regex]::new('(?i)Account\s+(\S+)\s+was', [System.Text.RegularExpressions.RegexOptions]::Compiled)
@@ -53,6 +54,256 @@ class AdLogEntry {
     [string]$FileName
     [int]$LineNumber
     [string]$Text
+}
+
+# Compiled ingest engine. A PowerShell while/ReadLine loop spends most of its
+# time in the interpreter; this C# path is typically 10-30x faster on large logs.
+$script:AdLogNativeReady = $null
+$script:AdLogNativeSource = @'
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Text;
+using System.Text.RegularExpressions;
+
+public sealed class AdLogNativeRow {
+    public DateTime SortKey;
+    public bool HasTimestamp;
+    public string TimestampText;
+    public string Event;
+    public string Account;
+    public string Actor;
+    public string HostName;
+    public string FileName;
+    public int LineNumber;
+    public string Text;
+}
+
+public sealed class AdLogNativeProgress {
+    public string FileName;
+    public int FileIndex;
+    public int FileCount;
+    public int FileLines;
+    public long TotalLines;
+    public int Matches;
+    public int Percent;
+    public long BytesRead;
+    public long TotalBytes;
+    public int LinesPerSec;
+    public double Elapsed;
+}
+
+public delegate void AdLogNativeProgressHandler(AdLogNativeProgress progress);
+
+public sealed class AdLogNativeScanner {
+    public bool Cancel;
+
+    private static readonly Regex AccountCalled = new Regex(@"AD user called:\s*([^,\s]+)", RegexOptions.Compiled);
+    private static readonly Regex AccountWas = new Regex(@"(?i)Account\s+(\S+)\s+was", RegexOptions.Compiled);
+    private static readonly Regex AccountOfUser = new Regex(@"(?i)of user(?:\s+called:)?\s+([^\s(]+)", RegexOptions.Compiled);
+    private static readonly Regex ActorBy = new Regex(@"(?i)\sby\s+(\S+)\s+in\s+", RegexOptions.Compiled);
+    private static readonly Regex ActorModified = new Regex(@"(?i)^.{19}\s*==\s*The user\s+(\S+)\s+modified", RegexOptions.Compiled);
+    private static readonly Regex HostRx = new Regex(@"(?i)\sin\s+([A-Za-z0-9._-]+)\s*$", RegexOptions.Compiled);
+    private static readonly CultureInfo Invariant = CultureInfo.InvariantCulture;
+    private const string TimestampFormat = "MM/dd/yyyy HH:mm:ss";
+
+    public List<AdLogNativeRow> ScanFile(
+        string filePath,
+        string fileName,
+        string searchTerm,
+        bool caseInsensitive,
+        bool useRegex,
+        Encoding encoding,
+        int fileIndex,
+        int fileCount,
+        long startingTotalLines,
+        AdLogNativeProgressHandler progress
+    ) {
+        List<AdLogNativeRow> results = new List<AdLogNativeRow>(256);
+        FileInfo info = new FileInfo(filePath);
+        long totalBytes = Math.Max(1L, info.Length);
+        DateTime started = DateTime.UtcNow;
+        DateTime lastReport = DateTime.MinValue;
+        Regex compiled = null;
+        if (useRegex && !string.IsNullOrEmpty(searchTerm)) {
+            RegexOptions opts = RegexOptions.Compiled;
+            if (caseInsensitive) opts |= RegexOptions.IgnoreCase;
+            compiled = new Regex(searchTerm, opts);
+        }
+        bool matchAll = string.IsNullOrEmpty(searchTerm);
+        StringComparison cmp = caseInsensitive ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        if (fileCount < 1) fileCount = 1;
+
+        FileStream stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 1024 * 1024, FileOptions.SequentialScan);
+        try {
+            StreamReader reader = new StreamReader(stream, encoding, true, 1024 * 1024);
+            try {
+                int lineNumber = 0;
+                long grandLines = startingTotalLines;
+                Report(progress, fileName, fileIndex, fileCount, 0, grandLines, 0, 0, totalBytes, started);
+
+                string line;
+                while ((line = reader.ReadLine()) != null) {
+                    if (Cancel) break;
+                    lineNumber++;
+                    grandLines++;
+
+                    bool matched = matchAll;
+                    if (!matched) {
+                        if (useRegex) matched = (compiled != null && compiled.IsMatch(line));
+                        else matched = line.IndexOf(searchTerm, cmp) >= 0;
+                    }
+
+                    if (matched) {
+                        results.Add(BuildRow(line, fileName, lineNumber));
+                    }
+
+                    DateTime now = DateTime.UtcNow;
+                    if (((lineNumber & 32767) == 0) || (now - lastReport).TotalMilliseconds >= 250) {
+                        if (Cancel) break;
+                        Report(progress, fileName, fileIndex, fileCount, lineNumber, grandLines, results.Count, stream.Position, totalBytes, started);
+                        lastReport = now;
+                    }
+                }
+
+                Report(progress, fileName, fileIndex, fileCount, lineNumber, grandLines, results.Count, totalBytes, totalBytes, started);
+            }
+            finally {
+                reader.Dispose();
+            }
+        }
+        finally {
+            stream.Dispose();
+        }
+
+        return results;
+    }
+
+    private static AdLogNativeRow BuildRow(string line, string fileName, int lineNumber) {
+        AdLogNativeRow row = new AdLogNativeRow();
+        row.Text = line;
+        row.FileName = fileName;
+        row.LineNumber = lineNumber;
+        row.Account = "";
+        row.Actor = "";
+        row.HostName = "";
+        row.Event = "Other";
+
+        DateTime ts;
+        if (line != null && line.Length >= 19 &&
+            DateTime.TryParseExact(line.Substring(0, 19), TimestampFormat, Invariant, DateTimeStyles.None, out ts)) {
+            row.SortKey = ts;
+            row.HasTimestamp = true;
+            row.TimestampText = ts.ToString(TimestampFormat, Invariant);
+        }
+        else {
+            row.SortKey = DateTime.MaxValue;
+            row.HasTimestamp = false;
+            row.TimestampText = "";
+        }
+
+        row.Event = Classify(line);
+        row.Account = FirstGroup(AccountCalled, line);
+        if (row.Account.Length == 0) row.Account = FirstGroup(AccountWas, line);
+        if (row.Account.Length == 0) row.Account = FirstGroup(AccountOfUser, line);
+        row.Actor = FirstGroup(ActorBy, line);
+        if (row.Actor.Length == 0) row.Actor = FirstGroup(ActorModified, line);
+        row.HostName = FirstGroup(HostRx, line);
+        return row;
+    }
+
+    private static string Classify(string line) {
+        if (string.IsNullOrEmpty(line)) return "Other";
+        if (ContainsIgnoreCase(line, "ADDED TO")) return "Added";
+        if (ContainsIgnoreCase(line, "REMOVED FROM")) return "Removed";
+        if (ContainsIgnoreCase(line, "DISABLED")) return "Disabled";
+        if (ContainsIgnoreCase(line, "UNLOCKED")) return "Unlocked";
+        if (ContainsIgnoreCase(line, "LOCKED")) return "Locked";
+        if (ContainsIgnoreCase(line, "ENABLED")) return "Enabled";
+        if (ContainsIgnoreCase(line, "CREATED")) return "Created";
+        if (ContainsIgnoreCase(line, "DELETED")) return "Deleted";
+        if (ContainsIgnoreCase(line, "PASSWORD")) return "Password";
+        if (ContainsIgnoreCase(line, "MODIFIED")) return "Modified";
+        return "Other";
+    }
+
+    private static bool ContainsIgnoreCase(string line, string token) {
+        return line.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static string FirstGroup(Regex rx, string line) {
+        Match m = rx.Match(line);
+        if (m.Success) return m.Groups[1].Value;
+        return "";
+    }
+
+    private static void Report(
+        AdLogNativeProgressHandler progress,
+        string fileName,
+        int fileIndex,
+        int fileCount,
+        int fileLines,
+        long totalLines,
+        int matches,
+        long bytesRead,
+        long totalBytes,
+        DateTime started
+    ) {
+        if (progress == null) return;
+        double elapsed = Math.Max(0.001, (DateTime.UtcNow - started).TotalSeconds);
+        double portion = ((fileIndex - 1) + ((double)bytesRead / Math.Max(1L, totalBytes))) / fileCount;
+        AdLogNativeProgress info = new AdLogNativeProgress();
+        info.FileName = fileName;
+        info.FileIndex = fileIndex;
+        info.FileCount = fileCount;
+        info.FileLines = fileLines;
+        info.TotalLines = totalLines;
+        info.Matches = matches;
+        info.Percent = (int)Math.Min(100, portion * 100.0);
+        info.BytesRead = bytesRead;
+        info.TotalBytes = totalBytes;
+        info.LinesPerSec = (int)(totalLines / elapsed);
+        info.Elapsed = elapsed;
+        progress(info);
+    }
+}
+'@
+
+function Initialize-AdLogNativeEngine {
+    if ($null -ne $script:AdLogNativeReady) {
+        return [bool]$script:AdLogNativeReady
+    }
+
+    try {
+        if (-not ('AdLogNativeScanner' -as [type])) {
+            Add-Type -TypeDefinition $script:AdLogNativeSource -ErrorAction Stop
+        }
+        $script:AdLogNativeReady = $true
+    } catch {
+        $script:AdLogNativeReady = $false
+    }
+
+    return [bool]$script:AdLogNativeReady
+}
+
+function ConvertFrom-AdLogNativeRow {
+    param($Row)
+
+    if ($Row -is [AdLogEntry]) { return $Row }
+
+    $entry = [AdLogEntry]::new()
+    $entry.SortKey = $Row.SortKey
+    $entry.HasTimestamp = [bool]$Row.HasTimestamp
+    $entry.TimestampText = [string]$Row.TimestampText
+    $entry.Event = [string]$Row.Event
+    $entry.Account = [string]$Row.Account
+    $entry.Actor = [string]$Row.Actor
+    $entry.HostName = [string]$Row.HostName
+    $entry.FileName = [string]$Row.FileName
+    $entry.LineNumber = [int]$Row.LineNumber
+    $entry.Text = [string]$Row.Text
+    return $entry
 }
 
 # ============================================================
@@ -249,6 +500,8 @@ function ConvertTo-AdLogList {
     foreach ($item in @($InputObject)) {
         if ($item -is [AdLogEntry]) {
             [void]$list.Add($item)
+        } elseif ($null -ne $item) {
+            [void]$list.Add((ConvertFrom-AdLogNativeRow $item))
         }
     }
     return , $list
@@ -283,6 +536,7 @@ function Search-AdLogFiles {
 
     $results = New-Object 'System.Collections.Generic.List[AdLogEntry]'
     $compiled = $null
+    $useNative = Initialize-AdLogNativeEngine
 
     if ($UseRegex -and -not [string]::IsNullOrEmpty($SearchTerm)) {
         $options = [System.Text.RegularExpressions.RegexOptions]::Compiled
@@ -299,6 +553,10 @@ function Search-AdLogFiles {
     $started = [datetime]::UtcNow
     $lastReport = [datetime]::MinValue
     $cancelled = $false
+    $scanner = $null
+    if ($useNative) {
+        $scanner = New-Object AdLogNativeScanner
+    }
 
     function Send-AdLogProgress {
         param(
@@ -341,51 +599,101 @@ function Search-AdLogFiles {
 
         $encoding = Get-AdLogEncoding -Name $EncodingName -FilePath $file.FullName
         $totalBytes = [math]::Max(1L, $file.Length)
-        $lineNumber = 0
 
-        $stream = $null
-        $reader = $null
         try {
-            $stream = [System.IO.FileStream]::new(
-                $file.FullName,
-                [System.IO.FileMode]::Open,
-                [System.IO.FileAccess]::Read,
-                [System.IO.FileShare]::ReadWrite,
-                65536,
-                [System.IO.FileOptions]::SequentialScan
-            )
-            $reader = New-Object System.IO.StreamReader($stream, $encoding, $true, 65536)
-            Send-AdLogProgress -FileName $file.Name -Index $fileIndex -Count $fileCount -FileLines 0 -BytesRead 0 -TotalBytes $totalBytes
-
-            while ($null -ne ($line = $reader.ReadLine())) {
-                $lineNumber++
-                $grandLines++
-
-                if (Test-AdLogLineMatch -Line $line -SearchTerm $SearchTerm -CaseInsensitive $CaseInsensitive -UseRegex $UseRegex -CompiledRegex $compiled) {
-                    $results.Add((New-AdLogEntry -Line $line -FileName $file.Name -LineNumber $lineNumber))
+            if ($scanner) {
+                $priorCount = $results.Count
+                $nativeSync = @{ TotalLines = [int64]$grandLines }
+                $progressHandler = [AdLogNativeProgressHandler] {
+                    param($info)
+                    $nativeSync.TotalLines = [int64]$info.TotalLines
+                    if ($ShouldCancel -and (& $ShouldCancel)) {
+                        $scanner.Cancel = $true
+                    }
+                    if ($ProgressCallback) {
+                        & $ProgressCallback @{
+                            FileName    = $info.FileName
+                            FileIndex   = $info.FileIndex
+                            FileCount   = $info.FileCount
+                            FileLines   = $info.FileLines
+                            TotalLines  = $info.TotalLines
+                            Matches     = $priorCount + $info.Matches
+                            Results     = $null
+                            Percent     = $info.Percent
+                            BytesRead   = $info.BytesRead
+                            TotalBytes  = $info.TotalBytes
+                            LinesPerSec = $info.LinesPerSec
+                            Elapsed     = $info.Elapsed
+                        }
+                    }
                 }
 
-                $now = [datetime]::UtcNow
-                $due = ($lineNumber % 8192 -eq 0) -or (($now - $lastReport).TotalMilliseconds -ge 120)
-                if ($due) {
-                    if ($ShouldCancel -and (& $ShouldCancel)) {
-                        $cancelled = $true
-                        break
+                $nativeRows = $scanner.ScanFile(
+                    $file.FullName,
+                    $file.Name,
+                    $SearchTerm,
+                    $CaseInsensitive,
+                    $UseRegex,
+                    $encoding,
+                    $fileIndex,
+                    [math]::Max(1, $fileCount),
+                    [int64]$grandLines,
+                    $progressHandler
+                )
+
+                foreach ($row in $nativeRows) {
+                    $results.Add((ConvertFrom-AdLogNativeRow $row))
+                }
+
+                $grandLines = [int64]$nativeSync.TotalLines
+                if ($scanner.Cancel) { break }
+            } else {
+                $lineNumber = 0
+                $stream = $null
+                $reader = $null
+                try {
+                    $stream = [System.IO.FileStream]::new(
+                        $file.FullName,
+                        [System.IO.FileMode]::Open,
+                        [System.IO.FileAccess]::Read,
+                        [System.IO.FileShare]::ReadWrite,
+                        65536,
+                        [System.IO.FileOptions]::SequentialScan
+                    )
+                    $reader = New-Object System.IO.StreamReader($stream, $encoding, $true, 65536)
+                    Send-AdLogProgress -FileName $file.Name -Index $fileIndex -Count $fileCount -FileLines 0 -BytesRead 0 -TotalBytes $totalBytes
+
+                    while ($null -ne ($line = $reader.ReadLine())) {
+                        $lineNumber++
+                        $grandLines++
+
+                        if (Test-AdLogLineMatch -Line $line -SearchTerm $SearchTerm -CaseInsensitive $CaseInsensitive -UseRegex $UseRegex -CompiledRegex $compiled) {
+                            $results.Add((New-AdLogEntry -Line $line -FileName $file.Name -LineNumber $lineNumber))
+                        }
+
+                        $now = [datetime]::UtcNow
+                        $due = ($lineNumber % 8192 -eq 0) -or (($now - $lastReport).TotalMilliseconds -ge 200)
+                        if ($due) {
+                            if ($ShouldCancel -and (& $ShouldCancel)) {
+                                $cancelled = $true
+                                break
+                            }
+                            Send-AdLogProgress -FileName $file.Name -Index $fileIndex -Count $fileCount -FileLines $lineNumber -BytesRead $stream.Position -TotalBytes $totalBytes
+                            $lastReport = $now
+                        }
                     }
-                    Send-AdLogProgress -FileName $file.Name -Index $fileIndex -Count $fileCount -FileLines $lineNumber -BytesRead $stream.Position -TotalBytes $totalBytes
-                    $lastReport = $now
+
+                    if ($cancelled) { break }
+                    Send-AdLogProgress -FileName $file.Name -Index $fileIndex -Count $fileCount -FileLines $lineNumber -BytesRead $totalBytes -TotalBytes $totalBytes
+                } finally {
+                    if ($reader) { $reader.Dispose() }
+                    elseif ($stream) { $stream.Dispose() }
                 }
             }
-
-            if ($cancelled) { break }
-            Send-AdLogProgress -FileName $file.Name -Index $fileIndex -Count $fileCount -FileLines $lineNumber -BytesRead $totalBytes -TotalBytes $totalBytes
         } catch {
             if ($ErrorLog) {
                 [void]$ErrorLog.Add("[FileError] $($file.FullName) - $($_.Exception.Message)")
             }
-        } finally {
-            if ($reader) { $reader.Dispose() }
-            elseif ($stream) { $stream.Dispose() }
         }
     }
 
@@ -1186,18 +1494,13 @@ public static class AdLogDpi {
                 -ShouldCancel { $script:CancelRequested } `
                 -ProgressCallback {
                     param($info)
-                    if ($info.Results) {
-                        $script:AllRows = $info.Results
-                        $script:VisibleRows = $info.Results
-                    }
                     $progressBar.Visible = $true
                     $progressBar.Value = [math]::Min(100, [math]::Max(0, [int]$info.Percent))
                     $statusMatches.Text = "Matches: $($info.Matches)"
                     $statusRate.Text = "$($info.LinesPerSec) lines/s"
                     Set-StatusText ("Ingesting {0} ({1}/{2})  ·  {3:N0} lines  ·  {4:N0} matches  ·  {5:N0}%" -f `
                         $info.FileName, $info.FileIndex, $info.FileCount, $info.TotalLines, $info.Matches, $info.Percent)
-                    $grid.RowCount = [int]$info.Matches
-                    $lblShown.Text = "$($info.Matches) shown"
+                    $lblShown.Text = "$($info.Matches) found"
                     [System.Windows.Forms.Application]::DoEvents()
                 }
             $script:AllRows = ConvertTo-AdLogList $found

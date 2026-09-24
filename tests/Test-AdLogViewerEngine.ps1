@@ -24,6 +24,8 @@ function Assert-True {
 
 . $viewer -SkipGui
 
+Assert-True (Initialize-AdLogNativeEngine) 'Compiled C# ingest engine loads'
+
 $added = '09/03/2026 12:39:08 == The AD user called: Y22686, was ADDED TO A UNIVERSAL (SECURITY) GROUP by ablake4.S in DFOMIPV22'
 $removed = '09/03/2026 12:42:35 == The AD user called: Y22686, was REMOVED FROM A UNIVERSAL (SECURITY) GROUP by ablake4.S in DFOMIPV22'
 $modified = '09/10/2026 08:45:37 == Account ablake4.SA was MODIFIED by SVC_DELINEADA in DFOMIPV2202'
@@ -117,7 +119,7 @@ try {
     $sw.Stop()
     Assert-True ($big.Count -eq (13 * 2500)) 'Large-file ingest match count is exact'
     Assert-True ($ticks.Count -ge 2) 'Large-file ingest emits multiple progress updates'
-    Assert-True ($sw.Elapsed.TotalSeconds -lt 20) ("Large-file ingest finishes quickly ({0:N2}s)" -f $sw.Elapsed.TotalSeconds)
+    Assert-True ($sw.Elapsed.TotalSeconds -lt 8) ("Large-file ingest finishes quickly ({0:N2}s)" -f $sw.Elapsed.TotalSeconds)
 } finally {
     if (Test-Path -LiteralPath $large) { Remove-Item -LiteralPath $large -Force }
 }
