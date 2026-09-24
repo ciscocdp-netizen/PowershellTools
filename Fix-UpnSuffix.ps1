@@ -19,6 +19,10 @@
       collisions / cannot change) next to the source file before you apply.
       The report includes each object's primary SMTP and proxyAddresses
       when those attributes exist.
+    - Optional rewrite of the Primary SMTP suffix (SMTP: proxy + mail)
+      to the same new suffix. The old primary is kept as a smtp: alias
+      unless -DiscardOldPrimarySmtp is used. Collisions are reported
+      (SmtpInUseBySam) and that proxy is not written.
     - Optional per-account confirmation.
     - Writes a text log and a results CSV next to the source file.
 
@@ -48,6 +52,19 @@
     Apply this suffix to every account and skip the suffix picker.
     Example: omi.com
 
+.PARAMETER AlsoChangePrimarySmtp
+    Also switch each account's Primary SMTP suffix to the same target
+    suffix. In non-interactive runs this is the only way to enable the
+    SMTP rewrite (the interactive prompt is skipped).
+
+.PARAMETER SkipPrimarySmtp
+    Do not change Primary SMTP addresses, and do not ask.
+
+.PARAMETER DiscardOldPrimarySmtp
+    When rewriting Primary SMTP, do not keep the old address as a
+    secondary smtp: alias. Default is to keep it so existing mail still
+    delivers.
+
 .PARAMETER SkipPause
     Skip the "Press ENTER to close" prompt (useful for automation).
 
@@ -60,6 +77,9 @@
 .EXAMPLE
     powershell -STA -ExecutionPolicy Bypass -File .\Fix-UpnSuffix.ps1 -CsvPath C:\Temp\users.csv -Suffix omi.com
 
+.EXAMPLE
+    powershell -STA -ExecutionPolicy Bypass -File .\Fix-UpnSuffix.ps1 -CsvPath C:\Temp\users.csv -Suffix omi.com -AlsoChangePrimarySmtp
+
 .NOTES
     Run from an elevated PowerShell session as an account with rights to modify users.
     Use -STA so the Windows file picker can open reliably (powershell.exe defaults to MTA).
@@ -70,6 +90,9 @@ param(
     [string]$CsvPath,
     [string]$Server,
     [string]$Suffix,
+    [switch]$AlsoChangePrimarySmtp,
+    [switch]$SkipPrimarySmtp,
+    [switch]$DiscardOldPrimarySmtp,
     [switch]$SkipPause
 )
 
@@ -99,6 +122,17 @@ $script:UserProperties = @("UserPrincipalName", "SamAccountName", "Distinguished
 $script:OutputStamp    = $null
 $script:CurrentDomainDns = $null
 $script:AvailableSuffixInfo = @()
+$script:ResultExportProperties = @(
+    "Row", "Identity", "SamAccount", "DistinguishedName",
+    "CurrentUPN", "NewUPN", "PrimarySmtp", "NewPrimarySmtp",
+    "ProxyAddresses", "NewProxyAddresses", "SmtpStatus",
+    "InUseBySam", "SmtpInUseBySam", "Status", "Recommendation", "Detail"
+)
+$script:ReportTableColumns = @(
+    "Row", "Identity", "SamAccount", "CurrentUPN", "NewUPN",
+    "PrimarySmtp", "NewPrimarySmtp", "ProxyAddresses", "NewProxyAddresses",
+    "SmtpStatus", "InUseBySam", "SmtpInUseBySam", "Status", "Recommendation", "Detail"
+)
 
 function Log {
     param([string]$Message, [string]$Level = "INFO")
@@ -250,18 +284,110 @@ function Get-PrimarySmtpAddress {
     return ""
 }
 
-function Format-ProxyAddressList {
-    <# All proxyAddresses, primary SMTP first, then aliases, then other types. #>
+function Get-UserProxyValues {
     param($User)
-    if (-not $User -or -not $User.proxyAddresses) { return "" }
+    if (-not $User -or -not $User.proxyAddresses) { return @() }
+    return @($User.proxyAddresses | Where-Object { $_ } | ForEach-Object { [string]$_ })
+}
 
-    $proxies = @($User.proxyAddresses | Where-Object { $_ } | ForEach-Object { [string]$_ })
+function Format-ProxyAddressValues {
+    <# All proxy values, primary SMTP first, then aliases, then other types. #>
+    param($Values)
+    $proxies = @($Values | Where-Object { $_ } | ForEach-Object { [string]$_ })
     if ($proxies.Count -eq 0) { return "" }
 
     $primary = @($proxies | Where-Object { $_ -clike 'SMTP:*' } | Sort-Object)
     $aliases = @($proxies | Where-Object { $_ -clike 'smtp:*' } | Sort-Object)
     $other   = @($proxies | Where-Object { $_ -notlike 'smtp:*' } | Sort-Object)
     return ((@($primary) + @($aliases) + @($other)) -join '; ')
+}
+
+function Format-ProxyAddressList {
+    <# All proxyAddresses on an AD user, primary SMTP first, then aliases, then other types. #>
+    param($User)
+    return (Format-ProxyAddressValues -Values (Get-UserProxyValues -User $User))
+}
+
+function Get-NewSmtpAddress {
+    <# Keep the current Primary SMTP local-part and apply the target suffix. #>
+    param(
+        [string]$CurrentPrimary,
+        [string]$TargetSuffix
+    )
+    $suffix = Get-NormalizedSuffix -Value $TargetSuffix
+    if ([string]::IsNullOrWhiteSpace($CurrentPrimary) -or [string]::IsNullOrWhiteSpace($suffix)) { return "" }
+    if ($CurrentPrimary -notlike '*@*') { return "" }
+    $prefix = $CurrentPrimary.Split('@')[0]
+    if ([string]::IsNullOrWhiteSpace($prefix)) { return "" }
+    return ("{0}@{1}" -f $prefix, $suffix)
+}
+
+function Get-UpdatedProxyAddressList {
+    <#
+        Build a replacement proxyAddresses list: new address is SMTP: (primary),
+        old primary becomes smtp: when KeepOldAsAlias is set, other values kept.
+        A second SMTP: value is demoted so the object has only one primary.
+    #>
+    param(
+        [string[]]$CurrentProxies,
+        [string]$CurrentPrimary,
+        [string]$NewPrimary,
+        [bool]$KeepOldAsAlias = $true
+    )
+    if ([string]::IsNullOrWhiteSpace($NewPrimary)) { return @() }
+
+    $result = New-Object System.Collections.ArrayList
+    [void]$result.Add(("SMTP:{0}" -f $NewPrimary))
+
+    foreach ($raw in @($CurrentProxies)) {
+        if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+        $p = [string]$raw
+        if ($p -like 'smtp:*') {
+            $addr = $p.Substring(5)
+            if ($addr.Equals($NewPrimary, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            if ($CurrentPrimary -and $p -clike 'SMTP:*' -and $addr.Equals($CurrentPrimary, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            if ($p -clike 'SMTP:*') {
+                [void]$result.Add(("smtp:{0}" -f $addr))
+            }
+            else {
+                [void]$result.Add($p)
+            }
+            continue
+        }
+        [void]$result.Add($p)
+    }
+
+    if ($KeepOldAsAlias -and $CurrentPrimary -and -not $CurrentPrimary.Equals($NewPrimary, [StringComparison]::OrdinalIgnoreCase)) {
+        $already = $false
+        foreach ($existing in $result) {
+            if ($existing -like 'smtp:*' -and $existing.Substring(5).Equals($CurrentPrimary, [StringComparison]::OrdinalIgnoreCase)) {
+                $already = $true
+                break
+            }
+        }
+        if (-not $already) {
+            [void]$result.Add(("smtp:{0}" -f $CurrentPrimary))
+        }
+    }
+
+    return @($result)
+}
+
+function Select-PrimarySmtpChange {
+    <# Interactive opt-in. -AlsoChangePrimarySmtp forces on; -SkipPrimarySmtp forces off. #>
+    param(
+        [switch]$AlsoChange,
+        [switch]$Skip
+    )
+    if ($Skip) { return $false }
+    if ($AlsoChange) { return $true }
+    if (-not (Test-IsInteractive)) { return $false }
+
+    Write-Section "Primary SMTP suffix"
+    Write-Host "Optionally switch the Primary SMTP (the SMTP: proxy, and mail) to the same new suffix on every account."
+    Write-Host "The current primary is kept as a secondary smtp: alias so existing mail still delivers."
+    Write-Host "Use -DiscardOldPrimarySmtp to drop the old primary instead of keeping it as an alias."
+    return (Confirm-YesNo "Also change the Primary SMTP suffix on these accounts?" -DefaultYes)
 }
 
 function Get-NormalizedSuffix {
@@ -1061,6 +1187,7 @@ function Set-DuplicateAccountFlags {
             $rows = ($group | ForEach-Object { $_.Row }) -join ", "
             foreach ($r in $group) {
                 $r.Status = "Collision"
+                $r.UpnAction = "Collision"
                 $r.Detail = "Same account appears on multiple CSV rows ($rows) with different target UPNs"
             }
         }
@@ -1069,6 +1196,7 @@ function Set-DuplicateAccountFlags {
             Add-RecordDetail -Record $group[0] -Message "Duplicate CSV rows for this account (row $firstRow kept)"
             for ($i = 1; $i -lt $group.Count; $i++) {
                 $group[$i].Status = "Skipped"
+                $group[$i].SmtpStatus = "Skip"
                 $group[$i].Detail = "Duplicate of row $firstRow"
             }
         }
@@ -1090,11 +1218,13 @@ function Set-CollisionFlags {
             $thisSam  = if ($r.SamAccount) { $r.SamAccount } else { "(row $($r.Row))" }
 
             $r.Status = "Collision"
+            $r.UpnAction = "Collision"
             $r.InUseBySam = $otherSam
             $r.Detail = "Duplicate target UPN in this CSV (also row {0}, sAMAccountName {1})" -f $otherRow, $otherSam
 
             if ($first -and $first.Status -eq "WillChange") {
                 $first.Status = "Collision"
+                $first.UpnAction = "Collision"
                 $first.InUseBySam = $thisSam
                 $first.Detail = "Duplicate target UPN in this CSV (also row {0}, sAMAccountName {1})" -f $r.Row, $thisSam
             }
@@ -1129,6 +1259,7 @@ function Set-CollisionFlags {
         if ([string]::IsNullOrWhiteSpace($occupantSam)) { continue }
 
         $r.Status = "Collision"
+        $r.UpnAction = "Collision"
         if ([string]::IsNullOrWhiteSpace($r.InUseBySam)) {
             $r.InUseBySam = $occupantSam
         }
@@ -1142,6 +1273,200 @@ function Set-CollisionFlags {
         }
         if ([string]::IsNullOrWhiteSpace($r.Detail) -or $r.Detail -notlike "*already in use*") {
             Add-RecordDetail -Record $r -Message $adDetail
+        }
+    }
+}
+
+function Invoke-ProxyAddressOccupantLookup {
+    <#
+        Find AD users that already hold a proxyAddresses or mail value.
+        Returns a case-insensitive hashtable keyed by the requested SMTP address.
+    #>
+    param(
+        [Parameter(Mandatory)] [string[]] $Addresses,
+        [string] $Server
+    )
+
+    $map = @{}
+    $unique = @(
+        $Addresses |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            ForEach-Object { $_.Trim() } |
+            Sort-Object { $_.ToLowerInvariant() } -Unique
+    )
+    if ($unique.Count -eq 0) { return $map }
+
+    $servers = @(Get-AdLookupServers -Preferred $Server)
+    if ($servers.Count -eq 0) { $servers = @($null) }
+
+    for ($i = 0; $i -lt $unique.Count; $i += $script:BatchSize) {
+        $end   = [Math]::Min($i + $script:BatchSize - 1, $unique.Count - 1)
+        $batch = @($unique[$i..$end])
+
+        $pct = if ($unique.Count -gt 0) { [int](($i / $unique.Count) * 100) } else { 0 }
+        Write-Progress -Activity "Querying Active Directory" -Status ("proxyAddresses: {0}-{1} of {2}" -f ($i + 1), ($end + 1), $unique.Count) -PercentComplete $pct
+
+        $parts = foreach ($addr in $batch) {
+            $mailEsc  = ConvertTo-LdapFilterValue -Value $addr
+            $smtpEsc  = ConvertTo-LdapFilterValue -Value ("SMTP:{0}" -f $addr)
+            $aliasEsc = ConvertTo-LdapFilterValue -Value ("smtp:{0}" -f $addr)
+            "(|(proxyAddresses={0})(proxyAddresses={1})(mail={2}))" -f $smtpEsc, $aliasEsc, $mailEsc
+        }
+        $ldap = "(|{0})" -f ($parts -join "")
+
+        $users = $null
+        $lastError = $null
+        foreach ($candidate in $servers) {
+            $params = @{
+                LDAPFilter     = $ldap
+                Properties     = $script:UserProperties
+                ResultPageSize = 200
+                ErrorAction    = "Stop"
+            }
+            if ($candidate) { $params.Server = $candidate }
+            try {
+                $users = @(Get-ADUser @params)
+                $lastError = $null
+                if ($candidate) {
+                    $script:QueryServer = $candidate
+                    $servers = @($candidate) + @($servers | Where-Object { $_ -and -not $_.Equals($candidate, [StringComparison]::OrdinalIgnoreCase) })
+                }
+                break
+            }
+            catch {
+                $lastError = $_
+                Write-Warn ("Batch proxyAddresses lookup failed on {0}: {1}" -f $candidate, $_.Exception.Message)
+                Log ("Batch proxyAddresses lookup failed on {0}: {1}" -f $candidate, $_.Exception.Message) "WARN"
+            }
+        }
+
+        if ($lastError -and $null -eq $users) {
+            Write-Warn "Falling back to one-by-one proxyAddresses lookup."
+            $fallbackServer = $null
+            if ($servers.Count -gt 0) { $fallbackServer = $servers[-1] }
+            $collected = New-Object System.Collections.ArrayList
+            foreach ($addr in $batch) {
+                try {
+                    $mailEsc  = ConvertTo-LdapFilterValue -Value $addr
+                    $smtpEsc  = ConvertTo-LdapFilterValue -Value ("SMTP:{0}" -f $addr)
+                    $aliasEsc = ConvertTo-LdapFilterValue -Value ("smtp:{0}" -f $addr)
+                    $one = @{
+                        LDAPFilter  = ("(|(proxyAddresses={0})(proxyAddresses={1})(mail={2}))" -f $smtpEsc, $aliasEsc, $mailEsc)
+                        Properties  = $script:UserProperties
+                        ErrorAction = "Stop"
+                    }
+                    if ($fallbackServer) { $one.Server = $fallbackServer }
+                    foreach ($u in @(Get-ADUser @one)) {
+                        if ($u) { [void]$collected.Add($u) }
+                    }
+                }
+                catch { }
+            }
+            $users = @($collected)
+        }
+
+        foreach ($u in @($users)) {
+            if (-not $u) { continue }
+            $owned = New-Object System.Collections.ArrayList
+            if ($u.mail) { [void]$owned.Add([string]$u.mail) }
+            foreach ($p in (Get-UserProxyValues -User $u)) {
+                if ($p -like 'smtp:*') { [void]$owned.Add($p.Substring(5)) }
+            }
+            foreach ($addr in $batch) {
+                foreach ($have in $owned) {
+                    if ($have.Equals($addr, [StringComparison]::OrdinalIgnoreCase)) {
+                        $map[$addr] = $u
+                        break
+                    }
+                }
+            }
+        }
+    }
+
+    Write-Progress -Activity "Querying Active Directory" -Completed
+    return $map
+}
+
+function Set-SmtpInUseBySam {
+    param($Record, [string]$Sam)
+    if ([string]::IsNullOrWhiteSpace($Sam)) { return }
+    if ([string]::IsNullOrWhiteSpace($Record.SmtpInUseBySam)) {
+        $Record.SmtpInUseBySam = $Sam
+    }
+    elseif ($Record.SmtpInUseBySam.IndexOf($Sam, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+        $Record.SmtpInUseBySam = "{0}; {1}" -f $Record.SmtpInUseBySam, $Sam
+    }
+}
+
+function Set-SmtpCollisionFlags {
+    <# Flag planned Primary SMTP addresses that collide in the CSV or already exist in AD. #>
+    param($Results)
+
+    $will = @($Results | Where-Object { $_.SmtpStatus -eq "WillChange" -and -not [string]::IsNullOrWhiteSpace($_.NewPrimarySmtp) })
+    $firstRowBySmtp = @{}
+
+    foreach ($r in $will) {
+        $key = $r.NewPrimarySmtp
+        if ($firstRowBySmtp.ContainsKey($key)) {
+            $otherRow = $firstRowBySmtp[$key]
+            $first = $Results | Where-Object { $_.Row -eq $otherRow } | Select-Object -First 1
+            $otherSam = if ($first -and $first.SamAccount) { $first.SamAccount } else { "(row $otherRow)" }
+            $thisSam  = if ($r.SamAccount) { $r.SamAccount } else { "(row $($r.Row))" }
+
+            $r.SmtpStatus = "Collision"
+            Set-SmtpInUseBySam -Record $r -Sam $otherSam
+            Add-RecordDetail -Record $r -Message ("Duplicate target Primary SMTP in this CSV (also row {0}, sAMAccountName {1})" -f $otherRow, $otherSam)
+
+            if ($first -and $first.SmtpStatus -eq "WillChange") {
+                $first.SmtpStatus = "Collision"
+                Set-SmtpInUseBySam -Record $first -Sam $thisSam
+                Add-RecordDetail -Record $first -Message ("Duplicate target Primary SMTP in this CSV (also row {0}, sAMAccountName {1})" -f $r.Row, $thisSam)
+            }
+        }
+        else {
+            $firstRowBySmtp[$key] = $r.Row
+        }
+    }
+
+    $candidates = @($Results | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_.NewPrimarySmtp) -and
+        ($_.SmtpStatus -eq "WillChange" -or $_.SmtpStatus -eq "Collision")
+    })
+    if ($candidates.Count -eq 0) { return }
+
+    $planned = @($candidates | ForEach-Object { $_.NewPrimarySmtp } | Select-Object -Unique)
+    $existing = Invoke-ProxyAddressOccupantLookup -Addresses $planned -Server $script:QueryServer
+
+    foreach ($r in $candidates) {
+        if (-not $existing.ContainsKey($r.NewPrimarySmtp)) { continue }
+        $other = $existing[$r.NewPrimarySmtp]
+        if (-not $other) { continue }
+        if ($r.DistinguishedName -and $other.DistinguishedName -and
+            $other.DistinguishedName.Equals($r.DistinguishedName, [StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+
+        $occupantSam = $other.SamAccountName
+        if ([string]::IsNullOrWhiteSpace($occupantSam)) { $occupantSam = $other.Name }
+        if ([string]::IsNullOrWhiteSpace($occupantSam)) { continue }
+
+        $r.SmtpStatus = "Collision"
+        Set-SmtpInUseBySam -Record $r -Sam $occupantSam
+
+        $adDetail = "Primary SMTP already in use by sAMAccountName {0}" -f $occupantSam
+        if ($other.UserPrincipalName) {
+            $adDetail = "{0} (their current UPN: {1})" -f $adDetail, $other.UserPrincipalName
+        }
+        if ([string]::IsNullOrWhiteSpace($r.Detail) -or $r.Detail -notlike "*Primary SMTP already in use*") {
+            Add-RecordDetail -Record $r -Message $adDetail
+        }
+    }
+
+    foreach ($r in $Results) {
+        if ($r.SmtpStatus -ne "Collision") { continue }
+        if ($r.UpnAction -eq "WillChange") { continue }
+        if ($r.Status -eq "WillChange" -or $r.Status -eq "NoChange") {
+            $r.Status = "Collision"
         }
     }
 }
@@ -1225,7 +1550,7 @@ function Export-UpnPreviewReport {
     $htmlPath = Join-Path $dir ("{0}_{1}.html" -f $NamePrefix, $stamp)
     $csvOut   = Join-Path $dir ("{0}_{1}.csv"  -f $NamePrefix, $stamp)
     $buckets  = Get-PreviewBuckets -Results $Results
-    $cols     = @("Row", "Identity", "SamAccount", "CurrentUPN", "NewUPN", "PrimarySmtp", "ProxyAddresses", "InUseBySam", "Status", "Recommendation", "Detail")
+    $cols     = $script:ReportTableColumns
 
     $generated = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $readyCount = $buckets.Ready.Count
@@ -1271,18 +1596,18 @@ code{background:#eef0f3;padding:1px 4px;border-radius:3px}
     [void]$sb.AppendLine('<div class="card bad"><div class="n">' + $blockCount + '</div><div class="l">Blocked / cannot change</div></div>')
     [void]$sb.AppendLine('<div class="card neutral"><div class="n">' + $buckets.NoChange.Count + '</div><div class="l">Already correct</div></div>')
     [void]$sb.AppendLine('</div>')
-    [void]$sb.AppendLine('<p class="meta"><strong>PrimarySmtp</strong> is the uppercase SMTP: proxy (or the mail attribute if no proxy exists). <strong>ProxyAddresses</strong> lists every proxyAddresses value on the object. A UPN change does not rewrite these.</p>')
+    [void]$sb.AppendLine('<p class="meta"><strong>PrimarySmtp</strong> is the current uppercase SMTP: proxy (or mail). <strong>NewPrimarySmtp</strong> / <strong>NewProxyAddresses</strong> are the planned values when Primary SMTP rewrite is enabled. The old primary is kept as a smtp: alias unless discarded. A UPN-only run does not rewrite proxies.</p>')
 
     [void]$sb.AppendLine('<h2 class="ok">OK to change — ' + $readyCount + '</h2>')
     [void]$sb.AppendLine('<p>These accounts have a valid new UPN, no collision, and no extra warnings. Safe to apply.</p>')
     [void]$sb.AppendLine((ConvertTo-ReportTableHtml -Rows $buckets.Ready -Columns $cols))
 
     [void]$sb.AppendLine('<h2 class="warn">Warnings — review before changing — ' + $warnCount + '</h2>')
-    [void]$sb.AppendLine('<p>The suffix can be written, but something needs a look (unregistered suffix, disabled account, local-part change, or duplicate rows). Apply these only if you intend to.</p>')
+    [void]$sb.AppendLine('<p>The suffix can be written, but something needs a look (unregistered suffix, disabled account, local-part change, duplicate rows, or a Primary SMTP collision). Apply these only if you intend to. A Primary SMTP collision still allows the UPN write; the proxy is skipped.</p>')
     [void]$sb.AppendLine((ConvertTo-ReportTableHtml -Rows $buckets.Warning -Columns $cols))
 
     [void]$sb.AppendLine('<h2 class="bad">Collisions — will not be changed — ' + $collCount + '</h2>')
-    [void]$sb.AppendLine('<p>Two rows share a target UPN, the UPN is already used in AD, or the same account is listed twice with different targets. <strong>InUseBySam</strong> is the sAMAccountName of the account that already holds that UPN.</p>')
+    [void]$sb.AppendLine('<p>Two rows share a target UPN, the UPN is already used in AD, the same account is listed twice with different targets, or the only planned change was a Primary SMTP that is already taken. <strong>InUseBySam</strong> is who holds the UPN. <strong>SmtpInUseBySam</strong> is who holds the proxy.</p>')
     [void]$sb.AppendLine((ConvertTo-ReportTableHtml -Rows $buckets.Collision -Columns $cols))
 
     [void]$sb.AppendLine('<h2 class="bad">Cannot change — ' + (@($buckets.NotFound).Count + @($buckets.Invalid).Count + @($buckets.Skipped).Count + @($buckets.Failed).Count) + '</h2>')
@@ -1313,7 +1638,7 @@ code{background:#eef0f3;padding:1px 4px;border-radius:3px}
     }
 
     try {
-        $Results | Select-Object Row, Identity, SamAccount, DistinguishedName, CurrentUPN, NewUPN, PrimarySmtp, ProxyAddresses, InUseBySam, Status, Recommendation, Detail |
+        $Results | Select-Object -Property $script:ResultExportProperties |
             Export-Csv -Path $csvOut -NoTypeInformation -Encoding UTF8
         $csvOutOut = $csvOut
         Write-Ok ("Preview report (CSV):  {0}" -f $csvOut)
@@ -1339,7 +1664,7 @@ function Show-PreviewReport {
         }
         $total = @($Rows).Count
         @($Rows | Select-Object -First $Limit) |
-            Format-Table Row, SamAccount, CurrentUPN, NewUPN, PrimarySmtp, InUseBySam, Recommendation, Detail -AutoSize |
+            Format-Table Row, SamAccount, CurrentUPN, NewUPN, PrimarySmtp, NewPrimarySmtp, SmtpStatus, InUseBySam, SmtpInUseBySam, Recommendation, Detail -AutoSize |
             Out-Host
         if ($total -gt $Limit) {
             Write-Host ("  ... {0} more in the HTML/CSV report" -f ($total - $Limit)) -ForegroundColor DarkGray
@@ -1429,6 +1754,21 @@ function Main {
     }
     Log ("Mode: {0}; IdentityCol: {1}; ValueCol: {2}; SingleSuffix: {3}" -f $mode, $identityCol, $valueCol, $singleSuffix)
 
+    $changeSmtp = Select-PrimarySmtpChange -AlsoChange:$AlsoChangePrimarySmtp -Skip:$SkipPrimarySmtp
+    $keepOldAlias = -not $DiscardOldPrimarySmtp
+    if ($changeSmtp) {
+        if ($keepOldAlias) {
+            Write-Ok "Primary SMTP suffix will be switched as well. Old primaries stay as smtp: aliases."
+        }
+        else {
+            Write-Warn "Primary SMTP suffix will be switched. Old primaries will NOT be kept as aliases."
+        }
+    }
+    else {
+        Write-Info "Primary SMTP addresses will be left unchanged."
+    }
+    Log ("ChangePrimarySmtp: {0}; KeepOldPrimaryAsAlias: {1}" -f $changeSmtp, $keepOldAlias)
+
     # ---------------------------------------------------- dry run / preview ---
     Write-Section "Building preview (no changes made yet)"
 
@@ -1467,8 +1807,14 @@ function Main {
             CurrentUPN         = ""
             NewUPN             = ""
             PrimarySmtp        = ""
+            NewPrimarySmtp     = ""
             ProxyAddresses     = ""
+            NewProxyAddresses  = ""
+            NewProxyList       = @()
+            UpnAction          = ""
+            SmtpStatus         = ""
             InUseBySam         = ""
+            SmtpInUseBySam     = ""
             Status             = ""
             Recommendation     = ""
             Detail             = ""
@@ -1498,6 +1844,8 @@ function Main {
         $newUpn = Get-NewUpn -User $user -Mode $mode -RowValue $rowValue -SingleSuffix $singleSuffix
         if ([string]::IsNullOrWhiteSpace($newUpn)) {
             $record.Status = "Skipped"
+            $record.UpnAction = "Skipped"
+            $record.SmtpStatus = "None"
             $record.Detail = "Could not build a new UPN"
             [void]$results.Add([pscustomobject]$record)
             continue
@@ -1506,21 +1854,59 @@ function Main {
         $record.NewUPN = $newUpn
         if (-not (Test-UpnFormat -Upn $newUpn)) {
             $record.Status = "InvalidUpn"
+            $record.UpnAction = "InvalidUpn"
+            $record.SmtpStatus = "None"
             $record.Detail = "New UPN is not in local-part@domain form"
             [void]$results.Add([pscustomobject]$record)
             continue
         }
 
-        if ($user.UserPrincipalName -and $newUpn.Equals($user.UserPrincipalName, [StringComparison]::OrdinalIgnoreCase)) {
+        $upnAlreadyCorrect = $user.UserPrincipalName -and $newUpn.Equals($user.UserPrincipalName, [StringComparison]::OrdinalIgnoreCase)
+        $record.UpnAction = if ($upnAlreadyCorrect) { "NoChange" } else { "WillChange" }
+
+        $newSuffix = Get-UpnSuffix -Upn $newUpn
+        if ($changeSmtp) {
+            $currentSmtp = $record.PrimarySmtp
+            if ([string]::IsNullOrWhiteSpace($currentSmtp) -or $currentSmtp -notlike '*@*') {
+                $record.SmtpStatus = "Skip"
+                Add-RecordDetail -Record $record -Message "No Primary SMTP on this object"
+            }
+            else {
+                $newSmtp = Get-NewSmtpAddress -CurrentPrimary $currentSmtp -TargetSuffix $newSuffix
+                $record.NewPrimarySmtp = $newSmtp
+                if ([string]::IsNullOrWhiteSpace($newSmtp) -or -not (Test-UpnFormat -Upn $newSmtp)) {
+                    $record.SmtpStatus = "Skip"
+                    Add-RecordDetail -Record $record -Message "Could not build a new Primary SMTP"
+                }
+                elseif ($newSmtp.Equals($currentSmtp, [StringComparison]::OrdinalIgnoreCase)) {
+                    $record.SmtpStatus = "NoChange"
+                }
+                else {
+                    $record.SmtpStatus = "WillChange"
+                    $newList = Get-UpdatedProxyAddressList -CurrentProxies (Get-UserProxyValues -User $user) -CurrentPrimary $currentSmtp -NewPrimary $newSmtp -KeepOldAsAlias $keepOldAlias
+                    $record.NewProxyList = $newList
+                    $record.NewProxyAddresses = Format-ProxyAddressValues -Values $newList
+                }
+            }
+        }
+        else {
+            $record.SmtpStatus = "None"
+        }
+
+        if ($upnAlreadyCorrect -and $record.SmtpStatus -ne "WillChange") {
             $record.Status = "NoChange"
-            $record.Detail = "Already correct"
+            if ([string]::IsNullOrWhiteSpace($record.Detail)) {
+                $record.Detail = "Already correct"
+            }
             [void]$results.Add([pscustomobject]$record)
             continue
         }
 
-        $newSuffix = Get-UpnSuffix -Upn $newUpn
         $record.Status = "WillChange"
-        if ($suffixSet.Count -gt 0 -and $newSuffix -and -not (Test-SetContains -Set $suffixSet -Value $newSuffix)) {
+        if ($upnAlreadyCorrect) {
+            Add-RecordDetail -Record $record -Message "UPN already correct"
+        }
+        if ($record.UpnAction -eq "WillChange" -and $suffixSet.Count -gt 0 -and $newSuffix -and -not (Test-SetContains -Set $suffixSet -Value $newSuffix)) {
             Add-RecordDetail -Record $record -Message ("Suffix '{0}' is not in the forest UPN suffix list" -f $newSuffix)
         }
         if ($user.Enabled -eq $false) {
@@ -1531,7 +1917,7 @@ function Main {
             $oldPrefix = $user.UserPrincipalName.Split('@')[0]
         }
         $newPrefix = $newUpn.Split('@')[0]
-        if ($oldPrefix -and $newPrefix -and -not $oldPrefix.Equals($newPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        if ($record.UpnAction -eq "WillChange" -and $oldPrefix -and $newPrefix -and -not $oldPrefix.Equals($newPrefix, [StringComparison]::OrdinalIgnoreCase)) {
             Add-RecordDetail -Record $record -Message ("Local-part will change from '{0}' to '{1}'" -f $oldPrefix, $newPrefix)
         }
         [void]$results.Add([pscustomobject]$record)
@@ -1539,9 +1925,12 @@ function Main {
 
     Write-Progress -Activity "Building preview" -Completed
 
-    Write-Info "Checking for duplicate rows and UPN collisions..."
+    Write-Info "Checking for duplicate rows, UPN collisions, and Primary SMTP collisions..."
     Set-DuplicateAccountFlags -Results $results
     Set-CollisionFlags -Results $results
+    if ($changeSmtp) {
+        Set-SmtpCollisionFlags -Results $results
+    }
     Set-RowRecommendations -Results $results
     $script:LastResults = $results
 
@@ -1581,7 +1970,7 @@ function Main {
     }
 
     if ($warning.Count -gt 0) {
-        Write-Warn ("{0} account(s) have warnings (unregistered suffix, disabled, local-part change, or duplicates)." -f $warning.Count)
+        Write-Warn ("{0} account(s) have warnings (unregistered suffix, disabled, local-part change, duplicates, or Primary SMTP collision)." -f $warning.Count)
         if (Confirm-YesNo "Also apply the warning account(s)?") {
             $toApply = @($toApply) + @($warning)
         }
@@ -1609,6 +1998,12 @@ function Main {
 
         if ($perAccount) {
             $msg = ("Change {0}: {1}  ->  {2}" -f $r.SamAccount, $r.CurrentUPN, $r.NewUPN)
+            if ($r.SmtpStatus -eq "WillChange") {
+                $msg = "{0}; Primary SMTP {1} -> {2}" -f $msg, $r.PrimarySmtp, $r.NewPrimarySmtp
+            }
+            elseif ($r.SmtpStatus -eq "Collision") {
+                $msg = "{0}; Primary SMTP skipped (in use by {1})" -f $msg, $r.SmtpInUseBySam
+            }
             if (-not (Confirm-YesNo $msg -DefaultYes)) {
                 $r.Status = "SkippedByUser"
                 $r.Detail = "User skipped at confirmation"
@@ -1626,17 +2021,49 @@ function Main {
 
         try {
             $setParams = @{
-                Identity          = $identity
-                UserPrincipalName = $r.NewUPN
-                ErrorAction       = "Stop"
+                Identity    = $identity
+                ErrorAction = "Stop"
             }
             if ($writeTo) { $setParams.Server = $writeTo }
+            if ($r.UpnAction -eq "WillChange") {
+                $setParams.UserPrincipalName = $r.NewUPN
+            }
+
+            $replace = @{}
+            if ($r.SmtpStatus -eq "WillChange") {
+                $proxyList = [string[]]@($r.NewProxyList)
+                if ($proxyList.Count -gt 0) {
+                    $replace["proxyAddresses"] = $proxyList
+                }
+                if (-not [string]::IsNullOrWhiteSpace($r.NewPrimarySmtp)) {
+                    $replace["mail"] = $r.NewPrimarySmtp
+                }
+            }
+            if ($replace.Count -gt 0) {
+                $setParams.Replace = $replace
+            }
+            if (-not $setParams.ContainsKey("UserPrincipalName") -and -not $setParams.ContainsKey("Replace")) {
+                $r.Status = "NoChange"
+                $r.Detail = "Nothing left to apply"
+                continue
+            }
+
             Set-ADUser @setParams
             $r.Status = "Changed"
+            $changedBits = New-Object System.Collections.ArrayList
+            if ($setParams.ContainsKey("UserPrincipalName")) {
+                [void]$changedBits.Add(("UPN {0} -> {1}" -f $r.CurrentUPN, $r.NewUPN))
+            }
+            if ($r.SmtpStatus -eq "WillChange") {
+                [void]$changedBits.Add(("Primary SMTP {0} -> {1}" -f $r.PrimarySmtp, $r.NewPrimarySmtp))
+                $r.PrimarySmtp = $r.NewPrimarySmtp
+                $r.ProxyAddresses = $r.NewProxyAddresses
+            }
             $r.Detail = "OK"
             $applied++
-            Write-Ok ("Changed {0}: {1} -> {2}" -f $r.SamAccount, $r.CurrentUPN, $r.NewUPN)
-            Log ("Changed {0}: {1} -> {2}" -f $r.SamAccount, $r.CurrentUPN, $r.NewUPN)
+            $summary = ($changedBits -join "; ")
+            Write-Ok ("Changed {0}: {1}" -f $r.SamAccount, $summary)
+            Log ("Changed {0}: {1}" -f $r.SamAccount, $summary)
         }
         catch {
             $r.Status = "Failed"
@@ -1671,7 +2098,7 @@ function Save-Output {
     $logTxt     = Join-Path $dir ("UpnFix_Log_{0}.txt"     -f $stamp)
 
     try {
-        $Results | Select-Object Row, Identity, SamAccount, DistinguishedName, CurrentUPN, NewUPN, PrimarySmtp, ProxyAddresses, InUseBySam, Status, Recommendation, Detail |
+        $Results | Select-Object -Property $script:ResultExportProperties |
             Export-Csv -Path $resultsCsv -NoTypeInformation -Encoding UTF8
         Write-Ok ("Results written to: {0}" -f $resultsCsv)
     }

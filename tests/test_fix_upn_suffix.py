@@ -142,7 +142,7 @@ def get_primary_smtp_address(proxies, mail=None):
 
 
 def format_proxy_address_list(proxies):
-    """Port of Format-ProxyAddressList."""
+    """Port of Format-ProxyAddressValues / Format-ProxyAddressList."""
     items = [str(p) for p in (proxies or []) if p]
     if not items:
         return ""
@@ -150,6 +150,61 @@ def format_proxy_address_list(proxies):
     aliases = sorted(p for p in items if p.startswith("smtp:"))
     other = sorted(p for p in items if not p.lower().startswith("smtp:"))
     return "; ".join(primary + aliases + other)
+
+
+def get_new_smtp_address(current_primary: str | None, target_suffix: str | None) -> str:
+    """Port of Get-NewSmtpAddress."""
+    suffix = get_normalized_suffix(target_suffix)
+    if not current_primary or not suffix or "@" not in current_primary:
+        return ""
+    prefix = current_primary.split("@")[0]
+    if not prefix.strip():
+        return ""
+    return f"{prefix}@{suffix}"
+
+
+def get_updated_proxy_address_list(
+    current_proxies,
+    current_primary: str | None,
+    new_primary: str,
+    keep_old_as_alias: bool = True,
+) -> list[str]:
+    """Port of Get-UpdatedProxyAddressList."""
+    if not new_primary:
+        return []
+    result = [f"SMTP:{new_primary}"]
+    for raw in current_proxies or []:
+        if not raw:
+            continue
+        p = str(raw)
+        if p.lower().startswith("smtp:"):
+            addr = p[5:]
+            if addr.lower() == new_primary.lower():
+                continue
+            if (
+                current_primary
+                and p.startswith("SMTP:")
+                and addr.lower() == current_primary.lower()
+            ):
+                continue
+            if p.startswith("SMTP:"):
+                result.append(f"smtp:{addr}")
+            else:
+                result.append(p)
+            continue
+        result.append(p)
+    if (
+        keep_old_as_alias
+        and current_primary
+        and current_primary.lower() != new_primary.lower()
+    ):
+        already = any(
+            x.lower().startswith("smtp:") and x[5:].lower() == current_primary.lower()
+            for x in result
+        )
+        if not already:
+            result.append(f"smtp:{current_primary}")
+    return result
 
 
 def add_discovered_suffix(mapping: dict, suffix: str | None, source: str) -> None:
@@ -541,6 +596,66 @@ class ProxyAddressTests(unittest.TestCase):
         self.assertEqual(format_proxy_address_list(None), "")
 
 
+class SmtpRewriteTests(unittest.TestCase):
+    def test_new_smtp_keeps_local_part_and_switches_suffix(self):
+        self.assertEqual(
+            get_new_smtp_address("jane.doe@old.local", "omi.com"),
+            "jane.doe@omi.com",
+        )
+        self.assertEqual(
+            get_new_smtp_address("jane.doe@old.local", "@OMI.com"),
+            "jane.doe@OMI.com",
+        )
+
+    def test_new_smtp_rejects_incomplete_inputs(self):
+        self.assertEqual(get_new_smtp_address("", "omi.com"), "")
+        self.assertEqual(get_new_smtp_address("not-an-email", "omi.com"), "")
+        self.assertEqual(get_new_smtp_address("jane@old.local", ""), "")
+
+    def test_updated_list_promotes_new_primary_and_keeps_old_alias(self):
+        updated = get_updated_proxy_address_list(
+            ["SMTP:jane@old.local", "smtp:alias@omi.com", "sip:jane@omi.com"],
+            "jane@old.local",
+            "jane@omi.com",
+            True,
+        )
+        self.assertEqual(updated[0], "SMTP:jane@omi.com")
+        self.assertIn("smtp:jane@old.local", updated)
+        self.assertIn("smtp:alias@omi.com", updated)
+        self.assertIn("sip:jane@omi.com", updated)
+        self.assertNotIn("SMTP:jane@old.local", updated)
+        self.assertEqual(1, sum(1 for p in updated if p.startswith("SMTP:")))
+
+    def test_updated_list_promotes_existing_alias(self):
+        updated = get_updated_proxy_address_list(
+            ["SMTP:jane@old.local", "smtp:jane@omi.com"],
+            "jane@old.local",
+            "jane@omi.com",
+            True,
+        )
+        self.assertEqual(updated[0], "SMTP:jane@omi.com")
+        self.assertEqual(1, sum(1 for p in updated if p.lower() == "smtp:jane@omi.com"))
+        self.assertIn("smtp:jane@old.local", updated)
+
+    def test_discard_old_primary_omits_alias(self):
+        updated = get_updated_proxy_address_list(
+            ["SMTP:jane@old.local"],
+            "jane@old.local",
+            "jane@omi.com",
+            False,
+        )
+        self.assertEqual(updated, ["SMTP:jane@omi.com"])
+
+    def test_mail_only_object_creates_proxy_pair(self):
+        updated = get_updated_proxy_address_list(
+            [],
+            "jane@old.local",
+            "jane@omi.com",
+            True,
+        )
+        self.assertEqual(updated, ["SMTP:jane@omi.com", "smtp:jane@old.local"])
+
+
 class EfficiencyTests(unittest.TestCase):
     def test_batching_beats_per_row_lookups(self):
         identities = [f"user{i:04d}@old.local" for i in range(200)]
@@ -604,6 +719,11 @@ class ScriptSourceTests(unittest.TestCase):
             "Set-DuplicateAccountFlags",
             "Get-PrimarySmtpAddress",
             "Format-ProxyAddressList",
+            "Get-NewSmtpAddress",
+            "Get-UpdatedProxyAddressList",
+            "Select-PrimarySmtpChange",
+            "Set-SmtpCollisionFlags",
+            "Invoke-ProxyAddressOccupantLookup",
         ):
             self.assertIn(f"function {name}", self.source)
 
@@ -640,6 +760,10 @@ class ScriptSourceTests(unittest.TestCase):
         self.assertIn("proxyAddresses", self.source)
         self.assertIn("PrimarySmtp", self.source)
         self.assertIn("Get-PrimarySmtpAddress", self.source)
+        self.assertIn("AlsoChangePrimarySmtp", self.source)
+        self.assertIn("NewPrimarySmtp", self.source)
+        self.assertIn("SmtpInUseBySam", self.source)
+        self.assertIn("Get-UpdatedProxyAddressList", self.source)
 
     def test_set_aduser_uses_distinguished_name(self):
         self.assertRegex(
