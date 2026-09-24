@@ -167,7 +167,7 @@ def get_updated_proxy_address_list(
     current_proxies,
     current_primary: str | None,
     new_primary: str,
-    keep_old_as_alias: bool = True,
+    keep_old_as_alias: bool = False,
 ) -> list[str]:
     """Port of Get-UpdatedProxyAddressList."""
     if not new_primary:
@@ -181,11 +181,7 @@ def get_updated_proxy_address_list(
             addr = p[5:]
             if addr.lower() == new_primary.lower():
                 continue
-            if (
-                current_primary
-                and p.startswith("SMTP:")
-                and addr.lower() == current_primary.lower()
-            ):
+            if current_primary and addr.lower() == current_primary.lower():
                 continue
             if p.startswith("SMTP:"):
                 result.append(f"smtp:{addr}")
@@ -612,48 +608,51 @@ class SmtpRewriteTests(unittest.TestCase):
         self.assertEqual(get_new_smtp_address("not-an-email", "omi.com"), "")
         self.assertEqual(get_new_smtp_address("jane@old.local", ""), "")
 
-    def test_updated_list_promotes_new_primary_and_keeps_old_alias(self):
+    def test_updated_list_replaces_old_primary_and_keeps_other_aliases(self):
         updated = get_updated_proxy_address_list(
             ["SMTP:jane@old.local", "smtp:alias@omi.com", "sip:jane@omi.com"],
             "jane@old.local",
             "jane@omi.com",
-            True,
         )
         self.assertEqual(updated[0], "SMTP:jane@omi.com")
-        self.assertIn("smtp:jane@old.local", updated)
+        self.assertNotIn("SMTP:jane@old.local", updated)
+        self.assertNotIn("smtp:jane@old.local", updated)
         self.assertIn("smtp:alias@omi.com", updated)
         self.assertIn("sip:jane@omi.com", updated)
-        self.assertNotIn("SMTP:jane@old.local", updated)
         self.assertEqual(1, sum(1 for p in updated if p.startswith("SMTP:")))
 
-    def test_updated_list_promotes_existing_alias(self):
+    def test_updated_list_promotes_existing_alias_and_deletes_old_primary(self):
         updated = get_updated_proxy_address_list(
             ["SMTP:jane@old.local", "smtp:jane@omi.com"],
             "jane@old.local",
             "jane@omi.com",
-            True,
-        )
-        self.assertEqual(updated[0], "SMTP:jane@omi.com")
-        self.assertEqual(1, sum(1 for p in updated if p.lower() == "smtp:jane@omi.com"))
-        self.assertIn("smtp:jane@old.local", updated)
-
-    def test_discard_old_primary_omits_alias(self):
-        updated = get_updated_proxy_address_list(
-            ["SMTP:jane@old.local"],
-            "jane@old.local",
-            "jane@omi.com",
-            False,
         )
         self.assertEqual(updated, ["SMTP:jane@omi.com"])
 
-    def test_mail_only_object_creates_proxy_pair(self):
+    def test_updated_list_drops_old_primary_alias_too(self):
         updated = get_updated_proxy_address_list(
-            [],
+            ["SMTP:jane@old.local", "smtp:jane@old.local"],
+            "jane@old.local",
+            "jane@omi.com",
+        )
+        self.assertEqual(updated, ["SMTP:jane@omi.com"])
+
+    def test_keep_old_as_alias_is_opt_in(self):
+        updated = get_updated_proxy_address_list(
+            ["SMTP:jane@old.local"],
             "jane@old.local",
             "jane@omi.com",
             True,
         )
         self.assertEqual(updated, ["SMTP:jane@omi.com", "smtp:jane@old.local"])
+
+    def test_mail_only_object_creates_new_primary_only(self):
+        updated = get_updated_proxy_address_list(
+            [],
+            "jane@old.local",
+            "jane@omi.com",
+        )
+        self.assertEqual(updated, ["SMTP:jane@omi.com"])
 
 
 class EfficiencyTests(unittest.TestCase):

@@ -20,9 +20,10 @@
       The report includes each object's primary SMTP and proxyAddresses
       when those attributes exist.
     - Optional rewrite of the Primary SMTP suffix (SMTP: proxy + mail)
-      to the same new suffix. The old primary is kept as a smtp: alias
-      unless -DiscardOldPrimarySmtp is used. Collisions are reported
-      (SmtpInUseBySam) and that proxy is not written.
+      to the same new suffix. The old primary address is deleted and
+      replaced. Use -KeepOldPrimarySmtpAsAlias to keep it as a smtp:
+      alias instead. Collisions are reported (SmtpInUseBySam) and that
+      proxy is not written.
     - Optional per-account confirmation.
     - Writes a text log and a results CSV next to the source file.
 
@@ -60,10 +61,9 @@
 .PARAMETER SkipPrimarySmtp
     Do not change Primary SMTP addresses, and do not ask.
 
-.PARAMETER DiscardOldPrimarySmtp
-    When rewriting Primary SMTP, do not keep the old address as a
-    secondary smtp: alias. Default is to keep it so existing mail still
-    delivers.
+.PARAMETER KeepOldPrimarySmtpAsAlias
+    When rewriting Primary SMTP, keep the old address as a secondary
+    smtp: alias. Default is to delete the old primary and replace it.
 
 .PARAMETER SkipPause
     Skip the "Press ENTER to close" prompt (useful for automation).
@@ -92,7 +92,7 @@ param(
     [string]$Suffix,
     [switch]$AlsoChangePrimarySmtp,
     [switch]$SkipPrimarySmtp,
-    [switch]$DiscardOldPrimarySmtp,
+    [switch]$KeepOldPrimarySmtpAsAlias,
     [switch]$SkipPause
 )
 
@@ -324,15 +324,16 @@ function Get-NewSmtpAddress {
 
 function Get-UpdatedProxyAddressList {
     <#
-        Build a replacement proxyAddresses list: new address is SMTP: (primary),
-        old primary becomes smtp: when KeepOldAsAlias is set, other values kept.
+        Build a replacement proxyAddresses list: new address is SMTP: (primary).
+        The old primary address (SMTP: and smtp:) is removed. Other proxies stay.
         A second SMTP: value is demoted so the object has only one primary.
+        KeepOldAsAlias puts the old primary back as smtp: (opt-in).
     #>
     param(
         [string[]]$CurrentProxies,
         [string]$CurrentPrimary,
         [string]$NewPrimary,
-        [bool]$KeepOldAsAlias = $true
+        [bool]$KeepOldAsAlias = $false
     )
     if ([string]::IsNullOrWhiteSpace($NewPrimary)) { return @() }
 
@@ -345,7 +346,7 @@ function Get-UpdatedProxyAddressList {
         if ($p -like 'smtp:*') {
             $addr = $p.Substring(5)
             if ($addr.Equals($NewPrimary, [StringComparison]::OrdinalIgnoreCase)) { continue }
-            if ($CurrentPrimary -and $p -clike 'SMTP:*' -and $addr.Equals($CurrentPrimary, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            if ($CurrentPrimary -and $addr.Equals($CurrentPrimary, [StringComparison]::OrdinalIgnoreCase)) { continue }
             if ($p -clike 'SMTP:*') {
                 [void]$result.Add(("smtp:{0}" -f $addr))
             }
@@ -385,8 +386,8 @@ function Select-PrimarySmtpChange {
 
     Write-Section "Primary SMTP suffix"
     Write-Host "Optionally switch the Primary SMTP (the SMTP: proxy, and mail) to the same new suffix on every account."
-    Write-Host "The current primary is kept as a secondary smtp: alias so existing mail still delivers."
-    Write-Host "Use -DiscardOldPrimarySmtp to drop the old primary instead of keeping it as an alias."
+    Write-Host "The old primary address is deleted and replaced with the new one. Other aliases are left alone."
+    Write-Host "Use -KeepOldPrimarySmtpAsAlias to keep the old primary as a secondary smtp: alias instead."
     return (Confirm-YesNo "Also change the Primary SMTP suffix on these accounts?" -DefaultYes)
 }
 
@@ -1596,7 +1597,7 @@ code{background:#eef0f3;padding:1px 4px;border-radius:3px}
     [void]$sb.AppendLine('<div class="card bad"><div class="n">' + $blockCount + '</div><div class="l">Blocked / cannot change</div></div>')
     [void]$sb.AppendLine('<div class="card neutral"><div class="n">' + $buckets.NoChange.Count + '</div><div class="l">Already correct</div></div>')
     [void]$sb.AppendLine('</div>')
-    [void]$sb.AppendLine('<p class="meta"><strong>PrimarySmtp</strong> is the current uppercase SMTP: proxy (or mail). <strong>NewPrimarySmtp</strong> / <strong>NewProxyAddresses</strong> are the planned values when Primary SMTP rewrite is enabled. The old primary is kept as a smtp: alias unless discarded. A UPN-only run does not rewrite proxies.</p>')
+    [void]$sb.AppendLine('<p class="meta"><strong>PrimarySmtp</strong> is the current uppercase SMTP: proxy (or mail). <strong>NewPrimarySmtp</strong> / <strong>NewProxyAddresses</strong> are the planned values when Primary SMTP rewrite is enabled. The old primary is deleted and replaced unless -KeepOldPrimarySmtpAsAlias is used. A UPN-only run does not rewrite proxies.</p>')
 
     [void]$sb.AppendLine('<h2 class="ok">OK to change — ' + $readyCount + '</h2>')
     [void]$sb.AppendLine('<p>These accounts have a valid new UPN, no collision, and no extra warnings. Safe to apply.</p>')
@@ -1755,13 +1756,13 @@ function Main {
     Log ("Mode: {0}; IdentityCol: {1}; ValueCol: {2}; SingleSuffix: {3}" -f $mode, $identityCol, $valueCol, $singleSuffix)
 
     $changeSmtp = Select-PrimarySmtpChange -AlsoChange:$AlsoChangePrimarySmtp -Skip:$SkipPrimarySmtp
-    $keepOldAlias = -not $DiscardOldPrimarySmtp
+    $keepOldAlias = [bool]$KeepOldPrimarySmtpAsAlias
     if ($changeSmtp) {
         if ($keepOldAlias) {
-            Write-Ok "Primary SMTP suffix will be switched as well. Old primaries stay as smtp: aliases."
+            Write-Warn "Primary SMTP suffix will be switched. Old primaries stay as smtp: aliases."
         }
         else {
-            Write-Warn "Primary SMTP suffix will be switched. Old primaries will NOT be kept as aliases."
+            Write-Ok "Primary SMTP suffix will be switched. The old primary address is deleted and replaced."
         }
     }
     else {
