@@ -1,0 +1,15 @@
+09/03/2026 12:39:08 == The AD user called: Y22686, was ADDED TO A UNIVERSAL (SECURITY) GROUP by ablake4.S in DFOMIPV22
+09/03/2026 12:42:35 == The AD user called: Y22686, was REMOVED FROM A UNIVERSAL (SECURITY) GROUP by ablake4.S in DFOMIPV22
+09/03/2026 12:42:38 == The user ablake4.S modified the primaryGroupID of user Y22686 (CN=Y22686,OU=San Pedro Sula,OU=Honduras)
+09/10/2026 08:45:37 == Account ablake4.SA was MODIFIED by SVC_DELINEADA in DFOMIPV2202
+09/10/2026 08:45:38 == The AD user called: ablake4.SA, was ADDED TO A GLOBAL (SECURITY) GROUP by SVC_DELINEADA in DFOMIPV2202
+09/10/2026 08:45:38 == The AD user called: ablake4.SA, was REMOVED FROM A GLOBAL (SECURITY) GROUP by SVC_DELINEADA in DFOMIPV2202
+09/10/2026 08:45:40 == Account ablake4.SA was MODIFIED by SVC_DELINEADA in DFOMIPV2202
+09/10/2026 08:45:44 == The user SVC_DELINEADA modified the accountExpires of user ablake4.SA (CN=ablake4.SA,OU=Nosync)
+09/10/2026 08:54:26 == Account ablake4.SA was MODIFIED by SVC_DELINEADA in DFOMIPV2202
+09/10/2026 08:54:27 == The user SVC_DELINEADA modified the accountExpires of user ablake4.SA (CN=ablake4.SA,OU=Nosync)
+09/10/2026 08:55:32 == Account ablake4.SA was MODIFIED by SVC_DELINEADA in DFOMIPV2202
+09/10/2026 08:55:32 == The AD user called: ablake4.SA, was ADDED TO A GLOBAL (SECURITY) GROUP by SVC_DELINEADA in DFOMIPV2202
+09/10/2026 08:55:33 == Account ablake4.SA was MODIFIED by SVC_DELINEADA in DFOMIPV2202
+This line has no timestamp and should sort last when date sorting is used
+09/01/2026 07:00:01 == The AD user called: jsmith, was ADDED TO A DOMAIN (SECURITY) GROUP by admin01 in DC01
