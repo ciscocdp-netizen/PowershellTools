@@ -501,8 +501,17 @@ public static class AdLogDpi {
         [AdLogDpi]::SetProcessDPIAware() | Out-Null
     } catch { }
 
-    [System.Windows.Forms.Application]::EnableVisualStyles()
-    [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
+    # SetCompatibleTextRenderingDefault must run before any IWin32Window exists.
+    # PowerShell ISE, VS Code, a previous Form in this session, and even
+    # EnableVisualStyles() can already have created one — never let that abort launch.
+    try {
+        [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
+    } catch {
+        # InvalidOperationException: a window was already created in this AppDomain.
+    }
+    try {
+        [System.Windows.Forms.Application]::EnableVisualStyles()
+    } catch { }
 
     $script:AllRows = New-Object 'System.Collections.Generic.List[AdLogEntry]'
     $script:VisibleRows = New-Object 'System.Collections.Generic.List[AdLogEntry]'
