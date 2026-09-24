@@ -100,7 +100,7 @@ try {
 
     $ticks = New-Object System.Collections.Generic.List[int]
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $big = Search-AdLogFiles -Path $large -SearchTerm 'ablake4.SA' -IsFolder $false -Recursive $false -CaseInsensitive $true -UseRegex $false -ProgressCallback {
+    $big = Search-AdLogFiles -Path $large -SearchTerm 'ablake4.s' -IsFolder $false -Recursive $false -CaseInsensitive $true -UseRegex $false -ProgressCallback {
         param($info)
         $ticks.Add([int]$info.Percent)
     }
