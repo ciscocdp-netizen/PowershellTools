@@ -234,6 +234,34 @@ function Get-AdLogTargetFiles {
     return @([System.IO.FileInfo]::new($Path))
 }
 
+function ConvertTo-AdLogList {
+    param($InputObject)
+
+    if ($InputObject -is [System.Collections.Generic.List[AdLogEntry]]) {
+        return , $InputObject
+    }
+
+    $list = New-Object 'System.Collections.Generic.List[AdLogEntry]'
+    if ($null -eq $InputObject) {
+        return , $list
+    }
+
+    foreach ($item in @($InputObject)) {
+        if ($item -is [AdLogEntry]) {
+            [void]$list.Add($item)
+        }
+    }
+    return , $list
+}
+
+function Get-AdLogEntryCount {
+    param($Entries)
+
+    if ($null -eq $Entries) { return 0 }
+    if ($Entries -is [System.Collections.ICollection]) { return [int]$Entries.Count }
+    return @($Entries).Count
+}
+
 function Search-AdLogFiles {
     <#
     .SYNOPSIS
@@ -250,11 +278,10 @@ function Search-AdLogFiles {
         [string]$EncodingName = 'Auto (BOM)',
         [scriptblock]$ProgressCallback,
         [scriptblock]$ShouldCancel,
-        [System.Collections.IList]$ErrorLog,
-        [System.Collections.Generic.List[AdLogEntry]]$OutputList
+        [System.Collections.IList]$ErrorLog
     )
 
-    $results = if ($OutputList) { $OutputList } else { New-Object 'System.Collections.Generic.List[AdLogEntry]' }
+    $results = New-Object 'System.Collections.Generic.List[AdLogEntry]'
     $compiled = $null
 
     if ($UseRegex -and -not [string]::IsNullOrEmpty($SearchTerm)) {
@@ -297,6 +324,7 @@ function Search-AdLogFiles {
             FileLines   = $FileLines
             TotalLines  = $grandLines
             Matches     = $results.Count
+            Results     = $results
             Percent     = [int]([math]::Min(100, $portion * 100))
             BytesRead   = $BytesRead
             TotalBytes  = $TotalBytes
@@ -361,7 +389,10 @@ function Search-AdLogFiles {
         }
     }
 
-    return $results
+    # Unary comma keeps the list intact. A bare `return $results` enumerates
+    # the items, so the caller would receive $null / a single object / an array
+    # and the GUI would think the search found nothing.
+    return , $results
 }
 
 function Sort-AdLogEntries {
@@ -385,7 +416,7 @@ function Sort-AdLogEntries {
     $output = New-Object 'System.Collections.Generic.List[AdLogEntry]'
     foreach ($entry in $sortedDated) { $output.Add($entry) }
     foreach ($entry in $undated) { $output.Add($entry) }
-    return $output
+    return , $output
 }
 
 function Select-AdLogEntries {
@@ -410,7 +441,7 @@ function Select-AdLogEntries {
         }
         $output.Add($entry)
     }
-    return $output
+    return , $output
 }
 
 # ============================================================
@@ -851,9 +882,13 @@ public static class AdLogDpi {
     }
 
     function Update-VisibleRows {
-        $script:VisibleRows = Select-AdLogEntries -Entries $script:AllRows -FilterText $txtFilter.Text -EventKind ([string]$cmbEvent.SelectedItem)
+        $script:AllRows = ConvertTo-AdLogList $script:AllRows
+        $script:VisibleRows = ConvertTo-AdLogList (
+            Select-AdLogEntries -Entries $script:AllRows -FilterText $txtFilter.Text -EventKind ([string]$cmbEvent.SelectedItem)
+        )
+        $shown = Get-AdLogEntryCount $script:VisibleRows
         $grid.RowCount = 0
-        $grid.RowCount = $script:VisibleRows.Count
+        $grid.RowCount = $shown
         $grid.Refresh()
 
         $added = 0; $removed = 0; $modified = 0
@@ -865,8 +900,8 @@ public static class AdLogDpi {
             }
         }
         $lblCounts.Text = "Added $added   Removed $removed   Modified $modified"
-        $lblShown.Text = "$($script:VisibleRows.Count) shown"
-        $statusMatches.Text = "Matches: $($script:AllRows.Count)"
+        $lblShown.Text = "$shown shown"
+        $statusMatches.Text = "Matches: $(Get-AdLogEntryCount $script:AllRows)"
     }
 
     function Show-SelectedDetail {
@@ -1027,9 +1062,9 @@ public static class AdLogDpi {
     })
 
     $btnSort.Add_Click({
-        if ($script:AllRows.Count -eq 0) { return }
+        if ((Get-AdLogEntryCount $script:AllRows) -eq 0) { return }
         $script:SortDescending = -not $script:SortDescending
-        $script:AllRows = Sort-AdLogEntries -Entries $script:AllRows -Descending $script:SortDescending
+        $script:AllRows = ConvertTo-AdLogList (Sort-AdLogEntries -Entries $script:AllRows -Descending $script:SortDescending)
         Update-VisibleRows
         if ($script:SortDescending) {
             $btnSort.Text = 'Sort newest'
@@ -1130,7 +1165,7 @@ public static class AdLogDpi {
 
         $errorLog = New-Object System.Collections.Generic.List[string]
         try {
-            $null = Search-AdLogFiles `
+            $found = Search-AdLogFiles `
                 -Path $path `
                 -SearchTerm $term `
                 -IsFolder ([bool]$chkFolder.Checked) `
@@ -1139,20 +1174,24 @@ public static class AdLogDpi {
                 -UseRegex ([bool]$chkRegex.Checked) `
                 -EncodingName ([string]$cmbEncoding.SelectedItem) `
                 -ErrorLog $errorLog `
-                -OutputList $script:AllRows `
                 -ShouldCancel { $script:CancelRequested } `
                 -ProgressCallback {
                     param($info)
+                    if ($info.Results) {
+                        $script:AllRows = $info.Results
+                        $script:VisibleRows = $info.Results
+                    }
                     $progressBar.Visible = $true
                     $progressBar.Value = [math]::Min(100, [math]::Max(0, [int]$info.Percent))
                     $statusMatches.Text = "Matches: $($info.Matches)"
                     $statusRate.Text = "$($info.LinesPerSec) lines/s"
                     Set-StatusText ("Ingesting {0} ({1}/{2})  ·  {3:N0} lines  ·  {4:N0} matches  ·  {5:N0}%" -f `
                         $info.FileName, $info.FileIndex, $info.FileCount, $info.TotalLines, $info.Matches, $info.Percent)
-                    $grid.RowCount = $script:AllRows.Count
-                    $lblShown.Text = "$($script:AllRows.Count) shown"
+                    $grid.RowCount = [int]$info.Matches
+                    $lblShown.Text = "$($info.Matches) shown"
                     [System.Windows.Forms.Application]::DoEvents()
                 }
+            $script:AllRows = ConvertTo-AdLogList $found
         } catch {
             Complete-LogSearchUi
             Set-StatusText "Search failed: $($_.Exception.Message)" ([System.Drawing.Color]::FromArgb(255, 170, 170))
@@ -1164,19 +1203,20 @@ public static class AdLogDpi {
         foreach ($line in $errorLog) { Write-ErrorLog $line }
 
         $cancelled = $script:CancelRequested
-        $script:AllRows = Sort-AdLogEntries -Entries $script:AllRows -Descending $false
+        $script:AllRows = ConvertTo-AdLogList (Sort-AdLogEntries -Entries $script:AllRows -Descending $false)
         $script:SortDescending = $false
         $btnSort.Text = 'Sort by date'
         Update-VisibleRows
         Complete-LogSearchUi
 
+        $matchCount = Get-AdLogEntryCount $script:AllRows
         if ($cancelled) {
-            Set-StatusText "Cancelled. Loaded $($script:AllRows.Count) match(es) so far." ([System.Drawing.Color]::FromArgb(255, 214, 150))
-        } elseif ($script:AllRows.Count -eq 0) {
+            Set-StatusText "Cancelled. Loaded $matchCount match(es) so far." ([System.Drawing.Color]::FromArgb(255, 214, 150))
+        } elseif ($matchCount -eq 0) {
             Set-StatusText 'Search complete. No matching entries.'
             [System.Windows.Forms.MessageBox]::Show('No matching entries found.', 'No results', 'OK', 'Information') | Out-Null
         } else {
-            Set-StatusText "Search complete. $($script:AllRows.Count) result(s) loaded." ([System.Drawing.Color]::FromArgb(160, 220, 180))
+            Set-StatusText "Search complete. $matchCount result(s) loaded." ([System.Drawing.Color]::FromArgb(160, 220, 180))
         }
     }
 

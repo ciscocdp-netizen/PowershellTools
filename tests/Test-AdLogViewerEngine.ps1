@@ -84,7 +84,17 @@ $filtered = Select-AdLogEntries -Entries $all -FilterText 'Y22686' -EventKind 'A
 Assert-True ($filtered.Count -eq 1) 'Filter + event kind narrows to one Added Y22686 row'
 
 $folder = Search-AdLogFiles -Path $PSScriptRoot -SearchTerm 'jsmith' -IsFolder $true -Recursive $false -CaseInsensitive $true -UseRegex $false
+Assert-True ($folder -is [System.Collections.Generic.List[AdLogEntry]]) 'Single-match search still returns a list (not an unrolled object)'
 Assert-True ($folder.Count -eq 1) 'Folder ingest finds the jsmith line in *.txt files'
+
+$kept = ConvertTo-AdLogList $folder
+Assert-True ((Get-AdLogEntryCount $kept) -eq 1) 'ConvertTo-AdLogList preserves a single match'
+Assert-True ((Get-AdLogEntryCount $null) -eq 0) 'Get-AdLogEntryCount treats null as zero'
+
+$guiStyle = Search-AdLogFiles -Path $sample -SearchTerm 'ablake4.s' -IsFolder $false -Recursive $false -CaseInsensitive $true -UseRegex $false
+$guiKept = ConvertTo-AdLogList $guiStyle
+Assert-True ($guiStyle -is [System.Collections.Generic.List[AdLogEntry]]) 'Multi-match search returns a list object to the caller'
+Assert-True ((Get-AdLogEntryCount $guiKept) -eq 13) 'Caller keeps all matches from the return value'
 
 $large = Join-Path $PSScriptRoot 'large-ad-log.txt'
 try {
