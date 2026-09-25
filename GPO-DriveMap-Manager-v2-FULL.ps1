@@ -664,36 +664,60 @@ function Write-ActionLog {
         Message = $Message
     }
     
-    $script:Window.Dispatcher.Invoke([action]{
-        $script:ActionLogEntries.Add($entry)
-        
-        $color = switch ($Level) {
-            'SUCCESS' { 'Green' }
-            'WARNING' { 'Yellow' }
-            'ERROR' { 'Red' }
-            default { 'Gray' }
+    $color = switch ($Level) {
+        'SUCCESS' { 'Green' }
+        'WARNING' { 'Yellow' }
+        'ERROR' { 'Red' }
+        default { 'Gray' }
+    }
+    
+    Write-Host "[$timestamp] $Level : $Message" -ForegroundColor $color
+    
+    if ($null -ne $script:Window) {
+        try {
+            if ($script:Window.Dispatcher.CheckAccess()) {
+                $script:ActionLogEntries.Add($entry)
+            } else {
+                $script:Window.Dispatcher.Invoke([action]{
+                    $script:ActionLogEntries.Add($entry)
+                })
+            }
+        } catch {
+            # Silently fail if window is not ready
         }
-        
-        Write-Host "[$timestamp] $Level : $Message" -ForegroundColor $color
-    })
+    }
 }
 
 function Update-StatusBar {
     param([string]$Message, [string]$Color = 'Success')
     
-    $script:Window.Dispatcher.Invoke([action]{
-        $statusText = $script:Window.FindName('TxtStatusLeft')
-        $statusText.Text = $Message
-        
-        $brush = switch ($Color) {
-            'Success' { $script:Window.Resources['Success'] }
-            'Warning' { $script:Window.Resources['Warning'] }
-            'Error' { $script:Window.Resources['Danger'] }
-            default { $script:Window.Resources['Accent'] }
+    if ($null -eq $script:Window) { return }
+    
+    try {
+        $updateAction = {
+            $statusText = $script:Window.FindName('TxtStatusLeft')
+            if ($null -eq $statusText) { return }
+            
+            $statusText.Text = $Message
+            
+            $brush = switch ($Color) {
+                'Success' { $script:Window.Resources['Success'] }
+                'Warning' { $script:Window.Resources['Warning'] }
+                'Error' { $script:Window.Resources['Danger'] }
+                default { $script:Window.Resources['Accent'] }
+            }
+            
+            $statusText.Foreground = $brush
         }
         
-        $statusText.Foreground = $brush
-    })
+        if ($script:Window.Dispatcher.CheckAccess()) {
+            & $updateAction
+        } else {
+            $script:Window.Dispatcher.Invoke([action]$updateAction)
+        }
+    } catch {
+        # Silently fail if window is not ready
+    }
 }
 #endregion
 
