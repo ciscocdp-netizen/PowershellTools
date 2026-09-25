@@ -30,6 +30,9 @@ $script:MappingsData = New-Object System.Collections.ObjectModel.ObservableColle
 $script:ActionLogEntries = New-Object System.Collections.ObjectModel.ObservableCollection[object]
 $script:ValidationResults = @()
 $script:ConflictData = @()
+$script:CsvData = $null
+$script:CsvHeaders = $null
+$script:SelectedCsvColumn = $null
 
 #region Assembly Loading
 try {
@@ -481,23 +484,34 @@ $xaml = @'
                                     <ColumnDefinition Width="Auto"/>
                                     <ColumnDefinition Width="*"/>
                                     <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
                                 </Grid.ColumnDefinitions>
                                 <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
                                     <RowDefinition Height="Auto"/>
                                     <RowDefinition Height="Auto"/>
                                 </Grid.RowDefinitions>
 
                                 <Label Grid.Row="0" Grid.Column="0" Content="Test Mode:" VerticalAlignment="Center" Margin="0,0,8,8"/>
-                                <ComboBox Grid.Row="0" Grid.Column="1" x:Name="ComboValidationMode" Margin="0,0,16,8">
+                                <ComboBox Grid.Row="0" Grid.Column="1" x:Name="ComboValidationMode" Margin="0,0,16,8" 
+                                          Grid.ColumnSpan="3">
                                     <ComboBoxItem Content="Single User (sAMAccountName)" IsSelected="True"/>
                                     <ComboBoxItem Content="All Users in OU (Distinguished Name)"/>
                                     <ComboBoxItem Content="User List (comma-separated sAMAccountNames)"/>
+                                    <ComboBoxItem Content="User List from CSV File"/>
                                 </ComboBox>
 
-                                <Label Grid.Row="1" Grid.Column="0" Content="Input:" VerticalAlignment="Center" Margin="0,0,8,0"/>
-                                <TextBox Grid.Row="1" Grid.Column="1" x:Name="TxtValidationInput" Margin="0,0,16,0" 
+                                <Label Grid.Row="1" Grid.Column="0" Content="Input:" VerticalAlignment="Center" Margin="0,0,8,8"/>
+                                <TextBox Grid.Row="1" Grid.Column="1" x:Name="TxtValidationInput" Margin="0,0,8,8" 
                                          TextWrapping="Wrap" AcceptsReturn="False"/>
-                                <Button Grid.Row="1" Grid.Column="2" x:Name="BtnRunValidation" Content="▶ Validate" Width="120"/>
+                                <Button Grid.Row="1" Grid.Column="2" x:Name="BtnLoadUser" Content="🔍 Load User" Width="100" Margin="0,0,8,8"/>
+                                <Button Grid.Row="1" Grid.Column="3" x:Name="BtnRunValidation" Content="▶ Validate" Width="120" Margin="0,0,0,8"/>
+                                
+                                <!-- CSV Import Row (Hidden by default) -->
+                                <Label Grid.Row="2" Grid.Column="0" x:Name="LblCsvFile" Content="CSV File:" VerticalAlignment="Center" Margin="0,0,8,0" Visibility="Collapsed"/>
+                                <TextBox Grid.Row="2" Grid.Column="1" x:Name="TxtCsvPath" Margin="0,0,8,0" IsReadOnly="True" Visibility="Collapsed"/>
+                                <Button Grid.Row="2" Grid.Column="2" x:Name="BtnBrowseCsv" Content="📁 Browse" Width="100" Margin="0,0,8,0" Visibility="Collapsed"/>
+                                <Button Grid.Row="2" Grid.Column="3" x:Name="BtnSelectCsvColumn" Content="Select Column" Width="120" Visibility="Collapsed"/>
                             </Grid>
                         </Grid>
                     </Border>
@@ -1775,11 +1789,204 @@ function Initialize-EventHandlers {
     
     # Add Enter key support for validation input
     $txtValidationInput = $script:Window.FindName('TxtValidationInput')
-    if ($null -ne $txtValidationInput) {
+    $btnRunValidation = $script:Window.FindName('BtnRunValidation')
+    if ($null -ne $txtValidationInput -and $null -ne $btnRunValidation) {
         $txtValidationInput.add_KeyDown({
             param($sender, $e)
-            if ($e.Key -eq [System.Windows.Input.Key]::Enter) {
-                $btnRunValidation.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)))
+            try {
+                if ($e.Key -eq [System.Windows.Input.Key]::Enter) {
+                    $btn = $script:Window.FindName('BtnRunValidation')
+                    if ($null -ne $btn) {
+                        $btn.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)))
+                    }
+                }
+            } catch {
+                # Ignore Enter key errors
+            }
+        })
+    }
+    
+    # Load User button - pre-validate user exists
+    $btnLoadUser = $script:Window.FindName('BtnLoadUser')
+    if ($null -ne $btnLoadUser) {
+        $btnLoadUser.add_Click({
+            try {
+                $txtInput = $script:Window.FindName('TxtValidationInput')
+                $input = $txtInput.Text.Trim()
+                
+                if ([string]::IsNullOrWhiteSpace($input)) {
+                    [System.Windows.MessageBox]::Show("Please enter a username first.", 
+                        "Load User", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+                    return
+                }
+                
+                Write-ActionLog "Loading user: $input" "INFO"
+                
+                try {
+                    $user = Get-ADUser -Identity $input -Properties DisplayName, MemberOf, DistinguishedName -ErrorAction Stop
+                    
+                    $groupCount = if ($user.MemberOf) { $user.MemberOf.Count } else { 0 }
+                    
+                    $message = "User found successfully!`n`n" +
+                               "Display Name: $($user.DisplayName)`n" +
+                               "sAMAccountName: $($user.SamAccountName)`n" +
+                               "Distinguished Name:`n$($user.DistinguishedName)`n`n" +
+                               "Member of $groupCount group(s)"
+                    
+                    [System.Windows.MessageBox]::Show($message, 
+                        "User Loaded", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+                    
+                    Write-ActionLog "User loaded: $($user.SamAccountName) ($($user.DisplayName))" "SUCCESS"
+                } catch {
+                    [System.Windows.MessageBox]::Show("User not found: $input`n`nError: $($_.Exception.Message)", 
+                        "User Not Found", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+                    Write-ActionLog "Failed to load user '$input': $($_.Exception.Message)" "ERROR"
+                }
+            } catch {
+                Write-ActionLog "Load user error: $($_.Exception.Message)" "ERROR"
+            }
+        })
+    }
+    
+    # Mode selection change handler
+    $comboValidationMode = $script:Window.FindName('ComboValidationMode')
+    if ($null -ne $comboValidationMode) {
+        $comboValidationMode.add_SelectionChanged({
+            try {
+                $mode = $comboValidationMode.SelectedItem.Content
+                
+                $lblCsv = $script:Window.FindName('LblCsvFile')
+                $txtCsv = $script:Window.FindName('TxtCsvPath')
+                $btnBrowse = $script:Window.FindName('BtnBrowseCsv')
+                $btnSelect = $script:Window.FindName('BtnSelectCsvColumn')
+                
+                if ($mode -match 'CSV') {
+                    # Show CSV controls
+                    if ($null -ne $lblCsv) { $lblCsv.Visibility = [System.Windows.Visibility]::Visible }
+                    if ($null -ne $txtCsv) { $txtCsv.Visibility = [System.Windows.Visibility]::Visible }
+                    if ($null -ne $btnBrowse) { $btnBrowse.Visibility = [System.Windows.Visibility]::Visible }
+                    if ($null -ne $btnSelect) { $btnSelect.Visibility = [System.Windows.Visibility]::Visible }
+                } else {
+                    # Hide CSV controls
+                    if ($null -ne $lblCsv) { $lblCsv.Visibility = [System.Windows.Visibility]::Collapsed }
+                    if ($null -ne $txtCsv) { $txtCsv.Visibility = [System.Windows.Visibility]::Collapsed }
+                    if ($null -ne $btnBrowse) { $btnBrowse.Visibility = [System.Windows.Visibility]::Collapsed }
+                    if ($null -ne $btnSelect) { $btnSelect.Visibility = [System.Windows.Visibility]::Collapsed }
+                }
+            } catch {
+                # Ignore mode change errors
+            }
+        })
+    }
+    
+    # CSV Browse button
+    $btnBrowseCsv = $script:Window.FindName('BtnBrowseCsv')
+    if ($null -ne $btnBrowseCsv) {
+        $btnBrowseCsv.add_Click({
+            try {
+                $openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
+                $openFileDialog.Filter = "CSV Files (*.csv)|*.csv|All Files (*.*)|*.*"
+                $openFileDialog.Title = "Select CSV File"
+                
+                if ($openFileDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+                    $txtCsvPath = $script:Window.FindName('TxtCsvPath')
+                    $txtCsvPath.Text = $openFileDialog.FileName
+                    
+                    Write-ActionLog "CSV file selected: $($openFileDialog.FileName)" "INFO"
+                    
+                    # Auto-detect headers
+                    try {
+                        $csvData = Import-Csv -Path $openFileDialog.FileName -ErrorAction Stop
+                        $headers = $csvData[0].PSObject.Properties.Name
+                        
+                        $script:CsvData = $csvData
+                        $script:CsvHeaders = $headers
+                        
+                        Write-ActionLog "CSV loaded: $($csvData.Count) rows, $($headers.Count) columns" "SUCCESS"
+                    } catch {
+                        Write-ActionLog "Failed to read CSV: $($_.Exception.Message)" "ERROR"
+                        [System.Windows.MessageBox]::Show("Failed to read CSV file:`n`n$($_.Exception.Message)", 
+                            "CSV Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+                    }
+                }
+            } catch {
+                Write-ActionLog "CSV browse error: $($_.Exception.Message)" "ERROR"
+            }
+        })
+    }
+    
+    # CSV column selector
+    $btnSelectCsvColumn = $script:Window.FindName('BtnSelectCsvColumn')
+    if ($null -ne $btnSelectCsvColumn) {
+        $btnSelectCsvColumn.add_Click({
+            try {
+                if ($null -eq $script:CsvData -or $null -eq $script:CsvHeaders) {
+                    [System.Windows.MessageBox]::Show("Please select a CSV file first using the Browse button.", 
+                        "No CSV Loaded", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+                    return
+                }
+                
+                # Show column selection dialog
+                $columnDialog = New-Object System.Windows.Window
+                $columnDialog.Title = "Select Username Column"
+                $columnDialog.Width = 400
+                $columnDialog.Height = 300
+                $columnDialog.WindowStartupLocation = 'CenterOwner'
+                $columnDialog.Owner = $script:Window
+                $columnDialog.Background = $script:Window.Resources['BgPanel']
+                
+                $grid = New-Object System.Windows.Controls.Grid
+                $grid.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition))
+                $grid.RowDefinitions[0].Height = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+                $grid.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition))
+                $grid.RowDefinitions[1].Height = [System.Windows.GridLength]::new(40)
+                
+                $listBox = New-Object System.Windows.Controls.ListBox
+                $listBox.Margin = New-Object System.Windows.Thickness(10)
+                $listBox.Background = $script:Window.Resources['BgCard']
+                $listBox.Foreground = $script:Window.Resources['TextPrimary']
+                
+                foreach ($header in $script:CsvHeaders) {
+                    $item = New-Object System.Windows.Controls.ListBoxItem
+                    $item.Content = $header
+                    $item.Foreground = $script:Window.Resources['TextPrimary']
+                    $listBox.Items.Add($item) | Out-Null
+                }
+                
+                [System.Windows.Controls.Grid]::SetRow($listBox, 0)
+                $grid.Children.Add($listBox) | Out-Null
+                
+                $btnOk = New-Object System.Windows.Controls.Button
+                $btnOk.Content = "OK"
+                $btnOk.Width = 100
+                $btnOk.Margin = New-Object System.Windows.Thickness(10)
+                $btnOk.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Center
+                $btnOk.add_Click({
+                    if ($null -ne $listBox.SelectedItem) {
+                        $script:SelectedCsvColumn = $listBox.SelectedItem.Content
+                        
+                        # Extract usernames from selected column
+                        $usernames = $script:CsvData | ForEach-Object { $_.$script:SelectedCsvColumn } | Where-Object { $_ }
+                        $txtValidationInput = $script:Window.FindName('TxtValidationInput')
+                        $txtValidationInput.Text = ($usernames -join ', ')
+                        
+                        Write-ActionLog "CSV column selected: $script:SelectedCsvColumn ($($usernames.Count) users)" "SUCCESS"
+                        
+                        $columnDialog.DialogResult = $true
+                        $columnDialog.Close()
+                    }
+                })
+                
+                [System.Windows.Controls.Grid]::SetRow($btnOk, 1)
+                $grid.Children.Add($btnOk) | Out-Null
+                
+                $columnDialog.Content = $grid
+                $columnDialog.ShowDialog() | Out-Null
+                
+            } catch {
+                Write-ActionLog "CSV column selection error: $($_.Exception.Message)" "ERROR"
+                [System.Windows.MessageBox]::Show("Error: $($_.Exception.Message)", 
+                    "Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
             }
         })
     }
