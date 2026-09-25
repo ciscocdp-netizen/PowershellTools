@@ -1403,9 +1403,6 @@ try {
     Initialize-EventHandlers
     
     $script:Window.add_Loaded({
-        Write-ActionLog "Application started" "SUCCESS"
-        Update-StatusBar "Ready" "Success"
-        
         $txtStatusRight = $script:Window.FindName('TxtStatusRight')
         
         $timer = New-Object System.Windows.Threading.DispatcherTimer
@@ -1415,10 +1412,16 @@ try {
         })
         $timer.Start()
         
-        Load-AvailableDomains
-        if ($script:CurrentDomain) {
-            Load-AvailableGpos -DomainName $script:CurrentDomain
-        }
+        # Defer data loading to avoid blocking window initialization
+        $script:Window.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background, [action]{
+            Write-ActionLog "Application started" "SUCCESS"
+            Update-StatusBar "Ready" "Success"
+            
+            Load-AvailableDomains
+            if ($script:CurrentDomain) {
+                Load-AvailableGpos -DomainName $script:CurrentDomain
+            }
+        })
     })
     
     $script:Window.add_Closing({
