@@ -49,12 +49,26 @@ Group Policy Preferences (GPP) drive mappings with Item-Level Targeting (ILT) ar
 - **Primary group handling**: Includes primary groups (usually missed by naive `MemberOf` checks)
 - **Disabled drive detection**: Identifies drives disabled in the GPO
 
-### 🖥️ Modern GUI
-- **WPF-based interface**: Clean, professional, responsive design
-- **Interactive results**: Sortable grids, visual summary cards, tabbed navigation
-- **Filter trace debugger**: Step-by-step evaluation viewer
-- **GPO browser**: Search and select from available GPOs
-- **CSV export**: Full results with timestamp for documentation
+### 🖥️ Multiple Interfaces
+**Web GUI (Server-Compatible)**
+- HTML/JavaScript interface served via PowerShell
+- Works on Windows Server Core and all environments
+- Modern responsive design
+- Real-time validation via AJAX
+- No WPF dependencies
+
+**WPF GUI (Desktop)**
+- Native Windows interface for desktop OS
+- Interactive results with sortable grids
+- Visual summary cards
+- Filter trace debugger
+- CSV export
+
+**Command Line Interface**
+- Works everywhere (Server, Desktop, Remote PS)
+- Scriptable and automatable
+- Perfect for CI/CD pipelines
+- Full feature parity with GUI
 
 ### 🔬 Testing Modes
 1. **Live AD users**: Test against real accounts (queries AD)
@@ -93,21 +107,23 @@ cd gpo-drivemap-validator
 
 Or download scripts directly:
 - `Test-GpoDriveMapTargeting.ps1` (backend validation engine)
-- `GPO-DriveMap-Validator-GUI.ps1` (GUI application)
+- `Start-WebGUI.ps1` (web interface - works on Server!)
+- `GPO-DriveMap-Validator-GUI.ps1` (WPF GUI - desktop only)
 
 ### 3. Launch
 
-**Option A: Interactive Quick Start**
+**For Windows Server (Recommended):**
 ```powershell
-.\Start-GPOValidator.ps1
+.\Start-WebGUI.ps1
 ```
+Opens a web interface in your browser that works perfectly on Server 2022!
 
-**Option B: GUI Directly**
+**For Desktop Windows:**
 ```powershell
 .\GPO-DriveMap-Validator-GUI.ps1
 ```
 
-**Option C: Command Line**
+**Command Line (Works Everywhere):**
 ```powershell
 .\Test-GpoDriveMapTargeting.ps1 -GpoName "Your GPO Name" -TargetUsers alice, bob, charlie
 ```
