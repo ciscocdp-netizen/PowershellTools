@@ -11,12 +11,66 @@
 .NOTES
     Version: 1.0
     Requires: PowerShell 5.1+, .NET Framework 4.5+, ActiveDirectory and GroupPolicy modules
+    
+    Note: This GUI requires a desktop environment with WPF support. On Windows Server,
+    you may need to use the CLI version (Test-GpoDriveMapTargeting.ps1) if:
+    - Running Server Core without Desktop Experience
+    - Connected via remote PowerShell (no GUI forwarding)
+    - WPF assemblies are not available
 #>
 
-Add-Type -AssemblyName PresentationFramework
-Add-Type -AssemblyName PresentationCore
-Add-Type -AssemblyName WindowsBase
-Add-Type -AssemblyName System.Windows.Forms
+# ---------------------------------------------------------------------------
+# Pre-flight checks and error handling
+# ---------------------------------------------------------------------------
+$ErrorActionPreference = 'Stop'
+
+Write-Host "GPO Drive Mapping Validator - GUI Launcher" -ForegroundColor Cyan
+Write-Host "Loading components..." -ForegroundColor Gray
+
+# Check if running on Server
+$osInfo = try { Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue } catch { $null }
+if ($osInfo -and $osInfo.Caption -like "*Server*") {
+    Write-Host ""
+    Write-Host "⚠ WARNING: Windows Server Detected" -ForegroundColor Yellow
+    Write-Host "  OS: $($osInfo.Caption)" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "The GUI may not work properly on Server environments without full GUI support." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "If this hangs or fails, press Ctrl+C and use the CLI version:" -ForegroundColor Cyan
+    Write-Host "  .\Test-GpoDriveMapTargeting.ps1 -GpoName `"Your GPO`" -TargetUsers alice,bob" -ForegroundColor White
+    Write-Host ""
+    Write-Host "Or use the interactive launcher:" -ForegroundColor Cyan
+    Write-Host "  .\Start-GPOValidator.ps1" -ForegroundColor White
+    Write-Host ""
+    Start-Sleep -Seconds 3
+}
+
+# Try to load WPF assemblies with error handling
+try {
+    Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
+    Add-Type -AssemblyName PresentationCore -ErrorAction Stop
+    Add-Type -AssemblyName WindowsBase -ErrorAction Stop
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    Write-Host "✓ WPF assemblies loaded successfully" -ForegroundColor Green
+}
+catch {
+    Write-Host ""
+    Write-Host "✗ ERROR: Failed to load WPF assemblies" -ForegroundColor Red
+    Write-Host "  $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "This system cannot run the GUI. Possible reasons:" -ForegroundColor Yellow
+    Write-Host "  • Windows Server Core (no Desktop Experience)" -ForegroundColor Yellow
+    Write-Host "  • Missing .NET Framework WPF components" -ForegroundColor Yellow
+    Write-Host "  • Remote PowerShell session" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "SOLUTION: Use the CLI version instead:" -ForegroundColor Cyan
+    Write-Host "  .\Test-GpoDriveMapTargeting.ps1 -GpoName `"Your GPO`" -TargetUsers alice,bob" -ForegroundColor White
+    Write-Host ""
+    Write-Host "See EXAMPLES.md for CLI usage examples." -ForegroundColor Cyan
+    Write-Host ""
+    Read-Host "Press Enter to exit"
+    exit 1
+}
 
 $script:ValidationResults = $null
 $script:BackendScriptPath = Join-Path $PSScriptRoot "Test-GpoDriveMapTargeting.ps1"
