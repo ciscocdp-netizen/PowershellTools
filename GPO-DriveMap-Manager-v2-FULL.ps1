@@ -33,6 +33,7 @@ $script:ConflictData = @()
 $script:CsvData = $null
 $script:CsvHeaders = $null
 $script:SelectedCsvColumn = $null
+$script:ValidationInputText = ""
 
 #region Assembly Loading
 try {
@@ -340,6 +341,19 @@ $xaml = @'
             </Style.Triggers>
         </Style>
 
+        <Style x:Key="DataGridRowStyle" TargetType="DataGridRow">
+            <Setter Property="Background" Value="{StaticResource BgCard}"/>
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="#2D3340"/>
+                </Trigger>
+                <Trigger Property="IsSelected" Value="True">
+                    <Setter Property="Background" Value="#1565C0"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+
         <!-- TabControl Style -->
         <Style TargetType="TabControl">
             <Setter Property="Background" Value="Transparent"/>
@@ -448,7 +462,7 @@ $xaml = @'
                         </StackPanel>
                     </Border>
 
-                    <DataGrid Grid.Row="1" x:Name="GridMappings" Margin="8" ItemsSource="{Binding}">
+                    <DataGrid Grid.Row="1" x:Name="GridMappings" Margin="8" ItemsSource="{Binding}" RowStyle="{StaticResource DataGridRowStyle}">
                         <DataGrid.Columns>
                             <DataGridTextColumn Header="Drive Letter" Binding="{Binding DriveLetter}" Width="100"/>
                             <DataGridTextColumn Header="Path" Binding="{Binding Path}" Width="300"/>
@@ -1774,14 +1788,38 @@ function Initialize-EventHandlers {
         }
     })
     
-    # Add double-click handler for Drive Mappings grid
+    # Add double-click handler for Drive Mappings grid - using PreviewMouseDoubleClick for more reliable row detection
     $gridMappings = $script:Window.FindName('GridMappings')
     if ($null -ne $gridMappings) {
-        $gridMappings.add_MouseDoubleClick({
+        $gridMappings.add_PreviewMouseDoubleClick({
             param($sender, $e)
             try {
+                # Get the clicked element
+                $clickedElement = $e.OriginalSource
+                
+                # Walk up the visual tree to find if we clicked on a DataGridRow
+                $row = $null
+                $current = $clickedElement
+                while ($null -ne $current -and $null -eq $row) {
+                    if ($current -is [System.Windows.Controls.DataGridRow]) {
+                        $row = $current
+                        break
+                    }
+                    if ($current -is [System.Windows.FrameworkElement]) {
+                        $current = [System.Windows.Media.VisualTreeHelper]::GetParent($current)
+                    } else {
+                        break
+                    }
+                }
+                
+                # If we didn't find a row or no item is selected, return
+                if ($null -eq $row -or $null -eq $gridMappings.SelectedItem) {
+                    return
+                }
+                
                 $selectedMapping = $gridMappings.SelectedItem
-                if ($null -eq $selectedMapping) { return }
+                
+                Write-ActionLog "Double-clicked on mapping: $($selectedMapping.DriveLetter) -> $($selectedMapping.Path)" "INFO"
                 
                 # Build detailed information
                 $details = New-Object System.Text.StringBuilder
@@ -1865,22 +1903,17 @@ function Initialize-EventHandlers {
     $btnRunValidation.add_Click({
         try {
             $comboMode = $script:Window.FindName('ComboValidationMode')
-            $txtInput = $script:Window.FindName('TxtValidationInput')
             
-            if ($null -eq $comboMode -or $null -eq $txtInput) {
-                [System.Windows.MessageBox]::Show("Could not find validation controls.", 
+            if ($null -eq $comboMode) {
+                [System.Windows.MessageBox]::Show("Could not find validation mode control.", 
                     "Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
                 return
             }
             
-            # Force LostFocus event to fire
-            $txtInput.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Primitives.TextBoxBase]::LostFocusEvent)))
-            
-            # Give the UI thread time to process
-            [System.Windows.Forms.Application]::DoEvents()
-            
             $mode = $comboMode.SelectedItem.Content
-            $input = $txtInput.Text
+            
+            # Use the script-scoped variable captured from TextChanged event
+            $input = $script:ValidationInputText
             
             # Debug logging
             Write-ActionLog "Validation button clicked - Mode: $mode, Input: '$input', Length: $($input.Length)" "INFO"
@@ -1919,6 +1952,16 @@ function Initialize-EventHandlers {
                 # Ignore Enter key errors
             }
         })
+        
+        # Capture TextBox input into script variable via TextChanged event
+        $txtValidationInput.add_TextChanged({
+            param($sender, $e)
+            try {
+                $script:ValidationInputText = $sender.Text
+            } catch {
+                # Ignore text change errors
+            }
+        })
     }
     
     # Load User button - pre-validate user exists
@@ -1926,17 +1969,8 @@ function Initialize-EventHandlers {
     if ($null -ne $btnLoadUser) {
         $btnLoadUser.add_Click({
             try {
-                $txtInput = $script:Window.FindName('TxtValidationInput')
-                
-                # Move focus to button to commit TextBox value
-                try {
-                    $btnLoadUser.Focus() | Out-Null
-                    Start-Sleep -Milliseconds 50
-                } catch {
-                    # Ignore focus errors
-                }
-                
-                $input = $txtInput.Text.Trim()
+                # Use the script-scoped variable captured from TextChanged event
+                $input = $script:ValidationInputText.Trim()
                 
                 if ([string]::IsNullOrWhiteSpace($input)) {
                     [System.Windows.MessageBox]::Show("Please enter a username first.", 
