@@ -476,8 +476,7 @@ $xaml = @'
                             <ColumnDefinition Width="2*"/>
                         </Grid.ColumnDefinitions>
 
-                        <DataGrid Grid.Column="0" x:Name="GridFilterInspectorDrives" Margin="0,0,4,0" 
-                                  SelectionChanged="GridFilterInspectorDrives_SelectionChanged">
+                        <DataGrid Grid.Column="0" x:Name="GridFilterInspectorDrives" Margin="0,0,4,0">
                             <DataGrid.Columns>
                                 <DataGridTextColumn Header="Drive" Binding="{Binding DriveLetter}" Width="60"/>
                                 <DataGridTextColumn Header="Path" Binding="{Binding Path}" Width="*"/>
