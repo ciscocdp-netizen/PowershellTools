@@ -1755,13 +1755,12 @@ function Initialize-EventHandlers {
                 return
             }
             
-            # Force TextBox to update its binding by moving focus away
-            $btnRunValidation.Focus() | Out-Null
-            
-            # Force binding update
-            $binding = [System.Windows.Data.BindingOperations]::GetBindingExpression($txtInput, [System.Windows.Controls.TextBox]::TextProperty)
-            if ($null -ne $binding) {
-                $binding.UpdateSource()
+            # Simple approach: just move focus to button to commit TextBox value
+            try {
+                $btnRunValidation.Focus() | Out-Null
+                Start-Sleep -Milliseconds 50  # Give time for focus change
+            } catch {
+                # Ignore focus errors
             }
             
             $mode = $comboMode.SelectedItem.Content
@@ -1812,6 +1811,15 @@ function Initialize-EventHandlers {
         $btnLoadUser.add_Click({
             try {
                 $txtInput = $script:Window.FindName('TxtValidationInput')
+                
+                # Move focus to button to commit TextBox value
+                try {
+                    $btnLoadUser.Focus() | Out-Null
+                    Start-Sleep -Milliseconds 50
+                } catch {
+                    # Ignore focus errors
+                }
+                
                 $input = $txtInput.Text.Trim()
                 
                 if ([string]::IsNullOrWhiteSpace($input)) {
@@ -1844,6 +1852,8 @@ function Initialize-EventHandlers {
                 }
             } catch {
                 Write-ActionLog "Load user error: $($_.Exception.Message)" "ERROR"
+                [System.Windows.MessageBox]::Show("Error: $($_.Exception.Message)", 
+                    "Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
             }
         })
     }
