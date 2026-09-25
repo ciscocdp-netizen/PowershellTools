@@ -101,6 +101,7 @@ $xaml = @'
     WindowStartupLocation="CenterScreen"
     Width="1600" Height="900"
     MinWidth="1200" MinHeight="700"
+    ResizeMode="CanResizeWithGrip"
     Background="#1A1D23">
 
     <Window.Resources>
@@ -1403,29 +1404,46 @@ try {
     Initialize-EventHandlers
     
     $script:Window.add_Loaded({
+        # Start clock timer
         $txtStatusRight = $script:Window.FindName('TxtStatusRight')
+        if ($null -ne $txtStatusRight) {
+            $timer = New-Object System.Windows.Threading.DispatcherTimer
+            $timer.Interval = [TimeSpan]::FromSeconds(1)
+            $timer.Add_Tick({
+                try {
+                    $txtStatusRight.Text = Get-Date -Format 'HH:mm:ss'
+                } catch {
+                    # Ignore timer errors
+                }
+            })
+            $timer.Start()
+        }
         
-        $timer = New-Object System.Windows.Threading.DispatcherTimer
-        $timer.Interval = [TimeSpan]::FromSeconds(1)
-        $timer.Add_Tick({
-            $txtStatusRight.Text = Get-Date -Format 'HH:mm:ss'
-        })
-        $timer.Start()
-        
-        # Defer data loading to avoid blocking window initialization
+        # Defer all data loading to background priority
         $script:Window.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background, [action]{
-            Write-ActionLog "Application started" "SUCCESS"
-            Update-StatusBar "Ready" "Success"
-            
-            Load-AvailableDomains
-            if ($script:CurrentDomain) {
-                Load-AvailableGpos -DomainName $script:CurrentDomain
+            try {
+                Write-ActionLog "Application started" "SUCCESS"
+                Update-StatusBar "Initializing..." "Warning"
+                
+                Load-AvailableDomains
+                if ($script:CurrentDomain) {
+                    Load-AvailableGpos -DomainName $script:CurrentDomain
+                }
+                
+                Update-StatusBar "Ready" "Success"
+            } catch {
+                Write-ActionLog "Error during initialization: $($_.Exception.Message)" "ERROR"
+                Update-StatusBar "Initialization error" "Error"
             }
         })
     })
     
     $script:Window.add_Closing({
-        Write-ActionLog "Application closing" "INFO"
+        try {
+            Write-ActionLog "Application closing" "INFO"
+        } catch {
+            # Ignore errors during shutdown
+        }
     })
     
     Write-Host "Launching UI..." -ForegroundColor Cyan
