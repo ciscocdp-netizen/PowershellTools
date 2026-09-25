@@ -121,12 +121,25 @@ Or download scripts directly:
 | [README](GPO-DRIVEMAP-VALIDATOR-README.md) | Comprehensive feature overview and examples |
 | [User Guide](GPO-DRIVEMAP-VALIDATOR-USERGUIDE.md) | Detailed usage instructions with screenshots |
 | [Deployment Guide](GPO-DRIVEMAP-VALIDATOR-DEPLOYMENT.md) | Enterprise deployment scenarios and automation |
+| [Adding to Existing GPO](ADDING-TO-EXISTING-GPO.md) | Guide for validating new drives in existing GPOs |
+| [Examples](EXAMPLES.md) | 13 practical usage examples |
 
 ---
 
 ## 💡 Usage Examples
 
-### Example 1: Test specific users
+### Example 1: Validate existing GPO (with all current drive mappings)
+
+```powershell
+# Validates ALL drives in the GPO - existing and newly added
+.\Test-GpoDriveMapTargeting.ps1 `
+    -GpoName "Corporate Drives" `
+    -TargetUsers alice, bob, charlie
+```
+
+**Use case**: You have an existing GPO with multiple drive mappings and want to add a new one. This validates the ENTIRE GPO state, detecting conflicts between existing and new mappings.
+
+### Example 2: Test specific users
 
 ```powershell
 .\Test-GpoDriveMapTargeting.ps1 `
@@ -151,7 +164,9 @@ charlie:
   (no drives mapped)
 ```
 
-### Example 2: Test entire OU with export
+**Note**: This evaluates ALL drive mappings in the GPO. Perfect for validating new additions to existing GPOs with multiple drives already configured.
+
+### Example 3: Test entire OU with export
 
 ```powershell
 .\Test-GpoDriveMapTargeting.ps1 `
@@ -160,7 +175,7 @@ charlie:
     -ExportCsvPath "C:\Reports\finance-validation.csv"
 ```
 
-### Example 3: Debug filter logic
+### Example 4: Debug filter logic
 
 ```powershell
 .\Test-GpoDriveMapTargeting.ps1 `
@@ -179,7 +194,7 @@ Drive F: (\\fileserver\finance) evaluated for 'alice':
 Final result: True
 ```
 
-### Example 4: Test simulated users
+### Example 5: Test simulated users
 
 ```powershell
 $simulatedUsers = @(
@@ -314,6 +329,17 @@ $computerMapping = @{
 3. Run validation against representative users
 4. Fix conflicts and warnings
 5. Once clean, link GPO to production
+
+### Scenario 1.5: Adding to Existing GPO
+**Goal**: Add a new drive mapping to an existing GPO with multiple drives already configured
+
+1. Note current state: Validate existing GPO before changes
+2. Add new drive mapping in GPMC (don't apply yet)
+3. Validate again - tool checks ALL drives (existing + new)
+4. Fix any conflicts between new and existing mappings
+5. Deploy when validation is clean
+
+**See [ADDING-TO-EXISTING-GPO.md](ADDING-TO-EXISTING-GPO.md) for detailed guide**
 
 ### Scenario 2: Troubleshoot User Issue
 **Goal**: User reports not receiving expected drive
