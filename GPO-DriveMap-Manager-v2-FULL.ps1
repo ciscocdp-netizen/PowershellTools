@@ -1057,7 +1057,234 @@ function Load-ComparisonGpoList {
 }
 #endregion
 
-#region Validation Engine (Integrated from Test-GpoDriveMapTargeting.ps1)
+#region Validation Engine (Integrated - Self-Contained)
+
+# Test Subject Class
+class TestSubject {
+    [string]$Label
+    [string]$SamAccountName
+    [string]$DistinguishedName
+    [string[]]$MemberOfGroupDNs
+    [string]$ComputerName
+    [string[]]$ComputerMemberOfGroupDNs
+    [string]$Site
+    [bool]$IsSimulated
+}
+
+# Helper function: Test if DN is under OU
+function Test-DnUnderOu {
+    param([string]$Dn, [string]$OuDn, [bool]$IncludeSubOus)
+
+    if (-not $Dn -or -not $OuDn) { return $false }
+    if ($Dn -eq $OuDn) { return $true }
+
+    if ($IncludeSubOus) {
+        return $Dn.ToLower().EndsWith(",$($OuDn.ToLower())")
+    }
+    else {
+        $firstComma = $Dn.IndexOf(',')
+        if ($firstComma -lt 0) { return $false }
+        $parentOfDn = $Dn.Substring($firstComma + 1)
+        return $parentOfDn.ToLower() -eq $OuDn.ToLower()
+    }
+}
+
+# Helper function: Test group membership
+function Test-GroupMembership {
+    param([string[]]$MemberOfDns, [string]$GroupIdentity)
+
+    if (-not $MemberOfDns -or -not $GroupIdentity) { return $false }
+    
+    foreach ($dn in $MemberOfDns) {
+        if ($dn -ieq $GroupIdentity) { return $true }
+        
+        if ($dn -match '^CN=([^,]+)' -and $GroupIdentity -match '^CN=([^,]+)') {
+            $dnCN = $matches[1]
+            $groupCN = if ($GroupIdentity -match '^CN=([^,]+)') { $matches[1] } else { $GroupIdentity }
+            if ($dnCN -ieq $groupCN) { return $true }
+        }
+        
+        if ($GroupIdentity -match '\\') {
+            $groupNameOnly = ($GroupIdentity -split '\\')[-1]
+            if ($dn -match "^CN=$([regex]::Escape($groupNameOnly)),") { return $true }
+        }
+    }
+    
+    return $false
+}
+
+# Resolve live AD user
+function Resolve-LiveAdUser {
+    param([string]$SamAccountName, [hashtable]$ComputerOverride, [ref]$Warnings)
+
+    try {
+        $u = Get-ADUser -Identity $SamAccountName -Properties MemberOf, DistinguishedName, primaryGroupID -ErrorAction Stop
+        $groupDns = @($u.MemberOf)
+
+        # Include primary group
+        try {
+            $primaryGroupID = $u.primaryGroupID
+            $domainObj = Get-ADDomain -Server $script:LoadedGpo.Domain -ErrorAction Stop
+            $domainSid = $domainObj.DomainSID.Value
+            $primaryGroupSid = "$domainSid-$primaryGroupID"
+            $primaryGroup = Get-ADGroup -Identity $primaryGroupSid -ErrorAction SilentlyContinue
+            if ($primaryGroup) { 
+                $groupDns += $primaryGroup.DistinguishedName 
+            }
+        } 
+        catch { }
+
+        $subj = [TestSubject]::new()
+        $subj.Label = $SamAccountName
+        $subj.SamAccountName = $SamAccountName
+        $subj.DistinguishedName = $u.DistinguishedName
+        $subj.MemberOfGroupDNs = $groupDns
+        $subj.IsSimulated = $false
+
+        if ($ComputerOverride.ContainsKey($SamAccountName)) {
+            $compName = $ComputerOverride[$SamAccountName]
+            $subj.ComputerName = $compName
+            try {
+                $comp = Get-ADComputer -Identity $compName -Properties MemberOf -ErrorAction Stop
+                $subj.ComputerMemberOfGroupDNs = @($comp.MemberOf)
+            } 
+            catch {
+                $Warnings.Value.Add("Could not resolve computer '$compName' for user '$SamAccountName'")
+            }
+        }
+
+        return $subj
+    }
+    catch {
+        throw "Failed to resolve AD user '$SamAccountName': $($_.Exception.Message)"
+    }
+}
+
+# Filter node evaluator
+function Invoke-FilterNode {
+    param(
+        [System.Xml.XmlElement]$Node,
+        [TestSubject]$Subject,
+        [System.Collections.Generic.List[string]]$Trace,
+        [ref]$Warnings,
+        [int]$Depth = 0
+    )
+
+    $indent = ('  ' * $Depth)
+    $isNot = ($Node.GetAttribute('not') -eq '1')
+    $raw = $null
+
+    switch ($Node.LocalName) {
+
+        'FilterCollection' {
+            $raw = Invoke-FilterTree -Node $Node -Subject $Subject -Trace $Trace -Warnings $Warnings -Depth ($Depth + 1)
+        }
+
+        'FilterGroup' {
+            $groupName = $Node.GetAttribute('name')
+            $userMatch = Test-GroupMembership -MemberOfDns $Subject.MemberOfGroupDNs -GroupIdentity $groupName
+            $compMatch = Test-GroupMembership -MemberOfDns $Subject.ComputerMemberOfGroupDNs -GroupIdentity $groupName
+            $raw = $userMatch -or $compMatch
+            $Trace.Add("$indent FilterGroup '$groupName' -> user:$userMatch computer:$compMatch")
+        }
+
+        'FilterUser' {
+            $target = $Node.GetAttribute('name')
+            $raw = ($Subject.SamAccountName -and $target -match [regex]::Escape($Subject.SamAccountName)) `
+                   -or ($Subject.DistinguishedName -ieq $target)
+            $Trace.Add("$indent FilterUser '$target' -> $raw")
+        }
+
+        'FilterComputer' {
+            $target = $Node.GetAttribute('name')
+            if (-not $Subject.ComputerName) {
+                $raw = $false
+                $Warnings.Value.Add("FilterComputer '$target': no ComputerName for '$($Subject.Label)'")
+            } else {
+                $raw = ($Subject.ComputerName -ieq $target) -or ($target -match [regex]::Escape($Subject.ComputerName))
+            }
+            $Trace.Add("$indent FilterComputer '$target' -> $raw")
+        }
+
+        'FilterOrgUnit' {
+            $ouDn = $Node.GetAttribute('name')
+            $includeSub = $true
+            $raw = Test-DnUnderOu -Dn $Subject.DistinguishedName -OuDn $ouDn -IncludeSubOus $includeSub
+            $Trace.Add("$indent FilterOrgUnit '$ouDn' -> $raw")
+        }
+
+        'FilterSite' {
+            $siteName = $Node.GetAttribute('name')
+            if (-not $Subject.Site) {
+                $raw = $false
+                $Warnings.Value.Add("FilterSite '$siteName': no Site for '$($Subject.Label)'")
+            } else {
+                $raw = ($Subject.Site -ieq $siteName)
+            }
+            $Trace.Add("$indent FilterSite '$siteName' -> $raw")
+        }
+
+        'FilterLdapQuery' {
+            $filterText = $Node.GetAttribute('filter')
+            if ($Subject.IsSimulated) {
+                $raw = $false
+                $Warnings.Value.Add("FilterLdapQuery: cannot verify for simulated user '$($Subject.Label)'")
+            } else {
+                try {
+                    $match = Get-ADObject -LDAPFilter $filterText -SearchBase $Subject.DistinguishedName -SearchScope Base -ErrorAction Stop
+                    $raw = [bool]$match
+                } catch {
+                    $raw = $false
+                    $Warnings.Value.Add("FilterLdapQuery '$filterText' error: $($_.Exception.Message)")
+                }
+            }
+            $Trace.Add("$indent FilterLdapQuery '$filterText' -> $raw")
+        }
+
+        default {
+            $raw = $false
+            $Warnings.Value.Add("Unsupported filter type '<$($Node.LocalName)>'")
+            $Trace.Add("$indent [UNSUPPORTED] <$($Node.LocalName)> -> FALSE")
+        }
+    }
+
+    $final = if ($isNot) { -not $raw } else { $raw }
+    if ($isNot) { $Trace.Add("$indent  (NOT applied -> $final)") }
+    return $final
+}
+
+# Filter tree evaluator
+function Invoke-FilterTree {
+    param(
+        [System.Xml.XmlElement]$Node,
+        [TestSubject]$Subject,
+        [System.Collections.Generic.List[string]]$Trace,
+        [ref]$Warnings,
+        [int]$Depth = 0
+    )
+
+    $children = @($Node.ChildNodes | Where-Object { $_ -is [System.Xml.XmlElement] })
+    if ($children.Count -eq 0) { return $true }
+
+    $result = $null
+    foreach ($child in $children) {
+        $value = Invoke-FilterNode -Node $child -Subject $Subject -Trace $Trace -Warnings $Warnings -Depth $Depth
+        $boolOp = $child.GetAttribute('bool')
+
+        if ($null -eq $result) {
+            $result = $value
+        }
+        elseif ($boolOp -ieq 'OR') {
+            $result = $result -or $value
+        }
+        else {
+            $result = $result -and $value
+        }
+    }
+    return [bool]$result
+}
+
+# Main validation function
 function Invoke-UserValidation {
     param(
         [string]$Mode,
@@ -1080,48 +1307,117 @@ function Invoke-UserValidation {
         Write-ActionLog "Starting user validation (Mode: $Mode)" "INFO"
         Update-StatusBar "Running validation..." "Warning"
         
-        $scriptPath = Join-Path $PSScriptRoot 'Test-GpoDriveMapTargeting.ps1'
+        $warnings = New-Object System.Collections.Generic.List[string]
+        $subjects = New-Object System.Collections.Generic.List[TestSubject]
+        $computerOverride = @{}
         
-        if (-not (Test-Path $scriptPath)) {
-            throw "Validation script not found: $scriptPath"
-        }
-        
-        $params = @{
-            DrivesXmlPath = $script:LoadedGpo.XmlPath
-            Domain = $script:LoadedGpo.Domain
-            ReturnObject = $true
-        }
-        
+        # Build subject list based on mode
         switch -Regex ($Mode) {
             'Single User' {
-                $params['TargetUsers'] = @($Input.Trim())
+                $subjects.Add((Resolve-LiveAdUser -SamAccountName $Input.Trim() -ComputerOverride $computerOverride -Warnings ([ref]$warnings)))
             }
             'All Users in OU' {
-                $params['TargetOU'] = $Input.Trim()
+                $ouUsers = Get-ADUser -SearchBase $Input.Trim() -Filter * -Properties MemberOf, DistinguishedName, primaryGroupID -ErrorAction Stop
+                foreach ($u in $ouUsers) {
+                    $groupDns = @($u.MemberOf)
+                    
+                    try {
+                        $primaryGroupID = $u.primaryGroupID
+                        $domainObj = Get-ADDomain -Server $script:LoadedGpo.Domain -ErrorAction Stop
+                        $domainSid = $domainObj.DomainSID.Value
+                        $primaryGroupSid = "$domainSid-$primaryGroupID"
+                        $primaryGroup = Get-ADGroup -Identity $primaryGroupSid -ErrorAction SilentlyContinue
+                        if ($primaryGroup) { 
+                            $groupDns += $primaryGroup.DistinguishedName 
+                        }
+                    } catch { }
+                    
+                    $subj = [TestSubject]::new()
+                    $subj.Label = $u.SamAccountName
+                    $subj.SamAccountName = $u.SamAccountName
+                    $subj.DistinguishedName = $u.DistinguishedName
+                    $subj.MemberOfGroupDNs = $groupDns
+                    $subj.IsSimulated = $false
+                    $subjects.Add($subj)
+                }
             }
             'User List' {
                 $users = $Input -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-                $params['TargetUsers'] = $users
+                foreach ($userName in $users) {
+                    try {
+                        $subjects.Add((Resolve-LiveAdUser -SamAccountName $userName -ComputerOverride $computerOverride -Warnings ([ref]$warnings)))
+                    } catch {
+                        $warnings.Add("Failed to resolve user '$userName': $($_.Exception.Message)")
+                    }
+                }
             }
         }
         
-        $result = & $scriptPath @params
-        
-        if ($null -eq $result) {
-            throw "Validation script returned no results"
+        if ($subjects.Count -eq 0) {
+            throw "No valid users found to validate"
         }
         
-        $script:ValidationResults = $result.Results
+        # Evaluate each drive against each subject
+        $results = New-Object System.Collections.Generic.List[object]
+        $driveNodes = $script:LoadedGpo.Xml.SelectNodes('//Drive')
+        
+        foreach ($driveNode in $driveNodes) {
+            $props = $driveNode.SelectSingleNode('Properties')
+            if (-not $props) { continue }
+            
+            $letter = $props.letter
+            $path = $props.path
+            $label = $props.label
+            $action = $props.action
+            
+            $isDisabled = $driveNode.GetAttribute('disabled') -eq '1'
+            $filtersNode = $driveNode.SelectSingleNode('Filters')
+            
+            foreach ($subject in $subjects) {
+                $trace = New-Object System.Collections.Generic.List[string]
+                $trace.Add("Drive $letter ($path) evaluated for '$($subject.Label)':")
+
+                if ($isDisabled) {
+                    $applies = $false
+                    $trace.Add("  Mapping is DISABLED in GPO")
+                }
+                elseif ($null -eq $filtersNode -or $filtersNode.ChildNodes.Count -eq 0) {
+                    $applies = $true
+                    $trace.Add("  No filters -> applies to ALL users")
+                }
+                else {
+                    $applies = Invoke-FilterTree -Node $filtersNode -Subject $subject -Trace $trace -Warnings ([ref]$warnings) -Depth 1
+                }
+
+                $results.Add([pscustomobject]@{
+                    Subject      = $subject.Label
+                    DriveLetter  = $letter
+                    Path         = $path
+                    Label        = $label
+                    Action       = $action
+                    Applies      = $applies
+                    IsDisabled   = $isDisabled
+                    Trace        = ($trace -join "`n")
+                })
+            }
+        }
+        
+        $script:ValidationResults = $results
         $script:ConflictData = @()
         
+        # Update Results Summary grid
         $gridResults = $script:Window.FindName('GridValidationResults')
         $gridResults.ItemsSource = $script:ValidationResults
         
+        # Update Filter Trace
         $txtTrace = $script:Window.FindName('TxtFilterTrace')
         $traceText = ($script:ValidationResults | ForEach-Object { $_.Trace }) -join "`n`n========================================`n`n"
         $txtTrace.Text = $traceText
         
-        $conflicts = $result.Conflicts
+        # Detect conflicts
+        $conflicts = $results | Where-Object { $_.Applies -and -not $_.IsDisabled } | 
+            Group-Object Subject, DriveLetter | Where-Object { $_.Count -gt 1 }
+            
         if ($conflicts.Count -gt 0) {
             foreach ($conflict in $conflicts) {
                 $parts = $conflict.Name -split ', '
@@ -1152,11 +1448,13 @@ function Invoke-UserValidation {
         $gridConflicts = $script:Window.FindName('GridConflicts')
         $gridConflicts.ItemsSource = $script:ConflictData
         
+        # Display warnings
         $panelWarnings = $script:Window.FindName('PanelWarnings')
         $panelWarnings.Children.Clear()
         
-        if ($result.Warnings.Count -gt 0) {
-            foreach ($warning in $result.Warnings) {
+        if ($warnings.Count -gt 0) {
+            $uniqueWarnings = $warnings | Sort-Object -Unique
+            foreach ($warning in $uniqueWarnings) {
                 $tb = New-Object System.Windows.Controls.TextBlock
                 $tb.Text = "⚠ $warning"
                 $tb.Foreground = $script:Window.Resources['Warning']
@@ -1314,37 +1612,70 @@ function Invoke-AddMappingSimulation {
             $results.AppendLine("Testing against users: $($users -join ', ')") | Out-Null
             $results.AppendLine("") | Out-Null
             
-            $scriptPath = Join-Path $PSScriptRoot 'Test-GpoDriveMapTargeting.ps1'
-            
-            if (Test-Path $scriptPath) {
-                $params = @{
-                    DrivesXmlPath = $script:LoadedGpo.XmlPath
-                    Domain = $script:LoadedGpo.Domain
-                    TargetUsers = $users
-                    ReturnObject = $true
+            # Use integrated validation engine
+            try {
+                $warnings = New-Object System.Collections.Generic.List[string]
+                $subjects = New-Object System.Collections.Generic.List[TestSubject]
+                $computerOverride = @{}
+                
+                foreach ($userName in $users) {
+                    try {
+                        $subjects.Add((Resolve-LiveAdUser -SamAccountName $userName -ComputerOverride $computerOverride -Warnings ([ref]$warnings)))
+                    } catch {
+                        $results.AppendLine("⚠ Failed to resolve user '$userName': $($_.Exception.Message)") | Out-Null
+                    }
                 }
                 
-                $validationResult = & $scriptPath @params
-                
-                $conflictsForLetter = $validationResult.Results | 
-                    Where-Object { $_.DriveLetter -eq $DriveLetter -and $_.Applies -and -not $_.IsDisabled }
-                
-                if ($conflictsForLetter.Count -gt 0) {
-                    $results.AppendLine("⚠ POTENTIAL CONFLICTS DETECTED:") | Out-Null
-                    $results.AppendLine("The following users already receive drive $DriveLetter from existing mappings:") | Out-Null
+                if ($subjects.Count -gt 0) {
+                    # Evaluate existing mappings for conflict detection
+                    $driveNodes = $script:LoadedGpo.Xml.SelectNodes('//Drive')
+                    $conflictsDetected = $false
                     
-                    foreach ($conflict in $conflictsForLetter) {
-                        $results.AppendLine("   - $($conflict.Subject): $($conflict.Path)") | Out-Null
+                    foreach ($driveNode in $driveNodes) {
+                        $props = $driveNode.SelectSingleNode('Properties')
+                        if (-not $props) { continue }
+                        
+                        $letter = $props.letter
+                        if ($letter -ne $DriveLetter) { continue }
+                        
+                        $isDisabled = $driveNode.GetAttribute('disabled') -eq '1'
+                        if ($isDisabled) { continue }
+                        
+                        $filtersNode = $driveNode.SelectSingleNode('Filters')
+                        
+                        foreach ($subject in $subjects) {
+                            $trace = New-Object System.Collections.Generic.List[string]
+                            $applies = $false
+                            
+                            if ($null -eq $filtersNode -or $filtersNode.ChildNodes.Count -eq 0) {
+                                $applies = $true
+                            } else {
+                                $applies = Invoke-FilterTree -Node $filtersNode -Subject $subject -Trace $trace -Warnings ([ref]$warnings) -Depth 0
+                            }
+                            
+                            if ($applies) {
+                                if (-not $conflictsDetected) {
+                                    $results.AppendLine("⚠ POTENTIAL CONFLICTS DETECTED:") | Out-Null
+                                    $results.AppendLine("The following users already receive drive $DriveLetter from existing mappings:") | Out-Null
+                                    $conflictsDetected = $true
+                                }
+                                $results.AppendLine("   - $($subject.Label): $($props.path)") | Out-Null
+                            }
+                        }
                     }
                     
-                    $results.AppendLine("") | Out-Null
-                    $results.AppendLine("Adding this new mapping will create a drive letter conflict!") | Out-Null
+                    if (-not $conflictsDetected) {
+                        $results.AppendLine("✓ No conflicts detected for the specified users.") | Out-Null
+                        $results.AppendLine("The new mapping can be safely added.") | Out-Null
+                    } else {
+                        $results.AppendLine("") | Out-Null
+                        $results.AppendLine("Adding this new mapping will create a drive letter conflict!") | Out-Null
+                    }
                 } else {
-                    $results.AppendLine("✓ No conflicts detected for the specified users.") | Out-Null
-                    $results.AppendLine("The new mapping can be safely added.") | Out-Null
+                    $results.AppendLine("⚠ No valid users found for testing.") | Out-Null
                 }
-            } else {
-                $results.AppendLine("⚠ Validation script not found - cannot test for conflicts.") | Out-Null
+            } catch {
+                $results.AppendLine("⚠ Conflict testing failed: $($_.Exception.Message)") | Out-Null
             }
         } else {
             $results.AppendLine("ℹ No target users specified - skipping conflict testing.") | Out-Null
