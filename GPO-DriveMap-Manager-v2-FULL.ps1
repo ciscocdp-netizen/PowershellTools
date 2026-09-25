@@ -1741,6 +1741,15 @@ function Initialize-EventHandlers {
                 return
             }
             
+            # Force TextBox to update its binding by moving focus away
+            $btnRunValidation.Focus() | Out-Null
+            
+            # Force binding update
+            $binding = [System.Windows.Data.BindingOperations]::GetBindingExpression($txtInput, [System.Windows.Controls.TextBox]::TextProperty)
+            if ($null -ne $binding) {
+                $binding.UpdateSource()
+            }
+            
             $mode = $comboMode.SelectedItem.Content
             $input = $txtInput.Text
             
@@ -1751,7 +1760,7 @@ function Initialize-EventHandlers {
             $input = $input.Trim()
             
             if ([string]::IsNullOrWhiteSpace($input)) {
-                [System.Windows.MessageBox]::Show("Please enter validation input in the Input field.", 
+                [System.Windows.MessageBox]::Show("Please enter validation input in the Input field.`n`nFor 'Single User' mode: Enter sAMAccountName (e.g., jdoe)`nFor 'All Users in OU' mode: Enter full OU DN`nFor 'User List' mode: Enter comma-separated user names", 
                     "Validation Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
                 return
             }
@@ -1763,6 +1772,17 @@ function Initialize-EventHandlers {
                 "Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
         }
     })
+    
+    # Add Enter key support for validation input
+    $txtValidationInput = $script:Window.FindName('TxtValidationInput')
+    if ($null -ne $txtValidationInput) {
+        $txtValidationInput.add_KeyDown({
+            param($sender, $e)
+            if ($e.Key -eq [System.Windows.Input.Key]::Enter) {
+                $btnRunValidation.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)))
+            }
+        })
+    }
     
     $btnCompare = $script:Window.FindName('BtnCompare')
     $btnCompare.add_Click({
