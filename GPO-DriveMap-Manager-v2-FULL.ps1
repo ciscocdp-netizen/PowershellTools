@@ -1715,6 +1715,37 @@ function Invoke-AddMappingSimulation {
 #endregion
 
 #region Event Handlers
+#region Event Handlers
+function Format-FilterTreeForDisplay {
+    param(
+        [System.Xml.XmlElement]$Node,
+        [System.Text.StringBuilder]$StringBuilder,
+        [int]$Depth
+    )
+    
+    $indent = '  ' * $Depth
+    
+    foreach ($child in $Node.ChildNodes) {
+        if ($child -isnot [System.Xml.XmlElement]) { continue }
+        
+        $type = $child.LocalName -replace '^Filter', ''
+        $name = $child.GetAttribute('name')
+        $bool = $child.GetAttribute('bool')
+        $not = $child.GetAttribute('not')
+        
+        $line = "$indent[$type]"
+        if ($name) { $line += " '$name'" }
+        if ($bool) { $line += " (bool=$bool)" }
+        if ($not -eq '1') { $line += " [NOT]" }
+        
+        $StringBuilder.AppendLine($line) | Out-Null
+        
+        if ($child.LocalName -eq 'FilterCollection') {
+            Format-FilterTreeForDisplay -Node $child -StringBuilder $StringBuilder -Depth ($Depth + 1)
+        }
+    }
+}
+
 function Initialize-EventHandlers {
     $comboDomain = $script:Window.FindName('ComboDomain')
     $comboDomain.add_SelectionChanged({
@@ -1743,7 +1774,94 @@ function Initialize-EventHandlers {
         }
     })
     
+    # Add double-click handler for Drive Mappings grid
+    $gridMappings = $script:Window.FindName('GridMappings')
+    if ($null -ne $gridMappings) {
+        $gridMappings.add_MouseDoubleClick({
+            param($sender, $e)
+            try {
+                $selectedMapping = $gridMappings.SelectedItem
+                if ($null -eq $selectedMapping) { return }
+                
+                # Build detailed information
+                $details = New-Object System.Text.StringBuilder
+                $details.AppendLine("=== DRIVE MAPPING DETAILS ===") | Out-Null
+                $details.AppendLine("") | Out-Null
+                $details.AppendLine("Drive Letter: $($selectedMapping.DriveLetter)") | Out-Null
+                $details.AppendLine("Path: $($selectedMapping.Path)") | Out-Null
+                $details.AppendLine("Label: $($selectedMapping.Label)") | Out-Null
+                $details.AppendLine("Action: $($selectedMapping.Action)") | Out-Null
+                $details.AppendLine("State: $($selectedMapping.State)") | Out-Null
+                $details.AppendLine("") | Out-Null
+                $details.AppendLine("=== ITEM-LEVEL TARGETING ===") | Out-Null
+                $details.AppendLine("") | Out-Null
+                
+                if ($selectedMapping.HasFilters -eq "Yes") {
+                    $details.AppendLine("Has Filters: Yes") | Out-Null
+                    $details.AppendLine("") | Out-Null
+                    $details.AppendLine("Filter Summary:") | Out-Null
+                    $details.AppendLine($selectedMapping.FilterSummary) | Out-Null
+                    $details.AppendLine("") | Out-Null
+                    $details.AppendLine("=== DETAILED FILTER TREE ===") | Out-Null
+                    $details.AppendLine("") | Out-Null
+                    
+                    # Get XML node for detailed filter tree
+                    if ($null -ne $selectedMapping.XmlNode) {
+                        $filtersNode = $selectedMapping.XmlNode.SelectSingleNode('Filters')
+                        if ($null -ne $filtersNode) {
+                            Format-FilterTreeForDisplay -Node $filtersNode -StringBuilder $details -Depth 0
+                        }
+                    }
+                } else {
+                    $details.AppendLine("Has Filters: No") | Out-Null
+                    $details.AppendLine("This mapping applies to ALL users (no targeting restrictions)") | Out-Null
+                }
+                
+                $details.AppendLine("") | Out-Null
+                $details.AppendLine("=== GPO INFORMATION ===") | Out-Null
+                $details.AppendLine("") | Out-Null
+                $details.AppendLine("GPO: $($script:LoadedGpo.DisplayName)") | Out-Null
+                $details.AppendLine("Domain: $($script:LoadedGpo.Domain)") | Out-Null
+                $details.AppendLine("XML Path: $($script:LoadedGpo.XmlPath)") | Out-Null
+                
+                # Show in a scrollable window
+                $detailWindow = New-Object System.Windows.Window
+                $detailWindow.Title = "Drive Mapping Details - $($selectedMapping.DriveLetter)"
+                $detailWindow.Width = 800
+                $detailWindow.Height = 600
+                $detailWindow.WindowStartupLocation = 'CenterOwner'
+                $detailWindow.Owner = $script:Window
+                $detailWindow.Background = $script:Window.Resources['BgDeep']
+                
+                $scrollViewer = New-Object System.Windows.Controls.ScrollViewer
+                $scrollViewer.VerticalScrollBarVisibility = 'Auto'
+                $scrollViewer.Margin = New-Object System.Windows.Thickness(10)
+                
+                $textBox = New-Object System.Windows.Controls.TextBox
+                $textBox.Text = $details.ToString()
+                $textBox.IsReadOnly = $true
+                $textBox.TextWrapping = [System.Windows.TextWrapping]::Wrap
+                $textBox.FontFamily = New-Object System.Windows.Media.FontFamily("Consolas")
+                $textBox.FontSize = 12
+                $textBox.Background = $script:Window.Resources['BgCard']
+                $textBox.Foreground = $script:Window.Resources['TextPrimary']
+                $textBox.BorderThickness = 0
+                $textBox.Padding = New-Object System.Windows.Thickness(10)
+                
+                $scrollViewer.Content = $textBox
+                $detailWindow.Content = $scrollViewer
+                
+                $detailWindow.ShowDialog() | Out-Null
+                
+            } catch {
+                Write-ActionLog "Drive mapping double-click error: $($_.Exception.Message)" "ERROR"
+            }
+        })
+    }
+    
     $btnRunValidation = $script:Window.FindName('BtnRunValidation')
+    $txtValidationInput = $script:Window.FindName('TxtValidationInput')
+    
     $btnRunValidation.add_Click({
         try {
             $comboMode = $script:Window.FindName('ComboValidationMode')
@@ -1755,13 +1873,11 @@ function Initialize-EventHandlers {
                 return
             }
             
-            # Simple approach: just move focus to button to commit TextBox value
-            try {
-                $btnRunValidation.Focus() | Out-Null
-                Start-Sleep -Milliseconds 50  # Give time for focus change
-            } catch {
-                # Ignore focus errors
-            }
+            # Force LostFocus event to fire
+            $txtInput.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Primitives.TextBoxBase]::LostFocusEvent)))
+            
+            # Give the UI thread time to process
+            [System.Windows.Forms.Application]::DoEvents()
             
             $mode = $comboMode.SelectedItem.Content
             $input = $txtInput.Text
