@@ -1297,14 +1297,17 @@ function Invoke-UserValidation {
         return
     }
     
+    # Trim input
+    $Input = $Input.Trim()
+    
     if ([string]::IsNullOrWhiteSpace($Input)) {
-        [System.Windows.MessageBox]::Show("Please enter validation input.", 
+        [System.Windows.MessageBox]::Show("Please enter validation input.`n`nFor 'Single User' mode: Enter sAMAccountName (e.g., jdoe)`nFor 'All Users in OU' mode: Enter full OU DN`nFor 'User List' mode: Enter comma-separated user names", 
             "Validation Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
         return
     }
     
     try {
-        Write-ActionLog "Starting user validation (Mode: $Mode)" "INFO"
+        Write-ActionLog "Starting user validation (Mode: $Mode, Input: $Input)" "INFO"
         Update-StatusBar "Running validation..." "Warning"
         
         $warnings = New-Object System.Collections.Generic.List[string]
@@ -1728,13 +1731,37 @@ function Initialize-EventHandlers {
     
     $btnRunValidation = $script:Window.FindName('BtnRunValidation')
     $btnRunValidation.add_Click({
-        $comboMode = $script:Window.FindName('ComboValidationMode')
-        $txtInput = $script:Window.FindName('TxtValidationInput')
-        
-        $mode = $comboMode.SelectedItem.Content
-        $input = $txtInput.Text
-        
-        Invoke-UserValidation -Mode $mode -Input $input
+        try {
+            $comboMode = $script:Window.FindName('ComboValidationMode')
+            $txtInput = $script:Window.FindName('TxtValidationInput')
+            
+            if ($null -eq $comboMode -or $null -eq $txtInput) {
+                [System.Windows.MessageBox]::Show("Could not find validation controls.", 
+                    "Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+                return
+            }
+            
+            $mode = $comboMode.SelectedItem.Content
+            $input = $txtInput.Text
+            
+            # Debug logging
+            Write-ActionLog "Validation button clicked - Mode: $mode, Input: '$input', Length: $($input.Length)" "INFO"
+            
+            # Trim and check for empty
+            $input = $input.Trim()
+            
+            if ([string]::IsNullOrWhiteSpace($input)) {
+                [System.Windows.MessageBox]::Show("Please enter validation input in the Input field.", 
+                    "Validation Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+                return
+            }
+            
+            Invoke-UserValidation -Mode $mode -Input $input
+        } catch {
+            Write-ActionLog "Validation button error: $($_.Exception.Message)" "ERROR"
+            [System.Windows.MessageBox]::Show("Error: $($_.Exception.Message)", 
+                "Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+        }
     })
     
     $btnCompare = $script:Window.FindName('BtnCompare')
