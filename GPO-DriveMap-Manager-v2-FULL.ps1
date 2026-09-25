@@ -186,6 +186,40 @@ $xaml = @'
             <Setter Property="Padding" Value="8,6"/>
             <Setter Property="FontSize" Value="13"/>
         </Style>
+        
+        <!-- ComboBoxItem Style (Dropdown Items) -->
+        <Style TargetType="ComboBoxItem">
+            <Setter Property="Background" Value="{StaticResource BgPanel}"/>
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
+            <Setter Property="Padding" Value="8,6"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBoxItem">
+                        <Border Name="Border" 
+                                Background="{TemplateBinding Background}"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsHighlighted" Value="True">
+                                <Setter TargetName="Border" Property="Background" Value="{StaticResource Accent}"/>
+                                <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
+                            </Trigger>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="Border" Property="Background" Value="{StaticResource Accent}"/>
+                                <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        
+        <!-- Popup Style for ComboBox Dropdown -->
+        <Style x:Key="ComboBoxPopupStyle" TargetType="Popup">
+            <Setter Property="AllowsTransparency" Value="True"/>
+        </Style>
 
         <!-- DataGrid Style -->
         <Style TargetType="DataGrid">
