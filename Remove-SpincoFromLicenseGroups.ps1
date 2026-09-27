@@ -125,7 +125,8 @@ function Add-ActionResult {
     [void]$script:Results.Add($Result)
 
     try {
-        $Result | Export-Csv -Path $script:ResolvedLogPath -NoTypeInformation -Encoding UTF8 -Append
+        # Logging must run even when the script itself is in -WhatIf mode.
+        $Result | Export-Csv -Path $script:ResolvedLogPath -NoTypeInformation -Encoding UTF8 -Append -WhatIf:$false
     }
     catch {
         Write-ScreenLog "Could not append to CSV log '$($script:ResolvedLogPath)': $($_.Exception.Message)" -Level WARN
@@ -155,11 +156,11 @@ $script:ResolvedTranscriptPath = $ExecutionContext.SessionState.Path.GetUnresolv
 
 $logDir = Split-Path -Parent $script:ResolvedLogPath
 if ($logDir -and -not (Test-Path -LiteralPath $logDir)) {
-    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    New-Item -ItemType Directory -Path $logDir -Force -WhatIf:$false | Out-Null
 }
 
 try {
-    Start-Transcript -Path $script:ResolvedTranscriptPath -Append -ErrorAction Stop | Out-Null
+    Start-Transcript -Path $script:ResolvedTranscriptPath -Append -ErrorAction Stop -WhatIf:$false | Out-Null
     $script:TranscriptStarted = $true
 }
 catch {
@@ -277,16 +278,20 @@ try {
     Write-Host ""
     Write-Host "---- Matching users -------------------------------------------------------" -ForegroundColor Cyan
     $preview = foreach ($u in $Users) {
+        $hitDns = @($u.MemberOf | Where-Object { $_ -and $Groups.ContainsKey($_) })
         [pscustomobject]@{
             SamAccountName      = $u.SamAccountName
+            Hits                = $hitDns.Count
+            TargetGroups        = ($(foreach ($dn in $hitDns) { $Groups[$dn].Name })) -join '; '
             DisplayName         = $u.DisplayName
             UserPrincipalName   = $u.UserPrincipalName
             Enabled             = $u.Enabled
             ExtensionAttribute3 = $u.extensionAttribute3
-            TargetGroupHits     = @($u.MemberOf | Where-Object { $_ -and $Groups.ContainsKey($_) }).Count
         }
     }
-    $preview | Format-Table -AutoSize | Out-Host
+    $preview |
+        Format-Table SamAccountName, Hits, TargetGroups, DisplayName, UserPrincipalName, Enabled, ExtensionAttribute3 -AutoSize -Wrap |
+        Out-Host
     Write-Host ""
 
     $usersWithActions = 0
@@ -435,7 +440,7 @@ try {
         Write-Host "---- Detail (user -> group -> status) -------------------------------------" -ForegroundColor Cyan
         $script:Results |
             Select-Object SamAccountName, UserPrincipalName, Group, Status |
-            Format-Table -AutoSize |
+            Format-Table -AutoSize -Wrap |
             Out-Host
     }
     else {
@@ -448,6 +453,6 @@ catch {
 }
 finally {
     if ($script:TranscriptStarted) {
-        try { Stop-Transcript | Out-Null } catch { }
+        try { Stop-Transcript -WhatIf:$false | Out-Null } catch { }
     }
 }
