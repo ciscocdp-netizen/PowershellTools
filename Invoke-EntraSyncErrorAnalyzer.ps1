@@ -5,7 +5,8 @@
 .DESCRIPTION
     A comprehensive, PowerShell 5.1-compatible tool that:
       * Connects to Entra ID with a device code (same public client as Connect-MgGraph).
-      * Pulls every user object that carries on-premises provisioning (AD Connect Sync) errors.
+      * Pulls users, groups, and contacts that carry on-premises provisioning (AD Connect Sync) errors,
+        then lists every other cloud object that holds the same proxy address or UPN.
       * Presents rich, detailed error information (category, property, offending value, timestamp).
       * Cross-references each errored object against on-prem Active Directory to surface the
         likely root cause (e.g. duplicate proxyAddresses / UPN, orphaned objects, mismatched
@@ -278,12 +279,22 @@ function Get-DirectoryAttributeValue {
     <#
         StrictMode-safe attribute read. Returns $null when the property was not loaded
         or the directory stored no value — both of which mean "no mailNickname".
+
+        Graph pages are sometimes hashtables (Invoke-MgGraphRequest default) and
+        sometimes PSCustomObjects (-OutputType PSObject). Hashtable keys are not
+        PSObject properties, so a property-only read would drop every group and contact.
     #>
     param(
         $Object,
         [Parameter(Mandatory)][string]$Name
     )
     if ($null -eq $Object) { return $null }
+    if ($Object -is [System.Collections.IDictionary]) {
+        foreach ($key in @($Object.Keys)) {
+            if ("$key" -eq $Name) { return $Object[$key] }
+        }
+        return $null
+    }
     $prop = $Object.PSObject.Properties[$Name]
     if ($prop) { return $prop.Value }
     return $null
@@ -293,9 +304,13 @@ function Get-GraphMailNickname {
     <#
         mailNickname from a Graph user. Typed SDK objects expose MailNickname; some
         payloads only place it in AdditionalProperties when it was $selected.
+        Hashtable pages from Invoke-MgGraphRequest store it as a dictionary key.
     #>
     param($User)
     if ($null -eq $User) { return $null }
+    if ($User -is [System.Collections.IDictionary]) {
+        return Get-DirectoryAttributeValue $User 'mailNickname'
+    }
     $prop = $User.PSObject.Properties['MailNickname']
     if ($prop) { return $prop.Value }
     $extraProp = $User.PSObject.Properties['AdditionalProperties']
@@ -809,12 +824,197 @@ function Connect-EntraTenant {
     }
 }
 
+function Get-SyncValueKey {
+    <#
+        Identity of one directory object plus one duplicated value, ignoring SMTP: vs smtp:
+        and the word "Proxy address" vs "ProxyAddresses".
+    #>
+    param([string]$ObjectId, [string]$Property, [string]$Value)
+    $bare = "$Value"
+    if ($bare -match '^(?i)[a-z0-9]+:(.+)$') { $bare = $Matches[1] }
+    $prop = "$Property"
+    if ($prop -match '(?i)proxy') { $prop = 'proxy' }
+    elseif ($prop -match '(?i)userprincipalname|^upn$') { $prop = 'upn' }
+    elseif ($prop -match '(?i)mailnickname|mail nickname') { $prop = 'mailnickname' }
+    elseif ($prop -match '(?i)^mail$') { $prop = 'mail' }
+    else { $prop = $prop.ToLower() }
+    return ('{0}|{1}|{2}' -f "$ObjectId".ToLower(), $prop, $bare.Trim().ToLower())
+}
+
+function Get-BareAddress {
+    param([string]$Value)
+    $bare = "$Value".Trim()
+    if ($bare -match '^(?i)[a-z0-9]+:(.+)$') { return $Matches[1] }
+    return $bare
+}
+
+function Get-CloudLookupPlan {
+    <#
+        Queries that find every user, group, and contact holding an address Entra
+        flagged. The portal lists all of those objects; a user-only error scan does not.
+    #>
+    param([string]$Value)
+    # Return nothing when there is nothing to query. `return ,@()` still becomes
+    # one empty array under @(), and the next loop then reads .Filter on it.
+    if ([string]::IsNullOrWhiteSpace($Value) -or "$Value".Trim() -eq '(null)') { return }
+    $bare = Get-BareAddress $Value
+    if ([string]::IsNullOrWhiteSpace($bare)) { return }
+    $odataBare = $bare.Replace("'", "''")
+    $selectUser = 'id,displayName,userPrincipalName,mail,proxyAddresses'
+    $selectGroup = 'id,displayName,mail,proxyAddresses'
+    $selectContact = 'id,displayName,mail,proxyAddresses'
+    $plans = New-Object System.Collections.Generic.List[object]
+    # Case-sensitive: SMTP: and smtp: are different Graph filters, and a normal
+    # hashtable would treat them as the same key and drop the second query.
+    $seen = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+    $candidates = New-Object System.Collections.Generic.List[object]
+    $proxyLiterals = @()
+    if ("$Value" -match '^(?i)smtp:(.+)$') {
+        $addr = $Matches[1].Replace("'", "''")
+        $proxyLiterals = @("SMTP:$addr", "smtp:$addr")
+    }
+    elseif ($bare -match '@') {
+        $proxyLiterals = @("SMTP:$odataBare", "smtp:$odataBare")
+    }
+    foreach ($pv in $proxyLiterals) {
+        [void]$candidates.Add([pscustomobject]@{ Resource = 'users';    ObjectType = 'User';    Filter = "proxyAddresses/any(p:p eq '$pv')"; Select = $selectUser })
+        [void]$candidates.Add([pscustomobject]@{ Resource = 'groups';   ObjectType = 'Group';   Filter = "proxyAddresses/any(p:p eq '$pv')"; Select = $selectGroup })
+        [void]$candidates.Add([pscustomobject]@{ Resource = 'contacts'; ObjectType = 'Contact'; Filter = "proxyAddresses/any(p:p eq '$pv')"; Select = $selectContact })
+    }
+    if ($bare -match '@') {
+        [void]$candidates.Add([pscustomobject]@{ Resource = 'users';    ObjectType = 'User';    Filter = "mail eq '$odataBare'"; Select = $selectUser })
+        [void]$candidates.Add([pscustomobject]@{ Resource = 'users';    ObjectType = 'User';    Filter = "userPrincipalName eq '$odataBare'"; Select = $selectUser })
+        [void]$candidates.Add([pscustomobject]@{ Resource = 'groups';   ObjectType = 'Group';   Filter = "mail eq '$odataBare'"; Select = $selectGroup })
+        [void]$candidates.Add([pscustomobject]@{ Resource = 'contacts'; ObjectType = 'Contact'; Filter = "mail eq '$odataBare'"; Select = $selectContact })
+    }
+    foreach ($candidate in $candidates) {
+        $key = "$($candidate.Resource)|$($candidate.Filter)"
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        [void]$plans.Add($candidate)
+    }
+    if ($plans.Count -eq 0) { return }
+    Write-Output -NoEnumerate $plans.ToArray()
+}
+
+function Format-CloudHolderSummary {
+    param($Holders)
+    $lines = @(
+        @($Holders) | Where-Object { $null -ne $_ } | ForEach-Object {
+            $name = "$(Get-DirectoryAttributeValue $_ 'DisplayName')".Trim()
+            if ([string]::IsNullOrWhiteSpace($name)) { $name = "$(Get-DirectoryAttributeValue $_ 'Id')" }
+            $type = "$(Get-DirectoryAttributeValue $_ 'ObjectType')".Trim()
+            if ([string]::IsNullOrWhiteSpace($type)) { "$name" } else { "$name ($type)" }
+        }
+    )
+    return ($lines -join '; ')
+}
+
+function Invoke-GraphGetAll {
+    <#
+        Follow @odata.nextLink. -NoEnumerate so an empty page stays an empty array
+        instead of becoming $null (and then a fake count of 1).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [hashtable]$Headers,
+        [string]$ProgressLabel
+    )
+    $items = New-Object System.Collections.Generic.List[object]
+    $next = $Uri
+    $guard = 0
+    while (-not [string]::IsNullOrWhiteSpace($next) -and $guard -lt 500) {
+        $guard++
+        $params = @{ Method = 'GET'; Uri = $next }
+        $cmd = Get-Command Invoke-MgGraphRequest -ErrorAction Stop
+        if ($cmd.Parameters.ContainsKey('OutputType')) { $params['OutputType'] = 'PSObject' }
+        if ($Headers) { $params['Headers'] = $Headers }
+        $page = Invoke-MgGraphRequest @params
+        $value = @(Get-DirectoryAttributeValue $page 'value' | Where-Object { $null -ne $_ })
+        foreach ($item in $value) { [void]$items.Add($item) }
+        if ($ProgressLabel -and $script:UI) {
+            $loaded = $items.Count
+            $script:UI.Window.Dispatcher.Invoke([action] {
+                $script:UI.StatusText.Text = "$ProgressLabel ($loaded downloaded)..."
+            })
+            Invoke-UiRefresh
+        }
+        $next = "$(Get-DirectoryAttributeValue $page '@odata.nextLink')".Trim()
+    }
+    if ($items.Count -eq 0) { return }
+    Write-Output -NoEnumerate $items.ToArray()
+}
+
+function ConvertTo-SyncDirectoryObject {
+    param($Raw, [Parameter(Mandatory)][string]$ObjectType)
+    if ($null -eq $Raw) { return $null }
+    $errors = @(Get-DirectoryAttributeValue $Raw 'OnPremisesProvisioningErrors' | Where-Object { $null -ne $_ })
+    if ($errors.Count -eq 0) { return $null }
+    $proxies = @(Get-DirectoryAttributeValue $Raw 'ProxyAddresses' | Where-Object { -not (Test-IsBlankAttributeValue $_) })
+    return [pscustomobject]@{
+        ObjectType        = $ObjectType
+        Id                = "$(Get-DirectoryAttributeValue $Raw 'Id')"
+        DisplayName       = "$(Get-DirectoryAttributeValue $Raw 'DisplayName')"
+        UserPrincipalName = "$(Get-DirectoryAttributeValue $Raw 'UserPrincipalName')"
+        Mail              = "$(Get-DirectoryAttributeValue $Raw 'Mail')"
+        MailNickname      = Get-GraphMailNickname $Raw
+        ProxyAddresses    = $proxies
+        SamAccountName    = "$(Get-DirectoryAttributeValue $Raw 'OnPremisesSamAccountName')"
+        OnPremDomain      = "$(Get-DirectoryAttributeValue $Raw 'OnPremisesDomainName')"
+        ImmutableId       = "$(Get-DirectoryAttributeValue $Raw 'OnPremisesImmutableId')"
+        LastSync          = Get-DirectoryAttributeValue $Raw 'OnPremisesLastSyncDateTime'
+        AccountEnabled    = Get-DirectoryAttributeValue $Raw 'AccountEnabled'
+        Errors            = $errors
+    }
+}
+
+function Find-CloudAttributeHolders {
+    <#
+        Directory objects in Entra that already contain this proxy address, mail, or UPN.
+        This is the contact or group the portal shows next to the user that failed to sync.
+    #>
+    param([Parameter(Mandatory)][string]$Value)
+    $plans = Get-CloudLookupPlan -Value $Value
+    if ($null -eq $plans) { $plans = @() }
+    $holders = New-Object System.Collections.Generic.List[object]
+    $seenIds = @{}
+    $headers = @{ ConsistencyLevel = 'eventual' }
+    foreach ($plan in $plans) {
+        $filter = [uri]::EscapeDataString($plan.Filter)
+        $uri = "https://graph.microsoft.com/v1.0/$($plan.Resource)?`$count=true&`$top=50&`$select=$($plan.Select)&`$filter=$filter"
+        try {
+            $hits = Invoke-GraphGetAll -Uri $uri -Headers $headers
+            if ($null -eq $hits) { $hits = @() }
+        }
+        catch {
+            Write-UiLog "Lookup for '$Value' on $($plan.ObjectType) failed: $($_.Exception.Message)" -Level Warning
+            continue
+        }
+        foreach ($hit in $hits) {
+            $id = "$(Get-DirectoryAttributeValue $hit 'Id')"
+            if ([string]::IsNullOrWhiteSpace($id) -or $seenIds.ContainsKey($id)) { continue }
+            $seenIds[$id] = $true
+            [void]$holders.Add([pscustomobject]@{
+                Id                = $id
+                DisplayName       = "$(Get-DirectoryAttributeValue $hit 'DisplayName')"
+                ObjectType        = $plan.ObjectType
+                UserPrincipalName = "$(Get-DirectoryAttributeValue $hit 'UserPrincipalName')"
+                Mail              = "$(Get-DirectoryAttributeValue $hit 'Mail')"
+                ProxyAddresses    = @(Get-DirectoryAttributeValue $hit 'ProxyAddresses' | Where-Object { -not (Test-IsBlankAttributeValue $_) })
+            })
+        }
+    }
+    if ($holders.Count -eq 0) { return }
+    Write-Output -NoEnumerate $holders.ToArray()
+}
+
 function Get-SyncErrorRecords {
     <#
-        Enumerates all users carrying onPremisesProvisioningErrors and flattens each error
-        into its own detailed record. Optionally cross-references on-prem AD.
-        A null cloud mailNickname is written as '(null)' and called out in the root-cause
-        text, because Graph returns an empty offending value for that failure.
+        Enumerates users, groups, and contacts carrying onPremisesProvisioningErrors.
+        Entra's duplicate-attribute table also lists the other cloud object that already
+        holds the value (often a contact or group). Those holders are added too.
+        Optionally cross-references on-prem AD.
+        A null cloud mailNickname is written as '(null)'.
     #>
     if (-not $script:State.Connected) {
         [System.Windows.MessageBox]::Show("Connect to Entra ID first.", 'Not Connected', 'OK', 'Warning') | Out-Null
@@ -823,97 +1023,230 @@ function Get-SyncErrorRecords {
 
     $doAd = $script:State.AdModuleLoaded -and $script:UI.CrossRefCheck.IsChecked
 
-    Start-UiOperation -Text "Querying Entra ID for synced users (this can take a while on large tenants)..." -Stage "Downloading directory"
-    Write-UiLog "Querying directory for users with on-premises provisioning errors..."
+    Start-UiOperation -Text "Querying Entra ID for users, groups, and contacts with sync errors..." -Stage "Downloading directory"
+    Write-UiLog "Querying users, groups, and contacts for on-premises provisioning errors..."
 
     $script:State.SyncErrorRecords.Clear()
 
     try {
-        # Pull the properties needed to both display and diagnose.
-        # mailNickname is included so a null alias is visible even when the provisioning
-        # error names a different property (or returns an empty offending value).
+        $directoryObjects = New-Object System.Collections.Generic.List[object]
+
         $props = @(
             'id', 'displayName', 'userPrincipalName', 'mail', 'mailNickname', 'proxyAddresses',
             'onPremisesProvisioningErrors', 'onPremisesImmutableId',
             'onPremisesSamAccountName', 'onPremisesDomainName',
             'onPremisesSyncEnabled', 'onPremisesLastSyncDateTime', 'accountEnabled'
         )
-
         # Graph cannot server-side $filter on onPremisesProvisioningErrors, so page through
-        # all synced users and filter client-side. -All handles paging automatically.
-        $users = Get-MgUser -All -Property $props -PageSize 999 -ErrorAction Stop |
-                 Where-Object { $_.OnPremisesProvisioningErrors -and $_.OnPremisesProvisioningErrors.Count -gt 0 }
-
-        $userCount = @($users).Count
-        Write-UiLog "Found $userCount user(s) with provisioning errors. Building detailed records..." -Level $(if ($userCount) { 'Warning' } else { 'Success' })
-
-        $i = 0
+        # each object type and filter client-side.
+        $users = @(Get-MgUser -All -Property $props -PageSize 999 -ErrorAction Stop |
+                 Where-Object { $_.OnPremisesProvisioningErrors -and @($_.OnPremisesProvisioningErrors).Count -gt 0 })
         foreach ($u in $users) {
+            $converted = ConvertTo-SyncDirectoryObject -Raw $u -ObjectType 'User'
+            if ($null -ne $converted) { [void]$directoryObjects.Add($converted) }
+        }
+        Write-UiLog "Users with provisioning errors: $($directoryObjects.Count)." -Level $(if ($directoryObjects.Count) { 'Warning' } else { 'Success' })
+
+        $groupSelect = 'id,displayName,mail,mailNickname,proxyAddresses,onPremisesProvisioningErrors,onPremisesSamAccountName,onPremisesDomainName,onPremisesLastSyncDateTime'
+        $contactSelect = 'id,displayName,mail,mailNickname,proxyAddresses,onPremisesProvisioningErrors,onPremisesLastSyncDateTime'
+        $extraTypes = @(
+            @{ Resource = 'groups';   ObjectType = 'Group';   Select = $groupSelect;   Label = 'Groups' },
+            @{ Resource = 'contacts'; ObjectType = 'Contact'; Select = $contactSelect; Label = 'Contacts' }
+        )
+        foreach ($kind in $extraTypes) {
+            $before = $directoryObjects.Count
+            $selectAttempts = @(
+                $kind.Select,
+                'id,displayName,mail,mailNickname,proxyAddresses,onPremisesProvisioningErrors'
+            )
+            $rawItems = @()
+            $loaded = $false
+            $lastScanError = ''
+            foreach ($select in $selectAttempts) {
+                try {
+                    $uri = "https://graph.microsoft.com/v1.0/$($kind.Resource)?`$select=$select&`$top=999"
+                    $rawItems = Invoke-GraphGetAll -Uri $uri -ProgressLabel "Downloading $($kind.Label)"
+                    if ($null -eq $rawItems) { $rawItems = @() }
+                    $loaded = $true
+                    break
+                }
+                catch {
+                    $lastScanError = "$($_.Exception.Message)"
+                }
+            }
+            if (-not $loaded) {
+                Write-UiLog "$($kind.Label) scan failed: $lastScanError" -Level Warning
+                continue
+            }
+            foreach ($raw in $rawItems) {
+                $converted = ConvertTo-SyncDirectoryObject -Raw $raw -ObjectType $kind.ObjectType
+                if ($null -ne $converted) { [void]$directoryObjects.Add($converted) }
+            }
+            $found = $directoryObjects.Count - $before
+            Write-UiLog "$($kind.Label) with provisioning errors: $found." -Level $(if ($found) { 'Warning' } else { 'Success' })
+        }
+
+        $objectCount = $directoryObjects.Count
+        Write-UiLog "Building detail for $objectCount directory object(s)..." -Level $(if ($objectCount) { 'Warning' } else { 'Success' })
+
+        $seenKeys = @{}
+        $i = 0
+        foreach ($obj in $directoryObjects) {
             $i++
-            $stageMsg = $(if ($doAd) { "Processing user & cross-referencing AD" } else { "Processing user" })
-            Update-UiProgress -Current $i -Total $userCount -Text "$stageMsg : $($u.UserPrincipalName)"
+            $label = if (-not [string]::IsNullOrWhiteSpace($obj.UserPrincipalName)) { $obj.UserPrincipalName } else { $obj.DisplayName }
+            $stageMsg = $(if ($doAd) { "Processing $($obj.ObjectType) & cross-referencing AD" } else { "Processing $($obj.ObjectType)" })
+            Update-UiProgress -Current $i -Total $objectCount -Text "$stageMsg : $label"
 
-            $mailNicknameDisplay = Format-MailNicknameDisplay (Get-GraphMailNickname $u)
+            $graphShape = [pscustomobject]@{
+                MailNickname               = $obj.MailNickname
+                Mail                       = $obj.Mail
+                ProxyAddresses             = $obj.ProxyAddresses
+                OnPremisesSamAccountName   = $obj.SamAccountName
+            }
+            $mailNicknameDisplay = Format-MailNicknameDisplay (Get-GraphMailNickname $graphShape)
 
-            foreach ($err in $u.OnPremisesProvisioningErrors) {
+            foreach ($err in @($obj.Errors)) {
+                $propertyName = "$(Get-DirectoryAttributeValue $err 'PropertyCausingError')"
+                $category = "$(Get-DirectoryAttributeValue $err 'Category')"
+                $rawValue = Get-DirectoryAttributeValue $err 'Value'
+                $occurred = Get-DirectoryAttributeValue $err 'OccurredDateTime'
+
                 $adFinding = $null
                 if ($doAd) {
-                    $adFinding = Resolve-AdRootCause -User $u -Error $err
+                    $adFinding = Resolve-AdRootCause -User $graphShape -Error $err
                 }
 
-                $offendingValue = $err.Value
-                if ((Test-IsBlankAttributeValue $offendingValue) -and ("$($err.PropertyCausingError)" -match '(?i)mailnickname')) {
+                $offendingValue = $rawValue
+                if ((Test-IsBlankAttributeValue $offendingValue) -and ($propertyName -match '(?i)mailnickname')) {
                     $offendingValue = '(null)'
                 }
 
                 $rootCause = if ($adFinding -and -not (Test-IsBlankAttributeValue $adFinding.Summary)) { $adFinding.Summary } else { '(not checked)' }
                 if ($mailNicknameDisplay -eq '(null)' -and $rootCause -notmatch '(?i)The mailNickname attribute has a null value') {
                     $cloudIssue = Get-MailNicknameNullIssue `
-                        -MailNickname (Get-GraphMailNickname $u) `
-                        -Mail (Get-DirectoryAttributeValue $u 'Mail') `
-                        -ProxyAddresses (Get-DirectoryAttributeValue $u 'ProxyAddresses') `
+                        -MailNickname $obj.MailNickname `
+                        -Mail $obj.Mail `
+                        -ProxyAddresses $obj.ProxyAddresses `
                         -EntraReportedNull (
-                            ("$($err.PropertyCausingError)" -match '(?i)mailnickname') -and (Test-IsBlankAttributeValue $err.Value)
+                            ($propertyName -match '(?i)mailnickname') -and (Test-IsBlankAttributeValue $rawValue)
                         )
                     $nullNote = if ($cloudIssue) { $cloudIssue.Message } else { 'The mailNickname attribute has a null value.' }
                     if ($rootCause -eq '(not checked)') { $rootCause = $nullNote }
                     else { $rootCause = "$rootCause $nullNote" }
                 }
 
+                $rowKey = Get-SyncValueKey -ObjectId $obj.Id -Property $propertyName -Value "$offendingValue"
+                $seenKeys[$rowKey] = $true
+
+                $lastSyncText = ''
+                if ($obj.LastSync) { $lastSyncText = ([datetime]$obj.LastSync).ToString('yyyy-MM-dd HH:mm') }
+                $occurredText = ''
+                if ($occurred) { $occurredText = ([datetime]$occurred).ToString('yyyy-MM-dd HH:mm') }
+
                 $record = [pscustomobject]@{
-                    DisplayName       = $u.DisplayName
-                    UserPrincipalName = $u.UserPrincipalName
-                    Category          = $err.Category
-                    Property          = $err.PropertyCausingError
+                    DisplayName       = $obj.DisplayName
+                    ObjectType        = $obj.ObjectType
+                    UserPrincipalName = $(if ($obj.UserPrincipalName) { $obj.UserPrincipalName } else { $obj.Mail })
+                    Category          = $category
+                    Property          = $propertyName
                     OffendingValue    = $offendingValue
-                    OccurredUtc       = if ($err.OccurredDateTime) { ([datetime]$err.OccurredDateTime).ToString('yyyy-MM-dd HH:mm') } else { '' }
-                    SamAccountName    = $u.OnPremisesSamAccountName
-                    OnPremDomain      = $u.OnPremisesDomainName
-                    ImmutableId       = $u.OnPremisesImmutableId
-                    LastSyncUtc       = if ($u.OnPremisesLastSyncDateTime) { ([datetime]$u.OnPremisesLastSyncDateTime).ToString('yyyy-MM-dd HH:mm') } else { '' }
-                    AccountEnabled    = $u.AccountEnabled
+                    CloudHolders      = ''
+                    OccurredUtc       = $occurredText
+                    SamAccountName    = $obj.SamAccountName
+                    OnPremDomain      = $obj.OnPremDomain
+                    ImmutableId       = $obj.ImmutableId
+                    LastSyncUtc       = $lastSyncText
+                    AccountEnabled    = $obj.AccountEnabled
                     MailNickname      = $mailNicknameDisplay
-                    ProxyAddresses    = ($u.ProxyAddresses -join '; ')
+                    ProxyAddresses    = ($obj.ProxyAddresses -join '; ')
                     AdRootCause       = $rootCause
                     AdConflictObjects = if ($adFinding) { $adFinding.Conflicts } else { '' }
-                    ObjectId          = $u.Id
+                    ObjectId          = $obj.Id
+                    HolderOnly        = $false
                 }
                 $script:UI.Window.Dispatcher.Invoke([action] { $script:State.SyncErrorRecords.Add($record) })
             }
         }
 
+        # Match the Entra duplicate-attribute table: every cloud object that holds the value.
+        $valuesToResolve = @(
+            $script:State.SyncErrorRecords |
+                Where-Object { -not (Test-IsBlankAttributeValue $_.OffendingValue) -and "$($_.OffendingValue)" -ne '(null)' } |
+                Select-Object -ExpandProperty OffendingValue -Unique
+        )
+        $holderCache = @{}
+        $lookupTotal = @($valuesToResolve).Count
+        $lookupIndex = 0
+        foreach ($lookupValue in $valuesToResolve) {
+            $lookupIndex++
+            Update-UiProgress -Current $lookupIndex -Total $lookupTotal -Text "Finding other Entra objects with '$lookupValue'..."
+            $bareKey = (Get-BareAddress "$lookupValue").ToLower()
+            if ([string]::IsNullOrWhiteSpace($bareKey)) { continue }
+            if (-not $holderCache.ContainsKey($bareKey)) {
+                $foundHolders = Find-CloudAttributeHolders -Value "$lookupValue"
+                if ($null -eq $foundHolders) { $foundHolders = @() }
+                $holderCache[$bareKey] = $foundHolders
+            }
+            $holders = $holderCache[$bareKey]
+            if ($null -eq $holders) { $holders = @() }
+            $summary = Format-CloudHolderSummary $holders
+
+            foreach ($existing in @($script:State.SyncErrorRecords)) {
+                $existingBare = (Get-BareAddress "$($existing.OffendingValue)").ToLower()
+                if ($existingBare -eq $bareKey) { $existing.CloudHolders = $summary }
+            }
+
+            $sample = @($script:State.SyncErrorRecords | Where-Object { (Get-BareAddress "$($_.OffendingValue)").ToLower() -eq $bareKey } | Select-Object -First 1)
+            if ($sample.Count -eq 0) { continue }
+            $template = $sample[0]
+            foreach ($holder in $holders) {
+                $holderKey = Get-SyncValueKey -ObjectId $holder.Id -Property $template.Property -Value "$lookupValue"
+                if ($seenKeys.ContainsKey($holderKey)) { continue }
+                $seenKeys[$holderKey] = $true
+                $holderRecord = [pscustomobject]@{
+                    DisplayName       = $holder.DisplayName
+                    ObjectType        = $holder.ObjectType
+                    UserPrincipalName = $(if ($holder.UserPrincipalName) { $holder.UserPrincipalName } else { $holder.Mail })
+                    Category          = 'PropertyConflict'
+                    Property          = $template.Property
+                    OffendingValue    = $lookupValue
+                    CloudHolders      = $summary
+                    OccurredUtc       = ''
+                    SamAccountName    = ''
+                    OnPremDomain      = ''
+                    ImmutableId       = ''
+                    LastSyncUtc       = ''
+                    AccountEnabled    = ''
+                    MailNickname      = ''
+                    ProxyAddresses    = (@($holder.ProxyAddresses) -join '; ')
+                    AdRootCause       = "Holds this duplicated value in Entra ($($holder.ObjectType)). The portal lists this object next to the one that failed to sync."
+                    AdConflictObjects = ''
+                    ObjectId          = $holder.Id
+                    HolderOnly        = $true
+                }
+                $script:UI.Window.Dispatcher.Invoke([action] { $script:State.SyncErrorRecords.Add($holderRecord) })
+                Write-UiLog "Also in Entra: $($holder.DisplayName) ($($holder.ObjectType)) has '$lookupValue'." -Level Warning
+            }
+        }
+
+        $boundView = [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:State.SyncErrorRecords)
+        if ($boundView) { $boundView.Refresh() }
+
         $total = $script:State.SyncErrorRecords.Count
+        $objectIds = @($script:State.SyncErrorRecords | Select-Object -ExpandProperty ObjectId -Unique)
+        $typeCounts = @($script:State.SyncErrorRecords | Group-Object ObjectType | ForEach-Object { "$($_.Count) $($_.Name.ToLower())" })
         $nullNickUsers = @($script:State.SyncErrorRecords |
-            Where-Object { $_.MailNickname -eq '(null)' } |
+            Where-Object { $_.MailNickname -eq '(null)' -and $_.ObjectType -eq 'User' } |
             Select-Object -ExpandProperty UserPrincipalName -Unique)
         $script:UI.Window.Dispatcher.Invoke([action] {
-            $countText = "$total error record(s) across $userCount user(s)"
+            $countText = "$total record(s) across $($objectIds.Count) object(s)"
+            if ($typeCounts.Count -gt 0) { $countText += " ($($typeCounts -join ', '))" }
             if ($nullNickUsers.Count -gt 0) {
                 $countText += "  |  $($nullNickUsers.Count) with null mailNickname"
             }
             $script:UI.ResultCount.Text = $countText
         })
-        Write-UiLog "Scan complete: $total detailed error record(s)." -Level Success
+        Write-UiLog "Scan complete: $total record(s) across $($objectIds.Count) directory object(s)." -Level Success
         if ($nullNickUsers.Count -gt 0) {
             $preview = ($nullNickUsers | Select-Object -First 15) -join ', '
             $more = if ($nullNickUsers.Count -gt 15) { ' ...' } else { '' }
@@ -1814,16 +2147,18 @@ function Export-SyncErrorRecords {
 
                     <TextBox x:Name="FilterBox" Grid.Row="0" Margin="0,0,0,8" Padding="8,6"
                              Background="#FF232336" Foreground="White" BorderBrush="#FF3A3A50"
-                             Tag="Filter results (name, UPN, category, property, value)..."/>
+                             Tag="Filter results (name, object type, UPN, property, value)..."/>
 
                     <DataGrid x:Name="ErrorGrid" Grid.Row="1" AutoGenerateColumns="False"
                               IsReadOnly="True" SelectionMode="Single" CanUserResizeColumns="True">
                         <DataGrid.Columns>
-                            <DataGridTextColumn Header="Display Name" Binding="{Binding DisplayName}" Width="150"/>
-                            <DataGridTextColumn Header="UPN" Binding="{Binding UserPrincipalName}" Width="200"/>
+                            <DataGridTextColumn Header="Display Name" Binding="{Binding DisplayName}" Width="160"/>
+                            <DataGridTextColumn Header="Object Type" Binding="{Binding ObjectType}" Width="90"/>
+                            <DataGridTextColumn Header="UPN" Binding="{Binding UserPrincipalName}" Width="180"/>
                             <DataGridTextColumn Header="Category" Binding="{Binding Category}" Width="110"/>
-                            <DataGridTextColumn Header="Property" Binding="{Binding Property}" Width="130"/>
-                            <DataGridTextColumn Header="Offending Value" Binding="{Binding OffendingValue}" Width="180"/>
+                            <DataGridTextColumn Header="Property" Binding="{Binding Property}" Width="120"/>
+                            <DataGridTextColumn Header="Offending Value" Binding="{Binding OffendingValue}" Width="200"/>
+                            <DataGridTextColumn Header="Objects with this value" Binding="{Binding CloudHolders}" Width="260"/>
                             <DataGridTextColumn Header="Mail Nickname" Binding="{Binding MailNickname}" Width="140">
                                 <DataGridTextColumn.ElementStyle>
                                     <Style TargetType="TextBlock">
@@ -1992,10 +2327,12 @@ $script:UI.FilterBox.Add_TextChanged({
         $t = $text.ToLower()
         return (
             ("$($item.DisplayName)".ToLower().Contains($t)) -or
+            ("$($item.ObjectType)".ToLower().Contains($t)) -or
             ("$($item.UserPrincipalName)".ToLower().Contains($t)) -or
             ("$($item.Category)".ToLower().Contains($t)) -or
             ("$($item.Property)".ToLower().Contains($t)) -or
             ("$($item.OffendingValue)".ToLower().Contains($t)) -or
+            ("$($item.CloudHolders)".ToLower().Contains($t)) -or
             ("$($item.MailNickname)".ToLower().Contains($t)) -or
             ("$($item.AdRootCause)".ToLower().Contains($t))
         )
@@ -2012,8 +2349,9 @@ $script:UI.ErrorGrid.Add_SelectionChanged({
         $nickBanner = "*** The mailNickname attribute has a null value. ***`r`n`r`n"
     }
     $detail = @"
-${nickBanner}USER
+${nickBanner}DIRECTORY OBJECT
   Display Name       : $($sel.DisplayName)
+  Object Type        : $($sel.ObjectType)
   UserPrincipalName  : $($sel.UserPrincipalName)
   Account Enabled    : $($sel.AccountEnabled)
   Cloud ObjectId     : $($sel.ObjectId)
@@ -2024,6 +2362,9 @@ ERROR
   Property           : $($sel.Property)
   Offending Value    : $($sel.OffendingValue)
   Occurred (UTC)     : $($sel.OccurredUtc)
+
+OBJECTS IN ENTRA WITH THIS VALUE
+  $($sel.CloudHolders)
 
 ON-PREM SOURCE
   sAMAccountName     : $($sel.SamAccountName)
@@ -2051,6 +2392,7 @@ $window.Add_Closing({
 $window.Add_Loaded({
     Write-UiLog "Entra ID Sync Error Analyzer started (PowerShell $($PSVersionTable.PSVersion))." -Level Success
     Write-UiLog "Step 1: Click 'Connect with device code' and finish sign-in at https://microsoft.com/devicelogin. Step 2: Click 'Scan Sync Errors'."
+    Write-UiLog "The scan lists users, groups, and contacts with sync errors, plus every other Entra object that already holds the same proxy address or UPN."
     # Best-effort AD module load so the scanner tab is usable immediately.
     Initialize-AdModule | Out-Null
 })
