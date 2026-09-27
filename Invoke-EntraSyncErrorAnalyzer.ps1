@@ -453,24 +453,112 @@ function Initialize-AdModule {
 #  SECTION 2 :: Core data operations (Graph + AD)
 # ====================================================================================
 
+function Enable-Tls12 {
+    <#
+        Windows PowerShell 5.1 often leaves ServicePointManager on TLS 1.0.
+        login.microsoftonline.com refuses that, so device-code requests never start.
+    #>
+    try {
+        $tls12 = [System.Net.SecurityProtocolType]::Tls12
+        $current = [System.Net.ServicePointManager]::SecurityProtocol
+        if (($current -band $tls12) -ne $tls12) {
+            [System.Net.ServicePointManager]::SecurityProtocol = $current -bor $tls12
+        }
+    }
+    catch {
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+    }
+}
+
+function Get-ErrorRecordText {
+    <#
+        Join every place a device-code HTTP 400 might hide its JSON body.
+        Windows PowerShell 5.1 puts it on ErrorDetails; some failures only
+        expose it on the WebException response stream.
+    #>
+    param($ErrorRecord)
+    $parts = New-Object System.Collections.Generic.List[string]
+    if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+        [void]$parts.Add("$($ErrorRecord.ErrorDetails.Message)")
+    }
+    $ex = $ErrorRecord.Exception
+    while ($ex) {
+        if ($ex.Message) { [void]$parts.Add("$($ex.Message)") }
+        $responseProp = $ex.PSObject.Properties['Response']
+        if ($responseProp -and $responseProp.Value) {
+            try {
+                $stream = $responseProp.Value.GetResponseStream()
+                if ($stream) {
+                    if ($stream.CanSeek) { $stream.Position = 0 }
+                    $reader = New-Object System.IO.StreamReader($stream)
+                    $body = $reader.ReadToEnd()
+                    $reader.Dispose()
+                    if (-not [string]::IsNullOrWhiteSpace($body)) { [void]$parts.Add($body) }
+                }
+            }
+            catch {}
+        }
+        $ex = $ex.InnerException
+    }
+    return ($parts -join "`n")
+}
+
+function Get-HttpStatusCode {
+    param($ErrorRecord)
+    $ex = $ErrorRecord.Exception
+    while ($ex) {
+        $responseProp = $ex.PSObject.Properties['Response']
+        if ($responseProp -and $responseProp.Value) {
+            try { return [int]$responseProp.Value.StatusCode } catch {}
+        }
+        $ex = $ex.InnerException
+    }
+    if ("$($ErrorRecord.Exception.Message)" -match '\((\d{3})\)') { return [int]$Matches[1] }
+    return 0
+}
+
 function Get-OAuthErrorCode {
     <#
         Device-code polling returns HTTP 400 for authorization_pending and slow_down.
         Pull the OAuth error code out of that body so those are not treated as failures.
     #>
     param($ErrorRecord)
-    $text = ''
-    if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
-        $text = "$($ErrorRecord.ErrorDetails.Message)"
-    }
-    if ([string]::IsNullOrWhiteSpace($text)) {
-        $text = "$($ErrorRecord.Exception.Message)"
-    }
+    $text = Get-ErrorRecordText $ErrorRecord
     if ($text -match '"error"\s*:\s*"([^"]+)"') { return $Matches[1] }
-    foreach ($known in @('authorization_pending', 'slow_down', 'authorization_declined', 'expired_token', 'access_denied')) {
+    foreach ($known in @(
+            'authorization_pending', 'slow_down', 'authorization_declined', 'expired_token',
+            'access_denied', 'invalid_grant', 'invalid_client', 'invalid_request',
+            'unauthorized_client', 'bad_verification_code'
+        )) {
         if ($text -match $known) { return $known }
     }
     return $null
+}
+
+function Get-DeviceCodePollAction {
+    <#
+        pending  - user has not finished sign-in yet; keep polling
+        slow_down - keep polling, but wait longer
+        declined / expired / fatal - stop
+        A bare HTTP 400 with no parsed code is treated as pending. PowerShell 5.1
+        sometimes drops the JSON body and would otherwise abort the wait immediately.
+    #>
+    param($ErrorRecord)
+    $code = Get-OAuthErrorCode $ErrorRecord
+    switch ($code) {
+        'authorization_pending' { return 'pending' }
+        'slow_down' { return 'slow_down' }
+        'authorization_declined' { return 'declined' }
+        'access_denied' { return 'declined' }
+        'expired_token' { return 'expired' }
+        'invalid_grant' { return 'expired' }
+        'invalid_client' { return 'fatal' }
+        'invalid_request' { return 'fatal' }
+        'unauthorized_client' { return 'fatal' }
+        'bad_verification_code' { return 'fatal' }
+    }
+    if ((Get-HttpStatusCode $ErrorRecord) -eq 400) { return 'pending' }
+    return 'fatal'
 }
 
 function Get-JwtPayload {
@@ -513,7 +601,26 @@ function Get-DeviceCodePromptText {
     } else {
         'Copy the device code from this message.'
     }
-    return $message + "`r`n`r`n$clipNote`r`n`r`nClick OK, then finish sign-in in the browser. This window waits until that completes."
+    return $message + "`r`n`r`n$clipNote`r`n`r`nFinish sign-in in the browser. This window keeps waiting until that completes."
+}
+
+function Write-DeviceCodeBanner {
+    <#
+        Print the code on the console that launched the script. A modal dialog is
+        easy to leave behind that window, which is the same failure mode as WAM.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$UserCode,
+        [Parameter(Mandatory)][string]$Url
+    )
+    $line = ('=' * 64)
+    Write-Host ''
+    Write-Host $line -ForegroundColor Yellow
+    Write-Host '  DEVICE CODE SIGN-IN' -ForegroundColor Yellow
+    Write-Host "  Code : $UserCode" -ForegroundColor Yellow
+    Write-Host "  URL  : $Url" -ForegroundColor Yellow
+    Write-Host $line -ForegroundColor Yellow
+    Write-Host ''
 }
 
 function Wait-UiInterval {
@@ -563,7 +670,9 @@ function Connect-EntraTenant {
     $scopes = @('User.Read.All', 'Directory.Read.All', 'Organization.Read.All')
     $tenant = if ($TenantId) { $TenantId.Trim() } else { 'organizations' }
     try {
+        Enable-Tls12
         Start-UiOperation -Text "Requesting a device code..." -Stage "Device code"
+        Write-UiLog "Sign-in mode: device code. The interactive browser / WAM prompt is not used."
         Write-UiLog "Starting Microsoft Graph device-code sign-in (scopes: $($scopes -join ', '))..."
 
         $deviceBody = @{
@@ -587,10 +696,12 @@ function Connect-EntraTenant {
         catch {
             Write-UiLog "Could not copy the device code to the clipboard. Copy it from the dialog." -Level Warning
         }
+        $verifyUrl = "$(Get-DirectoryAttributeValue $device 'verification_uri')".Trim()
+        if ([string]::IsNullOrWhiteSpace($verifyUrl)) { $verifyUrl = 'https://microsoft.com/devicelogin' }
         $prompt = Get-DeviceCodePromptText $device -CopiedToClipboard:$copied
+        Write-DeviceCodeBanner -UserCode $userCode -Url $verifyUrl
         Write-UiLog $prompt -Level Warning
         Invoke-UiRefresh
-        [System.Windows.MessageBox]::Show($prompt, 'Device code sign-in', 'OK', 'Information') | Out-Null
 
         $interval = 5
         $intervalRaw = Get-DirectoryAttributeValue $device 'interval'
@@ -628,16 +739,13 @@ function Connect-EntraTenant {
                 break
             }
             catch {
-                $oauthError = Get-OAuthErrorCode $_
-                if ($oauthError -eq 'authorization_pending') { continue }
-                if ($oauthError -eq 'slow_down') { $interval += 5; continue }
-                if ($oauthError -eq 'authorization_declined' -or $oauthError -eq 'access_denied') {
-                    throw "Sign-in was declined."
-                }
-                if ($oauthError -eq 'expired_token') {
-                    throw "The device code expired before sign-in completed."
-                }
-                throw
+                $action = Get-DeviceCodePollAction $_
+                if ($action -eq 'pending') { continue }
+                if ($action -eq 'slow_down') { $interval += 5; continue }
+                if ($action -eq 'declined') { throw "Sign-in was declined." }
+                if ($action -eq 'expired') { throw "The device code expired before sign-in completed." }
+                $detail = Get-ErrorRecordText $_
+                throw "Device-code sign-in failed: $detail"
             }
         }
 
