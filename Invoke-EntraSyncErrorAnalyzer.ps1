@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     A comprehensive, PowerShell 5.1-compatible tool that:
-      * Connects to Entra ID via the Microsoft Graph PowerShell SDK.
+      * Connects to Entra ID with a device code (same public client as Connect-MgGraph).
       * Pulls every user object that carries on-premises provisioning (AD Connect Sync) errors.
       * Presents rich, detailed error information (category, property, offending value, timestamp).
       * Cross-references each errored object against on-prem Active Directory to surface the
@@ -453,34 +453,235 @@ function Initialize-AdModule {
 #  SECTION 2 :: Core data operations (Graph + AD)
 # ====================================================================================
 
+function Get-OAuthErrorCode {
+    <#
+        Device-code polling returns HTTP 400 for authorization_pending and slow_down.
+        Pull the OAuth error code out of that body so those are not treated as failures.
+    #>
+    param($ErrorRecord)
+    $text = ''
+    if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+        $text = "$($ErrorRecord.ErrorDetails.Message)"
+    }
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        $text = "$($ErrorRecord.Exception.Message)"
+    }
+    if ($text -match '"error"\s*:\s*"([^"]+)"') { return $Matches[1] }
+    foreach ($known in @('authorization_pending', 'slow_down', 'authorization_declined', 'expired_token', 'access_denied')) {
+        if ($text -match $known) { return $known }
+    }
+    return $null
+}
+
+function Get-JwtPayload {
+    <#
+        Decode the JWT payload (no signature check). Used only to label the signed-in
+        account when Connect-MgGraph -AccessToken leaves Get-MgContext.Account empty.
+    #>
+    param([string]$Token)
+    if ([string]::IsNullOrWhiteSpace($Token)) { return $null }
+    $parts = $Token.Split('.')
+    if ($parts.Count -lt 2) { return $null }
+    $payload = $parts[1].Replace('-', '+').Replace('_', '/')
+    switch ($payload.Length % 4) {
+        2 { $payload += '=='; break }
+        3 { $payload += '='; break }
+        1 { return $null }
+    }
+    try {
+        $json = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($payload))
+        return ($json | ConvertFrom-Json)
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-DeviceCodePromptText {
+    param(
+        $Device,
+        [switch]$CopiedToClipboard
+    )
+    $message = "$(Get-DirectoryAttributeValue $Device 'message')".Trim()
+    $userCode = "$(Get-DirectoryAttributeValue $Device 'user_code')".Trim()
+    $url = "$(Get-DirectoryAttributeValue $Device 'verification_uri')".Trim()
+    if ([string]::IsNullOrWhiteSpace($message)) {
+        $message = "To sign in, open $url and enter the code $userCode."
+    }
+    $clipNote = if ($CopiedToClipboard) {
+        'The device code has been copied to the clipboard.'
+    } else {
+        'Copy the device code from this message.'
+    }
+    return $message + "`r`n`r`n$clipNote`r`n`r`nClick OK, then finish sign-in in the browser. This window waits until that completes."
+}
+
+function Wait-UiInterval {
+    <#
+        Sleep in short slices so the elapsed clock and log can paint while we poll.
+    #>
+    param([int]$Seconds)
+    if ($Seconds -lt 1) { $Seconds = 1 }
+    $end = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $end) {
+        $remaining = ($end - (Get-Date)).TotalMilliseconds
+        $slice = [int][Math]::Min(250, [Math]::Max(1, $remaining))
+        Start-Sleep -Milliseconds $slice
+        Update-UiElapsed
+        Invoke-UiRefresh
+    }
+}
+
+function Connect-MgGraphWithAccessToken {
+    <#
+        SDK 2.x takes a SecureString; older builds take a plain string.
+    #>
+    param([Parameter(Mandatory)][string]$Token)
+    $cmd = Get-Command Connect-MgGraph -ErrorAction Stop
+    if (-not $cmd.Parameters.ContainsKey('AccessToken')) {
+        throw "Installed Microsoft.Graph.Authentication cannot accept an access token from device-code sign-in."
+    }
+    $paramType = $cmd.Parameters['AccessToken'].ParameterType
+    if ($paramType -eq [System.Security.SecureString]) {
+        $secure = ConvertTo-SecureString -String $Token -AsPlainText -Force
+        Connect-MgGraph -AccessToken $secure -NoWelcome -ErrorAction Stop
+    }
+    else {
+        Connect-MgGraph -AccessToken $Token -NoWelcome -ErrorAction Stop
+    }
+}
+
 function Connect-EntraTenant {
     <#
-        Interactive Graph sign-in with the least-privilege read scopes needed for
-        surfacing sync errors.
+        Device-code sign-in with the least-privilege read scopes needed for sync errors.
+        The user code is shown in this window (and copied to the clipboard). Sign-in is
+        finished at https://microsoft.com/devicelogin, including from another device.
+        The resulting token is passed to Connect-MgGraph so the rest of the tool is unchanged.
     #>
+    # Same first-party public client Connect-MgGraph uses (Microsoft Graph Command Line Tools).
+    $clientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
     $scopes = @('User.Read.All', 'Directory.Read.All', 'Organization.Read.All')
+    $tenant = if ($TenantId) { $TenantId.Trim() } else { 'organizations' }
     try {
-        Start-UiOperation -Text "Signing in to Entra ID (complete sign-in in the browser)..." -Stage "Authenticating"
-        Write-UiLog "Launching Microsoft Graph interactive sign-in (scopes: $($scopes -join ', '))..."
+        Start-UiOperation -Text "Requesting a device code..." -Stage "Device code"
+        Write-UiLog "Starting Microsoft Graph device-code sign-in (scopes: $($scopes -join ', '))..."
 
-        $connectParams = @{ Scopes = $scopes; NoWelcome = $true; ErrorAction = 'Stop' }
-        if ($TenantId) { $connectParams['TenantId'] = $TenantId }
+        $deviceBody = @{
+            client_id = $clientId
+            scope     = ($scopes -join ' ')
+        }
+        $deviceUri = "https://login.microsoftonline.com/$([uri]::EscapeDataString($tenant))/oauth2/v2.0/devicecode"
+        $device = Invoke-RestMethod -Method Post -Uri $deviceUri -Body $deviceBody -ContentType 'application/x-www-form-urlencoded' -ErrorAction Stop
 
-        Connect-MgGraph @connectParams
+        $userCode = "$(Get-DirectoryAttributeValue $device 'user_code')".Trim()
+        $deviceCode = "$(Get-DirectoryAttributeValue $device 'device_code')".Trim()
+        if ([string]::IsNullOrWhiteSpace($userCode) -or [string]::IsNullOrWhiteSpace($deviceCode)) {
+            throw "The device-code endpoint did not return a user code."
+        }
+
+        $copied = $false
+        try {
+            Set-Clipboard -Value $userCode
+            $copied = $true
+        }
+        catch {
+            Write-UiLog "Could not copy the device code to the clipboard. Copy it from the dialog." -Level Warning
+        }
+        $prompt = Get-DeviceCodePromptText $device -CopiedToClipboard:$copied
+        Write-UiLog $prompt -Level Warning
+        Invoke-UiRefresh
+        [System.Windows.MessageBox]::Show($prompt, 'Device code sign-in', 'OK', 'Information') | Out-Null
+
+        $interval = 5
+        $intervalRaw = Get-DirectoryAttributeValue $device 'interval'
+        $intervalParsed = 0
+        if ([int]::TryParse("$intervalRaw", [ref]$intervalParsed) -and $intervalParsed -ge 1) {
+            $interval = $intervalParsed
+        }
+        $expiresIn = 900
+        $expiresRaw = Get-DirectoryAttributeValue $device 'expires_in'
+        $expiresParsed = 0
+        if ([int]::TryParse("$expiresRaw", [ref]$expiresParsed) -and $expiresParsed -ge 30) {
+            $expiresIn = $expiresParsed
+        }
+        $deadline = (Get-Date).AddSeconds($expiresIn)
+        $tokenUri = "https://login.microsoftonline.com/$([uri]::EscapeDataString($tenant))/oauth2/v2.0/token"
+        $accessToken = $null
+
+        $script:UI.Window.Dispatcher.Invoke([action] {
+            $script:UI.StatusText.Text = "Waiting for device-code sign-in ($userCode)..."
+        })
+
+        while ((Get-Date) -lt $deadline) {
+            Wait-UiInterval -Seconds $interval
+            if ((Get-Date) -ge $deadline) { break }
+            try {
+                $tokenResponse = Invoke-RestMethod -Method Post -Uri $tokenUri -Body @{
+                    grant_type  = 'urn:ietf:params:oauth:grant-type:device_code'
+                    client_id   = $clientId
+                    device_code = $deviceCode
+                } -ContentType 'application/x-www-form-urlencoded' -ErrorAction Stop
+                $accessToken = "$(Get-DirectoryAttributeValue $tokenResponse 'access_token')"
+                if ([string]::IsNullOrWhiteSpace($accessToken)) {
+                    throw "Sign-in completed but no access token was returned."
+                }
+                break
+            }
+            catch {
+                $oauthError = Get-OAuthErrorCode $_
+                if ($oauthError -eq 'authorization_pending') { continue }
+                if ($oauthError -eq 'slow_down') { $interval += 5; continue }
+                if ($oauthError -eq 'authorization_declined' -or $oauthError -eq 'access_denied') {
+                    throw "Sign-in was declined."
+                }
+                if ($oauthError -eq 'expired_token') {
+                    throw "The device code expired before sign-in completed."
+                }
+                throw
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($accessToken)) {
+            throw "The device code expired before sign-in completed."
+        }
+
+        Write-UiLog "Device-code sign-in completed. Connecting Microsoft Graph..."
+        $claims = Get-JwtPayload $accessToken
+        Connect-MgGraphWithAccessToken -Token $accessToken
+        # The SDK now holds the token. Don't keep another copy in this function.
+        $accessToken = $null
+        $tokenResponse = $null
 
         $ctx = Get-MgContext
         if (-not $ctx) { throw "No Graph context returned after sign-in." }
+
+        $account = "$(Get-DirectoryAttributeValue $ctx 'Account')"
+        $tenantIdShown = "$(Get-DirectoryAttributeValue $ctx 'TenantId')"
+        if ([string]::IsNullOrWhiteSpace($account)) {
+            foreach ($claimName in @('preferred_username', 'upn', 'unique_name', 'email')) {
+                $claim = "$(Get-DirectoryAttributeValue $claims $claimName)"
+                if (-not [string]::IsNullOrWhiteSpace($claim)) { $account = $claim; break }
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($tenantIdShown)) {
+            $tenantIdShown = "$(Get-DirectoryAttributeValue $claims 'tid')"
+        }
+        if ([string]::IsNullOrWhiteSpace($account)) { $account = '(signed in)' }
+        $claims = $null
 
         # Fetch tenant org details for the header.
         $org = $null
         try { $org = Get-MgOrganization -ErrorAction Stop | Select-Object -First 1 } catch {}
 
+        $scopeText = (@(Get-DirectoryAttributeValue $ctx 'Scopes') | Where-Object { -not [string]::IsNullOrWhiteSpace("$_") }) -join ', '
+        if ([string]::IsNullOrWhiteSpace($scopeText)) { $scopeText = ($scopes -join ', ') }
+
         $script:State.Connected = $true
         $script:State.TenantInfo = [pscustomobject]@{
-            Account   = $ctx.Account
-            TenantId  = $ctx.TenantId
+            Account   = $account
+            TenantId  = $tenantIdShown
             OrgName   = if ($org) { $org.DisplayName } else { '(unknown)' }
-            Scopes    = ($ctx.Scopes -join ', ')
+            Scopes    = $scopeText
         }
 
         $script:UI.Window.Dispatcher.Invoke([action] {
@@ -489,7 +690,7 @@ function Connect-EntraTenant {
             $script:UI.ScanButton.IsEnabled = $true
         })
 
-        Write-UiLog "Connected to '$($script:State.TenantInfo.OrgName)' as $($ctx.Account)." -Level Success
+        Write-UiLog "Connected to '$($script:State.TenantInfo.OrgName)' as $account." -Level Success
     }
     catch {
         Write-UiLog "Sign-in failed: $($_.Exception.Message)" -Level Error
@@ -1481,7 +1682,7 @@ function Export-SyncErrorRecords {
         <!-- ===== Toolbar ===== -->
         <Border Grid.Row="1" Background="#FF20202E" Padding="16,10">
             <StackPanel Orientation="Horizontal">
-                <Button x:Name="ConnectButton" Content="Connect to Entra ID" Style="{StaticResource AccentButton}"/>
+                <Button x:Name="ConnectButton" Content="Connect with device code" Style="{StaticResource AccentButton}"/>
                 <Button x:Name="ScanButton" Content="Scan Sync Errors" Style="{StaticResource AccentButton}" IsEnabled="False"/>
                 <CheckBox x:Name="CrossRefCheck" Content="Cross-reference on-prem AD" Foreground="#FFCCCCDD" VerticalAlignment="Center" Margin="12,0" IsChecked="True"/>
                 <Separator Margin="8,0" Background="#FF3A3A50"/>
@@ -1741,7 +1942,7 @@ $window.Add_Closing({
 
 $window.Add_Loaded({
     Write-UiLog "Entra ID Sync Error Analyzer started (PowerShell $($PSVersionTable.PSVersion))." -Level Success
-    Write-UiLog "Step 1: Click 'Connect to Entra ID' to sign in. Step 2: Click 'Scan Sync Errors'."
+    Write-UiLog "Step 1: Click 'Connect with device code' and finish sign-in at https://microsoft.com/devicelogin. Step 2: Click 'Scan Sync Errors'."
     # Best-effort AD module load so the scanner tab is usable immediately.
     Initialize-AdModule | Out-Null
 })
