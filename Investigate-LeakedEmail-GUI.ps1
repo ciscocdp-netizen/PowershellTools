@@ -522,6 +522,7 @@ function Get-InvestigationParameters {
         ResolveSenderAliases = [bool]$script:ChkAliases.Checked
         AuditThroughNow = [bool]$script:ChkAuditNow.Checked
         LooseSubjectMatch = [bool]$script:ChkLoose.Checked
+        FastSubjectSearch = [bool]$script:ChkFastSubject.Checked
         SkipConnectionCheck = $false
     }
 }
@@ -597,6 +598,7 @@ function Save-InvestigationProfile {
         ResolveSenderAliases = [bool]$script:ChkAliases.Checked
         AuditThroughNow = [bool]$script:ChkAuditNow.Checked
         LooseSubjectMatch = [bool]$script:ChkLoose.Checked
+        FastSubjectSearch = [bool]$script:ChkFastSubject.Checked
     }
     $profile | ConvertTo-Json | Set-Content -LiteralPath $dialog.FileName -Encoding UTF8
     Add-UiLog ("Saved profile {0}" -f $dialog.FileName)
@@ -627,6 +629,9 @@ function Restore-InvestigationProfile {
     $script:ChkAliases.Checked = [bool]$loaded.ResolveSenderAliases
     $script:ChkAuditNow.Checked = [bool]$loaded.AuditThroughNow
     $script:ChkLoose.Checked = [bool]$loaded.LooseSubjectMatch
+    if ($null -ne $loaded.PSObject.Properties['FastSubjectSearch']) {
+        $script:ChkFastSubject.Checked = [bool]$loaded.FastSubjectSearch
+    }
     Add-UiLog ("Loaded profile {0}" -f $dialog.FileName)
 }
 
@@ -867,7 +872,7 @@ $script:FieldsPanel.Controls.AddRange(@(
 
 $script:OptionsPanel = New-Object System.Windows.Forms.FlowLayoutPanel
 $script:OptionsPanel.Dock = 'Top'
-$script:OptionsPanel.Height = 78
+$script:OptionsPanel.Height = 100
 $script:OptionsPanel.Padding = New-Object System.Windows.Forms.Padding(12, 0, 12, 0)
 $script:OptionsPanel.BackColor = $script:Page
 $script:OptionsPanel.WrapContents = $true
@@ -894,10 +899,11 @@ $script:ChkHigh = New-Option 'High' 'High-completeness audit' $true 'Ask the aud
 $script:ChkDetail = New-Option 'Detail' 'Trace detail' $false 'Call Get-MessageTraceDetailV2 for related rows, external recipients first. Slower.'
 $script:ChkAliases = New-Option 'Aliases' 'Resolve sender aliases' $true 'Treat the sender mailbox aliases as the original sender.'
 $script:ChkAuditNow = New-Option 'Now' 'Search opens through now' $true 'Look for opens up to the current time, even if the trace window ended earlier.'
-$script:ChkLoose = New-Option 'Loose' 'Loose subject match' $false 'Include subjects that contain the text after prefixes are removed. More false positives.'
+$script:ChkLoose = New-Option 'Loose' 'Loose subject match' $false 'Include subjects that contain the text after prefixes are removed. More false positives, and the trace uses the slower Contains search.'
+$script:ChkFastSubject = New-Option 'FastSubject' 'Fast subject search' $true 'Match subjects that end with this text. FW: and RE: still match. Uncheck for a slower Contains scan of every subject that includes the text.'
 $script:OptionsPanel.Controls.AddRange(@(
     $script:ChkAuto, $script:ChkDisabled, $script:ChkPolicy, $script:ChkOpens, $script:ChkAuditAll,
-    $script:ChkHigh, $script:ChkDetail, $script:ChkAliases, $script:ChkAuditNow, $script:ChkLoose
+    $script:ChkHigh, $script:ChkDetail, $script:ChkAliases, $script:ChkAuditNow, $script:ChkLoose, $script:ChkFastSubject
 ))
 
 $buttonPanel = New-Object System.Windows.Forms.FlowLayoutPanel

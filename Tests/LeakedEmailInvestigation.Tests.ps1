@@ -218,6 +218,10 @@ $traced = Get-MessageTracePages -StartUtc ([datetime]::SpecifyKind([datetime]'20
 Assert-Equal 'deduped trace rows' @($traced.Rows).Count 3
 Assert-True 'paging moved cursor' ($state.Calls.Count -ge 2)
 Assert-True 'first page has no cursor' ([string]::IsNullOrEmpty([string]$state.Calls[0].StartingRecipient))
+Assert-Equal 'default subject filter' $state.Calls[0].SubjectFilterType 'EndsWith'
+Assert-Equal 'fast filter' (Get-SubjectTraceFilterType -FastSubjectSearch $true -LooseSubjectMatch $false) 'EndsWith'
+Assert-Equal 'broad filter' (Get-SubjectTraceFilterType -FastSubjectSearch $false -LooseSubjectMatch $false) 'Contains'
+Assert-Equal 'loose filter' (Get-SubjectTraceFilterType -FastSubjectSearch $true -LooseSubjectMatch $true) 'Contains'
 
 $windows = @{ Calls = (New-Object System.Collections.Generic.List[object]) }
 $windowFetch = {
@@ -353,11 +357,12 @@ Export-InvestigationReport -Report $formula | Out-Null
 $formulaCsv = Get-Content -LiteralPath (Join-Path $formula.OutputFolder 'A_OriginalRecipients.csv') -Raw
 Assert-True 'formula neutralized' ($formulaCsv -match "'=cmd")
 
-$calls = @{ Trace = 0; Mail = (New-Object System.Collections.Generic.List[string]); Rules = 0; AuditUsers = (New-Object System.Collections.Generic.List[object]); High = $false }
+$calls = @{ Trace = 0; Mail = (New-Object System.Collections.Generic.List[string]); Rules = 0; AuditUsers = (New-Object System.Collections.Generic.List[object]); High = $false; Filters = (New-Object System.Collections.Generic.List[string]) }
 $deps = [pscustomobject]@{
     GetAcceptedDomains = { @('contoso.com') }
     FetchTracePage = {
         param($Query)
+        $calls.Filters.Add([string]$Query.SubjectFilterType)
         $calls.Trace++
         if ($calls.Trace -gt 1) { return @() }
         @(
@@ -421,6 +426,7 @@ $deps = [pscustomobject]@{
 }
 $out = Join-Path $temp 'invoke'
 $inv = Invoke-LeakedEmailInvestigation -Subject "FW: $cleanSubject" -OriginalSender 'hr@contoso.com' -StartDate ([datetime]'2026-09-25') -EndDate ([datetime]'2026-09-25') -OutputFolder $out -CheckAutoForwarding $true -CheckTransportPolicy $true -SkipConnectionCheck $true -ResolveSenderAliases $true -AuditThroughNow $false -FastAudit $false -Dependencies $deps -AdditionalAuditUsers @('delegate@contoso.com') -AuditBatchSize 50
+Assert-Equal 'invoke uses endswith' $calls.Filters[0] 'EndsWith'
 Assert-Equal 'invoke original' $inv.Summary.OriginalRecipients 1
 Assert-Equal 'invoke external forward' $inv.Summary.PropagationExternal 1
 Assert-True 'alias lookup happened' ($calls.Mail -contains 'hr@contoso.com')
@@ -439,6 +445,23 @@ Assert-True 'high completeness requested' $calls.High
 Assert-Equal 'invoke open via upn' $inv.Opened[0].ReceivedVia 'Original'
 Assert-True 'summary file exists' (Test-Path -LiteralPath (Join-Path $out 'Summary.txt'))
 Assert-Equal 'end date includes day' $inv.EndDate.Hour 23
+
+$fallbackCalls = New-Object System.Collections.Generic.List[string]
+$fallbackDeps = [pscustomobject]@{
+    GetAcceptedDomains = { @('contoso.com') }
+    FetchTracePage = {
+        param($Query)
+        $fallbackCalls.Add([string]$Query.SubjectFilterType)
+        if ($Query.SubjectFilterType -eq 'Contains') {
+            return @(New-Trace '2026-09-25T12:00:00Z' 'hr@contoso.com' 'alice@contoso.com' $cleanSubject '<orig@contoso.com>')
+        }
+        return @()
+    }
+}
+$fallback = Invoke-LeakedEmailInvestigation -Subject $cleanSubject -OriginalSender 'hr@contoso.com' -StartDate ([datetime]'2026-09-25') -EndDate ([datetime]'2026-09-25') -OutputFolder (Join-Path $temp 'fallback') -SkipConnectionCheck $true -SkipOpenAudit $true -ResolveSenderAliases $false -FastSubjectSearch $true -Dependencies $fallbackDeps
+Assert-Equal 'endswith tried first' $fallbackCalls[0] 'EndsWith'
+Assert-Equal 'contains fallback' $fallbackCalls[1] 'Contains'
+Assert-Equal 'fallback found original' $fallback.Summary.OriginalRecipients 1
 
 Remove-Item -LiteralPath $temp -Recurse -Force
 

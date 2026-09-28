@@ -31,6 +31,9 @@
   - Get-MessageTraceV2 is a remote command created by Connect-ExchangeOnline.
     Importing ExchangeOnlineManagement does not add it, so sign-in is not
     rejected just because the command is absent before the session exists.
+  - Subject search uses EndsWith unless loose matching is requested. Forwards
+    and replies still match because their prefixes sit in front of the subject.
+    Contains is the slow fallback when EndsWith returns nothing.
 #>
 
 $script:InvCtx = $null
@@ -372,11 +375,21 @@ function ConvertTo-TraceRow {
     }
 }
 
+function Get-SubjectTraceFilterType {
+    param(
+        [bool]$FastSubjectSearch = $true,
+        [bool]$LooseSubjectMatch = $false
+    )
+    if ($LooseSubjectMatch -or -not $FastSubjectSearch) { return 'Contains' }
+    return 'EndsWith'
+}
+
 function Get-MessageTracePages {
     param(
         [datetime]$StartUtc,
         [datetime]$EndUtc,
         [string]$SubjectText,
+        [string]$SubjectFilterType = 'EndsWith',
         [int]$PageSize = 5000,
         [scriptblock]$FetchPage,
         [int]$MaxRows = 200000
@@ -414,6 +427,7 @@ function Get-MessageTracePages {
                 StartingRecipient   = $startingRecipient
                 PageSize            = $PageSize
                 Subject             = $SubjectText
+                SubjectFilterType   = $SubjectFilterType
             }
             $page = ConvertTo-ItemArray (& $FetchPage $query)
             $added = 0
@@ -1918,11 +1932,13 @@ function New-DefaultInvestigationDependencies {
         }
         FetchTracePage = {
             param($Query)
+            $filterType = [string](Get-ObjectProperty $Query 'SubjectFilterType')
+            if ([string]::IsNullOrWhiteSpace($filterType)) { $filterType = 'EndsWith' }
             $params = @{
                 StartDate         = $Query.WindowStart
                 EndDate           = $Query.PageEnd
                 Subject           = $Query.Subject
-                SubjectFilterType = 'Contains'
+                SubjectFilterType = $filterType
                 ResultSize        = $Query.PageSize
             }
             if ($Query.StartingRecipient) { $params.StartingRecipientAddress = $Query.StartingRecipient }
@@ -2017,6 +2033,7 @@ function Invoke-LeakedEmailInvestigation {
         [bool]$ResolveSenderAliases = $true,
         [bool]$AuditThroughNow = $true,
         [bool]$LooseSubjectMatch = $false,
+        [bool]$FastSubjectSearch = $true,
         [bool]$SkipConnectionCheck = $false,
         [int]$TracePageSize = 5000,
         [int]$AuditPageSize = 5000,
@@ -2109,8 +2126,13 @@ function Invoke-LeakedEmailInvestigation {
 
         $utcStart = ConvertTo-UtcFromLocal -Value $range.Start
         $utcEnd = ConvertTo-UtcFromLocal -Value $queryEnd
-        Update-InvProgress -Percent 15 -Phase 'Trace' -Message ("Tracing '{0}'" -f $searchInfo.Subject)
-        $pages = Get-MessageTracePages -StartUtc $utcStart -EndUtc $utcEnd -SubjectText $searchInfo.Subject -PageSize $TracePageSize -FetchPage $Dependencies.FetchTracePage -MaxRows $MaxTraceRows
+        $filterType = Get-SubjectTraceFilterType -FastSubjectSearch $FastSubjectSearch -LooseSubjectMatch $LooseSubjectMatch
+        Update-InvProgress -Percent 15 -Phase 'Trace' -Message ("Tracing '{0}' ({1})" -f $searchInfo.Subject, $filterType)
+        $pages = Get-MessageTracePages -StartUtc $utcStart -EndUtc $utcEnd -SubjectText $searchInfo.Subject -SubjectFilterType $filterType -PageSize $TracePageSize -FetchPage $Dependencies.FetchTracePage -MaxRows $MaxTraceRows
+        if ($filterType -eq 'EndsWith' -and -not $pages.Cancelled -and @($pages.Rows).Count -eq 0) {
+            Write-InvLog -Level 'WARN' -Message 'EndsWith found no trace rows. Retrying with Contains in case a gateway appended text to the subject.'
+            $pages = Get-MessageTracePages -StartUtc $utcStart -EndUtc $utcEnd -SubjectText $searchInfo.Subject -SubjectFilterType 'Contains' -PageSize $TracePageSize -FetchPage $Dependencies.FetchTracePage -MaxRows $MaxTraceRows
+        }
         Write-InvLog -Level 'INFO' -Message ("{0} unique trace rows collected" -f @($pages.Rows).Count)
 
         $report = New-LeakedEmailReport -TraceRows $pages.Rows -Subject $Subject -OriginalSender $OriginalSender -SenderAddresses $senderAddresses -InternalDomains $domains -MessageId $MessageId -LooseSubjectMatch $LooseSubjectMatch -StartDate $range.Start -EndDate $range.End -OutputFolder $OutputFolder

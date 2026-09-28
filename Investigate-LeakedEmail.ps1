@@ -38,6 +38,7 @@ param(
     [switch]$SkipSenderAliasLookup,
     [switch]$LimitAuditToEndDate,
     [switch]$LooseSubjectMatch,
+    [switch]$ContainsSubject,
     [switch]$PassThru
 )
 
@@ -79,6 +80,7 @@ try {
         -ResolveSenderAliases:(-not [bool]$SkipSenderAliasLookup) `
         -AuditThroughNow:(-not [bool]$LimitAuditToEndDate) `
         -LooseSubjectMatch:([bool]$LooseSubjectMatch) `
+        -FastSubjectSearch:(-not [bool]$ContainsSubject) `
         -LogHandler $log
 
     Write-Host ""
