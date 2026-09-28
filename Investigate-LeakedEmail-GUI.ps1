@@ -503,7 +503,7 @@ catch {
 function Show-RemovalConfirm {
     param($Plan)
     $dialog = New-Object System.Windows.Forms.Form
-    $dialog.Text = 'Remove from internal mailboxes'
+    $dialog.Text = 'Purge email from internal mailboxes'
     $dialog.StartPosition = 'CenterParent'
     $dialog.FormBorderStyle = 'FixedDialog'
     $dialog.MaximizeBox = $false
@@ -1066,40 +1066,28 @@ $script:OptionsPanel.Controls.AddRange(@(
 
 $buttonPanel = New-Object System.Windows.Forms.FlowLayoutPanel
 $buttonPanel.Dock = 'Top'
-$buttonPanel.Height = 46
+$buttonPanel.Height = 84
 $buttonPanel.Padding = New-Object System.Windows.Forms.Padding(12, 0, 12, 0)
 $buttonPanel.BackColor = $script:Page
-$buttonPanel.WrapContents = $false
+$buttonPanel.WrapContents = $true
 $script:RunButton = New-FlatButton 'Run investigation' 160 $script:Green { Start-Investigation }
 $script:CancelButton = New-FlatButton 'Cancel' 100 $script:Red { Stop-Investigation }
 $script:CancelButton.Enabled = $false
+$script:RemoveButton = New-FlatButton 'Purge email' 130 $script:Red { Start-Removal }
+$script:RemoveButton.Enabled = $false
+$tip.SetToolTip($script:RemoveButton, 'Delete the leaked message from internal mailboxes found by the last run. The button turns on after an investigation. You must type REMOVE.')
 $exportAll = New-FlatButton 'Export all' 110 $script:Blue { Export-AllReports }
 $openFolder = New-FlatButton 'Open folder' 110 $script:Teal { Open-ReportFolder }
 $copySummary = New-FlatButton 'Copy summary' 120 $script:Slate { Copy-InvestigationSummary }
 $saveProfile = New-FlatButton 'Save profile' 110 $script:Slate { Save-InvestigationProfile }
 $loadProfile = New-FlatButton 'Load profile' 110 $script:Slate { Restore-InvestigationProfile }
 $script:Progress = New-Object System.Windows.Forms.ProgressBar
-$script:Progress.Width = 180
+$script:Progress.Width = 140
 $script:Progress.Height = 18
 $script:Progress.Margin = New-Object System.Windows.Forms.Padding(8, 12, 0, 0)
 $script:Progress.Minimum = 0
 $script:Progress.Maximum = 100
-$buttonPanel.Controls.AddRange(@($script:RunButton, $script:CancelButton, $exportAll, $openFolder, $copySummary, $saveProfile, $loadProfile, $script:Progress))
-
-$removePanel = New-Object System.Windows.Forms.Panel
-$removePanel.Dock = 'Top'
-$removePanel.Height = 40
-$removePanel.BackColor = $script:Page
-$script:RemoveButton = New-FlatButton 'Remove from internal mailboxes' 250 $script:Red { Start-Removal }
-$script:RemoveButton.Enabled = $false
-$script:RemoveButton.Location = New-Object System.Drawing.Point(12, 4)
-$removeHint = New-Object System.Windows.Forms.Label
-$removeHint.Text = 'Deletes only internal copies found by the last investigation. Asks you to type REMOVE.'
-$removeHint.AutoSize = $true
-$removeHint.Location = New-Object System.Drawing.Point(274, 10)
-$removeHint.ForeColor = $script:Muted
-$removeHint.Font = New-UiFont 8
-$removePanel.Controls.AddRange(@($script:RemoveButton, $removeHint))
+$buttonPanel.Controls.AddRange(@($script:RunButton, $script:CancelButton, $script:RemoveButton, $exportAll, $openFolder, $copySummary, $saveProfile, $loadProfile, $script:Progress))
 
 $cardPanel = New-Object System.Windows.Forms.FlowLayoutPanel
 $cardPanel.Dock = 'Top'
@@ -1213,7 +1201,6 @@ $split.Panel2.Controls.Add($logHeader)
 $form.Controls.Add($split)
 $form.Controls.Add($status)
 $form.Controls.Add($cardPanel)
-$form.Controls.Add($removePanel)
 $form.Controls.Add($buttonPanel)
 $form.Controls.Add($script:OptionsPanel)
 $form.Controls.Add($script:FieldsPanel)
