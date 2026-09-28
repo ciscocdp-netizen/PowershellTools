@@ -497,7 +497,7 @@ catch {
         $Sync.Status = "Removal cancelled"
     }
     else {
-        $Sync.ErrorMessage = $_.Exception.Message
+        $Sync.ErrorMessage = ConvertTo-RemovalErrorMessage $_.Exception.Message
         $Sync.Log.Enqueue(("ERROR  {0}" -f $_.Exception.Message))
         $Sync.State = "RemovalError"
     }

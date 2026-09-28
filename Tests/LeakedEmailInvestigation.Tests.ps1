@@ -519,6 +519,10 @@ $externalOnly = New-LeakedEmailReport -TraceRows @(
 $externalPlan = Get-InternalRemovalPlan -Report $externalOnly
 Assert-Equal 'external plan has no mailbox' @($externalPlan.Mailboxes).Count 0
 
+$searchError = ConvertTo-RemovalErrorMessage 'Please close the current PowerShell session and open a new session using Connect-IPPSSession with the -EnableSearchOnlySession flag. This requires using ExchangeOnlineManagement v3.9.0 or higher. Compliance search initialization failed with exception: An error occurred while sending the request.'
+Assert-True 'search session error names the module' ($searchError -match '3\.9\.0')
+Assert-True 'search session error is short' ($searchError.Length -lt 400)
+
 $remoteCommands = @(Get-InvestigationRemoteCommandNames)
 Assert-True 'remote command list includes trace' ($remoteCommands -contains 'Get-MessageTraceV2')
 Assert-True 'remote command list includes detail' ($remoteCommands -contains 'Get-MessageTraceDetailV2')

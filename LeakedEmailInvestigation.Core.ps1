@@ -1872,20 +1872,72 @@ function Get-InternalRemovalPlan {
     }
 }
 
+function ConvertTo-RemovalErrorMessage {
+    param([string]$Message)
+    if ([string]::IsNullOrWhiteSpace($Message)) { return 'The purge failed.' }
+    if ($Message -match 'EnableSearchOnlySession' -or $Message -match '3\.9\.0') {
+        return 'Purge needs a search-only compliance session. Update Exchange Online Management to 3.9.0 or newer (Update-Module ExchangeOnlineManagement), close this window, and try Purge email again. The account also needs the Search And Purge role in Microsoft Purview.'
+    }
+    if ($Message -match 'sending the request') {
+        return 'Compliance search did not accept the request. Update Exchange Online Management to 3.9.0 or newer, close this window, and try again. The account also needs the Search And Purge role in Microsoft Purview.'
+    }
+    return $Message
+}
+
+function Disconnect-ComplianceConnections {
+    $infoCommand = Get-Command Get-ConnectionInformation -ErrorAction SilentlyContinue
+    $disconnect = Get-Command Disconnect-ExchangeOnline -ErrorAction SilentlyContinue
+    if (-not $infoCommand -or -not $disconnect -or -not $disconnect.Parameters.ContainsKey('ConnectionId')) { return }
+    foreach ($info in @(Get-ConnectionInformation -ErrorAction SilentlyContinue)) {
+        $blob = @(
+            [string](Get-ObjectProperty $info 'ConnectionUri'),
+            [string](Get-ObjectProperty $info 'Name'),
+            [string](Get-ObjectProperty $info 'ModuleName'),
+            [string](Get-ObjectProperty $info 'ConnectionType')
+        ) -join ' '
+        if ($blob -notmatch 'compliance|IPPS|protection\.outlook|Compliance|SearchOnly') { continue }
+        $id = Get-ObjectProperty $info 'ConnectionId'
+        if ($id) {
+            Disconnect-ExchangeOnline -ConnectionId $id -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+        }
+    }
+}
+
+function Connect-ComplianceSearchSession {
+    param([string]$UserPrincipalName)
+    $modules = @(Get-Module -ListAvailable -Name ExchangeOnlineManagement | Sort-Object Version -Descending)
+    if ($modules.Count -eq 0) {
+        throw 'ExchangeOnlineManagement is not installed. Run: Install-Module ExchangeOnlineManagement -Scope CurrentUser'
+    }
+    $best = $modules[0]
+    if ([version]$best.Version -lt [version]'3.9.0') {
+        throw "Purge requires ExchangeOnlineManagement 3.9.0 or newer. Installed version is $($best.Version). Run: Update-Module ExchangeOnlineManagement. Then close this window and open the script again."
+    }
+    $loaded = @(Get-Module -Name ExchangeOnlineManagement | Sort-Object Version -Descending)
+    if ($loaded.Count -gt 0 -and [version]$loaded[0].Version -lt [version]'3.9.0') {
+        throw "This window loaded ExchangeOnlineManagement $($loaded[0].Version). Purge needs 3.9.0 or newer. Run Update-Module ExchangeOnlineManagement, close this window, and open the script again."
+    }
+    if ($loaded.Count -eq 0) {
+        Import-Module ExchangeOnlineManagement -RequiredVersion $best.Version -ErrorAction Stop
+    }
+    $connect = Get-Command Connect-IPPSSession -ErrorAction Stop
+    if (-not $connect.Parameters.ContainsKey('EnableSearchOnlySession')) {
+        throw 'This ExchangeOnlineManagement build cannot open a search-only compliance session. Run: Update-Module ExchangeOnlineManagement. Then close this window and open the script again.'
+    }
+    Disconnect-ComplianceConnections
+    if ($UserPrincipalName) {
+        Connect-IPPSSession -ShowBanner:$false -EnableSearchOnlySession -UserPrincipalName $UserPrincipalName
+    }
+    else {
+        Connect-IPPSSession -ShowBanner:$false -EnableSearchOnlySession
+    }
+}
+
 function Get-DefaultRemovalDependencies {
     return [pscustomobject]@{
         ConnectCompliance = {
             param($Upn)
-            if (Get-Command New-ComplianceSearch -ErrorAction SilentlyContinue) { return }
-            if (-not (Get-Command Connect-IPPSSession -ErrorAction SilentlyContinue)) {
-                Import-Module ExchangeOnlineManagement -ErrorAction Stop
-            }
-            if ($Upn) {
-                Connect-IPPSSession -ShowBanner:$false -UserPrincipalName $Upn
-            }
-            else {
-                Connect-IPPSSession -ShowBanner:$false
-            }
+            Connect-ComplianceSearchSession -UserPrincipalName $Upn
         }
         NewSearch = {
             param($Name, $Mailboxes, $Query)
@@ -2007,7 +2059,7 @@ function Invoke-InternalMessageRemoval {
                 if ($search.Status -eq 'Failed' -or $search.Status -eq 'Stopped') {
                     $detail = $search.Results
                     if (-not $detail) { $detail = 'The compliance search failed.' }
-                    throw "Compliance search $name failed: $detail"
+                    throw (ConvertTo-RemovalErrorMessage "Compliance search $name failed: $detail")
                 }
                 $count = 0
                 if ($null -ne $search.Items) { $count = [int]$search.Items }
@@ -2023,7 +2075,7 @@ function Invoke-InternalMessageRemoval {
                 if ($action.Status -eq 'Failed' -or $action.Status -eq 'Stopped') {
                     $detail = $action.Results
                     if (-not $detail) { $detail = 'The purge action failed.' }
-                    throw "Purge action $actionName failed: $detail"
+                    throw (ConvertTo-RemovalErrorMessage "Purge action $actionName failed: $detail")
                 }
                 $actions.Add([pscustomobject]@{
                     Search = $name
