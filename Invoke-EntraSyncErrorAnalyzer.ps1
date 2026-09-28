@@ -16,6 +16,8 @@
         states explicitly that the mailNickname attribute has a null value.
       * Lets you scan Active Directory ad-hoc for any user and inspect the attributes that
         commonly break directory synchronization.
+      * Compares AD accounts with Entra accounts and lists mismatches (source anchor, UPN,
+        mail, mailNickname, proxy addresses, enabled state, and accounts present on only one side).
       * Exports findings to CSV / HTML.
 
     Everything runs inside a single robust, modern-looking dark-themed WPF window.
@@ -68,6 +70,7 @@ $script:State = [ordered]@{
     Connected        = $false
     TenantInfo       = $null
     SyncErrorRecords = New-Object System.Collections.ObjectModel.ObservableCollection[object]
+    AccountMismatches = New-Object System.Collections.ObjectModel.ObservableCollection[object]
     AdModuleLoaded   = $false
     GraphModule      = $null
     Stopwatch        = New-Object System.Diagnostics.Stopwatch
@@ -811,6 +814,9 @@ function Connect-EntraTenant {
             $script:UI.TenantLabel.Text = "$($script:State.TenantInfo.OrgName)  |  $($script:State.TenantInfo.Account)"
             $script:UI.ConnectButton.Content = "Reconnect"
             $script:UI.ScanButton.IsEnabled = $true
+            if ($script:UI.CompareButton) {
+                $script:UI.CompareButton.IsEnabled = [bool]$script:State.AdModuleLoaded
+            }
         })
 
         Write-UiLog "Connected to '$($script:State.TenantInfo.OrgName)' as $account." -Level Success
@@ -1953,28 +1959,549 @@ function Search-ActiveDirectoryUser {
     }
 }
 
-function Export-SyncErrorRecords {
-    param([ValidateSet('CSV', 'HTML')][string]$Format = 'CSV')
+function ConvertTo-SourceAnchorBase64 {
+    <#
+        Entra onPremisesImmutableId is the base64 form of the source anchor.
+        AD objectGUID and ms-DS-ConsistencyGuid arrive as a Guid or a byte array.
+        A value that is already that base64 string is returned unchanged.
+        Base64 is case-sensitive, so callers must compare the result with -ceq.
+    #>
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [guid]) {
+        return [System.Convert]::ToBase64String($Value.ToByteArray())
+    }
+    if ($Value -is [byte[]]) {
+        if ($Value.Length -eq 0) { return $null }
+        return [System.Convert]::ToBase64String($Value)
+    }
+    # A one-byte array is unwrapped to a single byte when it is returned from a function.
+    if ($Value -is [byte]) {
+        return [System.Convert]::ToBase64String([byte[]]@($Value))
+    }
+    if ($Value -is [System.Array] -and $Value.Length -gt 0 -and $Value[0] -is [byte]) {
+        return [System.Convert]::ToBase64String([byte[]]$Value)
+    }
+    $text = "$Value".Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    $parsed = [guid]::Empty
+    if ([guid]::TryParse($text, [ref]$parsed)) {
+        return [System.Convert]::ToBase64String($parsed.ToByteArray())
+    }
+    return $text
+}
 
-    if ($script:State.SyncErrorRecords.Count -eq 0) {
-        [System.Windows.MessageBox]::Show("There is nothing to export. Run a scan first.", 'Nothing to Export', 'OK', 'Information') | Out-Null
+function Get-PrimarySmtpAddress {
+    <#
+        Uppercase SMTP: is the primary address. A lowercase smtp: entry is not.
+    #>
+    param($ProxyAddresses)
+    foreach ($pa in @($ProxyAddresses)) {
+        if (Test-IsBlankAttributeValue $pa) { continue }
+        if ("$pa" -cmatch '^SMTP:(.+)$') { return $Matches[1].Trim() }
+    }
+    return $null
+}
+
+function Get-SmtpAddressList {
+    <#
+        Bare SMTP addresses, lowercased, one each. Empty input returns nothing
+        so the caller does not treat an empty array as a single blank row.
+    #>
+    param($ProxyAddresses)
+    $set = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+    foreach ($pa in @($ProxyAddresses)) {
+        if (Test-IsBlankAttributeValue $pa) { continue }
+        if ("$pa" -match '^(?i)smtp:(.+)$') {
+            $bare = $Matches[1].Trim().ToLower()
+            if ([string]::IsNullOrWhiteSpace($bare) -or $seen.ContainsKey($bare)) { continue }
+            $seen[$bare] = $true
+            [void]$set.Add($bare)
+        }
+    }
+    if ($set.Count -eq 0) { return }
+    Write-Output -NoEnumerate $set.ToArray()
+}
+
+function ConvertTo-ComparableAccount {
+    <#
+        One shape for an AD user and an Entra user so the compare does not care
+        which directory the property names came from.
+    #>
+    param(
+        $Raw,
+        [Parameter(Mandatory)][ValidateSet('AD', 'Entra')][string]$Source
+    )
+    if ($null -eq $Raw) { return $null }
+
+    if ($Source -eq 'AD') {
+        $objectGuid = Get-DirectoryAttributeValue $Raw 'objectGUID'
+        $consistency = Get-DirectoryAttributeValue $Raw 'mS-DS-ConsistencyGuid'
+        $guidAnchor = ConvertTo-SourceAnchorBase64 $objectGuid
+        $consistencyAnchor = ConvertTo-SourceAnchorBase64 $consistency
+        $preferred = if ($consistencyAnchor) { $consistencyAnchor } else { $guidAnchor }
+        $proxies = @(Get-DirectoryAttributeValue $Raw 'proxyAddresses' | Where-Object { $null -ne $_ })
+        $smtp = Get-SmtpAddressList $proxies
+        if ($null -eq $smtp) { $smtp = @() }
+        $enabled = Get-DirectoryAttributeValue $Raw 'Enabled'
+        $mail = "$(Get-DirectoryAttributeValue $Raw 'mail')".Trim()
+        return [pscustomobject]@{
+            Source              = 'AD'
+            DisplayName         = "$(Get-DirectoryAttributeValue $Raw 'DisplayName')".Trim()
+            SamAccountName      = "$(Get-DirectoryAttributeValue $Raw 'SamAccountName')".Trim()
+            UserPrincipalName   = "$(Get-DirectoryAttributeValue $Raw 'UserPrincipalName')".Trim()
+            Mail                = $mail
+            MailNickname        = Get-DirectoryAttributeValue $Raw 'mailNickname'
+            PrimarySmtp         = Get-PrimarySmtpAddress $proxies
+            SmtpAddresses       = $smtp
+            Enabled             = $(if ($null -eq $enabled) { $null } else { [bool]$enabled })
+            PreferredAnchor     = $preferred
+            ObjectGuidAnchor    = $guidAnchor
+            ConsistencyAnchor   = $consistencyAnchor
+            ImmutableId         = $preferred
+            CloudId             = ''
+            DistinguishedName   = "$(Get-DirectoryAttributeValue $Raw 'DistinguishedName')".Trim()
+            Synced              = $false
+        }
+    }
+
+    $immutable = "$(Get-DirectoryAttributeValue $Raw 'OnPremisesImmutableId')".Trim()
+    $syncFlag = Get-DirectoryAttributeValue $Raw 'OnPremisesSyncEnabled'
+    $proxies = @(Get-DirectoryAttributeValue $Raw 'ProxyAddresses' | Where-Object { $null -ne $_ })
+    $smtp = Get-SmtpAddressList $proxies
+    if ($null -eq $smtp) { $smtp = @() }
+    $enabled = Get-DirectoryAttributeValue $Raw 'AccountEnabled'
+    $cloudId = "$(Get-DirectoryAttributeValue $Raw 'Id')".Trim()
+    if ([string]::IsNullOrWhiteSpace($cloudId)) { $cloudId = $immutable }
+    return [pscustomobject]@{
+        Source              = 'Entra'
+        DisplayName         = "$(Get-DirectoryAttributeValue $Raw 'DisplayName')".Trim()
+        SamAccountName      = "$(Get-DirectoryAttributeValue $Raw 'OnPremisesSamAccountName')".Trim()
+        UserPrincipalName   = "$(Get-DirectoryAttributeValue $Raw 'UserPrincipalName')".Trim()
+        Mail                = "$(Get-DirectoryAttributeValue $Raw 'Mail')".Trim()
+        MailNickname        = Get-GraphMailNickname $Raw
+        PrimarySmtp         = Get-PrimarySmtpAddress $proxies
+        SmtpAddresses       = $smtp
+        Enabled             = $(if ($null -eq $enabled) { $null } else { [bool]$enabled })
+        PreferredAnchor     = $immutable
+        ObjectGuidAnchor    = ''
+        ConsistencyAnchor   = ''
+        ImmutableId         = $immutable
+        CloudId             = $cloudId
+        DistinguishedName   = "$(Get-DirectoryAttributeValue $Raw 'OnPremisesDistinguishedName')".Trim()
+        Synced              = (($syncFlag -eq $true) -or (-not [string]::IsNullOrWhiteSpace($immutable)))
+    }
+}
+
+function New-AccountMismatch {
+    param(
+        [Parameter(Mandatory)][string]$Severity,
+        [Parameter(Mandatory)][string]$Mismatch,
+        $Ad,
+        $Cloud,
+        [string]$AdValue,
+        [string]$EntraValue,
+        [string]$Detail
+    )
+    $display = ''
+    if ($Ad -and -not [string]::IsNullOrWhiteSpace("$($Ad.DisplayName)")) { $display = "$($Ad.DisplayName)" }
+    elseif ($Cloud) { $display = "$($Cloud.DisplayName)" }
+
+    $sam = ''
+    if ($Ad -and -not [string]::IsNullOrWhiteSpace("$($Ad.SamAccountName)")) { $sam = "$($Ad.SamAccountName)" }
+    elseif ($Cloud) { $sam = "$($Cloud.SamAccountName)" }
+
+    $upn = ''
+    if ($Ad -and -not [string]::IsNullOrWhiteSpace("$($Ad.UserPrincipalName)")) { $upn = "$($Ad.UserPrincipalName)" }
+    elseif ($Cloud) { $upn = "$($Cloud.UserPrincipalName)" }
+
+    $anchor = ''
+    if ($Ad -and -not [string]::IsNullOrWhiteSpace("$($Ad.PreferredAnchor)")) { $anchor = "$($Ad.PreferredAnchor)" }
+    elseif ($Cloud) { $anchor = "$($Cloud.ImmutableId)" }
+
+    return [pscustomobject]@{
+        Severity           = $Severity
+        Mismatch           = $Mismatch
+        DisplayName        = $display
+        SamAccountName     = $sam
+        UserPrincipalName  = $upn
+        AdValue            = $AdValue
+        EntraValue         = $EntraValue
+        Detail             = $Detail
+        CloudObjectId      = $(if ($Cloud) { "$($Cloud.CloudId)" } else { '' })
+        DistinguishedName  = $(if ($Ad) { "$($Ad.DistinguishedName)" } else { '' })
+        ImmutableId        = $anchor
+    }
+}
+
+function Add-AccountAttributeMismatches {
+    <#
+        Differences between one paired AD account and one Entra account.
+        A null mailNickname on a mail-enabled account stays Critical.
+    #>
+    param(
+        $Ad,
+        $Cloud,
+        $Rows,
+        [bool]$IncludeDisplayName
+    )
+
+    $adUpn = "$($Ad.UserPrincipalName)"
+    $cloudUpn = "$($Cloud.UserPrincipalName)"
+    if (-not [string]::IsNullOrWhiteSpace($adUpn) -and -not [string]::IsNullOrWhiteSpace($cloudUpn) -and ($adUpn -ne $cloudUpn)) {
+        $detail = 'The on-prem UPN and the Entra UPN are different.'
+        if ($cloudUpn -match '(?i)\.onmicrosoft\.com$') {
+            $detail = 'The Entra UPN uses the tenant .onmicrosoft.com domain. The on-prem UPN suffix may be unverified, so the cloud account kept the default UPN.'
+        }
+        [void]$Rows.Add((New-AccountMismatch -Severity 'Warning' -Mismatch 'UserPrincipalName' -Ad $Ad -Cloud $Cloud -AdValue $adUpn -EntraValue $cloudUpn -Detail $detail))
+    }
+
+    $adMail = "$($Ad.Mail)".Trim()
+    $cloudMail = "$($Cloud.Mail)".Trim()
+    $adMailBlank = [string]::IsNullOrWhiteSpace($adMail)
+    $cloudMailBlank = [string]::IsNullOrWhiteSpace($cloudMail)
+    if (-not ($adMailBlank -and $cloudMailBlank) -and ($adMail -ne $cloudMail)) {
+        [void]$Rows.Add((New-AccountMismatch -Severity 'Warning' -Mismatch 'mail' -Ad $Ad -Cloud $Cloud -AdValue $adMail -EntraValue $cloudMail -Detail 'The mail attribute does not match.'))
+    }
+
+    $adNickBlank = Test-IsBlankAttributeValue $Ad.MailNickname
+    $cloudNickBlank = Test-IsBlankAttributeValue $Cloud.MailNickname
+    if ($adNickBlank -or $cloudNickBlank) {
+        if (-not ($adNickBlank -and $cloudNickBlank)) {
+            $mailEnabled = (-not $adMailBlank) -or (-not $cloudMailBlank) -or (-not (Test-IsBlankAttributeValue $Ad.PrimarySmtp)) -or (-not (Test-IsBlankAttributeValue $Cloud.PrimarySmtp))
+            $severity = if ($mailEnabled) { 'Critical' } else { 'Warning' }
+            $detail = 'The mailNickname attribute has a null value.'
+            if ($mailEnabled) {
+                $detail += ' This account has mail and/or a primary SMTP address, so Entra Connect rejects a null alias.'
+            }
+            [void]$Rows.Add((New-AccountMismatch -Severity $severity -Mismatch 'mailNickname' -Ad $Ad -Cloud $Cloud -AdValue (Format-MailNicknameDisplay $Ad.MailNickname) -EntraValue (Format-MailNicknameDisplay $Cloud.MailNickname) -Detail $detail))
+        }
+    }
+    elseif ("$($Ad.MailNickname)".Trim() -ne "$($Cloud.MailNickname)".Trim()) {
+        [void]$Rows.Add((New-AccountMismatch -Severity 'Warning' -Mismatch 'mailNickname' -Ad $Ad -Cloud $Cloud -AdValue "$($Ad.MailNickname)".Trim() -EntraValue "$($Cloud.MailNickname)".Trim() -Detail 'The mailNickname values do not match.'))
+    }
+
+    $adPrimary = "$($Ad.PrimarySmtp)".Trim()
+    $cloudPrimary = "$($Cloud.PrimarySmtp)".Trim()
+    $adPrimaryBlank = [string]::IsNullOrWhiteSpace($adPrimary)
+    $cloudPrimaryBlank = [string]::IsNullOrWhiteSpace($cloudPrimary)
+    if (-not ($adPrimaryBlank -and $cloudPrimaryBlank) -and ($adPrimary -ne $cloudPrimary)) {
+        [void]$Rows.Add((New-AccountMismatch -Severity 'Warning' -Mismatch 'Primary SMTP' -Ad $Ad -Cloud $Cloud -AdValue $adPrimary -EntraValue $cloudPrimary -Detail 'The primary SMTP address (uppercase SMTP:) does not match.'))
+    }
+
+    $adSmtp = @($Ad.SmtpAddresses)
+    $cloudSmtp = @($Cloud.SmtpAddresses)
+    $adSeen = @{}
+    $cloudSeen = @{}
+    foreach ($item in $adSmtp) {
+        if (-not (Test-IsBlankAttributeValue $item)) { $adSeen["$item".Trim().ToLower()] = $true }
+    }
+    foreach ($item in $cloudSmtp) {
+        if (-not (Test-IsBlankAttributeValue $item)) { $cloudSeen["$item".Trim().ToLower()] = $true }
+    }
+    $onlyAd = New-Object System.Collections.Generic.List[string]
+    $onlyCloud = New-Object System.Collections.Generic.List[string]
+    foreach ($key in @($adSeen.Keys)) { if (-not $cloudSeen.ContainsKey($key)) { [void]$onlyAd.Add($key) } }
+    foreach ($key in @($cloudSeen.Keys)) { if (-not $adSeen.ContainsKey($key)) { [void]$onlyCloud.Add($key) } }
+    if ($onlyAd.Count -gt 0 -or $onlyCloud.Count -gt 0) {
+        $detail = "SMTP proxy addresses differ. Only in AD: $(if ($onlyAd.Count) { $onlyAd -join ', ' } else { '(none)' }). Only in Entra: $(if ($onlyCloud.Count) { $onlyCloud -join ', ' } else { '(none)' })."
+        [void]$Rows.Add((New-AccountMismatch -Severity 'Warning' -Mismatch 'proxyAddresses' -Ad $Ad -Cloud $Cloud -AdValue (($adSeen.Keys | Sort-Object) -join '; ') -EntraValue (($cloudSeen.Keys | Sort-Object) -join '; ') -Detail $detail))
+    }
+
+    if ($null -ne $Ad.Enabled -and $null -ne $Cloud.Enabled -and ([bool]$Ad.Enabled -ne [bool]$Cloud.Enabled)) {
+        $adEnabledText = $(if ([bool]$Ad.Enabled) { 'True' } else { 'False' })
+        $cloudEnabledText = $(if ([bool]$Cloud.Enabled) { 'True' } else { 'False' })
+        [void]$Rows.Add((New-AccountMismatch -Severity 'Warning' -Mismatch 'Account enabled' -Ad $Ad -Cloud $Cloud -AdValue $adEnabledText -EntraValue $cloudEnabledText -Detail 'One side is enabled and the other is disabled.'))
+    }
+
+    $adSam = "$($Ad.SamAccountName)".Trim()
+    $cloudSam = "$($Cloud.SamAccountName)".Trim()
+    if (-not [string]::IsNullOrWhiteSpace($adSam) -and -not [string]::IsNullOrWhiteSpace($cloudSam) -and ($adSam -ne $cloudSam)) {
+        [void]$Rows.Add((New-AccountMismatch -Severity 'Warning' -Mismatch 'sAMAccountName' -Ad $Ad -Cloud $Cloud -AdValue $adSam -EntraValue $cloudSam -Detail 'The AD sAMAccountName and the Entra onPremisesSamAccountName do not match.'))
+    }
+
+    if ($IncludeDisplayName) {
+        $adName = "$($Ad.DisplayName)".Trim()
+        $cloudName = "$($Cloud.DisplayName)".Trim()
+        if (-not [string]::IsNullOrWhiteSpace($adName) -and -not [string]::IsNullOrWhiteSpace($cloudName) -and ($adName -ne $cloudName)) {
+            [void]$Rows.Add((New-AccountMismatch -Severity 'Info' -Mismatch 'Display name' -Ad $Ad -Cloud $Cloud -AdValue $adName -EntraValue $cloudName -Detail 'The display names do not match.'))
+        }
+    }
+}
+
+function Compare-DirectoryAccounts {
+    <#
+        Pair AD and Entra accounts, then list the mismatches.
+
+        Pairing order for each AD account:
+          1. ms-DS-ConsistencyGuid, when it is set (Entra Connect's usual source anchor)
+          2. objectGUID
+          3. userPrincipalName
+        Anchor comparison is case-sensitive because immutableId is base64.
+        A cloud account with no anchor is cloud-only and is omitted unless requested.
+    #>
+    param(
+        $AdAccounts,
+        $EntraAccounts,
+        [bool]$IncludeCloudOnly = $false,
+        [bool]$IncludeDisplayName = $false
+    )
+
+    $adList = New-Object System.Collections.Generic.List[object]
+    foreach ($item in @($AdAccounts)) {
+        if ($null -ne $item) { [void]$adList.Add($item) }
+    }
+    $entraList = New-Object System.Collections.Generic.List[object]
+    foreach ($item in @($EntraAccounts)) {
+        if ($null -ne $item) { [void]$entraList.Add($item) }
+    }
+
+    $entraByAnchor = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+    $entraByUpn = @{}
+    $handledCloudIds = New-Object 'System.Collections.Generic.Dictionary[string,string]'
+    $upnConflictIds = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+    $rows = New-Object System.Collections.Generic.List[object]
+
+    foreach ($cloud in $entraList) {
+        $upnKey = "$($cloud.UserPrincipalName)".Trim().ToLower()
+        if (-not [string]::IsNullOrWhiteSpace($upnKey)) {
+            if ($entraByUpn.ContainsKey($upnKey)) {
+                $firstUpn = $entraByUpn[$upnKey]
+                [void]$rows.Add((New-AccountMismatch -Severity 'Critical' -Mismatch 'UserPrincipalName' -Ad $null -Cloud $cloud -AdValue "$($firstUpn.DisplayName)" -EntraValue "$($cloud.DisplayName)" -Detail "Two Entra accounts share the UPN $($cloud.UserPrincipalName)."))
+            }
+            else {
+                $entraByUpn[$upnKey] = $cloud
+            }
+        }
+        $anchor = "$($cloud.ImmutableId)".Trim()
+        if ([string]::IsNullOrWhiteSpace($anchor)) { continue }
+        if ($entraByAnchor.ContainsKey($anchor)) {
+            $first = $entraByAnchor[$anchor]
+            [void]$rows.Add((New-AccountMismatch -Severity 'Critical' -Mismatch 'ImmutableId' -Ad $null -Cloud $cloud -AdValue "$($first.UserPrincipalName)" -EntraValue "$($cloud.UserPrincipalName)" -Detail "Two Entra accounts share immutableId $anchor."))
+            if (-not [string]::IsNullOrWhiteSpace("$($cloud.CloudId)")) {
+                $handledCloudIds["$($cloud.CloudId)"] = 'duplicate immutableId'
+            }
+            continue
+        }
+        $entraByAnchor[$anchor] = $cloud
+    }
+
+    foreach ($ad in $adList) {
+        $cloud = $null
+        $matchedBy = ''
+        $consistency = "$($ad.ConsistencyAnchor)".Trim()
+        $objectGuidAnchor = "$($ad.ObjectGuidAnchor)".Trim()
+        if (-not [string]::IsNullOrWhiteSpace($consistency) -and $entraByAnchor.ContainsKey($consistency)) {
+            $cloud = $entraByAnchor[$consistency]
+            $matchedBy = 'ConsistencyGuid'
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($objectGuidAnchor) -and $entraByAnchor.ContainsKey($objectGuidAnchor)) {
+            $cloud = $entraByAnchor[$objectGuidAnchor]
+            $matchedBy = 'objectGUID'
+        }
+
+        $upnKey = "$($ad.UserPrincipalName)".Trim().ToLower()
+        $upnCloud = $null
+        if (-not [string]::IsNullOrWhiteSpace($upnKey) -and $entraByUpn.ContainsKey($upnKey)) {
+            $upnCloud = $entraByUpn[$upnKey]
+        }
+
+        if ($null -eq $cloud -and $null -ne $upnCloud) {
+            $cloud = $upnCloud
+            $matchedBy = 'UPN'
+            $cloudAnchor = "$($upnCloud.ImmutableId)".Trim()
+            $sameAnchor = (-not [string]::IsNullOrWhiteSpace($cloudAnchor)) -and (
+                ((-not [string]::IsNullOrWhiteSpace($consistency)) -and ($consistency -ceq $cloudAnchor)) -or
+                ((-not [string]::IsNullOrWhiteSpace($objectGuidAnchor)) -and ($objectGuidAnchor -ceq $cloudAnchor))
+            )
+            if (-not [string]::IsNullOrWhiteSpace($cloudAnchor) -and -not $sameAnchor) {
+                [void]$rows.Add((New-AccountMismatch -Severity 'Critical' -Mismatch 'Source anchor' -Ad $ad -Cloud $upnCloud -AdValue $(if ($ad.PreferredAnchor) { "$($ad.PreferredAnchor)" } else { '(none)' }) -EntraValue $cloudAnchor -Detail "The UPN matches $($upnCloud.UserPrincipalName), but the Entra immutableId is a different source anchor."))
+            }
+            elseif ([string]::IsNullOrWhiteSpace($cloudAnchor)) {
+                [void]$rows.Add((New-AccountMismatch -Severity 'Warning' -Mismatch 'Source anchor' -Ad $ad -Cloud $upnCloud -AdValue $(if ($ad.PreferredAnchor) { "$($ad.PreferredAnchor)" } else { '(none)' }) -EntraValue '(none)' -Detail "The UPN matches $($upnCloud.UserPrincipalName), and that Entra account has no immutableId."))
+            }
+        }
+        elseif ($null -ne $cloud -and $null -ne $upnCloud -and "$($upnCloud.CloudId)" -ne "$($cloud.CloudId)") {
+            [void]$rows.Add((New-AccountMismatch -Severity 'Critical' -Mismatch 'Source anchor' -Ad $ad -Cloud $cloud -AdValue "$($ad.UserPrincipalName)" -EntraValue "$($upnCloud.UserPrincipalName)" -Detail "The source anchor matches $($cloud.UserPrincipalName), but the AD UPN matches a different Entra account ($($upnCloud.UserPrincipalName))."))
+            if (-not [string]::IsNullOrWhiteSpace("$($upnCloud.CloudId)")) {
+                $upnConflictIds["$($upnCloud.CloudId)"] = $true
+            }
+        }
+
+        if ($null -eq $cloud) {
+            [void]$rows.Add((New-AccountMismatch -Severity 'Warning' -Mismatch 'In AD only' -Ad $ad -Cloud $null -AdValue "$($ad.UserPrincipalName)" -EntraValue '' -Detail 'No Entra account has this source anchor or UPN. The account may be outside Entra Connect scope, or it has never synced.'))
+            continue
+        }
+
+        $cloudKey = "$($cloud.CloudId)"
+        if (-not [string]::IsNullOrWhiteSpace($cloudKey) -and $handledCloudIds.ContainsKey($cloudKey) -and $handledCloudIds[$cloudKey] -ne 'duplicate immutableId') {
+            [void]$rows.Add((New-AccountMismatch -Severity 'Critical' -Mismatch 'Source anchor' -Ad $ad -Cloud $cloud -AdValue "$($ad.SamAccountName)" -EntraValue "$($handledCloudIds[$cloudKey])" -Detail "This Entra account is already matched to AD account $($handledCloudIds[$cloudKey])."))
+            continue
+        }
+        if (-not [string]::IsNullOrWhiteSpace($cloudKey)) {
+            $handledCloudIds[$cloudKey] = $(if ($ad.SamAccountName) { "$($ad.SamAccountName)" } else { "$($ad.UserPrincipalName)" })
+        }
+
+        Add-AccountAttributeMismatches -Ad $ad -Cloud $cloud -Rows $rows -IncludeDisplayName $IncludeDisplayName
+    }
+
+    foreach ($cloud in $entraList) {
+        $cloudKey = "$($cloud.CloudId)"
+        if (-not [string]::IsNullOrWhiteSpace($cloudKey) -and ($handledCloudIds.ContainsKey($cloudKey) -or $upnConflictIds.ContainsKey($cloudKey))) { continue }
+        if (-not $cloud.Synced -and -not $IncludeCloudOnly) { continue }
+        if ($cloud.Synced) {
+            [void]$rows.Add((New-AccountMismatch -Severity 'Warning' -Mismatch 'In Entra only' -Ad $null -Cloud $cloud -AdValue '' -EntraValue "$($cloud.UserPrincipalName)" -Detail 'This Entra account is synced or has an on-prem anchor, and no AD account has that anchor or UPN.'))
+        }
+        else {
+            [void]$rows.Add((New-AccountMismatch -Severity 'Info' -Mismatch 'Cloud only' -Ad $null -Cloud $cloud -AdValue '' -EntraValue "$($cloud.UserPrincipalName)" -Detail 'This Entra account has no on-prem anchor.'))
+        }
+    }
+
+    if ($rows.Count -eq 0) { return }
+    Write-Output -NoEnumerate $rows.ToArray()
+}
+
+function Get-AccountMismatchRecords {
+    <#
+        Download AD users and Entra users, then fill the Account Compare grid.
+        Requires a device-code Graph session and the ActiveDirectory module.
+    #>
+    if (-not $script:State.Connected) {
+        [System.Windows.MessageBox]::Show("Connect to Entra ID first.", 'Not Connected', 'OK', 'Warning') | Out-Null
+        return
+    }
+    if (-not $script:State.AdModuleLoaded) {
+        [System.Windows.MessageBox]::Show("The ActiveDirectory module is not loaded. Install RSAT and rerun (or remove -SkipActiveDirectory).", 'AD Unavailable', 'OK', 'Warning') | Out-Null
+        return
+    }
+
+    $includeCloudOnly = [bool]$script:UI.CompareCloudOnlyCheck.IsChecked
+    $includeDisplayName = [bool]$script:UI.CompareDisplayNameCheck.IsChecked
+    $searchBase = "$($script:UI.CompareOuBox.Text)".Trim()
+
+    Start-UiOperation -Text "Comparing Active Directory accounts with Entra ID..." -Stage "Reading directories"
+    $script:State.AccountMismatches.Clear()
+    $script:UI.CompareDetailBox.Text = 'Select a mismatch to see both values...'
+
+    try {
+        $adParams = @{
+            Filter         = '*'
+            Properties     = @('displayName', 'userPrincipalName', 'mail', 'mailNickname', 'proxyAddresses', 'mS-DS-ConsistencyGuid', 'distinguishedName')
+            ResultPageSize = 500
+            ErrorAction    = 'Stop'
+        }
+        if (-not [string]::IsNullOrWhiteSpace($searchBase)) {
+            $adParams['SearchBase'] = $searchBase
+            $adParams['SearchScope'] = 'Subtree'
+            Write-UiLog "Reading Active Directory users under '$searchBase'..."
+        }
+        else {
+            Write-UiLog "Reading Active Directory users from the whole domain..."
+        }
+        $adRaw = @(Get-ADUser @adParams | Where-Object { $null -ne $_ })
+        Write-UiLog "Active Directory users: $($adRaw.Count)."
+
+        $cloudProps = @(
+            'id', 'displayName', 'userPrincipalName', 'mail', 'mailNickname', 'proxyAddresses',
+            'accountEnabled', 'onPremisesImmutableId', 'onPremisesSamAccountName',
+            'onPremisesSyncEnabled', 'onPremisesDistinguishedName'
+        )
+        Write-UiLog "Reading Entra ID users..."
+        $cloudRaw = @(Get-MgUser -All -Property $cloudProps -PageSize 999 -ErrorAction Stop | Where-Object { $null -ne $_ })
+        Write-UiLog "Entra ID users: $($cloudRaw.Count)."
+
+        $adAccounts = New-Object System.Collections.Generic.List[object]
+        $i = 0
+        foreach ($user in $adRaw) {
+            $i++
+            if (($i % 250) -eq 0 -or $i -eq $adRaw.Count) {
+                Update-UiProgress -Current $i -Total $adRaw.Count -Text "Reading AD account $i of $($adRaw.Count)..."
+            }
+            $converted = ConvertTo-ComparableAccount -Raw $user -Source AD
+            if ($null -ne $converted) { [void]$adAccounts.Add($converted) }
+        }
+
+        $entraAccounts = New-Object System.Collections.Generic.List[object]
+        $i = 0
+        foreach ($user in $cloudRaw) {
+            $i++
+            if (($i % 250) -eq 0 -or $i -eq $cloudRaw.Count) {
+                Update-UiProgress -Current $i -Total $cloudRaw.Count -Text "Reading Entra account $i of $($cloudRaw.Count)..."
+            }
+            $converted = ConvertTo-ComparableAccount -Raw $user -Source Entra
+            if ($null -ne $converted) { [void]$entraAccounts.Add($converted) }
+        }
+
+        Update-UiProgress -Current 1 -Total 1 -Text "Comparing $($adAccounts.Count) AD account(s) with $($entraAccounts.Count) Entra account(s)..."
+        $mismatches = Compare-DirectoryAccounts -AdAccounts $adAccounts.ToArray() -EntraAccounts $entraAccounts.ToArray() -IncludeCloudOnly $includeCloudOnly -IncludeDisplayName $includeDisplayName
+        if ($null -eq $mismatches) { $mismatches = @() }
+
+        foreach ($row in @($mismatches)) {
+            $script:UI.Window.Dispatcher.Invoke([action] { $script:State.AccountMismatches.Add($row) })
+        }
+
+        $critical = @($mismatches | Where-Object { $_.Severity -eq 'Critical' })
+        $warnings = @($mismatches | Where-Object { $_.Severity -eq 'Warning' })
+        $script:UI.Window.Dispatcher.Invoke([action] {
+            $script:UI.CompareCount.Text = "$($mismatches.Count) mismatch(es)  |  $($critical.Count) critical  |  $($warnings.Count) warning"
+        })
+        $level = $(if ($critical.Count -gt 0) { 'Error' } elseif ($warnings.Count -gt 0) { 'Warning' } else { 'Success' })
+        Write-UiLog "Account compare finished: $($mismatches.Count) mismatch(es), $($critical.Count) critical / $($warnings.Count) warning. AD accounts: $($adAccounts.Count). Entra accounts: $($entraAccounts.Count)." -Level $level
+    }
+    catch {
+        Write-UiLog "Account compare failed: $($_.Exception.Message)" -Level Error
+        [System.Windows.MessageBox]::Show("Account compare failed:`n`n$($_.Exception.Message)", 'Compare Error', 'OK', 'Error') | Out-Null
+    }
+    finally {
+        $tail = $(if ($script:State.AccountMismatches.Count) { "$($script:State.AccountMismatches.Count) mismatch(es)" } else { 'no mismatches' })
+        Stop-UiOperation -Text "Account compare finished: $tail"
+    }
+}
+
+function Export-SyncErrorRecords {
+    param(
+        [ValidateSet('CSV', 'HTML')][string]$Format = 'CSV',
+        [ValidateSet('SyncErrors', 'AccountCompare', 'Auto')][string]$Dataset = 'Auto'
+    )
+
+    if ($Dataset -eq 'Auto') {
+        $Dataset = 'SyncErrors'
+        if ($script:UI -and $script:UI.MainTabs -and $script:UI.MainTabs.SelectedIndex -eq 2) {
+            $Dataset = 'AccountCompare'
+        }
+    }
+
+    $records = $script:State.SyncErrorRecords
+    $namePrefix = 'EntraSyncErrors'
+    $htmlTitle = 'Entra ID Sync Errors'
+    $emptyMessage = 'There is nothing to export. Run a scan first.'
+    if ($Dataset -eq 'AccountCompare') {
+        $records = $script:State.AccountMismatches
+        $namePrefix = 'AccountMismatches'
+        $htmlTitle = 'AD and Entra account mismatches'
+        $emptyMessage = 'There is nothing to export. Run Compare AD and Entra first.'
+    }
+
+    if ($records.Count -eq 0) {
+        [System.Windows.MessageBox]::Show($emptyMessage, 'Nothing to Export', 'OK', 'Information') | Out-Null
         return
     }
 
     $dialog = New-Object System.Windows.Forms.SaveFileDialog
     $dialog.Filter = if ($Format -eq 'CSV') { 'CSV files (*.csv)|*.csv' } else { 'HTML files (*.html)|*.html' }
-    $dialog.FileName = "EntraSyncErrors_$(Get-Date -Format 'yyyyMMdd_HHmmss').$($Format.ToLower())"
+    $dialog.FileName = "${namePrefix}_$(Get-Date -Format 'yyyyMMdd_HHmmss').$($Format.ToLower())"
 
     if ($dialog.ShowDialog() -ne 'OK') { return }
 
     try {
-        $data = @($script:State.SyncErrorRecords)
+        $data = @($records)
         if ($Format -eq 'CSV') {
             $data | Export-Csv -Path $dialog.FileName -NoTypeInformation -Encoding UTF8
         }
         else {
             $style = "<style>body{font-family:Segoe UI,Arial;background:#1e1e2e;color:#e0e0e0}table{border-collapse:collapse;width:100%}th{background:#0078d4;color:#fff;padding:8px;text-align:left}td{border:1px solid #444;padding:6px}tr:nth-child(even){background:#2a2a3a}</style>"
-            $html = $data | ConvertTo-Html -Title 'Entra ID Sync Errors' -Head $style
+            $html = $data | ConvertTo-Html -Title $htmlTitle -Head $style
             # ConvertTo-Html encodes the cell text first, so this highlight is not escaped.
             $html = $html -replace '\(null\)', '<span style="color:#ff8a80;font-weight:700">(null)</span>'
             $html | Out-File -FilePath $dialog.FileName -Encoding UTF8
@@ -2134,7 +2661,7 @@ function Export-SyncErrorRecords {
         </Border>
 
         <!-- ===== Tabs ===== -->
-        <TabControl Grid.Row="2" Background="Transparent" BorderThickness="0" Margin="12,8">
+        <TabControl x:Name="MainTabs" Grid.Row="2" Background="Transparent" BorderThickness="0" Margin="12,8">
 
             <!-- Tab 1 : Sync errors -->
             <TabItem Header="Sync Errors">
@@ -2209,6 +2736,95 @@ function Export-SyncErrorRecords {
                     </Border>
                 </Grid>
             </TabItem>
+
+            <!-- Tab 3 : AD versus Entra account compare -->
+            <TabItem Header="Account Compare">
+                <Grid Margin="0,8,0,0">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+
+                    <StackPanel Grid.Row="0" Margin="0,0,0,8">
+                        <WrapPanel>
+                            <Button x:Name="CompareButton" Content="Compare AD and Entra" Style="{StaticResource AccentButton}" IsEnabled="False"/>
+                            <TextBlock Text="AD OU" Foreground="#FFCCCCDD" VerticalAlignment="Center" Margin="8,0,6,0"/>
+                            <TextBox x:Name="CompareOuBox" Width="260" Padding="8,6" Margin="0,4,8,4"
+                                     Background="#FF232336" Foreground="White" BorderBrush="#FF3A3A50"/>
+                            <CheckBox x:Name="CompareCloudOnlyCheck" Content="Include cloud-only users" Foreground="#FFCCCCDD" VerticalAlignment="Center" Margin="8,0"/>
+                            <CheckBox x:Name="CompareDisplayNameCheck" Content="Include display name differences" Foreground="#FFCCCCDD" VerticalAlignment="Center" Margin="8,0"/>
+                            <Button x:Name="CompareExportButton" Content="Export CSV" Style="{StaticResource GhostButton}"/>
+                            <TextBlock x:Name="CompareCount" Text="" Foreground="#FF9A9AB5" VerticalAlignment="Center" Margin="12,0"/>
+                        </WrapPanel>
+                        <TextBlock Text="Pairs each AD account to Entra by ms-DS-ConsistencyGuid, then objectGUID, then UPN. Accounts outside the Connect scope show up as In AD only. Leave AD OU empty to read the whole domain."
+                                   Foreground="#FF9A9AB5" FontSize="12" TextWrapping="Wrap" Margin="4,4,0,0"/>
+                    </StackPanel>
+
+                    <TextBox x:Name="CompareFilterBox" Grid.Row="1" Margin="0,0,0,8" Padding="8,6"
+                             Background="#FF232336" Foreground="White" BorderBrush="#FF3A3A50"
+                             Tag="Filter mismatches (name, UPN, attribute, value)..."/>
+
+                    <DataGrid x:Name="CompareGrid" Grid.Row="2" AutoGenerateColumns="False"
+                              IsReadOnly="True" SelectionMode="Single" CanUserResizeColumns="True">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="Severity" Binding="{Binding Severity}" Width="90">
+                                <DataGridTextColumn.ElementStyle>
+                                    <Style TargetType="TextBlock">
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding Severity}" Value="Critical">
+                                                <Setter Property="Foreground" Value="#FFFF8A80"/>
+                                                <Setter Property="FontWeight" Value="Bold"/>
+                                            </DataTrigger>
+                                            <DataTrigger Binding="{Binding Severity}" Value="Warning">
+                                                <Setter Property="Foreground" Value="#FFFFE082"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </DataGridTextColumn.ElementStyle>
+                            </DataGridTextColumn>
+                            <DataGridTextColumn Header="Mismatch" Binding="{Binding Mismatch}" Width="140"/>
+                            <DataGridTextColumn Header="Display Name" Binding="{Binding DisplayName}" Width="160"/>
+                            <DataGridTextColumn Header="sAMAccountName" Binding="{Binding SamAccountName}" Width="130"/>
+                            <DataGridTextColumn Header="UPN" Binding="{Binding UserPrincipalName}" Width="200"/>
+                            <DataGridTextColumn Header="AD value" Binding="{Binding AdValue}" Width="200">
+                                <DataGridTextColumn.ElementStyle>
+                                    <Style TargetType="TextBlock">
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding AdValue}" Value="(null)">
+                                                <Setter Property="Foreground" Value="#FFFF8A80"/>
+                                                <Setter Property="FontWeight" Value="Bold"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </DataGridTextColumn.ElementStyle>
+                            </DataGridTextColumn>
+                            <DataGridTextColumn Header="Entra value" Binding="{Binding EntraValue}" Width="200">
+                                <DataGridTextColumn.ElementStyle>
+                                    <Style TargetType="TextBlock">
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding EntraValue}" Value="(null)">
+                                                <Setter Property="Foreground" Value="#FFFF8A80"/>
+                                                <Setter Property="FontWeight" Value="Bold"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </DataGridTextColumn.ElementStyle>
+                            </DataGridTextColumn>
+                        </DataGrid.Columns>
+                    </DataGrid>
+
+                    <Border Grid.Row="3" Background="#FF1A1A28" CornerRadius="6" Margin="0,8,0,0" Padding="14">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto" MaxHeight="160">
+                            <TextBox x:Name="CompareDetailBox" IsReadOnly="True" TextWrapping="Wrap"
+                                     Background="Transparent" Foreground="#FFD5D5E5" BorderThickness="0"
+                                     FontFamily="Consolas" FontSize="12"
+                                     Text="Select a mismatch to see both values..."/>
+                        </ScrollViewer>
+                    </Border>
+                </Grid>
+            </TabItem>
         </TabControl>
 
         <!-- ===== Activity log ===== -->
@@ -2279,6 +2895,16 @@ $script:UI = [ordered]@{
     AdQueryBox      = $window.FindName('AdQueryBox')
     AdSearchButton  = $window.FindName('AdSearchButton')
     AdResultsBox    = $window.FindName('AdResultsBox')
+    MainTabs        = $window.FindName('MainTabs')
+    CompareButton   = $window.FindName('CompareButton')
+    CompareOuBox    = $window.FindName('CompareOuBox')
+    CompareCloudOnlyCheck = $window.FindName('CompareCloudOnlyCheck')
+    CompareDisplayNameCheck = $window.FindName('CompareDisplayNameCheck')
+    CompareExportButton = $window.FindName('CompareExportButton')
+    CompareCount    = $window.FindName('CompareCount')
+    CompareFilterBox = $window.FindName('CompareFilterBox')
+    CompareGrid     = $window.FindName('CompareGrid')
+    CompareDetailBox = $window.FindName('CompareDetailBox')
     LogBox          = $window.FindName('LogBox')
     StatusText      = $window.FindName('StatusText')
     StageChip       = $window.FindName('StageChip')
@@ -2291,6 +2917,8 @@ $script:UI = [ordered]@{
 # Bind the grid to the observable collection + a filtered view.
 $view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:State.SyncErrorRecords)
 $script:UI.ErrorGrid.ItemsSource = $view
+$compareView = [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:State.AccountMismatches)
+$script:UI.CompareGrid.ItemsSource = $compareView
 
 # ====================================================================================
 #  SECTION 4 :: Event wiring
@@ -2304,6 +2932,8 @@ $script:UI.ScanButton.Add_Click({ Get-SyncErrorRecords })
 
 $script:UI.ExportCsvButton.Add_Click({ Export-SyncErrorRecords -Format CSV })
 $script:UI.ExportHtmlButton.Add_Click({ Export-SyncErrorRecords -Format HTML })
+$script:UI.CompareButton.Add_Click({ Get-AccountMismatchRecords })
+$script:UI.CompareExportButton.Add_Click({ Export-SyncErrorRecords -Format CSV -Dataset AccountCompare })
 
 $script:UI.AdSearchButton.Add_Click({
     $q = $script:UI.AdQueryBox.Text
@@ -2338,6 +2968,57 @@ $script:UI.FilterBox.Add_TextChanged({
         )
     }
     $view.Refresh()
+})
+
+$script:UI.CompareFilterBox.Add_TextChanged({
+    $compareText = $script:UI.CompareFilterBox.Text
+    $compareView.Filter = [Predicate[object]]{
+        param($item)
+        if ([string]::IsNullOrWhiteSpace($compareText)) { return $true }
+        $t = $compareText.ToLower()
+        return (
+            ("$($item.Severity)".ToLower().Contains($t)) -or
+            ("$($item.Mismatch)".ToLower().Contains($t)) -or
+            ("$($item.DisplayName)".ToLower().Contains($t)) -or
+            ("$($item.SamAccountName)".ToLower().Contains($t)) -or
+            ("$($item.UserPrincipalName)".ToLower().Contains($t)) -or
+            ("$($item.AdValue)".ToLower().Contains($t)) -or
+            ("$($item.EntraValue)".ToLower().Contains($t)) -or
+            ("$($item.Detail)".ToLower().Contains($t))
+        )
+    }
+    $compareView.Refresh()
+})
+
+$script:UI.CompareGrid.Add_SelectionChanged({
+    $sel = $script:UI.CompareGrid.SelectedItem
+    if (-not $sel) { return }
+    $nickBanner = ''
+    if ("$($sel.AdValue)" -eq '(null)' -or "$($sel.EntraValue)" -eq '(null)') {
+        if ("$($sel.Mismatch)" -eq 'mailNickname') {
+            $nickBanner = "*** The mailNickname attribute has a null value. ***`r`n`r`n"
+        }
+    }
+    $script:UI.CompareDetailBox.Text = @"
+${nickBanner}ACCOUNT MISMATCH
+  Severity           : $($sel.Severity)
+  Mismatch           : $($sel.Mismatch)
+  Display Name       : $($sel.DisplayName)
+  sAMAccountName     : $($sel.SamAccountName)
+  UserPrincipalName  : $($sel.UserPrincipalName)
+  ImmutableId        : $($sel.ImmutableId)
+
+AD
+  Value              : $($sel.AdValue)
+  DistinguishedName  : $($sel.DistinguishedName)
+
+ENTRA
+  Value              : $($sel.EntraValue)
+  Object Id          : $($sel.CloudObjectId)
+
+DETAIL
+  $($sel.Detail)
+"@
 })
 
 # Populate the detail pane when a row is selected.
@@ -2393,6 +3074,7 @@ $window.Add_Loaded({
     Write-UiLog "Entra ID Sync Error Analyzer started (PowerShell $($PSVersionTable.PSVersion))." -Level Success
     Write-UiLog "Step 1: Click 'Connect with device code' and finish sign-in at https://microsoft.com/devicelogin. Step 2: Click 'Scan Sync Errors'."
     Write-UiLog "The scan lists users, groups, and contacts with sync errors, plus every other Entra object that already holds the same proxy address or UPN."
+    Write-UiLog "The Account Compare tab pairs AD accounts with Entra and lists mismatched attributes. It needs the ActiveDirectory module."
     # Best-effort AD module load so the scanner tab is usable immediately.
     Initialize-AdModule | Out-Null
 })
