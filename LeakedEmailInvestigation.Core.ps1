@@ -388,12 +388,48 @@ function Get-SubjectTraceFilterType {
     return 'EndsWith'
 }
 
+function Get-SenderTraceAddresses {
+    param([string]$OriginalSender, [string[]]$SenderAddresses, [int]$Limit = 4)
+    $list = New-Object System.Collections.Generic.List[string]
+    $seen = New-AddressSet
+    foreach ($addr in @($OriginalSender) + @($SenderAddresses)) {
+        if ($list.Count -ge $Limit) { break }
+        if (-not (Test-SmtpAddress ([string]$addr))) { continue }
+        $text = ([string]$addr).Trim()
+        if ($seen.Add($text)) { $list.Add($text) }
+    }
+    Write-Output -NoEnumerate -InputObject $list.ToArray()
+}
+
+function Add-CollectedTraceRows {
+    param($List, $Seen, $PageResult)
+    if ($null -eq $PageResult) { return [pscustomobject]@{ Capped = $false; Cancelled = $false } }
+    foreach ($row in (ConvertTo-ItemArray $PageResult.Rows)) {
+        $recipientKey = ''
+        if ($row.RecipientAddress) { $recipientKey = $row.RecipientAddress.ToLowerInvariant() }
+        $messageKey = ''
+        if ($row.MessageId) { $messageKey = $row.MessageId.ToLowerInvariant() }
+        $statusKey = ''
+        if ($row.Status) { $statusKey = $row.Status.ToLowerInvariant() }
+        $ticks = 0
+        if ($row.ReceivedUtc) { $ticks = $row.ReceivedUtc.Ticks }
+        $key = '{0}|{1}|{2}|{3}|{4}' -f $row.MessageTraceId, $recipientKey, $messageKey, $ticks, $statusKey
+        if (-not $Seen.ContainsKey($key)) {
+            $Seen[$key] = $true
+            $List.Add($row)
+        }
+    }
+    return [pscustomobject]@{ Capped = [bool]$PageResult.Capped; Cancelled = [bool]$PageResult.Cancelled }
+}
+
 function Get-MessageTracePages {
     param(
         [datetime]$StartUtc,
         [datetime]$EndUtc,
         [string]$SubjectText,
         [string]$SubjectFilterType = 'EndsWith',
+        [string]$SenderAddress,
+        [string]$MessageId,
         [int]$PageSize = 5000,
         [scriptblock]$FetchPage,
         [int]$MaxRows = 200000
@@ -432,6 +468,8 @@ function Get-MessageTracePages {
                 PageSize            = $PageSize
                 Subject             = $SubjectText
                 SubjectFilterType   = $SubjectFilterType
+                SenderAddress       = $SenderAddress
+                MessageId           = $MessageId
             }
             $page = ConvertTo-ItemArray (& $FetchPage $query)
             $added = 0
@@ -2251,12 +2289,20 @@ function New-DefaultInvestigationDependencies {
             $filterType = [string](Get-ObjectProperty $Query 'SubjectFilterType')
             if ([string]::IsNullOrWhiteSpace($filterType)) { $filterType = 'EndsWith' }
             $params = @{
-                StartDate         = $Query.WindowStart
-                EndDate           = $Query.PageEnd
-                Subject           = $Query.Subject
-                SubjectFilterType = $filterType
-                ResultSize        = $Query.PageSize
+                StartDate  = $Query.WindowStart
+                EndDate    = $Query.PageEnd
+                ResultSize = $Query.PageSize
             }
+            $messageId = [string](Get-ObjectProperty $Query 'MessageId')
+            if ($messageId) {
+                $params.MessageId = $messageId
+            }
+            else {
+                $params.Subject = $Query.Subject
+                $params.SubjectFilterType = $filterType
+            }
+            $sender = [string](Get-ObjectProperty $Query 'SenderAddress')
+            if ($sender) { $params.SenderAddress = $sender }
             if ($Query.StartingRecipient) { $params.StartingRecipientAddress = $Query.StartingRecipient }
             @(Get-MessageTraceV2 @params)
         }
@@ -2360,7 +2406,8 @@ function Invoke-LeakedEmailInvestigation {
         $Dependencies,
         [scriptblock]$ProgressHandler,
         [scriptblock]$LogHandler,
-        [scriptblock]$CancelHandler
+        [scriptblock]$CancelHandler,
+        [scriptblock]$ResultHandler
     )
 
     $previous = $script:InvCtx
@@ -2368,6 +2415,7 @@ function Invoke-LeakedEmailInvestigation {
         Log       = $LogHandler
         Progress  = $ProgressHandler
         Cancel    = $CancelHandler
+        Result    = $ResultHandler
         Warnings  = (New-Object System.Collections.Generic.List[string])
     }
     try {
@@ -2443,17 +2491,70 @@ function Invoke-LeakedEmailInvestigation {
         $utcStart = ConvertTo-UtcFromLocal -Value $range.Start
         $utcEnd = ConvertTo-UtcFromLocal -Value $queryEnd
         $filterType = Get-SubjectTraceFilterType -FastSubjectSearch $FastSubjectSearch -LooseSubjectMatch $LooseSubjectMatch
-        Update-InvProgress -Percent 15 -Phase 'Trace' -Message ("Tracing '{0}' ({1})" -f $searchInfo.Subject, $filterType)
-        $pages = Get-MessageTracePages -StartUtc $utcStart -EndUtc $utcEnd -SubjectText $searchInfo.Subject -SubjectFilterType $filterType -PageSize $TracePageSize -FetchPage $Dependencies.FetchTracePage -MaxRows $MaxTraceRows
-        if ($filterType -eq 'EndsWith' -and -not $pages.Cancelled -and @($pages.Rows).Count -eq 0) {
-            Write-InvLog -Level 'WARN' -Message 'EndsWith found no trace rows. Retrying with Contains in case a gateway appended text to the subject.'
-            $pages = Get-MessageTracePages -StartUtc $utcStart -EndUtc $utcEnd -SubjectText $searchInfo.Subject -SubjectFilterType 'Contains' -PageSize $TracePageSize -FetchPage $Dependencies.FetchTracePage -MaxRows $MaxTraceRows
-        }
-        Write-InvLog -Level 'INFO' -Message ("{0} unique trace rows collected" -f @($pages.Rows).Count)
+        $collected = New-Object System.Collections.Generic.List[object]
+        $seenTrace = @{}
+        $traceCapped = $false
+        $traceCancelled = $false
+        $senderFound = 0
 
-        $report = New-LeakedEmailReport -TraceRows $pages.Rows -Subject $Subject -OriginalSender $OriginalSender -SenderAddresses $senderAddresses -InternalDomains $domains -MessageId $MessageId -LooseSubjectMatch $LooseSubjectMatch -StartDate $range.Start -EndDate $range.End -OutputFolder $OutputFolder
-        $report.Capped = [bool]$pages.Capped
-        $report.Cancelled = [bool]$pages.Cancelled -or (Test-InvCancel)
+        $normalizedMessageId = Get-NormalizedId $MessageId
+        if ($normalizedMessageId) {
+            Update-InvProgress -Percent 15 -Phase 'Trace' -Message 'Looking up the message ID'
+            $idPages = Get-MessageTracePages -StartUtc $utcStart -EndUtc $utcEnd -SubjectText '' -MessageId $normalizedMessageId -PageSize $TracePageSize -FetchPage $Dependencies.FetchTracePage -MaxRows $MaxTraceRows
+            $idMerge = Add-CollectedTraceRows -List $collected -Seen $seenTrace -PageResult $idPages
+            if ($idMerge.Capped) { $traceCapped = $true }
+            if ($idMerge.Cancelled) { $traceCancelled = $true }
+        }
+
+        $senderList = Get-SenderTraceAddresses -OriginalSender $OriginalSender -SenderAddresses $senderAddresses
+        foreach ($senderAddress in $senderList) {
+            if ($traceCancelled -or (Test-InvCancel)) { $traceCancelled = $true; break }
+            Update-InvProgress -Percent 18 -Phase 'Trace' -Message ("Fast lookup for sender {0}" -f $senderAddress)
+            $before = $collected.Count
+            $senderPages = Get-MessageTracePages -StartUtc $utcStart -EndUtc $utcEnd -SubjectText $searchInfo.Subject -SubjectFilterType $filterType -SenderAddress $senderAddress -PageSize $TracePageSize -FetchPage $Dependencies.FetchTracePage -MaxRows $MaxTraceRows
+            $senderMerge = Add-CollectedTraceRows -List $collected -Seen $seenTrace -PageResult $senderPages
+            if ($senderMerge.Capped) { $traceCapped = $true }
+            if ($senderMerge.Cancelled) { $traceCancelled = $true }
+            if ($filterType -eq 'EndsWith' -and $collected.Count -eq $before -and -not $traceCancelled) {
+                Update-InvProgress -Percent 20 -Phase 'Trace' -Message ("Sender lookup retry for {0}" -f $senderAddress)
+                $senderWide = Get-MessageTracePages -StartUtc $utcStart -EndUtc $utcEnd -SubjectText $searchInfo.Subject -SubjectFilterType 'Contains' -SenderAddress $senderAddress -PageSize $TracePageSize -FetchPage $Dependencies.FetchTracePage -MaxRows $MaxTraceRows
+                $senderWideMerge = Add-CollectedTraceRows -List $collected -Seen $seenTrace -PageResult $senderWide
+                if ($senderWideMerge.Capped) { $traceCapped = $true }
+                if ($senderWideMerge.Cancelled) { $traceCancelled = $true }
+            }
+        }
+        $senderFound = $collected.Count
+        if ($senderFound -gt 0) {
+            Write-InvLog -Level 'INFO' -Message ("Sender lookup found {0} trace row(s). Showing them while the forward search continues." -f $senderFound)
+            if ($script:InvCtx.Result) {
+                $preview = New-LeakedEmailReport -TraceRows $collected.ToArray() -Subject $Subject -OriginalSender $OriginalSender -SenderAddresses $senderAddresses -InternalDomains $domains -MessageId $MessageId -LooseSubjectMatch $LooseSubjectMatch -StartDate $range.Start -EndDate $range.End -OutputFolder $OutputFolder
+                $preview.Capped = $traceCapped
+                & $script:InvCtx.Result $preview
+            }
+        }
+
+        if (-not $traceCancelled) {
+            Update-InvProgress -Percent 30 -Phase 'Trace' -Message ("Searching for forwards of '{0}'" -f $searchInfo.Subject)
+            $broad = Get-MessageTracePages -StartUtc $utcStart -EndUtc $utcEnd -SubjectText $searchInfo.Subject -SubjectFilterType $filterType -PageSize $TracePageSize -FetchPage $Dependencies.FetchTracePage -MaxRows $MaxTraceRows
+            $broadMerge = Add-CollectedTraceRows -List $collected -Seen $seenTrace -PageResult $broad
+            if ($broadMerge.Capped) { $traceCapped = $true }
+            if ($broadMerge.Cancelled) { $traceCancelled = $true }
+            if ($filterType -eq 'EndsWith' -and $senderFound -eq 0 -and $collected.Count -eq 0 -and -not $traceCancelled) {
+                Write-InvLog -Level 'WARN' -Message 'Sender and EndsWith lookups found nothing. Retrying with a tenant-wide Contains search.'
+                $broadWide = Get-MessageTracePages -StartUtc $utcStart -EndUtc $utcEnd -SubjectText $searchInfo.Subject -SubjectFilterType 'Contains' -PageSize $TracePageSize -FetchPage $Dependencies.FetchTracePage -MaxRows $MaxTraceRows
+                $broadWideMerge = Add-CollectedTraceRows -List $collected -Seen $seenTrace -PageResult $broadWide
+                if ($broadWideMerge.Capped) { $traceCapped = $true }
+                if ($broadWideMerge.Cancelled) { $traceCancelled = $true }
+            }
+            elseif ($filterType -eq 'EndsWith' -and $senderFound -gt 0) {
+                Write-InvLog -Level 'INFO' -Message 'Skipped the slow tenant-wide Contains scan because the sender lookup already found the message.'
+            }
+        }
+        Write-InvLog -Level 'INFO' -Message ("{0} unique trace rows collected" -f $collected.Count)
+
+        $report = New-LeakedEmailReport -TraceRows $collected.ToArray() -Subject $Subject -OriginalSender $OriginalSender -SenderAddresses $senderAddresses -InternalDomains $domains -MessageId $MessageId -LooseSubjectMatch $LooseSubjectMatch -StartDate $range.Start -EndDate $range.End -OutputFolder $OutputFolder
+        $report.Capped = $traceCapped
+        $report.Cancelled = $traceCancelled -or (Test-InvCancel)
         $report.Options = [pscustomobject]@{
             CheckAutoForwarding = $CheckAutoForwarding
             IncludeDisabledRules = $IncludeDisabledRules
@@ -2468,6 +2569,7 @@ function Invoke-LeakedEmailInvestigation {
             try { Export-InvestigationReport -Report $report | Out-Null } catch { $report.ExportError = $_.Exception.Message }
             return $report
         }
+        if ($script:InvCtx.Result) { & $script:InvCtx.Result $report }
 
         if ($IncludeTraceDetail -and $Dependencies.FetchTraceDetail) {
             $detailTargets = @(ConvertTo-ItemArray $report.RelatedTrace | Sort-Object @{ Expression = { if ($_.External -eq 'Yes') { 0 } else { 1 } } }, ReceivedUtc)

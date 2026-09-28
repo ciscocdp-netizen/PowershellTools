@@ -357,12 +357,13 @@ Export-InvestigationReport -Report $formula | Out-Null
 $formulaCsv = Get-Content -LiteralPath (Join-Path $formula.OutputFolder 'A_OriginalRecipients.csv') -Raw
 Assert-True 'formula neutralized' ($formulaCsv -match "'=cmd")
 
-$calls = @{ Trace = 0; Mail = (New-Object System.Collections.Generic.List[string]); Rules = 0; AuditUsers = (New-Object System.Collections.Generic.List[object]); High = $false; Filters = (New-Object System.Collections.Generic.List[string]) }
+$calls = @{ Trace = 0; Mail = (New-Object System.Collections.Generic.List[string]); Rules = 0; AuditUsers = (New-Object System.Collections.Generic.List[object]); High = $false; Filters = (New-Object System.Collections.Generic.List[string]); Senders = (New-Object System.Collections.Generic.List[string]); Previews = 0 }
 $deps = [pscustomobject]@{
     GetAcceptedDomains = { @('contoso.com') }
     FetchTracePage = {
         param($Query)
         $calls.Filters.Add([string]$Query.SubjectFilterType)
+        $calls.Senders.Add([string]$Query.SenderAddress)
         $calls.Trace++
         if ($calls.Trace -gt 1) { return @() }
         @(
@@ -425,8 +426,10 @@ $deps = [pscustomobject]@{
     }
 }
 $out = Join-Path $temp 'invoke'
-$inv = Invoke-LeakedEmailInvestigation -Subject "FW: $cleanSubject" -OriginalSender 'hr@contoso.com' -StartDate ([datetime]'2026-09-25') -EndDate ([datetime]'2026-09-25') -OutputFolder $out -CheckAutoForwarding $true -CheckTransportPolicy $true -SkipConnectionCheck $true -ResolveSenderAliases $true -AuditThroughNow $false -FastAudit $false -Dependencies $deps -AdditionalAuditUsers @('delegate@contoso.com') -AuditBatchSize 50
+$inv = Invoke-LeakedEmailInvestigation -Subject "FW: $cleanSubject" -OriginalSender 'hr@contoso.com' -StartDate ([datetime]'2026-09-25') -EndDate ([datetime]'2026-09-25') -OutputFolder $out -CheckAutoForwarding $true -CheckTransportPolicy $true -SkipConnectionCheck $true -ResolveSenderAliases $true -AuditThroughNow $false -FastAudit $false -Dependencies $deps -AdditionalAuditUsers @('delegate@contoso.com') -AuditBatchSize 50 -ResultHandler { $calls.Previews++ }
 Assert-Equal 'invoke uses endswith' $calls.Filters[0] 'EndsWith'
+Assert-Equal 'first trace is sender scoped' $calls.Senders[0] 'hr@contoso.com'
+Assert-True 'preview published before the slow steps' ($calls.Previews -ge 1)
 Assert-Equal 'invoke original' $inv.Summary.OriginalRecipients 1
 Assert-Equal 'invoke external forward' $inv.Summary.PropagationExternal 1
 Assert-True 'alias lookup happened' ($calls.Mail -contains 'hr@contoso.com')
@@ -460,7 +463,7 @@ $fallbackDeps = [pscustomobject]@{
 }
 $fallback = Invoke-LeakedEmailInvestigation -Subject $cleanSubject -OriginalSender 'hr@contoso.com' -StartDate ([datetime]'2026-09-25') -EndDate ([datetime]'2026-09-25') -OutputFolder (Join-Path $temp 'fallback') -SkipConnectionCheck $true -SkipOpenAudit $true -ResolveSenderAliases $false -FastSubjectSearch $true -Dependencies $fallbackDeps
 Assert-Equal 'endswith tried first' $fallbackCalls[0] 'EndsWith'
-Assert-Equal 'contains fallback' $fallbackCalls[1] 'Contains'
+Assert-True 'contains fallback used' ($fallbackCalls -contains 'Contains')
 Assert-Equal 'fallback found original' $fallback.Summary.OriginalRecipients 1
 
 Remove-Item -LiteralPath $temp -Recurse -Force

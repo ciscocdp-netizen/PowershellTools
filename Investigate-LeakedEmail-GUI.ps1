@@ -382,7 +382,7 @@ function Show-InvestigationResult {
     foreach ($tab in $script:GridTabs) {
         Fill-ResultGrid $tab (Get-ObjectProperty $Result $tab.View.Collection)
     }
-    if ($Result.OutputFolder) {
+    if ($Result.OutputFolder -and -not $script:Pipeline) {
         $script:FolderBox.Text = $Result.OutputFolder
         $script:StatusLabel.Text = "Reports saved to $($Result.OutputFolder)"
     }
@@ -390,11 +390,16 @@ function Show-InvestigationResult {
     foreach ($finding in (ConvertTo-ItemArray $Result.Findings)) {
         if ($finding.Severity -eq 'High') { $high++ }
     }
-    Add-UiLog ("Finished. {0} high-severity finding(s). External original recipients: {1}." -f $high, $summary.OriginalExternal)
-    if ($Result.ExportError) {
-        [System.Windows.Forms.MessageBox]::Show($Result.ExportError, 'Reports were not written', 'OK', 'Warning')
+    if ($script:Pipeline) {
+        Add-UiLog ("Message trace is on screen. Original recipients so far: {0}. Rules and opens are still running." -f $summary.OriginalRecipients)
     }
-    Update-RemovalButton
+    else {
+        Add-UiLog ("Finished. {0} high-severity finding(s). External original recipients: {1}." -f $high, $summary.OriginalExternal)
+        if ($Result.ExportError) {
+            [System.Windows.Forms.MessageBox]::Show($Result.ExportError, 'Reports were not written', 'OK', 'Warning')
+        }
+        Update-RemovalButton
+    }
 }
 
 function Start-WorkerScript {
@@ -609,7 +614,11 @@ try {
             param($Level, $Message)
             $Sync.Log.Enqueue(("{0}  {1}" -f $Level, $Message))
         } `
-        -CancelHandler { [bool]$Sync.Cancel }
+        -CancelHandler { [bool]$Sync.Cancel } `
+        -ResultHandler {
+            param($Report)
+            $Sync.PartialResult = $Report
+        }
     $Sync.Result = $result
     if ($result.Cancelled) { $Sync.State = "Cancelled" }
     else { $Sync.State = "Completed" }
@@ -696,6 +705,8 @@ function Start-Investigation {
     }
     $script:Sync.Cancel = $false
     $script:Sync.Result = $null
+    $script:Sync.PartialResult = $null
+    $script:ShownPartial = $null
     $script:Sync.ErrorMessage = ''
     $script:Sync.Percent = 0
     $script:Sync.State = 'Running'
@@ -831,7 +842,14 @@ function Update-InvestigationUi {
         if ($percent -gt 100) { $percent = 100 }
         if ($script:Progress.Style -eq 'Continuous') { $script:Progress.Value = $percent }
     }
-    if (-not $script:PipelineHandle -or -not $script:PipelineHandle.IsCompleted) { return }
+    if (-not $script:PipelineHandle -or -not $script:PipelineHandle.IsCompleted) {
+        $partial = $script:Sync.PartialResult
+        if ($partial -and -not [object]::ReferenceEquals($partial, $script:ShownPartial)) {
+            $script:ShownPartial = $partial
+            Show-InvestigationResult $partial
+        }
+        return
+    }
     try { $script:Pipeline.EndInvoke($script:PipelineHandle) | Out-Null }
     catch {
         if ($script:Sync.State -eq 'Running' -or $script:Sync.State -eq 'Connecting') {
