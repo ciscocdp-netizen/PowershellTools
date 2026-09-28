@@ -39,6 +39,9 @@ param(
     [switch]$LimitAuditToEndDate,
     [switch]$LooseSubjectMatch,
     [switch]$ContainsSubject,
+    [string]$RemoveInternalCopies,
+    [ValidateSet('HardDelete', 'SoftDelete')]
+    [string]$RemovalMode = 'HardDelete',
     [switch]$PassThru
 )
 
@@ -60,6 +63,9 @@ $log = {
 }
 
 try {
+    if ($PSBoundParameters.ContainsKey('RemoveInternalCopies') -and $RemoveInternalCopies -cne 'REMOVE') {
+        throw 'Refusing to delete mail. Pass -RemoveInternalCopies REMOVE to delete the message from the internal mailboxes found by the trace.'
+    }
     $result = Invoke-LeakedEmailInvestigation `
         -Subject $Subject `
         -OriginalSender $OriginalSender `
@@ -83,6 +89,10 @@ try {
         -FastSubjectSearch:(-not [bool]$ContainsSubject) `
         -LogHandler $log
 
+    if ($RemoveInternalCopies -ceq 'REMOVE' -and -not $result.Cancelled) {
+        $removal = Invoke-InternalMessageRemoval -Report $result -PurgeType $RemovalMode -UserPrincipalName $SignInUpn -OutputFolder $result.OutputFolder -LogHandler $log
+        Write-Host $removal.Summary -ForegroundColor Yellow
+    }
     Write-Host ""
     Write-Host (Format-InvestigationSummaryText -Report $result) -ForegroundColor Green
     if ($result.ExportError) {

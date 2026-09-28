@@ -335,6 +335,18 @@ function New-ResultTab {
     return $state
 }
 
+function Update-RemovalButton {
+    param([bool]$ForceOff)
+    if (-not $script:RemoveButton) { return }
+    if ($ForceOff -or -not $script:LastResult) {
+        $script:RemoveButton.Enabled = $false
+        return
+    }
+    $plan = Get-InternalRemovalPlan -Report $script:LastResult
+    $script:RemovalPlan = $plan
+    $script:RemoveButton.Enabled = (@($plan.Mailboxes).Count -gt 0 -and @($plan.MessageIds).Count -gt 0)
+}
+
 function Set-UiBusy {
     param([bool]$Busy)
     $script:RunButton.Enabled = -not $Busy
@@ -343,6 +355,7 @@ function Set-UiBusy {
     $script:CancelButton.Enabled = $Busy
     $script:FieldsPanel.Enabled = -not $Busy
     $script:OptionsPanel.Enabled = -not $Busy
+    Update-RemovalButton -ForceOff:$Busy
     if ($Busy) {
         $script:Progress.Style = 'Marquee'
         $script:CancelButton.Text = 'Cancel'
@@ -381,6 +394,7 @@ function Show-InvestigationResult {
     if ($Result.ExportError) {
         [System.Windows.Forms.MessageBox]::Show($Result.ExportError, 'Reports were not written', 'OK', 'Warning')
     }
+    Update-RemovalButton
 }
 
 function Start-WorkerScript {
@@ -442,6 +456,137 @@ catch {
     $Sync.State = "Error"
 }
 '@
+}
+
+function Get-RemovalScript {
+    return @'
+param($CorePath, $Sync, $Request)
+$ErrorActionPreference = "Stop"
+. $CorePath
+try {
+    $Sync.Cancel = $false
+    $Sync.RemovalResult = $null
+    $Sync.ErrorMessage = ""
+    $Sync.State = "Removing"
+    $result = Invoke-InternalMessageRemoval -Report $Request.Report -PurgeType $Request.PurgeType -UserPrincipalName $Request.UserPrincipalName -OutputFolder $Request.OutputFolder `
+        -ProgressHandler {
+            param($Percent, $Phase, $Message)
+            $Sync.Percent = $Percent
+            if ($Message) { $Sync.Status = $Message }
+        } `
+        -LogHandler {
+            param($Level, $Message)
+            $Sync.Log.Enqueue(("{0}  {1}" -f $Level, $Message))
+        } `
+        -CancelHandler { [bool]$Sync.Cancel }
+    $Sync.RemovalResult = $result
+    if ($result.Status -eq "Cancelled") { $Sync.State = "RemovalCancelled" }
+    else { $Sync.State = "Removed" }
+    $Sync.Percent = 100
+    $Sync.Status = $result.Summary
+}
+catch {
+    $stopped = $_.Exception.Message -match "pipeline has been stopped|PipelineStopped"
+    if ($stopped -or $Sync.Cancel) {
+        $Sync.State = "RemovalCancelled"
+        $Sync.Status = "Removal cancelled"
+    }
+    else {
+        $Sync.ErrorMessage = $_.Exception.Message
+        $Sync.Log.Enqueue(("ERROR  {0}" -f $_.Exception.Message))
+        $Sync.State = "RemovalError"
+    }
+}
+'@
+}
+
+function Show-RemovalConfirm {
+    param($Plan)
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = 'Remove from internal mailboxes'
+    $dialog.StartPosition = 'CenterParent'
+    $dialog.FormBorderStyle = 'FixedDialog'
+    $dialog.MaximizeBox = $false
+    $dialog.MinimizeBox = $false
+    $dialog.ClientSize = New-Object System.Drawing.Size(620, 430)
+    $dialog.Font = New-UiFont 9
+    $names = @($Plan.Mailboxes | Select-Object -First 12)
+    $preview = $names -join ', '
+    if (@($Plan.Mailboxes).Count -gt 12) { $preview = $preview + ', ...' }
+    $partial = ''
+    if ($Plan.Partial) { $partial = ' This investigation was cancelled, so the mailbox list may be incomplete.' }
+    $label = New-Object System.Windows.Forms.Label
+    $label.Location = New-Object System.Drawing.Point(16, 16)
+    $label.Size = New-Object System.Drawing.Size(588, 210)
+    $label.Text = @(
+        "This deletes the leaked message, and internal forwards or redirects of it, from $(@($Plan.Mailboxes).Count) internal mailbox(es)."
+        "It covers $(@($Plan.MessageIds).Count) message ID(s). External recipients are not changed, and replies are not removed."
+        $partial
+        ""
+        $preview
+        ""
+        "Hard delete cannot be undone by the user. A retention hold can still keep a copy in the Purges folder. The signed-in account needs the Search And Purge role in Microsoft Purview."
+        "Each round deletes at most 10 matching items per mailbox. This tool repeats for up to 5 rounds."
+        ""
+        "Type REMOVE to continue."
+    ) -join [Environment]::NewLine
+    $mode = New-Object System.Windows.Forms.ComboBox
+    $mode.DropDownStyle = 'DropDownList'
+    $mode.Location = New-Object System.Drawing.Point(16, 236)
+    $mode.Size = New-Object System.Drawing.Size(280, 24)
+    [void]$mode.Items.Add('Hard delete')
+    [void]$mode.Items.Add('Soft delete (Recoverable Items)')
+    $mode.SelectedIndex = 0
+    $prompt = New-Object System.Windows.Forms.TextBox
+    $prompt.Location = New-Object System.Drawing.Point(16, 276)
+    $prompt.Size = New-Object System.Drawing.Size(280, 24)
+    $remove = New-Object System.Windows.Forms.Button
+    $remove.Text = 'Remove'
+    $remove.Enabled = $false
+    $remove.Location = New-Object System.Drawing.Point(420, 380)
+    $remove.Size = New-Object System.Drawing.Size(88, 30)
+    $remove.DialogResult = 'OK'
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = 'Cancel'
+    $cancel.Location = New-Object System.Drawing.Point(516, 380)
+    $cancel.Size = New-Object System.Drawing.Size(88, 30)
+    $cancel.DialogResult = 'Cancel'
+    $prompt.Tag = $remove
+    $prompt.Add_TextChanged({ $this.Tag.Enabled = ($this.Text -ceq 'REMOVE') })
+    $dialog.Controls.AddRange(@($label, $mode, $prompt, $remove, $cancel))
+    $dialog.AcceptButton = $remove
+    $dialog.CancelButton = $cancel
+    $answer = $dialog.ShowDialog()
+    if ($answer -ne 'OK' -or $prompt.Text -cne 'REMOVE') { return $null }
+    $purge = 'HardDelete'
+    if ($mode.SelectedIndex -eq 1) { $purge = 'SoftDelete' }
+    return [pscustomobject]@{ PurgeType = $purge }
+}
+
+function Start-Removal {
+    if (-not $script:LastResult) {
+        [System.Windows.Forms.MessageBox]::Show('Run an investigation before removing the message.', 'Removal')
+        return
+    }
+    $plan = Get-InternalRemovalPlan -Report $script:LastResult
+    if (@($plan.Mailboxes).Count -eq 0 -or @($plan.MessageIds).Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show('No internal mailbox in this result has the original message or an internal forward. External recipients cannot be changed from this tenant.', 'Removal')
+        return
+    }
+    $choice = Show-RemovalConfirm -Plan $plan
+    if (-not $choice) { return }
+    $request = [pscustomobject]@{
+        Report = $script:LastResult
+        PurgeType = $choice.PurgeType
+        UserPrincipalName = $script:UpnBox.Text.Trim()
+        OutputFolder = [string]$script:LastResult.OutputFolder
+    }
+    $script:Sync.State = 'Removing'
+    $script:Sync.ErrorMessage = ''
+    Set-UiBusy $true
+    $script:StatusLabel.Text = 'Removing the message from internal mailboxes...'
+    Add-UiLog 'Removal confirmed. External recipients are not included.'
+    [void](Start-WorkerScript -Code (Get-RemovalScript) -Arguments @($script:CorePath, $script:Sync, $request))
 }
 
 function Get-InvestigationScript {
@@ -718,6 +863,19 @@ function Update-InvestigationUi {
         $tabs = $script:Tabs.TabPages
         if ($tabs.Count -gt 1) { $script:Tabs.SelectedIndex = 1 }
     }
+    elseif ($state -eq 'Removed' -or $state -eq 'RemovalCancelled') {
+        $summary = 'Removal finished.'
+        if ($script:Sync.RemovalResult -and $script:Sync.RemovalResult.Summary) {
+            $summary = [string]$script:Sync.RemovalResult.Summary
+        }
+        Add-UiLog $summary
+        [System.Windows.Forms.MessageBox]::Show($summary, 'Internal removal', 'OK', 'Information')
+    }
+    elseif ($state -eq 'RemovalError') {
+        $message = [string]$script:Sync.ErrorMessage
+        if (-not $message) { $message = 'The removal failed.' }
+        [System.Windows.Forms.MessageBox]::Show($message, 'Removal failed', 'OK', 'Error')
+    }
     elseif ($state -eq 'Error') {
         $message = [string]$script:Sync.ErrorMessage
         if (-not $message) { $message = 'The Exchange Online operation failed.' }
@@ -928,6 +1086,21 @@ $script:Progress.Minimum = 0
 $script:Progress.Maximum = 100
 $buttonPanel.Controls.AddRange(@($script:RunButton, $script:CancelButton, $exportAll, $openFolder, $copySummary, $saveProfile, $loadProfile, $script:Progress))
 
+$removePanel = New-Object System.Windows.Forms.Panel
+$removePanel.Dock = 'Top'
+$removePanel.Height = 40
+$removePanel.BackColor = $script:Page
+$script:RemoveButton = New-FlatButton 'Remove from internal mailboxes' 250 $script:Red { Start-Removal }
+$script:RemoveButton.Enabled = $false
+$script:RemoveButton.Location = New-Object System.Drawing.Point(12, 4)
+$removeHint = New-Object System.Windows.Forms.Label
+$removeHint.Text = 'Deletes only internal copies found by the last investigation. Asks you to type REMOVE.'
+$removeHint.AutoSize = $true
+$removeHint.Location = New-Object System.Drawing.Point(274, 10)
+$removeHint.ForeColor = $script:Muted
+$removeHint.Font = New-UiFont 8
+$removePanel.Controls.AddRange(@($script:RemoveButton, $removeHint))
+
 $cardPanel = New-Object System.Windows.Forms.FlowLayoutPanel
 $cardPanel.Dock = 'Top'
 $cardPanel.Height = 78
@@ -1040,6 +1213,7 @@ $split.Panel2.Controls.Add($logHeader)
 $form.Controls.Add($split)
 $form.Controls.Add($status)
 $form.Controls.Add($cardPanel)
+$form.Controls.Add($removePanel)
 $form.Controls.Add($buttonPanel)
 $form.Controls.Add($script:OptionsPanel)
 $form.Controls.Add($script:FieldsPanel)

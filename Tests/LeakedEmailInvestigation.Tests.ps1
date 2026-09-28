@@ -465,6 +465,57 @@ Assert-Equal 'fallback found original' $fallback.Summary.OriginalRecipients 1
 
 Remove-Item -LiteralPath $temp -Recurse -Force
 
+$removalReport = New-LeakedEmailReport -TraceRows @(
+    (New-Trace '2026-09-25T12:00:00Z' 'hr@contoso.com' 'alice@contoso.com' $cleanSubject '<Orig@contoso.com>')
+    (New-Trace '2026-09-25T12:05:00Z' 'hr@contoso.com' 'vendor@external.com' $cleanSubject '<Orig@contoso.com>')
+    (New-Trace '2026-09-25T13:00:00Z' 'alice@contoso.com' 'dave@contoso.com' "FW: $cleanSubject" '<Fwd@contoso.com>')
+    (New-Trace '2026-09-25T14:00:00Z' 'dave@contoso.com' 'hr@contoso.com' "RE: $cleanSubject" '<Reply@contoso.com>')
+) -Subject $cleanSubject -OriginalSender 'hr@contoso.com' -InternalDomains $domains -StartDate ([datetime]'2026-09-25') -EndDate ([datetime]'2026-09-26')
+$removalReport.Mailboxes = @(
+    [pscustomobject]@{ Requested = 'alice@contoso.com'; PrimarySmtp = 'alice.primary@contoso.com'; Addresses = @('alice@contoso.com'); UserPrincipalName = 'alice@contoso.com' }
+)
+$removalPlan = Get-InternalRemovalPlan -Report $removalReport
+Assert-True 'removal includes alice primary' ($removalPlan.Mailboxes -contains 'alice.primary@contoso.com')
+Assert-True 'removal includes sender' ($removalPlan.Mailboxes -contains 'hr@contoso.com')
+Assert-True 'removal includes forward recipient' ($removalPlan.Mailboxes -contains 'dave@contoso.com')
+Assert-True 'removal skips external' (-not ($removalPlan.Mailboxes -contains 'vendor@external.com'))
+Assert-True 'removal keeps original id' ($removalPlan.MessageIds -contains 'orig@contoso.com')
+Assert-True 'removal keeps forward id' ($removalPlan.MessageIds -contains 'fwd@contoso.com')
+Assert-True 'removal skips reply id' (-not ($removalPlan.MessageIds -contains 'reply@contoso.com'))
+Assert-True 'removal query uses message id' ([string]$removalPlan.Queries[0] -match 'InternetMessageId:"<orig@contoso.com>"')
+
+$purgeState = @{ Searches = 0; Purges = 0; Type = ''; Mailboxes = $null }
+$removalDeps = [pscustomobject]@{
+    NewSearch = { param($Name, $Mailboxes, $Query) $purgeState.Mailboxes = @($Mailboxes) }
+    StartSearch = { param($Name) }
+    GetSearch = {
+        param($Name)
+        $purgeState.Searches++
+        $items = 2
+        if ($purgeState.Searches -gt 1) { $items = 0 }
+        [pscustomobject]@{ Status = 'Completed'; Items = $items }
+    }
+    NewPurge = { param($Name, $PurgeType) $purgeState.Purges++; $purgeState.Type = $PurgeType }
+    GetAction = { param($Name) [pscustomobject]@{ Status = 'Completed'; Results = 'Item count: 2' } }
+}
+$removed = Invoke-InternalMessageRemoval -Report $removalReport -PurgeType 'HardDelete' -PollSeconds 0 -OutputFolder (Join-Path $temp 'removal') -Dependencies $removalDeps
+Assert-Equal 'one purge action' $purgeState.Purges 1
+Assert-Equal 'hard delete requested' $purgeState.Type 'HardDelete'
+Assert-True 'purge skipped external mailbox' (-not ($purgeState.Mailboxes -contains 'vendor@external.com'))
+Assert-Equal 'removal completed' $removed.Status 'Completed'
+Assert-Equal 'removal remaining none' $removed.RemainingItems 0
+Assert-True 'removal csv written' (Test-Path -LiteralPath $removed.ExportPath)
+Remove-Item -LiteralPath (Join-Path $temp 'removal') -Recurse -Force -ErrorAction SilentlyContinue
+
+$cancelRemoval = Invoke-InternalMessageRemoval -Report $removalReport -PurgeType 'SoftDelete' -PollSeconds 0 -Dependencies $removalDeps -CancelHandler { $true }
+Assert-Equal 'removal cancelled' $cancelRemoval.Status 'Cancelled'
+
+$externalOnly = New-LeakedEmailReport -TraceRows @(
+    (New-Trace '2026-09-25T12:00:00Z' 'vendor@external.com' 'other@external.com' $cleanSubject '<Out@external.com>')
+) -Subject $cleanSubject -OriginalSender 'vendor@external.com' -InternalDomains $domains -StartDate ([datetime]'2026-09-25') -EndDate ([datetime]'2026-09-26')
+$externalPlan = Get-InternalRemovalPlan -Report $externalOnly
+Assert-Equal 'external plan has no mailbox' @($externalPlan.Mailboxes).Count 0
+
 $remoteCommands = @(Get-InvestigationRemoteCommandNames)
 Assert-True 'remote command list includes trace' ($remoteCommands -contains 'Get-MessageTraceV2')
 Assert-True 'remote command list includes detail' ($remoteCommands -contains 'Get-MessageTraceDetailV2')

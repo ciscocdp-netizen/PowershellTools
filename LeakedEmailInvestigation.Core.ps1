@@ -34,6 +34,10 @@
   - Subject search uses EndsWith unless loose matching is requested. Forwards
     and replies still match because their prefixes sit in front of the subject.
     Contains is the slow fallback when EndsWith returns nothing.
+  - Removing the message is a separate confirmed action. It hard-deletes or
+    soft-deletes only the internal mailboxes that received the original message
+    or an internal forward or redirect. External recipients and replies are left
+    alone.
 #>
 
 $script:InvCtx = $null
@@ -1734,6 +1738,318 @@ function Get-TargetMessageIds {
         if ($id) { $ids[$id] = $true }
     }
     return $ids
+}
+
+function Add-RemovalAddress {
+    param($Set, [string]$Address, [string[]]$InternalDomains)
+    if (-not (Test-SmtpAddress $Address)) { return }
+    if (-not (Test-InternalAddress $Address $InternalDomains)) { return }
+    Add-AddressToSet $Set $Address
+}
+
+function Get-RemovalQueryChunks {
+    param([string[]]$MessageIds, [int]$MaxLength = 3500)
+    $queries = New-Object System.Collections.Generic.List[string]
+    $current = New-Object System.Collections.Generic.List[string]
+    $length = 0
+    foreach ($id in @( $MessageIds )) {
+        $clean = Get-NormalizedId $id
+        if (-not $clean -or $clean.IndexOf('"') -ge 0) { continue }
+        $part = ('InternetMessageId:"<{0}>" OR InternetMessageId:"{0}"' -f $clean)
+        if ($current.Count -gt 0 -and (($length + $part.Length + 4) -gt $MaxLength)) {
+            $queries.Add('(' + ($current -join ' OR ') + ')')
+            $current.Clear()
+            $length = 0
+        }
+        $current.Add($part)
+        $length += $part.Length + 4
+    }
+    if ($current.Count -eq 1) { $queries.Add($current[0]) }
+    elseif ($current.Count -gt 1) { $queries.Add('(' + ($current -join ' OR ') + ')') }
+    Write-Output -NoEnumerate -InputObject $queries.ToArray()
+}
+
+function Get-InternalRemovalPlan {
+    <#
+    .SYNOPSIS
+      Lists internal mailboxes and message IDs that a later purge is allowed to target.
+    #>
+    param($Report)
+    $domains = @()
+    foreach ($domain in @( $Report.InternalDomains )) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$domain)) { $domains += ([string]$domain).Trim() }
+    }
+    $idList = New-Object System.Collections.Generic.List[string]
+    $idSeen = @{}
+    $addresses = New-AddressSet
+    foreach ($row in (ConvertTo-ItemArray $Report.Original) + (ConvertTo-ItemArray $Report.Propagation)) {
+        $id = Get-NormalizedId $row.MessageId
+        if ($id -and -not $idSeen.ContainsKey($id)) {
+            $idSeen[$id] = $true
+            $idList.Add($id)
+        }
+        Add-RemovalAddress $addresses ([string]$row.SenderAddress) $domains
+        if ([string]$row.External -ne 'Yes') {
+            Add-RemovalAddress $addresses ([string]$row.RecipientAddress) $domains
+        }
+    }
+    Add-RemovalAddress $addresses ([string]$Report.OriginalSender) $domains
+    foreach ($alias in @( $Report.SenderAddresses )) {
+        Add-RemovalAddress $addresses ([string]$alias) $domains
+    }
+
+    $resolved = New-AddressSet
+    $covered = New-AddressSet
+    foreach ($box in (ConvertTo-ItemArray $Report.Mailboxes)) {
+        $primary = [string](Get-ObjectProperty $box 'PrimarySmtp')
+        if (-not $primary) { $primary = [string](Get-ObjectProperty $box 'PrimarySmtpAddress') }
+        $candidates = New-Object System.Collections.Generic.List[string]
+        foreach ($candidate in @($box.Requested, $box.UserPrincipalName, $primary) + @(ConvertTo-ItemArray (Get-ObjectProperty $box 'Addresses'))) {
+            if ($candidate) { $candidates.Add([string]$candidate) }
+        }
+        $matched = $false
+        foreach ($candidate in $candidates) {
+            if ($addresses.Contains($candidate)) { $matched = $true }
+        }
+        if (-not $matched) { continue }
+        if ($primary -and (Test-InternalAddress $primary $domains)) {
+            Add-AddressToSet $resolved $primary
+            foreach ($candidate in $candidates) { Add-AddressToSet $covered $candidate }
+        }
+    }
+    foreach ($address in $addresses) {
+        if (-not $covered.Contains($address)) { Add-AddressToSet $resolved $address }
+    }
+
+    $mailboxes = New-Object System.Collections.Generic.List[string]
+    foreach ($address in $resolved) { $mailboxes.Add($address) }
+    $mailboxes.Sort([System.StringComparer]::OrdinalIgnoreCase)
+    $idList.Sort([System.StringComparer]::OrdinalIgnoreCase)
+    $queries = Get-RemovalQueryChunks -MessageIds $idList.ToArray()
+    return [pscustomobject]@{
+        Mailboxes = $mailboxes.ToArray()
+        MessageIds = $idList.ToArray()
+        Queries = $queries
+        Partial = [bool]$Report.Cancelled
+    }
+}
+
+function Get-DefaultRemovalDependencies {
+    return [pscustomobject]@{
+        ConnectCompliance = {
+            param($Upn)
+            if (Get-Command New-ComplianceSearch -ErrorAction SilentlyContinue) { return }
+            if (-not (Get-Command Connect-IPPSSession -ErrorAction SilentlyContinue)) {
+                Import-Module ExchangeOnlineManagement -ErrorAction Stop
+            }
+            if ($Upn) {
+                Connect-IPPSSession -ShowBanner:$false -UserPrincipalName $Upn
+            }
+            else {
+                Connect-IPPSSession -ShowBanner:$false
+            }
+        }
+        NewSearch = {
+            param($Name, $Mailboxes, $Query)
+            $params = @{
+                Name = $Name
+                ExchangeLocation = @($Mailboxes)
+                ContentMatchQuery = $Query
+                Description = 'Internal leaked-email removal. External recipients are not included.'
+            }
+            $command = Get-Command New-ComplianceSearch -ErrorAction Stop
+            if ($command.Parameters.ContainsKey('AllowNotFoundExchangeLocationsEnabled')) {
+                $params.AllowNotFoundExchangeLocationsEnabled = $true
+            }
+            if (-not $command.Parameters.ContainsKey('Description')) { $null = $params.Remove('Description') }
+            New-ComplianceSearch @params | Out-Null
+        }
+        StartSearch = {
+            param($Name)
+            Start-ComplianceSearch -Identity $Name -ErrorAction Stop | Out-Null
+        }
+        GetSearch = {
+            param($Name)
+            Get-ComplianceSearch -Identity $Name -ErrorAction Stop
+        }
+        NewPurge = {
+            param($Name, $PurgeType)
+            New-ComplianceSearchAction -SearchName $Name -Purge -PurgeType $PurgeType -Confirm:$false -ErrorAction Stop | Out-Null
+        }
+        GetAction = {
+            param($Name)
+            Get-ComplianceSearchAction -Identity $Name -ErrorAction Stop
+        }
+    }
+}
+
+function Wait-RemovalOperation {
+    param(
+        [scriptblock]$Fetch,
+        [string]$Identity,
+        [int]$PollSeconds,
+        [int]$TimeoutSeconds
+    )
+    $started = Get-Date
+    while ($true) {
+        if (Test-InvCancel) {
+            return [pscustomobject]@{ Status = 'Cancelled'; Items = $null; Results = ''; Raw = $null }
+        }
+        $raw = & $Fetch $Identity
+        $status = [string](Get-ObjectProperty $raw 'Status')
+        $items = Get-ObjectProperty $raw 'Items'
+        $results = [string](Get-ObjectProperty $raw 'Results')
+        if (-not $results) { $results = [string](Get-ObjectProperty $raw 'Errors') }
+        if ($status -match '^(Completed|Failed|Cancelled|PartiallySucceeded|Stopped)$') {
+            return [pscustomobject]@{ Status = $status; Items = $items; Results = $results; Raw = $raw }
+        }
+        if (((Get-Date) - $started).TotalSeconds -ge $TimeoutSeconds) {
+            return [pscustomobject]@{ Status = 'TimedOut'; Items = $items; Results = $results; Raw = $raw }
+        }
+        if ($PollSeconds -gt 0) { Start-Sleep -Seconds $PollSeconds }
+    }
+}
+
+function Invoke-InternalMessageRemoval {
+    <#
+    .SYNOPSIS
+      Deletes the leaked message from internal mailboxes found by the investigation.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$Report,
+        [ValidateSet('HardDelete', 'SoftDelete')]
+        [string]$PurgeType = 'HardDelete',
+        [string]$UserPrincipalName,
+        [string]$OutputFolder,
+        [int]$MaxRounds = 5,
+        [int]$PollSeconds = 5,
+        [int]$TimeoutSeconds = 1200,
+        $Dependencies,
+        [scriptblock]$ProgressHandler,
+        [scriptblock]$LogHandler,
+        [scriptblock]$CancelHandler
+    )
+    $previous = $script:InvCtx
+    $script:InvCtx = [pscustomobject]@{
+        Log = $LogHandler
+        Progress = $ProgressHandler
+        Cancel = $CancelHandler
+        Warnings = (New-Object System.Collections.Generic.List[string])
+    }
+    try {
+        $plan = Get-InternalRemovalPlan -Report $Report
+        if (@($plan.Mailboxes).Count -eq 0 -or @($plan.MessageIds).Count -eq 0) {
+            throw 'No internal mailbox in this result has a copy of the original message or an internal forward. External recipients cannot be changed from this tenant.'
+        }
+        if (-not $Dependencies) { $Dependencies = Get-DefaultRemovalDependencies }
+        Update-InvProgress -Percent 5 -Phase 'Compliance' -Message 'Connecting to Microsoft Purview'
+        if ($Dependencies.ConnectCompliance) { & $Dependencies.ConnectCompliance $UserPrincipalName }
+
+        $stamp = (Get-Date).ToString('yyyyMMddHHmmss')
+        $actions = New-Object System.Collections.Generic.List[object]
+        $pending = New-Object System.Collections.Generic.List[string]
+        foreach ($query in @( $plan.Queries )) { if ($query) { $pending.Add([string]$query) } }
+        $round = 0
+        $remaining = $null
+        $stopped = ''
+        while ($pending.Count -gt 0 -and $round -lt $MaxRounds) {
+            if (Test-InvCancel) { $stopped = 'Cancelled'; break }
+            $round++
+            $again = New-Object System.Collections.Generic.List[string]
+            for ($index = 0; $index -lt $pending.Count; $index++) {
+                if (Test-InvCancel) { $stopped = 'Cancelled'; break }
+                $query = $pending[$index]
+                $name = 'LeakRm{0}r{1}q{2}' -f $stamp, $round, ($index + 1)
+                Update-InvProgress -Percent 30 -Phase 'Search' -Message ("Compliance search {0}, round {1}" -f $name, $round)
+                & $Dependencies.NewSearch $name $plan.Mailboxes $query
+                & $Dependencies.StartSearch $name
+                $search = Wait-RemovalOperation -Fetch $Dependencies.GetSearch -Identity $name -PollSeconds $PollSeconds -TimeoutSeconds $TimeoutSeconds
+                if ($search.Status -eq 'Cancelled') { $stopped = 'Cancelled'; break }
+                if ($search.Status -eq 'TimedOut') { throw "Compliance search $name did not finish within $TimeoutSeconds seconds." }
+                if ($search.Status -eq 'Failed' -or $search.Status -eq 'Stopped') {
+                    $detail = $search.Results
+                    if (-not $detail) { $detail = 'The compliance search failed.' }
+                    throw "Compliance search $name failed: $detail"
+                }
+                $count = 0
+                if ($null -ne $search.Items) { $count = [int]$search.Items }
+                Write-InvLog -Level 'INFO' -Message ("{0} matched {1} item(s)." -f $name, $count)
+                if ($count -le 0) { continue }
+                $remaining = $count
+                Update-InvProgress -Percent 70 -Phase 'Purge' -Message ("Removing up to 10 items per mailbox ({0})" -f $PurgeType)
+                & $Dependencies.NewPurge $name $PurgeType
+                $actionName = $name + '_Purge'
+                $action = Wait-RemovalOperation -Fetch $Dependencies.GetAction -Identity $actionName -PollSeconds $PollSeconds -TimeoutSeconds $TimeoutSeconds
+                if ($action.Status -eq 'Cancelled') { $stopped = 'Cancelled'; break }
+                if ($action.Status -eq 'TimedOut') { throw "Purge action $actionName did not finish within $TimeoutSeconds seconds." }
+                if ($action.Status -eq 'Failed' -or $action.Status -eq 'Stopped') {
+                    $detail = $action.Results
+                    if (-not $detail) { $detail = 'The purge action failed.' }
+                    throw "Purge action $actionName failed: $detail"
+                }
+                $actions.Add([pscustomobject]@{
+                    Search = $name
+                    Round = $round
+                    ItemsMatched = $count
+                    PurgeType = $PurgeType
+                    ActionStatus = $action.Status
+                    Results = $action.Results
+                })
+                $again.Add($query)
+            }
+            if ($stopped) { break }
+            $pending = $again
+        }
+        if (-not $stopped -and $pending.Count -eq 0) {
+            $remaining = 0
+            $stopped = 'Completed'
+        }
+        elseif (-not $stopped) {
+            $stopped = 'Incomplete'
+            Write-InvLog -Level 'WARN' -Message 'The purge limit was reached before every matching item was removed. Run removal again to continue.'
+        }
+
+        $folder = $OutputFolder
+        if (-not $folder) { $folder = [string]$Report.OutputFolder }
+        $exportPath = ''
+        if ($folder) {
+            New-Item -ItemType Directory -Path $folder -Force | Out-Null
+            $exportPath = Join-Path $folder 'Removal.csv'
+            $exportRows = New-Object System.Collections.Generic.List[object]
+            foreach ($box in @($plan.Mailboxes)) {
+                $exportRows.Add([pscustomobject]@{ Kind = 'Mailbox'; Value = $box; Detail = '' })
+            }
+            foreach ($id in @($plan.MessageIds)) {
+                $exportRows.Add([pscustomobject]@{ Kind = 'MessageId'; Value = $id; Detail = '' })
+            }
+            foreach ($action in $actions) {
+                $exportRows.Add([pscustomobject]@{ Kind = 'Purge'; Value = $action.Search; Detail = $action.Results })
+            }
+            Export-ObjectCsv -Rows $exportRows.ToArray() -Path $exportPath -Columns @(
+                (New-Column 'Kind'), (New-Column 'Value'), (New-Column 'Detail')
+            )
+        }
+        $summary = "Removal $stopped. $PurgeType targeted $(@($plan.Mailboxes).Count) internal mailbox(es) and $(@($plan.MessageIds).Count) message ID(s) across $($actions.Count) purge action(s)."
+        if ($null -ne $remaining) { $summary += " Last matched item count: $remaining." }
+        Write-InvLog -Level 'INFO' -Message $summary
+        return [pscustomobject]@{
+            Status = $stopped
+            PurgeType = $PurgeType
+            MailboxCount = @($plan.Mailboxes).Count
+            MessageIdCount = @($plan.MessageIds).Count
+            Mailboxes = $plan.Mailboxes
+            MessageIds = $plan.MessageIds
+            Rounds = $round
+            RemainingItems = $remaining
+            Actions = $actions.ToArray()
+            Summary = $summary
+            ExportPath = $exportPath
+            Partial = [bool]$plan.Partial
+        }
+    }
+    finally {
+        $script:InvCtx = $previous
+    }
 }
 
 function Get-TenantPolicyRows {
