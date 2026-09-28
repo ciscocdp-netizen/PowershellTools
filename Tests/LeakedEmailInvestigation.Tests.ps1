@@ -442,6 +442,11 @@ Assert-Equal 'end date includes day' $inv.EndDate.Hour 23
 
 Remove-Item -LiteralPath $temp -Recurse -Force
 
+$remoteCommands = @(Get-InvestigationRemoteCommandNames)
+Assert-True 'remote command list includes trace' ($remoteCommands -contains 'Get-MessageTraceV2')
+Assert-True 'remote command list includes detail' ($remoteCommands -contains 'Get-MessageTraceDetailV2')
+Assert-True 'remote command list includes domains' ($remoteCommands -contains 'Get-AcceptedDomain')
+
 $views = @(Get-InvestigationViews)
 Assert-True 'report views exist' ($views.Count -ge 12)
 $viewNames = @{}

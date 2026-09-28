@@ -28,6 +28,9 @@
     are called out separately from external forwards.
   - Folder-sync rows are limited to investigated mailboxes and are not treated
     as proof the message was downloaded.
+  - Get-MessageTraceV2 is a remote command created by Connect-ExchangeOnline.
+    Importing ExchangeOnlineManagement does not add it, so sign-in is not
+    rejected just because the command is absent before the session exists.
 #>
 
 $script:InvCtx = $null
@@ -1795,6 +1798,22 @@ function Get-TenantPolicyRows {
     Write-Output -NoEnumerate -InputObject $policyRows
 }
 
+function Get-InvestigationRemoteCommandNames {
+    # These are remote Exchange commands. They appear in the temporary session
+    # module after Connect-ExchangeOnline, not when the gallery module is imported.
+    return @(
+        'Get-MessageTraceV2'
+        'Get-MessageTraceDetailV2'
+        'Get-AcceptedDomain'
+        'Get-InboxRule'
+        'Get-TransportRule'
+        'Get-RemoteDomain'
+        'Get-HostedOutboundSpamFilterPolicy'
+        'Get-AdminAuditLogConfig'
+        'Search-UnifiedAuditLog'
+    )
+}
+
 function Assert-InvestigationModule {
     $modules = @(Get-Module -ListAvailable -Name ExchangeOnlineManagement | Sort-Object Version -Descending)
     if ($modules.Count -eq 0) {
@@ -1802,13 +1821,42 @@ function Assert-InvestigationModule {
     }
     $best = $modules[0]
     if ([version]$best.Version -lt [version]'3.7.0') {
-        throw "ExchangeOnlineManagement $($best.Version) is installed. Get-MessageTraceV2 requires 3.7.0 or newer. Run: Update-Module ExchangeOnlineManagement"
+        throw "ExchangeOnlineManagement $($best.Version) is installed. Get-MessageTraceV2 requires 3.7.0 or newer. Run: Update-Module ExchangeOnlineManagement -Force"
     }
-    Import-Module ExchangeOnlineManagement -MinimumVersion 3.7.0 -ErrorAction Stop
-    if (-not (Get-Command Get-MessageTraceV2 -ErrorAction SilentlyContinue)) {
-        throw 'Get-MessageTraceV2 is not available after importing ExchangeOnlineManagement. Update the module to 3.7.0 or newer.'
+    $stale = @(Get-Module -Name ExchangeOnlineManagement | Where-Object { [version]$_.Version -lt [version]'3.7.0' })
+    if ($stale.Count -gt 0) {
+        Remove-Module -Name ExchangeOnlineManagement -Force -ErrorAction SilentlyContinue
+    }
+    $current = @(Get-Module -Name ExchangeOnlineManagement | Where-Object { [version]$_.Version -ge [version]'3.7.0' })
+    if ($current.Count -eq 0) {
+        Import-Module ExchangeOnlineManagement -RequiredVersion $best.Version -ErrorAction Stop
     }
     return $best.Version
+}
+
+function Connect-ExchangeOnlineForInvestigation {
+    param(
+        [string]$UserPrincipalName,
+        [string[]]$CommandName
+    )
+    # -ShowBanner:$false must be passed directly. Splatting a switch as $false
+    # still turns the switch on.
+    $names = @($CommandName | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($names.Count -gt 0) {
+        if ($UserPrincipalName) {
+            Connect-ExchangeOnline -ShowBanner:$false -ShowProgress:$false -SkipLoadingFormatData -UserPrincipalName $UserPrincipalName -CommandName $names
+        }
+        else {
+            Connect-ExchangeOnline -ShowBanner:$false -ShowProgress:$false -SkipLoadingFormatData -CommandName $names
+        }
+        return
+    }
+    if ($UserPrincipalName) {
+        Connect-ExchangeOnline -ShowBanner:$false -ShowProgress:$false -UserPrincipalName $UserPrincipalName
+    }
+    else {
+        Connect-ExchangeOnline -ShowBanner:$false -ShowProgress:$false
+    }
 }
 
 function Get-InvestigationConnectionStatus {
@@ -1828,13 +1876,18 @@ function Connect-InvestigationService {
     $version = Assert-InvestigationModule
     $existing = Get-InvestigationConnectionStatus
     if (-not $existing) {
-        if ($UserPrincipalName) {
-            Connect-ExchangeOnline -ShowBanner:$false -UserPrincipalName $UserPrincipalName
-        }
-        else {
-            Connect-ExchangeOnline -ShowBanner:$false
-        }
+        Connect-ExchangeOnlineForInvestigation -UserPrincipalName $UserPrincipalName
         $existing = Get-InvestigationConnectionStatus
+    }
+    if (-not (Get-Command Get-MessageTraceV2 -ErrorAction SilentlyContinue)) {
+        # A normal REST session does not always import this remote command.
+        # Ask for it explicitly. That signs the user in again.
+        Disconnect-InvestigationService
+        Connect-ExchangeOnlineForInvestigation -UserPrincipalName $UserPrincipalName -CommandName (Get-InvestigationRemoteCommandNames)
+        $existing = Get-InvestigationConnectionStatus
+    }
+    if (-not (Get-Command Get-MessageTraceV2 -ErrorAction SilentlyContinue)) {
+        throw "Signed in with ExchangeOnlineManagement $version, but Exchange Online did not load Get-MessageTraceV2. That command is created by Connect-ExchangeOnline, not by Import-Module. Run: Update-Module ExchangeOnlineManagement -Force. Then connect with an account that can run message trace."
     }
     $user = ''
     $organization = ''
