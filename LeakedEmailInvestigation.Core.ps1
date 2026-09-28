@@ -1973,27 +1973,63 @@ function Get-DefaultRemovalDependencies {
     }
 }
 
+function ConvertTo-RemovalStatus {
+    param($Raw)
+    $status = [string](Get-ObjectProperty $Raw 'Status')
+    if (-not $status) { $status = [string](Get-ObjectProperty $Raw 'StatusDescription') }
+    switch ($status) {
+        '0' { return 'NotStarted' }
+        '1' { return 'Starting' }
+        '2' { return 'InProgress' }
+        '3' { return 'Completed' }
+        '4' { return 'Stopping' }
+        '5' { return 'Stopped' }
+        '6' { return 'Failed' }
+        '7' { return 'PartiallySucceeded' }
+    }
+    if ($status -match 'Completed') { return 'Completed' }
+    if ($status -match 'Fail') { return 'Failed' }
+    if ($status -match 'Cancel') { return 'Cancelled' }
+    if ($status -match 'Stop') { return 'Stopped' }
+    if ($status -match 'Partial') { return 'PartiallySucceeded' }
+    if ($status -match 'Progress|Starting|Queued|NotStarted') { return 'InProgress' }
+    return $status
+}
+
 function Wait-RemovalOperation {
     param(
         [scriptblock]$Fetch,
         [string]$Identity,
         [int]$PollSeconds,
-        [int]$TimeoutSeconds
+        [int]$TimeoutSeconds,
+        [string]$Activity = 'Compliance search',
+        [int]$MailboxCount = 0
     )
     $started = Get-Date
+    $lastMinute = -1
     while ($true) {
         if (Test-InvCancel) {
             return [pscustomobject]@{ Status = 'Cancelled'; Items = $null; Results = ''; Raw = $null }
         }
         $raw = & $Fetch $Identity
-        $status = [string](Get-ObjectProperty $raw 'Status')
+        $status = ConvertTo-RemovalStatus $raw
         $items = Get-ObjectProperty $raw 'Items'
+        if ($null -eq $items) { $items = Get-ObjectProperty $raw 'ItemCount' }
         $results = [string](Get-ObjectProperty $raw 'Results')
         if (-not $results) { $results = [string](Get-ObjectProperty $raw 'Errors') }
+        $elapsed = [int]((Get-Date) - $started).TotalSeconds
+        $minute = [int]($elapsed / 60)
+        $shown = $status
+        if (-not $shown) { $shown = 'waiting for Microsoft' }
+        Update-InvProgress -Percent 45 -Phase 'Purge' -Message ("{0}: {1}. {2} min elapsed across {3} mailbox(es)." -f $Activity, $shown, $minute, $MailboxCount)
+        if ($minute -ne $lastMinute) {
+            $lastMinute = $minute
+            Write-InvLog -Level 'INFO' -Message ("{0} is {1} after {2} min. Microsoft runs this as a compliance job, including for a small set of mailboxes." -f $Activity, $shown, $minute)
+        }
         if ($status -match '^(Completed|Failed|Cancelled|PartiallySucceeded|Stopped)$') {
             return [pscustomobject]@{ Status = $status; Items = $items; Results = $results; Raw = $raw }
         }
-        if (((Get-Date) - $started).TotalSeconds -ge $TimeoutSeconds) {
+        if ($elapsed -ge $TimeoutSeconds) {
             return [pscustomobject]@{ Status = 'TimedOut'; Items = $items; Results = $results; Raw = $raw }
         }
         if ($PollSeconds -gt 0) { Start-Sleep -Seconds $PollSeconds }
@@ -2053,7 +2089,7 @@ function Invoke-InternalMessageRemoval {
                 Update-InvProgress -Percent 30 -Phase 'Search' -Message ("Compliance search {0}, round {1}" -f $name, $round)
                 & $Dependencies.NewSearch $name $plan.Mailboxes $query
                 & $Dependencies.StartSearch $name
-                $search = Wait-RemovalOperation -Fetch $Dependencies.GetSearch -Identity $name -PollSeconds $PollSeconds -TimeoutSeconds $TimeoutSeconds
+                $search = Wait-RemovalOperation -Fetch $Dependencies.GetSearch -Identity $name -PollSeconds $PollSeconds -TimeoutSeconds $TimeoutSeconds -Activity 'Compliance search' -MailboxCount @($plan.Mailboxes).Count
                 if ($search.Status -eq 'Cancelled') { $stopped = 'Cancelled'; break }
                 if ($search.Status -eq 'TimedOut') { throw "Compliance search $name did not finish within $TimeoutSeconds seconds." }
                 if ($search.Status -eq 'Failed' -or $search.Status -eq 'Stopped') {
@@ -2069,7 +2105,7 @@ function Invoke-InternalMessageRemoval {
                 Update-InvProgress -Percent 70 -Phase 'Purge' -Message ("Removing up to 10 items per mailbox ({0})" -f $PurgeType)
                 & $Dependencies.NewPurge $name $PurgeType
                 $actionName = $name + '_Purge'
-                $action = Wait-RemovalOperation -Fetch $Dependencies.GetAction -Identity $actionName -PollSeconds $PollSeconds -TimeoutSeconds $TimeoutSeconds
+                $action = Wait-RemovalOperation -Fetch $Dependencies.GetAction -Identity $actionName -PollSeconds $PollSeconds -TimeoutSeconds $TimeoutSeconds -Activity 'Purge action' -MailboxCount @($plan.Mailboxes).Count
                 if ($action.Status -eq 'Cancelled') { $stopped = 'Cancelled'; break }
                 if ($action.Status -eq 'TimedOut') { throw "Purge action $actionName did not finish within $TimeoutSeconds seconds." }
                 if ($action.Status -eq 'Failed' -or $action.Status -eq 'Stopped') {
@@ -2085,7 +2121,15 @@ function Invoke-InternalMessageRemoval {
                     ActionStatus = $action.Status
                     Results = $action.Results
                 })
-                $again.Add($query)
+                $purgeCap = @($plan.Mailboxes).Count * 10
+                if ($purgeCap -lt 10) { $purgeCap = 10 }
+                if ($count -le $purgeCap) {
+                    $remaining = 0
+                    Write-InvLog -Level 'INFO' -Message ("Purge action finished for {0} item(s). A second compliance search was not started." -f $count)
+                }
+                else {
+                    $again.Add($query)
+                }
             }
             if ($stopped) { break }
             $pending = $again
@@ -2121,6 +2165,9 @@ function Invoke-InternalMessageRemoval {
         }
         $summary = "Removal $stopped. $PurgeType targeted $(@($plan.Mailboxes).Count) internal mailbox(es) and $(@($plan.MessageIds).Count) message ID(s) across $($actions.Count) purge action(s)."
         if ($null -ne $remaining) { $summary += " Last matched item count: $remaining." }
+        if ($stopped -eq 'Completed' -and $actions.Count -gt 0) {
+            $summary += ' The purge action finished. A follow-up compliance search was not run, because that second scan often takes as long as the delete.'
+        }
         Write-InvLog -Level 'INFO' -Message $summary
         return [pscustomobject]@{
             Status = $stopped
