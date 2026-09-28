@@ -532,8 +532,6 @@ function Show-RemovalConfirm {
         ""
         "Hard delete cannot be undone by the user. A retention hold can still keep a copy in the Purges folder. The signed-in account needs the Search And Purge role in Microsoft Purview."
         "Each round deletes at most 10 matching items per mailbox. This tool repeats for up to 5 rounds."
-        ""
-        "Type REMOVE to continue."
     ) -join [Environment]::NewLine
     $mode = New-Object System.Windows.Forms.ComboBox
     $mode.DropDownStyle = 'DropDownList'
@@ -542,8 +540,13 @@ function Show-RemovalConfirm {
     [void]$mode.Items.Add('Hard delete')
     [void]$mode.Items.Add('Soft delete (Recoverable Items)')
     $mode.SelectedIndex = 0
+    $promptLabel = New-Object System.Windows.Forms.Label
+    $promptLabel.Text = 'Type REMOVE in capital letters'
+    $promptLabel.Font = New-UiFont 9 Bold
+    $promptLabel.Location = New-Object System.Drawing.Point(16, 270)
+    $promptLabel.Size = New-Object System.Drawing.Size(400, 22)
     $prompt = New-Object System.Windows.Forms.TextBox
-    $prompt.Location = New-Object System.Drawing.Point(16, 276)
+    $prompt.Location = New-Object System.Drawing.Point(16, 294)
     $prompt.Size = New-Object System.Drawing.Size(280, 24)
     $remove = New-Object System.Windows.Forms.Button
     $remove.Text = 'Remove'
@@ -558,7 +561,7 @@ function Show-RemovalConfirm {
     $cancel.DialogResult = 'Cancel'
     $prompt.Tag = $remove
     $prompt.Add_TextChanged({ $this.Tag.Enabled = ($this.Text -ceq 'REMOVE') })
-    $dialog.Controls.AddRange(@($label, $mode, $prompt, $remove, $cancel))
+    $dialog.Controls.AddRange(@($label, $mode, $promptLabel, $prompt, $remove, $cancel))
     $dialog.AcceptButton = $remove
     $dialog.CancelButton = $cancel
     $answer = $dialog.ShowDialog()
