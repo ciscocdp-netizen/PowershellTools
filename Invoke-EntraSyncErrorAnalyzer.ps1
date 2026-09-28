@@ -16,8 +16,9 @@
         states explicitly that the mailNickname attribute has a null value.
       * Lets you scan Active Directory ad-hoc for any user and inspect the attributes that
         commonly break directory synchronization.
-      * Compares AD accounts with Entra accounts and lists mismatches (source anchor, UPN,
-        mail, mailNickname, proxy addresses, enabled state, and accounts present on only one side).
+      * Compares one AD account with Entra at a time, or the whole directory, and lists
+        mismatches (source anchor, UPN, mail, mailNickname, proxy addresses, enabled state,
+        and accounts present on only one side).
       * Exports findings to CSV / HTML.
 
     Everything runs inside a single robust, modern-looking dark-themed WPF window.
@@ -814,9 +815,9 @@ function Connect-EntraTenant {
             $script:UI.TenantLabel.Text = "$($script:State.TenantInfo.OrgName)  |  $($script:State.TenantInfo.Account)"
             $script:UI.ConnectButton.Content = "Reconnect"
             $script:UI.ScanButton.IsEnabled = $true
-            if ($script:UI.CompareButton) {
-                $script:UI.CompareButton.IsEnabled = [bool]$script:State.AdModuleLoaded
-            }
+            $canCompare = [bool]$script:State.AdModuleLoaded
+            if ($script:UI.CompareButton) { $script:UI.CompareButton.IsEnabled = $canCompare }
+            if ($script:UI.CompareOneButton) { $script:UI.CompareOneButton.IsEnabled = $canCompare }
         })
 
         Write-UiLog "Connected to '$($script:State.TenantInfo.OrgName)' as $account." -Level Success
@@ -2362,6 +2363,274 @@ function Compare-DirectoryAccounts {
     Write-Output -NoEnumerate $rows.ToArray()
 }
 
+function Get-AdHocUserLdapFilter {
+    <#
+        Exact AD lookup for one account. Display-name fragments are intentionally
+        omitted so a short query cannot match the whole domain.
+    #>
+    param([string]$Query)
+    $raw = "$Query".Trim()
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+    $bare = Get-BareAddress $raw
+    $escRaw = Format-LdapFilterValue $raw
+    $escBare = Format-LdapFilterValue $bare
+    return "(|(userPrincipalName=$escRaw)(sAMAccountName=$escRaw)(mail=$escBare)(proxyAddresses=SMTP:$escBare)(proxyAddresses=smtp:$escBare))"
+}
+
+function Get-AdHocEntraFilters {
+    <#
+        Graph filters that find the Entra account for one query or one AD account.
+        proxyAddresses filters are Advanced because they need ConsistencyLevel eventual.
+        SMTP: and smtp: are both kept; a case-insensitive set would drop one of them.
+    #>
+    param(
+        [string]$Query,
+        $AdAccount
+    )
+    $plans = New-Object System.Collections.Generic.List[object]
+    $seen = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+
+    $texts = New-Object System.Collections.Generic.List[string]
+    $anchors = New-Object System.Collections.Generic.List[string]
+    $smtpValues = New-Object System.Collections.Generic.List[string]
+
+    $queryText = "$Query".Trim()
+    if (-not [string]::IsNullOrWhiteSpace($queryText)) { [void]$texts.Add($queryText) }
+    if ($null -ne $AdAccount) {
+        foreach ($field in @('UserPrincipalName', 'Mail', 'SamAccountName', 'PrimarySmtp')) {
+            $fieldValue = "$($AdAccount.$field)".Trim()
+            if (-not [string]::IsNullOrWhiteSpace($fieldValue)) { [void]$texts.Add($fieldValue) }
+        }
+        foreach ($anchor in @($AdAccount.PreferredAnchor, $AdAccount.ObjectGuidAnchor, $AdAccount.ConsistencyAnchor)) {
+            $anchorText = "$anchor".Trim()
+            if (-not [string]::IsNullOrWhiteSpace($anchorText)) { [void]$anchors.Add($anchorText) }
+        }
+        foreach ($smtp in @($AdAccount.SmtpAddresses)) {
+            $smtpText = "$smtp".Trim()
+            if (-not [string]::IsNullOrWhiteSpace($smtpText)) { [void]$smtpValues.Add($smtpText) }
+        }
+    }
+
+    foreach ($text in $texts) {
+        $odata = $text.Replace("'", "''")
+        $bare = Get-BareAddress $text
+        $odataBare = "$bare".Replace("'", "''")
+        if ($text -match '@' -or $text -match '^(?i)smtp:') {
+            [void]$plans.Add([pscustomobject]@{ Filter = "userPrincipalName eq '$odataBare'"; Advanced = $false })
+            [void]$plans.Add([pscustomobject]@{ Filter = "mail eq '$odataBare'"; Advanced = $false })
+            [void]$smtpValues.Add($bare)
+        }
+        else {
+            [void]$plans.Add([pscustomobject]@{ Filter = "onPremisesSamAccountName eq '$odata'"; Advanced = $false })
+            [void]$plans.Add([pscustomobject]@{ Filter = "userPrincipalName eq '$odata'"; Advanced = $false })
+            [void]$plans.Add([pscustomobject]@{ Filter = "mail eq '$odata'"; Advanced = $false })
+        }
+    }
+    foreach ($anchor in $anchors) {
+        $odata = $anchor.Replace("'", "''")
+        [void]$plans.Add([pscustomobject]@{ Filter = "onPremisesImmutableId eq '$odata'"; Advanced = $false })
+    }
+    foreach ($smtp in $smtpValues) {
+        $odata = ("$smtp").Replace("'", "''")
+        [void]$plans.Add([pscustomobject]@{ Filter = "proxyAddresses/any(p:p eq 'SMTP:$odata')"; Advanced = $true })
+        [void]$plans.Add([pscustomobject]@{ Filter = "proxyAddresses/any(p:p eq 'smtp:$odata')"; Advanced = $true })
+    }
+
+    $unique = New-Object System.Collections.Generic.List[object]
+    foreach ($plan in $plans) {
+        if ($seen.ContainsKey($plan.Filter)) { continue }
+        $seen[$plan.Filter] = $true
+        [void]$unique.Add($plan)
+    }
+    if ($unique.Count -eq 0) { return }
+    Write-Output -NoEnumerate $unique.ToArray()
+}
+
+function Publish-AccountMismatches {
+    <#
+        Replace the Account Compare grid. A single Match row means the one
+        account was checked and the compared attributes agree.
+    #>
+    param($Mismatches)
+    $rowList = @($Mismatches | Where-Object { $null -ne $_ })
+    $script:State.AccountMismatches.Clear()
+    if ($script:UI -and $script:UI.CompareDetailBox) {
+        $script:UI.CompareDetailBox.Text = 'Select a mismatch to see both values...'
+    }
+    foreach ($row in $rowList) {
+        $script:UI.Window.Dispatcher.Invoke([action] { $script:State.AccountMismatches.Add($row) })
+    }
+    $critical = @($rowList | Where-Object { $_.Severity -eq 'Critical' })
+    $warnings = @($rowList | Where-Object { $_.Severity -eq 'Warning' })
+    $countText = "$($rowList.Count) mismatch(es)  |  $($critical.Count) critical  |  $($warnings.Count) warning"
+    if ($rowList.Count -eq 1 -and $rowList[0].Mismatch -eq 'Match') {
+        $countText = "No mismatches for $($rowList[0].DisplayName)"
+    }
+    $script:UI.Window.Dispatcher.Invoke([action] { $script:UI.CompareCount.Text = $countText })
+    return [pscustomobject]@{
+        Count    = $rowList.Count
+        Critical = $critical.Count
+        Warning  = $warnings.Count
+    }
+}
+
+function Get-AdHocAccountComparison {
+    <#
+        Compare one account. The query is a UPN, sAMAccountName, or email.
+        A unique display-name hit is accepted. Several name hits are listed
+        and not compared, so this cannot walk the domain.
+    #>
+    param([string]$Query)
+
+    if ([string]::IsNullOrWhiteSpace($Query) -and $script:UI) {
+        $Query = "$($script:UI.CompareQueryBox.Text)"
+    }
+    $Query = "$Query".Trim()
+    if ([string]::IsNullOrWhiteSpace($Query)) {
+        [System.Windows.MessageBox]::Show("Enter a UPN, sAMAccountName, or email.", 'Account needed', 'OK', 'Information') | Out-Null
+        return
+    }
+    if (-not $script:State.Connected) {
+        [System.Windows.MessageBox]::Show("Connect to Entra ID first.", 'Not Connected', 'OK', 'Warning') | Out-Null
+        return
+    }
+    if (-not $script:State.AdModuleLoaded) {
+        [System.Windows.MessageBox]::Show("The ActiveDirectory module is not loaded. Install RSAT and rerun (or remove -SkipActiveDirectory).", 'AD Unavailable', 'OK', 'Warning') | Out-Null
+        return
+    }
+
+    $includeDisplayName = [bool]$script:UI.CompareDisplayNameCheck.IsChecked
+    $searchBase = "$($script:UI.CompareOuBox.Text)".Trim()
+
+    Start-UiOperation -Text "Comparing '$Query' in AD and Entra..." -Stage "One account"
+    $script:State.AccountMismatches.Clear()
+    $script:UI.CompareDetailBox.Text = 'Select a mismatch to see both values...'
+
+    try {
+        $props = @('displayName', 'userPrincipalName', 'mail', 'mailNickname', 'proxyAddresses', 'mS-DS-ConsistencyGuid', 'distinguishedName')
+        $ldap = Get-AdHocUserLdapFilter $Query
+        $adParams = @{ LDAPFilter = $ldap; Properties = $props; ErrorAction = 'Stop' }
+        if (-not [string]::IsNullOrWhiteSpace($searchBase)) {
+            $adParams['SearchBase'] = $searchBase
+            $adParams['SearchScope'] = 'Subtree'
+        }
+        $found = @(Get-ADUser @adParams | Where-Object { $null -ne $_ })
+        if ($found.Count -gt 1) {
+            $preview = (($found | Select-Object -First 10 | ForEach-Object { "$($_.SamAccountName) ($($_.UserPrincipalName))" }) -join ', ')
+            Write-UiLog "Several AD accounts match '$Query': $preview" -Level Warning
+            [System.Windows.MessageBox]::Show("Several Active Directory accounts match '$Query'. Enter one UPN or sAMAccountName.`n`n$preview", 'More than one account', 'OK', 'Warning') | Out-Null
+            return
+        }
+        if ($found.Count -eq 0) {
+            $anr = Format-LdapFilterValue $Query
+            $anrParams = @{ LDAPFilter = "(anr=$anr)"; Properties = $props; ErrorAction = 'Stop' }
+            if (-not [string]::IsNullOrWhiteSpace($searchBase)) {
+                $anrParams['SearchBase'] = $searchBase
+                $anrParams['SearchScope'] = 'Subtree'
+            }
+            $byName = @(Get-ADUser @anrParams | Where-Object { $null -ne $_ })
+            if ($byName.Count -eq 1) {
+                $found = $byName
+                Write-UiLog "One AD account matched '$Query' by name: $($found[0].SamAccountName)."
+            }
+            elseif ($byName.Count -gt 1) {
+                $preview = (($byName | Select-Object -First 10 | ForEach-Object { "$($_.SamAccountName) ($($_.UserPrincipalName))" }) -join ', ')
+                Write-UiLog "Several AD accounts match '$Query': $preview" -Level Warning
+                [System.Windows.MessageBox]::Show("Several Active Directory accounts match '$Query'. Enter one UPN or sAMAccountName.`n`n$preview", 'More than one account', 'OK', 'Warning') | Out-Null
+                return
+            }
+        }
+
+        $adAccount = $null
+        if ($found.Count -eq 1) {
+            $adAccount = ConvertTo-ComparableAccount -Raw $found[0] -Source AD
+            Write-UiLog "AD account: $($adAccount.DisplayName) <$($adAccount.UserPrincipalName)> ($($adAccount.SamAccountName))."
+        }
+        else {
+            Write-UiLog "No AD account matched '$Query'." -Level Warning
+        }
+
+        $cloudProps = @(
+            'id', 'displayName', 'userPrincipalName', 'mail', 'mailNickname', 'proxyAddresses',
+            'accountEnabled', 'onPremisesImmutableId', 'onPremisesSamAccountName',
+            'onPremisesSyncEnabled', 'onPremisesDistinguishedName'
+        )
+        $plans = Get-AdHocEntraFilters -Query $Query -AdAccount $adAccount
+        if ($null -eq $plans) { $plans = @() }
+        $cloudRaw = New-Object System.Collections.Generic.List[object]
+        $seenIds = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+        foreach ($plan in $plans) {
+            try {
+                if ($plan.Advanced) {
+                    $filter = [uri]::EscapeDataString($plan.Filter)
+                    $uri = "https://graph.microsoft.com/v1.0/users?`$count=true&`$top=25&`$select=$($cloudProps -join ',')&`$filter=$filter"
+                    $hits = Invoke-GraphGetAll -Uri $uri -Headers @{ ConsistencyLevel = 'eventual' }
+                    if ($null -eq $hits) { $hits = @() }
+                }
+                else {
+                    $hits = @(Get-MgUser -Filter $plan.Filter -Property $cloudProps -All -ErrorAction Stop | Where-Object { $null -ne $_ })
+                }
+            }
+            catch {
+                Write-UiLog "Entra lookup failed ($($plan.Filter)): $($_.Exception.Message)" -Level Warning
+                continue
+            }
+            foreach ($hit in @($hits)) {
+                if ($null -eq $hit) { continue }
+                $id = "$(Get-DirectoryAttributeValue $hit 'Id')".Trim()
+                if ([string]::IsNullOrWhiteSpace($id) -or $seenIds.ContainsKey($id)) { continue }
+                $seenIds[$id] = $true
+                [void]$cloudRaw.Add($hit)
+            }
+        }
+
+        $entraAccounts = New-Object System.Collections.Generic.List[object]
+        foreach ($cloud in $cloudRaw) {
+            $converted = ConvertTo-ComparableAccount -Raw $cloud -Source Entra
+            if ($null -ne $converted) { [void]$entraAccounts.Add($converted) }
+        }
+        Write-UiLog "Entra accounts matched for '$Query': $($entraAccounts.Count)."
+
+        if ($null -eq $adAccount -and $entraAccounts.Count -eq 0) {
+            Write-UiLog "No AD or Entra account matched '$Query'." -Level Warning
+            [System.Windows.MessageBox]::Show("No Active Directory or Entra account matched '$Query'.", 'No account', 'OK', 'Information') | Out-Null
+            Publish-AccountMismatches @() | Out-Null
+            return
+        }
+
+        $adForCompare = @()
+        if ($null -ne $adAccount) { $adForCompare = @($adAccount) }
+        $mismatches = Compare-DirectoryAccounts -AdAccounts $adForCompare -EntraAccounts $entraAccounts.ToArray() -IncludeCloudOnly $true -IncludeDisplayName $includeDisplayName
+        if ($null -eq $mismatches) { $mismatches = @() }
+        if (@($mismatches).Count -eq 0 -and $null -ne $adAccount -and $entraAccounts.Count -ge 1) {
+            $paired = $entraAccounts[0]
+            foreach ($candidate in $entraAccounts) {
+                $sameAnchor = (-not [string]::IsNullOrWhiteSpace("$($adAccount.PreferredAnchor)")) -and ("$($candidate.ImmutableId)" -ceq "$($adAccount.PreferredAnchor)")
+                $sameUpn = (-not [string]::IsNullOrWhiteSpace("$($adAccount.UserPrincipalName)")) -and ("$($candidate.UserPrincipalName)" -eq "$($adAccount.UserPrincipalName)")
+                if ($sameAnchor -or $sameUpn) { $paired = $candidate; break }
+            }
+            $mismatches = @(New-AccountMismatch -Severity 'Info' -Mismatch 'Match' -Ad $adAccount -Cloud $paired -AdValue "$($adAccount.UserPrincipalName)" -EntraValue "$($paired.UserPrincipalName)" -Detail 'AD and Entra agree on the compared attributes for this account.')
+        }
+
+        $published = Publish-AccountMismatches $mismatches
+        $level = $(if ($published.Critical -gt 0) { 'Error' } elseif ($published.Warning -gt 0) { 'Warning' } else { 'Success' })
+        if ($published.Count -eq 1 -and @($mismatches)[0].Mismatch -eq 'Match') {
+            Write-UiLog "No mismatches for $($adAccount.DisplayName)." -Level Success
+        }
+        else {
+            Write-UiLog "Compared '$Query': $($published.Count) mismatch(es), $($published.Critical) critical / $($published.Warning) warning." -Level $level
+        }
+    }
+    catch {
+        Write-UiLog "Account compare failed: $($_.Exception.Message)" -Level Error
+        [System.Windows.MessageBox]::Show("Account compare failed:`n`n$($_.Exception.Message)", 'Compare Error', 'OK', 'Error') | Out-Null
+    }
+    finally {
+        $tail = $(if ($script:State.AccountMismatches.Count) { "$($script:State.AccountMismatches.Count) row(s)" } else { 'no rows' })
+        Stop-UiOperation -Text "One-account compare finished: $tail"
+    }
+}
+
 function Get-AccountMismatchRecords {
     <#
         Download AD users and Entra users, then fill the Account Compare grid.
@@ -2435,19 +2704,9 @@ function Get-AccountMismatchRecords {
 
         Update-UiProgress -Current 1 -Total 1 -Text "Comparing $($adAccounts.Count) AD account(s) with $($entraAccounts.Count) Entra account(s)..."
         $mismatches = Compare-DirectoryAccounts -AdAccounts $adAccounts.ToArray() -EntraAccounts $entraAccounts.ToArray() -IncludeCloudOnly $includeCloudOnly -IncludeDisplayName $includeDisplayName
-        if ($null -eq $mismatches) { $mismatches = @() }
-
-        foreach ($row in @($mismatches)) {
-            $script:UI.Window.Dispatcher.Invoke([action] { $script:State.AccountMismatches.Add($row) })
-        }
-
-        $critical = @($mismatches | Where-Object { $_.Severity -eq 'Critical' })
-        $warnings = @($mismatches | Where-Object { $_.Severity -eq 'Warning' })
-        $script:UI.Window.Dispatcher.Invoke([action] {
-            $script:UI.CompareCount.Text = "$($mismatches.Count) mismatch(es)  |  $($critical.Count) critical  |  $($warnings.Count) warning"
-        })
-        $level = $(if ($critical.Count -gt 0) { 'Error' } elseif ($warnings.Count -gt 0) { 'Warning' } else { 'Success' })
-        Write-UiLog "Account compare finished: $($mismatches.Count) mismatch(es), $($critical.Count) critical / $($warnings.Count) warning. AD accounts: $($adAccounts.Count). Entra accounts: $($entraAccounts.Count)." -Level $level
+        $published = Publish-AccountMismatches $mismatches
+        $level = $(if ($published.Critical -gt 0) { 'Error' } elseif ($published.Warning -gt 0) { 'Warning' } else { 'Success' })
+        Write-UiLog "Account compare finished: $($published.Count) mismatch(es), $($published.Critical) critical / $($published.Warning) warning. AD accounts: $($adAccounts.Count). Entra accounts: $($entraAccounts.Count)." -Level $level
     }
     catch {
         Write-UiLog "Account compare failed: $($_.Exception.Message)" -Level Error
@@ -2480,7 +2739,7 @@ function Export-SyncErrorRecords {
         $records = $script:State.AccountMismatches
         $namePrefix = 'AccountMismatches'
         $htmlTitle = 'AD and Entra account mismatches'
-        $emptyMessage = 'There is nothing to export. Run Compare AD and Entra first.'
+        $emptyMessage = 'There is nothing to export. Compare one account, or compare all accounts, first.'
     }
 
     if ($records.Count -eq 0) {
@@ -2749,17 +3008,22 @@ function Export-SyncErrorRecords {
 
                     <StackPanel Grid.Row="0" Margin="0,0,0,8">
                         <WrapPanel>
-                            <Button x:Name="CompareButton" Content="Compare AD and Entra" Style="{StaticResource AccentButton}" IsEnabled="False"/>
-                            <TextBlock Text="AD OU" Foreground="#FFCCCCDD" VerticalAlignment="Center" Margin="8,0,6,0"/>
-                            <TextBox x:Name="CompareOuBox" Width="260" Padding="8,6" Margin="0,4,8,4"
+                            <TextBox x:Name="CompareQueryBox" Width="360" Padding="8,6" Margin="0,4,4,4"
                                      Background="#FF232336" Foreground="White" BorderBrush="#FF3A3A50"/>
-                            <CheckBox x:Name="CompareCloudOnlyCheck" Content="Include cloud-only users" Foreground="#FFCCCCDD" VerticalAlignment="Center" Margin="8,0"/>
+                            <Button x:Name="CompareOneButton" Content="Compare this account" Style="{StaticResource AccentButton}" IsEnabled="False"/>
                             <CheckBox x:Name="CompareDisplayNameCheck" Content="Include display name differences" Foreground="#FFCCCCDD" VerticalAlignment="Center" Margin="8,0"/>
                             <Button x:Name="CompareExportButton" Content="Export CSV" Style="{StaticResource GhostButton}"/>
                             <TextBlock x:Name="CompareCount" Text="" Foreground="#FF9A9AB5" VerticalAlignment="Center" Margin="12,0"/>
                         </WrapPanel>
-                        <TextBlock Text="Pairs each AD account to Entra by ms-DS-ConsistencyGuid, then objectGUID, then UPN. Accounts outside the Connect scope show up as In AD only. Leave AD OU empty to read the whole domain."
-                                   Foreground="#FF9A9AB5" FontSize="12" TextWrapping="Wrap" Margin="4,4,0,0"/>
+                        <WrapPanel Margin="0,4,0,0">
+                            <Button x:Name="CompareButton" Content="Compare all accounts" Style="{StaticResource GhostButton}" IsEnabled="False"/>
+                            <TextBlock Text="AD OU" Foreground="#FFCCCCDD" VerticalAlignment="Center" Margin="8,0,6,0"/>
+                            <TextBox x:Name="CompareOuBox" Width="260" Padding="8,6" Margin="0,4,8,4"
+                                     Background="#FF232336" Foreground="White" BorderBrush="#FF3A3A50"/>
+                            <CheckBox x:Name="CompareCloudOnlyCheck" Content="Include cloud-only users" Foreground="#FFCCCCDD" VerticalAlignment="Center" Margin="8,0"/>
+                        </WrapPanel>
+                        <TextBlock Text="Compare this account checks one UPN, sAMAccountName, or email. Compare all accounts reads the directory. An AD OU limits both lookups. Leave it empty to search the whole domain."
+                                   Foreground="#FF9A9AB5" FontSize="12" TextWrapping="Wrap" Margin="4,6,0,0"/>
                     </StackPanel>
 
                     <TextBox x:Name="CompareFilterBox" Grid.Row="1" Margin="0,0,0,8" Padding="8,6"
@@ -2897,6 +3161,8 @@ $script:UI = [ordered]@{
     AdResultsBox    = $window.FindName('AdResultsBox')
     MainTabs        = $window.FindName('MainTabs')
     CompareButton   = $window.FindName('CompareButton')
+    CompareQueryBox = $window.FindName('CompareQueryBox')
+    CompareOneButton = $window.FindName('CompareOneButton')
     CompareOuBox    = $window.FindName('CompareOuBox')
     CompareCloudOnlyCheck = $window.FindName('CompareCloudOnlyCheck')
     CompareDisplayNameCheck = $window.FindName('CompareDisplayNameCheck')
@@ -2933,6 +3199,11 @@ $script:UI.ScanButton.Add_Click({ Get-SyncErrorRecords })
 $script:UI.ExportCsvButton.Add_Click({ Export-SyncErrorRecords -Format CSV })
 $script:UI.ExportHtmlButton.Add_Click({ Export-SyncErrorRecords -Format HTML })
 $script:UI.CompareButton.Add_Click({ Get-AccountMismatchRecords })
+$script:UI.CompareOneButton.Add_Click({ Get-AdHocAccountComparison })
+$script:UI.CompareQueryBox.Add_KeyDown({
+    param($sender, $e)
+    if ($e.Key -eq 'Return') { Get-AdHocAccountComparison }
+})
 $script:UI.CompareExportButton.Add_Click({ Export-SyncErrorRecords -Format CSV -Dataset AccountCompare })
 
 $script:UI.AdSearchButton.Add_Click({
@@ -3074,7 +3345,7 @@ $window.Add_Loaded({
     Write-UiLog "Entra ID Sync Error Analyzer started (PowerShell $($PSVersionTable.PSVersion))." -Level Success
     Write-UiLog "Step 1: Click 'Connect with device code' and finish sign-in at https://microsoft.com/devicelogin. Step 2: Click 'Scan Sync Errors'."
     Write-UiLog "The scan lists users, groups, and contacts with sync errors, plus every other Entra object that already holds the same proxy address or UPN."
-    Write-UiLog "The Account Compare tab pairs AD accounts with Entra and lists mismatched attributes. It needs the ActiveDirectory module."
+    Write-UiLog "Account Compare can check one account: type a UPN, sAMAccountName, or email and click 'Compare this account'. It needs the ActiveDirectory module."
     # Best-effort AD module load so the scanner tab is usable immediately.
     Initialize-AdModule | Out-Null
 })
