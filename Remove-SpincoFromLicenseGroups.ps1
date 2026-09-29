@@ -205,31 +205,21 @@ function Test-ShouldPrompt {
 function Read-RawInput {
     param([Parameter(Mandatory = $true)][string]$PromptText)
 
-    $redirected = $false
-    try { $redirected = [Console]::IsInputRedirected } catch { }
-
-    if ($redirected) {
-        Write-Host "$PromptText " -NoNewline
-        $line = [Console]::In.ReadLine()
-        if ($null -eq $line) {
-            $script:InputEof = $true
-            Write-Host ""
-            return ''
-        }
-        Write-Host $line
-        return $line
-    }
-
+    # Always use Read-Host in a real console. [Console]::IsInputRedirected is
+    # true in some Windows PowerShell hosts even when the user is at a prompt,
+    # which previously made the menu treat Enter as EOF and quit immediately.
     try {
         return Read-Host $PromptText
     }
     catch {
         Write-Host "$PromptText " -NoNewline
-        $line = [Console]::In.ReadLine()
-        if ($null -eq $line) {
-            $script:InputEof = $true
-            return ''
+        try {
+            $line = [Console]::In.ReadLine()
         }
+        catch {
+            $line = ''
+        }
+        if ($null -eq $line) { return '' }
         return $line
     }
 }
@@ -294,12 +284,11 @@ function Read-MainWorkflow {
     Write-Host "  [2] Remove licenses           Find users by extensionAttribute3 (Spinco / Remainco)" -ForegroundColor Yellow
     Write-Host "  [3] Remove licenses from CSV  File picker, choose the user-id column" -ForegroundColor Yellow
     Write-Host "  [Q] Quit" -ForegroundColor Gray
+    Write-Host "Type 1, 2, 3, or Q and press Enter. Press Enter alone to pick [1]." -ForegroundColor Gray
     Write-Host ""
 
     while ($true) {
-        if ($script:InputEof) { return 'Quit' }
         $choice = Read-Prompt -Message "Select a workflow" -Default "1"
-        if ($script:InputEof) { return 'Quit' }
         switch -Regex ($choice) {
             '^(1|r|report)$' { return 'Report' }
             '^(2|a|attribute|spinco|remainco)$' { return 'RemoveByAttribute' }
@@ -1706,7 +1695,6 @@ $script:CertificateThumbprint   = $CertificateThumbprint
 $script:Results                 = [System.Collections.Generic.List[object]]::new()
 $script:EntraGroupCache         = @{}
 $script:TranscriptStarted       = $false
-$script:InputEof                = $false
 $script:UserCancelled           = $false
 $script:WhatIfBound             = [bool]$WhatIfPreference -or $PSBoundParameters.ContainsKey('WhatIf')
 $script:PreviewOnly             = $script:WhatIfBound
