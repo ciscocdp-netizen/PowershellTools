@@ -3393,7 +3393,7 @@ $copyButton.Add_Click({
                     Write-CopyLog ''
                     Write-CopyLog '=== COPY OPERATION STOPPED ==='
                     [System.Windows.Forms.MessageBox]::Show(
-                        "The email copy could not run, so it was stopped before copying anything.`r`n`r`nSee the status window for what to check.",
+                        "The email copy did not finish, so the run was stopped: the calendar copy and the verification did not start.`r`n`r`nSee the status window for what to check.",
                         "Copy Stopped",
                         [System.Windows.Forms.MessageBoxButtons]::OK,
                         [System.Windows.Forms.MessageBoxIcon]::Error)
