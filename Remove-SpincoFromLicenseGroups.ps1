@@ -567,26 +567,59 @@ function Invoke-GraphConnect {
         [switch]$DeviceCode
     )
 
-    $params = @{
-        Scopes      = $Scopes
-        ErrorAction = 'Stop'
-    }
     $cmd = Get-Command Connect-MgGraph -ErrorAction Stop
-    if ($cmd.Parameters.ContainsKey('NoWelcome')) {
-        $params.NoWelcome = $true
-    }
-    if ($DeviceCode) {
-        if ($cmd.Parameters.ContainsKey('UseDeviceCode')) {
-            $params.UseDeviceCode = $true
+    $oldInfo = $InformationPreference
+    $oldWarn = $WarningPreference
+    $oldVerbose = $VerbosePreference
+    # Graph prints the device URL/code on the Information stream, which is
+    # Silent by default — that looks like a hang with no URL.
+    $InformationPreference = 'Continue'
+    $WarningPreference = 'Continue'
+    $VerbosePreference = 'Continue'
+
+    try {
+        $params = @{
+            Scopes            = $Scopes
+            ErrorAction       = 'Stop'
+            InformationAction = 'Continue'
+            WarningAction     = 'Continue'
         }
-        elseif ($cmd.Parameters.ContainsKey('DeviceCode')) {
-            $params.DeviceCode = $true
+        if ($cmd.Parameters.ContainsKey('ContextScope')) {
+            $params.ContextScope = 'Process'
+        }
+
+        if ($DeviceCode) {
+            # Do not pass -NoWelcome: several SDK builds hide the device code with it.
+            Write-Host " Waiting for Microsoft Graph to print a device code (this can take a few seconds)..." -ForegroundColor Yellow
+            Write-Host " Then open https://microsoft.com/devicelogin and enter that code." -ForegroundColor Yellow
+            Write-Host ""
+            try { [Console]::Out.Flush() } catch { }
+
+            if ($cmd.Parameters.ContainsKey('UseDeviceCode')) {
+                Connect-MgGraph @params -UseDeviceCode
+            }
+            elseif ($cmd.Parameters.ContainsKey('DeviceCode')) {
+                Connect-MgGraph @params -DeviceCode
+            }
+            elseif ($cmd.Parameters.ContainsKey('UseDeviceAuthentication')) {
+                Connect-MgGraph @params -UseDeviceAuthentication
+            }
+            else {
+                throw "This Microsoft Graph SDK does not support device-code login. Run: Update-Module Microsoft.Graph.Authentication"
+            }
         }
         else {
-            throw "This Microsoft Graph SDK does not support device-code login. Update-Module Microsoft.Graph.Authentication"
+            if ($cmd.Parameters.ContainsKey('NoWelcome')) {
+                $params.NoWelcome = $true
+            }
+            Connect-MgGraph @params
         }
     }
-    Connect-MgGraph @params
+    finally {
+        $InformationPreference = $oldInfo
+        $WarningPreference = $oldWarn
+        $VerbosePreference = $oldVerbose
+    }
 }
 
 function Import-GraphLicenseModules {
@@ -626,7 +659,10 @@ function Import-GraphLicenseModules {
 }
 
 function Connect-SpincoGraph {
-    param([switch]$ForceDeviceCode)
+    param(
+        [switch]$ForceDeviceCode,
+        [switch]$ForceBrowser
+    )
 
     Import-GraphLicenseModules
     $neededScopes = @('User.ReadWrite.All', 'Organization.Read.All', 'Group.Read.All')
@@ -658,13 +694,15 @@ function Connect-SpincoGraph {
         Connect-MgGraph @certParams
     }
     else {
+        $useDeviceCode = if ($ForceBrowser) { $false } else { $ForceDeviceCode -or $script:IsInteractive }
         if ($script:IsInteractive) {
             Write-Host ""
             Write-Host "---- Microsoft Graph sign-in ---------------------------------------------" -ForegroundColor Cyan
             Write-Host " Entra / direct-license lookups need a Graph login." -ForegroundColor Gray
             Write-Host " Sign in with an account that can read users, groups, and licenses." -ForegroundColor Gray
-            if ($ForceDeviceCode) {
-                Write-Host " Device code: a URL and code will appear. Open the URL and enter the code." -ForegroundColor Yellow
+            if ($useDeviceCode) {
+                Write-Host " A URL and one-time code should appear below in this window." -ForegroundColor Yellow
+                Write-Host " Open the URL, enter the code, then return here. No browser popup is required." -ForegroundColor Yellow
             }
             else {
                 Write-Host " A browser window should open. Complete sign-in there, then return here." -ForegroundColor Yellow
@@ -674,7 +712,7 @@ function Connect-SpincoGraph {
         else {
             Write-ScreenLog "Connecting to Microsoft Graph (scopes: $($neededScopes -join ', '))..." -Level INFO
         }
-        Invoke-GraphConnect -Scopes $neededScopes -DeviceCode:$ForceDeviceCode
+        Invoke-GraphConnect -Scopes $neededScopes -DeviceCode:$useDeviceCode
     }
 
     if (-not (Test-GraphSession)) {
@@ -694,24 +732,35 @@ function Initialize-GraphForLicenses {
 
     $script:GraphReady = $false
     try {
-        Connect-SpincoGraph
+        # Interactive consoles use device code (WAM/browser popups often hang with no window).
+        if ($script:IsInteractive) {
+            Connect-SpincoGraph -ForceDeviceCode
+        }
+        else {
+            Connect-SpincoGraph
+        }
         return $true
     }
     catch {
         Write-ScreenLog $_.Exception.Message -Level ERROR
     }
 
-    $canDeviceCode = [bool](Get-Command Connect-MgGraph -ErrorAction SilentlyContinue)
-    if ($script:IsInteractive -and $canDeviceCode -and -not ($script:TenantId -and $script:ClientId -and $script:CertificateThumbprint)) {
-        if (Read-YesNo -Message "Browser sign-in failed or was skipped. Try device-code login instead?" -Default $false) {
+    $canConnect = [bool](Get-Command Connect-MgGraph -ErrorAction SilentlyContinue)
+    if ($script:IsInteractive -and $canConnect -and -not ($script:TenantId -and $script:ClientId -and $script:CertificateThumbprint)) {
+        if (Read-YesNo -Message "Device-code sign-in failed. Try a browser popup instead?" -Default $false) {
             try {
-                Connect-SpincoGraph -ForceDeviceCode
+                Connect-SpincoGraph -ForceBrowser
                 return $true
             }
             catch {
                 Write-ScreenLog $_.Exception.Message -Level ERROR
             }
         }
+        Write-Host ""
+        Write-Host " If no URL/code appeared, run this in the same window, then re-run the report:" -ForegroundColor Yellow
+        Write-Host "   `$InformationPreference = 'Continue'" -ForegroundColor Gray
+        Write-Host "   Connect-MgGraph -Scopes 'User.ReadWrite.All','Organization.Read.All','Group.Read.All' -UseDeviceCode" -ForegroundColor Gray
+        Write-Host ""
     }
 
     if ($Required) {
@@ -933,7 +982,7 @@ function Get-DirectLicenseInventory {
                 $entry.LookupMessage = 'Graph authentication needed. Remaining Entra lookups skipped.'
                 [void]$rows.Add($entry)
                 Write-ScreenLog "Graph is not authenticated. Stopping Entra lookups (will not repeat this error for every user)." -Level ERROR
-                Write-ScreenLog "Complete the Graph sign-in window, or choose device-code login, then re-run the report." -Level WARN
+                Write-ScreenLog "Complete the Graph device-code login (URL + code in this window), then re-run the report." -Level WARN
                 foreach ($rest in @($Users | Select-Object -Skip $index)) {
                     $restGroups = @(foreach ($dn in @($rest.MemberOf | Where-Object { $_ -and $Groups.ContainsKey($_) })) {
                         $Groups[$dn].Name
