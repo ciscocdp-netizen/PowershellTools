@@ -561,6 +561,184 @@ function Test-GraphSession {
     }
 }
 
+function Suspend-RunTranscript {
+    if ($script:TranscriptStarted) {
+        try { Stop-Transcript -WhatIf:$false | Out-Null } catch { }
+        $script:TranscriptStarted = $false
+        $script:TranscriptPaused = $true
+    }
+}
+
+function Resume-RunTranscript {
+    if (-not $script:TranscriptPaused) { return }
+    $script:TranscriptPaused = $false
+    if ($script:ResolvedTranscriptPath) {
+        try {
+            Start-Transcript -Path $script:ResolvedTranscriptPath -Append -ErrorAction Stop -WhatIf:$false | Out-Null
+            $script:TranscriptStarted = $true
+        }
+        catch {
+            Write-Warning "Could not resume transcript: $($_.Exception.Message)"
+        }
+    }
+}
+
+function Invoke-OAuthFormPost {
+    param(
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [Parameter(Mandatory = $true)][hashtable]$Body
+    )
+
+    try {
+        $resp = Invoke-WebRequest -Method Post -Uri $Uri -Body $Body -ContentType 'application/x-www-form-urlencoded' -UseBasicParsing -ErrorAction Stop
+        if ($resp.Content) { return ($resp.Content | ConvertFrom-Json) }
+        return $null
+    }
+    catch {
+        $content = $null
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            $content = $_.ErrorDetails.Message
+        }
+        elseif ($_.Exception.Response) {
+            try {
+                $stream = $_.Exception.Response.GetResponseStream()
+                if ($stream) {
+                    if ($stream.CanSeek) { [void]$stream.Seek(0, [System.IO.SeekOrigin]::Begin) }
+                    $reader = New-Object System.IO.StreamReader($stream)
+                    $content = $reader.ReadToEnd()
+                    $reader.Close()
+                }
+            }
+            catch { }
+        }
+        if ($content) {
+            try { return ($content | ConvertFrom-Json) } catch { throw "OAuth request failed: $content" }
+        }
+        throw
+    }
+}
+
+function Show-GraphDeviceCodePrompt {
+    param($Device)
+
+    $url = $null
+    try { $url = $Device.verification_uri } catch { }
+    if (-not $url) { try { $url = $Device.verification_url } catch { } }
+    if (-not $url) { $url = 'https://microsoft.com/devicelogin' }
+    $code = [string]$Device.user_code
+
+    Write-Host ""
+    Write-Host "==============================================================" -ForegroundColor Yellow
+    Write-Host "  SIGN IN TO MICROSOFT GRAPH" -ForegroundColor Yellow
+    Write-Host "==============================================================" -ForegroundColor Yellow
+    Write-Host "  1. Open:  $url" -ForegroundColor Cyan
+    Write-Host "  2. Enter: $code" -ForegroundColor Green
+    Write-Host "  3. Approve the permissions, then return to this window." -ForegroundColor Gray
+    Write-Host "==============================================================" -ForegroundColor Yellow
+    Write-Host ""
+    try {
+        if ($Device.message) { Write-Host " $($Device.message)" -ForegroundColor Gray; Write-Host "" }
+    } catch { }
+
+    try {
+        Start-Process $url | Out-Null
+        Write-Host " Opened the sign-in page in your browser (if one is available)." -ForegroundColor Gray
+    }
+    catch {
+        Write-Host " Could not open a browser automatically. Paste the URL into Edge or Chrome." -ForegroundColor Yellow
+    }
+}
+
+function Get-GraphDeviceCodeAccessToken {
+    param([Parameter(Mandatory = $true)][string[]]$Scopes)
+
+    $clientId = if ($script:ClientId) { $script:ClientId } else { '14d82eec-204b-4c2f-b7e8-296a70dab67e' }
+    $tenant = if ($script:TenantId) { $script:TenantId } else { 'organizations' }
+    $deviceUri = "https://login.microsoftonline.com/$tenant/oauth2/v2.0/devicecode"
+    $tokenUri = "https://login.microsoftonline.com/$tenant/oauth2/v2.0/token"
+
+    Write-ScreenLog "Requesting a Microsoft Graph device code..." -Level INFO
+    $dc = Invoke-OAuthFormPost -Uri $deviceUri -Body @{
+        client_id = $clientId
+        scope     = ($Scopes -join ' ')
+    }
+    if ($null -eq $dc) { throw "Device code request returned no body." }
+    $dcError = $null
+    try { $dcError = [string]$dc.error } catch { }
+    if ($dcError) {
+        throw "Device code request failed: $dcError $($dc.error_description)"
+    }
+    if (-not $dc.user_code) {
+        throw "Device code request did not return a user_code."
+    }
+
+    Show-GraphDeviceCodePrompt -Device $dc
+
+    $interval = 5
+    try { if ([int]$dc.interval -gt 0) { $interval = [int]$dc.interval } } catch { }
+    $expiresIn = 900
+    try { if ([int]$dc.expires_in -gt 0) { $expiresIn = [int]$dc.expires_in } } catch { }
+    $deadline = (Get-Date).AddSeconds($expiresIn)
+
+    Write-Host " Waiting for you to complete sign-in (code expires in $expiresIn seconds)..." -ForegroundColor Yellow
+    Write-Host " This window will continue automatically after you approve access." -ForegroundColor Gray
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds $interval
+        $tok = Invoke-OAuthFormPost -Uri $tokenUri -Body @{
+            grant_type  = 'urn:ietf:params:oauth:grant-type:device_code'
+            client_id   = $clientId
+            device_code = [string]$dc.device_code
+        }
+        if ($tok -and $tok.access_token) {
+            Write-Host ""
+            Write-ScreenLog "Device-code sign-in succeeded." -Level SUCCESS
+            return [string]$tok.access_token
+        }
+        $err = ''
+        try { $err = [string]$tok.error } catch { }
+        if ($err -eq 'authorization_pending') {
+            Write-Host "." -NoNewline -ForegroundColor DarkGray
+            continue
+        }
+        if ($err -eq 'slow_down') {
+            $interval += 5
+            continue
+        }
+        if ($err -eq 'expired_token') {
+            throw "The device code expired. Re-run the workflow to get a new code."
+        }
+        if ($err -eq 'authorization_declined') {
+            throw "Sign-in was declined in the browser."
+        }
+        $desc = $err
+        try { if ($tok.error_description) { $desc = [string]$tok.error_description } } catch { }
+        throw "Device-code token request failed: $desc"
+    }
+    throw "Timed out waiting for Graph device-code sign-in."
+}
+
+function Connect-GraphWithAccessToken {
+    param([Parameter(Mandatory = $true)][string]$AccessToken)
+
+    $cmd = Get-Command Connect-MgGraph -ErrorAction Stop
+    if (-not $cmd.Parameters.ContainsKey('AccessToken')) {
+        throw "This Graph SDK cannot accept -AccessToken. Update-Module Microsoft.Graph.Authentication"
+    }
+
+    $value = $AccessToken
+    $tokenType = $cmd.Parameters['AccessToken'].ParameterType
+    if ($tokenType -eq [securestring] -or $tokenType.FullName -eq 'System.Security.SecureString') {
+        $value = ConvertTo-SecureString -String $AccessToken -AsPlainText -Force
+    }
+
+    $params = @{
+        AccessToken = $value
+        ErrorAction = 'Stop'
+    }
+    if ($cmd.Parameters.ContainsKey('NoWelcome')) { $params.NoWelcome = $true }
+    Connect-MgGraph @params
+}
+
 function Invoke-GraphConnect {
     param(
         [Parameter(Mandatory = $true)][string[]]$Scopes,
@@ -695,24 +873,37 @@ function Connect-SpincoGraph {
     }
     else {
         $useDeviceCode = if ($ForceBrowser) { $false } else { $ForceDeviceCode -or $script:IsInteractive }
-        if ($script:IsInteractive) {
-            Write-Host ""
-            Write-Host "---- Microsoft Graph sign-in ---------------------------------------------" -ForegroundColor Cyan
-            Write-Host " Entra / direct-license lookups need a Graph login." -ForegroundColor Gray
-            Write-Host " Sign in with an account that can read users, groups, and licenses." -ForegroundColor Gray
-            if ($useDeviceCode) {
-                Write-Host " A URL and one-time code should appear below in this window." -ForegroundColor Yellow
-                Write-Host " Open the URL, enter the code, then return here. No browser popup is required." -ForegroundColor Yellow
+        Suspend-RunTranscript
+        try {
+            if ($script:IsInteractive) {
+                Write-Host ""
+                Write-Host "---- Microsoft Graph sign-in ---------------------------------------------" -ForegroundColor Cyan
+                Write-Host " Entra / direct-license lookups need a Graph login." -ForegroundColor Gray
+                Write-Host " Sign in with an account that can read users, groups, and licenses." -ForegroundColor Gray
+                Write-Host ""
             }
             else {
-                Write-Host " A browser window should open. Complete sign-in there, then return here." -ForegroundColor Yellow
+                Write-ScreenLog "Connecting to Microsoft Graph (scopes: $($neededScopes -join ', '))..." -Level INFO
             }
-            Write-Host ""
+
+            if ($useDeviceCode) {
+                try {
+                    $token = Get-GraphDeviceCodeAccessToken -Scopes $neededScopes
+                    Connect-GraphWithAccessToken -AccessToken $token
+                }
+                catch {
+                    Write-ScreenLog "Built-in device-code login failed: $($_.Exception.Message)" -Level WARN
+                    Write-ScreenLog "Falling back to Connect-MgGraph -UseDeviceCode..." -Level INFO
+                    Invoke-GraphConnect -Scopes $neededScopes -DeviceCode
+                }
+            }
+            else {
+                Invoke-GraphConnect -Scopes $neededScopes
+            }
         }
-        else {
-            Write-ScreenLog "Connecting to Microsoft Graph (scopes: $($neededScopes -join ', '))..." -Level INFO
+        finally {
+            Resume-RunTranscript
         }
-        Invoke-GraphConnect -Scopes $neededScopes -DeviceCode:$useDeviceCode
     }
 
     if (-not (Test-GraphSession)) {
@@ -756,8 +947,10 @@ function Initialize-GraphForLicenses {
                 Write-ScreenLog $_.Exception.Message -Level ERROR
             }
         }
+        Write-Host " If no URL/code appeared, the Graph SDK is not printing it. Re-run the report" -ForegroundColor Yellow
+        Write-Host " after signing in yourself, or ask an admin to consent the Microsoft Graph" -ForegroundColor Yellow
+        Write-Host " Command Line Tools app (client ID 14d82eec-204b-4c2f-b7e8-296a70dab67e)." -ForegroundColor Yellow
         Write-Host ""
-        Write-Host " If no URL/code appeared, run this in the same window, then re-run the report:" -ForegroundColor Yellow
         Write-Host "   `$InformationPreference = 'Continue'" -ForegroundColor Gray
         Write-Host "   Connect-MgGraph -Scopes 'User.ReadWrite.All','Organization.Read.All','Group.Read.All' -UseDeviceCode" -ForegroundColor Gray
         Write-Host ""
@@ -1957,6 +2150,7 @@ $script:Results                 = [System.Collections.Generic.List[object]]::new
 $script:EntraGroupCache         = @{}
 $script:GraphReady              = $false
 $script:TranscriptStarted       = $false
+$script:TranscriptPaused        = $false
 $script:UserCancelled           = $false
 $script:WhatIfBound             = [bool]$WhatIfPreference -or $PSBoundParameters.ContainsKey('WhatIf')
 $script:PreviewOnly             = $script:WhatIfBound
