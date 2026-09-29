@@ -512,9 +512,86 @@ function Test-IsDirectLicenseAssignment {
     return $false
 }
 
+function Test-IsGraphAuthError {
+    param([string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
+    return $Message -match 'Authentication needed|Please call Connect-MgGraph|Access token is empty|token is expired|Lifetime validation failed|invalid_grant|AADSTS70043|AADSTS50058|MSAL'
+}
+
+function Test-IsGraphNotFoundError {
+    param([string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
+    return $Message -match 'does not exist|Request_ResourceNotFound|ErrorCode:\s*Request_ResourceNotFound|NotFound'
+}
+
+function Test-GraphScopesOk {
+    param($Context, [string[]]$NeededScopes)
+
+    if (-not $Context -or -not $Context.Scopes) { return $false }
+    $have = @($Context.Scopes)
+    foreach ($s in $NeededScopes) {
+        if ($have -contains $s) { continue }
+        if ($s -eq 'Organization.Read.All' -and ($have -contains 'Directory.Read.All' -or $have -contains 'Directory.ReadWrite.All')) { continue }
+        if ($s -eq 'Group.Read.All' -and ($have -contains 'Directory.Read.All' -or $have -contains 'Directory.ReadWrite.All')) { continue }
+        if ($s -eq 'User.ReadWrite.All' -and ($have -contains 'Directory.ReadWrite.All')) { continue }
+        return $false
+    }
+    return $true
+}
+
+function Test-GraphSession {
+    try {
+        $ctx = Get-MgContext -ErrorAction Stop
+        if (-not $ctx) { return $false }
+
+        if (Get-Command Invoke-MgGraphRequest -ErrorAction SilentlyContinue) {
+            [void](Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/organization?$select=id' -ErrorAction Stop)
+            return $true
+        }
+        if (Get-Command Get-MgSubscribedSku -ErrorAction SilentlyContinue) {
+            [void]@(Get-MgSubscribedSku -ErrorAction Stop | Select-Object -First 1)
+            return $true
+        }
+        return $false
+    }
+    catch {
+        return $false
+    }
+}
+
+function Invoke-GraphConnect {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Scopes,
+        [switch]$DeviceCode
+    )
+
+    $params = @{
+        Scopes      = $Scopes
+        ErrorAction = 'Stop'
+    }
+    $cmd = Get-Command Connect-MgGraph -ErrorAction Stop
+    if ($cmd.Parameters.ContainsKey('NoWelcome')) {
+        $params.NoWelcome = $true
+    }
+    if ($DeviceCode) {
+        if ($cmd.Parameters.ContainsKey('UseDeviceCode')) {
+            $params.UseDeviceCode = $true
+        }
+        elseif ($cmd.Parameters.ContainsKey('DeviceCode')) {
+            $params.DeviceCode = $true
+        }
+        else {
+            throw "This Microsoft Graph SDK does not support device-code login. Update-Module Microsoft.Graph.Authentication"
+        }
+    }
+    Connect-MgGraph @params
+}
+
 function Import-GraphLicenseModules {
     $required = @(
-        @{ Name = 'Microsoft.Graph.Authentication'; Commands = @('Connect-MgGraph', 'Get-MgContext') }
+        @{ Name = 'Microsoft.Graph.Authentication'; Commands = @('Connect-MgGraph', 'Get-MgContext', 'Invoke-MgGraphRequest', 'Disconnect-MgGraph') }
         @{ Name = 'Microsoft.Graph.Users'; Commands = @('Get-MgUser') }
         @{ Name = 'Microsoft.Graph.Users.Actions'; Commands = @('Set-MgUserLicense') }
         @{ Name = 'Microsoft.Graph.Identity.DirectoryManagement'; Commands = @('Get-MgSubscribedSku') }
@@ -549,43 +626,105 @@ function Import-GraphLicenseModules {
 }
 
 function Connect-SpincoGraph {
-    Import-GraphLicenseModules
+    param([switch]$ForceDeviceCode)
 
+    Import-GraphLicenseModules
     $neededScopes = @('User.ReadWrite.All', 'Organization.Read.All', 'Group.Read.All')
+
     $ctx = $null
     try { $ctx = Get-MgContext } catch { $ctx = $null }
 
-    $scopeOk = $false
-    if ($ctx -and $ctx.Scopes) {
-        $have = @($ctx.Scopes)
-        $scopeOk = $true
-        foreach ($s in $neededScopes) {
-            if ($have -contains $s) { continue }
-            if ($s -eq 'Organization.Read.All' -and ($have -contains 'Directory.Read.All' -or $have -contains 'Directory.ReadWrite.All')) { continue }
-            if ($s -eq 'Group.Read.All' -and ($have -contains 'Directory.Read.All' -or $have -contains 'Directory.ReadWrite.All')) { continue }
-            if ($s -eq 'User.ReadWrite.All' -and ($have -contains 'Directory.ReadWrite.All')) { continue }
-            $scopeOk = $false
-            break
-        }
+    if (-not $ForceDeviceCode -and (Test-GraphScopesOk -Context $ctx -NeededScopes $neededScopes) -and (Test-GraphSession)) {
+        Write-ScreenLog "Using existing Graph session (account: $($ctx.Account); tenant: $($ctx.TenantId))." -Level INFO
+        $script:GraphReady = $true
+        return
     }
 
-    if ($scopeOk) {
-        Write-ScreenLog "Using existing Graph session (account: $($ctx.Account); tenant: $($ctx.TenantId))." -Level INFO
-        return
+    if ($ctx) {
+        Write-ScreenLog "Existing Graph session is missing, expired, or not authenticated. Signing in again..." -Level WARN
+        try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { }
     }
 
     if ($script:TenantId -and $script:ClientId -and $script:CertificateThumbprint) {
         Write-ScreenLog "Connecting to Microsoft Graph with app certificate auth..." -Level INFO
-        Connect-MgGraph -TenantId $script:TenantId -ClientId $script:ClientId -CertificateThumbprint $script:CertificateThumbprint -NoWelcome -ErrorAction Stop
-        return
+        $certParams = @{
+            TenantId              = $script:TenantId
+            ClientId              = $script:ClientId
+            CertificateThumbprint = $script:CertificateThumbprint
+            ErrorAction           = 'Stop'
+        }
+        $cmd = Get-Command Connect-MgGraph
+        if ($cmd.Parameters.ContainsKey('NoWelcome')) { $certParams.NoWelcome = $true }
+        Connect-MgGraph @certParams
+    }
+    else {
+        if ($script:IsInteractive) {
+            Write-Host ""
+            Write-Host "---- Microsoft Graph sign-in ---------------------------------------------" -ForegroundColor Cyan
+            Write-Host " Entra / direct-license lookups need a Graph login." -ForegroundColor Gray
+            Write-Host " Sign in with an account that can read users, groups, and licenses." -ForegroundColor Gray
+            if ($ForceDeviceCode) {
+                Write-Host " Device code: a URL and code will appear. Open the URL and enter the code." -ForegroundColor Yellow
+            }
+            else {
+                Write-Host " A browser window should open. Complete sign-in there, then return here." -ForegroundColor Yellow
+            }
+            Write-Host ""
+        }
+        else {
+            Write-ScreenLog "Connecting to Microsoft Graph (scopes: $($neededScopes -join ', '))..." -Level INFO
+        }
+        Invoke-GraphConnect -Scopes $neededScopes -DeviceCode:$ForceDeviceCode
     }
 
-    Write-ScreenLog "Connecting to Microsoft Graph (scopes: $($neededScopes -join ', '))..." -Level INFO
-    Connect-MgGraph -Scopes $neededScopes -NoWelcome -ErrorAction Stop
+    if (-not (Test-GraphSession)) {
+        throw "Graph sign-in did not produce a usable session (Authentication needed). Complete Connect-MgGraph in this window and retry."
+    }
+
+    $ctx = $null
+    try { $ctx = Get-MgContext } catch { }
+    $who = if ($ctx -and $ctx.Account) { $ctx.Account } else { 'app/unknown' }
+    $tid = if ($ctx -and $ctx.TenantId) { $ctx.TenantId } else { '' }
+    Write-ScreenLog "Connected to Microsoft Graph (account: $who; tenant: $tid)." -Level SUCCESS
+    $script:GraphReady = $true
+}
+
+function Initialize-GraphForLicenses {
+    param([switch]$Required)
+
+    $script:GraphReady = $false
+    try {
+        Connect-SpincoGraph
+        return $true
+    }
+    catch {
+        Write-ScreenLog $_.Exception.Message -Level ERROR
+    }
+
+    $canDeviceCode = [bool](Get-Command Connect-MgGraph -ErrorAction SilentlyContinue)
+    if ($script:IsInteractive -and $canDeviceCode -and -not ($script:TenantId -and $script:ClientId -and $script:CertificateThumbprint)) {
+        if (Read-YesNo -Message "Browser sign-in failed or was skipped. Try device-code login instead?" -Default $false) {
+            try {
+                Connect-SpincoGraph -ForceDeviceCode
+                return $true
+            }
+            catch {
+                Write-ScreenLog $_.Exception.Message -Level ERROR
+            }
+        }
+    }
+
+    if ($Required) {
+        throw "Microsoft Graph authentication is required. Run Connect-MgGraph in this PowerShell window, complete sign-in, then re-run this workflow."
+    }
+
+    Write-ScreenLog "Continuing without Entra ID. Direct / Entra license columns will be empty until you sign in." -Level WARN
+    return $false
 }
 
 function Get-SkuPartNumberMap {
     $map = @{}
+    if (-not $script:GraphReady) { return $map }
     if (Get-Command Get-MgSubscribedSku -ErrorAction SilentlyContinue) {
         try {
             foreach ($sku in @(Get-MgSubscribedSku -ErrorAction Stop)) {
@@ -595,6 +734,10 @@ function Get-SkuPartNumberMap {
             }
         }
         catch {
+            if (Test-IsGraphAuthError $_.Exception.Message) {
+                $script:GraphReady = $false
+                throw
+            }
             Write-ScreenLog "Could not load subscribed SKUs (names will be GUIDs): $($_.Exception.Message)" -Level WARN
         }
     }
@@ -604,29 +747,52 @@ function Get-SkuPartNumberMap {
 function Get-EntraUserForAdUser {
     param($AdUser)
 
+    if (-not $script:GraphReady) { return $null }
+
     $upn = $AdUser.UserPrincipalName
     $sam = $AdUser.SamAccountName
     $props = @('Id', 'UserPrincipalName', 'DisplayName', 'AssignedLicenses', 'LicenseAssignmentStates')
 
-    if ($upn) {
-        try {
-            return Get-MgUser -UserId $upn -Property $props -ErrorAction Stop
+    try {
+        if ($upn) {
+            try {
+                return Get-MgUser -UserId $upn -Property $props -ErrorAction Stop
+            }
+            catch {
+                if (Test-IsGraphAuthError $_.Exception.Message) { throw }
+                if ($sam -and (Test-IsGraphNotFoundError $_.Exception.Message)) {
+                    # Fall through to sAMAccountName lookup.
+                }
+                elseif ($sam) {
+                    Write-ScreenLog "Get-MgUser by UPN '$upn' failed: $($_.Exception.Message)" -Level WARN
+                }
+                else {
+                    if (Test-IsGraphNotFoundError $_.Exception.Message) { return $null }
+                    throw
+                }
+            }
         }
-        catch {
-            Write-ScreenLog "Get-MgUser by UPN '$upn' failed: $($_.Exception.Message)" -Level PROGRESS
-        }
-    }
 
-    if ($sam) {
-        $escaped = ($sam -replace "'", "''")
-        $found = @(Get-MgUser -Filter "onPremisesSamAccountName eq '$escaped'" -Property $props -ErrorAction SilentlyContinue)
-        if ($found.Count -eq 1) { return $found[0] }
-        if ($found.Count -gt 1) {
-            throw "Multiple Entra users match onPremisesSamAccountName '$sam'."
+        if ($sam) {
+            $escaped = ($sam -replace "'", "''")
+            $found = @(Get-MgUser -Filter "onPremisesSamAccountName eq '$escaped'" -Property $props -ErrorAction Stop)
+            if ($found.Count -eq 1) { return $found[0] }
+            if ($found.Count -gt 1) {
+                throw "Multiple Entra users match onPremisesSamAccountName '$sam'."
+            }
         }
-    }
 
-    return $null
+        return $null
+    }
+    catch {
+        if (Test-IsGraphAuthError $_.Exception.Message) {
+            $script:GraphReady = $false
+            throw [System.InvalidOperationException]::new(
+                "Microsoft Graph authentication is required. $($_.Exception.Message)"
+            )
+        }
+        throw
+    }
 }
 
 function Get-DirectLicensesForMgUser {
@@ -707,6 +873,10 @@ function Get-DirectLicenseInventory {
     if (-not $Groups) { $Groups = @{} }
     if (-not $SkuMap) { $SkuMap = @{} }
 
+    if (-not $script:GraphReady -and @($Users).Count -gt 0) {
+        Write-ScreenLog "Skipping Entra lookups for $(@($Users).Count) user(s) because Microsoft Graph is not signed in." -Level WARN
+    }
+
     $rows = [System.Collections.Generic.List[object]]::new()
     $index = 0
     foreach ($user in $Users) {
@@ -730,6 +900,13 @@ function Get-DirectLicenseInventory {
             LookupMessage          = ''
         }
 
+        if (-not $script:GraphReady) {
+            $entry.LookupStatus = 'Skipped'
+            $entry.LookupMessage = 'Microsoft Graph is not signed in.'
+            [void]$rows.Add($entry)
+            continue
+        }
+
         if (-not $user.UserPrincipalName -and -not $user.SamAccountName) {
             $entry.LookupStatus = 'Skipped'
             $entry.LookupMessage = 'No UPN or sAMAccountName to look up in Entra ID.'
@@ -750,6 +927,29 @@ function Get-DirectLicenseInventory {
             }
         }
         catch {
+            if (Test-IsGraphAuthError $_.Exception.Message) {
+                $script:GraphReady = $false
+                $entry.LookupStatus = 'Failed'
+                $entry.LookupMessage = 'Graph authentication needed. Remaining Entra lookups skipped.'
+                [void]$rows.Add($entry)
+                Write-ScreenLog "Graph is not authenticated. Stopping Entra lookups (will not repeat this error for every user)." -Level ERROR
+                Write-ScreenLog "Complete the Graph sign-in window, or choose device-code login, then re-run the report." -Level WARN
+                foreach ($rest in @($Users | Select-Object -Skip $index)) {
+                    $restGroups = @(foreach ($dn in @($rest.MemberOf | Where-Object { $_ -and $Groups.ContainsKey($_) })) {
+                        $Groups[$dn].Name
+                    })
+                    [void]$rows.Add([pscustomobject]@{
+                        AdUser                 = $rest
+                        MgUser                 = $null
+                        DirectLicenses         = @()
+                        GroupAssignedLicenses  = @()
+                        AdLicenseGroups        = $restGroups
+                        LookupStatus           = 'Skipped'
+                        LookupMessage          = 'Skipped because Graph is not authenticated.'
+                    })
+                }
+                break
+            }
             $entry.LookupStatus = 'Failed'
             $entry.LookupMessage = $_.Exception.Message
         }
@@ -1376,6 +1576,10 @@ function ConvertTo-LicenseSourceReport {
                elseif ($sources.Count -eq 1) { [string]$sources[0] }
                else { 'Mixed: ' + ($sources -join ' + ') }
 
+        if ($row.LookupStatus -eq 'Skipped' -and $row.LookupMessage -match 'Graph') {
+            $how = if ($adNames.Count -gt 0) { 'AD group (Entra lookup skipped)' } else { 'Unknown (Graph not signed in)' }
+        }
+
         $summaryParts = [System.Collections.Generic.List[string]]::new()
         if ($adNames.Count -gt 0) { [void]$summaryParts.Add('AD groups: ' + ($adNames -join ', ')) }
         if ($directNames.Count -gt 0) { [void]$summaryParts.Add('Direct: ' + ($directNames -join ', ')) }
@@ -1482,13 +1686,18 @@ function Invoke-RemovalPipeline {
     $inventory = $null
     if ($script:RemoveDirectLicenses -or $script:IsInteractive) {
         try {
-            Connect-SpincoGraph
-            $skuMap = Get-SkuPartNumberMap
-            Write-ScreenLog "Scanning $($resolvedUsers.Count) user(s) in Entra ID for license assignment sources..." -Level INFO
-            $inventory = Get-DirectLicenseInventory -Users $resolvedUsers -SkuMap $skuMap -Groups $Groups
-            Show-DirectLicenseTable -Inventory $inventory
-            $reportRows = @(ConvertTo-LicenseSourceReport -Inventory $inventory)
-            Show-LicenseSourceReport -ReportRows $reportRows
+            $graphRequired = [bool]$script:RemoveDirectLicenses
+            if (Initialize-GraphForLicenses -Required:$graphRequired) {
+                $skuMap = Get-SkuPartNumberMap
+                Write-ScreenLog "Scanning $($resolvedUsers.Count) user(s) in Entra ID for license assignment sources..." -Level INFO
+                $inventory = Get-DirectLicenseInventory -Users $resolvedUsers -SkuMap $skuMap -Groups $Groups
+                Show-DirectLicenseTable -Inventory $inventory
+                $reportRows = @(ConvertTo-LicenseSourceReport -Inventory $inventory)
+                Show-LicenseSourceReport -ReportRows $reportRows
+            }
+            else {
+                Write-ScreenLog "Skipping Entra / direct-license scan because Graph is not signed in." -Level WARN
+            }
         }
         catch {
             $graphError = $_.Exception.Message
@@ -1640,13 +1849,16 @@ function Invoke-ConfiguredWorkflow {
             return
         }
         Show-MatchingUserTable -Users $Users -Groups $Groups
-        try {
-            Connect-SpincoGraph
-            $skuMap = Get-SkuPartNumberMap
+        $graphOk = Initialize-GraphForLicenses
+        $skuMap = @{}
+        if ($graphOk) {
+            try { $skuMap = Get-SkuPartNumberMap } catch {
+                Write-ScreenLog "Could not load SKU names: $($_.Exception.Message)" -Level WARN
+                $skuMap = @{}
+            }
         }
-        catch {
-            Write-ScreenLog "Graph connect failed; report will include AD groups only. $($_.Exception.Message)" -Level WARN
-            $skuMap = @{}
+        else {
+            Write-ScreenLog "Report will include AD license groups only (Entra/direct columns empty)." -Level WARN
         }
         $inventory = Get-DirectLicenseInventory -Users $Users -SkuMap $skuMap -Groups $Groups
         $reportRows = @(ConvertTo-LicenseSourceReport -Inventory $inventory)
@@ -1694,6 +1906,7 @@ $script:ClientId                = $ClientId
 $script:CertificateThumbprint   = $CertificateThumbprint
 $script:Results                 = [System.Collections.Generic.List[object]]::new()
 $script:EntraGroupCache         = @{}
+$script:GraphReady              = $false
 $script:TranscriptStarted       = $false
 $script:UserCancelled           = $false
 $script:WhatIfBound             = [bool]$WhatIfPreference -or $PSBoundParameters.ContainsKey('WhatIf')
@@ -1737,6 +1950,7 @@ try {
     $firstPass = $true
     while ($true) {
         $script:UserCancelled = $false
+        $script:GraphReady = $false
         $script:Results = [System.Collections.Generic.List[object]]::new()
         $script:PreviewOnly = $script:WhatIfBound
         $runMatchValue = $MatchValue
