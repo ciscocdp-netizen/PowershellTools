@@ -6,7 +6,9 @@
     (AD license groups and/or direct Entra assignments).
 
 .DESCRIPTION
-    Interactive toolkit for divestiture licensing:
+    When run without -NonInteractive (the default), the script is a fully
+    interactive loop: pick a task, answer each prompt, then return to the
+    main menu until you choose Q.
 
       1. License source report — for Spinco or Remainco users, show HOW each user
          gets Office 365 (AD license group, Entra group, and/or direct assignment)
@@ -209,7 +211,11 @@ function Read-RawInput {
     if ($redirected) {
         Write-Host "$PromptText " -NoNewline
         $line = [Console]::In.ReadLine()
-        if ($null -eq $line) { $line = '' }
+        if ($null -eq $line) {
+            $script:InputEof = $true
+            Write-Host ""
+            return ''
+        }
         Write-Host $line
         return $line
     }
@@ -220,7 +226,10 @@ function Read-RawInput {
     catch {
         Write-Host "$PromptText " -NoNewline
         $line = [Console]::In.ReadLine()
-        if ($null -eq $line) { return '' }
+        if ($null -eq $line) {
+            $script:InputEof = $true
+            return ''
+        }
         return $line
     }
 }
@@ -265,15 +274,19 @@ function Read-YesNo {
 }
 
 function Read-MainWorkflow {
-    if ($script:Workflow) {
+    param([switch]$ForceMenu)
+
+    if (-not $ForceMenu -and $script:Workflow) {
         switch -Regex ($script:Workflow) {
             '^(Report|RemoveByAttribute|RemoveFromCsv)$' { return $script:Workflow }
             default { throw "Unknown Workflow '$($script:Workflow)'. Use Report, RemoveByAttribute, or RemoveFromCsv." }
         }
     }
-    if ($script:CsvPath) { return 'RemoveFromCsv' }
-    if ($script:ReportPath -and -not $script:IsInteractive) { return 'Report' }
-    if (-not $script:IsInteractive) { return 'RemoveByAttribute' }
+    if (-not $ForceMenu -and -not $script:IsInteractive) {
+        if ($script:CsvPath) { return 'RemoveFromCsv' }
+        if ($script:ReportPath) { return 'Report' }
+        return 'RemoveByAttribute'
+    }
 
     Write-Host ""
     Write-Host "---- What do you want to do? ------------------------------------------------" -ForegroundColor Cyan
@@ -284,7 +297,9 @@ function Read-MainWorkflow {
     Write-Host ""
 
     while ($true) {
+        if ($script:InputEof) { return 'Quit' }
         $choice = Read-Prompt -Message "Select a workflow" -Default "1"
+        if ($script:InputEof) { return 'Quit' }
         switch -Regex ($choice) {
             '^(1|r|report)$' { return 'Report' }
             '^(2|a|attribute|spinco|remainco)$' { return 'RemoveByAttribute' }
@@ -335,15 +350,24 @@ function Read-RemovalTarget {
     if ($script:SkipGroupRemoval -and $script:SkipDirectLicenses) {
         throw "Cannot use -SkipGroupRemoval and -SkipDirectLicenses together."
     }
-    if ($script:SkipGroupRemoval) { return 'Direct' }
-    if ($script:SkipDirectLicenses) { return 'Groups' }
-    if ($script:RemovalTarget) {
-        switch -Regex ($script:RemovalTarget) {
-            '^(Groups|Direct|Both)$' { return $script:RemovalTarget }
-            default { throw "Unknown RemovalTarget '$($script:RemovalTarget)'. Use Groups, Direct, or Both." }
+    if (-not $script:IsInteractive) {
+        if ($script:SkipGroupRemoval) { return 'Direct' }
+        if ($script:SkipDirectLicenses) { return 'Groups' }
+        if ($script:RemovalTarget) {
+            switch -Regex ($script:RemovalTarget) {
+                '^(Groups|Direct|Both)$' { return $script:RemovalTarget }
+                default { throw "Unknown RemovalTarget '$($script:RemovalTarget)'. Use Groups, Direct, or Both." }
+            }
         }
+        return 'Both'
     }
-    if (-not $script:IsInteractive) { return 'Both' }
+
+    $default = '3'
+    if ($script:SkipGroupRemoval) { $default = '2' }
+    elseif ($script:SkipDirectLicenses) { $default = '1' }
+    elseif ($script:RemovalTarget -match '^(?i)Groups$') { $default = '1' }
+    elseif ($script:RemovalTarget -match '^(?i)Direct$') { $default = '2' }
+    elseif ($script:RemovalTarget -match '^(?i)Both$') { $default = '3' }
 
     Write-Host ""
     Write-Host "---- How should licenses be removed? ----------------------------------------" -ForegroundColor Cyan
@@ -353,7 +377,7 @@ function Read-RemovalTarget {
     Write-Host ""
 
     while ($true) {
-        $choice = Read-Prompt -Message "Removal target" -Default "3"
+        $choice = Read-Prompt -Message "Removal target" -Default $default
         switch -Regex ($choice) {
             '^(1|g|group|groups)$' { return 'Groups' }
             '^(2|d|direct)$'       { return 'Direct' }
@@ -363,6 +387,18 @@ function Read-RemovalTarget {
             }
         }
     }
+}
+
+function Read-DomainController {
+    param([string]$Current)
+
+    Write-Host ""
+    Write-Host "---- Domain controller ------------------------------------------------------" -ForegroundColor Cyan
+    Write-Host "Press Enter to use the default DC for this machine." -ForegroundColor Gray
+    if ($Current) {
+        return (Read-Prompt -Message "Domain controller FQDN or NetBIOS name" -Default $Current)
+    }
+    return (Read-Prompt -Message "Domain controller FQDN or NetBIOS name (blank = default)")
 }
 
 function Read-RunMode {
@@ -1204,13 +1240,20 @@ if (`$d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { `$d.FileName
 function Get-CsvPathInteractive {
     param([string]$Existing)
 
-    if ($Existing) {
+    if ($Existing -and -not $script:IsInteractive) {
         if (-not (Test-Path -LiteralPath $Existing)) { throw "CSV file not found: $Existing" }
         return (Resolve-Path -LiteralPath $Existing).Path
     }
 
     Write-Host ""
     Write-Host "---- Import CSV -------------------------------------------------------------" -ForegroundColor Cyan
+    if ($Existing -and (Test-Path -LiteralPath $Existing)) {
+        if (Read-YesNo -Message "Use this CSV? $Existing" -Default $true) {
+            return (Resolve-Path -LiteralPath $Existing).Path
+        }
+    }
+
+    Write-Host "A file picker will open. Choose the CSV of users." -ForegroundColor Gray
     $picked = Show-FileDialog -Mode Open -Title 'Select a CSV of users to process'
     if ($picked) {
         Write-ScreenLog "Selected CSV: $picked" -Level INFO
@@ -1231,18 +1274,23 @@ function Read-CsvIdentityColumn {
 
     if (-not $Rows -or @($Rows).Count -eq 0) { throw "CSV has no data rows." }
     $headers = @($Rows[0].PSObject.Properties.Name)
-    if ($Preferred) {
-        $hit = $headers | Where-Object { $_ -eq $Preferred } | Select-Object -First 1
-        if (-not $hit) { throw "CSV has no column named '$Preferred'. Columns: $($headers -join ', ')" }
-        return [string]$hit
-    }
-
     $preferredNames = @(
         'UserPrincipalName', 'UPN', 'sAMAccountName', 'SamAccountName',
         'UserName', 'User', 'Mail', 'EmailAddress', 'Email'
     )
-    $defaultHeader = $headers | Where-Object { $preferredNames -contains $_ } | Select-Object -First 1
+    $defaultHeader = $null
+    if ($Preferred) {
+        $defaultHeader = $headers | Where-Object { $_ -eq $Preferred } | Select-Object -First 1
+        if (-not $defaultHeader -and -not $script:IsInteractive) {
+            throw "CSV has no column named '$Preferred'. Columns: $($headers -join ', ')"
+        }
+    }
+    if (-not $defaultHeader) {
+        $defaultHeader = $headers | Where-Object { $preferredNames -contains $_ } | Select-Object -First 1
+    }
     if (-not $defaultHeader) { $defaultHeader = $headers[0] }
+
+    if (-not $script:IsInteractive) { return [string]$defaultHeader }
 
     Write-Host ""
     Write-Host "---- CSV columns (choose the user identifier) -------------------------------" -ForegroundColor Cyan
@@ -1251,8 +1299,6 @@ function Read-CsvIdentityColumn {
         Write-Host ("  {0,2}) {1,-24}  e.g. {2}" -f ($i + 1), $headers[$i], ($samples -join ', '))
     }
     Write-Host ""
-
-    if (-not $script:IsInteractive) { return [string]$defaultHeader }
 
     while ($true) {
         $raw = Read-Prompt -Message "Column number or header name" -Default $defaultHeader
@@ -1398,11 +1444,13 @@ function Export-LicenseSourceReport {
         if ($picked) {
             $Path = $picked
         }
-        elseif ($script:IsInteractive) {
-            $Path = Read-Prompt -Message "Report CSV path" -Default ".\$defaultName"
-        }
         else {
             $Path = ".\$defaultName"
+            Write-Host "File picker unavailable or cancelled. Saving to $Path" -ForegroundColor Gray
+            if ($script:IsInteractive -and (Read-YesNo -Message "Save to a different path instead?" -Default $false)) {
+                $alt = Read-Prompt -Message "Report CSV path" -Default $Path
+                if ($alt) { $Path = $alt }
+            }
         }
     }
 
@@ -1536,114 +1584,34 @@ function Invoke-RemovalPipeline {
     }
 }
 
-# ---------------------------------------------------------------------------
-# Startup
-# ---------------------------------------------------------------------------
-$script:IsInteractive           = Test-ShouldPrompt
-$script:Server                  = $Server
-$script:TenantId                = $TenantId
-$script:ClientId                = $ClientId
-$script:CertificateThumbprint   = $CertificateThumbprint
-$script:Results                 = [System.Collections.Generic.List[object]]::new()
-$script:EntraGroupCache         = @{}
-$script:TranscriptStarted       = $false
-$script:UserCancelled           = $false
-$script:PreviewOnly             = [bool]$WhatIfPreference -or $PSBoundParameters.ContainsKey('WhatIf')
-$script:Workflow                = $Workflow
-$script:CsvPath                 = $CsvPath
-$script:ReportPath              = $ReportPath
-$script:RemovalTarget           = $RemovalTarget
-$script:SkipDirectLicenses      = [bool]$SkipDirectLicenses
-$script:SkipGroupRemoval        = [bool]$SkipGroupRemoval
-$script:LogPathWasBound         = $PSBoundParameters.ContainsKey('LogPath')
-$script:MatchValueWasBound      = $PSBoundParameters.ContainsKey('MatchValue')
-$script:RemoveFromGroups        = $true
-$script:RemoveDirectLicenses    = $true
+function Start-RunLogging {
+    param(
+        [string]$ChosenWorkflow,
+        [string]$Population
+    )
 
-$AllGroupNames = @(
-    "EXO P1 License"
-    "EXO P2 License"
-    "F3_Archive_License_ApriaUserOnly"
-    "E3 Licenses"
-    "M365-License-E5-eDiscovery"
-    "F3 Licenses"
-    "Power BI Pro License"
-)
-$GroupNames = @($AllGroupNames)
-
-try {
-    Import-Module ActiveDirectory -ErrorAction Stop
-
-    if ($script:IsInteractive) {
-        Write-Banner @(
-            " Office 365 license report & removal"
-            " Spinco / Remainco — AD groups (typical) and direct assignments"
-        )
+    if ($script:TranscriptStarted) {
+        try { Stop-Transcript -WhatIf:$false | Out-Null } catch { }
+        $script:TranscriptStarted = $false
     }
 
-    $chosenWorkflow = Read-MainWorkflow
-    if ($chosenWorkflow -eq 'Quit') {
-        Write-Host "Cancelled. No changes made." -ForegroundColor Yellow
-        $script:UserCancelled = $true
-        return
-    }
-    $script:Workflow = $chosenWorkflow
-
-    if ($script:IsInteractive -and $chosenWorkflow -ne 'Report') {
-        $mode = Read-RunMode -WhatIfAlreadySet:$script:PreviewOnly
-        if ($mode -eq 'Quit') {
-            Write-Host "Cancelled. No changes made." -ForegroundColor Yellow
-            $script:UserCancelled = $true
-            return
-        }
-        $script:PreviewOnly = ($mode -eq 'WhatIf')
-        $WhatIfPreference = $script:PreviewOnly
-    }
-
-    if ($script:IsInteractive -and $script:Server) {
-        $serverAnswer = Read-Prompt -Message "Domain controller (blank = default)" -Default $script:Server
-        $script:Server = $serverAnswer
-    }
-    elseif ($script:IsInteractive) {
-        $script:Server = Read-Prompt -Message "Domain controller (blank = default)"
-    }
-    $Server = $script:Server
-
-    if ($chosenWorkflow -ne 'RemoveFromCsv') {
-        if ($script:IsInteractive -and -not $script:MatchValueWasBound) {
-            $MatchValue = Read-Population -Current $MatchValue
-        }
-        if ([string]::IsNullOrWhiteSpace($MatchValue)) {
-            throw "MatchValue cannot be empty."
-        }
-    }
-
-    if ($script:IsInteractive) {
-        $GroupNames = Read-SelectedGroups -AllNames $AllGroupNames
-        Write-Host ""
-        Write-Host "Selected $($GroupNames.Count) group(s): $($GroupNames -join ', ')" -ForegroundColor Cyan
-    }
-
-    if ($chosenWorkflow -ne 'Report') {
-        $target = Read-RemovalTarget
-        $script:RemoveFromGroups = ($target -eq 'Groups' -or $target -eq 'Both')
-        $script:RemoveDirectLicenses = ($target -eq 'Direct' -or $target -eq 'Both')
+    if (-not $script:LogPathWasBound -or -not $script:SessionLogPath) {
+        $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $tag = if ($ChosenWorkflow -eq 'RemoveFromCsv') { 'CsvImport' }
+               elseif ($ChosenWorkflow -eq 'Report') { "Report_$Population" }
+               elseif ($Population) { $Population }
+               else { 'Session' }
+        $LogPath = ".\LicenseTool_${tag}_$stamp.csv"
     }
     else {
-        $script:RemoveFromGroups = $false
-        $script:RemoveDirectLicenses = $false
-    }
-
-    if (-not $script:LogPathWasBound -or -not $LogPath) {
-        $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-        $tag = if ($chosenWorkflow -eq 'RemoveFromCsv') { 'CsvImport' }
-               elseif ($chosenWorkflow -eq 'Report') { "Report_$MatchValue" }
-               else { $MatchValue }
-        $LogPath = ".\LicenseTool_${tag}_$stamp.csv"
+        $LogPath = $script:SessionLogPath
     }
 
     $script:ResolvedLogPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LogPath)
-    if (-not $TranscriptPath) {
+    if ($script:TranscriptPathBound) {
+        $TranscriptPath = $script:SessionTranscriptPath
+    }
+    else {
         $TranscriptPath = [System.IO.Path]::ChangeExtension($script:ResolvedLogPath, '.log')
     }
     $script:ResolvedTranscriptPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($TranscriptPath)
@@ -1660,41 +1628,24 @@ try {
     catch {
         Write-Warning "Could not start transcript at '$script:ResolvedTranscriptPath': $($_.Exception.Message)"
     }
+}
 
-    $modeText = if ($chosenWorkflow -eq 'Report') {
-        'REPORT - no license changes'
-    } elseif ($script:PreviewOnly) {
-        'WHATIF - preview only; no group or license changes will be made'
-    } else {
-        'LIVE - users WILL be removed from groups and/or direct licenses'
-    }
-    $removeText = if ($chosenWorkflow -eq 'Report') { 'None (report only)' }
-                  elseif ($script:RemoveFromGroups -and $script:RemoveDirectLicenses) { 'AD groups + direct SKUs' }
-                  elseif ($script:RemoveFromGroups) { 'AD groups only' }
-                  else { 'Direct SKUs only' }
-
-    Write-Banner @(
-        " Office 365 license report & removal"
-        " Started          : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-        " Workflow         : $chosenWorkflow"
-        " Mode             : $modeText"
-        " Population       : $(if ($chosenWorkflow -eq 'RemoveFromCsv') { 'CSV import' } else { "extensionAttribute3 like '*$MatchValue*'" })"
-        " Target DC        : $(if ($script:Server) { $script:Server } else { '(default)' })"
-        " Removal target   : $removeText"
-        " CSV log          : $script:ResolvedLogPath"
-        " Transcript       : $script:ResolvedTranscriptPath"
-        " Groups           : $($GroupNames.Count) selected"
+function Invoke-ConfiguredWorkflow {
+    param(
+        [Parameter(Mandatory = $true)][string]$ChosenWorkflow,
+        [string]$MatchValue,
+        [string[]]$GroupNames,
+        $AdParams
     )
 
-    $adParams = Get-AdCmdletParams
-    $Groups = Resolve-LicenseGroups -GroupNames $GroupNames -AdParams $adParams
+    $Groups = Resolve-LicenseGroups -GroupNames $GroupNames -AdParams $AdParams
 
-    if ($Groups.Count -eq 0 -and $chosenWorkflow -ne 'Report' -and $script:RemoveFromGroups) {
+    if ($Groups.Count -eq 0 -and $ChosenWorkflow -ne 'Report' -and $script:RemoveFromGroups) {
         throw "None of the target groups were found. Exiting."
     }
 
-    if ($chosenWorkflow -eq 'Report') {
-        $Users = Get-UsersByExtensionAttribute -Value $MatchValue -AdParams $adParams
+    if ($ChosenWorkflow -eq 'Report') {
+        $Users = Get-UsersByExtensionAttribute -Value $MatchValue -AdParams $AdParams
         if ($Users.Count -eq 0) {
             Write-ScreenLog "No users have extensionAttribute3 matching '*$MatchValue*'. Nothing to report." -Level WARN
             return
@@ -1718,31 +1669,191 @@ try {
             $target = Read-RemovalTarget
             $script:RemoveFromGroups = ($target -eq 'Groups' -or $target -eq 'Both')
             $script:RemoveDirectLicenses = ($target -eq 'Direct' -or $target -eq 'Both')
-            $mode = Read-RunMode -WhatIfAlreadySet:$false
+            $mode = Read-RunMode -WhatIfAlreadySet:$script:WhatIfBound
             if ($mode -eq 'Quit') { return }
             $script:PreviewOnly = ($mode -eq 'WhatIf')
             $WhatIfPreference = $script:PreviewOnly
-            Invoke-RemovalPipeline -Users $Users -Groups $Groups -AdParams $adParams
+            Invoke-RemovalPipeline -Users $Users -Groups $Groups -AdParams $AdParams
         }
     }
-    elseif ($chosenWorkflow -eq 'RemoveFromCsv') {
+    elseif ($ChosenWorkflow -eq 'RemoveFromCsv') {
         $csvFile = Get-CsvPathInteractive -Existing $script:CsvPath
-        $Users = Import-UsersFromCsv -Path $csvFile -Column $IdentityColumn -AdParams $adParams
+        $Users = Import-UsersFromCsv -Path $csvFile -Column $IdentityColumn -AdParams $AdParams
         if ($Users.Count -eq 0) {
             Write-ScreenLog "CSV produced no identities to process." -Level WARN
             return
         }
-        Invoke-RemovalPipeline -Users $Users -Groups $Groups -AdParams $adParams
+        Invoke-RemovalPipeline -Users $Users -Groups $Groups -AdParams $AdParams
     }
     else {
-        $Users = Get-UsersByExtensionAttribute -Value $MatchValue -AdParams $adParams
+        $Users = Get-UsersByExtensionAttribute -Value $MatchValue -AdParams $AdParams
         if ($Users.Count -eq 0) {
             Write-ScreenLog "No users have extensionAttribute3 matching '*$MatchValue*'. Nothing to do." -Level WARN
             return
         }
-        Invoke-RemovalPipeline -Users $Users -Groups $Groups -AdParams $adParams
+        Invoke-RemovalPipeline -Users $Users -Groups $Groups -AdParams $AdParams
     }
 }
+
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
+$script:IsInteractive           = Test-ShouldPrompt
+$script:Server                  = $Server
+$script:TenantId                = $TenantId
+$script:ClientId                = $ClientId
+$script:CertificateThumbprint   = $CertificateThumbprint
+$script:Results                 = [System.Collections.Generic.List[object]]::new()
+$script:EntraGroupCache         = @{}
+$script:TranscriptStarted       = $false
+$script:InputEof                = $false
+$script:UserCancelled           = $false
+$script:WhatIfBound             = [bool]$WhatIfPreference -or $PSBoundParameters.ContainsKey('WhatIf')
+$script:PreviewOnly             = $script:WhatIfBound
+$script:Workflow                = $Workflow
+$script:WorkflowBound           = $PSBoundParameters.ContainsKey('Workflow')
+$script:CsvPath                 = $CsvPath
+$script:ReportPath              = $ReportPath
+$script:RemovalTarget           = $RemovalTarget
+$script:SkipDirectLicenses      = [bool]$SkipDirectLicenses
+$script:SkipGroupRemoval        = [bool]$SkipGroupRemoval
+$script:LogPathWasBound         = $PSBoundParameters.ContainsKey('LogPath')
+$script:MatchValueWasBound      = $PSBoundParameters.ContainsKey('MatchValue')
+$script:TranscriptPathBound     = $PSBoundParameters.ContainsKey('TranscriptPath')
+$script:SessionLogPath          = $LogPath
+$script:SessionTranscriptPath   = $TranscriptPath
+$script:RemoveFromGroups        = $true
+$script:RemoveDirectLicenses    = $true
+
+$AllGroupNames = @(
+    "EXO P1 License"
+    "EXO P2 License"
+    "F3_Archive_License_ApriaUserOnly"
+    "E3 Licenses"
+    "M365-License-E5-eDiscovery"
+    "F3 Licenses"
+    "Power BI Pro License"
+)
+
+try {
+    Import-Module ActiveDirectory -ErrorAction Stop
+
+    if ($script:IsInteractive) {
+        Write-Banner @(
+            " Office 365 license report & removal"
+            " Fully interactive — menus at every step. Choose Q on the main menu to exit."
+            " Typical license path: AD group membership. Direct assignments are listed separately."
+        )
+    }
+
+    $firstPass = $true
+    while ($true) {
+        $script:UserCancelled = $false
+        $script:Results = [System.Collections.Generic.List[object]]::new()
+        $script:PreviewOnly = $script:WhatIfBound
+        $runMatchValue = $MatchValue
+        $GroupNames = @($AllGroupNames)
+
+        if ($script:IsInteractive) {
+            $forceMenu = -not ($firstPass -and $script:WorkflowBound)
+            $chosenWorkflow = Read-MainWorkflow -ForceMenu:$forceMenu
+        }
+        else {
+            $chosenWorkflow = Read-MainWorkflow
+        }
+        $firstPass = $false
+
+        if ($chosenWorkflow -eq 'Quit') {
+            Write-Host "Exiting. No further changes." -ForegroundColor Yellow
+            $script:UserCancelled = $true
+            break
+        }
+        $script:Workflow = $chosenWorkflow
+
+        if ($script:IsInteractive -and $chosenWorkflow -ne 'Report') {
+            $mode = Read-RunMode -WhatIfAlreadySet:$script:WhatIfBound
+            if ($mode -eq 'Quit') {
+                Write-Host "Cancelled this run. Returning to the main menu." -ForegroundColor Yellow
+                continue
+            }
+            $script:PreviewOnly = ($mode -eq 'WhatIf')
+            $WhatIfPreference = $script:PreviewOnly
+        }
+
+        if ($script:IsInteractive) {
+            $script:Server = Read-DomainController -Current $script:Server
+        }
+        $Server = $script:Server
+
+        if ($chosenWorkflow -ne 'RemoveFromCsv') {
+            if ($script:IsInteractive) {
+                $runMatchValue = Read-Population -Current $runMatchValue
+            }
+            if ([string]::IsNullOrWhiteSpace($runMatchValue)) {
+                throw "MatchValue cannot be empty."
+            }
+        }
+
+        if ($script:IsInteractive) {
+            $GroupNames = Read-SelectedGroups -AllNames $AllGroupNames
+            Write-Host ""
+            Write-Host "Selected $($GroupNames.Count) group(s): $($GroupNames -join ', ')" -ForegroundColor Cyan
+        }
+
+        if ($chosenWorkflow -ne 'Report') {
+            $target = Read-RemovalTarget
+            $script:RemoveFromGroups = ($target -eq 'Groups' -or $target -eq 'Both')
+            $script:RemoveDirectLicenses = ($target -eq 'Direct' -or $target -eq 'Both')
+        }
+        else {
+            $script:RemoveFromGroups = $false
+            $script:RemoveDirectLicenses = $false
+        }
+
+        Start-RunLogging -ChosenWorkflow $chosenWorkflow -Population $runMatchValue
+
+        $modeText = if ($chosenWorkflow -eq 'Report') {
+            'REPORT - no license changes'
+        } elseif ($script:PreviewOnly) {
+            'WHATIF - preview only; no group or license changes will be made'
+        } else {
+            'LIVE - users WILL be removed from groups and/or direct licenses'
+        }
+        $removeText = if ($chosenWorkflow -eq 'Report') { 'None (report only)' }
+                      elseif ($script:RemoveFromGroups -and $script:RemoveDirectLicenses) { 'AD groups + direct SKUs' }
+                      elseif ($script:RemoveFromGroups) { 'AD groups only' }
+                      else { 'Direct SKUs only' }
+
+        Write-Banner @(
+            " Office 365 license report & removal"
+            " Started          : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+            " Workflow         : $chosenWorkflow"
+            " Mode             : $modeText"
+            " Population       : $(if ($chosenWorkflow -eq 'RemoveFromCsv') { 'CSV import' } else { "extensionAttribute3 like '*$runMatchValue*'" })"
+            " Target DC        : $(if ($script:Server) { $script:Server } else { '(default)' })"
+            " Removal target   : $removeText"
+            " CSV log          : $script:ResolvedLogPath"
+            " Transcript       : $script:ResolvedTranscriptPath"
+            " Groups           : $($GroupNames.Count) selected"
+        )
+
+        $adParams = Get-AdCmdletParams
+        try {
+            Invoke-ConfiguredWorkflow -ChosenWorkflow $chosenWorkflow -MatchValue $runMatchValue -GroupNames $GroupNames -AdParams $adParams
+        }
+        catch {
+            Write-ScreenLog $_.Exception.Message -Level ERROR
+            if (-not $script:IsInteractive) { throw }
+            Write-Host "That run failed. You can choose another option from the main menu." -ForegroundColor Yellow
+        }
+
+        if (-not $script:IsInteractive) { break }
+
+        Write-Host ""
+        Write-Host "Finished that run. Returning to the main menu (Q to quit)." -ForegroundColor Cyan
+    }
+}
+
 
 catch {
     Write-ScreenLog $_.Exception.Message -Level ERROR
