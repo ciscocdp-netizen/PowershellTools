@@ -13,9 +13,31 @@
 
 .NOTES
     Author: v0
-    Version: 1.16
+    Version: 1.17
     Requires: Microsoft.Graph PowerShell SDK
     Authentication: Interactive (Delegated Permissions via browser)
+
+    Changelog v1.17:
+    - Fixed: Graph reports mailbox failures as NON-terminating errors, which the
+      try/catch around each listing never saw. "Get-MgUserMailFolder : The
+      specified object was not found in the store., Default folder Root not
+      found." was printed to the console, the call returned null, and the run
+      treated the mailbox as having no folders and carried on to verification and
+      a success message. Retried Graph calls now run with
+      $ErrorActionPreference = 'Stop' and every listing passes -ErrorAction Stop,
+      so a failure is caught, logged in the GUI and stops the copy.
+    - New: Both mailboxes are opened and checked before the copy starts. A
+      mailbox that does not exist, is not licensed for Exchange Online, still
+      lives on-premises, is a mail-enabled user / contact / group rather than a
+      mailbox, or that the signed-in account may not open, is reported with the
+      checks to run - and the copy does not start, so neither mailbox is touched.
+    - New: An address that is not an email address (a display name or bare alias)
+      is rejected before any Graph call.
+    - Fixed: An empty folder scan is no longer read as "an empty mailbox". Every
+      mailbox has at least an Inbox, so zero folders now aborts the copy with the
+      Graph error that caused it instead of reporting a completed copy of nothing.
+    - Fixed: A failed email copy no longer continues into the calendar copy,
+      verification and "=== COPY OPERATION COMPLETED ===".
 
     Changelog v1.16:
     - New: The target folder tree is enumerated and compared against the source
@@ -211,6 +233,9 @@ $script:GraphBase       = 'https://graph.microsoft.com/v1.0'
 # Set when a folder listing fails, so the run cannot claim a complete copy.
 $script:FolderScanIncomplete = $false
 
+# Text of the most recent folder listing failure, used to explain an empty scan.
+$script:LastFolderScanError = $null
+
 # Well-known folder names are resolved on the TARGET so a localized or renamed
 # mailbox does not end up with a duplicate "Inbox" / "Sent Items".
 $script:WellKnownFolderNames = @(
@@ -238,6 +263,12 @@ function Invoke-WithRetry {
         [int]$MaxRetries = 5,
         [int]$BaseDelaySeconds = 2
     )
+
+    # The Graph SDK reports most mailbox failures as non-terminating errors, which
+    # a try/catch does not see: the call would print to the console, return null,
+    # and the caller would carry on as if the mailbox were simply empty. Raising
+    # the preference here makes every failure inside the block catchable.
+    $ErrorActionPreference = 'Stop'
 
     $attempt = 0
     while ($true) {
@@ -1476,7 +1507,7 @@ function Copy-MessageAttachments {
 
     try {
         $attachments = Invoke-GraphPagedRequest -CommandBlock {
-            Get-MgUserMessageAttachment -UserId $SourceUserId -MessageId $SourceMessageId -All
+            Get-MgUserMessageAttachment -UserId $SourceUserId -MessageId $SourceMessageId -All -ErrorAction Stop
         }
         if (-not $attachments) { return }
 
@@ -1600,12 +1631,12 @@ function Get-AllMailFolders {
     try {
         if ($ParentFolderId) {
             $folders = Invoke-GraphPagedRequest -CommandBlock {
-                Get-MgUserMailFolderChildFolder -UserId $UserId -MailFolderId $ParentFolderId -All
+                Get-MgUserMailFolderChildFolder -UserId $UserId -MailFolderId $ParentFolderId -All -ErrorAction Stop
             }
         }
         else {
             $folders = Invoke-GraphPagedRequest -CommandBlock {
-                Get-MgUserMailFolder -UserId $UserId -All
+                Get-MgUserMailFolder -UserId $UserId -All -ErrorAction Stop
             }
         }
     }
@@ -1614,6 +1645,7 @@ function Get-AllMailFolders {
         # Write-Host alone hid this: the GUI showed nothing and the run still
         # reported success.
         $script:FolderScanIncomplete = $true
+        $script:LastFolderScanError  = $_.Exception.Message
         $where = 'mailbox root'
         if ($ParentPath.Count -gt 0) { $where = ($ParentPath -join '\') }
         $message = "  WARNING: could not list child folders of '$where': $($_.Exception.Message)"
@@ -1783,12 +1815,12 @@ function Find-ChildFolderByName {
 
     if ($ParentId) {
         $all = Invoke-GraphPagedRequest -CommandBlock {
-            Get-MgUserMailFolderChildFolder -UserId $UserId -MailFolderId $ParentId -All
+            Get-MgUserMailFolderChildFolder -UserId $UserId -MailFolderId $ParentId -All -ErrorAction Stop
         }
     }
     else {
         $all = Invoke-GraphPagedRequest -CommandBlock {
-            Get-MgUserMailFolder -UserId $UserId -All
+            Get-MgUserMailFolder -UserId $UserId -All -ErrorAction Stop
         }
     }
     return (@($all) | Where-Object { $_.DisplayName -eq $Name } | Select-Object -First 1)
@@ -1947,6 +1979,249 @@ function Sync-MailFolderStructure {
 }
 
 # ------------------------------------------------------------------------------
+# Mailbox reachability
+#
+# Graph answers "there is no mailbox behind this address" and "you may not open
+# it" with an ordinary 404/403 raised several layers below the copy, so the run
+# used to spray SDK errors at the console and then treat the mailbox as empty.
+# Probing both mailboxes before anything is created turns that into one
+# explanation the operator can act on.
+# ------------------------------------------------------------------------------
+
+<#
+.SYNOPSIS
+    Classifies a Graph error message into the handful of causes that matter here.
+#>
+function Get-GraphFailureKind {
+    param([string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message)) { return 'Unknown' }
+
+    switch -Regex ($Message) {
+        'Default folder Root not found'          { return 'NoMailbox' }
+        'MailboxNotEnabledForRESTAPI'            { return 'NoMailbox' }
+        'hosted on-?premis'                      { return 'NoMailbox' }
+        'mailbox is either inactive'             { return 'NoMailbox' }
+        'ErrorNonExistentMailbox'                { return 'NoMailbox' }
+        'ErrorMailboxNotFound'                   { return 'NoMailbox' }
+        'ErrorInvalidUser'                       { return 'UnknownUser' }
+        'Request_ResourceNotFound'               { return 'UnknownUser' }
+        'does not exist or one of its queried'   { return 'UnknownUser' }
+        'Resource .* does not exist'             { return 'UnknownUser' }
+        'InvalidAuthenticationToken'             { return 'SignedOut' }
+        'Lifetime validation failed'             { return 'SignedOut' }
+        'ErrorAccessDenied'                      { return 'AccessDenied' }
+        'Access is denied'                       { return 'AccessDenied' }
+        'Authorization_RequestDenied'            { return 'AccessDenied' }
+        'Forbidden'                              { return 'AccessDenied' }
+        'ApplicationThrottled'                   { return 'Throttled' }
+        'Too many requests'                      { return 'Throttled' }
+        # Checked last: Exchange uses this wording for anything it cannot open,
+        # so a more specific match above always wins.
+        'The specified object was not found in the store' { return 'NoMailbox' }
+        'ErrorItemNotFound'                      { return 'NoMailbox' }
+    }
+    return 'Unknown'
+}
+
+<#
+.SYNOPSIS
+    Turns a failure kind into the checks an operator should actually run.
+#>
+function Get-MailboxProblemAdvice {
+    param(
+        [string]$Kind,
+        [string]$Address,
+        [string]$Role = 'Mailbox'
+    )
+
+    switch ($Kind) {
+        'NotAnAddress' {
+            return @(
+                "Enter the primary SMTP address of the mailbox, for example first.last@contoso.com.",
+                "A display name ('Kirk Smith') or a bare alias ('ksmith') is not something Graph can open."
+            )
+        }
+        'NoMailbox' {
+            return @(
+                "The address was accepted, but there is no Exchange Online mailbox behind it.",
+                "Check, in this order:",
+                "  1. Open https://outlook.office.com/mail/$Address/ - does the mailbox exist at all?",
+                "  2. Is an Exchange Online licence assigned and has provisioning finished? A mailbox that",
+                "     was licensed minutes ago answers with exactly this error until it has been created.",
+                "  3. Is this a mailbox? Mail-enabled users, mail contacts, distribution lists and",
+                "     Microsoft 365 groups have an address but no mailbox to copy.",
+                "  4. Hybrid tenant: is the mailbox still on-premises? Graph only reaches Exchange Online.",
+                "  5. Is the mailbox inactive, soft-deleted, or was the licence removed?",
+                "Confirm with: Get-Mailbox -Identity '$Address' | Format-List Name,RecipientTypeDetails,ExchangeGuid"
+            )
+        }
+        'UnknownUser' {
+            return @(
+                "No account with that address exists in the tenant you signed in to.",
+                "Check the address for a typo, and use the primary SMTP address rather than an alias.",
+                "Confirm you signed in to the tenant that owns the mailbox."
+            )
+        }
+        'AccessDenied' {
+            return @(
+                "The signed-in account is not allowed to open this mailbox.",
+                "Grant access with:",
+                "  Add-MailboxPermission -Identity '$Address' -User <your account> -AccessRights FullAccess -InheritanceType All",
+                "Permission changes can take several minutes to reach Graph. Wait, then sign in again and retry.",
+                "Also confirm the consent prompt granted Mail.ReadWrite.Shared / Calendars.ReadWrite.Shared."
+            )
+        }
+        'SignedOut' {
+            return @(
+                "The Graph session is no longer valid. Sign out and sign in again, then retry."
+            )
+        }
+        'Throttled' {
+            return @(
+                "Graph is throttling this tenant right now. Wait a few minutes and retry."
+            )
+        }
+    }
+
+    return @(
+        "Graph refused the request for a reason this tool does not recognise.",
+        "Confirm the mailbox opens in Outlook on the web and that the signed-in account has FullAccess."
+    )
+}
+
+<#
+.SYNOPSIS
+    Confirms a mailbox exists and can be opened before the copy touches anything.
+.DESCRIPTION
+    Reads the mailbox folder root, which is the same call every later stage
+    depends on and needs no permission beyond the mail scopes already consented.
+    Returns a result object rather than throwing, so both mailboxes can be
+    reported in one pass.
+#>
+function Test-MailboxAccess {
+    param(
+        [string]$Address,
+        [string]$Role = 'Mailbox'
+    )
+
+    $check = [PSCustomObject]@{
+        Role    = $Role
+        Address = $Address
+        Ok      = $false
+        Kind    = 'Unknown'
+        Problem = ''
+        Detail  = ''
+        Advice  = @()
+        RootId  = $null
+    }
+
+    $trimmed = "$Address".Trim()
+
+    if ([string]::IsNullOrWhiteSpace($trimmed)) {
+        $check.Kind    = 'NotAnAddress'
+        $check.Problem = "No $($Role.ToLower()) address was entered."
+        $check.Advice  = Get-MailboxProblemAdvice -Kind 'NotAnAddress' -Address $trimmed -Role $Role
+        return $check
+    }
+
+    $check.Address = $trimmed
+
+    if ($trimmed -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
+        $check.Kind    = 'NotAnAddress'
+        $check.Problem = "$Role '$trimmed' is not an email address."
+        $check.Advice  = Get-MailboxProblemAdvice -Kind 'NotAnAddress' -Address $trimmed -Role $Role
+        return $check
+    }
+
+    try {
+        $root = Invoke-WithRetry -ScriptBlock {
+            Get-MgUserMailFolder -UserId $trimmed -MailFolderId 'msgfolderroot' -ErrorAction Stop
+        }
+        if ($root -and $root.Id) {
+            $check.Ok     = $true
+            $check.Kind   = 'Ok'
+            $check.RootId = $root.Id
+            return $check
+        }
+        $check.Kind    = 'NoMailbox'
+        $check.Problem = "$Role mailbox '$trimmed' returned no folder root."
+    }
+    catch {
+        $check.Detail  = $_.Exception.Message
+        $check.Kind    = Get-GraphFailureKind -Message $check.Detail
+        $check.Problem = "$Role mailbox '$trimmed' could not be opened."
+    }
+
+    $check.Advice = Get-MailboxProblemAdvice -Kind $check.Kind -Address $trimmed -Role $Role
+    return $check
+}
+
+function Write-MailboxAccessProblem {
+    param($Check)
+
+    Write-CopyLog ''
+    Write-CopyLog "ERROR: $($Check.Problem)"
+    if ($Check.Detail) { Write-CopyLog "  Graph said: $($Check.Detail)" }
+    foreach ($line in @($Check.Advice)) { Write-CopyLog "  $line" }
+}
+
+function Get-MailboxAccessSummary {
+    param($Check)
+
+    $lines = @($Check.Problem) + @($Check.Advice)
+    return ($lines -join "`r`n")
+}
+
+<#
+.SYNOPSIS
+    Logs why a mailbox scan came back empty and returns a failed copy result.
+#>
+function Write-UnreadableMailboxResult {
+    param(
+        [string]$Role,
+        [string]$Address
+    )
+
+    $kind = 'NoMailbox'
+    if ($script:LastFolderScanError) {
+        $kind = Get-GraphFailureKind -Message $script:LastFolderScanError
+    }
+
+    Write-CopyLog ''
+    Write-CopyLog "ERROR: no folders could be read from the $($Role.ToLower()) mailbox '$Address'."
+    if ($script:LastFolderScanError) {
+        Write-CopyLog "  Graph said: $script:LastFolderScanError"
+    }
+    foreach ($line in @(Get-MailboxProblemAdvice -Kind $kind -Address $Address -Role $Role)) {
+        Write-CopyLog "  $line"
+    }
+    Write-CopyLog ''
+    Write-CopyLog '=== EMAIL COPY ABORTED - nothing was copied ==='
+
+    return @{
+        Success        = $false
+        Blocked        = $true
+        BlockedRole    = $Role
+        BlockedAddress = $Address
+        Copied         = 0
+        Failed         = 0
+        Folders        = 0
+        Skipped        = 0
+        Cancelled      = $false
+    }
+}
+
+function Get-SignedInAccountText {
+    try {
+        $ctx = Get-MgContext -ErrorAction Stop
+        if ($ctx -and $ctx.Account) { return "$($ctx.Account) (tenant $($ctx.TenantId))" }
+    }
+    catch { }
+    return $null
+}
+
+# ------------------------------------------------------------------------------
 # Email copy
 # ------------------------------------------------------------------------------
 function Copy-Emails {
@@ -1962,11 +2237,18 @@ function Copy-Emails {
         Write-CopyLog '=== STARTING EMAIL COPY ==='
 
         $script:FolderScanIncomplete = $false
+        $script:LastFolderScanError  = $null
 
         Start-CopyPhase -Name "Scanning source folders ($SourceEmail)" -Indeterminate
         $sourceWellKnown = Get-WellKnownFolderMap -UserId $SourceEmail
         $sourceFolders   = @(Get-AllMailFolders -UserId $SourceEmail -WellKnownMap $sourceWellKnown -StatusBox $StatusBox)
         Write-CopyLog "Source: $($sourceFolders.Count) folders, $('{0:N0}' -f (($sourceFolders | Measure-Object -Property TotalItemCount -Sum).Sum)) messages."
+
+        # Every mailbox has at least an Inbox, so an empty listing is a mailbox
+        # that could not be read - never a mailbox with nothing in it.
+        if ($sourceFolders.Count -eq 0) {
+            return (Write-UnreadableMailboxResult -Role 'Source' -Address $SourceEmail)
+        }
 
         Write-CopyLog ''
         Write-CopyLog '--- SOURCE FOLDER STRUCTURE ---'
@@ -1991,6 +2273,10 @@ function Copy-Emails {
         $targetWellKnown = Get-WellKnownFolderMap -UserId $TargetEmail
         $targetFolders   = @(Get-AllMailFolders -UserId $TargetEmail -WellKnownMap $targetWellKnown -StatusBox $StatusBox)
         Write-CopyLog "Target: $($targetFolders.Count) folders already present."
+
+        if ($targetFolders.Count -eq 0) {
+            return (Write-UnreadableMailboxResult -Role 'Target' -Address $TargetEmail)
+        }
 
         if ($script:CancelRequested) {
             Write-CopyLog ''
@@ -2688,11 +2974,18 @@ function Verify-CopiedItems {
 
         if ($CheckCalendar) {
             Start-CopyPhase -Name 'Verifying calendars' -Indeterminate
-            $srcCal = Invoke-WithRetry -ScriptBlock {
-                Get-MgUserCalendar -UserId $SourceEmail -Filter "name eq 'Calendar'" -Top 1
+            $srcCal = $null
+            $tgtCal = $null
+            try {
+                $srcCal = Invoke-WithRetry -ScriptBlock {
+                    Get-MgUserCalendar -UserId $SourceEmail -Filter "name eq 'Calendar'" -Top 1 -ErrorAction Stop
+                }
+                $tgtCal = Invoke-WithRetry -ScriptBlock {
+                    Get-MgUserCalendar -UserId $TargetEmail -Filter "name eq 'Calendar'" -Top 1 -ErrorAction Stop
+                }
             }
-            $tgtCal = Invoke-WithRetry -ScriptBlock {
-                Get-MgUserCalendar -UserId $TargetEmail -Filter "name eq 'Calendar'" -Top 1
+            catch {
+                Write-CopyLog "Calendar verification could not read a calendar: $($_.Exception.Message)"
             }
 
             if ($srcCal -and $tgtCal) {
@@ -2797,7 +3090,7 @@ $fontButton  = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.Fo
 $fontStatus  = New-Object System.Drawing.Font('Consolas', 9)
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text            = "Microsoft 365 Mailbox Copy Tool v1.16 (Interactive Login)"
+$form.Text            = "Microsoft 365 Mailbox Copy Tool v1.17 (Interactive Login)"
 $form.Size            = New-Object System.Drawing.Size(780, 820)
 $form.MinimumSize     = New-Object System.Drawing.Size(600, 700)
 $form.StartPosition   = "CenterScreen"
@@ -3051,8 +3344,61 @@ $copyButton.Add_Click({
         Start-CopyPhase -Name 'Starting' -Indeterminate
 
         try {
+            # Nothing below can work if a mailbox cannot be opened, and Graph
+            # only says so one obscure 404 at a time. Ask once, up front.
+            Start-CopyPhase -Name 'Checking mailbox access' -Indeterminate
+            Write-CopyLog ''
+            Write-CopyLog '--- MAILBOX ACCESS CHECK ---'
+            $mailboxChecks = @(
+                (Test-MailboxAccess -Address $sourceEmail -Role 'Source'),
+                (Test-MailboxAccess -Address $targetEmail -Role 'Target')
+            )
+            foreach ($check in $mailboxChecks) {
+                if ($check.Ok) {
+                    Write-CopyLog "  OK: $($check.Role.ToLower()) mailbox '$($check.Address)' opened."
+                }
+                else {
+                    Write-MailboxAccessProblem -Check $check
+                }
+            }
+
+            $blockedChecks = @($mailboxChecks | Where-Object { -not $_.Ok })
+            if ($blockedChecks.Count -gt 0) {
+                $signedInAs = Get-SignedInAccountText
+                if ($signedInAs) {
+                    Write-CopyLog ''
+                    Write-CopyLog "  Signed in as: $signedInAs"
+                }
+                Write-CopyLog ''
+                Write-CopyLog '=== COPY NOT STARTED - neither mailbox was changed ==='
+                $phaseLabel.Text = 'Stopped before copying.'
+                $etaLabel.Text   = 'A mailbox could not be opened.'
+                $progressBar.Style = [System.Windows.Forms.ProgressBarStyle]::Continuous
+                $progressBar.Value = 0
+                $dialogText = (@($blockedChecks | ForEach-Object { Get-MailboxAccessSummary -Check $_ }) -join "`r`n`r`n")
+                [System.Windows.Forms.MessageBox]::Show(
+                    "$dialogText`r`n`r`nNothing was copied. The status log has the full checklist.",
+                    "Mailbox Not Reachable",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Error)
+                return
+            }
+
             if ($emailCheckbox.Checked -and -not $script:CancelRequested) {
                 $emailResult = Copy-Emails -SourceEmail $sourceEmail -TargetEmail $targetEmail -StatusBox $statusBox -ProgressBar $progressBar
+
+                if ($emailResult -and -not $emailResult.Success) {
+                    $phaseLabel.Text = 'Email copy failed.'
+                    $etaLabel.Text   = 'See the status log for details.'
+                    Write-CopyLog ''
+                    Write-CopyLog '=== COPY OPERATION STOPPED ==='
+                    [System.Windows.Forms.MessageBox]::Show(
+                        "The email copy could not run, so it was stopped before copying anything.`r`n`r`nSee the status window for what to check.",
+                        "Copy Stopped",
+                        [System.Windows.Forms.MessageBoxButtons]::OK,
+                        [System.Windows.Forms.MessageBoxIcon]::Error)
+                    return
+                }
             }
             if ($calendarCheckbox.Checked -and -not $script:CancelRequested) {
                 $calendarResult = Copy-CalendarItems -SourceEmail $sourceEmail -TargetEmail $targetEmail -StatusBox $statusBox -ProgressBar $progressBar

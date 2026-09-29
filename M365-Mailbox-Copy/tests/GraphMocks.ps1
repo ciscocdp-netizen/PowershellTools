@@ -16,6 +16,11 @@
       * creating a duplicate name in one parent is 409 ErrorFolderExists
 
     Failure injection:
+      $script:FailMailbox['<userId>']      = '<error message>'   # every mailFolder
+                                                                 # call for that user
+                                                                 # fails, the way Graph
+                                                                 # answers for an address
+                                                                 # with no mailbox
       $script:FailChildListing[<folderId>] = '<error message>'   # listing fails
       $script:HideFromFilter['<name>']     = $true               # $filter finds nothing
       $script:FailFilterQueries            = $true               # $filter itself errors
@@ -29,6 +34,7 @@
 #>
 
 $script:Store             = @{}
+$script:FailMailbox       = @{}
 $script:FailChildListing  = @{}
 $script:HideFromFilter    = @{}
 $script:HideFromListing   = @{}
@@ -41,16 +47,21 @@ $script:FilterSyntaxErrors = 0
 # does not fall back to a lookup per path segment.
 $script:CreatedFolderNames = New-Object System.Collections.Generic.List[string]
 $script:FilterQueryCount   = 0
+# Every mailFolder request, so a test can prove an address that cannot be a
+# mailbox is rejected without asking Graph about it.
+$script:MailFolderCallCount = 0
 
 function Reset-FakeGraph {
     $script:Store.Clear()
+    $script:FailMailbox.Clear()
     $script:FailChildListing.Clear()
     $script:HideFromFilter.Clear()
     $script:HideFromListing.Clear()
     $script:FailFolderCreate.Clear()
     $script:FailFilterQueries  = $false
-    $script:FilterSyntaxErrors = 0
-    $script:FilterQueryCount   = 0
+    $script:FilterSyntaxErrors  = 0
+    $script:FilterQueryCount    = 0
+    $script:MailFolderCallCount = 0
     $script:CreatedFolderNames.Clear()
 }
 
@@ -156,6 +167,24 @@ function Select-FakeFolders {
     return @($set | ForEach-Object { ConvertTo-FakeSdkFolder -Folder $_ -UserId $UserId })
 }
 
+<#
+.SYNOPSIS
+    Raises a Graph error the way the real SDK does.
+.DESCRIPTION
+    The Graph cmdlets report mailbox failures as NON-terminating errors: unless
+    the caller asks for -ErrorAction Stop (or has $ErrorActionPreference set to
+    Stop), the call prints an error and simply returns nothing, which a try/catch
+    around it never sees. Reproducing that here is the whole point - a mock that
+    always threw would hide the class of bug these tests exist to catch.
+#>
+function Write-FakeGraphError {
+    param([string]$Message, $ErrorAction)
+
+    $effective = if ($ErrorAction) { "$ErrorAction" } else { "$ErrorActionPreference" }
+    if ($effective -eq 'Stop') { throw $Message }
+    Write-Error $Message -ErrorAction Continue
+}
+
 function Get-MgUserMailFolder {
     param(
         [string]$UserId,
@@ -165,18 +194,39 @@ function Get-MgUserMailFolder {
         [int]$Top,
         $ErrorAction
     )
+    $script:MailFolderCallCount++
+
+    if ($script:FailMailbox.ContainsKey($UserId)) {
+        Write-FakeGraphError -Message $script:FailMailbox[$UserId] -ErrorAction $ErrorAction
+        return
+    }
+
     $mbx = $script:Store[$UserId]
-    if (-not $mbx) { throw "Status: 404 (NotFound) Code: ErrorInvalidUser Message: Unknown mailbox $UserId" }
+    if (-not $mbx) {
+        Write-FakeGraphError -Message "Status: 404 (NotFound) Code: ErrorInvalidUser Message: Unknown mailbox $UserId" -ErrorAction $ErrorAction
+        return
+    }
 
     if ($MailFolderId) {
         $wellKnown = "$MailFolderId".ToLowerInvariant()
+        if ($wellKnown -eq 'msgfolderroot') {
+            # The root of the mailbox itself, which every other folder hangs off.
+            return [pscustomobject]@{
+                Id               = "ROOT:$UserId"
+                DisplayName      = 'Top of Information Store'
+                TotalItemCount   = 0
+                UnreadItemCount  = 0
+                ChildFolderCount = (Get-FakeChildren -UserId $UserId -ParentId $null).Count
+            }
+        }
         if ($mbx.WellKnown.ContainsKey($wellKnown)) {
             return (ConvertTo-FakeSdkFolder -Folder $mbx.Folders[$mbx.WellKnown[$wellKnown]] -UserId $UserId)
         }
         if ($mbx.Folders.ContainsKey($MailFolderId)) {
             return (ConvertTo-FakeSdkFolder -Folder $mbx.Folders[$MailFolderId] -UserId $UserId)
         }
-        throw "Status: 404 (NotFound) Code: ErrorItemNotFound Message: The specified object was not found in the store."
+        Write-FakeGraphError -Message "Status: 404 (NotFound) Code: ErrorItemNotFound Message: The specified object was not found in the store." -ErrorAction $ErrorAction
+        return
     }
 
     return (Select-FakeFolders -Folders (Get-FakeChildren -UserId $UserId -ParentId $null) -Filter $Filter -UserId $UserId)
@@ -190,13 +240,21 @@ function Get-MgUserMailFolderChildFolder {
         [switch]$All,
         $ErrorAction
     )
+    $script:MailFolderCallCount++
+
+    if ($script:FailMailbox.ContainsKey($UserId)) {
+        Write-FakeGraphError -Message $script:FailMailbox[$UserId] -ErrorAction $ErrorAction
+        return
+    }
+
     $mbx      = $script:Store[$UserId]
     $parentId = $MailFolderId
     $wellKnown = "$MailFolderId".ToLowerInvariant()
     if ($mbx.WellKnown.ContainsKey($wellKnown)) { $parentId = $mbx.WellKnown[$wellKnown] }
 
     if ($script:FailChildListing.ContainsKey($parentId)) {
-        throw $script:FailChildListing[$parentId]
+        Write-FakeGraphError -Message $script:FailChildListing[$parentId] -ErrorAction $ErrorAction
+        return
     }
 
     return (Select-FakeFolders -Folders (Get-FakeChildren -UserId $UserId -ParentId $parentId) -Filter $Filter -UserId $UserId)

@@ -123,6 +123,38 @@ The status log keeps folder-level events: what was created or reused, how many
 messages the destination already held, per-batch results, per-folder totals, and any
 failure detail.
 
+## When a mailbox cannot be opened
+
+Before it creates anything, the tool opens the folder root of both mailboxes. If
+either cannot be opened the copy does not start, and the status log names the cause
+and the checks to run. The common one looks like this in Graph's own words:
+
+```
+The specified object was not found in the store., Default folder Root not found.
+Status: 404 (NotFound)  ErrorCode: ErrorItemNotFound
+```
+
+That means the address was accepted but there is no Exchange Online mailbox behind
+it. In rough order of likelihood:
+
+1. **No mailbox yet.** An account licensed a few minutes ago answers with exactly
+   this error until provisioning finishes.
+2. **No Exchange Online licence**, or the licence was removed and the mailbox is now
+   inactive or soft-deleted.
+3. **Not a mailbox.** Mail-enabled users, mail contacts, distribution lists and
+   Microsoft 365 groups have an address but nothing to copy.
+4. **Hybrid**: the mailbox is still on-premises. Graph only reaches Exchange Online.
+
+`Get-Mailbox -Identity <address> | Format-List Name,RecipientTypeDetails,ExchangeGuid`
+settles which of these it is.
+
+Two other cases are reported separately, because the fix is different: an address
+that does not exist in the signed-in tenant (check for a typo, and use the primary
+SMTP address rather than an alias), and a mailbox the signed-in account may not open
+(grant FullAccess and allow a few minutes for it to reach Graph). An entry that is
+not an email address at all — a display name such as `Kirk Smith`, or a bare alias —
+is rejected before any Graph call.
+
 ## Known limitations
 
 - Hidden folders are not enumerated (`GET /mailFolders` omits them unless
@@ -149,7 +181,7 @@ never starts) and drive them against a fake mailbox store and a virtual clock.
 pwsh -File .\tests\Invoke-AllTests.ps1
 ```
 
-161 assertions across three suites.
+224 assertions across four suites.
 
 The **folder** suite covers empty folders, apostrophes in nested and top-level names,
 backslashes in names, a localized target mailbox, repeated names under different
@@ -172,6 +204,16 @@ copy and create nothing, a partially populated target, a folder that cannot be c
 (its mail is skipped, not drafted, and its subtree is not created), a folder whose
 `TotalItemCount` disagrees with its message list, a message Graph rejects, and
 cancelling mid-copy.
+
+The **mailbox access** suite covers the reachability check and the class of bug it
+exists to prevent. Graph reports mailbox failures as *non-terminating* errors, so a
+listing that fails prints to the console, returns nothing, and used to be read as an
+empty mailbox — a copy that reported success having copied nothing. The fake Graph
+reproduces that exactly (it only throws when the caller asks for `-ErrorAction
+Stop`), and the suite checks that a failed listing is caught and logged, that an
+empty scan aborts the copy instead of completing it, that nothing is written to
+either mailbox when a check fails, and that each Graph error text maps to the cause
+and the advice an operator can act on.
 
 All three suites exit non-zero on failure, so they work as a build check.
 

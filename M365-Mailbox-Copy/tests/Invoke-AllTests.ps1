@@ -17,7 +17,8 @@ param(
 $suites = @(
     'Invoke-FolderStructureTests.ps1',
     'Invoke-ProgressTests.ps1',
-    'Invoke-CopyEmailsTests.ps1'
+    'Invoke-CopyEmailsTests.ps1',
+    'Invoke-MailboxAccessTests.ps1'
 )
 
 $failed = @()
