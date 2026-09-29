@@ -2,84 +2,73 @@
 #Requires -Modules ActiveDirectory
 <#
 .SYNOPSIS
-    Removes Spinco users from AD license groups and strips directly assigned Microsoft 365 licenses.
+    Report and remove Office 365 licenses for Spinco or Remainco users
+    (AD license groups and/or direct Entra assignments).
 
 .DESCRIPTION
-    Finds Active Directory users with extensionAttribute3 matching -MatchValue (default: Spinco)
-    and:
-      1. Removes them from the configured on-prem license groups (group-based licensing)
-      2. Removes any Microsoft 365 / Office 365 licenses assigned DIRECTLY on the user
-         in Entra ID (not inherited from a group)
+    Interactive toolkit for divestiture licensing:
+
+      1. License source report — for Spinco or Remainco users, show HOW each user
+         gets Office 365 (AD license group, Entra group, and/or direct assignment)
+         and export a CSV.
+      2. Remove by extensionAttribute3 — find Spinco or Remainco users in AD and
+         remove them from the AD groups that apply the license and/or strip
+         directly assigned SKUs.
+      3. Remove from CSV — file picker, choose which column is the user id, then
+         remove licenses the same way.
 
     Direct vs group-based:
-      - Group-based licenses are removed by taking the user out of the AD groups.
-      - Direct licenses were assigned in the M365 admin center / Graph and must be
-        cleared with Set-MgUserLicense. Those are identified via
-        licenseAssignmentStates where assignedByGroup is empty.
+      - Typical path in this environment: AD group membership -> group-based license.
+      - Direct licenses were assigned in the M365 admin center and are identified
+        via licenseAssignmentStates where assignedByGroup is empty.
 
-    When run without -NonInteractive (the default), the script is fully interactive:
-      - choose Preview / WhatIf or Live removals from a menu
-      - confirm match value, DC, groups, and whether to strip direct licenses
-      - review matching users and their direct SKUs before anything is processed
-      - type REMOVE to confirm a live run
-      - after a WhatIf preview, optionally run the same users live
+    Requires Microsoft Graph PowerShell for Entra lookups and direct-license removal:
+      Install-Module Microsoft.Graph -Scope CurrentUser
 
-    Requires the Microsoft Graph PowerShell SDK for the direct-license pass:
-      Install-Module Microsoft.Graph.Users, Microsoft.Graph.Users.Actions,
-                     Microsoft.Graph.Identity.DirectoryManagement
+.PARAMETER Workflow
+    Report, RemoveByAttribute, or RemoveFromCsv. Omit to choose from the interactive menu.
 
 .PARAMETER MatchValue
-    Substring to match in extensionAttribute3. Default: Spinco.
+    Substring in extensionAttribute3 (Spinco or Remainco). Interactive menu offers both.
 
-.PARAMETER LogPath
-    CSV audit log path. Default: .\SpincoGroupRemoval_<timestamp>.csv
+.PARAMETER CsvPath
+    CSV to import for RemoveFromCsv. Interactive runs can pick a file instead.
 
-.PARAMETER TranscriptPath
-    Console transcript path. Default: same basename as LogPath with a .log extension.
+.PARAMETER IdentityColumn
+    CSV header that contains the user id (sAMAccountName, UPN, or email).
 
-.PARAMETER Server
-    Optional domain controller FQDN or NetBIOS name.
+.PARAMETER ReportPath
+    Where to write the license-source report. Interactive runs can pick a save path.
 
-.PARAMETER NonInteractive
-    Skip all prompts. Use -WhatIf for a preview.
-
-.PARAMETER SkipDirectLicenses
-    Do not connect to Graph or remove directly assigned M365 licenses.
-    Only AD license-group memberships are processed.
-
-.PARAMETER TenantId
-    Optional tenant ID for Graph app-only auth (with ClientId and CertificateThumbprint).
-
-.PARAMETER ClientId
-    Optional app (client) ID for Graph app-only auth.
-
-.PARAMETER CertificateThumbprint
-    Optional certificate thumbprint for Graph app-only auth.
+.PARAMETER RemovalTarget
+    Groups (AD license groups only), Direct (Entra direct SKUs only), or Both.
 
 .EXAMPLE
     .\Remove-SpincoFromLicenseGroups.ps1
-    Interactive. Choose WhatIf or Live; review groups and direct licenses; confirm.
+    Interactive menu: report, Spinco/Remainco removal, or CSV import.
 
 .EXAMPLE
-    .\Remove-SpincoFromLicenseGroups.ps1 -WhatIf
-    Preview group and direct-license removals.
+    .\Remove-SpincoFromLicenseGroups.ps1 -Workflow Report -MatchValue Remainco -ReportPath .\remainco-licenses.csv
+    Export how Remainco users receive their licenses.
 
 .EXAMPLE
-    .\Remove-SpincoFromLicenseGroups.ps1 -NonInteractive -WhatIf
-    Unattended preview.
-
-.EXAMPLE
-    .\Remove-SpincoFromLicenseGroups.ps1 -SkipDirectLicenses
-    Interactive, but only AD group memberships (no Graph).
+    .\Remove-SpincoFromLicenseGroups.ps1 -Workflow RemoveFromCsv -CsvPath .\leavers.csv -IdentityColumn UserPrincipalName -WhatIf
+    Preview license removal for a CSV of users.
 #>
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
+    [string]$Workflow,
     [string]$MatchValue      = "Spinco",
-    [string]$LogPath         = ".\SpincoGroupRemoval_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv",
+    [string]$LogPath,
     [string]$TranscriptPath,
     [string]$Server,
     [switch]$NonInteractive,
     [switch]$SkipDirectLicenses,
+    [switch]$SkipGroupRemoval,
+    [string]$RemovalTarget,
+    [string]$CsvPath,
+    [string]$IdentityColumn,
+    [string]$ReportPath,
     [string]$TenantId,
     [string]$ClientId,
     [string]$CertificateThumbprint
@@ -275,6 +264,107 @@ function Read-YesNo {
     }
 }
 
+function Read-MainWorkflow {
+    if ($script:Workflow) {
+        switch -Regex ($script:Workflow) {
+            '^(Report|RemoveByAttribute|RemoveFromCsv)$' { return $script:Workflow }
+            default { throw "Unknown Workflow '$($script:Workflow)'. Use Report, RemoveByAttribute, or RemoveFromCsv." }
+        }
+    }
+    if ($script:CsvPath) { return 'RemoveFromCsv' }
+    if ($script:ReportPath -and -not $script:IsInteractive) { return 'Report' }
+    if (-not $script:IsInteractive) { return 'RemoveByAttribute' }
+
+    Write-Host ""
+    Write-Host "---- What do you want to do? ------------------------------------------------" -ForegroundColor Cyan
+    Write-Host "  [1] License source report     How Spinco/Remainco users get Office 365 (export CSV)" -ForegroundColor Cyan
+    Write-Host "  [2] Remove licenses           Find users by extensionAttribute3 (Spinco / Remainco)" -ForegroundColor Yellow
+    Write-Host "  [3] Remove licenses from CSV  File picker, choose the user-id column" -ForegroundColor Yellow
+    Write-Host "  [Q] Quit" -ForegroundColor Gray
+    Write-Host ""
+
+    while ($true) {
+        $choice = Read-Prompt -Message "Select a workflow" -Default "1"
+        switch -Regex ($choice) {
+            '^(1|r|report)$' { return 'Report' }
+            '^(2|a|attribute|spinco|remainco)$' { return 'RemoveByAttribute' }
+            '^(3|c|csv)$' { return 'RemoveFromCsv' }
+            '^(q|quit|exit)$' { return 'Quit' }
+            default {
+                Write-Host "Enter 1 (Report), 2 (Remove by Spinco/Remainco), 3 (CSV), or Q." -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
+function Read-Population {
+    param([string]$Current)
+
+    $default = '1'
+    if ($Current -match '^(?i)remainco$') { $default = '2' }
+    elseif ($Current -and $Current -notmatch '^(?i)spinco$') { $default = '3' }
+
+    Write-Host ""
+    Write-Host "---- User population (extensionAttribute3) ----------------------------------" -ForegroundColor Cyan
+    Write-Host "  [1] Spinco" -ForegroundColor Cyan
+    Write-Host "  [2] Remainco" -ForegroundColor Cyan
+    Write-Host "  [3] Custom value" -ForegroundColor Gray
+    Write-Host ""
+
+    while ($true) {
+        $choice = Read-Prompt -Message "Which users?" -Default $default
+        switch -Regex ($choice) {
+            '^(1|s|spinco)$'    { return 'Spinco' }
+            '^(2|r|remainco)$'  { return 'Remainco' }
+            '^(3|c|custom)$' {
+                $custom = Read-Prompt -Message "extensionAttribute3 contains" -Default $(if ($Current) { $Current } else { 'Spinco' })
+                if ([string]::IsNullOrWhiteSpace($custom)) {
+                    Write-Host "Value cannot be empty." -ForegroundColor Yellow
+                    continue
+                }
+                return $custom
+            }
+            default {
+                Write-Host "Enter 1 (Spinco), 2 (Remainco), or 3 (Custom)." -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
+function Read-RemovalTarget {
+    if ($script:SkipGroupRemoval -and $script:SkipDirectLicenses) {
+        throw "Cannot use -SkipGroupRemoval and -SkipDirectLicenses together."
+    }
+    if ($script:SkipGroupRemoval) { return 'Direct' }
+    if ($script:SkipDirectLicenses) { return 'Groups' }
+    if ($script:RemovalTarget) {
+        switch -Regex ($script:RemovalTarget) {
+            '^(Groups|Direct|Both)$' { return $script:RemovalTarget }
+            default { throw "Unknown RemovalTarget '$($script:RemovalTarget)'. Use Groups, Direct, or Both." }
+        }
+    }
+    if (-not $script:IsInteractive) { return 'Both' }
+
+    Write-Host ""
+    Write-Host "---- How should licenses be removed? ----------------------------------------" -ForegroundColor Cyan
+    Write-Host "  [1] AD license groups only     Typical — users get licenses from groups" -ForegroundColor Green
+    Write-Host "  [2] Direct assignments only    Strip SKUs assigned in the M365 admin center" -ForegroundColor Yellow
+    Write-Host "  [3] Both                       Groups and leftover direct assignments" -ForegroundColor Yellow
+    Write-Host ""
+
+    while ($true) {
+        $choice = Read-Prompt -Message "Removal target" -Default "3"
+        switch -Regex ($choice) {
+            '^(1|g|group|groups)$' { return 'Groups' }
+            '^(2|d|direct)$'       { return 'Direct' }
+            '^(3|b|both)$'         { return 'Both' }
+            default {
+                Write-Host "Enter 1 (Groups), 2 (Direct), or 3 (Both)." -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
 function Read-RunMode {
     param([bool]$WhatIfAlreadySet)
 
@@ -347,10 +437,12 @@ function Read-SelectedGroups {
 function Confirm-LiveRemoval {
     Write-Host ""
     Write-Host "WARNING: LIVE mode will:" -ForegroundColor Red
-    Write-Host "  - Remove users from the selected AD license groups" -ForegroundColor Red
+    if ($script:RemoveFromGroups) {
+        Write-Host "  - Remove users from the selected AD license groups (typical license path)" -ForegroundColor Red
+    }
     if ($script:RemoveDirectLicenses) {
         Write-Host "  - Remove Microsoft 365 licenses assigned DIRECTLY on each user" -ForegroundColor Red
-        Write-Host "    (group-based licenses are not stripped here; group removal covers those)" -ForegroundColor Red
+        Write-Host "    (group-based SKUs stay until the user is out of the applying group)" -ForegroundColor Red
     }
     $typed = Read-Prompt -Message "Type REMOVE to continue, or anything else to cancel"
     return ($typed -eq 'REMOVE')
@@ -401,6 +493,7 @@ function Import-GraphLicenseModules {
         @{ Name = 'Microsoft.Graph.Users'; Commands = @('Get-MgUser') }
         @{ Name = 'Microsoft.Graph.Users.Actions'; Commands = @('Set-MgUserLicense') }
         @{ Name = 'Microsoft.Graph.Identity.DirectoryManagement'; Commands = @('Get-MgSubscribedSku') }
+        @{ Name = 'Microsoft.Graph.Groups'; Commands = @('Get-MgGroup') }
     )
 
     $missing = [System.Collections.Generic.List[string]]::new()
@@ -424,17 +517,16 @@ function Import-GraphLicenseModules {
     }
 
     if (-not (Get-Command Connect-MgGraph -ErrorAction SilentlyContinue) -or
-        -not (Get-Command Get-MgUser -ErrorAction SilentlyContinue) -or
-        -not (Get-Command Set-MgUserLicense -ErrorAction SilentlyContinue)) {
-        $hint = if ($missing.Count) { $missing -join ', ' } else { 'Microsoft.Graph.Users, Microsoft.Graph.Users.Actions, Microsoft.Graph.Identity.DirectoryManagement' }
-        throw "Microsoft Graph PowerShell SDK is required to remove directly assigned licenses. Install: Install-Module Microsoft.Graph -Scope CurrentUser  (missing: $hint)"
+        -not (Get-Command Get-MgUser -ErrorAction SilentlyContinue)) {
+        $hint = if ($missing.Count) { $missing -join ', ' } else { 'Microsoft.Graph.Users, Microsoft.Graph.Identity.DirectoryManagement' }
+        throw "Microsoft Graph PowerShell SDK is required. Install: Install-Module Microsoft.Graph -Scope CurrentUser  (missing: $hint)"
     }
 }
 
 function Connect-SpincoGraph {
     Import-GraphLicenseModules
 
-    $neededScopes = @('User.ReadWrite.All', 'Organization.Read.All')
+    $neededScopes = @('User.ReadWrite.All', 'Organization.Read.All', 'Group.Read.All')
     $ctx = $null
     try { $ctx = Get-MgContext } catch { $ctx = $null }
 
@@ -445,6 +537,7 @@ function Connect-SpincoGraph {
         foreach ($s in $neededScopes) {
             if ($have -contains $s) { continue }
             if ($s -eq 'Organization.Read.All' -and ($have -contains 'Directory.Read.All' -or $have -contains 'Directory.ReadWrite.All')) { continue }
+            if ($s -eq 'Group.Read.All' -and ($have -contains 'Directory.Read.All' -or $have -contains 'Directory.ReadWrite.All')) { continue }
             if ($s -eq 'User.ReadWrite.All' -and ($have -contains 'Directory.ReadWrite.All')) { continue }
             $scopeOk = $false
             break
@@ -534,27 +627,82 @@ function Get-DirectLicensesForMgUser {
     return $direct
 }
 
+function Resolve-EntraGroupDisplayName {
+    param([string]$GroupId)
+
+    if ([string]::IsNullOrWhiteSpace($GroupId)) { return '' }
+    if ($script:EntraGroupCache.ContainsKey($GroupId)) {
+        return [string]$script:EntraGroupCache[$GroupId]
+    }
+
+    $name = $GroupId
+    if (Get-Command Get-MgGroup -ErrorAction SilentlyContinue) {
+        try {
+            $g = Get-MgGroup -GroupId $GroupId -Property Id, DisplayName -ErrorAction Stop
+            if ($g.DisplayName) { $name = [string]$g.DisplayName }
+        }
+        catch { }
+    }
+    $script:EntraGroupCache[$GroupId] = $name
+    return $name
+}
+
+function Get-GroupAssignedLicensesForMgUser {
+    param($MgUser, [hashtable]$SkuMap)
+
+    if (-not $SkuMap) { $SkuMap = @{} }
+    $states = @()
+    try { $states = @($MgUser.LicenseAssignmentStates) } catch { $states = @() }
+    $states = @($states | Where-Object { $_ })
+
+    return @(foreach ($state in $states) {
+        if (Test-IsDirectLicenseAssignment -State $state) { continue }
+        $skuId = [string]$state.SkuId
+        if ([string]::IsNullOrWhiteSpace($skuId)) { continue }
+        $groupId = [string]$state.AssignedByGroup
+        $part = $skuId
+        if ($SkuMap.ContainsKey($skuId) -and $SkuMap[$skuId]) { $part = [string]$SkuMap[$skuId] }
+        [pscustomobject]@{
+            SkuId          = $skuId
+            SkuPartNumber  = $part
+            AssignedByGroup = $groupId
+            GroupName      = (Resolve-EntraGroupDisplayName -GroupId $groupId)
+            State          = $(if ($state.PSObject.Properties['State']) { [string]$state.State } else { '' })
+        }
+    })
+}
+
 function Get-DirectLicenseInventory {
     param(
         [Parameter(Mandatory = $true)]$Users,
-        [hashtable]$SkuMap
+        [hashtable]$SkuMap,
+        $Groups
     )
+
+    if (-not $Groups) { $Groups = @{} }
+    if (-not $SkuMap) { $SkuMap = @{} }
 
     $rows = [System.Collections.Generic.List[object]]::new()
     $index = 0
     foreach ($user in $Users) {
         $index++
         $percent = [int](($index / $Users.Count) * 100)
-        Write-Progress -Activity "Scanning Entra ID for directly assigned licenses" `
+        Write-Progress -Activity "Scanning license sources (AD groups + Entra ID)" `
                        -Status ("[{0}/{1}] {2}" -f $index, $Users.Count, $user.SamAccountName) `
                        -PercentComplete $percent
 
+        $adGroupNames = @(foreach ($dn in @($user.MemberOf | Where-Object { $_ -and $Groups.ContainsKey($_) })) {
+            $Groups[$dn].Name
+        })
+
         $entry = [pscustomobject]@{
-            AdUser        = $user
-            MgUser        = $null
-            DirectLicenses = @()
-            LookupStatus  = 'OK'
-            LookupMessage = ''
+            AdUser                 = $user
+            MgUser                 = $null
+            DirectLicenses         = @()
+            GroupAssignedLicenses  = @()
+            AdLicenseGroups        = $adGroupNames
+            LookupStatus           = 'OK'
+            LookupMessage          = ''
         }
 
         if (-not $user.UserPrincipalName -and -not $user.SamAccountName) {
@@ -573,6 +721,7 @@ function Get-DirectLicenseInventory {
             else {
                 $entry.MgUser = $mgUser
                 $entry.DirectLicenses = @(Get-DirectLicensesForMgUser -MgUser $mgUser -SkuMap $SkuMap)
+                $entry.GroupAssignedLicenses = @(Get-GroupAssignedLicensesForMgUser -MgUser $mgUser -SkuMap $SkuMap)
             }
         }
         catch {
@@ -583,7 +732,7 @@ function Get-DirectLicenseInventory {
         [void]$rows.Add($entry)
     }
 
-    Write-Progress -Activity "Scanning Entra ID for directly assigned licenses" -Completed
+    Write-Progress -Activity "Scanning license sources (AD groups + Entra ID)" -Completed
     return $rows
 }
 
@@ -896,134 +1045,26 @@ function Write-RunSummary {
     }
 }
 
-# ---------------------------------------------------------------------------
-# Startup
-# ---------------------------------------------------------------------------
-$script:IsInteractive           = Test-ShouldPrompt
-$script:Server                  = $Server
-$script:TenantId                = $TenantId
-$script:ClientId                = $ClientId
-$script:CertificateThumbprint   = $CertificateThumbprint
-$script:Results                 = [System.Collections.Generic.List[object]]::new()
-$script:TranscriptStarted       = $false
-$script:UserCancelled           = $false
-$script:PreviewOnly             = [bool]$WhatIfPreference -or $PSBoundParameters.ContainsKey('WhatIf')
-$script:RemoveDirectLicenses    = -not $SkipDirectLicenses
+function Get-AdUserPropertyList {
+    return @(
+        'extensionAttribute3'
+        'MemberOf'
+        'DisplayName'
+        'UserPrincipalName'
+        'SamAccountName'
+        'DistinguishedName'
+        'Enabled'
+        'mail'
+    )
+}
 
-$AllGroupNames = @(
-    "EXO P1 License"
-    "EXO P2 License"
-    "F3_Archive_License_ApriaUserOnly"
-    "E3 Licenses"
-    "M365-License-E5-eDiscovery"
-    "F3 Licenses"
-    "Power BI Pro License"
-)
-$GroupNames = @($AllGroupNames)
-
-try {
-    Import-Module ActiveDirectory -ErrorAction Stop
-
-    if ($script:IsInteractive) {
-        Write-Banner @(
-            " Remove-SpincoFromLicenseGroups"
-            " Interactive setup — choose Preview (WhatIf) or Live before any changes."
-            " This run can remove AD license groups AND directly assigned M365 licenses."
-        )
-
-        $mode = Read-RunMode -WhatIfAlreadySet:$script:PreviewOnly
-        if ($mode -eq 'Quit') {
-            Write-Host "Cancelled. No changes made." -ForegroundColor Yellow
-            $script:UserCancelled = $true
-            return
-        }
-
-        $script:PreviewOnly = ($mode -eq 'WhatIf')
-        $WhatIfPreference = $script:PreviewOnly
-
-        $MatchValue = Read-Prompt -Message "extensionAttribute3 contains" -Default $MatchValue
-        if ([string]::IsNullOrWhiteSpace($MatchValue)) {
-            throw "MatchValue cannot be empty."
-        }
-
-        if ($script:Server) {
-            $serverAnswer = Read-Prompt -Message "Domain controller (blank = default)" -Default $script:Server
-        }
-        else {
-            $serverAnswer = Read-Prompt -Message "Domain controller (blank = default)"
-        }
-        $script:Server = $serverAnswer
-        $Server = $script:Server
-
-        $GroupNames = Read-SelectedGroups -AllNames $AllGroupNames
-        Write-Host ""
-        Write-Host "Selected $($GroupNames.Count) group(s): $($GroupNames -join ', ')" -ForegroundColor Cyan
-
-        if (-not $SkipDirectLicenses) {
-            Write-Host ""
-            Write-Host "---- Direct Microsoft 365 licenses ------------------------------------------" -ForegroundColor Cyan
-            Write-Host "A user can still have Office 365 / Microsoft 365 licenses assigned directly" -ForegroundColor Gray
-            Write-Host "in the admin center even after they are removed from the AD groups above." -ForegroundColor Gray
-            Write-Host "Those direct assignments are identified in Entra ID (assignedByGroup is empty)." -ForegroundColor Gray
-            $script:RemoveDirectLicenses = Read-YesNo -Message "Also remove directly assigned Microsoft 365 licenses from each matching user?" -Default $true
-        }
-    }
-    elseif ($script:PreviewOnly) {
-        Write-Host "Non-interactive WhatIf preview." -ForegroundColor Magenta
-    }
-    else {
-        Write-Host "Non-interactive LIVE run. Group memberships and direct licenses will be removed." -ForegroundColor Yellow
-    }
-
-    if ([string]::IsNullOrWhiteSpace($MatchValue)) {
-        throw "MatchValue cannot be empty."
-    }
-
-    $script:ResolvedLogPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LogPath)
-    if (-not $TranscriptPath) {
-        $TranscriptPath = [System.IO.Path]::ChangeExtension($script:ResolvedLogPath, '.log')
-    }
-    $script:ResolvedTranscriptPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($TranscriptPath)
-
-    $logDir = Split-Path -Parent $script:ResolvedLogPath
-    if ($logDir -and -not (Test-Path -LiteralPath $logDir)) {
-        New-Item -ItemType Directory -Path $logDir -Force -WhatIf:$false | Out-Null
-    }
-
-    try {
-        Start-Transcript -Path $script:ResolvedTranscriptPath -Append -ErrorAction Stop -WhatIf:$false | Out-Null
-        $script:TranscriptStarted = $true
-    }
-    catch {
-        Write-Warning "Could not start transcript at '$script:ResolvedTranscriptPath': $($_.Exception.Message)"
-    }
-
-    $modeText = if ($script:PreviewOnly) {
-        'WHATIF - preview only; no group or license changes will be made'
-    } else {
-        'LIVE - users WILL be removed from groups and/or direct licenses'
-    }
-    $directText = if ($script:RemoveDirectLicenses) { 'Yes (Entra ID direct assignments)' } else { 'No' }
-
-    Write-Banner @(
-        " Remove-SpincoFromLicenseGroups"
-        " Started          : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-        " Mode             : $modeText"
-        " Match            : extensionAttribute3 like '*$MatchValue*'"
-        " Target DC        : $(if ($script:Server) { $script:Server } else { '(default)' })"
-        " Direct licenses  : $directText"
-        " CSV log          : $script:ResolvedLogPath"
-        " Transcript       : $script:ResolvedTranscriptPath"
-        " Groups           : $($GroupNames.Count) selected"
+function Resolve-LicenseGroups {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$GroupNames,
+        $AdParams
     )
 
-    $adParams = Get-AdCmdletParams
-
-    # -----------------------------------------------------------------------
-    # Resolve groups once (Name OR sAMAccountName)
-    # -----------------------------------------------------------------------
     Write-ScreenLog "Resolving $($GroupNames.Count) target license group(s)..." -Level INFO
-
     $Groups = @{}
     $resolvedCount = 0
     $missingGroups = [System.Collections.Generic.List[string]]::new()
@@ -1031,7 +1072,7 @@ try {
     foreach ($name in $GroupNames) {
         $escapedName = Escape-AdFilterValue -Value $name
         try {
-            $found = @(Get-ADGroup -Filter "Name -eq '$escapedName' -or SamAccountName -eq '$escapedName'" @adParams)
+            $found = @(Get-ADGroup -Filter "Name -eq '$escapedName' -or SamAccountName -eq '$escapedName'" @AdParams)
             if ($found.Count -eq 0) {
                 throw "No group with Name or sAMAccountName '$name'."
             }
@@ -1051,69 +1092,378 @@ try {
         }
     }
 
-    if ($Groups.Count -eq 0) {
-        throw "None of the target groups were found. Exiting."
-    }
-
     Write-ScreenLog "Resolved $($Groups.Count) of $($GroupNames.Count) group(s). Missing: $(if ($missingGroups.Count) { $missingGroups -join ', ' } else { 'none' })" -Level INFO
+    return $Groups
+}
 
-    # -----------------------------------------------------------------------
-    # Find matching users
-    # -----------------------------------------------------------------------
-    $ldapValue = Escape-LdapFilterValue -Value $MatchValue
-    $ldapFilter = "(extensionAttribute3=*$ldapValue*)"
-
-    Write-ScreenLog "Searching for users with LDAP filter $ldapFilter ..." -Level INFO
-
-    $userProperties = @(
-        'extensionAttribute3'
-        'MemberOf'
-        'DisplayName'
-        'UserPrincipalName'
-        'SamAccountName'
-        'DistinguishedName'
-        'Enabled'
+function Get-UsersByExtensionAttribute {
+    param(
+        [Parameter(Mandatory = $true)][string]$Value,
+        $AdParams
     )
 
+    $ldapValue = Escape-LdapFilterValue -Value $Value
+    $ldapFilter = "(extensionAttribute3=*$ldapValue*)"
+    Write-ScreenLog "Searching for users with LDAP filter $ldapFilter ..." -Level INFO
     try {
-        $Users = @(Get-ADUser -LDAPFilter $ldapFilter -Properties $userProperties @adParams)
+        $users = @(Get-ADUser -LDAPFilter $ldapFilter -Properties (Get-AdUserPropertyList) @AdParams)
     }
     catch {
         throw "Get-ADUser failed for filter $ldapFilter : $($_.Exception.Message)"
     }
+    Write-ScreenLog "Found $($users.Count) matching user(s)." -Level INFO
+    return $users
+}
 
-    Write-ScreenLog "Found $($Users.Count) matching user(s)." -Level INFO
+function Get-AdUserFromIdentity {
+    param(
+        [Parameter(Mandatory = $true)][string]$Value,
+        $AdParams
+    )
 
-    if ($Users.Count -eq 0) {
-        Write-ScreenLog "No users have extensionAttribute3 matching '*$MatchValue*'. Nothing to do." -Level WARN
+    $Value = $Value.Trim()
+    if (-not $Value) { return $null }
+    $escaped = Escape-AdFilterValue -Value $Value
+    $props = Get-AdUserPropertyList
+
+    if ($Value -like '*@*') {
+        $found = @(Get-ADUser -Filter "UserPrincipalName -eq '$escaped'" -Properties $props @AdParams)
+        if ($found.Count -ge 1) { return $found[0] }
+        $found = @(Get-ADUser -Filter "mail -eq '$escaped'" -Properties $props @AdParams)
+        if ($found.Count -ge 1) { return $found[0] }
+    }
+
+    try {
+        return Get-ADUser -Identity $Value -Properties $props -ErrorAction Stop @AdParams
+    }
+    catch { }
+
+    $found = @(Get-ADUser -Filter "SamAccountName -eq '$escaped'" -Properties $props @AdParams)
+    if ($found.Count -ge 1) { return $found[0] }
+    return $null
+}
+
+function Show-FileDialog {
+    param(
+        [ValidateSet('Open', 'Save')]
+        [string]$Mode = 'Open',
+        [string]$Title = 'Select a file',
+        [string]$Filter = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*',
+        [string]$FileName
+    )
+
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $code = @"
+Add-Type -AssemblyName System.Windows.Forms
+`$d = New-Object System.Windows.Forms.$($Mode)FileDialog
+`$d.Filter = '$($Filter.Replace("'", "''"))'
+`$d.Title = '$($Title.Replace("'", "''"))'
+`$d.CheckFileExists = `$$($Mode -eq 'Open')
+if ('$($FileName.Replace("'", "''"))') { `$d.FileName = '$($FileName.Replace("'", "''"))' }
+if (`$d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { `$d.FileName }
+"@
+        $state = [System.Threading.Thread]::CurrentThread.GetApartmentState()
+        if ($state -eq 'STA') {
+            $dialog = if ($Mode -eq 'Open') {
+                New-Object System.Windows.Forms.OpenFileDialog
+            } else {
+                New-Object System.Windows.Forms.SaveFileDialog
+            }
+            $dialog.Filter = $Filter
+            $dialog.Title = $Title
+            if ($Mode -eq 'Open') { $dialog.CheckFileExists = $true }
+            if ($FileName) { $dialog.FileName = $FileName }
+            if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+                return $dialog.FileName
+            }
+            return $null
+        }
+
+        $ps = [powershell]::Create()
+        try {
+            $rs = [runspacefactory]::CreateRunspace()
+            $rs.ApartmentState = 'STA'
+            $rs.Open()
+            $ps.Runspace = $rs
+            [void]$ps.AddScript($code)
+            $out = $ps.Invoke()
+            if ($out -and $out.Count -gt 0) { return [string]$out[-1] }
+            return $null
+        }
+        finally {
+            $ps.Dispose()
+        }
+    }
+    catch {
+        Write-ScreenLog "File picker unavailable: $($_.Exception.Message)" -Level WARN
+        return $null
+    }
+}
+
+function Get-CsvPathInteractive {
+    param([string]$Existing)
+
+    if ($Existing) {
+        if (-not (Test-Path -LiteralPath $Existing)) { throw "CSV file not found: $Existing" }
+        return (Resolve-Path -LiteralPath $Existing).Path
+    }
+
+    Write-Host ""
+    Write-Host "---- Import CSV -------------------------------------------------------------" -ForegroundColor Cyan
+    $picked = Show-FileDialog -Mode Open -Title 'Select a CSV of users to process'
+    if ($picked) {
+        Write-ScreenLog "Selected CSV: $picked" -Level INFO
+        return $picked
+    }
+
+    $path = Read-Prompt -Message "CSV path (file picker cancelled or unavailable)"
+    if ([string]::IsNullOrWhiteSpace($path)) { throw "No CSV path provided." }
+    if (-not (Test-Path -LiteralPath $path)) { throw "CSV file not found: $path" }
+    return (Resolve-Path -LiteralPath $path).Path
+}
+
+function Read-CsvIdentityColumn {
+    param(
+        [Parameter(Mandatory = $true)]$Rows,
+        [string]$Preferred
+    )
+
+    if (-not $Rows -or @($Rows).Count -eq 0) { throw "CSV has no data rows." }
+    $headers = @($Rows[0].PSObject.Properties.Name)
+    if ($Preferred) {
+        $hit = $headers | Where-Object { $_ -eq $Preferred } | Select-Object -First 1
+        if (-not $hit) { throw "CSV has no column named '$Preferred'. Columns: $($headers -join ', ')" }
+        return [string]$hit
+    }
+
+    $preferredNames = @(
+        'UserPrincipalName', 'UPN', 'sAMAccountName', 'SamAccountName',
+        'UserName', 'User', 'Mail', 'EmailAddress', 'Email'
+    )
+    $defaultHeader = $headers | Where-Object { $preferredNames -contains $_ } | Select-Object -First 1
+    if (-not $defaultHeader) { $defaultHeader = $headers[0] }
+
+    Write-Host ""
+    Write-Host "---- CSV columns (choose the user identifier) -------------------------------" -ForegroundColor Cyan
+    for ($i = 0; $i -lt $headers.Count; $i++) {
+        $samples = @($Rows | Select-Object -First 3 | ForEach-Object { [string]$_.($headers[$i]) } | Where-Object { $_ })
+        Write-Host ("  {0,2}) {1,-24}  e.g. {2}" -f ($i + 1), $headers[$i], ($samples -join ', '))
+    }
+    Write-Host ""
+
+    if (-not $script:IsInteractive) { return [string]$defaultHeader }
+
+    while ($true) {
+        $raw = Read-Prompt -Message "Column number or header name" -Default $defaultHeader
+        $num = 0
+        if ([int]::TryParse($raw, [ref]$num) -and $num -ge 1 -and $num -le $headers.Count) {
+            return [string]$headers[$num - 1]
+        }
+        $hit = $headers | Where-Object { $_ -eq $raw } | Select-Object -First 1
+        if ($hit) { return [string]$hit }
+        Write-Host "Pick a listed number or an exact column name." -ForegroundColor Yellow
+    }
+}
+
+function Import-UsersFromCsv {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$Column,
+        $AdParams
+    )
+
+    Write-ScreenLog "Reading CSV $Path ..." -Level INFO
+    $rows = @(Import-Csv -Path $Path)
+    $column = Read-CsvIdentityColumn -Rows $rows -Preferred $Column
+    Write-ScreenLog "Using CSV column '$column' as the user identifier." -Level INFO
+
+    $users = [System.Collections.Generic.List[object]]::new()
+    $seen = @{}
+    $rowNum = 1
+    foreach ($row in $rows) {
+        $rowNum++
+        $raw = ''
+        try { $raw = [string]$row.$column } catch { $raw = '' }
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            Write-ScreenLog "CSV row $rowNum : empty '$column' — skipped." -Level SKIP
+            continue
+        }
+        $key = $raw.Trim().ToLowerInvariant()
+        if ($seen.ContainsKey($key)) {
+            Write-ScreenLog "CSV row $rowNum : duplicate '$raw' — skipped." -Level SKIP
+            continue
+        }
+        $seen[$key] = $true
+
+        $adUser = Get-AdUserFromIdentity -Value $raw.Trim() -AdParams $AdParams
+        if (-not $adUser) {
+            Write-ScreenLog "CSV row $rowNum : '$raw' was not found in AD." -Level WARN
+            $stub = [pscustomobject]@{
+                SamAccountName      = $raw.Trim()
+                DisplayName         = ''
+                UserPrincipalName   = $raw.Trim()
+                DistinguishedName   = ''
+                Enabled             = $false
+                extensionAttribute3 = ''
+                MemberOf            = @()
+                CsvUnresolved       = $true
+            }
+            [void]$users.Add($stub)
+            continue
+        }
+
+        Write-ScreenLog "CSV row $rowNum : '$raw' -> $($adUser.SamAccountName) <$($adUser.UserPrincipalName)>" -Level SUCCESS
+        [void]$users.Add($adUser)
+    }
+
+    Write-ScreenLog "CSV loaded: $($users.Count) identity(ies); unresolved will be skipped at removal." -Level INFO
+    return @($users)
+}
+
+function ConvertTo-LicenseSourceReport {
+    param([Parameter(Mandatory = $true)]$Inventory)
+
+    foreach ($row in $Inventory) {
+        $u = $row.AdUser
+        $adNames = @($row.AdLicenseGroups)
+        $directNames = @($row.DirectLicenses | ForEach-Object { $_.SkuPartNumber })
+        $entraBits = @($row.GroupAssignedLicenses | ForEach-Object {
+            if ($_.GroupName) { '{0} via {1}' -f $_.SkuPartNumber, $_.GroupName }
+            else { [string]$_.SkuPartNumber }
+        })
+
+        $sources = [System.Collections.Generic.List[string]]::new()
+        if ($adNames.Count -gt 0) { [void]$sources.Add('AD group') }
+        if ($directNames.Count -gt 0) { [void]$sources.Add('Direct') }
+        if ($entraBits.Count -gt 0) { [void]$sources.Add('Entra group') }
+        $how = if ($sources.Count -eq 0) { 'Unlicensed' }
+               elseif ($sources.Count -eq 1) { [string]$sources[0] }
+               else { 'Mixed: ' + ($sources -join ' + ') }
+
+        $summaryParts = [System.Collections.Generic.List[string]]::new()
+        if ($adNames.Count -gt 0) { [void]$summaryParts.Add('AD groups: ' + ($adNames -join ', ')) }
+        if ($directNames.Count -gt 0) { [void]$summaryParts.Add('Direct: ' + ($directNames -join ', ')) }
+        if ($entraBits.Count -gt 0) { [void]$summaryParts.Add('Entra groups: ' + ($entraBits -join ', ')) }
+        if ($summaryParts.Count -eq 0) { [void]$summaryParts.Add('No Office 365 license source found') }
+
+        [pscustomobject]@{
+            SamAccountName         = $u.SamAccountName
+            DisplayName            = $u.DisplayName
+            UserPrincipalName      = $u.UserPrincipalName
+            Enabled                = $u.Enabled
+            ExtensionAttribute3    = $u.extensionAttribute3
+            HowLicensed            = $how
+            AdLicenseGroups        = ($adNames -join '; ')
+            AdLicenseGroupCount    = $adNames.Count
+            DirectSkus             = ($directNames -join '; ')
+            DirectSkuCount         = $directNames.Count
+            EntraGroupLicenses     = ($entraBits -join '; ')
+            EntraGroupLicenseCount = $entraBits.Count
+            LicenseSourceSummary   = ($summaryParts -join ' | ')
+            EntraLookup            = $row.LookupStatus
+            EntraLookupMessage     = $row.LookupMessage
+        }
+    }
+}
+
+function Show-LicenseSourceReport {
+    param([Parameter(Mandatory = $true)]$ReportRows)
+
+    Write-Host ""
+    Write-Host "---- How each user gets Office 365 ----------------------------------------" -ForegroundColor Cyan
+    $ReportRows |
+        Select-Object SamAccountName, HowLicensed, AdLicenseGroups, DirectSkus, EntraGroupLicenses, UserPrincipalName |
+        Format-Table -AutoSize -Wrap |
+        Out-Host
+    Write-Host ""
+
+    $byHow = $ReportRows | Group-Object HowLicensed
+    Write-Host "---- Totals by license source ---------------------------------------------" -ForegroundColor Cyan
+    $byHow | Select-Object @{n = 'HowLicensed'; e = { $_.Name } }, @{n = 'Users'; e = { $_.Count } } |
+        Format-Table -AutoSize | Out-Host
+}
+
+function Export-LicenseSourceReport {
+    param(
+        [Parameter(Mandatory = $true)]$ReportRows,
+        [string]$Path,
+        [string]$Population
+    )
+
+    if (-not $Path) {
+        $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $defaultName = "LicenseSourceReport_${Population}_$stamp.csv"
+        $picked = Show-FileDialog -Mode Save -Title 'Save license source report' -FileName $defaultName
+        if ($picked) {
+            $Path = $picked
+        }
+        elseif ($script:IsInteractive) {
+            $Path = Read-Prompt -Message "Report CSV path" -Default ".\$defaultName"
+        }
+        else {
+            $Path = ".\$defaultName"
+        }
+    }
+
+    $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    $dir = Split-Path -Parent $full
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force -WhatIf:$false | Out-Null
+    }
+    $ReportRows | Export-Csv -Path $full -NoTypeInformation -Encoding UTF8 -WhatIf:$false
+    Write-ScreenLog "License source report exported: $full" -Level SUCCESS
+    return $full
+}
+
+function Invoke-RemovalPipeline {
+    param(
+        [Parameter(Mandatory = $true)]$Users,
+        [Parameter(Mandatory = $true)]$Groups,
+        $AdParams
+    )
+
+    $resolvedUsers = @($Users | Where-Object { -not ($_.PSObject.Properties['CsvUnresolved'] -and $_.CsvUnresolved) })
+    $unresolved = @($Users | Where-Object { $_.PSObject.Properties['CsvUnresolved'] -and $_.CsvUnresolved })
+    foreach ($stub in $unresolved) {
+        Add-ActionResult -Result (New-ActionResult -User $stub -ActionType 'Lookup' -Status 'Failed - not found in AD' -Message 'CSV identity did not resolve to an AD user.')
+    }
+
+    if ($resolvedUsers.Count -eq 0) {
+        Write-ScreenLog "No resolvable AD users to process." -Level WARN
+        Write-RunSummary -Users $Users -GroupPassCounts $null -LicensePassCounts $null
         return
     }
 
-    Show-MatchingUserTable -Users $Users -Groups $Groups
+    Show-MatchingUserTable -Users $resolvedUsers -Groups $Groups
 
-    $actionable = @($Users | Where-Object {
+    $actionable = @($resolvedUsers | Where-Object {
         @($_.MemberOf | Where-Object { $_ -and $Groups.ContainsKey($_) }).Count -gt 0
     }).Count
-    Write-ScreenLog "$actionable of $($Users.Count) matching user(s) are in at least one selected license group." -Level INFO
+    Write-ScreenLog "$actionable of $($resolvedUsers.Count) user(s) are in at least one selected license group." -Level INFO
 
     $inventory = $null
-    if ($script:RemoveDirectLicenses) {
+    if ($script:RemoveDirectLicenses -or $script:IsInteractive) {
         try {
             Connect-SpincoGraph
             $skuMap = Get-SkuPartNumberMap
-            Write-ScreenLog "Scanning $($Users.Count) user(s) in Entra ID for directly assigned licenses..." -Level INFO
-            $inventory = Get-DirectLicenseInventory -Users $Users -SkuMap $skuMap
+            Write-ScreenLog "Scanning $($resolvedUsers.Count) user(s) in Entra ID for license assignment sources..." -Level INFO
+            $inventory = Get-DirectLicenseInventory -Users $resolvedUsers -SkuMap $skuMap -Groups $Groups
             Show-DirectLicenseTable -Inventory $inventory
+            $reportRows = @(ConvertTo-LicenseSourceReport -Inventory $inventory)
+            Show-LicenseSourceReport -ReportRows $reportRows
         }
         catch {
             $graphError = $_.Exception.Message
             Write-ScreenLog $graphError -Level ERROR
-            if ($script:IsInteractive -and (Read-YesNo -Message "Graph lookup failed. Continue with AD group removals only?" -Default $false)) {
-                $script:RemoveDirectLicenses = $false
-                $inventory = $null
-            }
-            else {
-                throw "Direct license lookup failed: $graphError"
+            if ($script:RemoveDirectLicenses) {
+                if ($script:IsInteractive -and (Read-YesNo -Message "Graph lookup failed. Continue with AD group removals only?" -Default $false)) {
+                    $script:RemoveDirectLicenses = $false
+                    $inventory = $null
+                }
+                else {
+                    throw "Direct license lookup failed: $graphError"
+                }
             }
         }
     }
@@ -1125,7 +1475,7 @@ try {
 
     if ($script:IsInteractive) {
         $bits = @()
-        $bits += "$actionable group membership(s)"
+        if ($script:RemoveFromGroups) { $bits += "$actionable AD group membership(s)" }
         if ($script:RemoveDirectLicenses) { $bits += "$directActionable user(s) with direct licenses" }
         $continueHint = if ($script:PreviewOnly) {
             "Continue with WHATIF preview ($($bits -join '; '))?"
@@ -1147,32 +1497,37 @@ try {
         }
     }
 
-    $groupPassCounts = Invoke-LicenseGroupPass -Users $Users -Groups $Groups -AdParams $adParams
+    $groupPassCounts = $null
+    if ($script:RemoveFromGroups) {
+        $groupPassCounts = Invoke-LicenseGroupPass -Users $resolvedUsers -Groups $Groups -AdParams $AdParams
+    }
     $licensePassCounts = $null
     if ($script:RemoveDirectLicenses -and $inventory) {
         $licensePassCounts = Invoke-DirectLicensePass -Inventory $inventory
     }
-    Write-RunSummary -Users $Users -GroupPassCounts $groupPassCounts -LicensePassCounts $licensePassCounts
+    Write-RunSummary -Users $resolvedUsers -GroupPassCounts $groupPassCounts -LicensePassCounts $licensePassCounts
 
-    $anyActionable = ($actionable -gt 0) -or ($directActionable -gt 0)
+    $anyActionable = (($script:RemoveFromGroups) -and ($actionable -gt 0)) -or (($script:RemoveDirectLicenses) -and ($directActionable -gt 0))
     if ($script:IsInteractive -and $script:PreviewOnly -and $anyActionable) {
         Write-Host ""
         Write-Host "WhatIf preview finished. No memberships or licenses have been changed yet." -ForegroundColor Magenta
-        if (Read-YesNo -Message "Run LIVE removals now for the same users (groups and direct licenses)?" -Default $false) {
+        if (Read-YesNo -Message "Run LIVE removals now for the same users?" -Default $false) {
             if (Confirm-LiveRemoval) {
                 $script:PreviewOnly = $false
                 $WhatIfPreference = $false
                 Write-Banner @(
                     " LIVE PASS"
                     " Mode        : LIVE - groups and/or direct licenses WILL be changed"
-                    " Users       : $($Users.Count) matching extensionAttribute3"
+                    " Users       : $($resolvedUsers.Count)"
                 )
-                $groupPassCounts = Invoke-LicenseGroupPass -Users $Users -Groups $Groups -AdParams $adParams
+                if ($script:RemoveFromGroups) {
+                    $groupPassCounts = Invoke-LicenseGroupPass -Users $resolvedUsers -Groups $Groups -AdParams $AdParams
+                }
                 $licensePassCounts = $null
                 if ($script:RemoveDirectLicenses -and $inventory) {
                     $licensePassCounts = Invoke-DirectLicensePass -Inventory $inventory
                 }
-                Write-RunSummary -Users $Users -GroupPassCounts $groupPassCounts -LicensePassCounts $licensePassCounts
+                Write-RunSummary -Users $resolvedUsers -GroupPassCounts $groupPassCounts -LicensePassCounts $licensePassCounts
             }
             else {
                 Write-Host "Live run not confirmed. Leaving WhatIf results as-is." -ForegroundColor Yellow
@@ -1180,6 +1535,215 @@ try {
         }
     }
 }
+
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
+$script:IsInteractive           = Test-ShouldPrompt
+$script:Server                  = $Server
+$script:TenantId                = $TenantId
+$script:ClientId                = $ClientId
+$script:CertificateThumbprint   = $CertificateThumbprint
+$script:Results                 = [System.Collections.Generic.List[object]]::new()
+$script:EntraGroupCache         = @{}
+$script:TranscriptStarted       = $false
+$script:UserCancelled           = $false
+$script:PreviewOnly             = [bool]$WhatIfPreference -or $PSBoundParameters.ContainsKey('WhatIf')
+$script:Workflow                = $Workflow
+$script:CsvPath                 = $CsvPath
+$script:ReportPath              = $ReportPath
+$script:RemovalTarget           = $RemovalTarget
+$script:SkipDirectLicenses      = [bool]$SkipDirectLicenses
+$script:SkipGroupRemoval        = [bool]$SkipGroupRemoval
+$script:LogPathWasBound         = $PSBoundParameters.ContainsKey('LogPath')
+$script:MatchValueWasBound      = $PSBoundParameters.ContainsKey('MatchValue')
+$script:RemoveFromGroups        = $true
+$script:RemoveDirectLicenses    = $true
+
+$AllGroupNames = @(
+    "EXO P1 License"
+    "EXO P2 License"
+    "F3_Archive_License_ApriaUserOnly"
+    "E3 Licenses"
+    "M365-License-E5-eDiscovery"
+    "F3 Licenses"
+    "Power BI Pro License"
+)
+$GroupNames = @($AllGroupNames)
+
+try {
+    Import-Module ActiveDirectory -ErrorAction Stop
+
+    if ($script:IsInteractive) {
+        Write-Banner @(
+            " Office 365 license report & removal"
+            " Spinco / Remainco — AD groups (typical) and direct assignments"
+        )
+    }
+
+    $chosenWorkflow = Read-MainWorkflow
+    if ($chosenWorkflow -eq 'Quit') {
+        Write-Host "Cancelled. No changes made." -ForegroundColor Yellow
+        $script:UserCancelled = $true
+        return
+    }
+    $script:Workflow = $chosenWorkflow
+
+    if ($script:IsInteractive -and $chosenWorkflow -ne 'Report') {
+        $mode = Read-RunMode -WhatIfAlreadySet:$script:PreviewOnly
+        if ($mode -eq 'Quit') {
+            Write-Host "Cancelled. No changes made." -ForegroundColor Yellow
+            $script:UserCancelled = $true
+            return
+        }
+        $script:PreviewOnly = ($mode -eq 'WhatIf')
+        $WhatIfPreference = $script:PreviewOnly
+    }
+
+    if ($script:IsInteractive -and $script:Server) {
+        $serverAnswer = Read-Prompt -Message "Domain controller (blank = default)" -Default $script:Server
+        $script:Server = $serverAnswer
+    }
+    elseif ($script:IsInteractive) {
+        $script:Server = Read-Prompt -Message "Domain controller (blank = default)"
+    }
+    $Server = $script:Server
+
+    if ($chosenWorkflow -ne 'RemoveFromCsv') {
+        if ($script:IsInteractive -and -not $script:MatchValueWasBound) {
+            $MatchValue = Read-Population -Current $MatchValue
+        }
+        if ([string]::IsNullOrWhiteSpace($MatchValue)) {
+            throw "MatchValue cannot be empty."
+        }
+    }
+
+    if ($script:IsInteractive) {
+        $GroupNames = Read-SelectedGroups -AllNames $AllGroupNames
+        Write-Host ""
+        Write-Host "Selected $($GroupNames.Count) group(s): $($GroupNames -join ', ')" -ForegroundColor Cyan
+    }
+
+    if ($chosenWorkflow -ne 'Report') {
+        $target = Read-RemovalTarget
+        $script:RemoveFromGroups = ($target -eq 'Groups' -or $target -eq 'Both')
+        $script:RemoveDirectLicenses = ($target -eq 'Direct' -or $target -eq 'Both')
+    }
+    else {
+        $script:RemoveFromGroups = $false
+        $script:RemoveDirectLicenses = $false
+    }
+
+    if (-not $script:LogPathWasBound -or -not $LogPath) {
+        $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $tag = if ($chosenWorkflow -eq 'RemoveFromCsv') { 'CsvImport' }
+               elseif ($chosenWorkflow -eq 'Report') { "Report_$MatchValue" }
+               else { $MatchValue }
+        $LogPath = ".\LicenseTool_${tag}_$stamp.csv"
+    }
+
+    $script:ResolvedLogPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LogPath)
+    if (-not $TranscriptPath) {
+        $TranscriptPath = [System.IO.Path]::ChangeExtension($script:ResolvedLogPath, '.log')
+    }
+    $script:ResolvedTranscriptPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($TranscriptPath)
+
+    $logDir = Split-Path -Parent $script:ResolvedLogPath
+    if ($logDir -and -not (Test-Path -LiteralPath $logDir)) {
+        New-Item -ItemType Directory -Path $logDir -Force -WhatIf:$false | Out-Null
+    }
+
+    try {
+        Start-Transcript -Path $script:ResolvedTranscriptPath -Append -ErrorAction Stop -WhatIf:$false | Out-Null
+        $script:TranscriptStarted = $true
+    }
+    catch {
+        Write-Warning "Could not start transcript at '$script:ResolvedTranscriptPath': $($_.Exception.Message)"
+    }
+
+    $modeText = if ($chosenWorkflow -eq 'Report') {
+        'REPORT - no license changes'
+    } elseif ($script:PreviewOnly) {
+        'WHATIF - preview only; no group or license changes will be made'
+    } else {
+        'LIVE - users WILL be removed from groups and/or direct licenses'
+    }
+    $removeText = if ($chosenWorkflow -eq 'Report') { 'None (report only)' }
+                  elseif ($script:RemoveFromGroups -and $script:RemoveDirectLicenses) { 'AD groups + direct SKUs' }
+                  elseif ($script:RemoveFromGroups) { 'AD groups only' }
+                  else { 'Direct SKUs only' }
+
+    Write-Banner @(
+        " Office 365 license report & removal"
+        " Started          : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+        " Workflow         : $chosenWorkflow"
+        " Mode             : $modeText"
+        " Population       : $(if ($chosenWorkflow -eq 'RemoveFromCsv') { 'CSV import' } else { "extensionAttribute3 like '*$MatchValue*'" })"
+        " Target DC        : $(if ($script:Server) { $script:Server } else { '(default)' })"
+        " Removal target   : $removeText"
+        " CSV log          : $script:ResolvedLogPath"
+        " Transcript       : $script:ResolvedTranscriptPath"
+        " Groups           : $($GroupNames.Count) selected"
+    )
+
+    $adParams = Get-AdCmdletParams
+    $Groups = Resolve-LicenseGroups -GroupNames $GroupNames -AdParams $adParams
+
+    if ($Groups.Count -eq 0 -and $chosenWorkflow -ne 'Report' -and $script:RemoveFromGroups) {
+        throw "None of the target groups were found. Exiting."
+    }
+
+    if ($chosenWorkflow -eq 'Report') {
+        $Users = Get-UsersByExtensionAttribute -Value $MatchValue -AdParams $adParams
+        if ($Users.Count -eq 0) {
+            Write-ScreenLog "No users have extensionAttribute3 matching '*$MatchValue*'. Nothing to report." -Level WARN
+            return
+        }
+        Show-MatchingUserTable -Users $Users -Groups $Groups
+        try {
+            Connect-SpincoGraph
+            $skuMap = Get-SkuPartNumberMap
+        }
+        catch {
+            Write-ScreenLog "Graph connect failed; report will include AD groups only. $($_.Exception.Message)" -Level WARN
+            $skuMap = @{}
+        }
+        $inventory = Get-DirectLicenseInventory -Users $Users -SkuMap $skuMap -Groups $Groups
+        $reportRows = @(ConvertTo-LicenseSourceReport -Inventory $inventory)
+        Show-LicenseSourceReport -ReportRows $reportRows
+        $exported = Export-LicenseSourceReport -ReportRows $reportRows -Path $script:ReportPath -Population $MatchValue
+        $script:ReportPath = $exported
+
+        if ($script:IsInteractive -and (Read-YesNo -Message "Run license removal for these same users now?" -Default $false)) {
+            $target = Read-RemovalTarget
+            $script:RemoveFromGroups = ($target -eq 'Groups' -or $target -eq 'Both')
+            $script:RemoveDirectLicenses = ($target -eq 'Direct' -or $target -eq 'Both')
+            $mode = Read-RunMode -WhatIfAlreadySet:$false
+            if ($mode -eq 'Quit') { return }
+            $script:PreviewOnly = ($mode -eq 'WhatIf')
+            $WhatIfPreference = $script:PreviewOnly
+            Invoke-RemovalPipeline -Users $Users -Groups $Groups -AdParams $adParams
+        }
+    }
+    elseif ($chosenWorkflow -eq 'RemoveFromCsv') {
+        $csvFile = Get-CsvPathInteractive -Existing $script:CsvPath
+        $Users = Import-UsersFromCsv -Path $csvFile -Column $IdentityColumn -AdParams $adParams
+        if ($Users.Count -eq 0) {
+            Write-ScreenLog "CSV produced no identities to process." -Level WARN
+            return
+        }
+        Invoke-RemovalPipeline -Users $Users -Groups $Groups -AdParams $adParams
+    }
+    else {
+        $Users = Get-UsersByExtensionAttribute -Value $MatchValue -AdParams $adParams
+        if ($Users.Count -eq 0) {
+            Write-ScreenLog "No users have extensionAttribute3 matching '*$MatchValue*'. Nothing to do." -Level WARN
+            return
+        }
+        Invoke-RemovalPipeline -Users $Users -Groups $Groups -AdParams $adParams
+    }
+}
+
 catch {
     Write-ScreenLog $_.Exception.Message -Level ERROR
     throw
