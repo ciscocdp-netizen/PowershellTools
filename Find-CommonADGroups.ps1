@@ -1,12 +1,14 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Find Active Directory groups shared by users in a CSV and write an interactive HTML report.
+    Compare Active Directory users from a CSV and write an interactive HTML report.
 
 .DESCRIPTION
     Reads a CSV of user identifiers, resolves each account in Active Directory, and
     reports groups shared by every in-scope user plus groups shared by a minimum
-    number of users. An optional second CSV compares those groups with a reference list.
+    number of users. It also compares user attributes and organizational units so
+    you can see which value, if any, is the same for the whole list. An optional
+    second CSV compares groups with a reference list.
 
     Direct membership includes the primary group. MemberOf does not, and Domain Users
     is usually stored only as the primary group. Use -Recursive to include nested groups.
@@ -227,17 +229,357 @@ function New-ReportUser {
         [string]$Department = '',
         [string]$Title = '',
         [object]$Enabled = $true,
+        [string]$DistinguishedName = '',
+        [string]$UserPrincipalName = '',
+        [string]$ManagerDn = '',
+        $Attributes,
         $Groups
     )
     if ([string]::IsNullOrWhiteSpace($DisplayName)) { $DisplayName = $SamAccountName }
+    $bag = @{}
+    if ($null -ne $Attributes) {
+        foreach ($key in @($Attributes.Keys)) {
+            $bag[[string]$key] = $Attributes[$key]
+        }
+    }
     [pscustomobject]@{
-        SamAccountName = $SamAccountName
-        DisplayName    = $DisplayName
-        Email          = $Email
-        Department     = $Department
-        Title          = $Title
-        Enabled        = $Enabled
-        Groups         = $Groups
+        SamAccountName    = $SamAccountName
+        DisplayName       = $DisplayName
+        Email             = $Email
+        Department        = $Department
+        Title             = $Title
+        Enabled           = $Enabled
+        DistinguishedName = $DistinguishedName
+        UserPrincipalName = $UserPrincipalName
+        ManagerDn         = $ManagerDn
+        Attributes        = $bag
+        Groups            = $Groups
+    }
+}
+
+function Get-UserAttributeDefinitions {
+    $defs = New-Object System.Collections.Generic.List[object]
+    $add = {
+        param($Key, $Label, $Section, $Property, $YesOnly, $OptionalGroup)
+        [void]$defs.Add([pscustomobject]@{
+            Key           = [string]$Key
+            Label         = [string]$Label
+            Section       = [string]$Section
+            Property      = [string]$Property
+            YesOnly       = [bool]$YesOnly
+            Derived       = [string]::IsNullOrWhiteSpace([string]$Property)
+            Optional      = -not [string]::IsNullOrWhiteSpace([string]$OptionalGroup)
+            OptionalGroup = [string]$OptionalGroup
+        })
+    }
+    & $add 'company' 'Company' 'Organization' 'Company' $false ''
+    & $add 'department' 'Department' 'Organization' 'Department' $false ''
+    & $add 'title' 'Title' 'Organization' 'Title' $false ''
+    & $add 'division' 'Division' 'Organization' 'Division' $false ''
+    & $add 'organization' 'Organization' 'Organization' 'Organization' $false ''
+    & $add 'employeeType' 'Employee type' 'Organization' 'EmployeeType' $false ''
+    & $add 'employeeId' 'Employee ID' 'Organization' 'EmployeeID' $false ''
+    & $add 'employeeNumber' 'Employee number' 'Organization' 'EmployeeNumber' $false ''
+    & $add 'manager' 'Manager' 'Organization' 'Manager' $false ''
+    & $add 'description' 'Description' 'Organization' 'Description' $false ''
+    & $add 'office' 'Office' 'Location' 'Office' $false ''
+    & $add 'city' 'City' 'Location' 'City' $false ''
+    & $add 'state' 'State' 'Location' 'State' $false ''
+    & $add 'country' 'Country' 'Location' 'Country' $false ''
+    & $add 'postalCode' 'Postal code' 'Location' 'PostalCode' $false ''
+    & $add 'street' 'Street' 'Location' 'StreetAddress' $false ''
+    & $add 'poBox' 'PO box' 'Location' 'POBox' $false ''
+    & $add 'officePhone' 'Office phone' 'Contact' 'OfficePhone' $false ''
+    & $add 'mobile' 'Mobile' 'Contact' 'MobilePhone' $false ''
+    & $add 'homePhone' 'Home phone' 'Contact' 'HomePhone' $false ''
+    & $add 'fax' 'Fax' 'Contact' 'Fax' $false ''
+    & $add 'scriptPath' 'Logon script' 'Paths' 'ScriptPath' $false ''
+    & $add 'profilePath' 'Profile path' 'Paths' 'ProfilePath' $false ''
+    & $add 'homeDirectory' 'Home directory' 'Paths' 'HomeDirectory' $false ''
+    & $add 'homeDrive' 'Home drive' 'Paths' 'HomeDrive' $false ''
+    & $add 'homepage' 'Web page' 'Paths' 'HomePage' $false ''
+    & $add 'logonWorkstations' 'Logon workstations' 'Account' 'LogonWorkstations' $false ''
+    & $add 'accountExpires' 'Account expiration' 'Account' 'AccountExpirationDate' $false ''
+    & $add 'passwordNeverExpires' 'Password never expires' 'Account' 'PasswordNeverExpires' $true ''
+    & $add 'smartcardRequired' 'Smart card required' 'Account' 'SmartcardLogonRequired' $true ''
+    & $add 'cannotChangePassword' 'Cannot change password' 'Account' 'CannotChangePassword' $true ''
+    & $add 'passwordNotRequired' 'Password not required' 'Account' 'PasswordNotRequired' $true ''
+    & $add 'ouPath' 'OU path' 'Organizational unit' '' $false ''
+    & $add 'ouDn' 'OU distinguished name' 'Organizational unit' '' $false ''
+    & $add 'upnSuffix' 'UPN suffix' 'Account' '' $false ''
+    & $add 'mailDomain' 'Mail domain' 'Account' '' $false ''
+    for ($index = 1; $index -le 15; $index++) {
+        & $add ("extensionAttribute{0}" -f $index) ("Extension attribute {0}" -f $index) 'Custom' ("extensionAttribute{0}" -f $index) $false 'exchange'
+    }
+    for ($index = 1; $index -le 5; $index++) {
+        & $add ("cloudExtension{0}" -f $index) ("Cloud extension {0}" -f $index) 'Custom' ("msDS-cloudExtensionAttribute{0}" -f $index) $false 'cloud'
+    }
+    return ,$defs
+}
+
+function Get-AdUserQueryProperties {
+    $props = New-Object System.Collections.Generic.List[string]
+    $seen = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in @('MemberOf', 'DisplayName', 'mail', 'Enabled', 'PrimaryGroupID', 'DistinguishedName', 'SamAccountName', 'UserPrincipalName', 'SID')) {
+        if ($seen.ContainsKey($name)) { continue }
+        $seen[$name] = $true
+        [void]$props.Add($name)
+    }
+    foreach ($def in (Get-UserAttributeDefinitions)) {
+        if ($def.Derived -or $def.Optional) { continue }
+        $name = [string]$def.Property
+        if ([string]::IsNullOrWhiteSpace($name) -or $seen.ContainsKey($name)) { continue }
+        $seen[$name] = $true
+        [void]$props.Add($name)
+    }
+    return ,$props
+}
+
+function Get-OptionalPropertyNames {
+    param([Parameter(Mandatory = $true)][string]$GroupName)
+    $names = New-Object System.Collections.Generic.List[string]
+    foreach ($def in (Get-UserAttributeDefinitions)) {
+        if ($def.Optional -and $def.OptionalGroup -eq $GroupName -and -not [string]::IsNullOrWhiteSpace([string]$def.Property)) {
+            [void]$names.Add([string]$def.Property)
+        }
+    }
+    return ,$names
+}
+
+function ConvertTo-AttributeText {
+    param($Value, [bool]$YesOnly = $false)
+    if ($null -eq $Value) { return '' }
+    if ($Value -is [bool]) {
+        if ($Value) { return 'Yes' }
+        if ($YesOnly) { return '' }
+        return 'No'
+    }
+    if ($Value -is [datetime]) {
+        $when = [datetime]$Value
+        if ($when.Year -le 1601 -or $when.Year -ge 9999) { return '' }
+        return $when.ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    $parts = New-Object System.Collections.Generic.List[string]
+    $seen = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($item in (ConvertTo-ObjectList $Value)) {
+        $text = ''
+        if ($item -is [bool] -or $item -is [datetime]) {
+            $text = ConvertTo-AttributeText -Value $item -YesOnly:$YesOnly
+        }
+        else { $text = ([string]$item).Trim() }
+        if ([string]::IsNullOrWhiteSpace($text) -or $seen.ContainsKey($text)) { continue }
+        $seen[$text] = $true
+        [void]$parts.Add($text)
+    }
+    if ($parts.Count -eq 0) { return '' }
+    $sorted = $parts.ToArray()
+    [Array]::Sort($sorted, [System.StringComparer]::OrdinalIgnoreCase)
+    return ($sorted -join '; ')
+}
+
+function Split-DistinguishedName {
+    param([AllowNull()][string]$DistinguishedName)
+    $parts = New-Object System.Collections.Generic.List[string]
+    if ([string]::IsNullOrWhiteSpace($DistinguishedName)) { return ,$parts }
+    $current = New-Object System.Text.StringBuilder
+    $escaped = $false
+    foreach ($ch in $DistinguishedName.ToCharArray()) {
+        if ($escaped) {
+            [void]$current.Append($ch)
+            $escaped = $false
+            continue
+        }
+        if ($ch -eq '\') { $escaped = $true; continue }
+        if ($ch -eq ',') {
+            $text = $current.ToString().Trim()
+            if (-not [string]::IsNullOrWhiteSpace($text)) { [void]$parts.Add($text) }
+            [void]$current.Clear()
+            continue
+        }
+        [void]$current.Append($ch)
+    }
+    if ($escaped) { [void]$current.Append('\') }
+    $tail = $current.ToString().Trim()
+    if (-not [string]::IsNullOrWhiteSpace($tail)) { [void]$parts.Add($tail) }
+    return ,$parts
+}
+
+function Get-ParentDistinguishedName {
+    param([AllowNull()][string]$DistinguishedName)
+    if ([string]::IsNullOrWhiteSpace($DistinguishedName)) { return '' }
+    $escaped = $false
+    $chars = $DistinguishedName.ToCharArray()
+    for ($index = 0; $index -lt $chars.Length; $index++) {
+        $ch = $chars[$index]
+        if ($escaped) { $escaped = $false; continue }
+        if ($ch -eq '\') { $escaped = $true; continue }
+        if ($ch -eq ',') { return $DistinguishedName.Substring($index + 1).Trim() }
+    }
+    return ''
+}
+
+function ConvertTo-DirectoryPath {
+    param([AllowNull()][string]$DistinguishedName)
+    $ous = New-Object System.Collections.Generic.List[string]
+    $dcs = New-Object System.Collections.Generic.List[string]
+    foreach ($part in (Split-DistinguishedName $DistinguishedName)) {
+        if ($part -match '(?i)^OU=(.*)$') { [void]$ous.Add($Matches[1]) }
+        elseif ($part -match '(?i)^DC=(.*)$') { [void]$dcs.Add($Matches[1]) }
+    }
+    $ouNames = $ous.ToArray()
+    $dcNames = $dcs.ToArray()
+    [Array]::Reverse($ouNames)
+    $domain = ($dcNames -join '.')
+    if ($ouNames.Count -eq 0) { return $domain }
+    if ([string]::IsNullOrWhiteSpace($domain)) { return ($ouNames -join '/') }
+    return ($domain + '/' + ($ouNames -join '/'))
+}
+
+function Get-CommonDirectoryPath {
+    param($Paths)
+    $lists = New-Object System.Collections.Generic.List[object]
+    foreach ($path in (ConvertTo-ObjectList $Paths)) {
+        $text = ([string]$path).Trim().Trim('/')
+        if ([string]::IsNullOrWhiteSpace($text)) { continue }
+        $segments = New-Object System.Collections.Generic.List[string]
+        foreach ($piece in $text.Split('/')) {
+            $piece = $piece.Trim()
+            if (-not [string]::IsNullOrWhiteSpace($piece)) { [void]$segments.Add($piece) }
+        }
+        if ($segments.Count -gt 0) { [void]$lists.Add($segments) }
+    }
+    if ($lists.Count -eq 0) { return '' }
+    $first = $lists[0]
+    $count = $first.Count
+    foreach ($segments in $lists) {
+        $limit = [Math]::Min($count, $segments.Count)
+        $index = 0
+        while ($index -lt $limit -and [string]::Compare([string]$first[$index], [string]$segments[$index], [System.StringComparison]::OrdinalIgnoreCase) -eq 0) {
+            $index++
+        }
+        $count = $index
+        if ($count -eq 0) { break }
+    }
+    if ($count -le 0) { return '' }
+    $slice = New-Object System.Collections.Generic.List[string]
+    for ($index = 0; $index -lt $count; $index++) { [void]$slice.Add([string]$first[$index]) }
+    return ($slice.ToArray() -join '/')
+}
+
+function Get-MapValue {
+    param($Map, [string]$Key)
+    if ($null -eq $Map -or [string]::IsNullOrWhiteSpace($Key)) { return $null }
+    if ($Map -is [System.Collections.IDictionary]) {
+        foreach ($candidate in @($Map.Keys)) {
+            if ([string]::Compare([string]$candidate, $Key, [System.StringComparison]::OrdinalIgnoreCase) -eq 0) {
+                return $Map[$candidate]
+            }
+        }
+        return $null
+    }
+    $prop = $Map.PSObject.Properties[$Key]
+    if ($null -ne $prop) { return $prop.Value }
+    return $null
+}
+
+function Test-MapHasKey {
+    param($Map, [string]$Key)
+    if ($null -eq $Map -or [string]::IsNullOrWhiteSpace($Key)) { return $false }
+    if ($Map -is [System.Collections.IDictionary]) {
+        foreach ($candidate in @($Map.Keys)) {
+            if ([string]::Compare([string]$candidate, $Key, [System.StringComparison]::OrdinalIgnoreCase) -eq 0) { return $true }
+        }
+        return $false
+    }
+    return ($null -ne $Map.PSObject.Properties[$Key])
+}
+
+function New-UserAttributeDictionary {
+    param($Source, [string]$DistinguishedName, [string]$UserPrincipalName, [string]$Email)
+    $map = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($def in (Get-UserAttributeDefinitions)) {
+        if ($def.Derived) { continue }
+        $raw = $null
+        $propertyName = [string]$def.Property
+        if (Test-MapHasKey -Map $Source -Key $propertyName) { $raw = Get-MapValue -Map $Source -Key $propertyName }
+        elseif (Test-MapHasKey -Map $Source -Key ([string]$def.Key)) { $raw = Get-MapValue -Map $Source -Key ([string]$def.Key) }
+        else { continue }
+        $text = ConvertTo-AttributeText -Value $raw -YesOnly:([bool]$def.YesOnly)
+        if ($def.Key -eq 'manager' -and $text -match '(?i)^(CN|OU|DC)=') {
+            $text = Get-CnFromDistinguishedName $text
+        }
+        if (-not [string]::IsNullOrWhiteSpace($text)) { $map[[string]$def.Key] = $text }
+    }
+    $ouDn = Get-ParentDistinguishedName -DistinguishedName $DistinguishedName
+    $ouPath = ConvertTo-DirectoryPath -DistinguishedName $DistinguishedName
+    if (-not [string]::IsNullOrWhiteSpace($ouDn)) { $map['ouDn'] = $ouDn }
+    if (-not [string]::IsNullOrWhiteSpace($ouPath)) { $map['ouPath'] = $ouPath }
+    if ($UserPrincipalName -match '@([^@\s]+)$') { $map['upnSuffix'] = $Matches[1].ToLowerInvariant() }
+    if ($Email -match '@([^@\s]+)$') { $map['mailDomain'] = $Matches[1].ToLowerInvariant() }
+    return ,$map
+}
+
+function Get-UserAttributeValue {
+    param($User, [string]$Key)
+    if ($null -eq $User) { return '' }
+    $attrs = $User.Attrs
+    if ($null -eq $attrs) { return '' }
+    if ($attrs -is [System.Collections.Generic.Dictionary[string,string]]) {
+        if ($attrs.ContainsKey($Key)) { return [string]$attrs[$Key] }
+        return ''
+    }
+    $raw = Get-MapValue -Map $attrs -Key $Key
+    if ($null -eq $raw) { return '' }
+    return [string]$raw
+}
+
+function Get-AttributeTieSummary {
+    param($Model)
+    $includeDisabled = -not [bool]$Model.ExcludeDisabled
+    $users = New-Object System.Collections.Generic.List[object]
+    foreach ($user in (ConvertTo-ObjectList $Model.Users)) {
+        if ($includeDisabled -or ($user.Enabled -eq $true)) { [void]$users.Add($user) }
+    }
+    $shared = New-Object System.Collections.Generic.List[object]
+    foreach ($def in (ConvertTo-ObjectList $Model.AttributeCatalog)) {
+        $counts = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($user in $users) {
+            $value = (Get-UserAttributeValue -User $user -Key ([string]$def.Key)).Trim()
+            if ([string]::IsNullOrWhiteSpace($value)) { continue }
+            if (-not $counts.ContainsKey($value)) {
+                $counts[$value] = [pscustomobject]@{ Value = $value; Count = 0 }
+            }
+            $counts[$value].Count++
+        }
+        $best = $null
+        foreach ($entry in $counts.Values) {
+            if ($null -eq $best -or $entry.Count -gt $best.Count) { $best = $entry }
+            elseif ($entry.Count -eq $best.Count -and [string]::Compare([string]$entry.Value, [string]$best.Value, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
+                $best = $entry
+            }
+        }
+        if ($null -eq $best -or $users.Count -eq 0 -or $best.Count -ne $users.Count) { continue }
+        [void]$shared.Add([pscustomobject]@{
+            Key   = [string]$def.Key
+            Label = [string]$def.Label
+            Value = [string]$best.Value
+            Count = [int]$best.Count
+        })
+    }
+    $paths = New-Object System.Collections.Generic.List[string]
+    $missingOu = $false
+    foreach ($user in $users) {
+        $path = (Get-UserAttributeValue -User $user -Key 'ouPath').Trim()
+        if ([string]::IsNullOrWhiteSpace($path)) { $missingOu = $true }
+        else { [void]$paths.Add($path) }
+    }
+    $commonOu = ''
+    if (-not $missingOu) { $commonOu = Get-CommonDirectoryPath -Paths $paths }
+    [pscustomobject]@{
+        SharedCount = $shared.Count
+        Shared      = $shared
+        CommonOu    = $commonOu
+        InScope     = $users.Count
     }
 }
 
@@ -412,6 +754,7 @@ function New-CommonGroupReportModel {
         $enabledValue = $null
         if ($user.Enabled -eq $true) { $enabledValue = $true }
         elseif ($user.Enabled -eq $false) { $enabledValue = $false }
+        $attrs = New-UserAttributeDictionary -Source $user.Attributes -DistinguishedName ([string]$user.DistinguishedName) -UserPrincipalName ([string]$user.UserPrincipalName) -Email ([string]$user.Email)
         [void]$modelUsers.Add([pscustomobject]@{
             Sam       = [string]$user.SamAccountName
             Display   = [string]$(if ($user.DisplayName) { $user.DisplayName } else { $user.SamAccountName })
@@ -420,6 +763,22 @@ function New-CommonGroupReportModel {
             Title     = [string]$user.Title
             Enabled   = $enabledValue
             GroupDns  = $dns
+            Attrs     = $attrs
+        })
+    }
+
+    $usedKeys = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($modelUser in $modelUsers) {
+        if ($null -eq $modelUser.Attrs) { continue }
+        foreach ($attrKey in @($modelUser.Attrs.Keys)) { $usedKeys[[string]$attrKey] = $true }
+    }
+    $attributeCatalog = New-Object System.Collections.Generic.List[object]
+    foreach ($def in (Get-UserAttributeDefinitions)) {
+        if (-not $usedKeys.ContainsKey([string]$def.Key)) { continue }
+        [void]$attributeCatalog.Add([pscustomobject]@{
+            Key     = [string]$def.Key
+            Label   = [string]$def.Label
+            Section = [string]$def.Section
         })
     }
 
@@ -467,6 +826,7 @@ function New-CommonGroupReportModel {
         MinimumUserCount   = $MinimumUserCount
         InputCount         = ($modelUsers.Count + $notFoundList.Count)
         Users              = $modelUsers
+        AttributeCatalog   = $attributeCatalog
         NotFound           = $notFoundList
         GroupMeta          = $metaMap
         CompareEnabled     = ($compareEntries.Count -gt 0)
@@ -561,7 +921,17 @@ function ConvertTo-ReportJson {
     [void]$sb.Append(',"excludeDisabled":').Append((ConvertTo-JsonBool $Model.ExcludeDisabled))
     [void]$sb.Append(',"minimumUserCount":').Append(([int]$Model.MinimumUserCount).ToString([Globalization.CultureInfo]::InvariantCulture))
     [void]$sb.Append(',"inputCount":').Append(([int]$Model.InputCount).ToString([Globalization.CultureInfo]::InvariantCulture))
-    [void]$sb.Append(',"users":[')
+    [void]$sb.Append(',"attributeCatalog":[')
+    $firstCatalog = $true
+    foreach ($def in (ConvertTo-ObjectList $Model.AttributeCatalog)) {
+        if (-not $firstCatalog) { [void]$sb.Append(',') }
+        $firstCatalog = $false
+        [void]$sb.Append('{"key":').Append((ConvertTo-JsonString $def.Key))
+        [void]$sb.Append(',"label":').Append((ConvertTo-JsonString $def.Label))
+        [void]$sb.Append(',"section":').Append((ConvertTo-JsonString $def.Section))
+        [void]$sb.Append('}')
+    }
+    [void]$sb.Append('],"users":[')
     $firstUser = $true
     foreach ($user in (ConvertTo-ObjectList $Model.Users)) {
         if (-not $firstUser) { [void]$sb.Append(',') }
@@ -574,7 +944,21 @@ function ConvertTo-ReportJson {
         [void]$sb.Append(',"title":').Append((ConvertTo-JsonString $user.Title))
         [void]$sb.Append(',"enabled":').Append((ConvertTo-JsonBool $user.Enabled))
         [void]$sb.Append(',"groups":').Append((ConvertTo-JsonStringArray $user.GroupDns))
-        [void]$sb.Append('}')
+        [void]$sb.Append(',"attrs":{')
+        $attrKeys = New-Object System.Collections.Generic.List[string]
+        if ($null -ne $user.Attrs) {
+            foreach ($attrKey in @($user.Attrs.Keys)) { [void]$attrKeys.Add([string]$attrKey) }
+        }
+        $attrKeys.Sort([System.StringComparer]::OrdinalIgnoreCase)
+        $firstAttr = $true
+        foreach ($attrKey in $attrKeys) {
+            $attrValue = Get-UserAttributeValue -User $user -Key $attrKey
+            if ([string]::IsNullOrWhiteSpace($attrValue)) { continue }
+            if (-not $firstAttr) { [void]$sb.Append(',') }
+            $firstAttr = $false
+            [void]$sb.Append((ConvertTo-JsonString $attrKey)).Append(':').Append((ConvertTo-JsonString $attrValue))
+        }
+        [void]$sb.Append('}}')
     }
     [void]$sb.Append('],"notFound":').Append((ConvertTo-JsonStringArray $Model.NotFound))
     [void]$sb.Append(',"groupMeta":{')
@@ -632,6 +1016,7 @@ function New-CommonAdGroupsHtml {
 }
 
 function New-DemoReportModel {
+    param([bool]$ExcludeDisabled = $false)
     $domainUsers = New-GroupMeta -Name 'Domain Users' -DistinguishedName 'CN=Domain Users,CN=Users,DC=contoso,DC=com' -GroupScope 'Global' -GroupCategory 'Security' -Description 'Primary group for every domain account'
     $allStaff = New-GroupMeta -Name 'All Staff' -SamAccountName 'AllStaff' -DistinguishedName 'CN=All Staff,OU=Groups,DC=contoso,DC=com' -GroupScope 'Global' -GroupCategory 'Security' -Description 'All employees'
     $finance = New-GroupMeta -Name 'Finance' -DistinguishedName 'CN=Finance,OU=Groups,DC=contoso,DC=com' -GroupScope 'Global' -GroupCategory 'Security' -Description "Finance share access`nIncludes budget folders"
@@ -643,14 +1028,25 @@ function New-DemoReportModel {
     $weird = New-GroupMeta -Name 'Sales "West" </script><img src=x onerror=alert(1)>' -SamAccountName 'SalesWest' -DistinguishedName 'CN=Weird,OU=Groups,DC=contoso,DC=com' -GroupScope 'Global' -GroupCategory 'Distribution' -Description "Use \\fileserver\sales <b>not html</b>"
     $archive = New-GroupMeta -Name 'Archive Mail' -SamAccountName 'ArchiveMail' -DistinguishedName 'CN=Archive Mail,OU=Groups,DC=contoso,DC=com' -GroupScope 'Universal' -GroupCategory 'Distribution' -Description 'Mailbox archive. No selected user is a member.'
 
+    $sharedOrg = @{ Company = 'Contoso'; Division = 'Corporate'; City = 'Seattle'; State = 'WA'; Country = 'US' }
+    $aliceAttr = $sharedOrg.Clone()
+    $aliceAttr.Department = 'Finance'; $aliceAttr.Title = 'Analyst'; $aliceAttr.Office = 'London'; $aliceAttr.Manager = 'Pat Lee'; $aliceAttr.EmployeeType = 'Employee'; $aliceAttr.EmployeeID = 'E1001'; $aliceAttr.extensionAttribute1 = 'FALCON'; $aliceAttr.Description = 'Budget & planning'
+    $bobAttr = $sharedOrg.Clone()
+    $bobAttr.Department = 'IT'; $bobAttr.Title = 'Engineer'; $bobAttr.Office = 'London'; $bobAttr.Manager = 'Sam Roy'; $bobAttr.EmployeeType = 'Employee'; $bobAttr.EmployeeID = 'E1002'; $bobAttr.extensionAttribute1 = 'FALCON'
+    $carolAttr = $sharedOrg.Clone()
+    $carolAttr.Department = 'R&D'; $carolAttr.Title = 'Manager'; $carolAttr.Office = 'London'; $carolAttr.Manager = 'Pat Lee'; $carolAttr.EmployeeType = 'Employee'; $carolAttr.EmployeeID = 'E1003'; $carolAttr.extensionAttribute1 = 'FALCON'
+    $daveAttr = $sharedOrg.Clone()
+    $daveAttr.Department = 'Finance'; $daveAttr.Title = 'Contractor'; $daveAttr.Office = 'Remote'; $daveAttr.Manager = 'Pat Lee'; $daveAttr.EmployeeType = 'Contractor'; $daveAttr.EmployeeID = 'E1004'; $daveAttr.extensionAttribute1 = 'LEGACY'
+    $eveAttr = $sharedOrg.Clone()
+    $eveAttr.Department = 'Interns'; $eveAttr.Title = 'Intern'; $eveAttr.Office = 'London'; $eveAttr.Manager = 'Pat Lee'; $eveAttr.EmployeeType = 'Intern'; $eveAttr.EmployeeID = 'E1005'; $eveAttr.extensionAttribute1 = 'FALCON'
     $users = @(
-        (New-ReportUser -SamAccountName 'alice' -DisplayName 'Alice Nguyen' -Email 'alice@contoso.example' -Department 'Finance' -Title 'Analyst' -Enabled $true -Groups @($domainUsers, $allStaff, $finance, $vpn, $adminsFinance, $weird))
-        (New-ReportUser -SamAccountName 'bob' -DisplayName 'Bob Singh' -Email 'bob@contoso.example' -Department 'IT' -Title 'Engineer' -Enabled $true -Groups @($domainUsers, $allStaff, $finance, $vpn, $contractors))
-        (New-ReportUser -SamAccountName 'carol' -DisplayName "Carol O'Neil" -Email 'carol@contoso.example' -Department 'R&D' -Title 'Manager' -Enabled $true -Groups @($domainUsers, $allStaff, $finance, $adminsHr))
-        (New-ReportUser -SamAccountName 'dave' -DisplayName 'Dave Chen' -Email 'dave@contoso.example' -Department 'Finance' -Title 'Contractor' -Enabled $false -Groups @($domainUsers, $allStaff, $legacy))
-        (New-ReportUser -SamAccountName 'eve' -DisplayName 'Eve Patel' -Email '' -Department 'Interns' -Title 'Intern' -Enabled $true -Groups $domainUsers)
+        (New-ReportUser -SamAccountName 'alice' -DisplayName 'Alice Nguyen' -Email 'alice@contoso.example' -Department 'Finance' -Title 'Analyst' -Enabled $true -DistinguishedName 'CN=Alice Nguyen,OU=Finance,OU=Users,DC=contoso,DC=com' -UserPrincipalName 'alice@contoso.example' -Attributes $aliceAttr -Groups @($domainUsers, $allStaff, $finance, $vpn, $adminsFinance, $weird))
+        (New-ReportUser -SamAccountName 'bob' -DisplayName 'Bob Singh' -Email 'bob@contoso.example' -Department 'IT' -Title 'Engineer' -Enabled $true -DistinguishedName 'CN=Bob Singh,OU=IT,OU=Users,DC=contoso,DC=com' -UserPrincipalName 'bob@contoso.example' -Attributes $bobAttr -Groups @($domainUsers, $allStaff, $finance, $vpn, $contractors))
+        (New-ReportUser -SamAccountName 'carol' -DisplayName "Carol O'Neil" -Email 'carol@contoso.example' -Department 'R&D' -Title 'Manager' -Enabled $true -DistinguishedName "CN=Carol O'Neil,OU=R&D,OU=Users,DC=contoso,DC=com" -UserPrincipalName 'carol@contoso.example' -Attributes $carolAttr -Groups @($domainUsers, $allStaff, $finance, $adminsHr))
+        (New-ReportUser -SamAccountName 'dave' -DisplayName 'Dave Chen' -Email 'dave@contoso.example' -Department 'Finance' -Title 'Contractor' -Enabled $false -DistinguishedName 'CN=Dave Chen,OU=Contractors,OU=Finance,OU=Users,DC=contoso,DC=com' -UserPrincipalName 'dave@contoso.example' -Attributes $daveAttr -Groups @($domainUsers, $allStaff, $legacy))
+        (New-ReportUser -SamAccountName 'eve' -DisplayName 'Eve Patel' -Email '' -Department 'Interns' -Title 'Intern' -Enabled $true -DistinguishedName 'CN=Eve Patel,OU=Interns,OU=Users,DC=contoso,DC=com' -UserPrincipalName 'eve@contoso.example' -Attributes $eveAttr -Groups $domainUsers)
     )
-    New-CommonGroupReportModel -Users $users -NotFound @('frank') -CompareNames @('Domain Users', 'Finance', 'Ghost Group', 'Archive Mail', 'Admins', 'Legacy App') -ExtraGroups @($archive) -MinimumUserCount 2 -UsersCsv 'users.csv' -GroupsCsv 'groups.csv' -Domain 'contoso.example' -Generated 'Wednesday 30 September 2026, 12:00:00' -ScriptName 'Find-CommonADGroups.ps1'
+    New-CommonGroupReportModel -Users $users -NotFound @('frank') -CompareNames @('Domain Users', 'Finance', 'Ghost Group', 'Archive Mail', 'Admins', 'Legacy App') -ExtraGroups @($archive) -MinimumUserCount 2 -ExcludeDisabled:$ExcludeDisabled -UsersCsv 'users.csv' -GroupsCsv 'groups.csv' -Domain 'contoso.example' -Generated 'Wednesday 30 September 2026, 12:00:00' -ScriptName 'Find-CommonADGroups.ps1'
 }
 
 function Get-PrimaryGroupSid {
@@ -818,7 +1214,7 @@ function Find-AdGroupsForCompareNames {
 function Get-AdUserBySamBatch {
     param($SamList, $CommonParams)
     $map = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::OrdinalIgnoreCase)
-    $props = @('MemberOf', 'DisplayName', 'mail', 'Department', 'Title', 'Enabled', 'PrimaryGroupID', 'DistinguishedName', 'SamAccountName', 'UserPrincipalName')
+    $props = @(Get-AdUserQueryProperties)
     $batchSize = 40
     for ($offset = 0; $offset -lt $SamList.Count; $offset += $batchSize) {
         $end = [Math]::Min($offset + $batchSize - 1, $SamList.Count - 1)
@@ -860,7 +1256,7 @@ function Get-AdUserBySamBatch {
 
 function Find-AdUserAlternate {
     param([string]$Value, $CommonParams)
-    $props = @('MemberOf', 'DisplayName', 'mail', 'Department', 'Title', 'Enabled', 'PrimaryGroupID', 'DistinguishedName', 'SamAccountName', 'UserPrincipalName')
+    $props = @(Get-AdUserQueryProperties)
     $looksSpecial = ($Value -match '@') -or ($Value -like 'CN=*') -or ($Value -like '*=*') -or ($Value -like 'S-1-*') -or ($Value -match '^[0-9a-fA-F-]{36}$')
     if (-not $looksSpecial) { return $null }
     try {
@@ -881,11 +1277,130 @@ function Find-AdUserAlternate {
     catch { return $null }
 }
 
+function Get-RawAttributesFromAdUser {
+    param($AdUser, $Extra)
+    $bag = @{}
+    if ($null -eq $AdUser) { return $bag }
+    foreach ($def in (Get-UserAttributeDefinitions)) {
+        if ($def.Derived) { continue }
+        $propertyName = [string]$def.Property
+        if ([string]::IsNullOrWhiteSpace($propertyName)) { continue }
+        $value = $null
+        if ($def.Optional) {
+            if ($null -ne $Extra -and (Test-MapHasKey -Map $Extra -Key $propertyName)) {
+                $value = Get-MapValue -Map $Extra -Key $propertyName
+            }
+            else { continue }
+        }
+        else {
+            $prop = $AdUser.PSObject.Properties[$propertyName]
+            if ($null -eq $prop) { continue }
+            $value = $prop.Value
+        }
+        if ($null -ne $value) { $bag[$propertyName] = $value }
+    }
+    return $bag
+}
+
+function Get-OptionalAdAttributeMap {
+    param($SamList, $PropertyNames, $CommonParams)
+    $map = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $names = New-Object System.Collections.Generic.List[string]
+    foreach ($name in (ConvertTo-ObjectList $PropertyNames)) {
+        $text = ([string]$name).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($text)) { [void]$names.Add($text) }
+    }
+    $accounts = New-Object System.Collections.Generic.List[string]
+    foreach ($sam in (ConvertTo-ObjectList $SamList)) {
+        $text = ([string]$sam).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($text)) { [void]$accounts.Add($text) }
+    }
+    if ($names.Count -eq 0 -or $accounts.Count -eq 0) { return ,$map }
+    try {
+        $probeParams = @{ Identity = [string]$accounts[0]; Properties = @([string]$names[0]); ErrorAction = 'Stop' }
+        Add-DictionaryParameter -Target $probeParams -Source $CommonParams
+        $null = Get-ADUser @probeParams
+    }
+    catch { return ,$map }
+    $batchSize = 40
+    for ($offset = 0; $offset -lt $accounts.Count; $offset += $batchSize) {
+        $end = [Math]::Min($offset + $batchSize - 1, $accounts.Count - 1)
+        $clauses = New-Object System.Collections.Generic.List[string]
+        for ($index = $offset; $index -le $end; $index++) {
+            [void]$clauses.Add('(sAMAccountName=' + (ConvertTo-LdapFilterLiteral ([string]$accounts[$index])) + ')')
+        }
+        try {
+            $params = @{
+                LDAPFilter  = ('(|' + ($clauses -join '') + ')')
+                Properties  = $names.ToArray()
+                ErrorAction = 'Stop'
+            }
+            Add-DictionaryParameter -Target $params -Source $CommonParams
+            foreach ($user in @(Get-ADUser @params)) {
+                if (-not $user.SamAccountName) { continue }
+                $bag = @{}
+                foreach ($name in $names) {
+                    $prop = $user.PSObject.Properties[[string]$name]
+                    if ($null -ne $prop -and $null -ne $prop.Value) { $bag[[string]$name] = $prop.Value }
+                }
+                $map[[string]$user.SamAccountName] = $bag
+            }
+        }
+        catch {
+            Write-ToolStatus "Optional attributes could not be read: $($_.Exception.Message)" 'WARN'
+            break
+        }
+    }
+    return ,$map
+}
+
+function Merge-OptionalAttributeBags {
+    param($Target, $SourceMap, [string]$Sam)
+    if ($null -eq $Target -or $null -eq $SourceMap -or [string]::IsNullOrWhiteSpace($Sam)) { return }
+    if (-not $SourceMap.ContainsKey($Sam)) { return }
+    $bag = $SourceMap[$Sam]
+    if ($null -eq $bag) { return }
+    foreach ($key in @($bag.Keys)) { $Target[[string]$key] = $bag[$key] }
+}
+
+function Resolve-ManagerDisplayNames {
+    param($Users, $CommonParams)
+    $pending = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[object]]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($user in (ConvertTo-ObjectList $Users)) {
+        $dn = [string]$user.ManagerDn
+        if ([string]::IsNullOrWhiteSpace($dn)) { continue }
+        if (-not $pending.ContainsKey($dn)) {
+            $pending[$dn] = New-Object System.Collections.Generic.List[object]
+        }
+        [void]$pending[$dn].Add($user)
+    }
+    foreach ($dn in @($pending.Keys)) {
+        $label = Get-CnFromDistinguishedName $dn
+        try {
+            $params = @{ Identity = $dn; Properties = @('DisplayName', 'SamAccountName'); ErrorAction = 'Stop' }
+            Add-DictionaryParameter -Target $params -Source $CommonParams
+            $manager = Get-ADUser @params
+            $display = [string]$manager.DisplayName
+            if ([string]::IsNullOrWhiteSpace($display)) { $display = Get-CnFromDistinguishedName ([string]$manager.DistinguishedName) }
+            $sam = [string]$manager.SamAccountName
+            if (-not [string]::IsNullOrWhiteSpace($display) -and -not [string]::IsNullOrWhiteSpace($sam) -and ($display -ne $sam)) {
+                $label = '{0} ({1})' -f $display, $sam
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($display)) { $label = $display }
+        }
+        catch { }
+        foreach ($user in $pending[$dn]) {
+            if ($null -eq $user.Attributes) { continue }
+            $user.Attributes['Manager'] = $label
+        }
+    }
+}
+
 function Get-AdReportRecords {
     param($SamList, $CompareNames, [bool]$IncludeNested, $CommonParams)
     $userMap = Get-AdUserBySamBatch -SamList $SamList -CommonParams $CommonParams
     $cache = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::OrdinalIgnoreCase)
-    $users = New-Object System.Collections.Generic.List[object]
+    $pending = New-Object System.Collections.Generic.List[object]
     $notFound = New-Object System.Collections.Generic.List[string]
     $index = 0
     foreach ($sam in $SamList) {
@@ -896,23 +1411,52 @@ function Get-AdReportRecords {
         if ($null -eq $adUser) {
             Write-ToolStatus "Account not found: $sam" 'WARN'
             [void]$notFound.Add([string]$sam)
-            continue
         }
+        else { [void]$pending.Add([pscustomobject]@{ Input = [string]$sam; AdUser = $adUser }) }
+        $percent = [int]($index * 100 / [Math]::Max(1, $SamList.Count))
+        Write-Progress -Activity 'Find common AD groups' -Status "Resolved accounts $index of $($SamList.Count)" -PercentComplete $percent
+    }
+    $resolvedSams = New-Object System.Collections.Generic.List[string]
+    $seenResolved = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($item in $pending) {
+        $resolvedSam = [string]$item.AdUser.SamAccountName
+        if ([string]::IsNullOrWhiteSpace($resolvedSam) -or $seenResolved.ContainsKey($resolvedSam)) { continue }
+        $seenResolved[$resolvedSam] = $true
+        [void]$resolvedSams.Add($resolvedSam)
+    }
+    $exchangeMap = Get-OptionalAdAttributeMap -SamList $resolvedSams -PropertyNames (Get-OptionalPropertyNames 'exchange') -CommonParams $CommonParams
+    $cloudMap = Get-OptionalAdAttributeMap -SamList $resolvedSams -PropertyNames (Get-OptionalPropertyNames 'cloud') -CommonParams $CommonParams
+    $users = New-Object System.Collections.Generic.List[object]
+    $index = 0
+    foreach ($item in $pending) {
+        $index++
+        $sam = [string]$item.Input
+        $adUser = $item.AdUser
         Write-ToolStatus "Querying $($adUser.SamAccountName)"
         try {
             $groups = Get-AdGroupMetadataForUser -AdUser $adUser -Cache $cache -IncludeNested:$IncludeNested -CommonParams $CommonParams
             $email = ''
             if ($adUser.mail) { $email = [string]$adUser.mail }
-            [void]$users.Add((New-ReportUser -SamAccountName ([string]$adUser.SamAccountName) -DisplayName ([string]$adUser.DisplayName) -Email $email -Department ([string]$adUser.Department) -Title ([string]$adUser.Title) -Enabled $adUser.Enabled -Groups $groups))
+            $extra = @{}
+            Merge-OptionalAttributeBags -Target $extra -SourceMap $exchangeMap -Sam ([string]$adUser.SamAccountName)
+            Merge-OptionalAttributeBags -Target $extra -SourceMap $cloudMap -Sam ([string]$adUser.SamAccountName)
+            $raw = Get-RawAttributesFromAdUser -AdUser $adUser -Extra $extra
+            $managerDn = ''
+            if ($raw.Contains('Manager') -and [string]$raw['Manager'] -match '(?i)^(CN|OU|DC)=') {
+                $managerDn = [string]$raw['Manager']
+                $raw['Manager'] = Get-CnFromDistinguishedName $managerDn
+            }
+            [void]$users.Add((New-ReportUser -SamAccountName ([string]$adUser.SamAccountName) -DisplayName ([string]$adUser.DisplayName) -Email $email -Department ([string]$adUser.Department) -Title ([string]$adUser.Title) -Enabled $adUser.Enabled -DistinguishedName ([string]$adUser.DistinguishedName) -UserPrincipalName ([string]$adUser.UserPrincipalName) -ManagerDn $managerDn -Attributes $raw -Groups $groups))
             Write-ToolStatus "  $($groups.Count) group(s), including the primary group." 'OK'
         }
         catch {
             Write-ToolStatus "Failed to read groups for $($adUser.SamAccountName): $($_.Exception.Message)" 'WARN'
             [void]$notFound.Add([string]$sam)
         }
-        $percent = [int]($index * 100 / [Math]::Max(1, $SamList.Count))
-        Write-Progress -Activity 'Find common AD groups' -Status "Read groups for $index of $($SamList.Count)" -PercentComplete $percent
+        $percent = [int]($index * 100 / [Math]::Max(1, $pending.Count))
+        Write-Progress -Activity 'Find common AD groups' -Status "Read groups for $index of $($pending.Count)" -PercentComplete $percent
     }
+    Resolve-ManagerDisplayNames -Users $users -CommonParams $CommonParams
     $extra = Find-AdGroupsForCompareNames -Names $CompareNames -CommonParams $CommonParams
     Write-Progress -Activity 'Find common AD groups' -Completed
     [pscustomobject]@{
@@ -1164,6 +1708,14 @@ function Invoke-FindCommonADGroups {
         Write-Host ("  Distinct groups  : {0}" -f $stats.Groups)
         Write-Host ("  Shared by all    : {0}" -f $stats.SharedByAll)
         Write-Host ("  Threshold (>= {0}) : {1}" -f $model.MinimumUserCount, $stats.Threshold)
+        $attributeSummary = Get-AttributeTieSummary -Model $model
+        Write-Host ("  Shared attributes: {0}" -f $attributeSummary.SharedCount)
+        foreach ($tie in $attributeSummary.Shared) {
+            Write-Host ("    {0} = {1}" -f $tie.Label, $tie.Value)
+        }
+        $commonOuText = [string]$attributeSummary.CommonOu
+        if ([string]::IsNullOrWhiteSpace($commonOuText)) { $commonOuText = 'None' }
+        Write-Host ("  Common OU        : {0}" -f $commonOuText)
         if ($model.CompareEnabled) {
             Write-Host ("  Comparison       : {0} matched, {1} in AD with nobody in scope, {2} not in AD, {3} AD only" -f $stats.Matched, $stats.NoMembers, $stats.Missing, $stats.AdOnly)
         }
@@ -1182,7 +1734,7 @@ function Get-ReportTemplate {
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>AD Group Analysis Report</title>
+<title>AD Account Analysis Report</title>
 <script>
 window.onerror = function(message, source, line, col) {
   var banner = document.getElementById('errBanner');
@@ -1243,6 +1795,7 @@ button,input,select{font:inherit}
 .card-sub{color:var(--text-muted);font-size:.75rem}
 .note,.callout{border:1px solid var(--border);background:var(--surface);border-radius:10px;padding:12px 14px;color:var(--text-muted);margin:8px 0 16px;line-height:1.45}
 .callout.warn{background:var(--amber-bg);color:var(--amber);border-color:rgba(217,119,6,.25)}
+.callout.ok{background:var(--green-bg);color:var(--text);border-color:rgba(5,150,105,.28)}
 .toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
 .toolbar .grow{flex:1;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .search{position:relative}
@@ -1332,7 +1885,7 @@ tbody tr:hover{background:var(--surface2)}
 <header class="topbar">
   <div class="brand">
     <div class="brand-mark">AD</div>
-    <div><h1>AD Group Analysis</h1><p id="brandSub"></p></div>
+    <div><h1>AD Account Analysis</h1><p id="brandSub"></p></div>
   </div>
   <div class="topbar-spacer"></div>
   <div class="topbar-meta" id="topbarMeta"></div>
@@ -1342,6 +1895,7 @@ tbody tr:hover{background:var(--surface2)}
 <nav class="sidebar" aria-label="Report sections">
   <div class="nav-label">Analysis</div>
   <button type="button" class="nav-btn active" data-action="show-tab" data-tab="overview"><span class="name">Overview</span></button>
+  <button type="button" class="nav-btn" data-action="show-tab" data-tab="attributes"><span class="name">Common attributes</span><span class="badge" id="badge-attributes">0</span></button>
   <button type="button" class="nav-btn" data-action="show-tab" data-tab="common"><span class="name">Shared by all</span><span class="badge" id="badge-shared">0</span></button>
   <button type="button" class="nav-btn" data-action="show-tab" data-tab="threshold"><span class="name">Threshold</span><span class="badge" id="badge-threshold">0</span></button>
   <button type="button" class="nav-btn" data-action="show-tab" data-tab="heatmap"><span class="name">Matrix</span></button>
@@ -1356,7 +1910,37 @@ tbody tr:hover{background:var(--surface2)}
     <div class="cards" id="overviewCards"></div>
     <div id="overviewAlert"></div>
     <div class="note" id="overviewNote"></div>
+    <div id="overviewAttributes"></div>
     <div id="overviewCompare"></div>
+  </section>
+  <section class="tab-pane" id="tab-attributes">
+    <div class="page-head"><h2>Attributes and OUs in common</h2><p id="attributeLead"></p></div>
+    <div id="attributeSummary"></div>
+    <div class="page-head"><h2>Organizational units</h2><p id="ouLead"></p></div>
+    <div class="table-card"><div class="table-scroll"><table id="tblOu"><thead><tr>
+      <th data-action="sort" data-table="ous" data-sort="path">OU path <span class="si"></span></th>
+      <th data-action="sort" data-table="ous" data-sort="dn">Distinguished name <span class="si"></span></th>
+      <th data-action="sort" data-table="ous" data-sort="count">Users <span class="si"></span></th>
+      <th data-action="sort" data-table="ous" data-sort="coverage">Coverage <span class="si"></span></th>
+      <th>Accounts</th>
+    </tr></thead><tbody id="tblOuBody"></tbody></table></div><div class="footer" id="footerOu"></div></div>
+    <div class="page-head"><h2>Attribute values</h2><p>Blank values are ignored. An attribute can tie this list together only when every in-scope account has the same non-blank value.</p></div>
+    <div class="toolbar"><div class="grow"><div class="search"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.3-4.3"/></svg><input id="searchAttrs" type="text" placeholder="Search attributes or values" aria-label="Search attributes"/></div>
+      <div class="pills-row">
+        <button type="button" class="filter-pill active" data-action="filter" data-group="attrs" data-value="all">All</button>
+        <button type="button" class="filter-pill" data-action="filter" data-group="attrs" data-value="shared">Shared by everyone</button>
+        <button type="button" class="filter-pill" data-action="filter" data-group="attrs" data-value="partial">Partial matches</button>
+      </div>
+    </div><button type="button" class="btn" data-action="export" data-kind="attributes">Export CSV</button><button type="button" class="btn primary" data-action="export" data-kind="attribute-matrix">Export user matrix</button></div>
+    <div class="table-card"><div class="table-scroll"><table id="tblAttrs"><thead><tr>
+      <th data-action="sort" data-table="attributes" data-sort="label">Attribute <span class="si"></span></th>
+      <th data-action="sort" data-table="attributes" data-sort="section">Section <span class="si"></span></th>
+      <th data-action="sort" data-table="attributes" data-sort="value">Most common value <span class="si"></span></th>
+      <th data-action="sort" data-table="attributes" data-sort="count">Users <span class="si"></span></th>
+      <th data-action="sort" data-table="attributes" data-sort="coverage">Coverage <span class="si"></span></th>
+      <th data-action="sort" data-table="attributes" data-sort="distinct">Distinct <span class="si"></span></th>
+      <th data-action="sort" data-table="attributes" data-sort="blanks">Blank <span class="si"></span></th>
+    </tr></thead><tbody id="tblAttrBody"></tbody></table></div><div class="footer" id="footerAttrs"></div></div>
   </section>
   <section class="tab-pane" id="tab-common">
     <div class="page-head"><h2>Groups shared by all users</h2><p>Every account currently in scope is a direct member. The primary group is included.</p></div>
@@ -1453,9 +2037,12 @@ var sortState = {
   common: { key: 'name', dir: 1 },
   threshold: { key: 'count', dir: -1 },
   compare: { key: 'status', dir: 1 },
-  users: { key: 'sam', dir: 1 }
+  users: { key: 'sam', dir: 1 },
+  attributes: { key: 'coverage', dir: -1 },
+  ous: { key: 'path', dir: 1 }
 };
-var filters = { category: 'all', hideShared: false, compare: 'all' };
+var filters = { category: 'all', hideShared: false, compare: 'all', attrs: 'all' };
+var latestAttributeSummary = { rows: [], shared: [], ous: [], commonOu: '' };
 var memberStore = {};
 var hmPage = 0;
 var activeUserCount = 0;
@@ -1509,6 +2096,19 @@ function sortRows(rows, table) {
   });
 }
 function sortValue(table, key, row) {
+  if (table === 'attributes') {
+    if (key === 'label') return row.label || '';
+    if (key === 'section') return row.section || '';
+    if (key === 'value') return row.topValue || '';
+    if (key === 'distinct') return row.distinct || 0;
+    if (key === 'blanks') return row.blanks || 0;
+    if (key === 'count' || key === 'coverage') return row.count || 0;
+  }
+  if (table === 'ous') {
+    if (key === 'dn') return row.dn || '';
+    if (key === 'path') return row.path || '';
+    if (key === 'count' || key === 'coverage') return row.count || 0;
+  }
   if (table === 'users') {
     if (key === 'sam') return row.sam || '';
     if (key === 'display') return row.display || '';
@@ -1804,6 +2404,179 @@ function visibleUsers(model) {
   sortRows(rows, 'users');
   return rows;
 }
+function attrValue(user, key) {
+  if (!user || !user.attrs) return '';
+  var value = user.attrs[key];
+  if (value == null) return '';
+  return String(value).trim();
+}
+function commonDirectoryPath(paths) {
+  var lists = [];
+  for (var i = 0; i < paths.length; i++) {
+    var text = String(paths[i] || '').replace(/^\/+|\/+$/g, '');
+    if (!text) continue;
+    var parts = text.split('/');
+    var clean = [];
+    for (var p = 0; p < parts.length; p++) {
+      if (parts[p]) clean.push(parts[p]);
+    }
+    if (clean.length) lists.push(clean);
+  }
+  if (!lists.length) return '';
+  var count = lists[0].length;
+  for (var n = 0; n < lists.length; n++) {
+    var limit = Math.min(count, lists[n].length);
+    var index = 0;
+    while (index < limit && String(lists[0][index]).toLowerCase() === String(lists[n][index]).toLowerCase()) index++;
+    count = index;
+    if (!count) break;
+  }
+  if (!count) return '';
+  return lists[0].slice(0, count).join('/');
+}
+function analyzeAttributes(users) {
+  var catalog = asArray(REPORT.attributeCatalog);
+  var rows = [];
+  for (var i = 0; i < catalog.length; i++) {
+    var def = catalog[i];
+    var buckets = Object.create(null);
+    var order = [];
+    var blanks = 0;
+    for (var u = 0; u < users.length; u++) {
+      var value = attrValue(users[u], def.key);
+      if (!value) { blanks++; continue; }
+      var fold = value.toLowerCase();
+      if (!buckets[fold]) {
+        buckets[fold] = { value: value, users: [] };
+        order.push(fold);
+      }
+      buckets[fold].users.push(users[u].sam);
+    }
+    if (!order.length) continue;
+    var values = [];
+    for (var b = 0; b < order.length; b++) values.push(buckets[order[b]]);
+    values.sort(function(a, b) {
+      if (b.users.length !== a.users.length) return b.users.length - a.users.length;
+      return String(a.value).localeCompare(String(b.value));
+    });
+    var top = values[0];
+    rows.push({
+      key: def.key, label: def.label, section: def.section, name: def.label,
+      values: values, blanks: blanks, count: top.users.length, distinct: values.length,
+      topValue: top.value, shared: users.length > 0 && top.users.length === users.length
+    });
+  }
+  var ouMap = Object.create(null);
+  var ouOrder = [];
+  var ouPaths = [];
+  var missingOu = false;
+  for (var n = 0; n < users.length; n++) {
+    var path = attrValue(users[n], 'ouPath');
+    var dn = attrValue(users[n], 'ouDn');
+    if (!path) missingOu = true;
+    else ouPaths.push(path);
+    var ouKey = (path || dn || '').toLowerCase();
+    if (!ouKey) continue;
+    if (!ouMap[ouKey]) {
+      ouMap[ouKey] = { path: path || dn, dn: dn, users: [] };
+      ouOrder.push(ouKey);
+    }
+    ouMap[ouKey].users.push(users[n].sam);
+  }
+  var ous = [];
+  for (var o = 0; o < ouOrder.length; o++) {
+    var item = ouMap[ouOrder[o]];
+    ous.push({ path: item.path, dn: item.dn, users: item.users, count: item.users.length, name: item.path });
+  }
+  return {
+    rows: rows,
+    shared: rows.filter(function(row) { return row.shared; }),
+    ous: ous,
+    commonOu: missingOu ? '' : commonDirectoryPath(ouPaths)
+  };
+}
+function visibleAttributeRows(analysis) {
+  var query = valueOf('searchAttrs').toLowerCase();
+  var mode = filters.attrs || 'all';
+  var rows = analysis.rows.filter(function(row) {
+    if (mode === 'shared' && !row.shared) return false;
+    if (mode === 'partial' && (row.shared || row.count < 2)) return false;
+    if (!query) return true;
+    var blob = (row.label + ' ' + row.section + ' ' + row.topValue).toLowerCase();
+    return blob.indexOf(query) >= 0;
+  });
+  sortRows(rows, 'attributes');
+  return rows;
+}
+function userPills(sams) {
+  var sorted = asArray(sams).slice().sort();
+  if (!sorted.length) return '<span class="muted">None</span>';
+  var html = '<div class="pills">';
+  for (var i = 0; i < sorted.length; i++) html += '<span class="pill">' + esc(sorted[i]) + '</span>';
+  return html + '</div>';
+}
+function attributeDetailHtml(row) {
+  var key = 'attr-' + row.key;
+  var html = '<tr class="detail-row" id="detail-' + key + '"><td class="detail-cell" colspan="7"><div class="detail-grid">';
+  for (var i = 0; i < row.values.length; i++) {
+    var bucket = row.values[i];
+    html += '<div><label>' + esc(bucket.value) + ' (' + bucket.users.length + ')</label>' + userPills(bucket.users) + '</div>';
+  }
+  if (row.blanks) html += '<div><label>Blank (' + row.blanks + ')</label><span class="muted">These accounts have no value, so they are not a match.</span></div>';
+  return html + '</div></td></tr>';
+}
+function renderAttributes(model) {
+  var analysis = latestAttributeSummary || analyzeAttributes(model.users);
+  var shared = analysis.shared;
+  var sentences = [];
+  if (!model.inScope) sentences.push('No accounts are in scope.');
+  else if (!shared.length) sentences.push('No attribute has the same non-blank value on every in-scope account. The closest matches are listed first.');
+  else sentences.push('Every in-scope account has ' + shared.map(function(row) { return row.label + ' = ' + row.topValue; }).join('; ') + '.');
+  if (analysis.commonOu && analysis.ous.length === 1) sentences.push('Every in-scope account is in ' + analysis.commonOu + '.');
+  else if (analysis.commonOu) sentences.push('The deepest organizational unit that contains every in-scope account is ' + analysis.commonOu + '. They are spread across ' + analysis.ous.length + ' OUs.');
+  else if (model.inScope) sentences.push('These accounts do not share one organizational unit path.');
+  var lead = document.getElementById('attributeLead');
+  if (lead) lead.textContent = 'Use this view to find a directory value that applies to the whole CSV. Blank values are not treated as a match.';
+  var summary = document.getElementById('attributeSummary');
+  if (summary) summary.innerHTML = '<div class="callout' + (shared.length ? ' ok' : '') + '">' + esc(sentences.join(' ')) + '</div>';
+  var ouLead = document.getElementById('ouLead');
+  if (ouLead) ouLead.textContent = analysis.commonOu ? ('Common ancestor: ' + analysis.commonOu) : 'No shared OU path for every account in scope.';
+  var ouRows = analysis.ous.slice();
+  sortRows(ouRows, 'ous');
+  var ouBody = document.getElementById('tblOuBody');
+  if (ouBody) {
+    if (!ouRows.length) ouBody.innerHTML = '<tr class="empty-row"><td colspan="5">No organizational unit was available for the accounts in scope.</td></tr>';
+    else {
+      var ouHtml = [];
+      for (var i = 0; i < ouRows.length; i++) {
+        var ou = ouRows[i];
+        ouHtml.push('<tr><td class="mono">' + esc(ou.path) + '</td><td class="mono">' + esc(ou.dn || '') + '</td><td>' + ou.count + '</td><td>' + coverageHtml(ou.count) + '</td><td>' + userPills(ou.users) + '</td></tr>');
+      }
+      ouBody.innerHTML = ouHtml.join('');
+    }
+  }
+  var footerOu = document.getElementById('footerOu');
+  if (footerOu) footerOu.textContent = ouRows.length + (ouRows.length === 1 ? ' OU' : ' OUs');
+  var rows = visibleAttributeRows(analysis);
+  var body = document.getElementById('tblAttrBody');
+  if (body) {
+    if (!rows.length) body.innerHTML = '<tr class="empty-row"><td colspan="7">No attributes match the current filter.</td></tr>';
+    else {
+      var html = [];
+      for (var r = 0; r < rows.length; r++) {
+        var row = rows[r];
+        var key = 'attr-' + row.key;
+        html.push('<tr><td><div class="name-cell"><button type="button" class="exp-btn" data-action="toggle-detail" data-exp="' + key + '" data-detail="' + key + '" aria-expanded="false" aria-label="Show values">&#9656;</button><div class="name-stack"><strong>' + esc(row.label) + '</strong>' + (row.shared ? ' <span class="chip chip-green">All</span>' : '') + '</div></div></td><td>' + esc(row.section) + '</td><td>' + esc(row.topValue) + '</td><td>' + row.count + '</td><td>' + coverageHtml(row.count) + '</td><td>' + row.distinct + '</td><td>' + row.blanks + '</td></tr>');
+        html.push(attributeDetailHtml(row));
+      }
+      body.innerHTML = html.join('');
+    }
+  }
+  var footer = document.getElementById('footerAttrs');
+  if (footer) footer.textContent = rows.length + (rows.length === 1 ? ' attribute' : ' attributes');
+  var badge = document.getElementById('badge-attributes');
+  if (badge) badge.textContent = String(shared.length);
+}
 function statCard(key, label, value, sub, cls) {
   return '<article class="card ' + (cls || '') + '" data-stat="' + esc(key) + '"><div class="card-label">' + esc(label) + '</div><div class="card-value">' + esc(String(value)) + '</div><div class="card-sub">' + esc(sub) + '</div></article>';
 }
@@ -1815,6 +2588,7 @@ function renderOverview(model) {
     statCard('notfound', 'Not found', asArray(REPORT.notFound).length, 'Excluded from sharing', 'c-red'),
     statCard('groups', 'Distinct groups', model.rows.length, 'Groups with someone in scope', ''),
     statCard('shared', 'Shared by all', model.shared.length, 'Common to every in-scope account', 'c-cyan'),
+    statCard('attributes', 'Shared attributes', latestAttributeSummary.shared.length, 'Same non-blank value for everyone in scope', 'c-green'),
     statCard('threshold', 'Threshold groups', model.threshold.length, 'Shared by at least ' + model.minCount, 'c-purple')
   ];
   if (model.compare.enabled) {
@@ -1833,6 +2607,14 @@ function renderOverview(model) {
   } else alert.innerHTML = '';
   var mode = REPORT.recursive ? 'Nested membership is included, plus each account primary group.' : 'Direct membership is included, plus each account primary group. Domain Users is usually only the primary group, so it is part of this report. Nested groups are omitted unless the report was generated with -Recursive.';
   document.getElementById('overviewNote').textContent = mode + ' The users shown beside a group are the accounts in this report, not the full Active Directory membership.';
+  var tieHost = document.getElementById('overviewAttributes');
+  if (tieHost) {
+    var tieText = latestAttributeSummary.shared.length
+      ? (latestAttributeSummary.shared.length + ' attribute' + (latestAttributeSummary.shared.length === 1 ? '' : 's') + ' match on every account in scope.')
+      : 'No attribute is the same for every account in scope.';
+    if (latestAttributeSummary.commonOu) tieText += ' Deepest shared OU: ' + latestAttributeSummary.commonOu + '.';
+    tieHost.innerHTML = '<div class="callout">' + esc(tieText) + ' <button type="button" class="linkish" data-action="show-tab" data-tab="attributes">Compare attributes and OUs</button></div>';
+  }
   var compareHost = document.getElementById('overviewCompare');
   if (model.compare.enabled) {
     compareHost.innerHTML = '<div class="page-head"><h2>Comparison</h2><p>Reference file: ' + esc(REPORT.groupsCsv || 'reference list') + '</p></div>' + vennHtml(model.compare);
@@ -1956,7 +2738,7 @@ function updateChrome(model) {
   if (REPORT.groupsCsv) meta.push('Groups: ' + REPORT.groupsCsv);
   document.getElementById('topbarMeta').innerHTML = esc(meta.join('  |  ')).replace(/ \| /g, '<br>');
   document.getElementById('brandSub').textContent = (REPORT.scriptName || 'Find-CommonADGroups.ps1') + (REPORT.recursive ? '  |  Nested + primary group' : '  |  Direct + primary group');
-  document.getElementById('pageFooter').textContent = 'AD Group Analysis  |  ' + (REPORT.generated || '') + '  |  ' + REPORT.inputCount + ' input, ' + asArray(REPORT.users).length + ' resolved';
+  document.getElementById('pageFooter').textContent = 'AD Account Analysis  |  ' + (REPORT.generated || '') + '  |  ' + REPORT.inputCount + ' input, ' + asArray(REPORT.users).length + ' resolved';
   markSortHeaders();
 }
 function renderAll() {
@@ -1965,7 +2747,9 @@ function renderAll() {
   safeRun('compute', function() { model = compute(); });
   if (!model) return;
   activeUserCount = model.inScope;
+  latestAttributeSummary = analyzeAttributes(model.users);
   safeRun('overview', function() { renderOverview(model); });
+  safeRun('attributes', function() { renderAttributes(model); });
   safeRun('common', function() { renderCommon(model); });
   safeRun('threshold', function() { renderThreshold(model); });
   safeRun('compare', function() { renderCompare(model); });
@@ -1976,7 +2760,8 @@ function renderAll() {
   window.__reportModel = {
     inScope: model.inScope, shared: model.shared.length, threshold: model.threshold.length,
     groups: model.rows.length, matched: model.compare.matched, noMembers: model.compare.noMembers,
-    missing: model.compare.missing, adOnly: model.compare.adOnly
+    missing: model.compare.missing, adOnly: model.compare.adOnly,
+    attributeShared: latestAttributeSummary.shared.length, commonOu: latestAttributeSummary.commonOu
   };
 }
 function csvField(value) {
@@ -2027,6 +2812,30 @@ function exportCurrent(kind) {
     var missing = [['SamAccountName', 'Status'].map(csvField).join(',')];
     for (var n = 0; n < names.length; n++) missing.push([names[n], 'Not found'].map(csvField).join(','));
     downloadCsv('not_found', missing);
+  }
+  else if (kind === 'attributes') {
+    var analysis = analyzeAttributes(model.users);
+    var attrRows = visibleAttributeRows(analysis);
+    var attrLines = [['Attribute', 'Section', 'MostCommonValue', 'UserCount', 'InScope', 'CoveragePercent', 'DistinctValues', 'BlankCount', 'SharedByAll', 'ValueBreakdown'].map(csvField).join(',')];
+    for (var a = 0; a < attrRows.length; a++) {
+      var attr = attrRows[a];
+      var pct = model.inScope > 0 ? Math.round((attr.count / model.inScope) * 100) : 0;
+      var breakdown = attr.values.map(function(bucket) { return bucket.value + ' (' + bucket.users.length + ': ' + bucket.users.join(', ') + ')'; }).join('; ');
+      attrLines.push([attr.label, attr.section, attr.topValue, attr.count, model.inScope, pct, attr.distinct, attr.blanks, attr.shared ? 'Yes' : 'No', breakdown].map(csvField).join(','));
+    }
+    downloadCsv('common_attributes', attrLines);
+  }
+  else if (kind === 'attribute-matrix') {
+    var matrixAnalysis = analyzeAttributes(model.users);
+    var matrixHeader = ['SamAccountName', 'DisplayName', 'Enabled'].concat(matrixAnalysis.rows.map(function(row) { return row.label; }));
+    var matrixLines = [matrixHeader.map(csvField).join(',')];
+    for (var mu = 0; mu < model.users.length; mu++) {
+      var account = model.users[mu];
+      var matrixValues = [account.sam, account.display, account.enabled === true ? 'Enabled' : (account.enabled === false ? 'Disabled' : 'Unknown')];
+      for (var mc = 0; mc < matrixAnalysis.rows.length; mc++) matrixValues.push(attrValue(account, matrixAnalysis.rows[mc].key));
+      matrixLines.push(matrixValues.map(csvField).join(','));
+    }
+    downloadCsv('attribute_matrix', matrixLines);
   }
   else if (kind === 'matrix') {
     var groups = model.rows.slice().sort(function(a, b) { return String(a.name).localeCompare(String(b.name)); });
@@ -2128,7 +2937,7 @@ document.addEventListener('click', function(event) {
 document.addEventListener('input', function(event) {
   var id = event.target && event.target.id;
   if (id === 'searchHeatmap' || id === 'searchHeatUsers' || id === 'hmPageSize') hmPage = 0;
-  if (id === 'searchAll' || id === 'searchThresh' || id === 'searchCompare' || id === 'searchUsers' || id === 'threshMin' || id === 'includeDisabled' || id === 'searchHeatmap' || id === 'searchHeatUsers' || id === 'hmPageSize') renderAll();
+  if (id === 'searchAll' || id === 'searchThresh' || id === 'searchCompare' || id === 'searchUsers' || id === 'searchAttrs' || id === 'threshMin' || id === 'includeDisabled' || id === 'searchHeatmap' || id === 'searchHeatUsers' || id === 'hmPageSize') renderAll();
 });
 document.addEventListener('change', function(event) {
   var id = event.target && event.target.id;

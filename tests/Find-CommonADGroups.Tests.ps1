@@ -137,6 +137,15 @@ const finance = report.groupMeta['CN=Finance,OU=Groups,DC=contoso,DC=com'];
 if (!finance.description.includes('\n')) throw new Error('newline description was lost');
 const carol = report.users.find((user) => user.sam === 'carol');
 if (carol.display !== "Carol O'Neil" || carol.dept !== 'R&D') throw new Error('carol text changed');
+const alice = report.users.find((user) => user.sam === 'alice');
+if (!alice.attrs || alice.attrs.company !== 'Contoso') throw new Error('alice company missing');
+if (alice.attrs.ouPath !== 'contoso.com/Users/Finance') throw new Error('alice OU path ' + alice.attrs.ouPath);
+if (alice.attrs.description !== 'Budget & planning') throw new Error('alice description ' + alice.attrs.description);
+if (!Array.isArray(report.attributeCatalog) || report.attributeCatalog.length < 5) throw new Error('attribute catalog collapsed');
+const dave = report.users.find((user) => user.sam === 'dave');
+if (dave.attrs.office !== 'Remote' || dave.attrs.extensionAttribute1 !== 'LEGACY') throw new Error('dave differing attributes missing');
+if (eve.attrs.mailDomain) throw new Error('eve should not have a mail domain');
+if (eve.attrs.upnSuffix !== 'contoso.example') throw new Error('eve UPN suffix missing');
 const admins = report.compare.entries.find((entry) => entry.name === 'Admins');
 if (!admins || !Array.isArray(admins.dns) || admins.dns.length !== 2) throw new Error('Admins comparison collapsed');
 console.log('NODE_OK');
@@ -156,6 +165,39 @@ console.log('NODE_OK');
 finally {
     Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+Assert-Equal (ConvertTo-DirectoryPath 'CN=Alice Nguyen,OU=Finance,OU=Users,DC=contoso,DC=com') 'contoso.com/Users/Finance' 'OU path reverses OU and DC components'
+Assert-Equal (Get-ParentDistinguishedName 'CN=Smith\, Ann,OU=Users,DC=contoso,DC=com') 'OU=Users,DC=contoso,DC=com' 'Escaped comma stays inside the common name'
+Assert-Equal (ConvertTo-DirectoryPath 'CN=Smith\, Ann,OU=Sales\, West,OU=Users,DC=contoso,DC=com') 'contoso.com/Users/Sales, West' 'Escaped comma in an OU is unescaped for the path'
+Assert-Equal (Get-CommonDirectoryPath @('contoso.com/Users/Finance', 'contoso.com/Users/IT', 'contoso.com/Users/Finance/Contractors')) 'contoso.com/Users' 'Common OU is the shared ancestor'
+Assert-Equal (Get-CommonDirectoryPath @('contoso.com/Users')) 'contoso.com/Users' 'A single OU path is its own common path'
+Assert-Equal (Get-CommonDirectoryPath @('contoso.com/Users', 'fabrikam.com/Users')) '' 'Different domains have no common OU'
+
+function Get-TieKeys {
+    param($Summary)
+    $keys = New-Object System.Collections.Generic.List[string]
+    foreach ($tie in $Summary.Shared) { [void]$keys.Add([string]$tie.Key) }
+    return ,$keys
+}
+$allUsers = Get-AttributeTieSummary (New-DemoReportModel)
+$allKeys = Get-TieKeys $allUsers
+Assert-True ($allKeys.Contains('company')) 'Company is shared by every demo account'
+Assert-True ($allKeys.Contains('city')) 'City is shared by every demo account'
+Assert-True ($allKeys.Contains('division')) 'Division is shared by every demo account'
+Assert-True ($allKeys.Contains('upnSuffix')) 'UPN suffix is shared by every demo account'
+Assert-True (-not $allKeys.Contains('office')) 'Office is not universal while the disabled account is included'
+Assert-True (-not $allKeys.Contains('extensionAttribute1')) 'Extension attribute 1 is not universal while the disabled account is included'
+Assert-True (-not $allKeys.Contains('mailDomain')) 'Mail domain is not universal when one account has no mail'
+Assert-Equal $allUsers.CommonOu 'contoso.com/Users' 'Demo accounts share the Users OU'
+
+$enabledOnly = Get-AttributeTieSummary (New-DemoReportModel -ExcludeDisabled $true)
+$enabledKeys = Get-TieKeys $enabledOnly
+Assert-True ($enabledKeys.Contains('office')) 'Office is shared once the disabled account is excluded'
+Assert-True ($enabledKeys.Contains('extensionAttribute1')) 'Extension attribute 1 is shared once the disabled account is excluded'
+Assert-Equal $enabledOnly.InScope 4 'Disabled account leaves four accounts in scope'
+$falcon = $null
+foreach ($tie in $enabledOnly.Shared) { if ($tie.Key -eq 'extensionAttribute1') { $falcon = $tie } }
+Assert-Equal $falcon.Value 'FALCON' 'The shared extension value is FALCON'
 
 if ($failures.Count) {
     Write-Host 'FAILURES:'
