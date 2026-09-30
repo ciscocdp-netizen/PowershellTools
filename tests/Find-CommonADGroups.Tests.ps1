@@ -66,6 +66,29 @@ try {
     Assert-Equal $unicode.Count 1 'UTF-8 name is one row'
     Assert-Equal $unicode[0] 'josé' 'UTF-8 name round-trips'
 
+    $widePath = Join-Path $root 'wide.csv'
+    [System.IO.File]::WriteAllText($widePath, "Username,Email,Employee ID,extensionAttribute1`r`nalice,alice@contoso.example,E1001,FALCON`r`nbob,bob@contoso.example,E1002,FALCON`r`n", $utf8)
+    $wideHeaders = Get-CsvColumnNames -Path $widePath -Label 'Users'
+    Assert-Equal $wideHeaders.Count 4 'Wide CSV exposes every header'
+    $emailNames = Import-NameCsv -Path $widePath -Aliases @('SamAccountName', 'Username') -Label 'Users' -Column 'Email'
+    Assert-Equal $emailNames.Count 2 'Email column supplies both accounts'
+    Assert-Equal $emailNames[0] 'alice@contoso.example' 'Email column is used instead of Username'
+    $employeeNames = Import-NameCsv -Path $widePath -Aliases @('Username') -Label 'Users' -Column 'employee id'
+    Assert-Equal $employeeNames[0] 'E1001' 'Employee ID header match ignores case and spacing in the request'
+    $autoColumn = Select-CsvColumn -Headers $wideHeaders -Aliases @('SamAccountName', 'Username', 'Email') -Label 'Users'
+    Assert-Equal (Get-CleanCsvHeader $autoColumn) 'Username' 'Automatic selection keeps the first recognized header'
+    Assert-Equal (Get-UserLookupAttribute 'Email') 'mail' 'Email column looks up mail'
+    Assert-Equal (Get-UserLookupAttribute 'Employee ID') 'employeeID' 'Employee ID column looks up employeeID'
+    Assert-Equal (Get-UserLookupAttribute 'E-mail') 'mail' 'E-mail header maps to mail'
+    Assert-Equal (Get-UserLookupAttribute 'extensionAttribute1') 'extensionAttribute1' 'Custom attribute headers are used as LDAP attributes'
+    Assert-Equal (Get-UserLookupAttribute 'SamAccountName') 'sAMAccountName' 'Account name column stays a sam lookup'
+    $missingColumn = $false
+    try { Import-NameCsv -Path $widePath -Aliases @('Username') -Label 'Users' -Column 'Badge' | Out-Null } catch { $missingColumn = $true }
+    Assert-True $missingColumn 'An unknown column name is rejected'
+    $badHeader = $false
+    try { Get-UserLookupAttribute 'Badge Number' | Out-Null } catch { $badHeader = $true }
+    Assert-True $badHeader 'A spaced header that is not a known field is rejected'
+
     $model = New-DemoReportModel
     $stats = Get-MembershipStats $model
     Assert-Equal $stats.Input 6 'Demo input count'

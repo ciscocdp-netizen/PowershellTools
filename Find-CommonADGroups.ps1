@@ -18,8 +18,16 @@
 
 .PARAMETER CsvPath
     CSV of users. Recognized columns: SamAccountName, Username, User, LoginName,
-    UserPrincipalName, UPN. If none of those exist, the first column is used.
-    A file picker opens when this is omitted and a desktop session is available.
+    UserPrincipalName, UPN, Email, and EmployeeID. If none of those exist, the
+    first column is used. A file picker opens when this is omitted and a desktop
+    session is available.
+
+.PARAMETER UserColumn
+    CSV header that identifies each account, such as Email, EmployeeID, or
+    SamAccountName. The match is case-insensitive. On a desktop session, when
+    this is omitted and the file has more than one column, a prompt lists the
+    headers. Use -NoGui together with this parameter to choose a column without
+    a prompt.
 
 .PARAMETER GroupCsvPath
     Optional CSV of reference groups. Recognized columns: GroupName, Name, Group,
@@ -66,6 +74,9 @@
     .\Find-CommonADGroups.ps1 -CsvPath .\users.csv -GroupCsvPath .\groups.csv -NoGui
 
 .EXAMPLE
+    .\Find-CommonADGroups.ps1 -CsvPath .\users.csv -UserColumn Email -NoGui
+
+.EXAMPLE
     .\Find-CommonADGroups.ps1 -CsvPath .\users.csv -MinimumUserCount 3 -Recursive -Server dc01.contoso.com
 
 .EXAMPLE
@@ -79,6 +90,7 @@
 [CmdletBinding()]
 param(
     [string]$CsvPath,
+    [string]$UserColumn,
     [string]$GroupCsvPath,
     [string]$OutputPath,
     [ValidateRange(1, 9999)]
@@ -627,13 +639,19 @@ function Get-CsvDelimiter {
     return ','
 }
 
-function Import-NameCsv {
+function Get-CleanCsvHeader {
+    param([AllowNull()][string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return '' }
+    return ([string]$Name).Trim().TrimStart([char]0xFEFF)
+}
+
+function Read-CsvTable {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string[]]$Aliases,
-        [Parameter(Mandatory = $true)][string]$Label,
-        [switch]$AllowEmpty
+        [string]$Label = 'CSV'
     )
+    $headers = New-Object System.Collections.Generic.List[string]
+    $rows = @()
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "$Label file was not found: $Path"
     }
@@ -641,8 +659,7 @@ function Import-NameCsv {
     if ($text.Length -gt 0 -and [int][char]$text[0] -eq 0xFEFF) { $text = $text.Substring(1) }
     $lines = @([regex]::Split($text, '\r\n|\n|\r') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     if ($lines.Count -eq 0) {
-        if ($AllowEmpty) { return ,(New-Object System.Collections.Generic.List[string]) }
-        throw "The $Label file is empty."
+        return [pscustomobject]@{ Rows = $rows; Headers = $headers; HasLines = $false }
     }
     $delimiter = Get-CsvDelimiter -HeaderLine $lines[0]
     $temp = [System.IO.Path]::GetTempFileName()
@@ -654,24 +671,101 @@ function Import-NameCsv {
     finally {
         Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
     }
-    if ($rows.Count -eq 0) {
+    if ($rows.Count -gt 0) {
+        foreach ($prop in @($rows[0].PSObject.Properties)) { [void]$headers.Add([string]$prop.Name) }
+    }
+    return [pscustomobject]@{ Rows = $rows; Headers = $headers; HasLines = $true }
+}
+
+function Get-CsvColumnNames {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$Label = 'CSV'
+    )
+    $table = Read-CsvTable -Path $Path -Label $Label
+    if (-not $table.HasLines) { throw "The $Label file is empty." }
+    if ($table.Headers.Count -eq 0) { throw "The $Label file has a header but no data rows." }
+    return ,$table.Headers
+}
+
+function Select-CsvColumn {
+    param(
+        $Headers,
+        [string]$Column = '',
+        [string[]]$Aliases = @(),
+        [string]$Label = 'CSV',
+        [switch]$Quiet
+    )
+    $headerList = New-Object System.Collections.Generic.List[string]
+    foreach ($header in (ConvertTo-ObjectList $Headers)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$header)) { [void]$headerList.Add([string]$header) }
+    }
+    if ($headerList.Count -eq 0) { throw "The $Label file has a header but no data rows." }
+    if (-not [string]::IsNullOrWhiteSpace($Column)) {
+        $wanted = Get-CleanCsvHeader $Column
+        foreach ($header in $headerList) {
+            if ([string]::Equals((Get-CleanCsvHeader $header), $wanted, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return [string]$header
+            }
+        }
+        $shown = New-Object System.Collections.Generic.List[string]
+        foreach ($header in $headerList) { [void]$shown.Add((Get-CleanCsvHeader $header)) }
+        throw "Column '$wanted' was not found in the $Label CSV. Headers: $($shown -join ', ')"
+    }
+    foreach ($header in $headerList) {
+        $clean = Get-CleanCsvHeader $header
+        foreach ($alias in $Aliases) {
+            if ($clean -eq $alias) { return [string]$header }
+        }
+    }
+    $fallback = [string]$headerList[0]
+    if (-not $Quiet) {
+        Write-ToolStatus "$Label CSV has no recognized column. Using '$(Get-CleanCsvHeader $fallback)'. Add a header such as $($Aliases -join ', ') so the first row is not treated as a header." 'WARN'
+    }
+    return $fallback
+}
+
+function Get-UserLookupAttribute {
+    param([Parameter(Mandatory = $true)][string]$ColumnName)
+    $key = ((Get-CleanCsvHeader $ColumnName) -replace '[\s_-]', '').ToLowerInvariant()
+    switch ($key) {
+        { $_ -in @('samaccountname', 'username', 'user', 'loginname', 'login', 'account') } { return 'sAMAccountName' }
+        { $_ -in @('userprincipalname', 'upn') } { return 'userPrincipalName' }
+        { $_ -in @('email', 'emailaddress', 'mail') } { return 'mail' }
+        'employeeid' { return 'employeeID' }
+        'employeenumber' { return 'employeeNumber' }
+        { $_ -in @('distinguishedname', 'dn') } { return 'distinguishedName' }
+        { $_ -in @('objectguid', 'guid') } { return 'objectGUID' }
+        { $_ -in @('objectsid', 'sid') } { return 'objectSid' }
+        'displayname' { return 'displayName' }
+        { $_ -in @('name', 'cn') } { return 'name' }
+        default {
+            $raw = Get-CleanCsvHeader $ColumnName
+            if ($raw -match '^[A-Za-z][A-Za-z0-9-]*$') { return $raw }
+            throw "Column '$raw' is not a recognized account field and cannot be used as an Active Directory attribute. Choose a column such as SamAccountName, Email, EmployeeID, or extensionAttribute1."
+        }
+    }
+}
+
+function Import-NameCsv {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string[]]$Aliases,
+        [Parameter(Mandatory = $true)][string]$Label,
+        [string]$Column = '',
+        [switch]$AllowEmpty
+    )
+    $table = Read-CsvTable -Path $Path -Label $Label
+    if (-not $table.HasLines) {
+        if ($AllowEmpty) { return ,(New-Object System.Collections.Generic.List[string]) }
+        throw "The $Label file is empty."
+    }
+    if ($table.Rows.Count -eq 0) {
         if ($AllowEmpty) { return ,(New-Object System.Collections.Generic.List[string]) }
         throw "The $Label file has a header but no data rows."
     }
-    $first = $rows[0]
-    $chosen = $null
-    foreach ($prop in @($first.PSObject.Properties)) {
-        $clean = ([string]$prop.Name).Trim().TrimStart([char]0xFEFF)
-        foreach ($alias in $Aliases) {
-            if ($clean -eq $alias) { $chosen = $prop.Name; break }
-        }
-        if ($chosen) { break }
-    }
-    if (-not $chosen) {
-        $firstProp = @($first.PSObject.Properties)[0]
-        $chosen = $firstProp.Name
-        Write-ToolStatus "$Label CSV has no recognized column. Using '$chosen'. Add a header such as $($Aliases -join ', ') so the first row is not treated as a header." 'WARN'
-    }
+    $chosen = Select-CsvColumn -Headers $table.Headers -Column $Column -Aliases $Aliases -Label $Label
+    $rows = @($table.Rows)
     $names = New-Object System.Collections.Generic.List[string]
     $seen = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::OrdinalIgnoreCase)
     $duplicates = 0
@@ -716,6 +810,7 @@ function New-CommonGroupReportModel {
         [bool]$ExcludeDisabled = $false,
         [bool]$Recursive = $false,
         [string]$UsersCsv = '',
+        [string]$UserColumn = '',
         [string]$GroupsCsv = '',
         [string]$ServerName = '',
         [string]$Domain = '',
@@ -818,6 +913,7 @@ function New-CommonGroupReportModel {
         Generated          = $Generated
         ScriptName         = $ScriptName
         UsersCsv           = $UsersCsv
+        UserColumn         = $UserColumn
         GroupsCsv          = $GroupsCsv
         Server             = $ServerName
         Domain             = $Domain
@@ -914,6 +1010,7 @@ function ConvertTo-ReportJson {
     [void]$sb.Append('"generated":').Append((ConvertTo-JsonString $Model.Generated))
     [void]$sb.Append(',"scriptName":').Append((ConvertTo-JsonString $Model.ScriptName))
     [void]$sb.Append(',"usersCsv":').Append((ConvertTo-JsonString $Model.UsersCsv))
+    [void]$sb.Append(',"userColumn":').Append((ConvertTo-JsonString $Model.UserColumn))
     [void]$sb.Append(',"groupsCsv":').Append((ConvertTo-JsonString $Model.GroupsCsv))
     [void]$sb.Append(',"server":').Append((ConvertTo-JsonString $Model.Server))
     [void]$sb.Append(',"domain":').Append((ConvertTo-JsonString $Model.Domain))
@@ -1211,39 +1308,142 @@ function Find-AdGroupsForCompareNames {
     return ,$found
 }
 
+function Test-IdentityLookupAttribute {
+    param([string]$Attribute)
+    return @('distinguishedName', 'objectGUID', 'objectSid') -contains $Attribute
+}
+
+function Test-AmbiguousUserMatch {
+    param($Value)
+    return ($null -ne $Value -and $null -ne $Value.PSObject.Properties['AmbiguousMatch'] -and $Value.AmbiguousMatch -eq $true)
+}
+
+function Get-AdUserQueryPropertyList {
+    param([string]$LookupAttribute)
+    $props = New-Object System.Collections.Generic.List[string]
+    $seen = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in @(Get-AdUserQueryProperties)) {
+        $text = [string]$name
+        if ([string]::IsNullOrWhiteSpace($text) -or $seen.ContainsKey($text)) { continue }
+        $seen[$text] = $true
+        [void]$props.Add($text)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($LookupAttribute) -and -not $seen.ContainsKey($LookupAttribute)) {
+        [void]$props.Add($LookupAttribute)
+    }
+    return ,$props
+}
+
+function Get-AdUserLookupText {
+    param($AdUser, [string]$Attribute)
+    if ($null -eq $AdUser -or [string]::IsNullOrWhiteSpace($Attribute)) { return '' }
+    $names = New-Object System.Collections.Generic.List[string]
+    switch ($Attribute) {
+        'sAMAccountName' { [void]$names.Add('SamAccountName') }
+        'userPrincipalName' { [void]$names.Add('UserPrincipalName') }
+        'mail' { [void]$names.Add('mail'); [void]$names.Add('EmailAddress') }
+        'employeeID' { [void]$names.Add('EmployeeID') }
+        'employeeNumber' { [void]$names.Add('EmployeeNumber') }
+        'distinguishedName' { [void]$names.Add('DistinguishedName') }
+        'displayName' { [void]$names.Add('DisplayName') }
+        'name' { [void]$names.Add('Name') }
+        'objectGUID' { [void]$names.Add('ObjectGUID') }
+        'objectSid' { [void]$names.Add('SID') }
+    }
+    [void]$names.Add($Attribute)
+    foreach ($name in $names) {
+        $prop = $AdUser.PSObject.Properties[$name]
+        if ($null -eq $prop -or $null -eq $prop.Value) { continue }
+        $text = ([string]$prop.Value).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($text)) { return $text }
+    }
+    return ''
+}
+
+function Add-ResolvedUserLookup {
+    param($Map, [string]$Key, $AdUser)
+    if ($null -eq $Map -or [string]::IsNullOrWhiteSpace($Key) -or $null -eq $AdUser) { return }
+    if ($Map.ContainsKey($Key)) {
+        $existing = $Map[$Key]
+        if (Test-AmbiguousUserMatch $existing) { return }
+        $existingSam = ''
+        $newSam = ''
+        if ($null -ne $existing -and $existing.SamAccountName) { $existingSam = [string]$existing.SamAccountName }
+        if ($AdUser.SamAccountName) { $newSam = [string]$AdUser.SamAccountName }
+        if ([string]::IsNullOrWhiteSpace($existingSam) -or [string]::IsNullOrWhiteSpace($newSam) -or $existingSam -ne $newSam) {
+            $Map[$Key] = [pscustomobject]@{ AmbiguousMatch = $true }
+        }
+        return
+    }
+    $Map[$Key] = $AdUser
+}
+
 function Get-AdUserBySamBatch {
-    param($SamList, $CommonParams)
+    param($SamList, $CommonParams, [string]$LookupAttribute = 'sAMAccountName')
+    if ([string]::IsNullOrWhiteSpace($LookupAttribute)) { $LookupAttribute = 'sAMAccountName' }
     $map = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::OrdinalIgnoreCase)
-    $props = @(Get-AdUserQueryProperties)
+    $props = @(Get-AdUserQueryPropertyList -LookupAttribute $LookupAttribute)
+    $identityLookup = Test-IdentityLookupAttribute $LookupAttribute
     $batchSize = 40
     for ($offset = 0; $offset -lt $SamList.Count; $offset += $batchSize) {
         $end = [Math]::Min($offset + $batchSize - 1, $SamList.Count - 1)
         $batch = New-Object System.Collections.Generic.List[string]
         $clauses = New-Object System.Collections.Generic.List[string]
+        $wanted = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::OrdinalIgnoreCase)
         for ($index = $offset; $index -le $end; $index++) {
             $sam = [string]$SamList[$index]
             [void]$batch.Add($sam)
-            [void]$clauses.Add('(sAMAccountName=' + (ConvertTo-LdapFilterLiteral $sam) + ')')
+            $wanted[$sam] = $true
+            [void]$clauses.Add('(' + $LookupAttribute + '=' + (ConvertTo-LdapFilterLiteral $sam) + ')')
         }
         $resolved = $false
-        try {
-            $params = @{ LDAPFilter = ('(|' + ($clauses -join '') + ')'); Properties = $props; ErrorAction = 'Stop' }
-            Add-DictionaryParameter -Target $params -Source $CommonParams
-            foreach ($user in @(Get-ADUser @params)) {
-                if ($user.SamAccountName) { $map[[string]$user.SamAccountName] = $user }
-            }
-            $resolved = $true
-        }
-        catch {
-            Write-ToolStatus "User batch failed ($($_.Exception.Message)). Retrying each account." 'WARN'
-        }
-        if (-not $resolved) {
+        if ($identityLookup) {
             foreach ($sam in $batch) {
                 try {
                     $params = @{ Identity = $sam; Properties = $props; ErrorAction = 'Stop' }
                     Add-DictionaryParameter -Target $params -Source $CommonParams
                     $user = Get-ADUser @params
-                    if ($user -and $user.SamAccountName) { $map[[string]$user.SamAccountName] = $user }
+                    if ($user) { Add-ResolvedUserLookup -Map $map -Key $sam -AdUser $user }
+                }
+                catch { }
+            }
+            $resolved = $true
+        }
+        else {
+            try {
+                $params = @{ LDAPFilter = ('(|' + ($clauses -join '') + ')'); Properties = $props; ErrorAction = 'Stop' }
+                Add-DictionaryParameter -Target $params -Source $CommonParams
+                foreach ($user in @(Get-ADUser @params)) {
+                    $text = Get-AdUserLookupText -AdUser $user -Attribute $LookupAttribute
+                    if ([string]::IsNullOrWhiteSpace($text) -or -not $wanted.ContainsKey($text)) { continue }
+                    Add-ResolvedUserLookup -Map $map -Key $text -AdUser $user
+                }
+                $resolved = $true
+            }
+            catch {
+                Write-ToolStatus "User batch failed ($($_.Exception.Message)). Retrying each account." 'WARN'
+            }
+        }
+        if (-not $resolved) {
+            foreach ($sam in $batch) {
+                try {
+                    if ($LookupAttribute -eq 'sAMAccountName') {
+                        $params = @{ Identity = $sam; Properties = $props; ErrorAction = 'Stop' }
+                        Add-DictionaryParameter -Target $params -Source $CommonParams
+                        $user = Get-ADUser @params
+                        if ($user) { Add-ResolvedUserLookup -Map $map -Key $sam -AdUser $user }
+                    }
+                    else {
+                        $params = @{
+                            LDAPFilter  = ('(' + $LookupAttribute + '=' + (ConvertTo-LdapFilterLiteral $sam) + ')')
+                            Properties  = $props
+                            ErrorAction = 'Stop'
+                        }
+                        Add-DictionaryParameter -Target $params -Source $CommonParams
+                        $found = @(Get-ADUser @params)
+                        if ($found.Count -gt 1) { $map[$sam] = [pscustomobject]@{ AmbiguousMatch = $true } }
+                        elseif ($found.Count -eq 1) { Add-ResolvedUserLookup -Map $map -Key $sam -AdUser $found[0] }
+                    }
                 }
                 catch { }
             }
@@ -1255,8 +1455,23 @@ function Get-AdUserBySamBatch {
 }
 
 function Find-AdUserAlternate {
-    param([string]$Value, $CommonParams)
-    $props = @(Get-AdUserQueryProperties)
+    param([string]$Value, $CommonParams, [string]$LookupAttribute = 'sAMAccountName')
+    if ([string]::IsNullOrWhiteSpace($LookupAttribute)) { $LookupAttribute = 'sAMAccountName' }
+    $props = @(Get-AdUserQueryPropertyList -LookupAttribute $LookupAttribute)
+    if ($LookupAttribute -ne 'sAMAccountName' -and -not (Test-IdentityLookupAttribute $LookupAttribute)) {
+        try {
+            $params = @{
+                LDAPFilter  = ('(' + $LookupAttribute + '=' + (ConvertTo-LdapFilterLiteral $Value) + ')')
+                Properties  = $props
+                ErrorAction = 'Stop'
+            }
+            Add-DictionaryParameter -Target $params -Source $CommonParams
+            $found = @(Get-ADUser @params)
+            if ($found.Count -gt 1) { return [pscustomobject]@{ AmbiguousMatch = $true } }
+            if ($found.Count -eq 1) { return $found[0] }
+        }
+        catch { }
+    }
     $looksSpecial = ($Value -match '@') -or ($Value -like 'CN=*') -or ($Value -like '*=*') -or ($Value -like 'S-1-*') -or ($Value -match '^[0-9a-fA-F-]{36}$')
     if (-not $looksSpecial) { return $null }
     try {
@@ -1397,8 +1612,10 @@ function Resolve-ManagerDisplayNames {
 }
 
 function Get-AdReportRecords {
-    param($SamList, $CompareNames, [bool]$IncludeNested, $CommonParams)
-    $userMap = Get-AdUserBySamBatch -SamList $SamList -CommonParams $CommonParams
+    param($SamList, $CompareNames, [bool]$IncludeNested, $CommonParams, [string]$LookupAttribute = 'sAMAccountName', [string]$ColumnName = '')
+    if ([string]::IsNullOrWhiteSpace($LookupAttribute)) { $LookupAttribute = 'sAMAccountName' }
+    if ([string]::IsNullOrWhiteSpace($ColumnName)) { $ColumnName = $LookupAttribute }
+    $userMap = Get-AdUserBySamBatch -SamList $SamList -CommonParams $CommonParams -LookupAttribute $LookupAttribute
     $cache = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::OrdinalIgnoreCase)
     $pending = New-Object System.Collections.Generic.List[object]
     $notFound = New-Object System.Collections.Generic.List[string]
@@ -1407,7 +1624,17 @@ function Get-AdReportRecords {
         $index++
         $adUser = $null
         if ($userMap.ContainsKey([string]$sam)) { $adUser = $userMap[[string]$sam] }
-        if ($null -eq $adUser) { $adUser = Find-AdUserAlternate -Value $sam -CommonParams $CommonParams }
+        if (Test-AmbiguousUserMatch $adUser) {
+            Write-ToolStatus "More than one account matches '$sam' in column '$ColumnName'." 'WARN'
+            [void]$notFound.Add([string]$sam)
+            continue
+        }
+        if ($null -eq $adUser) { $adUser = Find-AdUserAlternate -Value $sam -CommonParams $CommonParams -LookupAttribute $LookupAttribute }
+        if (Test-AmbiguousUserMatch $adUser) {
+            Write-ToolStatus "More than one account matches '$sam' in column '$ColumnName'." 'WARN'
+            [void]$notFound.Add([string]$sam)
+            continue
+        }
         if ($null -eq $adUser) {
             Write-ToolStatus "Account not found: $sam" 'WARN'
             [void]$notFound.Add([string]$sam)
@@ -1512,6 +1739,53 @@ try {
         $dlg.FileName = [string]$opt.FileName
         $dlg.OverwritePrompt = $true
         if ($dlg.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { $dlg.FileName }
+    }
+    elseif ($kind -eq 'choose') {
+        Add-Type -AssemblyName System.Drawing
+        $form = New-Object System.Windows.Forms.Form
+        $form.Text = [string]$opt.Title
+        $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+        $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+        $form.MaximizeBox = $false
+        $form.MinimizeBox = $false
+        $form.TopMost = $true
+        $form.ClientSize = New-Object System.Drawing.Size(480, 168)
+        $label = New-Object System.Windows.Forms.Label
+        $label.Text = [string]$opt.Message
+        $label.Location = New-Object System.Drawing.Point(12, 12)
+        $label.Size = New-Object System.Drawing.Size(456, 48)
+        $combo = New-Object System.Windows.Forms.ComboBox
+        $combo.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+        $combo.Location = New-Object System.Drawing.Point(12, 68)
+        $combo.Size = New-Object System.Drawing.Size(456, 24)
+        foreach ($item in @($opt.Items)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$item)) { [void]$combo.Items.Add([string]$item) }
+        }
+        $selected = [string]$opt.Selected
+        $selectedIndex = 0
+        for ($i = 0; $i -lt $combo.Items.Count; $i++) {
+            if ([string]::Equals([string]$combo.Items[$i], $selected, [System.StringComparison]::OrdinalIgnoreCase)) { $selectedIndex = $i; break }
+        }
+        if ($combo.Items.Count -gt 0) { $combo.SelectedIndex = $selectedIndex }
+        $ok = New-Object System.Windows.Forms.Button
+        $ok.Text = 'Use this column'
+        $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $ok.Location = New-Object System.Drawing.Point(268, 116)
+        $ok.Size = New-Object System.Drawing.Size(118, 28)
+        $cancel = New-Object System.Windows.Forms.Button
+        $cancel.Text = 'Cancel'
+        $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+        $cancel.Location = New-Object System.Drawing.Point(392, 116)
+        $cancel.Size = New-Object System.Drawing.Size(76, 28)
+        $form.AcceptButton = $ok
+        $form.CancelButton = $cancel
+        [void]$form.Controls.Add($label)
+        [void]$form.Controls.Add($combo)
+        [void]$form.Controls.Add($ok)
+        [void]$form.Controls.Add($cancel)
+        if ($form.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK -and $null -ne $combo.SelectedItem) {
+            [string]$combo.SelectedItem
+        }
     }
     else {
         $result = [System.Windows.Forms.MessageBox]::Show([string]$opt.Message, [string]$opt.Title, [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
@@ -1651,17 +1925,44 @@ function Invoke-FindCommonADGroups {
                 $GroupCsvPath = ''
             }
 
-            $userAliases = @('SamAccountName', 'sAMAccountName', 'Username', 'UserName', 'User', 'LoginName', 'UserPrincipalName', 'UPN', 'Account')
-            $samList = Import-NameCsv -Path $CsvPath -Aliases $userAliases -Label 'Users'
-            Write-ToolStatus "Found $($samList.Count) unique account name(s)." 'OK'
+            $userAliases = @('SamAccountName', 'sAMAccountName', 'Username', 'UserName', 'User', 'LoginName', 'UserPrincipalName', 'UPN', 'Account', 'Email', 'EmailAddress', 'Mail', 'EmployeeID', 'EmployeeId')
+            $headers = Get-CsvColumnNames -Path $CsvPath -Label 'Users'
+            $selectedColumn = ''
+            if (-not [string]::IsNullOrWhiteSpace($UserColumn)) {
+                $selectedColumn = Select-CsvColumn -Headers $headers -Column $UserColumn -Aliases $userAliases -Label 'Users'
+            }
+            elseif ($gui -and $headers.Count -gt 1) {
+                $preferred = Select-CsvColumn -Headers $headers -Aliases $userAliases -Label 'Users' -Quiet
+                $displayHeaders = New-Object System.Collections.Generic.List[string]
+                foreach ($header in $headers) { [void]$displayHeaders.Add((Get-CleanCsvHeader $header)) }
+                Write-ToolStatus 'Select the CSV column that identifies each user.'
+                $picked = Invoke-StaDialog -Kind 'choose' -Options @{
+                    Title = 'Which column identifies each user?'
+                    Message = 'The user comparison looks up every value in this column. Choose the header that contains the account name, email, employee ID, or other directory value.'
+                    Items = $displayHeaders.ToArray()
+                    Selected = (Get-CleanCsvHeader $preferred)
+                }
+                if ([string]::IsNullOrWhiteSpace([string]$picked)) {
+                    Write-ToolStatus 'No CSV column selected. Exiting.' 'WARN'
+                    return 0
+                }
+                $selectedColumn = Select-CsvColumn -Headers $headers -Column ([string]$picked) -Aliases $userAliases -Label 'Users'
+            }
+            else {
+                $selectedColumn = Select-CsvColumn -Headers $headers -Aliases $userAliases -Label 'Users'
+            }
+            $displayColumn = Get-CleanCsvHeader $selectedColumn
+            $lookupAttribute = Get-UserLookupAttribute -ColumnName $displayColumn
+            $samList = Import-NameCsv -Path $CsvPath -Aliases $userAliases -Label 'Users' -Column $selectedColumn
+            Write-ToolStatus "Matching $($samList.Count) value(s) from column '$displayColumn' using $lookupAttribute." 'OK'
             $compareNames = New-Object System.Collections.Generic.List[string]
             if (-not [string]::IsNullOrWhiteSpace($GroupCsvPath)) {
                 $groupAliases = @('GroupName', 'Name', 'Group', 'SamAccountName', 'sAMAccountName', 'GroupSamAccountName')
                 $compareNames = Import-NameCsv -Path $GroupCsvPath -Aliases $groupAliases -Label 'Reference group' -AllowEmpty
                 Write-ToolStatus "Loaded $($compareNames.Count) reference group name(s)." 'OK'
             }
-            $records = Get-AdReportRecords -SamList $samList -CompareNames $compareNames -IncludeNested:([bool]$Recursive) -CommonParams $common
-            $model = New-CommonGroupReportModel -Users $records.Users -NotFound $records.NotFound -CompareNames $compareNames -ExtraGroups $records.ExtraGroups -MinimumUserCount $MinimumUserCount -ExcludeDisabled:([bool]$ExcludeDisabled) -Recursive:([bool]$Recursive) -UsersCsv ([System.IO.Path]::GetFileName($CsvPath)) -GroupsCsv $(if ($GroupCsvPath) { [System.IO.Path]::GetFileName($GroupCsvPath) } else { '' }) -ServerName $Server -Domain $domainName -ScriptName $toolFileName
+            $records = Get-AdReportRecords -SamList $samList -CompareNames $compareNames -IncludeNested:([bool]$Recursive) -CommonParams $common -LookupAttribute $lookupAttribute -ColumnName $displayColumn
+            $model = New-CommonGroupReportModel -Users $records.Users -NotFound $records.NotFound -CompareNames $compareNames -ExtraGroups $records.ExtraGroups -MinimumUserCount $MinimumUserCount -ExcludeDisabled:([bool]$ExcludeDisabled) -Recursive:([bool]$Recursive) -UsersCsv ([System.IO.Path]::GetFileName($CsvPath)) -UserColumn $displayColumn -GroupsCsv $(if ($GroupCsvPath) { [System.IO.Path]::GetFileName($GroupCsvPath) } else { '' }) -ServerName $Server -Domain $domainName -ScriptName $toolFileName
         }
 
         $stats = Get-MembershipStats $model
@@ -2598,7 +2899,9 @@ function renderOverview(model) {
     cards.push(statCard('adonly', 'AD only', model.compare.adOnly, 'In the results, not in the list', ''));
   }
   document.getElementById('overviewCards').innerHTML = cards.join('');
-  document.getElementById('overviewLead').textContent = asArray(REPORT.users).length + ' of ' + REPORT.inputCount + ' input accounts were resolved. ' + model.inScope + ' are included in the sharing totals.';
+  var overviewLead = asArray(REPORT.users).length + ' of ' + REPORT.inputCount + ' input accounts were resolved. ' + model.inScope + ' are included in the sharing totals.';
+  if (REPORT.userColumn) overviewLead += ' Accounts were matched from the "' + REPORT.userColumn + '" column.';
+  document.getElementById('overviewLead').textContent = overviewLead;
   var alert = document.getElementById('overviewAlert');
   var missingCount = asArray(REPORT.notFound).length;
   if (missingCount) {
@@ -2735,6 +3038,7 @@ function updateChrome(model) {
   if (REPORT.domain) meta.push(REPORT.domain);
   if (REPORT.server) meta.push(REPORT.server);
   if (REPORT.usersCsv) meta.push('Users: ' + REPORT.usersCsv);
+  if (REPORT.userColumn) meta.push('Column: ' + REPORT.userColumn);
   if (REPORT.groupsCsv) meta.push('Groups: ' + REPORT.groupsCsv);
   document.getElementById('topbarMeta').innerHTML = esc(meta.join('  |  ')).replace(/ \| /g, '<br>');
   document.getElementById('brandSub').textContent = (REPORT.scriptName || 'Find-CommonADGroups.ps1') + (REPORT.recursive ? '  |  Nested + primary group' : '  |  Direct + primary group');
