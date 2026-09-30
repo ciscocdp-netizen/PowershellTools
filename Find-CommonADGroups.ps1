@@ -17,14 +17,14 @@
     sharing threshold, and compare the reference list without regenerating the file.
 
 .PARAMETER CsvPath
-    CSV of users. Recognized columns: SamAccountName, Username, User, LoginName,
-    UserPrincipalName, UPN, Email, and EmployeeID. If none of those exist, the
-    first column is used. A file picker opens when this is omitted and a desktop
-    session is available.
+    CSV of users. Recognized columns: SamAccountName, SAMAccount, Username, User,
+    LoginName, UserPrincipalName, UPN, Email, and EmployeeID. If none of those
+    exist, the first column is used. A file picker opens when this is omitted
+    and a desktop session is available.
 
 .PARAMETER UserColumn
-    CSV header that identifies each account, such as Email, EmployeeID, or
-    SamAccountName. The match is case-insensitive. On a desktop session, when
+    CSV header that identifies each account, such as Email, EmployeeID,
+    SamAccountName, or SAMAccount. The match is case-insensitive. On a desktop session, when
     this is omitted and the file has more than one column, a prompt lists the
     headers. Use -NoGui together with this parameter to choose a column without
     a prompt.
@@ -348,6 +348,53 @@ function Get-AdUserQueryProperties {
     return ,$props.ToArray()
 }
 
+function Test-RequestableUserProperty {
+    param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    # SID is not a Get-ADUser property. Requesting it rejects the whole call.
+    if ($Name -match '^(?i)(sid|objectsid|enabled)$') { return $false }
+    foreach ($existing in (Get-AdUserQueryProperties)) {
+        if ([string]::Equals([string]$existing, $Name, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    foreach ($def in (Get-UserAttributeDefinitions)) {
+        $propertyName = [string]$def.Property
+        if ([string]::IsNullOrWhiteSpace($propertyName)) { continue }
+        if ([string]::Equals($propertyName, $Name, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    foreach ($extra in @('name', 'cn', 'displayName', 'distinguishedName', 'objectGUID')) {
+        if ([string]::Equals($extra, $Name, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+function Add-RequestableProperty {
+    param($Props, $Seen, [string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name) -or $null -eq $Seen -or $Seen.ContainsKey($Name)) { return }
+    if (-not (Test-RequestableUserProperty $Name)) { return }
+    $Seen[$Name] = $true
+    [void]$Props.Add($Name)
+}
+
+function Get-RejectedPropertyName {
+    param([string]$Message)
+    if ([string]::IsNullOrWhiteSpace($Message)) { return '' }
+    if ($Message -match 'Parameter name:\s*([A-Za-z][A-Za-z0-9-]*)') { return $Matches[1] }
+    return ''
+}
+
+function Remove-PropertyName {
+    param($Names, [string]$Rejected)
+    if ([string]::IsNullOrWhiteSpace($Rejected)) { return ,$Names }
+    $kept = New-Object System.Collections.Generic.List[string]
+    foreach ($name in $Names) {
+        $text = [string]$name
+        if ([string]::IsNullOrWhiteSpace($text)) { continue }
+        if ([string]::Equals($text, $Rejected, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        [void]$kept.Add($text)
+    }
+    return ,$kept.ToArray()
+}
+
 function Get-CoreAdUserProperties {
     param([string]$LookupAttribute)
     $props = New-Object System.Collections.Generic.List[string]
@@ -357,9 +404,7 @@ function Get-CoreAdUserProperties {
         $seen[$name] = $true
         [void]$props.Add($name)
     }
-    if (-not [string]::IsNullOrWhiteSpace($LookupAttribute) -and -not $seen.ContainsKey($LookupAttribute)) {
-        [void]$props.Add($LookupAttribute)
-    }
+    Add-RequestableProperty -Props $props -Seen $seen -Name $LookupAttribute
     return ,$props.ToArray()
 }
 
@@ -755,7 +800,7 @@ function Get-UserLookupAttribute {
     param([Parameter(Mandatory = $true)][string]$ColumnName)
     $key = ((Get-CleanCsvHeader $ColumnName) -replace '[\s_-]', '').ToLowerInvariant()
     switch ($key) {
-        { $_ -in @('samaccountname', 'username', 'user', 'loginname', 'login', 'account') } { return 'sAMAccountName' }
+        { $_ -in @('samaccountname', 'samaccount', 'sam', 'accountname', 'username', 'user', 'loginname', 'login', 'account') } { return 'sAMAccountName' }
         { $_ -in @('userprincipalname', 'upn') } { return 'userPrincipalName' }
         { $_ -in @('email', 'emailaddress', 'mail') } { return 'mail' }
         'employeeid' { return 'employeeID' }
@@ -1354,9 +1399,7 @@ function Get-AdUserQueryPropertyList {
         $seen[$text] = $true
         [void]$props.Add($text)
     }
-    if (-not [string]::IsNullOrWhiteSpace($LookupAttribute) -and -not $seen.ContainsKey($LookupAttribute)) {
-        [void]$props.Add($LookupAttribute)
-    }
+    Add-RequestableProperty -Props $props -Seen $seen -Name $LookupAttribute
     return ,$props.ToArray()
 }
 
@@ -1407,10 +1450,12 @@ function Add-ResolvedUserLookup {
 function Get-AdUserBySamBatch {
     param($SamList, $CommonParams, [string]$LookupAttribute = 'sAMAccountName')
     if ([string]::IsNullOrWhiteSpace($LookupAttribute)) { $LookupAttribute = 'sAMAccountName' }
+    $LookupAttribute = Get-UserLookupAttribute -ColumnName $LookupAttribute
     $map = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::OrdinalIgnoreCase)
     $props = Get-AdUserQueryPropertyList -LookupAttribute $LookupAttribute
     $coreProps = Get-CoreAdUserProperties -LookupAttribute $LookupAttribute
     $reducedProperties = $false
+    $batchRetryWarned = $false
     $lookupError = ''
     $identityLookup = Test-IdentityLookupAttribute $LookupAttribute
     $batchSize = 40
@@ -1442,6 +1487,11 @@ function Get-AdUserBySamBatch {
                 catch {
                     $lookupError = $_.Exception.Message
                     if (-not $reducedProperties) {
+                        $rejectedProperty = Get-RejectedPropertyName $lookupError
+                        if (-not [string]::IsNullOrWhiteSpace($rejectedProperty)) {
+                            $props = Remove-PropertyName -Names $props -Rejected $rejectedProperty
+                            $coreProps = Remove-PropertyName -Names $coreProps -Rejected $rejectedProperty
+                        }
                         Write-ToolStatus "Active Directory rejected the attribute list ($lookupError). Retrying with the core attributes." 'WARN'
                         $props = $coreProps
                         $reducedProperties = $true
@@ -1472,6 +1522,11 @@ function Get-AdUserBySamBatch {
             }
             catch {
                 $lookupError = $_.Exception.Message
+                $rejectedProperty = Get-RejectedPropertyName $lookupError
+                if (-not [string]::IsNullOrWhiteSpace($rejectedProperty)) {
+                    $props = Remove-PropertyName -Names $props -Rejected $rejectedProperty
+                    $coreProps = Remove-PropertyName -Names $coreProps -Rejected $rejectedProperty
+                }
                 if (-not $reducedProperties) {
                     Write-ToolStatus "Active Directory rejected the attribute list ($lookupError). Retrying with the core attributes." 'WARN'
                     $props = $coreProps
@@ -1490,11 +1545,15 @@ function Get-AdUserBySamBatch {
                     }
                     catch {
                         $lookupError = $_.Exception.Message
-                        Write-ToolStatus "User batch failed ($lookupError). Retrying each account." 'WARN'
+                        if (-not $batchRetryWarned) {
+                            Write-ToolStatus "User batch failed ($lookupError). Retrying each account." 'WARN'
+                            $batchRetryWarned = $true
+                        }
                     }
                 }
-                else {
+                elseif (-not $batchRetryWarned) {
                     Write-ToolStatus "User batch failed ($lookupError). Retrying each account." 'WARN'
+                    $batchRetryWarned = $true
                 }
             }
         }
@@ -1537,6 +1596,7 @@ function Get-AdUserBySamBatch {
 function Find-AdUserAlternate {
     param([string]$Value, $CommonParams, [string]$LookupAttribute = 'sAMAccountName')
     if ([string]::IsNullOrWhiteSpace($LookupAttribute)) { $LookupAttribute = 'sAMAccountName' }
+    $LookupAttribute = Get-UserLookupAttribute -ColumnName $LookupAttribute
     $props = Get-AdUserQueryPropertyList -LookupAttribute $LookupAttribute
     if ($LookupAttribute -ne 'sAMAccountName' -and -not (Test-IdentityLookupAttribute $LookupAttribute)) {
         try {
@@ -2005,7 +2065,7 @@ function Invoke-FindCommonADGroups {
                 $GroupCsvPath = ''
             }
 
-            $userAliases = @('SamAccountName', 'sAMAccountName', 'Username', 'UserName', 'User', 'LoginName', 'UserPrincipalName', 'UPN', 'Account', 'Email', 'EmailAddress', 'Mail', 'EmployeeID', 'EmployeeId')
+            $userAliases = @('SamAccountName', 'sAMAccountName', 'SAMAccount', 'SAM Account', 'AccountName', 'Username', 'UserName', 'User', 'LoginName', 'UserPrincipalName', 'UPN', 'Account', 'Email', 'EmailAddress', 'Mail', 'EmployeeID', 'EmployeeId')
             $headers = Get-CsvColumnNames -Path $CsvPath -Label 'Users'
             $selectedColumn = ''
             if (-not [string]::IsNullOrWhiteSpace($UserColumn)) {
