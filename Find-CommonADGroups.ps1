@@ -332,7 +332,8 @@ function Get-UserAttributeDefinitions {
 function Get-AdUserQueryProperties {
     $props = New-Object System.Collections.Generic.List[string]
     $seen = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($name in @('MemberOf', 'DisplayName', 'mail', 'Enabled', 'PrimaryGroupID', 'DistinguishedName', 'SamAccountName', 'UserPrincipalName', 'SID')) {
+    # SID and Enabled are returned by default. Requesting SID makes Get-ADUser reject the whole call.
+    foreach ($name in @('MemberOf', 'DisplayName', 'mail', 'PrimaryGroupID', 'DistinguishedName', 'SamAccountName', 'UserPrincipalName')) {
         if ($seen.ContainsKey($name)) { continue }
         $seen[$name] = $true
         [void]$props.Add($name)
@@ -344,7 +345,32 @@ function Get-AdUserQueryProperties {
         $seen[$name] = $true
         [void]$props.Add($name)
     }
-    return ,$props
+    return ,$props.ToArray()
+}
+
+function Get-CoreAdUserProperties {
+    param([string]$LookupAttribute)
+    $props = New-Object System.Collections.Generic.List[string]
+    $seen = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in @('MemberOf', 'DisplayName', 'mail', 'Department', 'Title', 'Company', 'Manager', 'UserPrincipalName', 'SamAccountName', 'DistinguishedName', 'PrimaryGroupID')) {
+        if ($seen.ContainsKey($name)) { continue }
+        $seen[$name] = $true
+        [void]$props.Add($name)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($LookupAttribute) -and -not $seen.ContainsKey($LookupAttribute)) {
+        [void]$props.Add($LookupAttribute)
+    }
+    return ,$props.ToArray()
+}
+
+function Get-AccountLookupValue {
+    param([string]$Value, [string]$LookupAttribute)
+    $text = ([string]$Value).Trim()
+    if ($LookupAttribute -eq 'sAMAccountName' -and $text -match '^[^\\/]+\\([^\\/]+)$') {
+        $short = $Matches[1].Trim()
+        if (-not [string]::IsNullOrWhiteSpace($short)) { return $short }
+    }
+    return $text
 }
 
 function Get-OptionalPropertyNames {
@@ -1322,7 +1348,7 @@ function Get-AdUserQueryPropertyList {
     param([string]$LookupAttribute)
     $props = New-Object System.Collections.Generic.List[string]
     $seen = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($name in @(Get-AdUserQueryProperties)) {
+    foreach ($name in (Get-AdUserQueryProperties)) {
         $text = [string]$name
         if ([string]::IsNullOrWhiteSpace($text) -or $seen.ContainsKey($text)) { continue }
         $seen[$text] = $true
@@ -1331,7 +1357,7 @@ function Get-AdUserQueryPropertyList {
     if (-not [string]::IsNullOrWhiteSpace($LookupAttribute) -and -not $seen.ContainsKey($LookupAttribute)) {
         [void]$props.Add($LookupAttribute)
     }
-    return ,$props
+    return ,$props.ToArray()
 }
 
 function Get-AdUserLookupText {
@@ -1382,30 +1408,52 @@ function Get-AdUserBySamBatch {
     param($SamList, $CommonParams, [string]$LookupAttribute = 'sAMAccountName')
     if ([string]::IsNullOrWhiteSpace($LookupAttribute)) { $LookupAttribute = 'sAMAccountName' }
     $map = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::OrdinalIgnoreCase)
-    $props = @(Get-AdUserQueryPropertyList -LookupAttribute $LookupAttribute)
+    $props = Get-AdUserQueryPropertyList -LookupAttribute $LookupAttribute
+    $coreProps = Get-CoreAdUserProperties -LookupAttribute $LookupAttribute
+    $reducedProperties = $false
+    $lookupError = ''
     $identityLookup = Test-IdentityLookupAttribute $LookupAttribute
     $batchSize = 40
     for ($offset = 0; $offset -lt $SamList.Count; $offset += $batchSize) {
         $end = [Math]::Min($offset + $batchSize - 1, $SamList.Count - 1)
         $batch = New-Object System.Collections.Generic.List[string]
         $clauses = New-Object System.Collections.Generic.List[string]
-        $wanted = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::OrdinalIgnoreCase)
+        $wanted = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::OrdinalIgnoreCase)
         for ($index = $offset; $index -le $end; $index++) {
-            $sam = [string]$SamList[$index]
-            [void]$batch.Add($sam)
-            $wanted[$sam] = $true
-            [void]$clauses.Add('(' + $LookupAttribute + '=' + (ConvertTo-LdapFilterLiteral $sam) + ')')
+            $original = [string]$SamList[$index]
+            $lookupValue = Get-AccountLookupValue -Value $original -LookupAttribute $LookupAttribute
+            [void]$batch.Add($original)
+            if (-not $wanted.ContainsKey($lookupValue)) { $wanted[$lookupValue] = $original }
+            [void]$clauses.Add('(' + $LookupAttribute + '=' + (ConvertTo-LdapFilterLiteral $lookupValue) + ')')
         }
         $resolved = $false
         if ($identityLookup) {
             foreach ($sam in $batch) {
+                $lookupValue = Get-AccountLookupValue -Value $sam -LookupAttribute $LookupAttribute
                 try {
-                    $params = @{ Identity = $sam; Properties = $props; ErrorAction = 'Stop' }
+                    $params = @{ Identity = $lookupValue; Properties = $props; ErrorAction = 'Stop' }
                     Add-DictionaryParameter -Target $params -Source $CommonParams
                     $user = Get-ADUser @params
-                    if ($user) { Add-ResolvedUserLookup -Map $map -Key $sam -AdUser $user }
+                    if ($user) {
+                        Add-ResolvedUserLookup -Map $map -Key $sam -AdUser $user
+                        if ($lookupValue -ne $sam) { Add-ResolvedUserLookup -Map $map -Key $lookupValue -AdUser $user }
+                    }
                 }
-                catch { }
+                catch {
+                    $lookupError = $_.Exception.Message
+                    if (-not $reducedProperties) {
+                        Write-ToolStatus "Active Directory rejected the attribute list ($lookupError). Retrying with the core attributes." 'WARN'
+                        $props = $coreProps
+                        $reducedProperties = $true
+                        try {
+                            $params = @{ Identity = $lookupValue; Properties = $props; ErrorAction = 'Stop' }
+                            Add-DictionaryParameter -Target $params -Source $CommonParams
+                            $user = Get-ADUser @params
+                            if ($user) { Add-ResolvedUserLookup -Map $map -Key $sam -AdUser $user }
+                        }
+                        catch { $lookupError = $_.Exception.Message }
+                    }
+                }
             }
             $resolved = $true
         }
@@ -1416,26 +1464,53 @@ function Get-AdUserBySamBatch {
                 foreach ($user in @(Get-ADUser @params)) {
                     $text = Get-AdUserLookupText -AdUser $user -Attribute $LookupAttribute
                     if ([string]::IsNullOrWhiteSpace($text) -or -not $wanted.ContainsKey($text)) { continue }
-                    Add-ResolvedUserLookup -Map $map -Key $text -AdUser $user
+                    $original = [string]$wanted[$text]
+                    Add-ResolvedUserLookup -Map $map -Key $original -AdUser $user
+                    if ($original -ne $text) { Add-ResolvedUserLookup -Map $map -Key $text -AdUser $user }
                 }
                 $resolved = $true
             }
             catch {
-                Write-ToolStatus "User batch failed ($($_.Exception.Message)). Retrying each account." 'WARN'
+                $lookupError = $_.Exception.Message
+                if (-not $reducedProperties) {
+                    Write-ToolStatus "Active Directory rejected the attribute list ($lookupError). Retrying with the core attributes." 'WARN'
+                    $props = $coreProps
+                    $reducedProperties = $true
+                    try {
+                        $params = @{ LDAPFilter = ('(|' + ($clauses -join '') + ')'); Properties = $coreProps; ErrorAction = 'Stop' }
+                        Add-DictionaryParameter -Target $params -Source $CommonParams
+                        foreach ($user in @(Get-ADUser @params)) {
+                            $text = Get-AdUserLookupText -AdUser $user -Attribute $LookupAttribute
+                            if ([string]::IsNullOrWhiteSpace($text) -or -not $wanted.ContainsKey($text)) { continue }
+                            $original = [string]$wanted[$text]
+                            Add-ResolvedUserLookup -Map $map -Key $original -AdUser $user
+                            if ($original -ne $text) { Add-ResolvedUserLookup -Map $map -Key $text -AdUser $user }
+                        }
+                        $resolved = $true
+                    }
+                    catch {
+                        $lookupError = $_.Exception.Message
+                        Write-ToolStatus "User batch failed ($lookupError). Retrying each account." 'WARN'
+                    }
+                }
+                else {
+                    Write-ToolStatus "User batch failed ($lookupError). Retrying each account." 'WARN'
+                }
             }
         }
         if (-not $resolved) {
             foreach ($sam in $batch) {
+                $lookupValue = Get-AccountLookupValue -Value $sam -LookupAttribute $LookupAttribute
                 try {
-                    if ($LookupAttribute -eq 'sAMAccountName') {
-                        $params = @{ Identity = $sam; Properties = $props; ErrorAction = 'Stop' }
+                    if ($LookupAttribute -eq 'sAMAccountName' -or $identityLookup) {
+                        $params = @{ Identity = $lookupValue; Properties = $props; ErrorAction = 'Stop' }
                         Add-DictionaryParameter -Target $params -Source $CommonParams
                         $user = Get-ADUser @params
                         if ($user) { Add-ResolvedUserLookup -Map $map -Key $sam -AdUser $user }
                     }
                     else {
                         $params = @{
-                            LDAPFilter  = ('(' + $LookupAttribute + '=' + (ConvertTo-LdapFilterLiteral $sam) + ')')
+                            LDAPFilter  = ('(' + $LookupAttribute + '=' + (ConvertTo-LdapFilterLiteral $lookupValue) + ')')
                             Properties  = $props
                             ErrorAction = 'Stop'
                         }
@@ -1445,7 +1520,12 @@ function Get-AdUserBySamBatch {
                         elseif ($found.Count -eq 1) { Add-ResolvedUserLookup -Map $map -Key $sam -AdUser $found[0] }
                     }
                 }
-                catch { }
+                catch {
+                    if ([string]::IsNullOrWhiteSpace($lookupError)) {
+                        $lookupError = $_.Exception.Message
+                        Write-ToolStatus "Account lookup failed: $lookupError" 'ERROR'
+                    }
+                }
             }
         }
         $percent = [int](($end + 1) * 100 / [Math]::Max(1, $SamList.Count))
@@ -1457,7 +1537,7 @@ function Get-AdUserBySamBatch {
 function Find-AdUserAlternate {
     param([string]$Value, $CommonParams, [string]$LookupAttribute = 'sAMAccountName')
     if ([string]::IsNullOrWhiteSpace($LookupAttribute)) { $LookupAttribute = 'sAMAccountName' }
-    $props = @(Get-AdUserQueryPropertyList -LookupAttribute $LookupAttribute)
+    $props = Get-AdUserQueryPropertyList -LookupAttribute $LookupAttribute
     if ($LookupAttribute -ne 'sAMAccountName' -and -not (Test-IdentityLookupAttribute $LookupAttribute)) {
         try {
             $params = @{
@@ -1967,7 +2047,15 @@ function Invoke-FindCommonADGroups {
 
         $stats = Get-MembershipStats $model
         if (-not $Demo -and $stats.Resolved -eq 0) {
-            Write-ToolStatus 'No accounts were resolved. The report will still list the names that were not found.' 'WARN'
+            $sampleValues = New-Object System.Collections.Generic.List[string]
+            foreach ($missingName in (ConvertTo-ObjectList $model.NotFound)) {
+                if ($sampleValues.Count -ge 5) { break }
+                [void]$sampleValues.Add([string]$missingName)
+            }
+            $sampleText = ($sampleValues.ToArray() -join ', ')
+            $columnText = [string]$model.UserColumn
+            if ([string]::IsNullOrWhiteSpace($columnText)) { $columnText = 'the selected column' }
+            Write-ToolStatus "No accounts were resolved from '$columnText'. Sample values: $sampleText. The report lists every value that did not match." 'ERROR'
         }
         if ($stats.InScope -gt 0 -and $MinimumUserCount -gt $stats.InScope) {
             Write-ToolStatus "MinimumUserCount ($MinimumUserCount) is higher than the in-scope user count ($($stats.InScope)). Lower the threshold in the report to see groups." 'WARN'

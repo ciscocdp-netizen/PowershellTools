@@ -30,6 +30,13 @@ $many = ConvertTo-ObjectList @('a', 'b')
 Assert-Equal $many.Count 2 'Two values stay two values'
 
 Assert-Equal (ConvertTo-LdapFilterLiteral 'a*(b)\') 'a\2a\28b\29\5c' 'LDAP filter escapes special characters'
+$propertyNames = Get-AdUserQueryPropertyList -LookupAttribute 'userPrincipalName'
+Assert-True ($propertyNames.Count -gt 10) 'User property list stays a list of names'
+Assert-Equal $propertyNames[0] 'MemberOf' 'The first requested property is MemberOf, not the list object'
+Assert-True ($propertyNames -contains 'userPrincipalName') 'The selected lookup attribute is requested'
+Assert-True (-not ($propertyNames -contains 'SID')) 'SID is not requested because that rejects the Active Directory call'
+Assert-Equal (Get-AccountLookupValue -Value 'CONTOSO\alice' -LookupAttribute 'sAMAccountName') 'alice' 'Domain-qualified account names search by the sam'
+Assert-Equal (Get-AccountLookupValue -Value 'alice@contoso.example' -LookupAttribute 'userPrincipalName') 'alice@contoso.example' 'UPN values stay intact'
 Assert-Equal (Get-CnFromDistinguishedName 'CN=Sales\, West,OU=Groups,DC=contoso,DC=com') 'Sales, West' 'CN parser honors escaped commas'
 
 $params = New-AdCommonParameter -ServerName '' -AdCredential $null
