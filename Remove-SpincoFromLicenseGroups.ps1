@@ -516,7 +516,7 @@ function Test-IsGraphAuthError {
     param([string]$Message)
 
     if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
-    return $Message -match 'Authentication needed|Please call Connect-MgGraph|Access token is empty|token is expired|Lifetime validation failed|invalid_grant|AADSTS70043|AADSTS50058|MSAL'
+    return $Message -match 'Authentication needed|Please call Connect-MgGraph|Access token is empty|token is expired|Lifetime validation failed|invalid_grant|AADSTS70043|AADSTS50058|MSAL|Unauthorized|InvalidAuthenticationToken|CompactToken|401'
 }
 
 function Test-IsGraphNotFoundError {
@@ -526,22 +526,157 @@ function Test-IsGraphNotFoundError {
     return $Message -match 'does not exist|Request_ResourceNotFound|ErrorCode:\s*Request_ResourceNotFound|NotFound'
 }
 
+function Get-GraphScopeShortName {
+    param([string]$Scope)
+
+    $s = [string]$Scope
+    if ($s -match '^https://graph\.microsoft\.com/(.+)$') { return $Matches[1] }
+    return $s
+}
+
 function Test-GraphScopesOk {
     param($Context, [string[]]$NeededScopes)
 
     if (-not $Context -or -not $Context.Scopes) { return $false }
-    $have = @($Context.Scopes)
+    $have = @(
+        $Context.Scopes |
+            ForEach-Object { Get-GraphScopeShortName $_ } |
+            Where-Object { $_ -and $_ -notin @('offline_access', 'openid', 'profile') }
+    )
     foreach ($s in $NeededScopes) {
-        if ($have -contains $s) { continue }
-        if ($s -eq 'Organization.Read.All' -and ($have -contains 'Directory.Read.All' -or $have -contains 'Directory.ReadWrite.All')) { continue }
-        if ($s -eq 'Group.Read.All' -and ($have -contains 'Directory.Read.All' -or $have -contains 'Directory.ReadWrite.All')) { continue }
-        if ($s -eq 'User.ReadWrite.All' -and ($have -contains 'Directory.ReadWrite.All')) { continue }
+        $need = Get-GraphScopeShortName $s
+        if ($need -in @('offline_access', 'openid', 'profile')) { continue }
+        if ($have -contains $need) { continue }
+        if ($need -eq 'Organization.Read.All' -and ($have -contains 'Directory.Read.All' -or $have -contains 'Directory.ReadWrite.All')) { continue }
+        if ($need -eq 'Group.Read.All' -and ($have -contains 'Directory.Read.All' -or $have -contains 'Directory.ReadWrite.All')) { continue }
+        if ($need -eq 'User.ReadWrite.All' -and ($have -contains 'Directory.ReadWrite.All')) { continue }
+        if ($need -eq 'User.Read.All' -and ($have -contains 'User.ReadWrite.All' -or $have -contains 'Directory.Read.All' -or $have -contains 'Directory.ReadWrite.All')) { continue }
         return $false
     }
     return $true
 }
 
+function Get-RequiredGraphScopes {
+    if ($script:GraphNeedWrite) {
+        return @(
+            'https://graph.microsoft.com/User.ReadWrite.All'
+            'https://graph.microsoft.com/Organization.Read.All'
+            'https://graph.microsoft.com/Group.Read.All'
+            'offline_access'
+        )
+    }
+    return @(
+        'https://graph.microsoft.com/User.Read.All'
+        'https://graph.microsoft.com/Organization.Read.All'
+        'https://graph.microsoft.com/Group.Read.All'
+        'offline_access'
+    )
+}
+
+function Enable-GraphNetwork {
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    } catch { }
+    try {
+        $proxy = [Net.WebRequest]::DefaultWebProxy
+        if ($proxy) {
+            $proxy.Credentials = [Net.CredentialCache]::DefaultCredentials
+        }
+    } catch { }
+}
+
+function Invoke-GraphApi {
+    param(
+        [string]$Method = 'GET',
+        [Parameter(Mandatory = $true)][string]$Path,
+        $Body
+    )
+
+    Enable-GraphNetwork
+    if (-not $script:GraphAccessToken) {
+        throw "Authentication needed. Please complete Graph sign-in."
+    }
+
+    $uri = if ($Path -match '^https://') { $Path } else { "https://graph.microsoft.com/v1.0/$Path" }
+    $headers = @{
+        Authorization    = "Bearer $($script:GraphAccessToken)"
+        ConsistencyLevel = 'eventual'
+    }
+
+    try {
+        if ($Method -eq 'GET') {
+            $resp = Invoke-WebRequest -Method GET -Uri $uri -Headers $headers -UseBasicParsing -ErrorAction Stop
+        }
+        else {
+            $headers['Content-Type'] = 'application/json'
+            $json = if ($null -ne $Body) { $Body | ConvertTo-Json -Depth 8 -Compress } else { '' }
+            $resp = Invoke-WebRequest -Method $Method -Uri $uri -Headers $headers -Body $json -UseBasicParsing -ErrorAction Stop
+        }
+        if ($resp.Content) { return ($resp.Content | ConvertFrom-Json) }
+        return $null
+    }
+    catch {
+        $content = $null
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $content = $_.ErrorDetails.Message }
+        elseif ($_.Exception.Response) {
+            try {
+                $stream = $_.Exception.Response.GetResponseStream()
+                if ($stream) {
+                    if ($stream.CanSeek) { [void]$stream.Seek(0, [System.IO.SeekOrigin]::Begin) }
+                    $reader = New-Object System.IO.StreamReader($stream)
+                    $content = $reader.ReadToEnd()
+                    $reader.Close()
+                }
+            }
+            catch { }
+        }
+        if ($content) {
+            try {
+                $err = $content | ConvertFrom-Json
+                $code = $null
+                $msg = $null
+                try { $code = [string]$err.error.code } catch { }
+                try { $msg = [string]$err.error.message } catch { }
+                if ($code -or $msg) { throw ("{0}: {1}" -f $code, $msg) }
+            }
+            catch {
+                if ($_.Exception.Message -match '^\w+:') { throw }
+            }
+            throw $content
+        }
+        throw
+    }
+}
+
+function Resolve-OAuthErrorMessage {
+    param([string]$Message)
+
+    $tenant = if ($script:TenantId) { $script:TenantId } else { 'organizations' }
+    $clientId = if ($script:ClientId) { $script:ClientId } else { '14d82eec-204b-4c2f-b7e8-296a70dab67e' }
+    if ($Message -match 'AADSTS65001|AADSTS65004|consent|admin approval|Authorization_RequestDenied') {
+        return "Admin consent is required for Microsoft Graph PowerShell. Ask a Global Admin to open: https://login.microsoftonline.com/$tenant/adminconsent?client_id=$clientId  then re-run this script. Detail: $Message"
+    }
+    if ($Message -match 'AADSTS53003|AADSTS50005|device.?code|AADSTS7000218|blocked by Conditional Access') {
+        return "This tenant may block device-code sign-in (Conditional Access). Use a browser sign-in or app-certificate auth (-TenantId, -ClientId, -CertificateThumbprint). Detail: $Message"
+    }
+    return $Message
+}
+
 function Test-GraphSession {
+    if ($script:GraphAccessToken) {
+        try {
+            $org = Invoke-GraphApi -Path 'organization?$select=id'
+            if ($org) { return $true }
+        }
+        catch {
+            try {
+                $me = Invoke-GraphApi -Path 'me?$select=id'
+                if ($me) { return $true }
+            }
+            catch { return $false }
+        }
+    }
+
     try {
         $ctx = Get-MgContext -ErrorAction Stop
         if (-not $ctx) { return $false }
@@ -589,6 +724,7 @@ function Invoke-OAuthFormPost {
         [Parameter(Mandatory = $true)][hashtable]$Body
     )
 
+    Enable-GraphNetwork
     try {
         $resp = Invoke-WebRequest -Method Post -Uri $Uri -Body $Body -ContentType 'application/x-www-form-urlencoded' -UseBasicParsing -ErrorAction Stop
         if ($resp.Content) { return ($resp.Content | ConvertFrom-Json) }
@@ -666,7 +802,8 @@ function Get-GraphDeviceCodeAccessToken {
     $dcError = $null
     try { $dcError = [string]$dc.error } catch { }
     if ($dcError) {
-        throw "Device code request failed: $dcError $($dc.error_description)"
+        $detail = "$dcError $($dc.error_description)"
+        throw (Resolve-OAuthErrorMessage -Message "Device code request failed: $detail")
     }
     if (-not $dc.user_code) {
         throw "Device code request did not return a user_code."
@@ -712,7 +849,7 @@ function Get-GraphDeviceCodeAccessToken {
         }
         $desc = $err
         try { if ($tok.error_description) { $desc = [string]$tok.error_description } } catch { }
-        throw "Device-code token request failed: $desc"
+        throw (Resolve-OAuthErrorMessage -Message "Device-code token request failed: $desc")
     }
     throw "Timed out waiting for Graph device-code sign-in."
 }
@@ -842,11 +979,31 @@ function Connect-SpincoGraph {
         [switch]$ForceBrowser
     )
 
-    Import-GraphLicenseModules
-    $neededScopes = @('User.ReadWrite.All', 'Organization.Read.All', 'Group.Read.All')
+    $neededScopes = @(Get-RequiredGraphScopes)
+    if ($ForceDeviceCode -or $ForceBrowser) {
+        $script:GraphAccessToken = $null
+        $script:GraphTokenHasWrite = $false
+    }
+    $sdkAvailable = $false
+    try {
+        Import-GraphLicenseModules
+        $sdkAvailable = $true
+    }
+    catch {
+        if ($script:TenantId -and $script:ClientId -and $script:CertificateThumbprint) { throw }
+        Write-ScreenLog $_.Exception.Message -Level WARN
+    }
 
     $ctx = $null
-    try { $ctx = Get-MgContext } catch { $ctx = $null }
+    if ($sdkAvailable) {
+        try { $ctx = Get-MgContext } catch { $ctx = $null }
+    }
+
+    if (-not $ForceDeviceCode -and $script:GraphAccessToken -and (Test-GraphSession)) {
+        Write-ScreenLog "Using existing Graph access token." -Level INFO
+        $script:GraphReady = $true
+        return
+    }
 
     if (-not $ForceDeviceCode -and (Test-GraphScopesOk -Context $ctx -NeededScopes $neededScopes) -and (Test-GraphSession)) {
         Write-ScreenLog "Using existing Graph session (account: $($ctx.Account); tenant: $($ctx.TenantId))." -Level INFO
@@ -879,22 +1036,45 @@ function Connect-SpincoGraph {
                 Write-Host ""
                 Write-Host "---- Microsoft Graph sign-in ---------------------------------------------" -ForegroundColor Cyan
                 Write-Host " Entra / direct-license lookups need a Graph login." -ForegroundColor Gray
-                Write-Host " Sign in with an account that can read users, groups, and licenses." -ForegroundColor Gray
+                if ($script:GraphNeedWrite) {
+                    Write-Host " This run requests write access so direct licenses can be removed." -ForegroundColor Gray
+                }
+                else {
+                    Write-Host " This report only needs read access (User.Read.All)." -ForegroundColor Gray
+                }
+                if (-not $script:TenantId) {
+                    $entered = Read-Prompt -Message "Entra tenant domain or ID (your company.onmicrosoft.com is fine)" -Default "organizations"
+                    if ($entered) { $script:TenantId = $entered }
+                }
                 Write-Host ""
             }
             else {
-                Write-ScreenLog "Connecting to Microsoft Graph (scopes: $($neededScopes -join ', '))..." -Level INFO
+                Write-ScreenLog "Connecting to Microsoft Graph..." -Level INFO
             }
 
             if ($useDeviceCode) {
                 try {
                     $token = Get-GraphDeviceCodeAccessToken -Scopes $neededScopes
-                    Connect-GraphWithAccessToken -AccessToken $token
+                    $script:GraphAccessToken = $token
+                    $script:GraphTokenHasWrite = [bool]$script:GraphNeedWrite
+                    if ($sdkAvailable) {
+                        try {
+                            Connect-GraphWithAccessToken -AccessToken $token
+                        }
+                        catch {
+                            Write-ScreenLog "Graph SDK did not accept the token; calling Microsoft Graph directly." -Level WARN
+                        }
+                    }
                 }
                 catch {
-                    Write-ScreenLog "Built-in device-code login failed: $($_.Exception.Message)" -Level WARN
-                    Write-ScreenLog "Falling back to Connect-MgGraph -UseDeviceCode..." -Level INFO
-                    Invoke-GraphConnect -Scopes $neededScopes -DeviceCode
+                    Write-ScreenLog $_.Exception.Message -Level WARN
+                    if ($sdkAvailable) {
+                        Write-ScreenLog "Falling back to Connect-MgGraph -UseDeviceCode..." -Level INFO
+                        Invoke-GraphConnect -Scopes $neededScopes -DeviceCode
+                    }
+                    else {
+                        throw
+                    }
                 }
             }
             else {
@@ -907,23 +1087,40 @@ function Connect-SpincoGraph {
     }
 
     if (-not (Test-GraphSession)) {
-        throw "Graph sign-in did not produce a usable session (Authentication needed). Complete Connect-MgGraph in this window and retry."
+        throw (Resolve-OAuthErrorMessage -Message "Graph sign-in did not produce a usable token. If you entered the code and saw 'Need admin approval', a Global Admin must consent the Microsoft Graph Command Line Tools app.")
     }
 
-    $ctx = $null
-    try { $ctx = Get-MgContext } catch { }
-    $who = if ($ctx -and $ctx.Account) { $ctx.Account } else { 'app/unknown' }
-    $tid = if ($ctx -and $ctx.TenantId) { $ctx.TenantId } else { '' }
+    $who = 'token'
+    $tid = $script:TenantId
+    try {
+        $ctx = Get-MgContext
+        if ($ctx -and $ctx.Account) { $who = $ctx.Account }
+        if ($ctx -and $ctx.TenantId) { $tid = $ctx.TenantId }
+    } catch { }
     Write-ScreenLog "Connected to Microsoft Graph (account: $who; tenant: $tid)." -Level SUCCESS
     $script:GraphReady = $true
 }
 
 function Initialize-GraphForLicenses {
-    param([switch]$Required)
+    param(
+        [switch]$Required,
+        [switch]$AllowWrite
+    )
+
+    $script:GraphNeedWrite = [bool]$AllowWrite
+    if ($AllowWrite -and $script:GraphAccessToken -and -not $script:GraphTokenHasWrite) {
+        $script:GraphAccessToken = $null
+        $script:GraphReady = $false
+    }
+
+    if ($script:GraphAccessToken -and (Test-GraphSession)) {
+        $script:GraphReady = $true
+        Write-ScreenLog "Using existing Graph access token." -Level INFO
+        return $true
+    }
 
     $script:GraphReady = $false
     try {
-        # Interactive consoles use device code (WAM/browser popups often hang with no window).
         if ($script:IsInteractive) {
             Connect-SpincoGraph -ForceDeviceCode
         }
@@ -947,17 +1144,16 @@ function Initialize-GraphForLicenses {
                 Write-ScreenLog $_.Exception.Message -Level ERROR
             }
         }
-        Write-Host " If no URL/code appeared, the Graph SDK is not printing it. Re-run the report" -ForegroundColor Yellow
-        Write-Host " after signing in yourself, or ask an admin to consent the Microsoft Graph" -ForegroundColor Yellow
-        Write-Host " Command Line Tools app (client ID 14d82eec-204b-4c2f-b7e8-296a70dab67e)." -ForegroundColor Yellow
         Write-Host ""
-        Write-Host "   `$InformationPreference = 'Continue'" -ForegroundColor Gray
-        Write-Host "   Connect-MgGraph -Scopes 'User.ReadWrite.All','Organization.Read.All','Group.Read.All' -UseDeviceCode" -ForegroundColor Gray
+        Write-Host " Graph sign-in failed. Common causes:" -ForegroundColor Yellow
+        Write-Host "  - The account saw 'Need admin approval' (a Global Admin must consent the Graph PowerShell app)" -ForegroundColor Yellow
+        Write-Host "  - Conditional Access blocks device-code sign-in" -ForegroundColor Yellow
+        Write-Host "  - Wrong tenant. Re-run and enter your company.onmicrosoft.com domain" -ForegroundColor Yellow
         Write-Host ""
     }
 
     if ($Required) {
-        throw "Microsoft Graph authentication is required. Run Connect-MgGraph in this PowerShell window, complete sign-in, then re-run this workflow."
+        throw "Microsoft Graph authentication is required. A Global Admin may need to consent Microsoft Graph Command Line Tools, or use -TenantId/-ClientId/-CertificateThumbprint."
     }
 
     Write-ScreenLog "Continuing without Entra ID. Direct / Entra license columns will be empty until you sign in." -Level WARN
@@ -967,6 +1163,25 @@ function Initialize-GraphForLicenses {
 function Get-SkuPartNumberMap {
     $map = @{}
     if (-not $script:GraphReady) { return $map }
+    if ($script:GraphAccessToken) {
+        try {
+            $skus = Invoke-GraphApi -Path 'subscribedSkus'
+            foreach ($sku in @($skus.value)) {
+                if ($sku.skuId) {
+                    $map[[string]$sku.skuId] = $sku.skuPartNumber
+                }
+            }
+            return $map
+        }
+        catch {
+            if (Test-IsGraphAuthError $_.Exception.Message) {
+                $script:GraphReady = $false
+                throw
+            }
+            Write-ScreenLog "Could not load subscribed SKUs (names will be GUIDs): $($_.Exception.Message)" -Level WARN
+            return $map
+        }
+    }
     if (Get-Command Get-MgSubscribedSku -ErrorAction SilentlyContinue) {
         try {
             foreach ($sku in @(Get-MgSubscribedSku -ErrorAction Stop)) {
@@ -994,6 +1209,51 @@ function Get-EntraUserForAdUser {
     $upn = $AdUser.UserPrincipalName
     $sam = $AdUser.SamAccountName
     $props = @('Id', 'UserPrincipalName', 'DisplayName', 'AssignedLicenses', 'LicenseAssignmentStates')
+    $select = 'id,userPrincipalName,displayName,assignedLicenses,licenseAssignmentStates'
+
+    if ($script:GraphAccessToken) {
+        try {
+            if ($upn) {
+                try {
+                    $enc = [uri]::EscapeDataString($upn)
+                    return Invoke-GraphApi -Path ("users/{0}?`$select={1}" -f $enc, $select)
+                }
+                catch {
+                    if (Test-IsGraphAuthError $_.Exception.Message) { throw }
+                    if ($sam -and (Test-IsGraphNotFoundError $_.Exception.Message)) { }
+                    elseif ($sam) {
+                        Write-ScreenLog "Graph user lookup by UPN '$upn' failed: $($_.Exception.Message)" -Level WARN
+                    }
+                    else {
+                        if (Test-IsGraphNotFoundError $_.Exception.Message) { return $null }
+                        throw
+                    }
+                }
+            }
+            if ($sam) {
+                $escaped = ($sam -replace "'", "''")
+                $filter = [uri]::EscapeDataString("onPremisesSamAccountName eq '$escaped'")
+                $found = Invoke-GraphApi -Path ("users?`$filter={0}&`$select={1}" -f $filter, $select)
+                $vals = @()
+                try { $vals = @($found.value) } catch { $vals = @($found) }
+                $vals = @($vals | Where-Object { $_ })
+                if ($vals.Count -eq 1) { return $vals[0] }
+                if ($vals.Count -gt 1) {
+                    throw "Multiple Entra users match onPremisesSamAccountName '$sam'."
+                }
+            }
+            return $null
+        }
+        catch {
+            if (Test-IsGraphAuthError $_.Exception.Message) {
+                $script:GraphReady = $false
+                throw [System.InvalidOperationException]::new(
+                    "Microsoft Graph authentication is required. $($_.Exception.Message)"
+                )
+            }
+            throw
+        }
+    }
 
     try {
         if ($upn) {
@@ -1069,6 +1329,15 @@ function Resolve-EntraGroupDisplayName {
     }
 
     $name = $GroupId
+    if ($script:GraphAccessToken) {
+        try {
+            $g = Invoke-GraphApi -Path ("groups/{0}?`$select=id,displayName" -f $GroupId)
+            if ($g.displayName) { $name = [string]$g.displayName }
+        }
+        catch { }
+        $script:EntraGroupCache[$GroupId] = $name
+        return $name
+    }
     if (Get-Command Get-MgGroup -ErrorAction SilentlyContinue) {
         try {
             $g = Get-MgGroup -GroupId $GroupId -Property Id, DisplayName -ErrorAction Stop
@@ -1236,9 +1505,21 @@ function Remove-DirectLicensesFromUser {
     $unique = @($SkuIds | Where-Object { $_ } | Select-Object -Unique)
     if ($unique.Count -eq 0) { return }
 
+    $userId = $null
+    try { $userId = $MgUser.Id } catch { }
+    if (-not $userId) { try { $userId = $MgUser.id } catch { } }
+
+    if ($script:GraphAccessToken -and $userId) {
+        Invoke-GraphApi -Method POST -Path ("users/{0}/assignLicense" -f $userId) -Body @{
+            addLicenses    = @()
+            removeLicenses = $unique
+        } | Out-Null
+        return $true
+    }
+
     $removed = $false
     try {
-        Set-MgUserLicense -UserId $MgUser.Id -AddLicenses @() -RemoveLicenses $unique -ErrorAction Stop | Out-Null
+        Set-MgUserLicense -UserId $userId -AddLicenses @() -RemoveLicenses $unique -ErrorAction Stop | Out-Null
         $removed = $true
     }
     catch {
@@ -1929,7 +2210,7 @@ function Invoke-RemovalPipeline {
     if ($script:RemoveDirectLicenses -or $script:IsInteractive) {
         try {
             $graphRequired = [bool]$script:RemoveDirectLicenses
-            if (Initialize-GraphForLicenses -Required:$graphRequired) {
+            if (Initialize-GraphForLicenses -Required:$graphRequired -AllowWrite:([bool]$script:RemoveDirectLicenses)) {
                 $skuMap = Get-SkuPartNumberMap
                 Write-ScreenLog "Scanning $($resolvedUsers.Count) user(s) in Entra ID for license assignment sources..." -Level INFO
                 $inventory = Get-DirectLicenseInventory -Users $resolvedUsers -SkuMap $skuMap -Groups $Groups
@@ -2149,6 +2430,9 @@ $script:CertificateThumbprint   = $CertificateThumbprint
 $script:Results                 = [System.Collections.Generic.List[object]]::new()
 $script:EntraGroupCache         = @{}
 $script:GraphReady              = $false
+$script:GraphAccessToken        = $null
+$script:GraphNeedWrite          = $false
+$script:GraphTokenHasWrite      = $false
 $script:TranscriptStarted       = $false
 $script:TranscriptPaused        = $false
 $script:UserCancelled           = $false
