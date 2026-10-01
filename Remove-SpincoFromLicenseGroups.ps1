@@ -1065,6 +1065,273 @@ function Get-GroupAssignedLicensesForMgUser {
     })
 }
 
+function Get-GraphUserSelectProperties {
+    return 'id,userPrincipalName,displayName,assignedLicenses,licenseAssignmentStates,onPremisesSamAccountName'
+}
+
+function Split-GraphBatchChunks {
+    param(
+        [Parameter(Mandatory = $true)]$Items,
+        [int]$Size = 20
+    )
+
+    $list = @($Items)
+    if ($list.Count -eq 0) { return @() }
+    $chunks = [System.Collections.Generic.List[object]]::new()
+    for ($i = 0; $i -lt $list.Count; $i += $Size) {
+        $end = [Math]::Min($i + $Size - 1, $list.Count - 1)
+        [void]$chunks.Add(@($list[$i..$end]))
+    }
+    return @($chunks)
+}
+
+function Invoke-GraphBatch {
+    param([Parameter(Mandatory = $true)][array]$Requests)
+
+    if ($Requests.Count -eq 0) { return @() }
+    if ($Requests.Count -gt 20) {
+        throw "Microsoft Graph `$batch allows at most 20 requests."
+    }
+    if (-not (Get-Command Invoke-MgGraphRequest -ErrorAction SilentlyContinue)) {
+        throw "Invoke-MgGraphRequest is not available."
+    }
+
+    $uri = 'https://graph.microsoft.com/v1.0/$batch'
+    $attempts = 0
+    $maxAttempts = 5
+    $pending = @($Requests)
+
+    while ($attempts -lt $maxAttempts) {
+        $attempts++
+        $body = @{ requests = @($pending) }
+        $result = Invoke-MgGraphRequest -Method POST -Uri $uri -Body $body -ErrorAction Stop
+        $responses = @()
+        try { $responses = @($result.responses) } catch { $responses = @() }
+        if ($responses.Count -eq 0) {
+            try { $responses = @($result.Responses) } catch { $responses = @() }
+        }
+
+        $retry = [System.Collections.Generic.List[object]]::new()
+        $wait = 0
+        foreach ($r in $responses) {
+            $status = 0
+            try { $status = [int]$r.status } catch {
+                try { $status = [int]$r.Status } catch { }
+            }
+            if ($status -eq 429) {
+                $rid = $null
+                try { $rid = [string]$r.id } catch { try { $rid = [string]$r.Id } catch { } }
+                foreach ($req in $pending) {
+                    if ([string]$req.id -eq $rid) { [void]$retry.Add($req) }
+                }
+                if ($wait -lt 5) { $wait = 5 }
+            }
+        }
+
+        if ($retry.Count -eq 0) { return $responses }
+        Start-Sleep -Seconds $wait
+        $pending = @($retry)
+    }
+
+    return @()
+}
+
+function Get-GraphBatchResponseBody {
+    param($Response)
+
+    if ($null -eq $Response) { return $null }
+    try { if ($Response.body) { return $Response.body } } catch { }
+    try { if ($Response.Body) { return $Response.Body } } catch { }
+    return $null
+}
+
+function Get-GraphBatchResponseStatus {
+    param($Response)
+
+    try { return [int]$Response.status } catch { }
+    try { return [int]$Response.Status } catch { }
+    return 0
+}
+
+function Import-EntraUsersByUpn {
+    param([string[]]$Upns)
+
+    $byUpn = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::OrdinalIgnoreCase)
+    $bySam = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::OrdinalIgnoreCase)
+    $select = Get-GraphUserSelectProperties
+    $unique = @($Upns | Where-Object { $_ } | Select-Object -Unique)
+    if ($unique.Count -eq 0) {
+        return @{ ByUpn = $byUpn; BySam = $bySam }
+    }
+
+    $chunks = @(Split-GraphBatchChunks -Items $unique -Size 20)
+    $done = 0
+    foreach ($chunk in $chunks) {
+        $requests = [System.Collections.Generic.List[object]]::new()
+        $id = 0
+        $idToUpn = @{}
+        foreach ($upn in @($chunk)) {
+            $id++
+            $sid = [string]$id
+            $idToUpn[$sid] = $upn
+            $enc = [uri]::EscapeDataString($upn)
+            [void]$requests.Add(@{
+                id     = $sid
+                method = 'GET'
+                url    = '/users/' + $enc + '?$select=' + $select
+            })
+        }
+
+        $responses = @(Invoke-GraphBatch -Requests @($requests))
+        foreach ($r in $responses) {
+            $status = Get-GraphBatchResponseStatus -Response $r
+            $rid = $null
+            try { $rid = [string]$r.id } catch { try { $rid = [string]$r.Id } catch { } }
+            if ($status -eq 200) {
+                $user = Get-GraphBatchResponseBody -Response $r
+                if ($user) {
+                    $upnVal = $null
+                    try { $upnVal = [string]$user.userPrincipalName } catch { }
+                    if (-not $upnVal) { try { $upnVal = [string]$user.UserPrincipalName } catch { } }
+                    if (-not $upnVal -and $rid -and $idToUpn.ContainsKey($rid)) { $upnVal = $idToUpn[$rid] }
+                    if ($upnVal) { $byUpn[$upnVal] = $user }
+                    $samVal = $null
+                    try { $samVal = [string]$user.onPremisesSamAccountName } catch { }
+                    if (-not $samVal) { try { $samVal = [string]$user.OnPremisesSamAccountName } catch { } }
+                    if ($samVal) { $bySam[$samVal] = $user }
+                }
+            }
+            elseif ($status -eq 401 -or $status -eq 403) {
+                $body = Get-GraphBatchResponseBody -Response $r
+                $msg = "Graph batch user lookup failed with status $status"
+                try { if ($body.error.message) { $msg = [string]$body.error.message } } catch { }
+                throw $msg
+            }
+        }
+
+        $done += @($chunk).Count
+        Write-Progress -Activity "Looking up licenses in Entra ID" `
+                       -Status ("Users {0}/{1}" -f $done, $unique.Count) `
+                       -PercentComplete ([int](($done / $unique.Count) * 100))
+    }
+
+    return @{ ByUpn = $byUpn; BySam = $bySam }
+}
+
+function Import-EntraUsersBySam {
+    param(
+        [string[]]$Sams,
+        $Lookup
+    )
+
+    $select = Get-GraphUserSelectProperties
+    $unique = @($Sams | Where-Object { $_ } | Select-Object -Unique)
+    if ($unique.Count -eq 0) { return $Lookup }
+
+    $chunks = @(Split-GraphBatchChunks -Items $unique -Size 20)
+    foreach ($chunk in $chunks) {
+        $requests = [System.Collections.Generic.List[object]]::new()
+        $id = 0
+        foreach ($sam in @($chunk)) {
+            $id++
+            $escaped = ($sam -replace "'", "''")
+            $filter = [uri]::EscapeDataString("onPremisesSamAccountName eq '$escaped'")
+            [void]$requests.Add(@{
+                id      = [string]$id
+                method  = 'GET'
+                url     = '/users?$filter=' + $filter + '&$select=' + $select
+                headers = @{ ConsistencyLevel = 'eventual' }
+            })
+        }
+
+        $responses = @(Invoke-GraphBatch -Requests @($requests))
+        foreach ($r in $responses) {
+            $status = Get-GraphBatchResponseStatus -Response $r
+            if ($status -ne 200) {
+                if ($status -eq 401 -or $status -eq 403) {
+                    throw "Graph batch SAM lookup failed with status $status"
+                }
+                continue
+            }
+            $body = Get-GraphBatchResponseBody -Response $r
+            $vals = @()
+            try { $vals = @($body.value) } catch { }
+            if ($vals.Count -eq 0 -and $body -and $body.userPrincipalName) { $vals = @($body) }
+            foreach ($user in $vals) {
+                $upnVal = $null
+                try { $upnVal = [string]$user.userPrincipalName } catch { }
+                if (-not $upnVal) { try { $upnVal = [string]$user.UserPrincipalName } catch { } }
+                if ($upnVal) { $Lookup.ByUpn[$upnVal] = $user }
+                $samVal = $null
+                try { $samVal = [string]$user.onPremisesSamAccountName } catch { }
+                if (-not $samVal) { try { $samVal = [string]$user.OnPremisesSamAccountName } catch { } }
+                if ($samVal) { $Lookup.BySam[$samVal] = $user }
+            }
+        }
+    }
+
+    return $Lookup
+}
+
+function Import-EntraGroupDisplayNames {
+    param([string[]]$GroupIds)
+
+    $missing = @(
+        $GroupIds |
+            Where-Object { $_ -and -not $script:EntraGroupCache.ContainsKey($_) } |
+            Select-Object -Unique
+    )
+    if ($missing.Count -eq 0) { return }
+
+    $chunks = @(Split-GraphBatchChunks -Items $missing -Size 20)
+    foreach ($chunk in $chunks) {
+        $requests = [System.Collections.Generic.List[object]]::new()
+        $id = 0
+        $idToGroup = @{}
+        foreach ($gid in @($chunk)) {
+            $id++
+            $sid = [string]$id
+            $idToGroup[$sid] = $gid
+            [void]$requests.Add(@{
+                id     = $sid
+                method = 'GET'
+                url    = '/groups/' + [uri]::EscapeDataString($gid) + '?$select=id,displayName'
+            })
+        }
+
+        $responses = @(Invoke-GraphBatch -Requests @($requests))
+        foreach ($r in $responses) {
+            $rid = $null
+            try { $rid = [string]$r.id } catch { try { $rid = [string]$r.Id } catch { } }
+            $gid = $null
+            if ($rid -and $idToGroup.ContainsKey($rid)) { $gid = $idToGroup[$rid] }
+            $status = Get-GraphBatchResponseStatus -Response $r
+            $name = $gid
+            if ($status -eq 200) {
+                $g = Get-GraphBatchResponseBody -Response $r
+                try { if ($g.displayName) { $name = [string]$g.displayName } } catch { }
+                try { if (-not $name -or $name -eq $gid) { if ($g.DisplayName) { $name = [string]$g.DisplayName } } } catch { }
+            }
+            if ($gid) { $script:EntraGroupCache[$gid] = $name }
+        }
+    }
+}
+
+function Find-EntraUserFromLookup {
+    param($AdUser, $Lookup)
+
+    if (-not $Lookup) { return $null }
+    $upn = $AdUser.UserPrincipalName
+    $sam = $AdUser.SamAccountName
+    if ($upn -and $Lookup.ByUpn -and $Lookup.ByUpn.ContainsKey($upn)) {
+        return $Lookup.ByUpn[$upn]
+    }
+    if ($sam -and $Lookup.BySam -and $Lookup.BySam.ContainsKey($sam)) {
+        return $Lookup.BySam[$sam]
+    }
+    return $null
+}
+
 function Get-DirectLicenseInventory {
     param(
         [Parameter(Mandatory = $true)]$Users,
@@ -1075,18 +1342,84 @@ function Get-DirectLicenseInventory {
     if (-not $Groups) { $Groups = @{} }
     if (-not $SkuMap) { $SkuMap = @{} }
 
-    if (-not $script:GraphReady -and @($Users).Count -gt 0) {
-        Write-ScreenLog "Skipping Entra lookups for $(@($Users).Count) user(s) because Microsoft Graph is not signed in." -Level WARN
+    $userList = @($Users)
+    if (-not $script:GraphReady -and $userList.Count -gt 0) {
+        Write-ScreenLog "Skipping Entra lookups for $($userList.Count) user(s) because Microsoft Graph is not signed in." -Level WARN
+    }
+
+    $lookup = $null
+    if ($script:GraphReady -and (Get-Command Invoke-MgGraphRequest -ErrorAction SilentlyContinue)) {
+        try {
+            Write-ScreenLog "Looking up $($userList.Count) user(s) in Entra ID (20 per Graph batch)..." -Level INFO
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $upns = @($userList | ForEach-Object { $_.UserPrincipalName } | Where-Object { $_ })
+            $lookup = Import-EntraUsersByUpn -Upns $upns
+            $missingSams = @(
+                $userList |
+                    Where-Object {
+                        $_.SamAccountName -and -not (Find-EntraUserFromLookup -AdUser $_ -Lookup $lookup)
+                    } |
+                    ForEach-Object { $_.SamAccountName }
+            )
+            if ($missingSams.Count -gt 0) {
+                Write-ScreenLog "Resolving $($missingSams.Count) user(s) by sAMAccountName..." -Level INFO
+                $lookup = Import-EntraUsersBySam -Sams $missingSams -Lookup $lookup
+            }
+
+            $groupIds = [System.Collections.Generic.List[string]]::new()
+            $seenMg = @{}
+            $mgUsers = @()
+            try { $mgUsers += @($lookup.ByUpn.Values) } catch { }
+            try { $mgUsers += @($lookup.BySam.Values) } catch { }
+            foreach ($mg in $mgUsers) {
+                $mid = $null
+                try { $mid = [string]$mg.id } catch { }
+                if (-not $mid) { try { $mid = [string]$mg.Id } catch { } }
+                if ($mid) {
+                    if ($seenMg.ContainsKey($mid)) { continue }
+                    $seenMg[$mid] = $true
+                }
+                $states = @()
+                try { $states = @($mg.licenseAssignmentStates) } catch { }
+                if ($states.Count -eq 0) { try { $states = @($mg.LicenseAssignmentStates) } catch { } }
+                foreach ($state in $states) {
+                    if (Test-IsDirectLicenseAssignment -State $state) { continue }
+                    $gid = $null
+                    try { $gid = [string]$state.AssignedByGroup } catch { }
+                    if (-not $gid) { try { $gid = [string]$state.assignedByGroup } catch { } }
+                    if ($gid) { [void]$groupIds.Add($gid) }
+                }
+            }
+            Import-EntraGroupDisplayNames -GroupIds @($groupIds)
+            $sw.Stop()
+            Write-ScreenLog ("Entra lookup finished in {0:N1}s ({1} unique UPN(s))." -f $sw.Elapsed.TotalSeconds, @($lookup.ByUpn.Keys).Count) -Level SUCCESS
+            Write-Progress -Activity "Looking up licenses in Entra ID" -Completed
+        }
+        catch {
+            Write-Progress -Activity "Looking up licenses in Entra ID" -Completed
+            if (Test-IsGraphAuthError $_.Exception.Message) {
+                $script:GraphReady = $false
+                Write-ScreenLog "Graph is not authenticated. Skipping Entra lookups." -Level ERROR
+                $lookup = $null
+            }
+            else {
+                Write-ScreenLog "Batched Entra lookup failed ($($_.Exception.Message)); falling back to per-user calls." -Level WARN
+                $lookup = $null
+            }
+        }
     }
 
     $rows = [System.Collections.Generic.List[object]]::new()
     $index = 0
-    foreach ($user in $Users) {
+    $useSequential = $script:GraphReady -and ($null -eq $lookup)
+    foreach ($user in $userList) {
         $index++
-        $percent = [int](($index / $Users.Count) * 100)
-        Write-Progress -Activity "Scanning license sources (AD groups + Entra ID)" `
-                       -Status ("[{0}/{1}] {2}" -f $index, $Users.Count, $user.SamAccountName) `
-                       -PercentComplete $percent
+        if ($useSequential -or -not $script:GraphReady) {
+            $percent = [int](($index / [Math]::Max($userList.Count, 1)) * 100)
+            Write-Progress -Activity "Scanning license sources (AD groups + Entra ID)" `
+                           -Status ("[{0}/{1}] {2}" -f $index, $userList.Count, $user.SamAccountName) `
+                           -PercentComplete $percent
+        }
 
         $adGroupNames = @(foreach ($dn in @($user.MemberOf | Where-Object { $_ -and $Groups.ContainsKey($_) })) {
             $Groups[$dn].Name
@@ -1117,7 +1450,14 @@ function Get-DirectLicenseInventory {
         }
 
         try {
-            $mgUser = Get-EntraUserForAdUser -AdUser $user
+            $mgUser = $null
+            if ($lookup) {
+                $mgUser = Find-EntraUserFromLookup -AdUser $user -Lookup $lookup
+            }
+            else {
+                $mgUser = Get-EntraUserForAdUser -AdUser $user
+            }
+
             if (-not $mgUser) {
                 $entry.LookupStatus = 'NotFound'
                 $entry.LookupMessage = 'No matching Entra ID user.'
@@ -1136,7 +1476,7 @@ function Get-DirectLicenseInventory {
                 [void]$rows.Add($entry)
                 Write-ScreenLog "Graph is not authenticated. Stopping Entra lookups (will not repeat this error for every user)." -Level ERROR
                 Write-ScreenLog "Complete Microsoft 365 sign-in, then re-run the report." -Level WARN
-                foreach ($rest in @($Users | Select-Object -Skip $index)) {
+                foreach ($rest in @($userList | Select-Object -Skip $index)) {
                     $restGroups = @(foreach ($dn in @($rest.MemberOf | Where-Object { $_ -and $Groups.ContainsKey($_) })) {
                         $Groups[$dn].Name
                     })
