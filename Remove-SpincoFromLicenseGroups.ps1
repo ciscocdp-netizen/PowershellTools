@@ -469,8 +469,21 @@ function Confirm-LiveRemoval {
         Write-Host "  - Remove Microsoft 365 licenses assigned DIRECTLY on each user" -ForegroundColor Red
         Write-Host "    (group-based SKUs stay until the user is out of the applying group)" -ForegroundColor Red
     }
-    $typed = Read-Prompt -Message "Type REMOVE to continue, or anything else to cancel"
-    return ($typed -eq 'REMOVE')
+    Write-Host " Type REMOVE (all caps) to proceed. Type N to cancel. Blank Enter does nothing." -ForegroundColor Yellow
+    while ($true) {
+        $typed = Read-Prompt -Message "Confirm live removal"
+        if ([string]::IsNullOrWhiteSpace($typed)) {
+            Write-Host "No text entered. Type REMOVE to proceed, or N to cancel." -ForegroundColor Yellow
+            continue
+        }
+        if ($typed -ceq 'REMOVE') { return $true }
+        if ($typed -eq 'REMOVE') {
+            Write-Host "Type REMOVE in all caps." -ForegroundColor Yellow
+            continue
+        }
+        if ($typed -match '^(n|no|q|quit|cancel)$') { return $false }
+        Write-Host "That was not REMOVE. Type REMOVE to proceed, or N to cancel." -ForegroundColor Yellow
+    }
 }
 
 function Show-MatchingUserTable {
@@ -1153,20 +1166,119 @@ function Get-GraphBatchResponseStatus {
     return 0
 }
 
-function Import-EntraUsersByUpn {
-    param([string[]]$Upns)
+function Get-GraphUserLookupChunkSize {
+    # Users per Graph filter request. $batch itself is still capped at 20
+    # sub-requests; this is how many UPNs/SAMs we send in one `in` clause.
+    return 100
+}
 
-    $byUpn = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::OrdinalIgnoreCase)
-    $bySam = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::OrdinalIgnoreCase)
-    $notFound = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::OrdinalIgnoreCase)
-    $select = Get-GraphUserSelectProperties
-    $unique = @($Upns | Where-Object { $_ } | Select-Object -Unique)
-    if ($unique.Count -eq 0) {
-        return @{ ByUpn = $byUpn; BySam = $bySam; NotFoundUpns = $notFound }
+function ConvertTo-GraphInClause {
+    param([Parameter(Mandatory = $true)][string[]]$Values)
+
+    return @(
+        foreach ($value in @($Values)) {
+            "'" + ($value -replace "'", "''") + "'"
+        }
+    ) -join ','
+}
+
+function Get-GraphCollectionValues {
+    param($Body)
+
+    $vals = @()
+    try { $vals = @($Body.value) } catch { }
+    if ($vals.Count -eq 0) {
+        try { $vals = @($Body.Value) } catch { }
+    }
+    if ($vals.Count -eq 0 -and $Body) {
+        $upnVal = $null
+        try { $upnVal = [string]$Body.userPrincipalName } catch { }
+        if (-not $upnVal) { try { $upnVal = [string]$Body.UserPrincipalName } catch { } }
+        if ($upnVal) { $vals = @($Body) }
+    }
+    return @($vals)
+}
+
+function Add-EntraUserToLookupTables {
+    param(
+        $User,
+        $ByUpn,
+        $BySam,
+        [string]$RequestedUpn
+    )
+
+    if (-not $User) { return }
+    if ($RequestedUpn) { $ByUpn[$RequestedUpn] = $User }
+
+    $upnVal = $null
+    try { $upnVal = [string]$User.userPrincipalName } catch { }
+    if (-not $upnVal) { try { $upnVal = [string]$User.UserPrincipalName } catch { } }
+    if ($upnVal) { $ByUpn[$upnVal] = $User }
+
+    $samVal = $null
+    try { $samVal = [string]$User.onPremisesSamAccountName } catch { }
+    if (-not $samVal) { try { $samVal = [string]$User.OnPremisesSamAccountName } catch { } }
+    if ($samVal) { $BySam[$samVal] = $User }
+}
+
+function Invoke-GraphUsersInFilter {
+    param(
+        [Parameter(Mandatory = $true)][string]$Property,
+        [Parameter(Mandatory = $true)][string[]]$Values,
+        [Parameter(Mandatory = $true)][string]$Select
+    )
+
+    $list = @($Values)
+    if ($list.Count -eq 0) {
+        return @{ Ok = $true; Users = @(); Status = 200 }
     }
 
-    $chunks = @(Split-GraphBatchChunks -Items $unique -Size 20)
-    $done = 0
+    $quoted = ConvertTo-GraphInClause -Values $list
+    $filter = [uri]::EscapeDataString("$Property in ($quoted)")
+    $top = [Math]::Max($list.Count, 1)
+    $url = '/users?$filter=' + $filter + '&$count=true&$top=' + $top + '&$select=' + $Select
+    $requests = @(
+        @{
+            id      = '1'
+            method  = 'GET'
+            url     = $url
+            headers = @{ ConsistencyLevel = 'eventual' }
+        }
+    )
+
+    $responses = @(Invoke-GraphBatch -Requests $requests)
+    if ($responses.Count -eq 0) {
+        return @{ Ok = $false; Users = @(); Status = 0 }
+    }
+
+    foreach ($r in $responses) {
+        $status = Get-GraphBatchResponseStatus -Response $r
+        if ($status -eq 401 -or $status -eq 403) {
+            $body = Get-GraphBatchResponseBody -Response $r
+            $msg = "Graph $Property lookup failed with status $status"
+            try { if ($body.error.message) { $msg = [string]$body.error.message } } catch { }
+            throw $msg
+        }
+        if ($status -ne 200) {
+            return @{ Ok = $false; Users = @(); Status = $status }
+        }
+        $body = Get-GraphBatchResponseBody -Response $r
+        return @{ Ok = $true; Users = @(Get-GraphCollectionValues -Body $body); Status = $status }
+    }
+
+    return @{ Ok = $false; Users = @(); Status = 0 }
+}
+
+function Import-EntraUsersByUpnGetById {
+    param(
+        [string[]]$Upns,
+        $ByUpn,
+        $BySam,
+        $NotFound,
+        [string]$Select
+    )
+
+    $chunks = @(Split-GraphBatchChunks -Items $Upns -Size 20)
     foreach ($chunk in $chunks) {
         $requests = [System.Collections.Generic.List[object]]::new()
         $id = 0
@@ -1179,7 +1291,7 @@ function Import-EntraUsersByUpn {
             [void]$requests.Add(@{
                 id     = $sid
                 method = 'GET'
-                url    = '/users/' + $enc + '?$select=' + $select
+                url    = '/users/' + $enc + '?$select=' + $Select
             })
         }
 
@@ -1192,21 +1304,11 @@ function Import-EntraUsersByUpn {
             if ($rid -and $idToUpn.ContainsKey($rid)) { $requestedUpn = $idToUpn[$rid] }
 
             if ($status -eq 200) {
-                $user = Get-GraphBatchResponseBody -Response $r
-                if ($user) {
-                    if ($requestedUpn) { $byUpn[$requestedUpn] = $user }
-                    $upnVal = $null
-                    try { $upnVal = [string]$user.userPrincipalName } catch { }
-                    if (-not $upnVal) { try { $upnVal = [string]$user.UserPrincipalName } catch { } }
-                    if ($upnVal) { $byUpn[$upnVal] = $user }
-                    $samVal = $null
-                    try { $samVal = [string]$user.onPremisesSamAccountName } catch { }
-                    if (-not $samVal) { try { $samVal = [string]$user.OnPremisesSamAccountName } catch { } }
-                    if ($samVal) { $bySam[$samVal] = $user }
-                }
+                Add-EntraUserToLookupTables -User (Get-GraphBatchResponseBody -Response $r) `
+                    -ByUpn $ByUpn -BySam $BySam -RequestedUpn $requestedUpn
             }
             elseif ($status -eq 404) {
-                if ($requestedUpn) { $notFound[$requestedUpn] = $true }
+                if ($requestedUpn) { $NotFound[$requestedUpn] = $true }
             }
             elseif ($status -eq 401 -or $status -eq 403) {
                 $body = Get-GraphBatchResponseBody -Response $r
@@ -1215,8 +1317,45 @@ function Import-EntraUsersByUpn {
                 throw $msg
             }
         }
+    }
+}
 
-        $done += @($chunk).Count
+function Import-EntraUsersByUpn {
+    param([string[]]$Upns)
+
+    $byUpn = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::OrdinalIgnoreCase)
+    $bySam = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::OrdinalIgnoreCase)
+    $notFound = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::OrdinalIgnoreCase)
+    $select = Get-GraphUserSelectProperties
+    $unique = @($Upns | Where-Object { $_ } | Select-Object -Unique)
+    if ($unique.Count -eq 0) {
+        return @{ ByUpn = $byUpn; BySam = $bySam; NotFoundUpns = $notFound }
+    }
+
+    $chunkSize = Get-GraphUserLookupChunkSize
+    $chunks = @(Split-GraphBatchChunks -Items $unique -Size $chunkSize)
+    $done = 0
+    foreach ($chunk in $chunks) {
+        $chunkList = @($chunk)
+        $usedFilter = $false
+        if ($chunkList.Count -ge 2) {
+            $filterResult = Invoke-GraphUsersInFilter -Property 'userPrincipalName' -Values $chunkList -Select $select
+            if ($filterResult.Ok) {
+                $usedFilter = $true
+                foreach ($user in @($filterResult.Users)) {
+                    Add-EntraUserToLookupTables -User $user -ByUpn $byUpn -BySam $bySam -RequestedUpn $null
+                }
+                foreach ($upn in $chunkList) {
+                    if (-not $byUpn.ContainsKey($upn)) { $notFound[$upn] = $true }
+                }
+            }
+        }
+
+        if (-not $usedFilter) {
+            Import-EntraUsersByUpnGetById -Upns $chunkList -ByUpn $byUpn -BySam $bySam -NotFound $notFound -Select $select
+        }
+
+        $done += $chunkList.Count
         Write-Progress -Activity "Looking up licenses in Entra ID" `
                        -Status ("Users {0}/{1}" -f $done, $unique.Count) `
                        -PercentComplete ([int](($done / $unique.Count) * 100))
@@ -1238,52 +1377,30 @@ function Import-EntraUsersBySam {
     $unique = @($Sams | Where-Object { $_ } | Select-Object -Unique)
     if ($unique.Count -eq 0) { return $Lookup }
 
-    $chunks = @(Split-GraphBatchChunks -Items $unique -Size 20)
+    $chunkSize = Get-GraphUserLookupChunkSize
+    $chunks = @(Split-GraphBatchChunks -Items $unique -Size $chunkSize)
     $done = 0
     $total = $unique.Count
     foreach ($chunk in $chunks) {
-        $quoted = @(
-            foreach ($sam in @($chunk)) {
-                "'" + ($sam -replace "'", "''") + "'"
+        $chunkList = @($chunk)
+        $filterResult = Invoke-GraphUsersInFilter -Property 'onPremisesSamAccountName' -Values $chunkList -Select $select
+        if ($filterResult.Ok) {
+            foreach ($user in @($filterResult.Users)) {
+                Add-EntraUserToLookupTables -User $user -ByUpn $Lookup.ByUpn -BySam $Lookup.BySam -RequestedUpn $null
             }
-        ) -join ','
-        $filter = [uri]::EscapeDataString("onPremisesSamAccountName in ($quoted)")
-        $url = '/users?$filter=' + $filter + '&$count=true&$select=' + $select
-        $requests = @(
-            @{
-                id      = '1'
-                method  = 'GET'
-                url     = $url
-                headers = @{ ConsistencyLevel = 'eventual' }
-            }
-        )
-
-        $responses = @(Invoke-GraphBatch -Requests $requests)
-        foreach ($r in $responses) {
-            $status = Get-GraphBatchResponseStatus -Response $r
-            if ($status -ne 200) {
-                if ($status -eq 401 -or $status -eq 403) {
-                    throw "Graph SAM lookup failed with status $status"
+        }
+        elseif ($chunkList.Count -gt 20) {
+            $smallChunks = @(Split-GraphBatchChunks -Items $chunkList -Size 20)
+            foreach ($small in $smallChunks) {
+                $retry = Invoke-GraphUsersInFilter -Property 'onPremisesSamAccountName' -Values @($small) -Select $select
+                if (-not $retry.Ok) { continue }
+                foreach ($user in @($retry.Users)) {
+                    Add-EntraUserToLookupTables -User $user -ByUpn $Lookup.ByUpn -BySam $Lookup.BySam -RequestedUpn $null
                 }
-                continue
-            }
-            $body = Get-GraphBatchResponseBody -Response $r
-            $vals = @()
-            try { $vals = @($body.value) } catch { }
-            if ($vals.Count -eq 0 -and $body -and $body.userPrincipalName) { $vals = @($body) }
-            foreach ($user in $vals) {
-                $upnVal = $null
-                try { $upnVal = [string]$user.userPrincipalName } catch { }
-                if (-not $upnVal) { try { $upnVal = [string]$user.UserPrincipalName } catch { } }
-                if ($upnVal) { $Lookup.ByUpn[$upnVal] = $user }
-                $samVal = $null
-                try { $samVal = [string]$user.onPremisesSamAccountName } catch { }
-                if (-not $samVal) { try { $samVal = [string]$user.OnPremisesSamAccountName } catch { } }
-                if ($samVal) { $Lookup.BySam[$samVal] = $user }
             }
         }
 
-        $done += @($chunk).Count
+        $done += $chunkList.Count
         Write-Progress -Activity "Resolving remaining users by sAMAccountName" `
                        -Status ("{0}/{1}" -f $done, $total) `
                        -PercentComplete ([int](($done / $total) * 100))
@@ -1373,7 +1490,7 @@ function Get-DirectLicenseInventory {
     $lookup = $null
     if ($script:GraphReady -and (Get-Command Invoke-MgGraphRequest -ErrorAction SilentlyContinue)) {
         try {
-            Write-ScreenLog "Looking up $($userList.Count) user(s) in Entra ID (20 per Graph batch)..." -Level INFO
+            Write-ScreenLog "Looking up $($userList.Count) user(s) in Entra ID (100 per Graph request)..." -Level INFO
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
             $upns = @($userList | ForEach-Object { $_.UserPrincipalName } | Where-Object { $_ })
             $lookup = Import-EntraUsersByUpn -Upns $upns
@@ -2321,7 +2438,7 @@ function Invoke-RemovalPipeline {
         } else {
             "Continue with LIVE removal ($($bits -join '; '))?"
         }
-        if (-not (Read-YesNo -Message $continueHint -Default $true)) {
+        if (-not (Read-YesNo -Message $continueHint -Default:$script:PreviewOnly)) {
             Write-Host "Cancelled after review. No memberships or licenses were changed." -ForegroundColor Yellow
             $script:UserCancelled = $true
             return
