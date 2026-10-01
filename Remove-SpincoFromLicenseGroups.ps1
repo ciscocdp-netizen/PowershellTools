@@ -558,19 +558,9 @@ function Test-GraphScopesOk {
 
 function Get-RequiredGraphScopes {
     if ($script:GraphNeedWrite) {
-        return @(
-            'https://graph.microsoft.com/User.ReadWrite.All'
-            'https://graph.microsoft.com/Organization.Read.All'
-            'https://graph.microsoft.com/Group.Read.All'
-            'offline_access'
-        )
+        return @('User.ReadWrite.All', 'Organization.Read.All', 'Group.Read.All')
     }
-    return @(
-        'https://graph.microsoft.com/User.Read.All'
-        'https://graph.microsoft.com/Organization.Read.All'
-        'https://graph.microsoft.com/Group.Read.All'
-        'offline_access'
-    )
+    return @('User.Read.All', 'Organization.Read.All', 'Group.Read.All')
 }
 
 function Enable-GraphNetwork {
@@ -657,7 +647,7 @@ function Resolve-OAuthErrorMessage {
         return "Admin consent is required for Microsoft Graph PowerShell. Ask a Global Admin to open: https://login.microsoftonline.com/$tenant/adminconsent?client_id=$clientId  then re-run this script. Detail: $Message"
     }
     if ($Message -match 'AADSTS53003|AADSTS50005|device.?code|AADSTS7000218|blocked by Conditional Access') {
-        return "This tenant may block device-code sign-in (Conditional Access). Use a browser sign-in or app-certificate auth (-TenantId, -ClientId, -CertificateThumbprint). Detail: $Message"
+        return "Sign-in was blocked by Conditional Access or tenant policy. Sign in with an allowed work account, or use app-certificate auth (-TenantId, -ClientId, -CertificateThumbprint). Detail: $Message"
     }
     return $Message
 }
@@ -718,223 +708,25 @@ function Resume-RunTranscript {
     }
 }
 
-function Invoke-OAuthFormPost {
-    param(
-        [Parameter(Mandatory = $true)][string]$Uri,
-        [Parameter(Mandatory = $true)][hashtable]$Body
-    )
-
-    Enable-GraphNetwork
-    try {
-        $resp = Invoke-WebRequest -Method Post -Uri $Uri -Body $Body -ContentType 'application/x-www-form-urlencoded' -UseBasicParsing -ErrorAction Stop
-        if ($resp.Content) { return ($resp.Content | ConvertFrom-Json) }
-        return $null
-    }
-    catch {
-        $content = $null
-        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
-            $content = $_.ErrorDetails.Message
-        }
-        elseif ($_.Exception.Response) {
-            try {
-                $stream = $_.Exception.Response.GetResponseStream()
-                if ($stream) {
-                    if ($stream.CanSeek) { [void]$stream.Seek(0, [System.IO.SeekOrigin]::Begin) }
-                    $reader = New-Object System.IO.StreamReader($stream)
-                    $content = $reader.ReadToEnd()
-                    $reader.Close()
-                }
-            }
-            catch { }
-        }
-        if ($content) {
-            try { return ($content | ConvertFrom-Json) } catch { throw "OAuth request failed: $content" }
-        }
-        throw
-    }
-}
-
-function Show-GraphDeviceCodePrompt {
-    param($Device)
-
-    $url = $null
-    try { $url = $Device.verification_uri } catch { }
-    if (-not $url) { try { $url = $Device.verification_url } catch { } }
-    if (-not $url) { $url = 'https://microsoft.com/devicelogin' }
-    $code = [string]$Device.user_code
-
-    Write-Host ""
-    Write-Host "==============================================================" -ForegroundColor Yellow
-    Write-Host "  SIGN IN TO MICROSOFT GRAPH" -ForegroundColor Yellow
-    Write-Host "==============================================================" -ForegroundColor Yellow
-    Write-Host "  1. Open:  $url" -ForegroundColor Cyan
-    Write-Host "  2. Enter: $code" -ForegroundColor Green
-    Write-Host "  3. Approve the permissions, then return to this window." -ForegroundColor Gray
-    Write-Host "==============================================================" -ForegroundColor Yellow
-    Write-Host ""
-    try {
-        if ($Device.message) { Write-Host " $($Device.message)" -ForegroundColor Gray; Write-Host "" }
-    } catch { }
-
-    try {
-        Start-Process $url | Out-Null
-        Write-Host " Opened the sign-in page in your browser (if one is available)." -ForegroundColor Gray
-    }
-    catch {
-        Write-Host " Could not open a browser automatically. Paste the URL into Edge or Chrome." -ForegroundColor Yellow
-    }
-}
-
-function Get-GraphDeviceCodeAccessToken {
-    param([Parameter(Mandatory = $true)][string[]]$Scopes)
-
-    $clientId = if ($script:ClientId) { $script:ClientId } else { '14d82eec-204b-4c2f-b7e8-296a70dab67e' }
-    $tenant = if ($script:TenantId) { $script:TenantId } else { 'organizations' }
-    $deviceUri = "https://login.microsoftonline.com/$tenant/oauth2/v2.0/devicecode"
-    $tokenUri = "https://login.microsoftonline.com/$tenant/oauth2/v2.0/token"
-
-    Write-ScreenLog "Requesting a Microsoft Graph device code..." -Level INFO
-    $dc = Invoke-OAuthFormPost -Uri $deviceUri -Body @{
-        client_id = $clientId
-        scope     = ($Scopes -join ' ')
-    }
-    if ($null -eq $dc) { throw "Device code request returned no body." }
-    $dcError = $null
-    try { $dcError = [string]$dc.error } catch { }
-    if ($dcError) {
-        $detail = "$dcError $($dc.error_description)"
-        throw (Resolve-OAuthErrorMessage -Message "Device code request failed: $detail")
-    }
-    if (-not $dc.user_code) {
-        throw "Device code request did not return a user_code."
-    }
-
-    Show-GraphDeviceCodePrompt -Device $dc
-
-    $interval = 5
-    try { if ([int]$dc.interval -gt 0) { $interval = [int]$dc.interval } } catch { }
-    $expiresIn = 900
-    try { if ([int]$dc.expires_in -gt 0) { $expiresIn = [int]$dc.expires_in } } catch { }
-    $deadline = (Get-Date).AddSeconds($expiresIn)
-
-    Write-Host " Waiting for you to complete sign-in (code expires in $expiresIn seconds)..." -ForegroundColor Yellow
-    Write-Host " This window will continue automatically after you approve access." -ForegroundColor Gray
-    while ((Get-Date) -lt $deadline) {
-        Start-Sleep -Seconds $interval
-        $tok = Invoke-OAuthFormPost -Uri $tokenUri -Body @{
-            grant_type  = 'urn:ietf:params:oauth:grant-type:device_code'
-            client_id   = $clientId
-            device_code = [string]$dc.device_code
-        }
-        if ($tok -and $tok.access_token) {
-            Write-Host ""
-            Write-ScreenLog "Device-code sign-in succeeded." -Level SUCCESS
-            return [string]$tok.access_token
-        }
-        $err = ''
-        try { $err = [string]$tok.error } catch { }
-        if ($err -eq 'authorization_pending') {
-            Write-Host "." -NoNewline -ForegroundColor DarkGray
-            continue
-        }
-        if ($err -eq 'slow_down') {
-            $interval += 5
-            continue
-        }
-        if ($err -eq 'expired_token') {
-            throw "The device code expired. Re-run the workflow to get a new code."
-        }
-        if ($err -eq 'authorization_declined') {
-            throw "Sign-in was declined in the browser."
-        }
-        $desc = $err
-        try { if ($tok.error_description) { $desc = [string]$tok.error_description } } catch { }
-        throw (Resolve-OAuthErrorMessage -Message "Device-code token request failed: $desc")
-    }
-    throw "Timed out waiting for Graph device-code sign-in."
-}
-
-function Connect-GraphWithAccessToken {
-    param([Parameter(Mandatory = $true)][string]$AccessToken)
-
-    $cmd = Get-Command Connect-MgGraph -ErrorAction Stop
-    if (-not $cmd.Parameters.ContainsKey('AccessToken')) {
-        throw "This Graph SDK cannot accept -AccessToken. Update-Module Microsoft.Graph.Authentication"
-    }
-
-    $value = $AccessToken
-    $tokenType = $cmd.Parameters['AccessToken'].ParameterType
-    if ($tokenType -eq [securestring] -or $tokenType.FullName -eq 'System.Security.SecureString') {
-        $value = ConvertTo-SecureString -String $AccessToken -AsPlainText -Force
-    }
-
-    $params = @{
-        AccessToken = $value
-        ErrorAction = 'Stop'
-    }
-    if ($cmd.Parameters.ContainsKey('NoWelcome')) { $params.NoWelcome = $true }
-    Connect-MgGraph @params
-}
-
 function Invoke-GraphConnect {
     param(
-        [Parameter(Mandatory = $true)][string[]]$Scopes,
-        [switch]$DeviceCode
+        [Parameter(Mandatory = $true)][string[]]$Scopes
     )
 
     $cmd = Get-Command Connect-MgGraph -ErrorAction Stop
-    $oldInfo = $InformationPreference
-    $oldWarn = $WarningPreference
-    $oldVerbose = $VerbosePreference
-    # Graph prints the device URL/code on the Information stream, which is
-    # Silent by default — that looks like a hang with no URL.
-    $InformationPreference = 'Continue'
-    $WarningPreference = 'Continue'
-    $VerbosePreference = 'Continue'
-
-    try {
-        $params = @{
-            Scopes            = $Scopes
-            ErrorAction       = 'Stop'
-            InformationAction = 'Continue'
-            WarningAction     = 'Continue'
-        }
-        if ($cmd.Parameters.ContainsKey('ContextScope')) {
-            $params.ContextScope = 'Process'
-        }
-
-        if ($DeviceCode) {
-            # Do not pass -NoWelcome: several SDK builds hide the device code with it.
-            Write-Host " Waiting for Microsoft Graph to print a device code (this can take a few seconds)..." -ForegroundColor Yellow
-            Write-Host " Then open https://microsoft.com/devicelogin and enter that code." -ForegroundColor Yellow
-            Write-Host ""
-            try { [Console]::Out.Flush() } catch { }
-
-            if ($cmd.Parameters.ContainsKey('UseDeviceCode')) {
-                Connect-MgGraph @params -UseDeviceCode
-            }
-            elseif ($cmd.Parameters.ContainsKey('DeviceCode')) {
-                Connect-MgGraph @params -DeviceCode
-            }
-            elseif ($cmd.Parameters.ContainsKey('UseDeviceAuthentication')) {
-                Connect-MgGraph @params -UseDeviceAuthentication
-            }
-            else {
-                throw "This Microsoft Graph SDK does not support device-code login. Run: Update-Module Microsoft.Graph.Authentication"
-            }
-        }
-        else {
-            if ($cmd.Parameters.ContainsKey('NoWelcome')) {
-                $params.NoWelcome = $true
-            }
-            Connect-MgGraph @params
-        }
+    $params = @{
+        Scopes      = $Scopes
+        ErrorAction = 'Stop'
     }
-    finally {
-        $InformationPreference = $oldInfo
-        $WarningPreference = $oldWarn
-        $VerbosePreference = $oldVerbose
+    if ($cmd.Parameters.ContainsKey('ContextScope')) {
+        $params.ContextScope = 'Process'
     }
+    if ($script:TenantId -and $cmd.Parameters.ContainsKey('TenantId')) {
+        $params.TenantId = $script:TenantId
+    }
+    # Regular Microsoft 365 sign-in window (browser / Windows account picker).
+    # Do not pass -UseDeviceCode.
+    Connect-MgGraph @params
 }
 
 function Import-GraphLicenseModules {
@@ -974,38 +766,13 @@ function Import-GraphLicenseModules {
 }
 
 function Connect-SpincoGraph {
-    param(
-        [switch]$ForceDeviceCode,
-        [switch]$ForceBrowser
-    )
-
+    Import-GraphLicenseModules
     $neededScopes = @(Get-RequiredGraphScopes)
-    if ($ForceDeviceCode -or $ForceBrowser) {
-        $script:GraphAccessToken = $null
-        $script:GraphTokenHasWrite = $false
-    }
-    $sdkAvailable = $false
-    try {
-        Import-GraphLicenseModules
-        $sdkAvailable = $true
-    }
-    catch {
-        if ($script:TenantId -and $script:ClientId -and $script:CertificateThumbprint) { throw }
-        Write-ScreenLog $_.Exception.Message -Level WARN
-    }
 
     $ctx = $null
-    if ($sdkAvailable) {
-        try { $ctx = Get-MgContext } catch { $ctx = $null }
-    }
+    try { $ctx = Get-MgContext } catch { $ctx = $null }
 
-    if (-not $ForceDeviceCode -and $script:GraphAccessToken -and (Test-GraphSession)) {
-        Write-ScreenLog "Using existing Graph access token." -Level INFO
-        $script:GraphReady = $true
-        return
-    }
-
-    if (-not $ForceDeviceCode -and (Test-GraphScopesOk -Context $ctx -NeededScopes $neededScopes) -and (Test-GraphSession)) {
+    if ((Test-GraphScopesOk -Context $ctx -NeededScopes $neededScopes) -and (Test-GraphSession)) {
         Write-ScreenLog "Using existing Graph session (account: $($ctx.Account); tenant: $($ctx.TenantId))." -Level INFO
         $script:GraphReady = $true
         return
@@ -1029,57 +796,19 @@ function Connect-SpincoGraph {
         Connect-MgGraph @certParams
     }
     else {
-        $useDeviceCode = if ($ForceBrowser) { $false } else { $ForceDeviceCode -or $script:IsInteractive }
         Suspend-RunTranscript
         try {
             if ($script:IsInteractive) {
                 Write-Host ""
-                Write-Host "---- Microsoft Graph sign-in ---------------------------------------------" -ForegroundColor Cyan
-                Write-Host " Entra / direct-license lookups need a Graph login." -ForegroundColor Gray
-                if ($script:GraphNeedWrite) {
-                    Write-Host " This run requests write access so direct licenses can be removed." -ForegroundColor Gray
-                }
-                else {
-                    Write-Host " This report only needs read access (User.Read.All)." -ForegroundColor Gray
-                }
-                if (-not $script:TenantId) {
-                    $entered = Read-Prompt -Message "Entra tenant domain or ID (your company.onmicrosoft.com is fine)" -Default "organizations"
-                    if ($entered) { $script:TenantId = $entered }
-                }
+                Write-Host "---- Microsoft 365 sign-in -----------------------------------------------" -ForegroundColor Cyan
+                Write-Host " A sign-in window should open. Sign in with your work or school account." -ForegroundColor Yellow
+                Write-Host " After you finish in the browser/window, this script will continue." -ForegroundColor Gray
                 Write-Host ""
             }
             else {
-                Write-ScreenLog "Connecting to Microsoft Graph..." -Level INFO
+                Write-ScreenLog "Connecting to Microsoft Graph (interactive sign-in)..." -Level INFO
             }
-
-            if ($useDeviceCode) {
-                try {
-                    $token = Get-GraphDeviceCodeAccessToken -Scopes $neededScopes
-                    $script:GraphAccessToken = $token
-                    $script:GraphTokenHasWrite = [bool]$script:GraphNeedWrite
-                    if ($sdkAvailable) {
-                        try {
-                            Connect-GraphWithAccessToken -AccessToken $token
-                        }
-                        catch {
-                            Write-ScreenLog "Graph SDK did not accept the token; calling Microsoft Graph directly." -Level WARN
-                        }
-                    }
-                }
-                catch {
-                    Write-ScreenLog $_.Exception.Message -Level WARN
-                    if ($sdkAvailable) {
-                        Write-ScreenLog "Falling back to Connect-MgGraph -UseDeviceCode..." -Level INFO
-                        Invoke-GraphConnect -Scopes $neededScopes -DeviceCode
-                    }
-                    else {
-                        throw
-                    }
-                }
-            }
-            else {
-                Invoke-GraphConnect -Scopes $neededScopes
-            }
+            Invoke-GraphConnect -Scopes $neededScopes
         }
         finally {
             Resume-RunTranscript
@@ -1087,16 +816,13 @@ function Connect-SpincoGraph {
     }
 
     if (-not (Test-GraphSession)) {
-        throw (Resolve-OAuthErrorMessage -Message "Graph sign-in did not produce a usable token. If you entered the code and saw 'Need admin approval', a Global Admin must consent the Microsoft Graph Command Line Tools app.")
+        throw "Microsoft 365 sign-in did not complete. Close any leftover browser tabs and run the workflow again."
     }
 
-    $who = 'token'
-    $tid = $script:TenantId
-    try {
-        $ctx = Get-MgContext
-        if ($ctx -and $ctx.Account) { $who = $ctx.Account }
-        if ($ctx -and $ctx.TenantId) { $tid = $ctx.TenantId }
-    } catch { }
+    $ctx = $null
+    try { $ctx = Get-MgContext } catch { }
+    $who = if ($ctx -and $ctx.Account) { $ctx.Account } else { 'signed-in' }
+    $tid = if ($ctx -and $ctx.TenantId) { $ctx.TenantId } else { '' }
     Write-ScreenLog "Connected to Microsoft Graph (account: $who; tenant: $tid)." -Level SUCCESS
     $script:GraphReady = $true
 }
@@ -1108,52 +834,17 @@ function Initialize-GraphForLicenses {
     )
 
     $script:GraphNeedWrite = [bool]$AllowWrite
-    if ($AllowWrite -and $script:GraphAccessToken -and -not $script:GraphTokenHasWrite) {
-        $script:GraphAccessToken = $null
-        $script:GraphReady = $false
-    }
-
-    if ($script:GraphAccessToken -and (Test-GraphSession)) {
-        $script:GraphReady = $true
-        Write-ScreenLog "Using existing Graph access token." -Level INFO
-        return $true
-    }
-
     $script:GraphReady = $false
     try {
-        if ($script:IsInteractive) {
-            Connect-SpincoGraph -ForceDeviceCode
-        }
-        else {
-            Connect-SpincoGraph
-        }
+        Connect-SpincoGraph
         return $true
     }
     catch {
         Write-ScreenLog $_.Exception.Message -Level ERROR
     }
 
-    $canConnect = [bool](Get-Command Connect-MgGraph -ErrorAction SilentlyContinue)
-    if ($script:IsInteractive -and $canConnect -and -not ($script:TenantId -and $script:ClientId -and $script:CertificateThumbprint)) {
-        if (Read-YesNo -Message "Device-code sign-in failed. Try a browser popup instead?" -Default $false) {
-            try {
-                Connect-SpincoGraph -ForceBrowser
-                return $true
-            }
-            catch {
-                Write-ScreenLog $_.Exception.Message -Level ERROR
-            }
-        }
-        Write-Host ""
-        Write-Host " Graph sign-in failed. Common causes:" -ForegroundColor Yellow
-        Write-Host "  - The account saw 'Need admin approval' (a Global Admin must consent the Graph PowerShell app)" -ForegroundColor Yellow
-        Write-Host "  - Conditional Access blocks device-code sign-in" -ForegroundColor Yellow
-        Write-Host "  - Wrong tenant. Re-run and enter your company.onmicrosoft.com domain" -ForegroundColor Yellow
-        Write-Host ""
-    }
-
     if ($Required) {
-        throw "Microsoft Graph authentication is required. A Global Admin may need to consent Microsoft Graph Command Line Tools, or use -TenantId/-ClientId/-CertificateThumbprint."
+        throw "Microsoft 365 sign-in is required for Entra / direct-license work. Sign in when the Microsoft prompt appears, then retry."
     }
 
     Write-ScreenLog "Continuing without Entra ID. Direct / Entra license columns will be empty until you sign in." -Level WARN
@@ -1444,7 +1135,7 @@ function Get-DirectLicenseInventory {
                 $entry.LookupMessage = 'Graph authentication needed. Remaining Entra lookups skipped.'
                 [void]$rows.Add($entry)
                 Write-ScreenLog "Graph is not authenticated. Stopping Entra lookups (will not repeat this error for every user)." -Level ERROR
-                Write-ScreenLog "Complete the Graph device-code login (URL + code in this window), then re-run the report." -Level WARN
+                Write-ScreenLog "Complete Microsoft 365 sign-in, then re-run the report." -Level WARN
                 foreach ($rest in @($Users | Select-Object -Skip $index)) {
                     $restGroups = @(foreach ($dn in @($rest.MemberOf | Where-Object { $_ -and $Groups.ContainsKey($_) })) {
                         $Groups[$dn].Name
