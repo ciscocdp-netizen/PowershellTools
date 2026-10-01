@@ -1158,10 +1158,11 @@ function Import-EntraUsersByUpn {
 
     $byUpn = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::OrdinalIgnoreCase)
     $bySam = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::OrdinalIgnoreCase)
+    $notFound = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::OrdinalIgnoreCase)
     $select = Get-GraphUserSelectProperties
     $unique = @($Upns | Where-Object { $_ } | Select-Object -Unique)
     if ($unique.Count -eq 0) {
-        return @{ ByUpn = $byUpn; BySam = $bySam }
+        return @{ ByUpn = $byUpn; BySam = $bySam; NotFoundUpns = $notFound }
     }
 
     $chunks = @(Split-GraphBatchChunks -Items $unique -Size 20)
@@ -1187,19 +1188,25 @@ function Import-EntraUsersByUpn {
             $status = Get-GraphBatchResponseStatus -Response $r
             $rid = $null
             try { $rid = [string]$r.id } catch { try { $rid = [string]$r.Id } catch { } }
+            $requestedUpn = $null
+            if ($rid -and $idToUpn.ContainsKey($rid)) { $requestedUpn = $idToUpn[$rid] }
+
             if ($status -eq 200) {
                 $user = Get-GraphBatchResponseBody -Response $r
                 if ($user) {
+                    if ($requestedUpn) { $byUpn[$requestedUpn] = $user }
                     $upnVal = $null
                     try { $upnVal = [string]$user.userPrincipalName } catch { }
                     if (-not $upnVal) { try { $upnVal = [string]$user.UserPrincipalName } catch { } }
-                    if (-not $upnVal -and $rid -and $idToUpn.ContainsKey($rid)) { $upnVal = $idToUpn[$rid] }
                     if ($upnVal) { $byUpn[$upnVal] = $user }
                     $samVal = $null
                     try { $samVal = [string]$user.onPremisesSamAccountName } catch { }
                     if (-not $samVal) { try { $samVal = [string]$user.OnPremisesSamAccountName } catch { } }
                     if ($samVal) { $bySam[$samVal] = $user }
                 }
+            }
+            elseif ($status -eq 404) {
+                if ($requestedUpn) { $notFound[$requestedUpn] = $true }
             }
             elseif ($status -eq 401 -or $status -eq 403) {
                 $body = Get-GraphBatchResponseBody -Response $r
@@ -1213,9 +1220,12 @@ function Import-EntraUsersByUpn {
         Write-Progress -Activity "Looking up licenses in Entra ID" `
                        -Status ("Users {0}/{1}" -f $done, $unique.Count) `
                        -PercentComplete ([int](($done / $unique.Count) * 100))
+        if ($done -eq $unique.Count -or ($done % 500) -eq 0) {
+            Write-ScreenLog ("Entra UPN lookup {0}/{1}..." -f $done, $unique.Count) -Level PROGRESS
+        }
     }
 
-    return @{ ByUpn = $byUpn; BySam = $bySam }
+    return @{ ByUpn = $byUpn; BySam = $bySam; NotFoundUpns = $notFound }
 }
 
 function Import-EntraUsersBySam {
@@ -1229,27 +1239,31 @@ function Import-EntraUsersBySam {
     if ($unique.Count -eq 0) { return $Lookup }
 
     $chunks = @(Split-GraphBatchChunks -Items $unique -Size 20)
+    $done = 0
+    $total = $unique.Count
     foreach ($chunk in $chunks) {
-        $requests = [System.Collections.Generic.List[object]]::new()
-        $id = 0
-        foreach ($sam in @($chunk)) {
-            $id++
-            $escaped = ($sam -replace "'", "''")
-            $filter = [uri]::EscapeDataString("onPremisesSamAccountName eq '$escaped'")
-            [void]$requests.Add(@{
-                id      = [string]$id
+        $quoted = @(
+            foreach ($sam in @($chunk)) {
+                "'" + ($sam -replace "'", "''") + "'"
+            }
+        ) -join ','
+        $filter = [uri]::EscapeDataString("onPremisesSamAccountName in ($quoted)")
+        $url = '/users?$filter=' + $filter + '&$count=true&$select=' + $select
+        $requests = @(
+            @{
+                id      = '1'
                 method  = 'GET'
-                url     = '/users?$filter=' + $filter + '&$select=' + $select
+                url     = $url
                 headers = @{ ConsistencyLevel = 'eventual' }
-            })
-        }
+            }
+        )
 
-        $responses = @(Invoke-GraphBatch -Requests @($requests))
+        $responses = @(Invoke-GraphBatch -Requests $requests)
         foreach ($r in $responses) {
             $status = Get-GraphBatchResponseStatus -Response $r
             if ($status -ne 200) {
                 if ($status -eq 401 -or $status -eq 403) {
-                    throw "Graph batch SAM lookup failed with status $status"
+                    throw "Graph SAM lookup failed with status $status"
                 }
                 continue
             }
@@ -1268,8 +1282,17 @@ function Import-EntraUsersBySam {
                 if ($samVal) { $Lookup.BySam[$samVal] = $user }
             }
         }
+
+        $done += @($chunk).Count
+        Write-Progress -Activity "Resolving remaining users by sAMAccountName" `
+                       -Status ("{0}/{1}" -f $done, $total) `
+                       -PercentComplete ([int](($done / $total) * 100))
+        if ($done -eq $total -or ($done % 200) -eq 0) {
+            Write-ScreenLog ("sAMAccountName lookup {0}/{1}..." -f $done, $total) -Level PROGRESS
+        }
     }
 
+    Write-Progress -Activity "Resolving remaining users by sAMAccountName" -Completed
     return $Lookup
 }
 
@@ -1357,12 +1380,28 @@ function Get-DirectLicenseInventory {
             $missingSams = @(
                 $userList |
                     Where-Object {
-                        $_.SamAccountName -and -not (Find-EntraUserFromLookup -AdUser $_ -Lookup $lookup)
+                        $_.SamAccountName -and
+                        -not (Find-EntraUserFromLookup -AdUser $_ -Lookup $lookup) -and
+                        (
+                            -not $_.UserPrincipalName -or
+                            -not ($lookup.NotFoundUpns -and $lookup.NotFoundUpns.ContainsKey($_.UserPrincipalName))
+                        )
                     } |
                     ForEach-Object { $_.SamAccountName }
             )
+            $skipped404 = @(
+                $userList |
+                    Where-Object {
+                        $_.UserPrincipalName -and
+                        $lookup.NotFoundUpns -and
+                        $lookup.NotFoundUpns.ContainsKey($_.UserPrincipalName)
+                    }
+            ).Count
+            if ($skipped404 -gt 0) {
+                Write-ScreenLog "Skipping sAMAccountName lookup for $skipped404 user(s) already not found by UPN." -Level INFO
+            }
             if ($missingSams.Count -gt 0) {
-                Write-ScreenLog "Resolving $($missingSams.Count) user(s) by sAMAccountName..." -Level INFO
+                Write-ScreenLog "Resolving $($missingSams.Count) user(s) with no UPN match by sAMAccountName..." -Level INFO
                 $lookup = Import-EntraUsersBySam -Sams $missingSams -Lookup $lookup
             }
 
