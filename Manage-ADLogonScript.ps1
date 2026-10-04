@@ -42,8 +42,10 @@
                   RevertResults_<timestamp>.csv
 
     Identity values in the input CSV may be sAMAccountName, DOMAIN\user, UPN,
-    distinguishedName, GUID or SID. Common header aliases (Username, User,
-    LoginName, UPN, ...) are recognised automatically.
+    distinguishedName, GUID or SID. Headers are auto-detected for every column
+    and you choose which column to key on. Known names (SamAccountName,
+    Username, UPN, Email, DN, GUID, ...) are recommended as the default;
+    any other column can still be selected.
 
 .PARAMETER OutputRoot
     Root folder for logs, backups and reports.
@@ -129,13 +131,15 @@ $script:LargeSetWarningThreshold = 1000
 $script:PreviewRowLimit = 100
 
 $script:IdentityColumnAliases = @(
-    'SamAccountName', 'sAMAccountName', 'SAMAccountName',
+    'SamAccountName', 'sAMAccountName', 'SAMAccountName', 'SAM',
     'Username', 'UserName', 'User', 'Account', 'AccountName',
-    'Login', 'LoginName', 'LogonName', 'Identity', 'Name'
+    'Login', 'LoginName', 'LogonName', 'Identity'
 )
+$script:WeakIdentityColumnAliases = @('Name', 'DisplayName')
 $script:UpnColumnAliases = @('UserPrincipalName', 'UPN', 'Email', 'EmailAddress', 'Mail')
 $script:DnColumnAliases  = @('DistinguishedName', 'DN')
 $script:GuidColumnAliases = @('ObjectGUID', 'GUID', 'ObjectGuid')
+$script:SidColumnAliases  = @('SID', 'objectSid', 'ObjectSID', 'ObjectSid', 'SecurityIdentifier')
 
 # ---------------------------------------------------------------------------
 # Small helpers (no Active Directory dependency)
@@ -214,6 +218,137 @@ function Get-PropertyNameIgnoreCase {
         if ($match) { return [string]$match }
     }
     return $null
+}
+
+function Get-CsvColumnKind {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+    if (Get-PropertyNameIgnoreCase -Names @($Name) -Candidates $script:IdentityColumnAliases) { return 'SAM' }
+    if (Get-PropertyNameIgnoreCase -Names @($Name) -Candidates $script:GuidColumnAliases) { return 'GUID' }
+    if (Get-PropertyNameIgnoreCase -Names @($Name) -Candidates $script:SidColumnAliases) { return 'SID' }
+    if (Get-PropertyNameIgnoreCase -Names @($Name) -Candidates $script:UpnColumnAliases) { return 'UPN' }
+    if (Get-PropertyNameIgnoreCase -Names @($Name) -Candidates $script:DnColumnAliases) { return 'DN' }
+    if (Get-PropertyNameIgnoreCase -Names @($Name) -Candidates $script:WeakIdentityColumnAliases) { return 'Name' }
+
+    if ($Name -match '(?i)samaccount|sam_account|^sam$') { return 'SAM' }
+    if ($Name -match '(?i)objectguid|^guid$') { return 'GUID' }
+    if ($Name -match '(?i)\bsid\b') { return 'SID' }
+    if ($Name -match '(?i)userprincipal|^upn$|e-?mail') { return 'UPN' }
+    if ($Name -match '(?i)distinguished|^dn$') { return 'DN' }
+    if ($Name -match '(?i)user|login|account|logon') { return 'SAM' }
+    return $null
+}
+
+function Get-RecommendedCsvIdentityColumn {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Columns)
+
+    if ($null -eq $Columns -or $Columns.Count -eq 0) { return $null }
+
+    $groups = @(
+        $script:IdentityColumnAliases,
+        $script:GuidColumnAliases,
+        $script:SidColumnAliases,
+        $script:UpnColumnAliases,
+        $script:DnColumnAliases,
+        $script:WeakIdentityColumnAliases
+    )
+    foreach ($group in $groups) {
+        $match = Get-PropertyNameIgnoreCase -Names $Columns -Candidates $group
+        if ($match) { return $match }
+    }
+
+    foreach ($column in $Columns) {
+        if (Get-CsvColumnKind -Name $column) { return $column }
+    }
+    return $null
+}
+
+function Get-CsvColumnSample {
+    param(
+        [Parameter(Mandatory)]$Rows,
+        [Parameter(Mandatory)][string]$Column,
+        [int]$Take = 3
+    )
+
+    $values = New-Object System.Collections.Generic.List[string]
+    foreach ($row in $Rows) {
+        $value = [string](Get-NotePropertyValue -Object $row -Name $Column)
+        if ($null -ne $value) { $value = $value.Trim() }
+        if ([string]::IsNullOrWhiteSpace($value)) { continue }
+        if ($values.Count -ge $Take) { break }
+        $values.Add($value)
+    }
+    return ($values -join ', ')
+}
+
+function Select-CsvIdentityColumn {
+    param(
+        [Parameter(Mandatory)][string[]]$Columns,
+        [Parameter(Mandatory)]$Rows,
+        [switch]$AutoSelect
+    )
+
+    $recommended = Get-RecommendedCsvIdentityColumn -Columns $Columns
+    $recommendedIndex = $null
+    if ($recommended) {
+        for ($i = 0; $i -lt $Columns.Count; $i++) {
+            if ($Columns[$i] -ieq $recommended) {
+                $recommendedIndex = '{0}' -f ($i + 1)
+                $recommended = $Columns[$i]
+                break
+            }
+        }
+    }
+
+    if ($AutoSelect) {
+        $column = $recommended
+        if (-not $column -and $Columns.Count -ge 1) { $column = $Columns[0] }
+        return [pscustomobject]@{
+            Cancelled  = $false
+            Headerless = $false
+            Column     = $column
+        }
+    }
+
+    Write-Host ''
+    Write-Host '  Detected CSV headers (choose the column to key on):' -ForegroundColor Cyan
+    for ($i = 0; $i -lt $Columns.Count; $i++) {
+        $name    = $Columns[$i]
+        $kind    = Get-CsvColumnKind -Name $name
+        $sample  = Get-CsvColumnSample -Rows $Rows -Column $name
+        $kindText = if ($kind) { ' [{0}]' -f $kind } else { '' }
+        $marker  = if ($recommended -and $name -ieq $recommended) { '  <- recommended' } else { '' }
+        Write-Host ("    [{0}] {1}{2}{3}" -f ($i + 1), $name, $kindText, $marker)
+        if ($sample) {
+            Write-Host ("         sample: {0}" -f $sample) -ForegroundColor DarkGray
+        }
+    }
+    Write-Host '    [H] File has NO header row (first column is the user identity)'
+    Write-Host '    [C] Cancel'
+
+    $valid  = @('H', 'C') + (ConvertTo-ChoiceIndexList -Count $Columns.Count)
+    $prompt = '  Select the column to key on'
+    if ($recommendedIndex) {
+        $prompt = '{0} [Enter = {1}, {2}]' -f $prompt, $recommendedIndex, $recommended
+    }
+
+    $choice = Read-Choice -Prompt $prompt -ValidChoices $valid -Default $recommendedIndex
+    switch ($choice) {
+        'C' {
+            return [pscustomobject]@{ Cancelled = $true; Headerless = $false; Column = $null }
+        }
+        'H' {
+            return [pscustomobject]@{ Cancelled = $false; Headerless = $true; Column = 'SamAccountName' }
+        }
+        default {
+            return [pscustomobject]@{
+                Cancelled  = $false
+                Headerless = $false
+                Column     = $Columns[[int]$choice - 1]
+            }
+        }
+    }
 }
 
 function ConvertTo-IdentityTokenList {
@@ -522,12 +657,19 @@ function Read-YesNo {
 function Read-Choice {
     param(
         [Parameter(Mandatory)][string]$Prompt,
-        [Parameter(Mandatory)][string[]]$ValidChoices
+        [Parameter(Mandatory)][string[]]$ValidChoices,
+        [string]$Default
     )
+    if ($Default) { $Default = $Default.Trim().ToUpper() }
     while ($true) {
         $answer = (Read-Host $Prompt).Trim().ToUpper()
+        if ([string]::IsNullOrEmpty($answer) -and $Default -and ($ValidChoices -contains $Default)) {
+            return $Default
+        }
         if ($ValidChoices -contains $answer) { return $answer }
-        Write-Host ("  Invalid choice. Valid options: {0}" -f ($ValidChoices -join ', ')) -ForegroundColor Yellow
+        $hint = $ValidChoices -join ', '
+        if ($Default) { $hint = '{0} (Enter = {1})' -f $hint, $Default }
+        Write-Host ("  Invalid choice. Valid options: {0}" -f $hint) -ForegroundColor Yellow
     }
 }
 
@@ -833,7 +975,10 @@ function Initialize-ADConnection {
 # CSV input
 # ---------------------------------------------------------------------------
 function Get-UserListFromCsv {
-    param([Parameter(Mandatory)][string]$Path)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [switch]$AutoSelect
+    )
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         Write-Log "Input file not found: $Path" -Level ERROR
@@ -854,43 +999,35 @@ function Get-UserListFromCsv {
     }
 
     $columns = @($rows[0].PSObject.Properties.Name)
-    $column  = Get-PropertyNameIgnoreCase -Names $columns -Candidates $script:IdentityColumnAliases
+    $selection = Select-CsvIdentityColumn -Columns $columns -Rows $rows -AutoSelect:$AutoSelect
+
+    if ($selection.Cancelled) {
+        Write-Log 'User cancelled column selection.' -Level WARN
+        return , [string[]]@()
+    }
+
+    $column = $selection.Column
+    if ($selection.Headerless) {
+        $encodingName = Get-FileTextEncodingName -Path $Path
+        $delimiter    = Get-CsvDelimiterFromPath -Path $Path
+        $raw = Import-Csv -LiteralPath $Path -Header 'SamAccountName' -Encoding $encodingName -Delimiter $delimiter
+        if ($null -eq $raw) { return , [string[]]@() }
+        $rows = @($raw)
+        $column = 'SamAccountName'
+        Write-Log 'Treating the file as headerless; first column is the user identity.' -Level INFO
+    }
 
     if (-not $column) {
-        $upnColumn = Get-PropertyNameIgnoreCase -Names $columns -Candidates $script:UpnColumnAliases
-        $dnColumn  = Get-PropertyNameIgnoreCase -Names $columns -Candidates $script:DnColumnAliases
-        $guidColumn = Get-PropertyNameIgnoreCase -Names $columns -Candidates $script:GuidColumnAliases
-        if ($upnColumn)      { $column = $upnColumn }
-        elseif ($dnColumn)   { $column = $dnColumn }
-        elseif ($guidColumn) { $column = $guidColumn }
+        Write-Log 'No identity column was selected.' -Level ERROR
+        return , [string[]]@()
     }
 
-    if ($column) {
-        Write-Log "Using column '$column' as the user identity." -Level INFO
+    $kind = Get-CsvColumnKind -Name $column
+    if ($kind) {
+        Write-Log "Using column '$column' ($kind) as the user identity." -Level INFO
     }
     else {
-        Write-Host ''
-        Write-Host '  No recognised identity column was found. Columns in file:' -ForegroundColor Yellow
-        for ($i = 0; $i -lt $columns.Count; $i++) {
-            Write-Host ("    [{0}] {1}" -f ($i + 1), $columns[$i])
-        }
-        Write-Host '    [H] File has NO header row (first column is the user identity)'
-        Write-Host '    [C] Cancel'
-
-        $valid  = @('H', 'C') + (ConvertTo-ChoiceIndexList -Count $columns.Count)
-        $choice = Read-Choice -Prompt '  Select the column containing the user identity' -ValidChoices $valid
-
-        switch ($choice) {
-            'C' { Write-Log 'User cancelled column selection.' -Level WARN; return , [string[]]@() }
-            'H' {
-                $encodingName = Get-FileTextEncodingName -Path $Path
-                $delimiter    = Get-CsvDelimiterFromPath -Path $Path
-                $rows   = @(Import-Csv -LiteralPath $Path -Header 'SamAccountName' -Encoding $encodingName -Delimiter $delimiter)
-                $column = 'SamAccountName'
-            }
-            default { $column = $columns[[int]$choice - 1] }
-        }
-        Write-Log "Using column '$column' as the user identity." -Level INFO
+        Write-Log "Using column '$column' as the user identity (unrecognised header; values will still be resolved as SAM/UPN/DN/GUID/SID)." -Level WARN
     }
 
     $seen  = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
@@ -1141,7 +1278,7 @@ function Save-EmergencyBackup {
 function Invoke-LogonScriptRemoval {
     Write-Header 'Remove logon scripts'
 
-    $inputPath = Select-CsvFile -Title 'Select CSV file containing users (SamAccountName)' -InitialDirectory $script:ScriptRoot
+    $inputPath = Select-CsvFile -Title 'Select CSV file containing users' -InitialDirectory $script:ScriptRoot
     if (-not $inputPath) {
         Write-Log 'No input file selected. Returning to menu.' -Level WARN
         return
@@ -1838,6 +1975,11 @@ function Invoke-SelfTest {
     $alias = Get-PropertyNameIgnoreCase -Names @('EmployeeID', 'Username', 'Dept') -Candidates $script:IdentityColumnAliases
     Assert-True -Condition ($alias -eq 'Username') -Name 'Get-PropertyNameIgnoreCase matches Username alias'
 
+    Assert-True -Condition ((Get-CsvColumnKind -Name 'EmailAddress') -eq 'UPN') -Name 'Get-CsvColumnKind classifies EmailAddress as UPN'
+    Assert-True -Condition ((Get-CsvColumnKind -Name 'LoginName') -eq 'SAM') -Name 'Get-CsvColumnKind classifies LoginName as SAM'
+    Assert-True -Condition ((Get-RecommendedCsvIdentityColumn -Columns @('EmployeeID', 'Email', 'Department')) -eq 'Email') -Name 'Get-RecommendedCsvIdentityColumn prefers Email over non-identity headers'
+    Assert-True -Condition ((Get-RecommendedCsvIdentityColumn -Columns @('EmailAddress', 'SamAccountName', 'DisplayName')) -eq 'SamAccountName') -Name 'Get-RecommendedCsvIdentityColumn prefers SamAccountName over Email'
+
     $idSam = ConvertTo-AdUserIdentity -Value 'jsmith'
     Assert-True -Condition ($idSam.Kind -eq 'SAM' -and $idSam.SamAccountName -eq 'jsmith') -Name 'ConvertTo-AdUserIdentity parses sAMAccountName'
 
@@ -1911,8 +2053,12 @@ function Invoke-SelfTest {
         Assert-True -Condition ($null -ne $emptyImport -and $emptyImport.Count -eq 0) -Name 'Import-CsvSafe returns an empty array for a header-only CSV'
 
         [System.IO.File]::WriteAllText($tempCsv, "SamAccountName`r`nalice`r`nbob`r`nalice`r`n`r`n", $script:Utf8NoBom)
-        $loaded = Get-UserListFromCsv -Path $tempCsv
+        $loaded = Get-UserListFromCsv -Path $tempCsv -AutoSelect
         Assert-True -Condition ($loaded.Count -eq 2 -and $loaded[0] -eq 'alice' -and $loaded[1] -eq 'bob') -Name 'Get-UserListFromCsv de-duplicates and skips blank rows'
+
+        [System.IO.File]::WriteAllText($tempCsv, "EmployeeID,EmailAddress,Department`r`n1,bob.lee@contoso.com,IT`r`n2,ann@contoso.com,HR`r`n", $script:Utf8NoBom)
+        $byEmail = Get-UserListFromCsv -Path $tempCsv -AutoSelect
+        Assert-True -Condition ($byEmail.Count -eq 2 -and $byEmail[0] -eq 'bob.lee@contoso.com') -Name 'Get-UserListFromCsv -AutoSelect keys on EmailAddress when no SAM column exists'
     }
     finally {
         if (Test-Path -LiteralPath $tempCsv) { Remove-Item -LiteralPath $tempCsv -Force }
