@@ -5,6 +5,10 @@
     Active Directory user accounts listed in a CSV file.
 
 .DESCRIPTION
+    All lookups and writes target the domain's PDC Emulator (auto-discovered
+    via Get-ADDomain). That keeps remove, verify and later revert on the same
+    writable DC so replication lag cannot hide a change.
+
     Menu-driven tool with four main operations:
 
       1. Remove logon scripts
@@ -17,14 +21,16 @@
            in-memory copy is also rewritten at the end of the run.
 
       2. Revert logon scripts
-         - Pick a BACKUP CSV created by option 1 using a file picker.
-         - Restores the original scriptPath value for each user.
+         - Pick a BACKUP CSV created by option 1 (or a RemovalResults CSV).
+         - Restore every user in the file, or a subset (typed names or a filter
+           CSV). One user and many users use the same path.
          - Lets you decide how to handle users whose scriptPath was changed
            since the removal (skip, overwrite, or ask).
+         - Each user is independent: one failure does not stop the rest.
 
       3. Open output folder
 
-      4. Change domain controller / credentials
+      4. Re-discover the PDC Emulator / change domain or credentials
 
     Every action, skip and failure is written to a timestamped log file.
     A results CSV with the status of every processed user is created per run.
@@ -79,6 +85,8 @@
       - Not-found errors wrapped by $ErrorActionPreference = Stop were not
         recognised as ADIdentityNotFoundException.
       - DC discovery did not require ADWS (needed by the AD module).
+      - Discovery picked any writable DC instead of the PDC Emulator, so
+        verify/revert could read a replica that had not yet received the write.
 
 .EXAMPLE
     .\Manage-ADLogonScript.ps1
@@ -112,6 +120,8 @@ $script:BackupFolder = Join-Path $script:OutputRoot 'Backups'
 $script:ReportFolder = Join-Path $script:OutputRoot 'Reports'
 $script:LogFile      = Join-Path $script:LogFolder ("LogonScript_{0}.log" -f $script:SessionStamp)
 $script:ADParams     = @{}
+$script:PdcEmulator  = $null
+$script:DomainDnsRoot = $null
 $script:Operator     = '{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME
 $script:Utf8NoBom    = New-Object System.Text.UTF8Encoding $false
 $script:BackupSchemaVersion = '2'
@@ -204,6 +214,28 @@ function Get-PropertyNameIgnoreCase {
         if ($match) { return [string]$match }
     }
     return $null
+}
+
+function ConvertTo-IdentityTokenList {
+    param([AllowEmptyString()][string]$RawText)
+
+    if ([string]::IsNullOrWhiteSpace($RawText)) { return , [string[]]@() }
+
+    $normalized = $RawText.Replace("`r`n", "`n").Replace("`r", "`n")
+    $parts = @($normalized -split "[;`n]+" | ForEach-Object { $_.Trim().Trim('"') } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+
+    $hasDn = $false
+    foreach ($part in $parts) {
+        if ((ConvertTo-AdUserIdentity -Value $part).Kind -eq 'DN') { $hasDn = $true; break }
+    }
+
+    # "jsmith, ajones" is a list of SAMs. A distinguishedName also contains
+    # commas, so only split on comma when no DN token is present.
+    if (-not $hasDn -and $parts.Count -eq 1 -and $parts[0] -match ',') {
+        $parts = @($parts[0] -split ',' | ForEach-Object { $_.Trim().Trim('"') } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    }
+
+    return , [string[]]@($parts)
 }
 
 function ConvertTo-AdUserIdentity {
@@ -650,103 +682,149 @@ function Invoke-ADOperation {
     }
 }
 
-function Resolve-DomainControllerHost {
-    $candidates = New-Object System.Collections.Generic.List[string]
+function Get-AdConnectionSplat {
+    $params = @{}
+    if ($script:ADParams -and $script:ADParams.ContainsKey('Credential') -and $script:ADParams['Credential']) {
+        $params['Credential'] = $script:ADParams['Credential']
+    }
+    return $params
+}
 
-    $discoveries = @(
-        @{ Name = 'writable ADWS DC'; Script = { Get-ADDomainController -Discover -Service ADWS -Writable -ErrorAction Stop } },
-        @{ Name = 'ADWS DC';          Script = { Get-ADDomainController -Discover -Service ADWS -ErrorAction Stop } },
-        @{ Name = 'any DC';           Script = { Get-ADDomainController -Discover -ErrorAction Stop } }
-    )
+function Resolve-PdcEmulator {
+    param([string]$Hint)
 
-    foreach ($discovery in $discoveries) {
-        try {
-            $dc = & $discovery.Script
-            $hostName = Get-FirstNonEmptyString -Value (Get-NotePropertyValue -Object $dc -Name 'HostName')
-            if (-not $hostName) { $hostName = Get-FirstNonEmptyString -Value (Get-NotePropertyValue -Object $dc -Name 'Name') }
-            if ($hostName) {
-                $candidates.Add($hostName)
-                Write-Log ("Discovered {0}: {1}" -f $discovery.Name, $hostName) -Level INFO -NoConsole
-                break
+    $base = Get-AdConnectionSplat
+
+    $domain = Invoke-ADOperation -OperationName 'Get-ADDomain (locate PDC)' -ScriptBlock {
+        if ($Hint) {
+            try {
+                return Get-ADDomain -Identity $Hint @base -ErrorAction Stop
+            }
+            catch {
+                return Get-ADDomain -Server $Hint @base -ErrorAction Stop
             }
         }
-        catch {
-            Write-Log ("{0} discovery failed: {1}" -f $discovery.Name, $_.Exception.Message) -Level WARN
+        return Get-ADDomain @base -ErrorAction Stop
+    }
+
+    $pdc = Get-FirstNonEmptyString -Value (Get-NotePropertyValue -Object $domain -Name 'PDCEmulator')
+    if (-not $pdc) {
+        throw 'Get-ADDomain returned no PDCEmulator. Cannot continue.'
+    }
+
+    $verifyParams = Get-AdConnectionSplat
+    $verifyParams['Server'] = $pdc
+
+    $domainOnPdc = Invoke-ADOperation -OperationName ("Get-ADDomain via PDC {0}" -f $pdc) -ScriptBlock {
+        Get-ADDomain @verifyParams -ErrorAction Stop
+    }
+
+    $confirmedPdc = Get-FirstNonEmptyString -Value (Get-NotePropertyValue -Object $domainOnPdc -Name 'PDCEmulator')
+    if ($confirmedPdc -and -not (Test-ScriptPathEqual -Left $pdc -Right $confirmedPdc)) {
+        Write-Log "PDC Emulator role is now '$confirmedPdc' (locator returned '$pdc'). Switching to the current PDC." -Level WARN
+        $pdc = $confirmedPdc
+        $verifyParams['Server'] = $pdc
+        $domainOnPdc = Invoke-ADOperation -OperationName ("Get-ADDomain via current PDC {0}" -f $pdc) -ScriptBlock {
+            Get-ADDomain @verifyParams -ErrorAction Stop
         }
     }
 
-    if ($candidates.Count -eq 0) {
-        try {
-            $pdc = Get-FirstNonEmptyString -Value (Get-ADDomain -ErrorAction Stop).PDCEmulator
-            if ($pdc) {
-                $candidates.Add($pdc)
-                Write-Log "Falling back to PDC Emulator: $pdc" -Level INFO
-            }
-        }
-        catch {
-            Write-Log "PDC Emulator lookup failed: $($_.Exception.Message)" -Level WARN
+    try {
+        $dc = Get-ADDomainController -Identity $pdc @verifyParams -ErrorAction Stop
+        $roles = @($dc.OperationMasterRoles | ForEach-Object { $_.ToString() })
+        if ($roles -notcontains 'PDCEmulator') {
+            Write-Log ("WARNING: {0} does not currently list PDCEmulator in OperationMasterRoles ({1})." -f $pdc, ($roles -join ', ')) -Level WARN
         }
     }
+    catch {
+        Write-Log "Could not verify OperationMasterRoles on '$pdc': $($_.Exception.Message)" -Level WARN
+    }
 
-    return Get-FirstNonEmptyString -Value $candidates
+    return [pscustomobject]@{
+        Server      = $pdc
+        Domain      = [string](Get-NotePropertyValue -Object $domainOnPdc -Name 'DNSRoot')
+        NetBIOSName = [string](Get-NotePropertyValue -Object $domainOnPdc -Name 'NetBIOSName')
+    }
+}
+
+function Set-AdPdcTarget {
+    param($PdcInfo)
+
+    $script:PdcEmulator   = $PdcInfo.Server
+    $script:DomainDnsRoot = $PdcInfo.Domain
+    $script:ADParams['Server'] = $PdcInfo.Server
+}
+
+function Confirm-ConnectedPdc {
+    try {
+        $info = Resolve-PdcEmulator
+        $current = [string]$script:ADParams['Server']
+        if ($current -and -not (Test-ScriptPathEqual -Left $current -Right $info.Server)) {
+            Write-Log "PDC Emulator changed from '$current' to '$($info.Server)'. All further changes will use the current PDC." -Level WARN
+        }
+        Set-AdPdcTarget -PdcInfo $info
+        Write-Log "Using PDC Emulator '$($info.Server)' for domain '$($info.Domain)'." -Level INFO
+        return $true
+    }
+    catch {
+        $fallback = [string]$script:ADParams['Server']
+        if ($fallback) {
+            Write-Log "Could not re-confirm the PDC Emulator: $($_.Exception.Message). Continuing with '$fallback'." -Level WARN
+            return $false
+        }
+        throw
+    }
 }
 
 function Initialize-ADConnection {
+    param([switch]$AllowHint)
+
     Write-Header 'Active Directory connection'
+    Write-Host '  All changes will be made on the domain PDC Emulator.' -ForegroundColor Gray
 
     $connected = $false
-    $attempt   = 0
-
     while (-not $connected) {
-        $attempt++
-        $server = $null
-
-        try {
-            $server = Resolve-DomainControllerHost
-            if ($server) {
-                Write-Host "  Discovered domain controller: $server" -ForegroundColor Gray
-            }
+        $hint = $null
+        if ($AllowHint) {
+            $hint = (Read-Host '  Press Enter for the current domain, or type a domain / DC name').Trim()
+            if ([string]::IsNullOrWhiteSpace($hint)) { $hint = $null }
         }
-        catch {
-            Write-Log "Domain controller auto-discovery failed: $($_.Exception.Message)" -Level WARN
-        }
-
-        $override = (Read-Host '  Press Enter to use this DC, or type a different DC/domain name').Trim()
-        if ($override) { $server = $override }
-
-        if (-not $server) {
-            Write-Log 'No domain controller specified.' -Level ERROR
-            if (-not (Read-YesNo -Prompt '  Try again?' -Default $true)) {
-                throw 'No domain controller available.'
-            }
-            continue
-        }
-
-        $script:ADParams = @{ Server = $server }
 
         if (Read-YesNo -Prompt '  Use alternate credentials?' -Default $false) {
             $cred = Get-Credential -Message 'Enter credentials with rights to modify AD user accounts'
             if ($cred) {
-                $script:ADParams['Credential'] = $cred
+                $script:ADParams = @{ Credential = $cred }
                 Write-Log "Using alternate credentials: $($cred.UserName)" -Level INFO
             }
             else {
+                $script:ADParams = @{}
                 Write-Log 'Credential prompt cancelled; connecting with the current security context.' -Level WARN
             }
         }
+        else {
+            $existingCred = $null
+            if ($script:ADParams -and $script:ADParams.ContainsKey('Credential')) {
+                $existingCred = $script:ADParams['Credential']
+            }
+            $script:ADParams = @{}
+            if ($existingCred) { $script:ADParams['Credential'] = $existingCred }
+        }
 
         try {
-            $domain = Invoke-ADOperation -OperationName 'Get-ADDomain' -ScriptBlock {
-                Get-ADDomain @script:ADParams -ErrorAction Stop
-            }
-            Write-Log "Connected to domain '$($domain.DNSRoot)' via DC '$server'." -Level SUCCESS
+            Write-Host '  Locating the PDC Emulator...' -ForegroundColor Gray
+            $info = Resolve-PdcEmulator -Hint $hint
+            Set-AdPdcTarget -PdcInfo $info
+            Write-Host "  Domain       : $($info.Domain)" -ForegroundColor Gray
+            Write-Host "  PDC Emulator : $($info.Server)" -ForegroundColor Green
+            Write-Log "Connected to domain '$($info.Domain)' via PDC Emulator '$($info.Server)'." -Level SUCCESS
             $connected = $true
         }
         catch {
-            Write-Log "Unable to connect to AD using '$server': $($_.Exception.Message)" -Level ERROR
-            if (-not (Read-YesNo -Prompt '  Try a different DC or credentials?' -Default $true)) {
+            Write-Log "Unable to locate or reach the PDC Emulator: $($_.Exception.Message)" -Level ERROR
+            if (-not (Read-YesNo -Prompt '  Try again (different domain or credentials)?' -Default $true)) {
                 throw
             }
+            $AllowHint = $true
         }
     }
 }
@@ -842,7 +920,9 @@ function Get-UserListFromCsv {
 function Get-AdUserSafe {
     param(
         [Parameter(Mandatory)][string]$InputValue,
-        [string]$ObjectGUID
+        [string]$ObjectGUID,
+        [string]$SID,
+        [string]$DistinguishedName
     )
 
     $properties = @(
@@ -865,6 +945,8 @@ function Get-AdUserSafe {
     if ($ObjectGUID -and [guid]::TryParse($ObjectGUID, [ref]$parsedGuid)) {
         & $addAttempt 'GUID' $parsedGuid $null
     }
+    if ($SID) { & $addAttempt 'SID' $SID $null }
+    if ($DistinguishedName) { & $addAttempt 'DN' $DistinguishedName $null }
 
     $parsed = ConvertTo-AdUserIdentity -Value $InputValue
     switch ($parsed.Kind) {
@@ -1171,6 +1253,7 @@ function Invoke-LogonScriptRemoval {
             Export-RunReport -Results $results -Prefix 'RemovalCancelled'
             return
         }
+        Confirm-ConnectedPdc | Out-Null
     }
 
     $backupFile = Join-Path $script:BackupFolder ("LogonScriptBackup_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
@@ -1284,8 +1367,19 @@ function Get-BackupEntries {
     param([Parameter(Mandatory)]$Rows)
 
     $usable = @($Rows | Where-Object {
-        -not [string]::IsNullOrWhiteSpace([string](Get-NotePropertyValue -Object $_ -Name 'SamAccountName')) -and
-        -not [string]::IsNullOrWhiteSpace([string](Get-NotePropertyValue -Object $_ -Name 'OriginalScriptPath'))
+        $sam  = [string](Get-NotePropertyValue -Object $_ -Name 'SamAccountName')
+        $orig = [string](Get-NotePropertyValue -Object $_ -Name 'OriginalScriptPath')
+        if ([string]::IsNullOrWhiteSpace($sam) -or [string]::IsNullOrWhiteSpace($orig)) { return $false }
+
+        # Allow a RemovalResults CSV as a revert source, but never replay
+        # dry-run / skip / failed rows that happen to have an original path.
+        $status = [string](Get-NotePropertyValue -Object $_ -Name 'Status')
+        if ($status) {
+            if ($status -like 'DryRun-*' -or $status -like 'Skipped-*' -or $status -like 'Failed-*') {
+                return $false
+            }
+        }
+        return $true
     })
 
     $grouped = $usable | Group-Object -Property SamAccountName
@@ -1298,6 +1392,117 @@ function Get-BackupEntries {
     }
     if ($null -eq $entries) { return , [object[]]@() }
     return , @($entries)
+}
+
+function Test-BackupEntryIdentityMatch {
+    param(
+        $Entry,
+        [Parameter(Mandatory)][string]$Identity
+    )
+
+    $parsed = ConvertTo-AdUserIdentity -Value $Identity
+    $keys = @(
+        [string](Get-NotePropertyValue -Object $Entry -Name 'SamAccountName')
+        [string](Get-NotePropertyValue -Object $Entry -Name 'UserPrincipalName')
+        [string](Get-NotePropertyValue -Object $Entry -Name 'DistinguishedName')
+        [string](Get-NotePropertyValue -Object $Entry -Name 'ObjectGUID')
+        [string](Get-NotePropertyValue -Object $Entry -Name 'SID')
+        [string](Get-NotePropertyValue -Object $Entry -Name 'InputIdentity')
+    )
+
+    foreach ($key in $keys) {
+        if ([string]::IsNullOrWhiteSpace($key)) { continue }
+        if (Test-ScriptPathEqual -Left $key -Right $Identity) { return $true }
+        if ($parsed.SamAccountName -and (Test-ScriptPathEqual -Left $key -Right $parsed.SamAccountName)) { return $true }
+        if ($parsed.UserPrincipalName -and (Test-ScriptPathEqual -Left $key -Right $parsed.UserPrincipalName)) { return $true }
+        if ($parsed.DistinguishedName -and (Test-ScriptPathEqual -Left $key -Right $parsed.DistinguishedName)) { return $true }
+        if ($parsed.SID -and (Test-ScriptPathEqual -Left $key -Right $parsed.SID)) { return $true }
+        if ($parsed.ObjectGUID -and (Test-ScriptPathEqual -Left $key -Right $parsed.ObjectGUID.ToString())) { return $true }
+    }
+    return $false
+}
+
+function Get-MatchingBackupEntries {
+    param(
+        [Parameter(Mandatory)]$Entries,
+        [Parameter(Mandatory)][string[]]$Identities
+    )
+
+    $wanted = @($Identities | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $matched = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in $Entries) {
+        foreach ($id in $wanted) {
+            if (Test-BackupEntryIdentityMatch -Entry $entry -Identity $id) {
+                $matched.Add($entry)
+                break
+            }
+        }
+    }
+
+    $unmatched = New-Object System.Collections.Generic.List[string]
+    foreach ($id in $wanted) {
+        $hit = $false
+        foreach ($entry in $matched) {
+            if (Test-BackupEntryIdentityMatch -Entry $entry -Identity $id) { $hit = $true; break }
+        }
+        if (-not $hit) { $unmatched.Add($id) }
+    }
+
+    return [pscustomobject]@{
+        Entries             = $matched.ToArray()
+        UnmatchedIdentities = $unmatched.ToArray()
+    }
+}
+
+function Select-BackupEntriesForRevert {
+    param([Parameter(Mandatory)]$Entries)
+
+    if ($Entries.Count -le 1) {
+        Write-Log ("Revert set contains {0} user(s)." -f $Entries.Count) -Level INFO
+        return , @($Entries)
+    }
+
+    Write-Host ''
+    Write-Host "  [A] Revert ALL $($Entries.Count) users in this file"
+    Write-Host '  [S] Select specific user(s) by name (one or many)'
+    Write-Host '  [F] Filter using another CSV of identities'
+    $scope = Read-Choice -Prompt '  Who should be reverted?' -ValidChoices @('A', 'S', 'F')
+
+    $wanted = $null
+    switch ($scope) {
+        'A' { return , @($Entries) }
+        'S' {
+            $typed = Read-Host '  Enter one or more identities (comma, semicolon or newline separated)'
+            $wanted = ConvertTo-IdentityTokenList -RawText $typed
+        }
+        'F' {
+            $filterPath = Select-CsvFile -Title 'Select CSV of users to revert from the backup' -InitialDirectory $script:ScriptRoot
+            if (-not $filterPath) {
+                Write-Log 'No filter file selected. Revert cancelled.' -Level WARN
+                return , [object[]]@()
+            }
+            $wanted = Get-UserListFromCsv -Path $filterPath
+        }
+    }
+
+    if ($null -eq $wanted -or $wanted.Count -eq 0) {
+        Write-Log 'No identities supplied for the revert filter.' -Level WARN
+        return , [object[]]@()
+    }
+
+    $match = Get-MatchingBackupEntries -Entries $Entries -Identities $wanted
+    foreach ($missing in @($match.UnmatchedIdentities)) {
+        Write-Log "[$missing] Not present in the backup file. Skipped." -Level WARN
+    }
+
+    $selected = @($match.Entries)
+    if ($selected.Count -eq 0) {
+        Write-Log 'None of the requested identities were found in the backup file.' -Level ERROR
+        return , [object[]]@()
+    }
+
+    Write-Log ("Revert filtered to {0} user(s) of {1}." -f $selected.Count, $Entries.Count) -Level INFO
+    return , $selected
 }
 
 function Invoke-LogonScriptRevert {
@@ -1342,7 +1547,13 @@ function Invoke-LogonScriptRevert {
         Write-Log ("Using {0} unique user(s) from {1} backup row(s). Duplicate identities keep the earliest RemovedOn value." -f $entries.Count, $rows.Count) -Level INFO
     }
 
-    Write-Host ("  Entries to revert: {0}" -f $entries.Count)
+    $entries = Select-BackupEntriesForRevert -Entries $entries
+    if ($entries.Count -eq 0) {
+        Write-Log 'No users selected for revert.' -Level WARN
+        return
+    }
+
+    Write-Host ("  Users selected to revert: {0}" -f $entries.Count)
     if (Read-YesNo -Prompt '  Show list of users that will be reverted?' -Default $true) {
         Show-ObjectPreview -Items $entries -Properties @('SamAccountName', 'OriginalScriptPath', 'RemovedOn') -MaxRows $script:PreviewRowLimit
     }
@@ -1369,6 +1580,7 @@ function Invoke-LogonScriptRevert {
             Write-Log 'Confirmation text did not match. Revert cancelled.' -Level WARN
             return
         }
+        Confirm-ConnectedPdc | Out-Null
     }
 
     Write-Log ("Revert {0} started. Conflict policy: {1}" -f $(if ($isDryRun) { 'DRY RUN' } else { 'LIVE RUN' }), $conflictPolicy) -Level $(if ($isDryRun) { 'DRYRUN' } else { 'INFO' })
@@ -1392,7 +1604,10 @@ function Invoke-LogonScriptRevert {
             $current = ''
 
             try {
-                $user = Get-AdUserSafe -InputValue $sam -ObjectGUID $(if ($hasGuid) { $guidText } else { $null })
+                $user = Get-AdUserSafe -InputValue $sam `
+                    -ObjectGUID $(if ($hasGuid) { $guidText } else { $null }) `
+                    -SID ([string](Get-NotePropertyValue -Object $entry -Name 'SID')) `
+                    -DistinguishedName ([string](Get-NotePropertyValue -Object $entry -Name 'DistinguishedName'))
                 $liveDn      = $user.DistinguishedName
                 $liveGuid    = $user.ObjectGUID.ToString()
                 $enabledText = [string](Get-NotePropertyValue -Object $user -Name 'Enabled')
@@ -1537,14 +1752,15 @@ function Open-OutputFolder {
 function Show-MainMenu {
     while ($true) {
         Write-Header 'AD Logon Script Manager'
-        Write-Host "  Domain controller : $($script:ADParams['Server'])"
+        Write-Host "  Domain            : $($script:DomainDnsRoot)"
+        Write-Host "  PDC Emulator      : $($script:PdcEmulator)"
         Write-Host "  Output folder     : $($script:OutputRoot)"
         Write-Host "  Log file          : $($script:LogFile)"
         Write-Host ''
         Write-Host '  [1] Remove logon scripts (select users CSV)'
         Write-Host '  [2] Revert logon scripts (select backup CSV)'
         Write-Host '  [3] Open output folder'
-        Write-Host '  [4] Change domain controller / credentials'
+        Write-Host '  [4] Re-discover PDC Emulator / change credentials'
         Write-Host '  [Q] Quit'
 
         $choice = Read-Choice -Prompt '  Select an option' -ValidChoices @('1', '2', '3', '4', 'Q')
@@ -1555,7 +1771,7 @@ function Show-MainMenu {
                 '1' { Invoke-LogonScriptRemoval }
                 '2' { Invoke-LogonScriptRevert }
                 '3' { Open-OutputFolder }
-                '4' { Initialize-ADConnection }
+                '4' { Initialize-ADConnection -AllowHint }
                 'Q' { return }
             }
         }
@@ -1668,6 +1884,25 @@ function Invoke-SelfTest {
     $jsmith  = @($deduped | Where-Object { $_.SamAccountName -eq 'jsmith' })[0]
     Assert-True -Condition ($deduped.Count -eq 2) -Name 'Get-BackupEntries drops blank identities and collapses duplicates'
     Assert-True -Condition ([string]$jsmith.OriginalScriptPath -eq 'old.bat') -Name 'Get-BackupEntries keeps the earliest RemovedOn value as the true original'
+
+    $singleBackup = Get-BackupEntries -Rows @([pscustomobject]@{ SamAccountName = 'onlyme'; OriginalScriptPath = 'one.bat'; RemovedOn = '2024-01-01T00:00:00' })
+    Assert-True -Condition ($singleBackup.Count -eq 1 -and $singleBackup[0].SamAccountName -eq 'onlyme') -Name 'Get-BackupEntries keeps a single-user backup as a one-element array'
+
+    $mixedStatus = Get-BackupEntries -Rows @(
+        [pscustomobject]@{ SamAccountName = 'keep'; OriginalScriptPath = 'a.bat'; Status = 'Removed' },
+        [pscustomobject]@{ SamAccountName = 'dry';  OriginalScriptPath = 'b.bat'; Status = 'DryRun-WouldRemove' },
+        [pscustomobject]@{ SamAccountName = 'skip'; OriginalScriptPath = 'c.bat'; Status = 'Skipped-NoLogonScript' }
+    )
+    Assert-True -Condition ($mixedStatus.Count -eq 1 -and $mixedStatus[0].SamAccountName -eq 'keep') -Name 'Get-BackupEntries ignores dry-run and skipped rows when a Status column is present'
+
+    $samList = ConvertTo-IdentityTokenList -RawText 'jsmith, ajones'
+    Assert-True -Condition ($samList.Count -eq 2 -and $samList[0] -eq 'jsmith' -and $samList[1] -eq 'ajones') -Name 'ConvertTo-IdentityTokenList splits comma-separated SAM names'
+    $dnList = ConvertTo-IdentityTokenList -RawText 'CN=John Smith,OU=Users,DC=contoso,DC=com'
+    Assert-True -Condition ($dnList.Count -eq 1 -and $dnList[0] -like 'CN=John Smith,*') -Name 'ConvertTo-IdentityTokenList does not split a distinguishedName on commas'
+
+    $filtered = Get-MatchingBackupEntries -Entries $deduped -Identities @('CONTOSO\jsmith', 'nobody')
+    Assert-True -Condition (@($filtered.Entries).Count -eq 1 -and $filtered.Entries[0].SamAccountName -eq 'jsmith') -Name 'Get-MatchingBackupEntries can revert one user out of a multi-user backup'
+    Assert-True -Condition (@($filtered.UnmatchedIdentities) -contains 'nobody') -Name 'Get-MatchingBackupEntries reports identities that are not in the backup'
 
     $tempCsv = Join-Path ([System.IO.Path]::GetTempPath()) ("logonscript-selftest-{0}.csv" -f [guid]::NewGuid().ToString('N'))
     try {
