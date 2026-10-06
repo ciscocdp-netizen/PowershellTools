@@ -1,70 +1,66 @@
-<#
-.SYNOPSIS
-    Event Log XML Analyzer - a WPF GUI for parsing Windows Event Log XML/EVTX exports
-    and surfacing probable root causes.
-
-.DESCRIPTION
-    Ingests Windows event log data exported as XML (or native .evtx) and turns it
-    into a readable, searchable and correlated view of what happened.
-
-    Supported input formats:
-      * Event Viewer  -> "Save All Events As..." -> XML (*.xml)  [UTF-8 or UTF-16]
-      * wevtutil qe <log> /f:xml   (multiple <Event> elements without a root)
-      * Get-WinEvent ... | ForEach-Object { $_.ToXml() }
-      * Native .evtx files (Windows only)
-      * Any XML file that contains <Event> elements using the standard schema
-      * Multiple files merged in one analysis (System + Application + Security)
-
-    Features:
-      * Dashboard with KPIs, level breakdown, top providers / event IDs, timeline
-      * Root-cause findings engine (crashes, unexpected shutdowns, service failures,
-        disk/hardware faults, brute-force logons, log tampering, Defender, recurring errors, bursts)
-      * Incident clustering: groups errors that happened close together and points
-        at the earliest event as the probable trigger
-      * Built-in knowledge base for common event IDs with explanation + fix
-      * Decoding of NTSTATUS / HRESULT / Win32 codes, logon types, bug check codes
-      * Full-text search and filtering, related-event correlation (+/- N minutes)
-      * Export to a styled HTML report, JSON, or CSV
-      * Drag-and-drop .xml / .evtx files onto the window
-      * Headless / CI mode with -NoGui and -SelfTest
-
-.PARAMETER Path
-    Optional .xml or .evtx file(s) to load on start-up. Multiple paths are merged.
-
-.PARAMETER NoGui
-    Run headless: parse the file and print findings to the console.
-
-.PARAMETER ReportPath
-    With -NoGui (or together with -Path), write a report. Extension selects format:
-    .html (default), .json, .csv
-
-.PARAMETER CorrelationMinutes
-    Window (in minutes) used for incident clustering and related events. Default 5.
-
-.PARAMETER MaxEvents
-    Maximum events to read from a .evtx file or a live capture. 0 = no limit for XML.
-    Default 5000 for .evtx / live capture.
-
-.PARAMETER SelfTest
-    Generate fixture logs, parse them, and assert the analysis engine. Exit 0/1.
-
-.EXAMPLE
-    .\EventLogAnalyzer.ps1
-.EXAMPLE
-    .\EventLogAnalyzer.ps1 -Path C:\Temp\System.xml
-.EXAMPLE
-    .\EventLogAnalyzer.ps1 -Path C:\Temp\System.xml,C:\Temp\Application.xml -NoGui -ReportPath C:\Temp\report.html
-.EXAMPLE
-    .\EventLogAnalyzer.ps1 -SelfTest
-
-.NOTES
-    Version 1.2.0
-    Requires Windows PowerShell 5.1 (or PowerShell 7+) on Windows for the GUI.
-    Headless analysis (-NoGui / -SelfTest) also runs on PowerShell 7 on other OS.
-    If script execution is blocked, run:
-        powershell.exe -ExecutionPolicy Bypass -File .\EventLogAnalyzer.ps1
-#>
+# .SYNOPSIS
+#   WPF GUI that parses Windows Event Log XML and EVTX exports and surfaces
+#   probable root causes.
+#
+# .DESCRIPTION
+#   Ingests Windows event log data exported as XML or native EVTX and turns it
+#   into a readable, searchable and correlated view of what happened.
+#
+#   Supported input formats:
+#     - Event Viewer, Save All Events As, XML (UTF-8 or UTF-16)
+#     - wevtutil qe LOGNAME /f:xml  (Event elements with or without a root)
+#     - Get-WinEvent piped to ForEach-Object ToXml()
+#     - Native EVTX files (Windows only)
+#     - Any XML file that contains Event elements using the standard schema
+#     - Multiple files merged in one analysis (System, Application, Security)
+#
+#   Features:
+#     - Dashboard with KPIs, level breakdown, top providers / event IDs, timeline
+#     - Root-cause findings: crashes, unexpected shutdowns, service failures,
+#       disk/hardware faults, brute-force logons, log tampering, Defender,
+#       recurring errors, bursts
+#     - Incident clustering of errors that occurred close together, using the
+#       earliest event as the probable trigger
+#     - Built-in knowledge base for common event IDs with explanation and fix
+#     - Decoding of NTSTATUS / HRESULT / Win32 codes, logon types, bug check codes
+#     - Full-text search and filtering, related-event correlation (plus/minus N minutes)
+#     - Export to a styled HTML report, JSON, or CSV
+#     - Drag-and-drop .xml / .evtx files onto the window
+#     - Headless / CI mode with -NoGui and -SelfTest
+#
+# .PARAMETER Path
+#   Optional .xml or .evtx file(s) to load on start-up. Multiple paths are merged.
+# .PARAMETER NoGui
+#   Run headless: parse the file and print findings to the console.
+# .PARAMETER ReportPath
+#   With -NoGui (or together with -Path), write a report. Extension selects format:
+#   .html (default), .json, .csv
+# .PARAMETER CorrelationMinutes
+#   Window in minutes used for incident clustering and related events. Default 5.
+# .PARAMETER MaxEvents
+#   Maximum events to read from an EVTX file or a live capture. 0 = no limit for XML.
+#   Default 5000 for EVTX / live capture.
+# .PARAMETER SelfTest
+#   Generate fixture logs, parse them, and assert the analysis engine. Exit 0/1.
+#
+# .EXAMPLE
+#   .\EventLogAnalyzer.ps1
+# .EXAMPLE
+#   .\EventLogAnalyzer.ps1 -Path C:\Temp\System.xml
+# .EXAMPLE
+#   .\EventLogAnalyzer.ps1 -Path C:\Temp\System.xml,C:\Temp\Application.xml -NoGui -ReportPath C:\Temp\report.html
+# .EXAMPLE
+#   .\EventLogAnalyzer.ps1 -SelfTest
+#
+# .NOTES
+#   Version 1.2.1
+#   Requires Windows PowerShell 5.1 or PowerShell 7+ on Windows for the GUI.
+#   Headless analysis (-NoGui / -SelfTest) also runs on PowerShell 7 on other OS.
+#   When script execution is blocked:
+#     powershell.exe -ExecutionPolicy Bypass -File .\EventLogAnalyzer.ps1
+#
 #Requires -Version 5.1
+
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
@@ -87,7 +83,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:AppName    = 'Event Log XML Analyzer'
-$script:AppVersion = '1.2.0'
+$script:AppVersion = '1.2.1'
 $script:IsWindowsOS = [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
 
 function Get-HostExecutable {
