@@ -1,0 +1,153 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Sample Event Viewer-style export for EventLogAnalyzer.ps1.
+     Includes crashes, unexpected reboot, disk faults, failed logons, and log clearing. -->
+<Events>
+  <Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+    <System>
+      <Provider Name="disk"/>
+      <EventID>7</EventID>
+      <Level>2</Level>
+      <TimeCreated SystemTime="2024-06-15T14:00:01.0000000Z"/>
+      <EventRecordID>1001</EventRecordID>
+      <Channel>System</Channel>
+      <Computer>TEST-PC</Computer>
+      <Security UserID="S-1-5-18"/>
+    </System>
+    <EventData>
+      <Data Name="DeviceName">\Device\Harddisk0\DR0</Data>
+    </EventData>
+    <RenderingInfo Culture="en-US"><Message>The device, \Device\Harddisk0\DR0, has a bad block.</Message></RenderingInfo>
+  </Event>
+  <Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+    <System>
+      <Provider Name="Microsoft-Windows-Ntfs"/>
+      <EventID>55</EventID>
+      <Level>2</Level>
+      <TimeCreated SystemTime="2024-06-15T14:00:05.0000000Z"/>
+      <EventRecordID>1002</EventRecordID>
+      <Channel>System</Channel>
+      <Computer>TEST-PC</Computer>
+      <Security/>
+    </System>
+    <EventData>
+      <Data Name="DriveName">C:</Data>
+    </EventData>
+    <RenderingInfo Culture="en-US"><Message>The file system structure on the disk is corrupt and unusable.</Message></RenderingInfo>
+  </Event>
+  <Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+    <System>
+      <Provider Name="Application Error"/>
+      <EventID>1000</EventID>
+      <Level>2</Level>
+      <TimeCreated SystemTime="2024-06-15T14:00:20.0000000Z"/>
+      <EventRecordID>1003</EventRecordID>
+      <Channel>Application</Channel>
+      <Computer>TEST-PC</Computer>
+      <Security/>
+    </System>
+    <EventData>
+      <Data Name="AppName">sqlservr.exe</Data>
+      <Data Name="ModuleName">ntdll.dll</Data>
+      <Data Name="ExceptionCode">c0000005</Data>
+    </EventData>
+    <RenderingInfo Culture="en-US"><Message>Faulting application name: sqlservr.exe, Faulting module name: ntdll.dll, Exception code: 0xc0000005</Message></RenderingInfo>
+  </Event>
+  <Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+    <System>
+      <Provider Name="Microsoft-Windows-Kernel-Power"/>
+      <EventID>41</EventID>
+      <Level>1</Level>
+      <TimeCreated SystemTime="2024-06-15T14:02:00.0000000Z"/>
+      <EventRecordID>1004</EventRecordID>
+      <Channel>System</Channel>
+      <Computer>TEST-PC</Computer>
+      <Security/>
+    </System>
+    <EventData>
+      <Data Name="BugcheckCode">10</Data>
+      <Data Name="BugcheckParameter1">0</Data>
+    </EventData>
+    <RenderingInfo Culture="en-US"><Message>The system has rebooted without cleanly shutting down first.</Message></RenderingInfo>
+  </Event>
+  <Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+    <System>
+      <Provider Name="EventLog"/>
+      <EventID>6008</EventID>
+      <Level>2</Level>
+      <TimeCreated SystemTime="2024-06-15T14:02:05.0000000Z"/>
+      <EventRecordID>1005</EventRecordID>
+      <Channel>System</Channel>
+      <Computer>TEST-PC</Computer>
+      <Security/>
+    </System>
+    <RenderingInfo Culture="en-US"><Message>The previous system shutdown was unexpected.</Message></RenderingInfo>
+  </Event>
+  <Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+    <System>
+      <Provider Name="Microsoft-Windows-WHEA-Logger"/>
+      <EventID>18</EventID>
+      <Level>1</Level>
+      <TimeCreated SystemTime="2024-06-15T14:01:00.0000000Z"/>
+      <EventRecordID>1006</EventRecordID>
+      <Channel>System</Channel>
+      <Computer>TEST-PC</Computer>
+      <Security/>
+    </System>
+    <RenderingInfo Culture="en-US"><Message>A fatal hardware error has occurred. Component: Processor.</Message></RenderingInfo>
+  </Event>
+  <Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+    <System>
+      <Provider Name="Microsoft-Windows-Security-Auditing"/>
+      <EventID>4625</EventID>
+      <Level>4</Level>
+      <Keywords>0x8010000000000000</Keywords>
+      <TimeCreated SystemTime="2024-06-15T14:10:01.0000000Z"/>
+      <EventRecordID>2001</EventRecordID>
+      <Channel>Security</Channel>
+      <Computer>TEST-PC</Computer>
+      <Security/>
+    </System>
+    <EventData>
+      <Data Name="TargetUserName">alice</Data>
+      <Data Name="IpAddress">203.0.113.50</Data>
+      <Data Name="Status">0xC000006D</Data>
+      <Data Name="SubStatus">0xC0000064</Data>
+      <Data Name="LogonType">3</Data>
+    </EventData>
+    <RenderingInfo Culture="en-US"><Message>An account failed to log on.</Message></RenderingInfo>
+  </Event>
+  <Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+    <System>
+      <Provider Name="Microsoft-Windows-Security-Auditing"/>
+      <EventID>1102</EventID>
+      <Level>4</Level>
+      <Keywords>0x8010000000000000</Keywords>
+      <TimeCreated SystemTime="2024-06-15T14:08:00.0000000Z"/>
+      <EventRecordID>2002</EventRecordID>
+      <Channel>Security</Channel>
+      <Computer>TEST-PC</Computer>
+      <Security/>
+    </System>
+    <EventData>
+      <Data Name="SubjectUserName">badactor</Data>
+    </EventData>
+    <RenderingInfo Culture="en-US"><Message>The audit log was cleared.</Message></RenderingInfo>
+  </Event>
+  <Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+    <System>
+      <Provider Name="Service Control Manager"/>
+      <EventID>7045</EventID>
+      <Level>4</Level>
+      <TimeCreated SystemTime="2024-06-15T14:04:00.0000000Z"/>
+      <EventRecordID>1007</EventRecordID>
+      <Channel>System</Channel>
+      <Computer>TEST-PC</Computer>
+      <Security/>
+    </System>
+    <EventData>
+      <Data Name="ServiceName">UpdHelper</Data>
+      <Data Name="ImagePath">C:\Users\Public\upd.exe</Data>
+    </EventData>
+    <RenderingInfo Culture="en-US"><Message>A service was installed in the system.</Message></RenderingInfo>
+  </Event>
+</Events>
