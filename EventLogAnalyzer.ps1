@@ -53,7 +53,7 @@
 #   .\EventLogAnalyzer.ps1 -SelfTest
 #
 # .NOTES
-#   Version 1.2.1
+#   Version 1.2.2
 #   Requires Windows PowerShell 5.1 or PowerShell 7+ on Windows for the GUI.
 #   Headless analysis (-NoGui / -SelfTest) also runs on PowerShell 7 on other OS.
 #   When script execution is blocked:
@@ -83,7 +83,8 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:AppName    = 'Event Log XML Analyzer'
-$script:AppVersion = '1.2.1'
+$script:AppVersion = '1.2.2'
+$script:LastImportSkipped = 0
 $script:IsWindowsOS = [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
 
 function Get-HostExecutable {
@@ -795,9 +796,85 @@ function ConvertTo-ParsedEvent {
     }
 }
 
+function Repair-XmlText {
+    param([string]$Xml)
+    if ([string]::IsNullOrEmpty($Xml)) { return $Xml }
+    $t = Remove-InvalidXmlChars $Xml
+    # Bare ampersands in event messages/command lines (not already entities).
+    return [regex]::Replace($t, '&(?!(?:amp|lt|gt|quot|apos|#(?:\d+|x[0-9A-Fa-f]+));)', '&amp;')
+}
+
+function Test-XmlEventTagBoundary {
+    param([string]$Text, [int]$AfterName)
+    if ($AfterName -ge $Text.Length) { return $false }
+    $c = $Text[$AfterName]
+    return ($c -eq [char]32 -or $c -eq [char]9 -or $c -eq [char]10 -or $c -eq [char]13 -or $c -eq [char]'>' -or $c -eq [char]'/')
+}
+
+function Get-XmlEventChunks {
+    <#
+        Pull complete Event elements out of a possibly truncated export.
+        Skips <Events>/<EventData>/<EventID>. An unclosed last event is skipped.
+        Always returns a string[] so StrictMode .Length/.Count is safe.
+    #>
+    param([string]$Text)
+    $chunks = New-Object System.Collections.Generic.List[string]
+    if ([string]::IsNullOrEmpty($Text)) { return ,[string[]]@() }
+    $s = $Text
+    $n = $s.Length
+    $i = 0
+    while ($i -lt $n) {
+        $start = -1
+        $p = $s.IndexOf('<Event', $i, [StringComparison]::OrdinalIgnoreCase)
+        $pNs = $s.IndexOf(':Event', $i, [StringComparison]::OrdinalIgnoreCase)
+
+        if ($p -ge 0 -and (Test-XmlEventTagBoundary -Text $s -AfterName ($p + 6))) {
+            $start = $p
+        }
+        if ($pNs -gt 0 -and (Test-XmlEventTagBoundary -Text $s -AfterName ($pNs + 6))) {
+            $lt = $s.LastIndexOf('<', $pNs)
+            if ($lt -ge $i -and ($start -lt 0 -or $lt -lt $start) -and ($lt + 1 -ge $n -or $s[$lt + 1] -ne [char]'/')) {
+                $start = $lt
+            }
+        }
+
+        if ($start -lt 0) {
+            # <Events>, <EventData>, <EventID> etc. Advance past the false hit.
+            $advance = -1
+            if ($p -ge 0) { $advance = $p + 6 }
+            if ($pNs -ge 0 -and ($advance -lt 0 -or ($pNs + 6) -lt $advance)) { $advance = $pNs + 6 }
+            if ($advance -lt 0) { break }
+            $i = $advance
+            continue
+        }
+
+        $search = $start + 6
+        $end = -1
+        $e = $s.IndexOf('</Event>', $search, [StringComparison]::OrdinalIgnoreCase)
+        $eNs = $s.IndexOf(':Event>', $search, [StringComparison]::OrdinalIgnoreCase)
+        if ($e -ge 0) { $end = $e + 8 }
+        if ($eNs -ge 0) {
+            $slash = $s.LastIndexOf('</', $eNs)
+            if ($slash -ge $search -and $slash -lt $eNs) {
+                $endNs = $eNs + 7
+                if ($end -lt 0 -or $endNs -lt $end) { $end = $endNs }
+            }
+        }
+        if ($end -gt $start) {
+            [void]$chunks.Add($s.Substring($start, $end - $start))
+            $i = $end
+        }
+        else {
+            $script:LastImportSkipped++
+            break
+        }
+    }
+    return ,$chunks.ToArray()
+}
+
 function Convert-EventXmlString {
     param([string]$Xml, [int]$Index, [string]$MessageOverride)
-    $clean = Remove-InvalidXmlChars $Xml
+    $clean = Repair-XmlText $Xml
     $doc = New-Object System.Xml.XmlDocument
     $doc.XmlResolver = $null
     $doc.LoadXml($clean)
@@ -814,36 +891,31 @@ function Convert-EventXmlString {
 
 function Import-EventsFromXmlText {
     param([string]$Raw, [int]$StartIndex = 0, [scriptblock]$OnProgress)
-    $clean = Remove-InvalidXmlChars $Raw
+    $clean = Repair-XmlText $Raw
     $clean = [regex]::Replace($clean, '<\?xml[^>]*\?>', '')
-    if ($clean -notmatch '(?s)<\s*[\w\-.]+:?EventLogAnalyzerRoot') {
-        $clean = "<EventLogAnalyzerRoot>$clean</EventLogAnalyzerRoot>"
-    }
-    $settings = New-XmlReaderSettings
-    $doc = New-Object System.Xml.XmlDocument
-    $doc.XmlResolver = $null
-    $reader = $null
-    try {
-        $reader = [System.Xml.XmlReader]::Create((New-Object System.IO.StringReader($clean)), $settings)
-        $doc.Load($reader)
-    }
-    finally {
-        if ($reader) { $reader.Close() }
-    }
-    $nodes = $doc.SelectNodes("//*[local-name()='Event' and *[local-name()='System']]")
+    $chunks = Get-XmlEventChunks -Text $clean
     $list = New-Object System.Collections.Generic.List[object]
-    if ($null -eq $nodes) { return $list }
-    $total = $nodes.Count
+    $total = 0
+    if ($null -ne $chunks) { $total = $chunks.Length }
     $i = $StartIndex
-    foreach ($n in $nodes) {
-        $i++
-        try { $list.Add((ConvertTo-ParsedEvent -EventNode $n -Index $i)) }
-        catch { Write-Verbose "Skipping malformed event #$i : $($_.Exception.Message)" }
-        if ($OnProgress -and ($i % 250 -eq 0 -or ($i - $StartIndex) -eq $total)) {
-            & $OnProgress $i $total
+    $skipped = 0
+    if ($total -gt 0) {
+        foreach ($chunk in $chunks) {
+            $i++
+            try {
+                $list.Add((Convert-EventXmlString -Xml $chunk -Index $i))
+            }
+            catch {
+                $skipped++
+                Write-Verbose "Skipping malformed event #$i : $($_.Exception.Message)"
+            }
+            if ($OnProgress -and ($i % 250 -eq 0 -or ($i - $StartIndex) -eq $total)) {
+                & $OnProgress $i $total
+            }
         }
     }
-    return $list
+    $script:LastImportSkipped += $skipped
+    return ,$list.ToArray()
 }
 
 function Import-EventsFromXmlFile {
@@ -857,6 +929,8 @@ function Import-EventsFromXmlFile {
     $list = New-Object System.Collections.Generic.List[object]
     $index = $StartIndex
     $fileLen = [math]::Max(1L, (Get-Item -LiteralPath $FilePath).Length)
+    $streamedOk = $false
+    $aborted = $false
     $stream = $null
     $xmlReader = $null
     try {
@@ -866,32 +940,54 @@ function Import-EventsFromXmlFile {
         while ($xmlReader.Read()) {
             if ($xmlReader.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
             if ($xmlReader.LocalName -ne 'Event') { continue }
-            $outer = $xmlReader.ReadOuterXml()
+            $outer = $null
+            try { $outer = $xmlReader.ReadOuterXml() }
+            catch {
+                $script:LastImportSkipped++
+                $aborted = $true
+                Write-Verbose "XmlReader skipped a malformed Event: $($_.Exception.Message)"
+                break
+            }
             if ([string]::IsNullOrWhiteSpace($outer)) { continue }
             if ($outer.IndexOf('System', [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
             $index++
             try { $list.Add((Convert-EventXmlString -Xml $outer -Index $index)) }
-            catch { Write-Verbose "Skipping malformed event #$index : $($_.Exception.Message)" }
+            catch {
+                $script:LastImportSkipped++
+                Write-Verbose "Skipping malformed event #$index : $($_.Exception.Message)"
+            }
             if ($OnProgress -and ($index % 200 -eq 0)) {
                 $guess = [int][math]::Max($index, $index / [math]::Max(0.05, ($stream.Position / $fileLen)))
                 & $OnProgress $index $guess
             }
         }
+        if (-not $aborted) { $streamedOk = $true }
     }
     catch {
-        Write-Verbose "Streaming XML parse failed, falling back to wrap: $($_.Exception.Message)"
-        $raw = [System.IO.File]::ReadAllText($FilePath, $encoding)
-        $list = Import-EventsFromXmlText -Raw $raw -StartIndex $StartIndex -OnProgress $OnProgress
+        Write-Verbose "Streaming XML parse failed, falling back to per-event extract: $($_.Exception.Message)"
+        $streamedOk = $false
     }
     finally {
         if ($xmlReader) { try { $xmlReader.Close() } catch { } }
         if ($stream) { try { $stream.Dispose() } catch { } }
     }
-    if ($list.Count -eq 0) {
-        $raw = [System.IO.File]::ReadAllText($FilePath, $encoding)
-        $list = Import-EventsFromXmlText -Raw $raw -StartIndex $StartIndex -OnProgress $OnProgress
+    # Never wrap the whole file in a synthetic root: one truncated Data element fails everything.
+    # Fall back to per-event extract when the stream aborts (bare &, invalid chars, truncated tail)
+    # so later events are not lost. Keep streamed events if extract finds fewer.
+    if (-not $streamedOk -or $list.Count -eq 0) {
+        try {
+            $raw = [System.IO.File]::ReadAllText($FilePath, $encoding)
+            $recovered = Import-EventsFromXmlText -Raw $raw -StartIndex $StartIndex -OnProgress $OnProgress
+            $recCount = 0
+            if ($null -ne $recovered) { $recCount = $recovered.Length }
+            if ($recCount -ge $list.Count) { return ,$recovered }
+        }
+        catch {
+            Write-Verbose "Per-event extract fallback failed: $($_.Exception.Message)"
+            if ($list.Count -eq 0) { throw }
+        }
     }
-    return $list
+    return ,$list.ToArray()
 }
 
 function Import-EventsFromEvtx {
@@ -924,7 +1020,7 @@ function Import-EventsFromEvtx {
             & $OnProgress $index $total
         }
     }
-    return $list
+    return ,$list.ToArray()
 }
 
 function Import-EventLogXml {
@@ -935,6 +1031,7 @@ function Import-EventLogXml {
     )
     $list = New-Object System.Collections.Generic.List[object]
     $index = 0
+    $script:LastImportSkipped = 0
     foreach ($fp in @($FilePath)) {
         if ([string]::IsNullOrWhiteSpace($fp)) { continue }
         if (-not (Test-Path -LiteralPath $fp)) { throw "File not found: $fp" }
@@ -947,11 +1044,17 @@ function Import-EventLogXml {
         else {
             $chunk = Import-EventsFromXmlFile -FilePath $resolved -StartIndex $index -OnProgress $OnProgress
         }
-        foreach ($e in $chunk) { $list.Add($e) }
+        if ($null -ne $chunk) {
+            foreach ($e in $chunk) {
+                if ($null -ne $e) { $list.Add($e) }
+            }
+        }
         $index = $list.Count
         if ($Limit -gt 0 -and $list.Count -ge $Limit) { break }
     }
-    if ($list.Count -eq 0) { throw 'No <Event> elements with a <System> section were found in this file.' }
+    if ($list.Count -eq 0) {
+        throw 'No complete Event elements with a System section were found. The file may be truncated, still syncing (OneDrive), or not an Event Viewer XML/EVTX export.'
+    }
     $sorted = @($list | Sort-Object -Property Time, Index)
     return ,$sorted
 }
@@ -1695,7 +1798,7 @@ function Invoke-AnalyzerSelfTest {
         $u16 = Import-EventLogXml -FilePath $utf16Path
         Assert-True ($u16.Count -eq $events.Count) "UTF-16 XML parses ($($u16.Count))"
         $bad = Import-EventLogXml -FilePath $badPath
-        Assert-True ($bad.Count -ge $events.Count) "Invalid XML chars do not abort parse ($($bad.Count))"
+        Assert-True ($bad.Count -eq ($events.Count + 1)) "Invalid XML chars do not abort parse ($($bad.Count))"
 
         $merged = Import-EventLogXml -FilePath @($xmlPath, $fragPath)
         Assert-True ($merged.Count -eq ($events.Count * 2)) "Multiple files merge ($($merged.Count))"
@@ -1707,6 +1810,29 @@ function Invoke-AnalyzerSelfTest {
         Assert-True ($html -match 'Root-cause findings' -and $html -match 'Unexpected') 'HTML report written'
         Assert-True ($html -notmatch '<script>alert') 'HTML encodes content'
         Assert-True ($json -match '"HealthScore"' -and $json -match 'Findings') 'JSON report written'
+
+        $truncPath = Join-Path $dir 'truncated.xml'
+        $goodXml = New-SampleEventLogXml
+        $truncatedEvent = '<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><Provider Name="disk"/><EventID>7</EventID><Level>2</Level></System><EventData><Data Name="DeviceName">\Device\Harddisk0\DR0'
+        $eventsCloseAt = $goodXml.LastIndexOf('</Events>')
+        # Cut inside the Events root with an unclosed Data tag — the Event Viewer / OneDrive case.
+        $truncatedXml = if ($eventsCloseAt -ge 0) { $goodXml.Substring(0, $eventsCloseAt) + $truncatedEvent } else { $goodXml.TrimEnd() + "`n$truncatedEvent" }
+        [System.IO.File]::WriteAllText($truncPath, $truncatedXml, (New-Object System.Text.UTF8Encoding $false))
+        $trunc = Import-EventLogXml -FilePath $truncPath
+        Assert-True ($trunc.Count -eq $events.Count) "Truncated trailing Event does not abort parse ($($trunc.Count))"
+
+        $utf16TruncPath = Join-Path $dir 'truncated-utf16.xml'
+        [System.IO.File]::WriteAllText($utf16TruncPath, $truncatedXml, [System.Text.Encoding]::Unicode)
+        $u16trunc = Import-EventLogXml -FilePath $utf16TruncPath
+        Assert-True ($u16trunc.Count -eq $events.Count) "Truncated UTF-16 Events export does not abort parse ($($u16trunc.Count))"
+
+        $ampPath = Join-Path $dir 'ampersand.xml'
+        $ampEvent = '<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><Provider Name="disk"/><EventID>11</EventID><Level>2</Level><TimeCreated SystemTime="2024-06-15T14:00:02.0000000Z"/><Channel>System</Channel><Computer>TEST-PC</Computer></System><EventData><Data Name="param1">cmd /c dir & echo done</Data></EventData></Event>'
+        $ampInsertAt = $goodXml.LastIndexOf('</Events>')
+        $ampXml = if ($ampInsertAt -ge 0) { $goodXml.Insert($ampInsertAt, $ampEvent) } else { $goodXml + $ampEvent }
+        [System.IO.File]::WriteAllText($ampPath, $ampXml, (New-Object System.Text.UTF8Encoding $false))
+        $amp = Import-EventLogXml -FilePath $ampPath
+        Assert-True ($amp.Count -eq ($events.Count + 1)) "Bare ampersand in Data does not abort parse ($($amp.Count))"
 
         $emptyPath = Join-Path $dir 'empty.xml'
         [System.IO.File]::WriteAllText($emptyPath, '<root><hello/></root>')
@@ -3013,7 +3139,8 @@ function Complete-LoadedAnalysis {
     $script:Window.Title = "$script:AppName - $titleLeaf"
     if ($Stopwatch) { $Stopwatch.Stop() }
     $secs = if ($Stopwatch) { $Stopwatch.Elapsed.TotalSeconds } else { 0 }
-    Set-Status ('Loaded {0:N0} events, {1} finding(s), {2} incident(s) in {3:N1} s' -f $Events.Count, @($Analysis.Findings).Count, @($Analysis.Incidents).Count, $secs)
+    $skipNote = if ($script:LastImportSkipped -gt 0) { '; skipped {0} malformed/truncated event(s)' -f $script:LastImportSkipped } else { '' }
+    Set-Status (('Loaded {0:N0} events, {1} finding(s), {2} incident(s) in {3:N1} s' -f $Events.Count, @($Analysis.Findings).Count, @($Analysis.Incidents).Count, $secs) + $skipNote)
 }
 
 function Import-AndAnalyze {

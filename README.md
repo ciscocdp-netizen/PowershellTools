@@ -14,7 +14,7 @@ powershell.exe -ExecutionPolicy Bypass -File .\EventLogAnalyzer.ps1
 .\EventLogAnalyzer.ps1 -Path C:\Temp\System.xml
 ```
 
-Supports Event Viewer "Save All Events As... XML" (UTF-8 or UTF-16), `wevtutil qe /f:xml` fragments, native `.evtx`, drag-and-drop, and merging several logs in one pass.
+Supports Event Viewer "Save All Events As... XML" (UTF-8 or UTF-16), `wevtutil qe /f:xml` fragments, native `.evtx`, drag-and-drop, and merging several logs in one pass. Incomplete last events (truncated exports, OneDrive placeholders, unescaped `&` in Data) are skipped so the rest of the log still loads.
 
 ### Headless / report
 
