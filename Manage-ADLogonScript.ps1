@@ -212,6 +212,40 @@ function ConvertTo-CleanIdentityValue {
     return $clean.Trim()
 }
 
+function Test-ConfirmationPhrase {
+    param(
+        [AllowEmptyString()][string]$Typed,
+        [Parameter(Mandatory)][string]$Expected
+    )
+    $clean = ConvertTo-CleanIdentityValue -Value $Typed
+    return [string]::Equals($clean, $Expected, [System.StringComparison]::Ordinal)
+}
+
+function Read-ConfirmPhrase {
+    param(
+        [Parameter(Mandatory)][string]$Prompt,
+        [Parameter(Mandatory)][string]$Expected,
+        [Parameter(Mandatory)][string]$ActionName
+    )
+
+    $last = ''
+    for ($try = 1; $try -le 2; $try++) {
+        $last = ConvertTo-CleanIdentityValue -Value (Read-Host $Prompt)
+        if (Test-ConfirmationPhrase -Typed $last -Expected $Expected) { return $true }
+
+        if ([string]::Equals($last, $Expected, [System.StringComparison]::OrdinalIgnoreCase)) {
+            Write-Host ("  It must be exactly {0} in capital letters. You typed '{1}'." -f $Expected, $last) -ForegroundColor Yellow
+        }
+        else {
+            Write-Host ("  Type {0} exactly. Received '{1}' ({2} character(s))." -f $Expected, $last, $last.Length) -ForegroundColor Yellow
+        }
+        if ($try -lt 2) { Write-Host '  Try again.' -ForegroundColor Yellow }
+    }
+
+    Write-Log ("{0} cancelled: confirmation did not match (received '{1}', length {2}; expected '{3}')." -f $ActionName, $last, $last.Length, $Expected) -Level WARN
+    return $false
+}
+
 function ConvertTo-ChoiceIndexList {
     param([Parameter(Mandatory)][int]$Count)
 
@@ -1446,9 +1480,8 @@ function Invoke-LogonScriptRemoval {
 
     $isDryRun = ($mode -eq 'D')
     if (-not $isDryRun) {
-        $confirm = Read-Host "  Type REMOVE to confirm clearing the logon script on $($candidates.Count) user(s)"
-        if ($confirm -cne 'REMOVE') {
-            Write-Log 'Confirmation text did not match. Removal cancelled.' -Level WARN
+        $ok = Read-ConfirmPhrase -Prompt ("  Type REMOVE to confirm clearing the logon script on {0} user(s)" -f $candidates.Count) -Expected 'REMOVE' -ActionName 'Removal'
+        if (-not $ok) {
             Export-RunReport -Results $results -Prefix 'RemovalCancelled'
             return
         }
@@ -1774,9 +1807,8 @@ function Invoke-LogonScriptRevert {
 
     $isDryRun = ($mode -eq 'D')
     if (-not $isDryRun) {
-        $confirm = Read-Host "  Type REVERT to confirm restoring logon scripts on $($entries.Count) user(s)"
-        if ($confirm -cne 'REVERT') {
-            Write-Log 'Confirmation text did not match. Revert cancelled.' -Level WARN
+        $ok = Read-ConfirmPhrase -Prompt ("  Type REVERT to confirm restoring logon scripts on {0} user(s)" -f $entries.Count) -Expected 'REVERT' -ActionName 'Revert'
+        if (-not $ok) {
             return
         }
         Confirm-ConnectedPdc | Out-Null
@@ -2054,6 +2086,8 @@ function Invoke-SelfTest {
 
     Assert-True -Condition ((ConvertTo-EscapedAdFilterString -Value "O'Brien") -eq "O''Brien") -Name 'ConvertTo-EscapedAdFilterString doubles single quotes'
     Assert-True -Condition ((ConvertTo-CleanIdentityValue -Value "  `"aalosman`"  ") -eq 'aalosman') -Name 'ConvertTo-CleanIdentityValue trims quotes and whitespace'
+    Assert-True -Condition (Test-ConfirmationPhrase -Typed " REMOVE`r " -Expected 'REMOVE') -Name 'Test-ConfirmationPhrase accepts REMOVE with trailing whitespace/CR'
+    Assert-True -Condition (-not (Test-ConfirmationPhrase -Typed 'remove' -Expected 'REMOVE')) -Name 'Test-ConfirmationPhrase still requires capital REMOVE'
 
     $propertyMissing = New-Object System.Management.Automation.ErrorRecord (
         (New-Object System.ArgumentException "The property 'Filter' cannot be found on this object. Verify that the property exists."),
