@@ -89,6 +89,9 @@
       - DC discovery did not require ADWS (needed by the AD module).
       - Discovery picked any writable DC instead of the PDC Emulator, so
         verify/revert could read a replica that had not yet received the write.
+      - Get-ADUser ran inside a retry helper that reused the variable name
+        `$attempt`, so every lookup read the retry counter (1, 2, 3) instead of
+        the user identity and was mis-reported as "User not found".
 
 .EXAMPLE
     .\Manage-ADLogonScript.ps1
@@ -131,7 +134,7 @@ $script:LargeSetWarningThreshold = 1000
 $script:PreviewRowLimit = 100
 
 $script:IdentityColumnAliases = @(
-    'SamAccountName', 'sAMAccountName', 'SAMAccountName', 'SAM',
+    'SamAccountName', 'sAMAccountName', 'SAMAccountName', 'SAMAccount', 'SAM',
     'Username', 'UserName', 'User', 'Account', 'AccountName',
     'Login', 'LoginName', 'LogonName', 'Identity'
 )
@@ -196,6 +199,17 @@ function ConvertTo-EscapedAdFilterString {
 
     if ($null -eq $Value) { return '' }
     return $Value.Replace("'", "''")
+}
+
+function ConvertTo-CleanIdentityValue {
+    param([AllowEmptyString()][string]$Value)
+
+    if ($null -eq $Value) { return '' }
+    $clean = $Value.Trim().Trim('"')
+    $clean = $clean -replace "^\uFEFF", ''
+    $clean = $clean -replace '\u00A0', ' '
+    $clean = $clean -replace '[\u200B-\u200D\u2060]', ''
+    return $clean.Trim()
 }
 
 function ConvertTo-ChoiceIndexList {
@@ -376,7 +390,7 @@ function ConvertTo-IdentityTokenList {
 function ConvertTo-AdUserIdentity {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
 
-    $raw = if ($null -eq $Value) { '' } else { $Value.Trim().Trim('"') }
+    $raw = ConvertTo-CleanIdentityValue -Value $Value
     $result = [ordered]@{
         InputValue         = $raw
         Kind               = 'Unknown'
@@ -479,12 +493,13 @@ function Test-IsIdentityNotFound {
     param($ErrorRecord)
 
     return Test-ErrorRecordMatch -ErrorRecord $ErrorRecord `
-        -TypePatterns @('ADIdentityNotFound', 'ADIdentityResolution', 'ItemNotFound', 'ObjectNotFound') `
+        -TypePatterns @('ADIdentityNotFound', 'ADIdentityResolution') `
         -MessagePatterns @(
             'Cannot find an object with identity',
-            'cannot be found',
-            'was not found',
-            'There is no such object'
+            'Cannot find an object with identity:',
+            'no such object on the server',
+            'No user matched',
+            'User not found'
         ) `
         -FullyQualifiedIdPatterns @('ADIdentityNotFound', 'IdentityNotFound')
 }
@@ -805,19 +820,23 @@ function Initialize-Environment {
 function Invoke-ADOperation {
     param(
         [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [object[]]$ArgumentList,
         [int]$MaxAttempts = 3,
         [string]$OperationName = 'AD operation'
     )
 
     $delaySeconds = 1
-    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+    for ($retryCount = 1; $retryCount -le $MaxAttempts; $retryCount++) {
         try {
+            if ($null -ne $ArgumentList -and $ArgumentList.Count -gt 0) {
+                return & $ScriptBlock @ArgumentList
+            }
             return & $ScriptBlock
         }
         catch {
             $isTransient = Test-IsTransientAdError -ErrorRecord $_
-            if (-not $isTransient -or $attempt -eq $MaxAttempts) { throw }
-            Write-Log ("{0} failed (attempt {1}/{2}): {3} Retrying in {4}s." -f $OperationName, $attempt, $MaxAttempts, $_.Exception.Message, $delaySeconds) -Level WARN
+            if (-not $isTransient -or $retryCount -eq $MaxAttempts) { throw }
+            Write-Log ("{0} failed (attempt {1}/{2}): {3} Retrying in {4}s." -f $OperationName, $retryCount, $MaxAttempts, $_.Exception.Message, $delaySeconds) -Level WARN
             Start-Sleep -Seconds $delaySeconds
             $delaySeconds = [Math]::Min($delaySeconds * 2, 8)
         }
@@ -1030,14 +1049,13 @@ function Get-UserListFromCsv {
         Write-Log "Using column '$column' as the user identity (unrecognised header; values will still be resolved as SAM/UPN/DN/GUID/SID)." -Level WARN
     }
 
-    $seen  = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $seen  = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $users = New-Object System.Collections.Generic.List[string]
     $blank = 0
     $dupes = 0
 
     foreach ($row in $rows) {
-        $value = [string](Get-NotePropertyValue -Object $row -Name $column)
-        if ($null -ne $value) { $value = $value.Trim() }
+        $value = ConvertTo-CleanIdentityValue -Value ([string](Get-NotePropertyValue -Object $row -Name $column))
 
         if ([string]::IsNullOrWhiteSpace($value)) { $blank++; continue }
 
@@ -1062,71 +1080,88 @@ function Get-AdUserSafe {
         [string]$DistinguishedName
     )
 
+    $InputValue = ConvertTo-CleanIdentityValue -Value $InputValue
     $properties = @(
         'scriptPath', 'ObjectGUID', 'DisplayName', 'Enabled',
-        'UserPrincipalName', 'objectSid', 'DistinguishedName', 'SamAccountName'
+        'UserPrincipalName', 'SID', 'DistinguishedName', 'SamAccountName'
     )
 
-    $attempts = New-Object System.Collections.Generic.List[object]
-    $seen     = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $lookups = New-Object System.Collections.Generic.List[object]
+    $seen    = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
-    $addAttempt = {
+    $addLookup = {
         param($Type, $Identity, $Filter)
         $key = '{0}|{1}|{2}' -f $Type, $Identity, $Filter
         if ($seen.Add($key)) {
-            $attempts.Add([pscustomobject]@{ Type = $Type; Identity = $Identity; Filter = $Filter })
+            $lookups.Add([pscustomobject]@{ Type = $Type; Identity = $Identity; Filter = $Filter })
         }
     }
 
-    $parsedGuid = [guid]::Empty
-    if ($ObjectGUID -and [guid]::TryParse($ObjectGUID, [ref]$parsedGuid)) {
-        & $addAttempt 'GUID' $parsedGuid $null
+    $addSamLookups = {
+        param([string]$Sam)
+        if ([string]::IsNullOrWhiteSpace($Sam)) { return }
+        $escaped = ConvertTo-EscapedAdFilterString -Value $Sam
+        & $addLookup 'SAM' $Sam ("SamAccountName -eq '{0}'" -f $escaped)
+        & $addLookup 'SAM-Identity' $Sam $null
     }
-    if ($SID) { & $addAttempt 'SID' $SID $null }
-    if ($DistinguishedName) { & $addAttempt 'DN' $DistinguishedName $null }
+
+    $parsedGuid = [guid]::Empty
+    if ($ObjectGUID -and [guid]::TryParse((ConvertTo-CleanIdentityValue -Value $ObjectGUID), [ref]$parsedGuid)) {
+        & $addLookup 'GUID' $parsedGuid $null
+    }
+    if ($SID) { & $addLookup 'SID' (ConvertTo-CleanIdentityValue -Value $SID) $null }
+    if ($DistinguishedName) { & $addLookup 'DN' $DistinguishedName $null }
 
     $parsed = ConvertTo-AdUserIdentity -Value $InputValue
     switch ($parsed.Kind) {
         'GUID' {
-            & $addAttempt 'GUID' $parsed.ObjectGUID $null
+            & $addLookup 'GUID' $parsed.ObjectGUID $null
         }
         'SID' {
-            & $addAttempt 'SID' $parsed.SID $null
+            & $addLookup 'SID' $parsed.SID $null
         }
         'DN' {
-            & $addAttempt 'DN' $parsed.DistinguishedName $null
+            & $addLookup 'DN' $parsed.DistinguishedName $null
         }
         'UPN' {
             $escaped = ConvertTo-EscapedAdFilterString -Value $parsed.UserPrincipalName
-            & $addAttempt 'UPN' $null ("UserPrincipalName -eq '{0}'" -f $escaped)
-            if ($parsed.SamAccountName) { & $addAttempt 'SAM' $parsed.SamAccountName $null }
+            & $addLookup 'UPN' $parsed.UserPrincipalName ("UserPrincipalName -eq '{0}'" -f $escaped)
+            & $addSamLookups $parsed.SamAccountName
         }
         'NT4' {
-            if ($parsed.SamAccountName) { & $addAttempt 'SAM' $parsed.SamAccountName $null }
+            & $addSamLookups $parsed.SamAccountName
         }
         default {
-            if ($parsed.SamAccountName) { & $addAttempt 'SAM' $parsed.SamAccountName $null }
-            & $addAttempt 'Identity' $InputValue $null
+            & $addSamLookups $parsed.SamAccountName
+            if ($InputValue -and $InputValue -ne $parsed.SamAccountName) {
+                & $addLookup 'Identity' $InputValue $null
+            }
         }
     }
 
-    $lastNotFound = $null
-    foreach ($attempt in $attempts) {
-        try {
-            $user = Invoke-ADOperation -OperationName ("Get-ADUser [{0}] {1}" -f $attempt.Type, $InputValue) -ScriptBlock {
-                if ($attempt.Filter) {
-                    $found = @(Get-ADUser -Filter $attempt.Filter -Properties $properties @script:ADParams)
-                    if ($found.Count -eq 0) {
-                        throw (New-Object System.Management.Automation.ItemNotFoundException ("No user matched filter for '{0}'." -f $InputValue))
-                    }
-                    if ($found.Count -gt 1) {
-                        throw ("Multiple users matched {0} '{1}'." -f $attempt.Type, $InputValue)
-                    }
-                    return $found[0]
-                }
-                return Get-ADUser -Identity $attempt.Identity -Properties $properties @script:ADParams -ErrorAction Stop
+    $lookupScript = {
+        param($Identity, $Filter, $Properties, $AdParams, $InputLabel)
+        if ($Filter) {
+            $found = @(Get-ADUser -Filter $Filter -Properties $Properties @AdParams)
+            if ($found.Count -eq 0) {
+                throw [System.Management.Automation.ItemNotFoundException]::new(("No user matched '{0}'." -f $InputLabel))
             }
-            if ($parsed.Kind -eq 'UPN' -and $attempt.Type -eq 'SAM') {
+            if ($found.Count -gt 1) {
+                throw ("Multiple users matched '{0}'." -f $InputLabel)
+            }
+            return $found[0]
+        }
+        return Get-ADUser -Identity $Identity -Properties $Properties @AdParams -ErrorAction Stop
+    }
+
+    $lastNotFound = $null
+    foreach ($lookup in $lookups) {
+        try {
+            $user = Invoke-ADOperation -OperationName ("Get-ADUser [{0}] {1}" -f $lookup.Type, $InputValue) -ArgumentList @(
+                $lookup.Identity, $lookup.Filter, $properties, $script:ADParams, $InputValue
+            ) -ScriptBlock $lookupScript
+
+            if ($parsed.Kind -eq 'UPN' -and $lookup.Type -like 'SAM*' ) {
                 $userUpn = [string](Get-NotePropertyValue -Object $user -Name 'UserPrincipalName')
                 if (-not (Test-ScriptPathEqual -Left $userUpn -Right $parsed.UserPrincipalName)) {
                     Write-Log "[$InputValue] sAMAccountName '$($user.SamAccountName)' is not the same account as UPN '$($parsed.UserPrincipalName)'. Continuing search." -Level WARN -NoConsole
@@ -1137,6 +1172,7 @@ function Get-AdUserSafe {
             return $user
         }
         catch {
+            Write-Log ("[{0}] Lookup via {1} failed: {2}" -f $InputValue, $lookup.Type, $_.Exception.Message) -Level INFO -NoConsole
             if (Test-IsIdentityNotFound -ErrorRecord $_) {
                 $lastNotFound = $_
                 continue
@@ -1145,8 +1181,34 @@ function Get-AdUserSafe {
         }
     }
 
-    if ($lastNotFound) { throw $lastNotFound }
-    throw (New-Object System.Management.Automation.ItemNotFoundException ("User not found: {0}" -f $InputValue))
+    # Last resort: Global Catalog (other domains / lingering replicas).
+    $pdc = [string]$script:ADParams['Server']
+    $samForGc = $parsed.SamAccountName
+    if (-not $samForGc) { $samForGc = $InputValue }
+    if ($pdc -and $samForGc) {
+        try {
+            $gcParams = @{}
+            foreach ($key in @($script:ADParams.Keys)) { $gcParams[$key] = $script:ADParams[$key] }
+            $gcParams['Server'] = '{0}:3268' -f ($pdc -replace ':3268$', '')
+            $escaped = ConvertTo-EscapedAdFilterString -Value $samForGc
+            $gcUser = Invoke-ADOperation -OperationName ("Get-ADUser [GC] {0}" -f $InputValue) -ArgumentList @(
+                $samForGc, ("SamAccountName -eq '{0}'" -f $escaped), $properties, $gcParams, $InputValue
+            ) -ScriptBlock $lookupScript
+            Write-Log "[$InputValue] Found via Global Catalog on $($gcParams['Server']). Writes still go to the PDC; if this account is in another domain, set that domain's PDC from menu option 4." -Level WARN
+            return $gcUser
+        }
+        catch {
+            Write-Log ("[{0}] GC lookup failed: {1}" -f $InputValue, $_.Exception.Message) -Level INFO -NoConsole
+        }
+    }
+
+    if ($lastNotFound) {
+        if ($lastNotFound -is [System.Management.Automation.ErrorRecord] -and $lastNotFound.Exception) {
+            throw $lastNotFound.Exception
+        }
+        throw $lastNotFound
+    }
+    throw [System.Management.Automation.ItemNotFoundException]::new(("User not found: {0}" -f $InputValue))
 }
 
 function New-ResultRow {
@@ -1329,8 +1391,8 @@ function Invoke-LogonScriptRemoval {
             }
             catch {
                 if (Test-IsIdentityNotFound -ErrorRecord $_) {
-                    Write-Log "[$sam] User not found in Active Directory." -Level WARN
-                    $results.Add((New-ResultRow -InputIdentity $sam -SamAccountName $sam -Status 'Failed-NotFound' -Details 'User not found'))
+                    Write-Log "[$sam] User not found in Active Directory. ($($_.Exception.Message))" -Level WARN
+                    $results.Add((New-ResultRow -InputIdentity $sam -SamAccountName $sam -Status 'Failed-NotFound' -Details $_.Exception.Message))
                 }
                 else {
                     Write-Log "[$sam] Lookup failed: $($_.Exception.Message)" -Level ERROR
@@ -1833,22 +1895,43 @@ function Invoke-LogonScriptRevert {
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
+function ConvertTo-ReportRows {
+    param($Results)
+
+    $list = New-Object System.Collections.Generic.List[object]
+    if ($null -eq $Results) { return , [object[]]@() }
+
+    if ($Results -is [System.Collections.IList] -and $Results.PSObject.Methods['ToArray']) {
+        foreach ($item in $Results.ToArray()) {
+            if ($null -ne $item) { [void]$list.Add($item) }
+        }
+        return , $list.ToArray()
+    }
+
+    foreach ($item in $Results) {
+        if ($null -ne $item) { [void]$list.Add($item) }
+    }
+    return , $list.ToArray()
+}
+
 function Export-RunReport {
     param(
         [Parameter(Mandatory)]$Results,
         [Parameter(Mandatory)][string]$Prefix
     )
-    $arr = @($Results)
+
+    $arr = ConvertTo-ReportRows -Results $Results
     if ($arr.Count -eq 0) { return }
 
-    $reportFile = Join-Path $script:ReportFolder ("{0}_{1}.csv" -f $Prefix, (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $reportFile = Join-Path -Path $script:ReportFolder -ChildPath ("{0}_{1}.csv" -f $Prefix, $stamp)
     try {
         $arr | Export-Csv -LiteralPath $reportFile -NoTypeInformation -Encoding UTF8
         Write-Log "Results report written: $reportFile" -Level INFO
     }
     catch {
         Write-Log "Failed to write results report '$reportFile': $($_.Exception.Message)" -Level ERROR
-        $emergency = Join-Path $script:ReportFolder ("{0}_EMERGENCY_{1}.csv" -f $Prefix, (Get-Date -Format 'yyyyMMdd_HHmmss'))
+        $emergency = Join-Path -Path $script:ReportFolder -ChildPath ("{0}_EMERGENCY_{1}.csv" -f $Prefix, $stamp)
         try {
             $arr | Export-Csv -LiteralPath $emergency -NoTypeInformation -Encoding UTF8
             Write-Log "Emergency results report written: $emergency" -Level WARN
@@ -1916,7 +1999,10 @@ function Show-MainMenu {
             Complete-Progress -Activity 'Looking up users in Active Directory'
             Complete-Progress -Activity 'Removing logon scripts'
             Complete-Progress -Activity 'Reverting logon scripts'
-            Write-Log "Unexpected error: $($_.Exception.Message)" -Level ERROR
+            Write-Log ("Unexpected error ({0}): {1}" -f $_.Exception.GetType().FullName, $_.Exception.Message) -Level ERROR
+            if ($_.ScriptStackTrace) {
+                Write-Log $_.ScriptStackTrace -Level ERROR -NoConsole
+            }
         }
 
         if ($choice -ne '3') {
@@ -1967,6 +2053,18 @@ function Invoke-SelfTest {
     Assert-True -Condition (-not (Test-ScriptPathEqual -Left 'a.bat' -Right 'b.bat')) -Name 'Test-ScriptPathEqual detects different values'
 
     Assert-True -Condition ((ConvertTo-EscapedAdFilterString -Value "O'Brien") -eq "O''Brien") -Name 'ConvertTo-EscapedAdFilterString doubles single quotes'
+    Assert-True -Condition ((ConvertTo-CleanIdentityValue -Value "  `"aalosman`"  ") -eq 'aalosman') -Name 'ConvertTo-CleanIdentityValue trims quotes and whitespace'
+
+    $propertyMissing = New-Object System.Management.Automation.ErrorRecord (
+        (New-Object System.ArgumentException "The property 'Filter' cannot be found on this object. Verify that the property exists."),
+        'PropertyNotFoundStrict',
+        [System.Management.Automation.ErrorCategory]::InvalidOperation,
+        1
+    )
+    Assert-True -Condition (-not (Test-IsIdentityNotFound -ErrorRecord $propertyMissing)) -Name 'Test-IsIdentityNotFound does not treat StrictMode missing-property errors as AD not-found'
+
+    $passedThrough = Invoke-ADOperation -OperationName 'self-test' -MaxAttempts 1 -ArgumentList @('AAD34929') -ScriptBlock { param($Identity) $Identity }
+    Assert-True -Condition ($passedThrough -eq 'AAD34929') -Name 'Invoke-ADOperation passes ArgumentList into the scriptblock (no `$attempt` collision)'
 
     $zeroChoices = ConvertTo-ChoiceIndexList -Count 0
     Assert-True -Condition ($null -ne $zeroChoices -and @($zeroChoices).Count -eq 0) -Name 'ConvertTo-ChoiceIndexList does not emit 1,0 when Count is 0'
