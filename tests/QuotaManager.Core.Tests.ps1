@@ -285,6 +285,16 @@ Assert-True 'gui keeps exchange commands on the UI thread' $guiText.Contains('Co
 Assert-True 'gui can list licenses' $guiText.Contains('Get-MgUserLicenseDetail')
 Assert-True 'gui does not stop a sign-in timer' (-not $guiText.Contains('$timer.Stop()'))
 Assert-True 'gui reads connection properties safely' $guiText.Contains('function Get-SafeText')
+Assert-True 'gui can skip WAM sign-in' $guiText.Contains('DisableWAM')
+
+$launcherPath = Join-Path $PSScriptRoot '..' 'MailboxQuotaChange.ps1'
+$launcherTokens = $null
+$launcherErrors = $null
+[void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $launcherPath), [ref]$launcherTokens, [ref]$launcherErrors)
+Assert-Equal 'launcher parse error count' @($launcherErrors).Count 0
+$launcherText = [System.IO.File]::ReadAllText((Resolve-Path $launcherPath))
+Assert-True 'launcher opens the fixed manager' $launcherText.Contains('Exchange-Online-Quota-Manager.ps1')
+Assert-True 'launcher does not stop a sign-in timer' (-not $launcherText.Contains('$timer.Stop()'))
 
 Write-Host ""
 Write-Host "Passed: $($script:passed)"

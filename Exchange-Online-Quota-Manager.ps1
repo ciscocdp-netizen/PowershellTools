@@ -114,7 +114,7 @@ if (-not (Test-Path -LiteralPath $script:CorePath)) {
 }
 . $script:CorePath
 
-$script:AppVersion = '2.2'
+$script:AppVersion = '2.3'
 $script:busy = $false
 $script:cancelRequested = $false
 $script:exoConnected = $false
@@ -429,9 +429,25 @@ function Connect-ExchangeSession {
         if ($connectCommand.Parameters.ContainsKey('ShowBanner')) {
             $connectParams['ShowBanner'] = $false
         }
-        # Sign-in stays on this thread. A timer in another scope is left null
-        # after the browser closes, and calling Stop() on it crashes the window.
-        Connect-ExchangeOnline @connectParams
+        # WinForms sign-in must stay on this thread. WAM often calls a method on
+        # a null window after the browser closes, so skip it when the module allows.
+        $skippedWam = $false
+        if ($connectCommand.Parameters.ContainsKey('DisableWAM')) {
+            $connectParams['DisableWAM'] = $true
+            $skippedWam = $true
+        }
+        try {
+            Connect-ExchangeOnline @connectParams
+        }
+        catch {
+            $connectMessage = [string]$_.Exception.Message
+            if (-not $skippedWam -or $connectMessage -notmatch 'null-valued expression|WAM') {
+                throw
+            }
+            try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+            $connectParams.Remove('DisableWAM')
+            Connect-ExchangeOnline @connectParams
+        }
     }
 
     $info = Get-ExchangeConnectionInfo
