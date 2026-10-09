@@ -16,6 +16,10 @@
     be changed before the update runs. A QuotaInGB column is used only when the
     three quota columns are blank.
 
+    The window reflows with its size. Status text, quota details, the license
+    list, CSV mapping, and the bulk grid use the extra width, and the mailbox
+    splitter keeps its share of the form.
+
 .NOTES
     Requires Windows PowerShell 5.1 or PowerShell 7 on Windows.
     Keep QuotaManager.Core.ps1 in the same folder as this script.
@@ -76,7 +80,7 @@ if (-not (Test-Path -LiteralPath $script:CorePath)) {
 }
 . $script:CorePath
 
-$script:AppVersion = '2.0'
+$script:AppVersion = '2.1'
 $script:busy = $false
 $script:cancelRequested = $false
 $script:exoConnected = $false
@@ -98,6 +102,9 @@ $script:detectedDisplayName = $null
 $script:mapSnapshot = $null
 $script:licenseSummary = ''
 $script:form = $null
+$script:splitRatio = 0.58
+$script:applyingSplit = $false
+$script:sizingCsvHeader = $false
 
 function Write-Activity {
     param(
@@ -168,6 +175,7 @@ function Show-TextDialog {
     $dialog = New-Object System.Windows.Forms.Form
     $dialog.Text = $Title
     $dialog.Size = New-Object System.Drawing.Size(780, 580)
+    $dialog.MinimumSize = New-Object System.Drawing.Size(480, 320)
     $dialog.StartPosition = 'CenterParent'
     $dialog.MinimizeBox = $false
     $dialog.Font = $script:form.Font
@@ -1592,15 +1600,189 @@ function Enable-ControlDoubleBuffer {
     if ($property) { $property.SetValue($Control, $true, $null) }
 }
 
+function Add-DockedLeft {
+    param($Parent, $Control, [int]$Width, [int]$GapAfter = 8)
+    $Control.Dock = 'Left'
+    $Control.Width = $Width
+    $Parent.Controls.Add($Control)
+    if ($GapAfter -gt 0) {
+        $gap = New-Object System.Windows.Forms.Panel
+        $gap.Dock = 'Left'
+        $gap.Width = $GapAfter
+        $gap.TabStop = $false
+        $Parent.Controls.Add($gap)
+    }
+}
+
+function Add-DockedRight {
+    param($Parent, $Control, [int]$Width, [int]$GapBefore = 8)
+    $Control.Dock = 'Right'
+    $Control.Width = $Width
+    $Parent.Controls.Add($Control)
+    if ($GapBefore -gt 0) {
+        $gap = New-Object System.Windows.Forms.Panel
+        $gap.Dock = 'Right'
+        $gap.Width = $GapBefore
+        $gap.TabStop = $false
+        $Parent.Controls.Add($gap)
+    }
+}
+
+function Add-FillLabel {
+    param($Parent, $Label)
+    $Label.Dock = 'Fill'
+    $Label.AutoSize = $false
+    $Label.AutoEllipsis = $true
+    $Label.TextAlign = 'MiddleLeft'
+    $Label.Padding = New-Object System.Windows.Forms.Padding(8, 0, 4, 0)
+    $Parent.Controls.Add($Label)
+}
+
+function New-StretchRow {
+    param([int]$Height = 40)
+    $row = New-Object System.Windows.Forms.Panel
+    $row.Dock = 'Top'
+    $row.Height = $Height
+    return $row
+}
+
+function Get-GreedyFlowContentHeight {
+    param($Controls, [int]$InnerWidth)
+    $x = 0
+    $rows = 1
+    $rowHeight = 0
+    foreach ($child in @($Controls)) {
+        $needed = $child.Margin.Left + $child.Width + $child.Margin.Right
+        if ($needed -lt 1) { continue }
+        $childHeight = $child.Margin.Top + $child.Height + $child.Margin.Bottom
+        if ($childHeight -gt $rowHeight) { $rowHeight = $childHeight }
+        if ($x -gt 0 -and ($x + $needed) -gt $InnerWidth) {
+            $rows++
+            $x = 0
+        }
+        $x += $needed
+    }
+    if ($rowHeight -lt 28) { $rowHeight = 36 }
+    return ($rows * $rowHeight)
+}
+
+function Get-WrappingFlowHeight {
+    param($Flow, [int]$Minimum = 40)
+    if ($null -eq $Flow) { return $Minimum }
+    $width = $Flow.ClientSize.Width
+    if ($width -lt 80) { return $Minimum }
+    $inner = $width - $Flow.Padding.Left - $Flow.Padding.Right
+    if ($inner -lt 40) { return $Minimum }
+
+    $controls = @($Flow.Controls)
+    $forward = Get-GreedyFlowContentHeight $controls $inner
+    $backwardControls = @($controls)
+    [array]::Reverse($backwardControls)
+    $backward = Get-GreedyFlowContentHeight $backwardControls $inner
+    $height = [Math]::Max($forward, $backward) + $Flow.Padding.Top + $Flow.Padding.Bottom
+    try {
+        $preferred = $Flow.GetPreferredSize((New-Object System.Drawing.Size($width, 0)))
+        if ($preferred.Height -gt $height -and $preferred.Height -le 240) { $height = $preferred.Height }
+    }
+    catch {}
+    if ($height -lt $Minimum) { return $Minimum }
+    return $height
+}
+
+function Update-LicenseListColumns {
+    $list = $script:licenseList
+    if ($null -eq $list -or $list.IsDisposed -or $list.Columns.Count -lt 5) { return }
+    $available = $list.ClientSize.Width
+    if ($available -lt 80) { return }
+    $product = 128
+    $sku = 96
+    $skuId = 148
+    $disabled = 120
+    $fixed = $product + $sku + $skuId + $disabled
+    $enabledWidth = $available - $fixed - 8
+    if ($enabledWidth -lt 96) { $enabledWidth = 96 }
+    $widths = @($product, $sku, $skuId, $enabledWidth, $disabled)
+    for ($i = 0; $i -lt $widths.Count; $i++) {
+        if ($list.Columns[$i].Width -ne $widths[$i]) {
+            $list.Columns[$i].Width = $widths[$i]
+        }
+    }
+}
+
+function Update-SplitLayout {
+    if ($script:applyingSplit -or $null -eq $script:split -or $script:split.Width -lt 200) { return }
+    $width = $script:split.Width
+    $min1 = 460
+    $min2 = 240
+    $available = $width - $script:split.SplitterWidth
+    if ($available -lt ($min1 + $min2)) {
+        $min1 = [Math]::Max(25, [int]($available * 0.55))
+        $min2 = [Math]::Max(25, $available - $min1)
+    }
+    $maxDistance = $available - $min2
+    if ($maxDistance -lt $min1) { return }
+    if ($script:splitRatio -le 0) { $script:splitRatio = 0.58 }
+    $distance = [int]($width * $script:splitRatio)
+    if ($distance -lt $min1) { $distance = $min1 }
+    if ($distance -gt $maxDistance) { $distance = $maxDistance }
+
+    $script:applyingSplit = $true
+    try {
+        try { $script:split.Panel1MinSize = 25 } catch {}
+        try { $script:split.Panel2MinSize = 25 } catch {}
+        if ($script:split.SplitterDistance -ne $distance) {
+            $script:split.SplitterDistance = $distance
+        }
+        try { $script:split.Panel1MinSize = $min1 } catch {}
+        try { $script:split.Panel2MinSize = $min2 } catch {}
+    }
+    catch {}
+    finally {
+        $script:applyingSplit = $false
+    }
+}
+
+function Update-CsvHeaderHeight {
+    if ($script:sizingCsvHeader) { return }
+    if ($null -eq $script:csvButtonFlow -or $null -eq $script:csvPanel) { return }
+    if ($script:csvButtonFlow.Width -lt 240) { return }
+    $script:sizingCsvHeader = $true
+    try {
+        $flowHeight = Get-WrappingFlowHeight $script:csvButtonFlow 40
+        # Filter row, mapping table, status line, and the group caption/padding.
+        $target = $flowHeight + 36 + 72 + 36 + 44
+        if ($script:csvButtonFlow.Height -ne $flowHeight) {
+            $script:csvButtonFlow.Height = $flowHeight
+        }
+        if ($script:csvPanel.Height -ne $target) {
+            $script:csvPanel.Height = $target
+        }
+        if ($null -ne $script:actionButtonFlow -and $null -ne $script:actionPanel -and $script:actionButtonFlow.Width -ge 240) {
+            $actionFlowHeight = Get-WrappingFlowHeight $script:actionButtonFlow 40
+            $actionTarget = $actionFlowHeight + 28 + 42
+            if ($script:actionButtonFlow.Height -ne $actionFlowHeight) {
+                $script:actionButtonFlow.Height = $actionFlowHeight
+            }
+            if ($script:actionPanel.Height -ne $actionTarget) {
+                $script:actionPanel.Height = $actionTarget
+            }
+        }
+    }
+    finally {
+        $script:sizingCsvHeader = $false
+    }
+}
+
 function Build-MainForm {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "Exchange Online Quota Manager $($script:AppVersion)"
     $form.Size = New-Object System.Drawing.Size(1280, 860)
-    $form.MinimumSize = New-Object System.Drawing.Size(1100, 740)
+    $form.MinimumSize = New-Object System.Drawing.Size(960, 700)
     $form.StartPosition = 'CenterScreen'
     $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
     $form.BackColor = [System.Drawing.Color]::FromArgb(245, 246, 248)
     $script:form = $form
+    Enable-ControlDoubleBuffer $form
 
     $menu = New-Object System.Windows.Forms.MenuStrip
     $fileMenu = New-Object System.Windows.Forms.ToolStripMenuItem
@@ -1668,37 +1850,38 @@ function Build-MainForm {
 
     $connectionPanel = New-Object System.Windows.Forms.Panel
     $connectionPanel.Dock = 'Top'
-    $connectionPanel.Height = 118
+    $connectionPanel.Height = 112
     $connectionPanel.Padding = New-Object System.Windows.Forms.Padding(8, 4, 8, 4)
     $connectionGroup = New-Object System.Windows.Forms.GroupBox
     $connectionGroup.Text = 'Connections'
     $connectionGroup.Dock = 'Fill'
+    $connectionGroup.Padding = New-Object System.Windows.Forms.Padding(10, 4, 10, 4)
     $connectionPanel.Controls.Add($connectionGroup)
 
-    $script:btnConnect = New-PrimaryButton 'Connect to Exchange Online' 12 24 210
-    $script:btnDisconnectExo = New-StandardButton 'Disconnect' 230 24 110
+    $script:btnConnect = New-PrimaryButton 'Connect to Exchange Online' 0 0 210
+    $script:btnDisconnectExo = New-StandardButton 'Disconnect' 0 0 110
     $script:btnDisconnectExo.Enabled = $false
     $script:lblExo = New-Object System.Windows.Forms.Label
     $script:lblExo.Text = 'Not connected'
-    $script:lblExo.Location = New-Object System.Drawing.Point(352, 30)
-    $script:lblExo.Size = New-Object System.Drawing.Size(760, 22)
     $script:lblExo.ForeColor = [System.Drawing.Color]::Firebrick
-    $script:lblExo.AutoEllipsis = $true
+    $exoRow = New-StretchRow 36
+    Add-DockedLeft $exoRow $script:btnConnect 210
+    Add-DockedLeft $exoRow $script:btnDisconnectExo 110
+    Add-FillLabel $exoRow $script:lblExo
 
-    $script:btnConnectLicense = New-StandardButton 'Connect for licenses' 12 64 210
-    $script:btnDisconnectLicense = New-StandardButton 'Disconnect' 230 64 110
+    $script:btnConnectLicense = New-StandardButton 'Connect for licenses' 0 0 210
+    $script:btnDisconnectLicense = New-StandardButton 'Disconnect' 0 0 110
     $script:btnDisconnectLicense.Enabled = $false
     $script:lblLicense = New-Object System.Windows.Forms.Label
     $script:lblLicense.Text = 'Not connected — user licenses are not loaded'
-    $script:lblLicense.Location = New-Object System.Drawing.Point(352, 70)
-    $script:lblLicense.Size = New-Object System.Drawing.Size(760, 22)
     $script:lblLicense.ForeColor = [System.Drawing.Color]::Firebrick
-    $script:lblLicense.AutoEllipsis = $true
+    $licenseRow = New-StretchRow 36
+    Add-DockedLeft $licenseRow $script:btnConnectLicense 210
+    Add-DockedLeft $licenseRow $script:btnDisconnectLicense 110
+    Add-FillLabel $licenseRow $script:lblLicense
 
-    $connectionGroup.Controls.AddRange(@(
-        $script:btnConnect, $script:btnDisconnectExo, $script:lblExo,
-        $script:btnConnectLicense, $script:btnDisconnectLicense, $script:lblLicense
-    ))
+    $connectionGroup.Controls.Add($exoRow)
+    $connectionGroup.Controls.Add($licenseRow)
 
     $script:tabs = New-Object System.Windows.Forms.TabControl
     $script:tabs.Dock = 'Fill'
@@ -1719,29 +1902,62 @@ function Build-MainForm {
     $lookup = New-Object System.Windows.Forms.GroupBox
     $lookup.Text = 'Find mailbox'
     $lookup.Dock = 'Top'
-    $lookup.Height = 84
+    $lookup.Height = 86
+    $lookup.Padding = New-Object System.Windows.Forms.Padding(10, 4, 10, 8)
+    $lookupTable = New-Object System.Windows.Forms.TableLayoutPanel
+    $lookupTable.Dock = 'Fill'
+    $lookupTable.ColumnCount = 2
+    $lookupTable.RowCount = 2
+    $lookupTable.Margin = New-Object System.Windows.Forms.Padding(0)
+    $lookupTable.ColumnStyles.Clear()
+    $lookupTable.RowStyles.Clear()
+    [void]$lookupTable.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$lookupTable.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 118)))
+    [void]$lookupTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 20)))
+    [void]$lookupTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
     $userLabel = New-Object System.Windows.Forms.Label
     $userLabel.Text = 'User principal name or email'
-    $userLabel.Location = New-Object System.Drawing.Point(12, 20)
-    $userLabel.AutoSize = $true
+    $userLabel.Dock = 'Fill'
+    $userLabel.AutoSize = $false
+    $userLabel.TextAlign = 'BottomLeft'
     $script:txtUser = New-Object System.Windows.Forms.TextBox
-    $script:txtUser.Location = New-Object System.Drawing.Point(12, 42)
-    $script:txtUser.Size = New-Object System.Drawing.Size(360, 24)
-    $script:txtUser.Anchor = 'Top, Left, Right'
-    $script:btnLookup = New-PrimaryButton 'Look up' 382 38 110
-    $script:btnLookup.Anchor = 'Top, Right'
+    $script:txtUser.Dock = 'Fill'
+    $script:txtUser.Margin = New-Object System.Windows.Forms.Padding(0, 4, 8, 0)
+    $script:btnLookup = New-PrimaryButton 'Look up' 0 0 110 30
+    $script:btnLookup.Dock = 'Fill'
+    $script:btnLookup.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 0)
     $script:btnLookup.Enabled = $false
-    $lookup.Controls.AddRange(@($userLabel, $script:txtUser, $script:btnLookup))
+    $lookupTable.Controls.Add($userLabel, 0, 0)
+    $lookupTable.SetColumnSpan($userLabel, 2)
+    $lookupTable.Controls.Add($script:txtUser, 0, 1)
+    $lookupTable.Controls.Add($script:btnLookup, 1, 1)
+    $lookup.Controls.Add($lookupTable)
 
     $quota = New-Object System.Windows.Forms.GroupBox
     $quota.Text = 'Quota settings (GB)'
     $quota.Dock = 'Top'
-    $quota.Height = 292
+    $quota.Height = 268
+    $quota.Padding = New-Object System.Windows.Forms.Padding(10, 4, 10, 8)
+    $quotaTable = New-Object System.Windows.Forms.TableLayoutPanel
+    $quotaTable.Dock = 'Fill'
+    $quotaTable.ColumnCount = 3
+    $quotaTable.RowCount = 6
+    $quotaTable.Margin = New-Object System.Windows.Forms.Padding(0)
+    $quotaTable.ColumnStyles.Clear()
+    $quotaTable.RowStyles.Clear()
+    [void]$quotaTable.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 176)))
+    [void]$quotaTable.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 88)))
+    [void]$quotaTable.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    foreach ($rowHeight in @(44, 34, 34, 34, 30, 40)) {
+        [void]$quotaTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, $rowHeight)))
+    }
     $script:lblQuotaHint = New-Object System.Windows.Forms.Label
     $script:lblQuotaHint.Text = 'Look up a mailbox, then edit IssueWarningGB, ProhibitSendGB, and ProhibitSendReceiveGB.'
-    $script:lblQuotaHint.Location = New-Object System.Drawing.Point(12, 22)
-    $script:lblQuotaHint.Size = New-Object System.Drawing.Size(470, 36)
+    $script:lblQuotaHint.Dock = 'Fill'
+    $script:lblQuotaHint.AutoSize = $false
     $script:lblQuotaHint.ForeColor = [System.Drawing.Color]::DimGray
+    $quotaTable.Controls.Add($script:lblQuotaHint, 0, 0)
+    $quotaTable.SetColumnSpan($script:lblQuotaHint, 3)
 
     $script:txtWarning = New-Object System.Windows.Forms.TextBox
     $script:txtSend = New-Object System.Windows.Forms.TextBox
@@ -1750,50 +1966,65 @@ function Build-MainForm {
     $script:lblCurrentSend = New-Object System.Windows.Forms.Label
     $script:lblCurrentReceive = New-Object System.Windows.Forms.Label
     $quotaRows = @(
-        @{ Label = 'IssueWarningGB'; Box = $script:txtWarning; Current = $script:lblCurrentWarning; Y = 66 }
-        @{ Label = 'ProhibitSendGB'; Box = $script:txtSend; Current = $script:lblCurrentSend; Y = 100 }
-        @{ Label = 'ProhibitSendReceiveGB'; Box = $script:txtReceive; Current = $script:lblCurrentReceive; Y = 134 }
+        @{ Label = 'IssueWarningGB'; Box = $script:txtWarning; Current = $script:lblCurrentWarning; Row = 1 }
+        @{ Label = 'ProhibitSendGB'; Box = $script:txtSend; Current = $script:lblCurrentSend; Row = 2 }
+        @{ Label = 'ProhibitSendReceiveGB'; Box = $script:txtReceive; Current = $script:lblCurrentReceive; Row = 3 }
     )
     foreach ($quotaRow in $quotaRows) {
         $caption = New-Object System.Windows.Forms.Label
         $caption.Text = $quotaRow.Label
-        $caption.Location = New-Object System.Drawing.Point(12, ($quotaRow.Y + 4))
-        $caption.Size = New-Object System.Drawing.Size(180, 22)
+        $caption.Dock = 'Fill'
+        $caption.AutoSize = $false
+        $caption.AutoEllipsis = $true
+        $caption.TextAlign = 'MiddleLeft'
         $caption.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
-        $quotaRow.Box.Location = New-Object System.Drawing.Point(196, $quotaRow.Y)
-        $quotaRow.Box.Size = New-Object System.Drawing.Size(80, 24)
+        $quotaRow.Box.Dock = 'Fill'
+        $quotaRow.Box.Margin = New-Object System.Windows.Forms.Padding(0, 5, 8, 3)
         $quotaRow.Current.Text = 'Current: -'
-        $quotaRow.Current.Location = New-Object System.Drawing.Point(286, ($quotaRow.Y + 4))
-        $quotaRow.Current.Size = New-Object System.Drawing.Size(190, 22)
+        $quotaRow.Current.Dock = 'Fill'
+        $quotaRow.Current.AutoSize = $false
+        $quotaRow.Current.TextAlign = 'MiddleLeft'
         $quotaRow.Current.AutoEllipsis = $true
-        $quota.Controls.Add($caption)
-        $quota.Controls.Add($quotaRow.Box)
-        $quota.Controls.Add($quotaRow.Current)
+        $quotaTable.Controls.Add($caption, 0, $quotaRow.Row)
+        $quotaTable.Controls.Add($quotaRow.Box, 1, $quotaRow.Row)
+        $quotaTable.Controls.Add($quotaRow.Current, 2, $quotaRow.Row)
     }
 
     $script:chkRevert = New-Object System.Windows.Forms.CheckBox
     $script:chkRevert.Text = 'Revert this mailbox to license defaults'
-    $script:chkRevert.Location = New-Object System.Drawing.Point(12, 172)
-    $script:chkRevert.Size = New-Object System.Drawing.Size(320, 24)
+    $script:chkRevert.Dock = 'Fill'
+    $script:chkRevert.Margin = New-Object System.Windows.Forms.Padding(0, 4, 0, 0)
+    $quotaTable.Controls.Add($script:chkRevert, 0, 4)
+    $quotaTable.SetColumnSpan($script:chkRevert, 3)
+
     $script:chkWhatIfOne = New-Object System.Windows.Forms.CheckBox
     $script:chkWhatIfOne.Text = 'Test mode (no changes saved)'
-    $script:chkWhatIfOne.Location = New-Object System.Drawing.Point(12, 248)
-    $script:chkWhatIfOne.Size = New-Object System.Drawing.Size(220, 24)
     $script:chkWhatIfOne.Checked = $true
-    $script:btnApplyOne = New-PrimaryButton 'Apply to this mailbox' 240 242 180
+    $script:chkWhatIfOne.AutoSize = $false
+    $script:chkWhatIfOne.TextAlign = 'MiddleLeft'
+    $script:chkWhatIfOne.CheckAlign = 'MiddleLeft'
+    $script:btnApplyOne = New-PrimaryButton 'Apply to this mailbox' 0 0 180 32
     $script:btnApplyOne.Enabled = $false
-    $quota.Controls.AddRange(@($script:lblQuotaHint, $script:chkRevert, $script:chkWhatIfOne, $script:btnApplyOne))
+    $quotaActions = New-Object System.Windows.Forms.Panel
+    $quotaActions.Dock = 'Fill'
+    $quotaActions.Margin = New-Object System.Windows.Forms.Padding(0)
+    Add-DockedRight $quotaActions $script:btnApplyOne 180 0
+    $script:chkWhatIfOne.Dock = 'Fill'
+    $quotaActions.Controls.Add($script:chkWhatIfOne)
+    $quotaTable.Controls.Add($quotaActions, 0, 5)
+    $quotaTable.SetColumnSpan($quotaActions, 3)
+    $quota.Controls.Add($quotaTable)
 
     $licenseGroup = New-Object System.Windows.Forms.GroupBox
     $licenseGroup.Text = 'User licenses'
     $licenseGroup.Dock = 'Fill'
-    $script:btnCopyLicenses = New-StandardButton 'Copy summary' 12 18 120 26
-    $script:btnCopyLicenses.Dock = 'Bottom'
+    $licenseGroup.Padding = New-Object System.Windows.Forms.Padding(8, 4, 8, 8)
+    $licenseHeader = New-StretchRow 32
+    $script:btnCopyLicenses = New-StandardButton 'Copy summary' 0 0 120 28
     $script:lblLicenseCount = New-Object System.Windows.Forms.Label
     $script:lblLicenseCount.Text = 'Look up a mailbox to see every license assigned to it.'
-    $script:lblLicenseCount.Dock = 'Top'
-    $script:lblLicenseCount.Height = 36
-    $script:lblLicenseCount.Padding = New-Object System.Windows.Forms.Padding(8, 8, 8, 0)
+    Add-DockedRight $licenseHeader $script:btnCopyLicenses 120 0
+    Add-FillLabel $licenseHeader $script:lblLicenseCount
     $script:licenseList = New-Object System.Windows.Forms.ListView
     $script:licenseList.Dock = 'Fill'
     $script:licenseList.View = 'Details'
@@ -1801,13 +2032,13 @@ function Build-MainForm {
     $script:licenseList.GridLines = $true
     $script:licenseList.HideSelection = $false
     $script:licenseList.ShowItemToolTips = $true
-    [void]$script:licenseList.Columns.Add('Product', 210)
-    [void]$script:licenseList.Columns.Add('SKU', 170)
-    [void]$script:licenseList.Columns.Add('SKU id', 250)
-    [void]$script:licenseList.Columns.Add('Enabled service plans', 360)
-    [void]$script:licenseList.Columns.Add('Disabled service plans', 240)
-    $licenseGroup.Controls.Add($script:btnCopyLicenses)
-    $licenseGroup.Controls.Add($script:lblLicenseCount)
+    [void]$script:licenseList.Columns.Add('Product', 128)
+    [void]$script:licenseList.Columns.Add('SKU', 96)
+    [void]$script:licenseList.Columns.Add('SKU id', 148)
+    [void]$script:licenseList.Columns.Add('Enabled service plans', 180)
+    [void]$script:licenseList.Columns.Add('Disabled service plans', 120)
+    $script:licenseList.Add_Resize({ Update-LicenseListColumns })
+    $licenseGroup.Controls.Add($licenseHeader)
     $licenseGroup.Controls.Add($script:licenseList)
 
     $split.Panel1.Controls.Add($lookup)
@@ -1820,6 +2051,7 @@ function Build-MainForm {
     $detailTable = New-Object System.Windows.Forms.TableLayoutPanel
     $detailTable.Dock = 'Fill'
     $detailTable.ColumnCount = 2
+    $detailTable.AutoScroll = $true
     $detailTable.Padding = New-Object System.Windows.Forms.Padding(8)
     $detailTable.ColumnStyles.Clear()
     [void]$detailTable.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 180)))
@@ -1836,24 +2068,28 @@ function Build-MainForm {
         @{ Key = 'ProhibitSend'; Caption = 'ProhibitSendGB' }
         @{ Key = 'ProhibitSendReceive'; Caption = 'ProhibitSendReceiveGB' }
     )
-    $detailTable.RowCount = $detailFields.Count
+    $detailTable.RowCount = $detailFields.Count + 1
     $detailTable.RowStyles.Clear()
     for ($i = 0; $i -lt $detailFields.Count; $i++) {
         [void]$detailTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 32)))
         $caption = New-Object System.Windows.Forms.Label
         $caption.Text = $detailFields[$i].Caption
         $caption.Dock = 'Fill'
+        $caption.AutoSize = $false
+        $caption.AutoEllipsis = $true
         $caption.TextAlign = 'MiddleLeft'
         $caption.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
         $value = New-Object System.Windows.Forms.Label
         $value.Text = '-'
         $value.Dock = 'Fill'
+        $value.AutoSize = $false
         $value.TextAlign = 'MiddleLeft'
         $value.AutoEllipsis = $true
         $detailTable.Controls.Add($caption, 0, $i)
         $detailTable.Controls.Add($value, 1, $i)
         $script:detailValues[$detailFields[$i].Key] = $value
     }
+    [void]$detailTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
     $detailGroup.Controls.Add($detailTable)
     $split.Panel2.Controls.Add($detailGroup)
 
@@ -1864,43 +2100,61 @@ function Build-MainForm {
     $bulkTab.UseVisualStyleBackColor = $false
     $bulkTab.BackColor = [System.Drawing.Color]::FromArgb(245, 246, 248)
 
-    $csvPanel = New-Object System.Windows.Forms.Panel
-    $csvPanel.Dock = 'Top'
-    $csvPanel.Height = 230
+    $script:csvPanel = New-Object System.Windows.Forms.Panel
+    $script:csvPanel.Dock = 'Top'
+    $script:csvPanel.Height = 228
     $csvGroup = New-Object System.Windows.Forms.GroupBox
     $csvGroup.Text = 'CSV column mapping'
     $csvGroup.Dock = 'Fill'
+    $csvGroup.Padding = New-Object System.Windows.Forms.Padding(8, 2, 8, 4)
     $script:csvGroup = $csvGroup
-    $csvPanel.Controls.Add($csvGroup)
+    $script:csvPanel.Controls.Add($csvGroup)
 
-    $script:btnImport = New-PrimaryButton 'Import CSV' 12 24 120
-    $script:btnExportTemplate = New-StandardButton 'Export template' 140 24 130
-    $script:btnExportGrid = New-StandardButton 'Export grid' 278 24 110
-    $script:btnRemoveRows = New-StandardButton 'Remove selected' 396 24 130
-    $script:btnOpenSelected = New-StandardButton 'Open selected mailbox' 534 24 170
+    $script:btnImport = New-PrimaryButton 'Import CSV' 0 0 120 32
+    $script:btnExportTemplate = New-StandardButton 'Export template' 0 0 130 32
+    $script:btnExportGrid = New-StandardButton 'Export grid' 0 0 110 32
+    $script:btnRemoveRows = New-StandardButton 'Remove selected' 0 0 130 32
+    $script:btnOpenSelected = New-StandardButton 'Open selected mailbox' 0 0 170 32
     $script:btnOpenSelected.Enabled = $false
+    $script:csvButtonFlow = New-Object System.Windows.Forms.FlowLayoutPanel
+    $script:csvButtonFlow.Dock = 'Top'
+    $script:csvButtonFlow.Height = 40
+    $script:csvButtonFlow.FlowDirection = 'LeftToRight'
+    $script:csvButtonFlow.WrapContents = $true
+    $script:csvButtonFlow.AutoScroll = $false
+    $script:csvButtonFlow.Padding = New-Object System.Windows.Forms.Padding(0, 2, 0, 0)
+    foreach ($csvButton in @(
+        $script:btnImport, $script:btnExportTemplate, $script:btnExportGrid,
+        $script:btnRemoveRows, $script:btnOpenSelected
+    )) {
+        $csvButton.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 4)
+        $script:csvButtonFlow.Controls.Add($csvButton)
+    }
+    $script:csvButtonFlow.Add_Layout({ Update-CsvHeaderHeight })
+
+    $filterRow = New-StretchRow 36
+    $filterRow.Padding = New-Object System.Windows.Forms.Padding(0, 5, 0, 5)
     $script:lblRecords = New-Object System.Windows.Forms.Label
     $script:lblRecords.Text = 'Records: 0'
-    $script:lblRecords.Location = New-Object System.Drawing.Point(716, 30)
-    $script:lblRecords.AutoSize = $true
+    $script:lblRecords.AutoSize = $false
+    $script:lblRecords.AutoEllipsis = $true
+    $script:lblRecords.TextAlign = 'MiddleLeft'
     $filterLabel = New-Object System.Windows.Forms.Label
     $filterLabel.Text = 'Filter'
-    $filterLabel.Location = New-Object System.Drawing.Point(820, 30)
-    $filterLabel.AutoSize = $true
-    $filterLabel.Anchor = 'Top, Right'
+    $filterLabel.AutoSize = $false
+    $filterLabel.TextAlign = 'MiddleRight'
     $script:txtFilter = New-Object System.Windows.Forms.TextBox
-    $script:txtFilter.Location = New-Object System.Drawing.Point(858, 26)
-    $script:txtFilter.Size = New-Object System.Drawing.Size(220, 24)
-    $script:txtFilter.Anchor = 'Top, Right'
-    $csvGroup.Controls.AddRange(@(
-        $script:btnImport, $script:btnExportTemplate, $script:btnExportGrid,
-        $script:btnRemoveRows, $script:btnOpenSelected, $script:lblRecords,
-        $filterLabel, $script:txtFilter
-    ))
+    $script:txtFilter.Margin = New-Object System.Windows.Forms.Padding(0, 4, 0, 0)
+    Add-DockedRight $filterRow $script:txtFilter 240 0
+    Add-DockedRight $filterRow $filterLabel 44
+    Add-DockedLeft $filterRow $script:lblRecords 168 0
+    $filterFill = New-Object System.Windows.Forms.Panel
+    $filterFill.Dock = 'Fill'
+    $filterRow.Controls.Add($filterFill)
 
     $script:mapTable = New-Object System.Windows.Forms.TableLayoutPanel
-    $script:mapTable.Location = New-Object System.Drawing.Point(12, 66)
-    $script:mapTable.Size = New-Object System.Drawing.Size(1040, 78)
+    $script:mapTable.Dock = 'Top'
+    $script:mapTable.Height = 72
     $script:mapTable.ColumnCount = 5
     $script:mapTable.RowCount = 2
     $script:mapTable.ColumnStyles.Clear()
@@ -1908,7 +2162,7 @@ function Build-MainForm {
     for ($i = 0; $i -lt 5; $i++) {
         [void]$script:mapTable.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 20)))
     }
-    [void]$script:mapTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 22)))
+    [void]$script:mapTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 20)))
     [void]$script:mapTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
 
     $mapCaptions = @('Identity', 'ProhibitSendReceiveGB', 'ProhibitSendGB', 'IssueWarningGB', 'QuotaInGB fallback')
@@ -1917,6 +2171,8 @@ function Build-MainForm {
         $caption = New-Object System.Windows.Forms.Label
         $caption.Text = $mapCaptions[$i]
         $caption.Dock = 'Fill'
+        $caption.AutoSize = $false
+        $caption.AutoEllipsis = $true
         $caption.TextAlign = 'BottomLeft'
         $caption.Font = New-Object System.Drawing.Font('Segoe UI', 8, [System.Drawing.FontStyle]::Bold)
         $combo = New-Object System.Windows.Forms.ComboBox
@@ -1934,42 +2190,67 @@ function Build-MainForm {
     $script:cboSend = $mapCombos[2]
     $script:cboWarning = $mapCombos[3]
     $script:cboQuota = $mapCombos[4]
-    $csvGroup.Controls.Add($script:mapTable)
 
     $script:lblMap = New-Object System.Windows.Forms.Label
     $script:lblMap.Text = 'Import a CSV to detect Identity, ProhibitSendReceiveGB, ProhibitSendGB, and IssueWarningGB.'
-    $script:lblMap.Location = New-Object System.Drawing.Point(12, 152)
-    $script:lblMap.Size = New-Object System.Drawing.Size(1040, 40)
+    $script:lblMap.Dock = 'Top'
+    $script:lblMap.Height = 36
+    $script:lblMap.AutoSize = $false
+    $script:lblMap.AutoEllipsis = $true
+    $script:lblMap.TextAlign = 'MiddleLeft'
     $script:lblMap.ForeColor = [System.Drawing.Color]::DimGray
+    $csvGroup.Controls.Add($script:csvButtonFlow)
+    $csvGroup.Controls.Add($filterRow)
+    $csvGroup.Controls.Add($script:mapTable)
     $csvGroup.Controls.Add($script:lblMap)
 
-    $actionPanel = New-Object System.Windows.Forms.Panel
-    $actionPanel.Dock = 'Bottom'
-    $actionPanel.Height = 104
+    $script:actionPanel = New-Object System.Windows.Forms.Panel
+    $script:actionPanel.Dock = 'Bottom'
+    $script:actionPanel.Height = 110
     $actionGroup = New-Object System.Windows.Forms.GroupBox
     $actionGroup.Text = 'Apply'
     $actionGroup.Dock = 'Fill'
-    $actionPanel.Controls.Add($actionGroup)
+    $actionGroup.Padding = New-Object System.Windows.Forms.Padding(8, 2, 8, 6)
+    $script:actionPanel.Controls.Add($actionGroup)
     $script:chkWhatIfBulk = New-Object System.Windows.Forms.CheckBox
     $script:chkWhatIfBulk.Text = 'Test mode (no changes saved)'
-    $script:chkWhatIfBulk.Location = New-Object System.Drawing.Point(12, 28)
-    $script:chkWhatIfBulk.Size = New-Object System.Drawing.Size(210, 24)
     $script:chkWhatIfBulk.Checked = $true
-    $script:btnApplyBulk = New-PrimaryButton 'Apply quota changes' 230 22 180
+    $script:chkWhatIfBulk.AutoSize = $false
+    $script:chkWhatIfBulk.Width = 220
+    $script:chkWhatIfBulk.Height = 32
+    $script:chkWhatIfBulk.TextAlign = 'MiddleLeft'
+    $script:chkWhatIfBulk.CheckAlign = 'MiddleLeft'
+    $script:btnApplyBulk = New-PrimaryButton 'Apply quota changes' 0 0 180 32
     $script:btnApplyBulk.Enabled = $false
-    $script:btnLoadCurrent = New-StandardButton 'Load quotas and licenses' 418 22 190
+    $script:btnLoadCurrent = New-StandardButton 'Load quotas and licenses' 0 0 190 32
     $script:btnLoadCurrent.Enabled = $false
-    $script:btnCancel = New-StandardButton 'Cancel' 616 22 90
+    $script:btnCancel = New-StandardButton 'Cancel' 0 0 90 32
     $script:btnCancel.Enabled = $false
+    $script:actionButtonFlow = New-Object System.Windows.Forms.FlowLayoutPanel
+    $script:actionButtonFlow.Dock = 'Top'
+    $script:actionButtonFlow.Height = 40
+    $script:actionButtonFlow.FlowDirection = 'LeftToRight'
+    $script:actionButtonFlow.WrapContents = $true
+    $script:actionButtonFlow.AutoScroll = $false
+    $script:actionButtonFlow.Padding = New-Object System.Windows.Forms.Padding(0, 2, 0, 0)
+    foreach ($actionControl in @(
+        $script:chkWhatIfBulk, $script:btnApplyBulk, $script:btnLoadCurrent, $script:btnCancel
+    )) {
+        $actionControl.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 4)
+        $script:actionButtonFlow.Controls.Add($actionControl)
+    }
+    $script:actionButtonFlow.Add_Layout({ Update-CsvHeaderHeight })
     $script:progress = New-Object System.Windows.Forms.ProgressBar
-    $script:progress.Location = New-Object System.Drawing.Point(12, 64)
-    $script:progress.Size = New-Object System.Drawing.Size(1040, 22)
-    $script:progress.Anchor = 'Top, Left, Right'
+    $script:progress.Dock = 'Fill'
+    $script:progress.Margin = New-Object System.Windows.Forms.Padding(0, 6, 0, 0)
     $script:progress.Visible = $false
-    $actionGroup.Controls.AddRange(@(
-        $script:chkWhatIfBulk, $script:btnApplyBulk, $script:btnLoadCurrent,
-        $script:btnCancel, $script:progress
-    ))
+    $progressHost = New-Object System.Windows.Forms.Panel
+    $progressHost.Dock = 'Bottom'
+    $progressHost.Height = 28
+    $progressHost.Padding = New-Object System.Windows.Forms.Padding(0, 6, 0, 0)
+    $progressHost.Controls.Add($script:progress)
+    $actionGroup.Controls.Add($progressHost)
+    $actionGroup.Controls.Add($script:actionButtonFlow)
 
     $script:dataTable = New-QuotaTable
     $script:grid = New-Object System.Windows.Forms.DataGridView
@@ -1989,36 +2270,46 @@ function Build-MainForm {
     $script:grid.EditMode = 'EditOnKeystrokeOrF2'
     $script:grid.ClipboardCopyMode = 'EnableAlwaysIncludeHeaderText'
     $script:grid.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(248, 250, 252)
+    $script:grid.ColumnHeadersDefaultCellStyle.WrapMode = [System.Windows.Forms.DataGridViewTriState]::True
+    $script:grid.ColumnHeadersHeight = 44
+    $script:grid.ColumnHeadersHeightSizeMode = 'DisableResizing'
     Enable-ControlDoubleBuffer $script:grid
 
     $columnPlan = @(
-        @{ Name = 'DisplayName'; Header = 'Display name'; Width = 160; ReadOnly = $true; Tip = 'Display name from the CSV or the mailbox.' }
-        @{ Name = 'UserPrincipalName'; Header = 'User principal name'; Width = 220; ReadOnly = $true; Tip = 'Mailbox identity used for the update.' }
-        @{ Name = 'IssueWarningGB'; Header = 'IssueWarningGB'; Width = 130; ReadOnly = $false; Tip = 'IssueWarningQuota in gigabytes. Editable.' }
-        @{ Name = 'ProhibitSendGB'; Header = 'ProhibitSendGB'; Width = 130; ReadOnly = $false; Tip = 'ProhibitSendQuota in gigabytes. Editable.' }
-        @{ Name = 'ProhibitSendReceiveGB'; Header = 'ProhibitSendReceiveGB'; Width = 170; ReadOnly = $false; Tip = 'ProhibitSendReceiveQuota in gigabytes. Editable.' }
-        @{ Name = 'Validation'; Header = 'Validation'; Width = 220; ReadOnly = $true; Tip = 'Whether this row is ready to apply.' }
-        @{ Name = 'Result'; Header = 'Result'; Width = 260; ReadOnly = $true; Tip = 'Outcome of the last preview or update.' }
-        @{ Name = 'Licenses'; Header = 'User licenses'; Width = 360; ReadOnly = $true; Tip = 'Every license assigned to the account.' }
-        @{ Name = 'CurrentIssueWarningGB'; Header = 'Current warning'; Width = 120; ReadOnly = $true; Tip = 'Issue warning currently on the mailbox.' }
-        @{ Name = 'CurrentProhibitSendGB'; Header = 'Current send'; Width = 110; ReadOnly = $true; Tip = 'Prohibit send quota currently on the mailbox.' }
-        @{ Name = 'CurrentProhibitSendReceiveGB'; Header = 'Current send/receive'; Width = 140; ReadOnly = $true; Tip = 'Prohibit send/receive quota currently on the mailbox.' }
-        @{ Name = 'DatabaseDefaults'; Header = 'Quota source'; Width = 120; ReadOnly = $true; Tip = 'License defaults, or custom quotas.' }
+        @{ Name = 'DisplayName'; Header = 'Display name'; Width = 160; Min = 120; ReadOnly = $true; Tip = 'Display name from the CSV or the mailbox.' }
+        @{ Name = 'UserPrincipalName'; Header = 'User principal name'; Width = 210; Min = 160; ReadOnly = $true; Tip = 'Mailbox identity used for the update.' }
+        @{ Name = 'IssueWarningGB'; Header = 'IssueWarningGB'; Width = 124; Min = 110; ReadOnly = $false; Tip = 'IssueWarningQuota in gigabytes. Editable.' }
+        @{ Name = 'ProhibitSendGB'; Header = 'ProhibitSendGB'; Width = 118; Min = 108; ReadOnly = $false; Tip = 'ProhibitSendQuota in gigabytes. Editable.' }
+        @{ Name = 'ProhibitSendReceiveGB'; Header = 'ProhibitSendReceiveGB'; Width = 168; Min = 150; ReadOnly = $false; Tip = 'ProhibitSendReceiveQuota in gigabytes. Editable.' }
+        @{ Name = 'Validation'; Header = 'Validation'; Width = 160; Min = 100; Weight = 100; ReadOnly = $true; Tip = 'Whether this row is ready to apply.' }
+        @{ Name = 'Result'; Header = 'Result'; Width = 200; Min = 110; Weight = 140; ReadOnly = $true; Tip = 'Outcome of the last preview or update.' }
+        @{ Name = 'Licenses'; Header = 'User licenses'; Width = 240; Min = 140; Weight = 220; ReadOnly = $true; Tip = 'Every license assigned to the account.' }
+        @{ Name = 'CurrentIssueWarningGB'; Header = 'Current warning'; Width = 108; Min = 96; ReadOnly = $true; Tip = 'Issue warning currently on the mailbox.' }
+        @{ Name = 'CurrentProhibitSendGB'; Header = 'Current send'; Width = 96; Min = 88; ReadOnly = $true; Tip = 'Prohibit send quota currently on the mailbox.' }
+        @{ Name = 'CurrentProhibitSendReceiveGB'; Header = 'Current send/receive'; Width = 132; Min = 120; ReadOnly = $true; Tip = 'Prohibit send/receive quota currently on the mailbox.' }
+        @{ Name = 'DatabaseDefaults'; Header = 'Quota source'; Width = 100; Min = 90; ReadOnly = $true; Tip = 'License defaults, or custom quotas.' }
     )
     foreach ($plan in $columnPlan) {
         $column = $script:grid.Columns[$plan.Name]
         $column.HeaderText = $plan.Header
-        $column.Width = $plan.Width
-        $column.MinimumWidth = 70
+        $column.MinimumWidth = $plan.Min
         $column.ReadOnly = $plan.ReadOnly
         $column.ToolTipText = $plan.Tip
         $column.SortMode = 'Automatic'
+        if ($plan.ContainsKey('Weight')) {
+            $column.FillWeight = $plan.Weight
+            $column.AutoSizeMode = 'Fill'
+        }
+        else {
+            $column.AutoSizeMode = 'None'
+            $column.Width = $plan.Width
+        }
     }
     $script:grid.Columns['DisplayName'].Frozen = $true
     $script:grid.Columns['UserPrincipalName'].Frozen = $true
 
-    $bulkTab.Controls.Add($actionPanel)
-    $bulkTab.Controls.Add($csvPanel)
+    $bulkTab.Controls.Add($script:actionPanel)
+    $bulkTab.Controls.Add($script:csvPanel)
     $bulkTab.Controls.Add($script:grid)
 
     # Log tab
@@ -2028,9 +2319,11 @@ function Build-MainForm {
     $logButtons = New-Object System.Windows.Forms.Panel
     $logButtons.Dock = 'Bottom'
     $logButtons.Height = 48
-    $btnSaveLog = New-StandardButton 'Save log' 0 8 110
-    $btnClearLog = New-StandardButton 'Clear log' 118 8 110
-    $logButtons.Controls.AddRange(@($btnSaveLog, $btnClearLog))
+    $logButtons.Padding = New-Object System.Windows.Forms.Padding(0, 8, 0, 8)
+    $btnSaveLog = New-StandardButton 'Save log' 0 0 110 32
+    $btnClearLog = New-StandardButton 'Clear log' 0 0 110 32
+    Add-DockedLeft $logButtons $btnSaveLog 110
+    Add-DockedLeft $logButtons $btnClearLog 110 0
     $script:txtLog = New-Object System.Windows.Forms.RichTextBox
     $script:txtLog.Dock = 'Fill'
     $script:txtLog.ReadOnly = $true
@@ -2223,28 +2516,15 @@ function Build-MainForm {
     $btnSaveLog.Add_Click({ Save-ActivityLog })
     $btnClearLog.Add_Click({ $script:txtLog.Clear() })
 
-    $form.Add_Shown({
-        try {
-            $script:split.Panel1MinSize = 420
-            $script:split.Panel2MinSize = 280
-            $script:split.SplitterDistance = 560
-        }
-        catch {}
-        if ($script:csvGroup -and $script:mapTable) {
-            $width = $script:csvGroup.ClientSize.Width - 24
-            if ($width -gt 200) {
-                $script:mapTable.Width = $width
-                $script:lblMap.Width = $width
-            }
-        }
+    $script:split.Add_Resize({ Update-SplitLayout })
+    $script:split.Add_SplitterMoved({
+        if ($script:applyingSplit -or $script:split.Width -le 0) { return }
+        $script:splitRatio = $script:split.SplitterDistance / [double]$script:split.Width
     })
-    $script:csvGroup.Add_Resize({
-        if (-not $script:mapTable -or -not $script:csvGroup) { return }
-        $width = $script:csvGroup.ClientSize.Width - 24
-        if ($width -gt 200) {
-            $script:mapTable.Width = $width
-            $script:lblMap.Width = $width
-        }
+    $form.Add_Shown({
+        Update-SplitLayout
+        Update-LicenseListColumns
+        Update-CsvHeaderHeight
     })
     $form.Add_FormClosing({
         if ($script:busy) {
