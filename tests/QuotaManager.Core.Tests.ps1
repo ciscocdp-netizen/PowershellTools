@@ -283,6 +283,8 @@ Assert-True 'gui exposes send setting' $guiText.Contains('ProhibitSendGB')
 Assert-True 'gui exposes warning setting' $guiText.Contains('IssueWarningGB')
 Assert-True 'gui keeps exchange commands on the UI thread' $guiText.Contains('Commands now run on the')
 Assert-True 'gui can list licenses' $guiText.Contains('Get-MgUserLicenseDetail')
+Assert-True 'gui does not stop a sign-in timer' (-not $guiText.Contains('$timer.Stop()'))
+Assert-True 'gui reads connection properties safely' $guiText.Contains('function Get-SafeText')
 
 Write-Host ""
 Write-Host "Passed: $($script:passed)"

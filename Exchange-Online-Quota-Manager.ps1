@@ -42,6 +42,10 @@
       - Test mode did not check that the mailbox existed.
       - Exchange progress output could stall a Windows Forms host.
       - The last grid edit could be left uncommitted.
+      - After the sign-in window closed, cleanup called Stop() and Dispose()
+        on a timer that was not in scope. That null call was reported as the
+        connection error and then crashed the window. Sign-in no longer uses
+        that timer, and a missing organization object cannot crash the form.
 #>
 
 $ErrorActionPreference = 'Continue'
@@ -67,6 +71,36 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 try { [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false) } catch {}
+try {
+    [System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException)
+}
+catch {}
+$script:handlingUiException = $false
+[System.Windows.Forms.Application]::add_ThreadException({
+    if ($script:handlingUiException) { return }
+    $script:handlingUiException = $true
+    try {
+        $eventArgs = $null
+        if ($args.Count -gt 1) { $eventArgs = $args[1] }
+        $message = 'The window hit an unexpected error.'
+        if ($eventArgs -and $eventArgs.Exception -and $eventArgs.Exception.Message) {
+            $message = [string]$eventArgs.Exception.Message
+        }
+        try { Write-Activity "The window hit an error: $message" 'ERROR' } catch {}
+        try {
+            [void][System.Windows.Forms.MessageBox]::Show(
+                "The window hit an error and stayed open.`r`n`r`n$message",
+                'Exchange Online Quota Manager',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            )
+        }
+        catch {}
+    }
+    finally {
+        $script:handlingUiException = $false
+    }
+})
 
 $script:CorePath = Join-Path $PSScriptRoot 'QuotaManager.Core.ps1'
 if (-not (Test-Path -LiteralPath $script:CorePath)) {
@@ -80,7 +114,7 @@ if (-not (Test-Path -LiteralPath $script:CorePath)) {
 }
 . $script:CorePath
 
-$script:AppVersion = '2.1'
+$script:AppVersion = '2.2'
 $script:busy = $false
 $script:cancelRequested = $false
 $script:exoConnected = $false
@@ -237,6 +271,41 @@ function Set-UiBusy {
     Update-ConnectionLabels
 }
 
+function Get-SafeText {
+    param($Object, [string[]]$Names)
+    if ($null -eq $Object) { return '' }
+    foreach ($name in @($Names)) {
+        $property = $Object.PSObject.Properties[$name]
+        if ($null -eq $property) { continue }
+        $text = [string]$property.Value
+        if (-not [string]::IsNullOrWhiteSpace($text)) { return $text }
+    }
+    return ''
+}
+
+function Get-ErrorDetail {
+    param($ErrorRecord)
+    $parts = New-Object System.Collections.Generic.List[string]
+    $current = $null
+    if ($ErrorRecord -and $ErrorRecord.Exception) { $current = $ErrorRecord.Exception }
+    while ($current) {
+        $text = [string]$current.Message
+        if (-not [string]::IsNullOrWhiteSpace($text) -and -not $parts.Contains($text)) {
+            [void]$parts.Add($text)
+        }
+        $current = $current.InnerException
+    }
+    if ($parts.Count -eq 0 -and $ErrorRecord) {
+        $fallback = [string]$ErrorRecord
+        if (-not [string]::IsNullOrWhiteSpace($fallback)) { [void]$parts.Add($fallback) }
+    }
+    if ($ErrorRecord -and $ErrorRecord.InvocationInfo -and $ErrorRecord.InvocationInfo.PositionMessage) {
+        $position = $ErrorRecord.InvocationInfo.PositionMessage.Trim()
+        if (-not [string]::IsNullOrWhiteSpace($position)) { [void]$parts.Add($position) }
+    }
+    return ($parts -join "`r`n`r`n")
+}
+
 function Invoke-WithBusyCursor {
     param([Parameter(Mandatory)][scriptblock]$Action)
 
@@ -247,8 +316,11 @@ function Invoke-WithBusyCursor {
     $script:busy = $true
     $script:cancelRequested = $false
     Set-UiBusy $true
-    $previous = $script:form.Cursor
-    $script:form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    $previous = [System.Windows.Forms.Cursors]::Default
+    if ($script:form -and -not $script:form.IsDisposed) {
+        $previous = $script:form.Cursor
+        $script:form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    }
     [System.Windows.Forms.Application]::DoEvents()
     try {
         & $Action
@@ -259,7 +331,7 @@ function Invoke-WithBusyCursor {
         if ($script:form -and -not $script:form.IsDisposed) {
             $script:form.Cursor = $previous
         }
-        Set-UiBusy $false
+        try { Set-UiBusy $false } catch {}
     }
 }
 
@@ -326,6 +398,17 @@ function Connect-GraphWithFallback {
     }
 }
 
+function Get-ExchangeConnectionInfo {
+    try {
+        $items = @(Get-ConnectionInformation -ErrorAction SilentlyContinue | Where-Object { $null -ne $_ })
+        if ($items.Count -eq 0) { return $null }
+        return $items[0]
+    }
+    catch {
+        return $null
+    }
+}
+
 function Connect-ExchangeSession {
     if (-not (Get-Module -ListAvailable -Name ExchangeOnlineManagement)) {
         throw "The ExchangeOnlineManagement module is not installed.`r`n`r`nInstall-Module ExchangeOnlineManagement -Scope CurrentUser"
@@ -334,31 +417,50 @@ function Connect-ExchangeSession {
         Import-Module ExchangeOnlineManagement -ErrorAction Stop
     }
 
-    $existing = @()
-    try { $existing = @(Get-ConnectionInformation -ErrorAction SilentlyContinue) } catch {}
-    if ($existing.Count -eq 0) {
-        Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop
+    $existing = Get-ExchangeConnectionInfo
+    $state = Get-SafeText $existing @('State')
+    $connectedAlready = ($null -ne $existing) -and ($state -eq '' -or $state -eq 'Connected')
+    if (-not $connectedAlready) {
+        if ($null -ne $existing) {
+            try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+        }
+        $connectParams = @{ ErrorAction = 'Stop' }
+        $connectCommand = Get-Command Connect-ExchangeOnline -ErrorAction Stop
+        if ($connectCommand.Parameters.ContainsKey('ShowBanner')) {
+            $connectParams['ShowBanner'] = $false
+        }
+        # Sign-in stays on this thread. A timer in another scope is left null
+        # after the browser closes, and calling Stop() on it crashes the window.
+        Connect-ExchangeOnline @connectParams
     }
 
+    $info = Get-ExchangeConnectionInfo
+    if ($null -eq $info) {
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 400
+        $info = Get-ExchangeConnectionInfo
+    }
+
+    $account = Get-SafeText $info @('UserPrincipalName', 'UserName', 'Account')
+    $orgName = Get-SafeText $info @('Organization', 'TenantId', 'Name')
+
+    $org = $null
     try {
-        $org = Get-OrganizationConfig -ErrorAction Stop
+        $org = @(Get-OrganizationConfig -ErrorAction Stop | Where-Object { $null -ne $_ }) | Select-Object -First 1
     }
     catch {
-        try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue } catch {}
-        throw
+        if ($null -eq $info) { throw }
+        Write-Activity "Signed in, but organization details were not returned: $($_.Exception.Message)" 'WARN'
     }
+    $display = Get-SafeText $org @('DisplayName', 'Name', 'Identity')
+    if ($display) { $orgName = $display }
 
-    $account = ''
-    try {
-        $info = @(Get-ConnectionInformation -ErrorAction SilentlyContinue) | Select-Object -First 1
-        if ($info -and $info.UserPrincipalName) {
-            $account = [string]$info.UserPrincipalName
-        }
+    if ($null -eq $info -and $null -eq $org) {
+        throw "Sign-in finished, but Exchange Online did not return a connection.`r`n`r`nClose any leftover sign-in window and try again. If this keeps happening, run:`r`n`r`nUpdate-Module ExchangeOnlineManagement"
     }
-    catch {}
 
     $script:exoConnected = $true
-    $script:exoOrganization = [string]$org.DisplayName
+    $script:exoOrganization = $orgName
     $script:exoAccount = $account
 }
 
@@ -392,14 +494,16 @@ function Connect-LicenseSession {
 
         $context = $null
         try { $context = Get-MgContext -ErrorAction SilentlyContinue } catch {}
-        if (-not $context -or [string]::IsNullOrWhiteSpace([string]$context.Account)) {
+        $graphAccount = Get-SafeText $context @('Account')
+        if ([string]::IsNullOrWhiteSpace($graphAccount)) {
             Connect-GraphWithFallback
             $context = Get-MgContext -ErrorAction Stop
+            $graphAccount = Get-SafeText $context @('Account')
         }
 
         $script:licenseConnected = $true
         $script:licenseSource = 'Graph'
-        $script:licenseAccount = [string]$context.Account
+        $script:licenseAccount = $graphAccount
         return
     }
 
@@ -410,7 +514,9 @@ function Connect-LicenseSession {
         $connection = Connect-AzureAD -ErrorAction Stop
         $script:licenseConnected = $true
         $script:licenseSource = 'AzureAD'
-        $script:licenseAccount = [string]$connection.Account.Id
+        $accountObject = $null
+        if ($connection) { $accountObject = $connection.Account }
+        $script:licenseAccount = Get-SafeText $accountObject @('Id', 'UserPrincipalName')
         return
     }
 
@@ -2368,8 +2474,11 @@ function Build-MainForm {
             }
             catch {
                 $script:exoConnected = $false
-                Write-Activity "Exchange Online connection failed: $($_.Exception.Message)" 'ERROR'
-                Show-Info "Could not connect to Exchange Online.`r`n`r`n$($_.Exception.Message)" -Icon Error
+                $script:exoOrganization = ''
+                $script:exoAccount = ''
+                $detail = Get-ErrorDetail $_
+                Write-Activity "Exchange Online connection failed: $detail" 'ERROR'
+                Show-Info "Could not connect to Exchange Online.`r`n`r`n$detail" -Icon Error
             }
         }
     })
