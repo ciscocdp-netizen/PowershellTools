@@ -75,6 +75,7 @@ param(
     [string]$LogoPath,
     [string]$TemplatePath,
     [int]$PreviewRowCount = 12,
+    [int]$InlineDetailDays = 14,
     [int]$ReportRetentionDays = 90,
     [switch]$SkipEmail,
     [switch]$WriteHtmlPreview,
@@ -517,6 +518,129 @@ function New-HtmlPreviewTable {
     return $sb.ToString()
 }
 
+function Get-SecretDaysRemainingValue {
+    param($Row)
+    $days = 0
+    if ($null -eq $Row) { return $null }
+    if ([int]::TryParse([string]$Row.DaysRemaining, [ref]$days)) { return $days }
+    return $null
+}
+
+function Select-SecretsInDayWindow {
+    param(
+        [AllowEmptyCollection()][object[]]$Items,
+        [int]$MinDays = 0,
+        [int]$MaxDays = 14
+    )
+    $matched = New-Object System.Collections.ArrayList
+    foreach ($row in @($Items)) {
+        $days = Get-SecretDaysRemainingValue -Row $row
+        if ($null -eq $days) { continue }
+        if ($days -ge $MinDays -and $days -le $MaxDays) {
+            [void]$matched.Add($row)
+        }
+    }
+    return @($matched | Sort-Object { Get-SecretDaysRemainingValue -Row $_ }, { $_.Name })
+}
+
+function New-HtmlDetailMetaRow {
+    param([string]$Label, [string]$ValueHtml)
+    return '<tr><td style="padding:3px 0;font-family:Segoe UI,Arial,Helvetica,sans-serif;font-size:12px;color:#6d6e71;width:28%;vertical-align:top;">' + $Label + '</td><td style="padding:3px 0;font-family:Segoe UI,Arial,Helvetica,sans-serif;font-size:12px;color:#2f3337;">' + $ValueHtml + '</td></tr>'
+}
+
+function New-HtmlFourteenDayDetails {
+    param(
+        [AllowEmptyCollection()][object[]]$Items,
+        [int]$WindowDays = 14,
+        [int]$MaxCards = 40
+    )
+
+    $rows = @($Items)
+    $sb = New-Object System.Text.StringBuilder
+
+    if ($rows.Count -eq 0) {
+        [void]$sb.Append('<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #eee8e4;border-radius:8px;background-color:#faf8f6;"><tr><td style="padding:16px 18px;font-family:Segoe UI,Arial,Helvetica,sans-serif;font-size:13px;line-height:20px;color:#6d6e71;">No client secrets expire in the next ' + $WindowDays + ' days. Items already expired, and those further out than ' + $WindowDays + ' days, are covered in the other sections and the attached workbooks.</td></tr></table>')
+        return $sb.ToString()
+    }
+
+    $shown = 0
+    foreach ($row in $rows) {
+        if ($shown -ge $MaxCards) { break }
+        $shown++
+
+        $days = Get-SecretDaysRemainingValue -Row $row
+        if ($null -eq $days) { $days = 0 }
+
+        switch ($row.Severity) {
+            "Urgent"  { $sevColor = "#c05621"; $sevBg = "#fff1e8"; $accent = "#c05621" }
+            "Warning" { $sevColor = "#8a6d1b"; $sevBg = "#fff8e8"; $accent = "#c5a035" }
+            default   { $sevColor = "#1b2a4a"; $sevBg = "#eef2f6"; $accent = "#1b2a4a" }
+        }
+
+        $nameSafe   = ConvertTo-HtmlSafe $row.Name
+        $secretSafe = ConvertTo-HtmlSafe $(if ($row.SecretName) { $row.SecretName } else { "(unnamed)" })
+        $hintSafe   = ConvertTo-HtmlSafe $row.SecretHint
+        $appIdSafe  = ConvertTo-HtmlSafe $row.AppId
+        $keyIdSafe  = ConvertTo-HtmlSafe $row.KeyId
+        $created    = ConvertTo-HtmlSafe $row.CreatedDate
+        $expiry     = ConvertTo-HtmlSafe $row.ExpiryDate
+        $owners     = ConvertTo-HtmlSafe $row.OwnerNames
+        $emails     = ConvertTo-HtmlSafe $row.OwnerEmails
+
+        $appHeading = $nameSafe
+        $portalLink = ""
+        if ($row.PortalUrl) {
+            $urlSafe = ConvertTo-HtmlSafe $row.PortalUrl
+            $appHeading = '<a href="' + $urlSafe + '" style="color:#1b2a4a;font-weight:700;text-decoration:underline;">' + $nameSafe + '</a>'
+            $portalLink = '<a href="' + $urlSafe + '" style="color:#0f4c81;font-weight:600;text-decoration:underline;">Open Certificates &amp; secrets</a>'
+        }
+
+        $secretValue = $secretSafe
+        if ($hintSafe) { $secretValue = $secretSafe + ' <span style="color:#6d6e71;">(hint ' + $hintSafe + ")</span>" }
+
+        $ownerValue = $owners
+        if ([string]::IsNullOrWhiteSpace($ownerValue)) {
+            $ownerValue = '<span style="color:#8a6d1b;font-weight:600;">Unassigned</span>'
+        }
+        if (-not [string]::IsNullOrWhiteSpace($emails)) {
+            $ownerValue = $ownerValue + '<br /><span style="color:#6d6e71;">' + $emails + "</span>"
+        }
+
+        $daysWord = if ($days -eq 1) { "day" } else { "days" }
+        $daysLabel = ([string]$days) + " " + $daysWord + " remaining"
+
+        [void]$sb.Append('<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #eee8e4;border-left:4px solid ' + $accent + ';border-radius:8px;margin-bottom:10px;">')
+        [void]$sb.Append('<tr><td style="padding:14px 16px;">')
+        [void]$sb.Append('<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>')
+        [void]$sb.Append('<td style="font-family:Segoe UI,Arial,Helvetica,sans-serif;font-size:15px;line-height:20px;">' + $appHeading + "</td>")
+        [void]$sb.Append('<td align="right" style="white-space:nowrap;padding-left:10px;"><span style="display:inline-block;padding:3px 8px;border-radius:10px;font-family:Segoe UI,Arial,Helvetica,sans-serif;font-size:11px;font-weight:700;color:' + $sevColor + ';background-color:' + $sevBg + ';">' + (ConvertTo-HtmlSafe $row.Severity) + " · " + $daysLabel + "</span></td>")
+        [void]$sb.Append("</tr></table>")
+        [void]$sb.Append('<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="padding-top:8px;">')
+        [void]$sb.Append((New-HtmlDetailMetaRow -Label "Secret" -ValueHtml $secretValue))
+        [void]$sb.Append((New-HtmlDetailMetaRow -Label "Expires" -ValueHtml ($expiry + " &nbsp;&bull;&nbsp; " + $daysLabel)))
+        if ($created) {
+            [void]$sb.Append((New-HtmlDetailMetaRow -Label "Created" -ValueHtml $created))
+        }
+        if ($appIdSafe) {
+            [void]$sb.Append((New-HtmlDetailMetaRow -Label "App ID" -ValueHtml ('<span style="font-family:Consolas,Courier New,monospace;font-size:11px;">' + $appIdSafe + "</span>")))
+        }
+        if ($keyIdSafe) {
+            [void]$sb.Append((New-HtmlDetailMetaRow -Label "Key ID" -ValueHtml ('<span style="font-family:Consolas,Courier New,monospace;font-size:11px;">' + $keyIdSafe + "</span>")))
+        }
+        [void]$sb.Append((New-HtmlDetailMetaRow -Label "Owners" -ValueHtml $ownerValue))
+        if ($portalLink) {
+            [void]$sb.Append((New-HtmlDetailMetaRow -Label "Entra" -ValueHtml $portalLink))
+        }
+        [void]$sb.Append("</table></td></tr></table>")
+    }
+
+    if ($rows.Count -gt $MaxCards) {
+        [void]$sb.Append('<div style="font-family:Segoe UI,Arial,Helvetica,sans-serif;font-size:12px;color:#6d6e71;padding-top:4px;">Showing ' + $MaxCards + " of " + $rows.Count + " secrets that expire within " + $WindowDays + " days. The remaining rows are in the attached Expiring workbook.</div>")
+    }
+
+    return $sb.ToString()
+}
+
 function New-HtmlAttachmentList {
     param([string[]]$Paths, [hashtable]$Counts)
     $items = @($Paths | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
@@ -558,6 +682,7 @@ function New-HtmlNextSteps {
     if ($UrgentCount -gt 0) {
         [void]$steps.Add("<strong>Treat 0–7 day expirations as a change window this week.</strong> Prefer overlapping secrets (add the new one first) so production traffic never sees a gap.")
     }
+    [void]$steps.Add("<strong>Work the 14-day list in this email first.</strong> Each card includes the application, secret, owners, App ID, and an Entra link so rotation can start without opening the workbook.")
     [void]$steps.Add("<strong>Notify listed owners</strong> using the OwnerEmails column. Ask them to confirm the secret is still required and to complete rotation before the expiry date.")
     if ($UnownedCount -gt 0) {
         [void]$steps.Add("<strong>Assign owners on unowned app registrations</strong> in Entra admin center. Secrets with no owner are the most common cause of missed rotations.")
@@ -596,6 +721,7 @@ function New-ExpirationReportHtml {
         [int]$SeverityWatch,
         [object[]]$PreviewItems,
         [int]$PreviewRowCount,
+        [int]$InlineDetailDays = 14,
         [string[]]$AttachmentPaths,
         [hashtable]$AttachmentCounts,
         [string]$ComputerName
@@ -626,16 +752,27 @@ function New-ExpirationReportHtml {
     if ($ExpiredCount -gt 0) {
         [void]$alerts.Append((New-HtmlAlert -BorderColor $BrandBurgundy -BackgroundColor "#fdecec" -TextColor "#8a1a1a" -HtmlMessage ("<strong>Action needed:</strong> " + $ExpiredCount + " client secret(s) have already expired and should be rotated immediately. Details are in the attached <strong>Expired</strong> workbook.")))
     }
+    $fourteenDayItems = Select-SecretsInDayWindow -Items $PreviewItems -MinDays 0 -MaxDays $InlineDetailDays
+    $fourteenDayCount = @($fourteenDayItems).Count
+
     if ($SeverityUrgent -gt 0) {
         [void]$alerts.Append((New-HtmlAlert -BorderColor "#c05621" -BackgroundColor "#fff1e8" -TextColor "#7a3b12" -HtmlMessage ("<strong>This week:</strong> " + $SeverityUrgent + " secret(s) expire within 7 days. Add a replacement secret before cutting over so the application does not lose access.")))
+    }
+    if ($fourteenDayCount -gt 0) {
+        [void]$alerts.Append((New-HtmlAlert -BorderColor "#0f4c81" -BackgroundColor "#eef5fc" -TextColor "#0f4c81" -HtmlMessage ("<strong>Next " + $InlineDetailDays + " days:</strong> " + $fourteenDayCount + " client secret(s) are still valid but expire inside this window. Full application details are listed inline below.")))
     }
     if ($UnownedCount -gt 0) {
         [void]$alerts.Append((New-HtmlAlert -BorderColor "#c5a035" -BackgroundColor "#fff8e8" -TextColor "#8a6d1b" -HtmlMessage ("<strong>Ownership gap:</strong> " + $UnownedCount + " reportable secret(s) have no application owner in Entra ID. Assign an owner so the next rotation is not missed.")))
     }
 
-    $previewIntro = "The table below is sorted by urgency (oldest / soonest first). Application names link to the Certificates &amp; secrets blade in Entra admin center."
+    $previewIntro = "The table below is sorted by urgency (oldest / soonest first) and includes expired secrets plus the rest of the $DaysThreshold-day window. Application names link to the Certificates &amp; secrets blade in Entra admin center."
     if ((@($PreviewItems)).Count -eq 0) {
         $previewIntro = "No client secrets are inside the current reporting window. The attached Expiring workbook was still generated so the scheduled job has a consistent artifact."
+    }
+
+    $fourteenIntro = "Every application with a client secret that is still valid and expires within the next $InlineDetailDays days is listed here with owners, identifiers, and an Entra link so rotation can start from this email."
+    if ($fourteenDayCount -eq 0) {
+        $fourteenIntro = "No still-valid client secrets expire inside the next $InlineDetailDays days."
     }
 
     $includeLabel = ""
@@ -666,6 +803,10 @@ function New-ExpirationReportHtml {
         ALERT_SECTION          = $alerts.ToString()
         PREVIEW_INTRO          = $previewIntro
         PREVIEW_TABLE          = (New-HtmlPreviewTable -Items $PreviewItems -MaxRows $PreviewRowCount)
+        FOURTEEN_DAY_COUNT     = [string]$fourteenDayCount
+        FOURTEEN_DAY_WINDOW    = [string]$InlineDetailDays
+        FOURTEEN_DAY_INTRO     = $fourteenIntro
+        FOURTEEN_DAY_DETAILS   = (New-HtmlFourteenDayDetails -Items $fourteenDayItems -WindowDays $InlineDetailDays)
         NEXT_STEPS             = (New-HtmlNextSteps -ExpiredCount $ExpiredCount -UnownedCount $UnownedCount -UrgentCount $SeverityUrgent -DaysThreshold $DaysThreshold)
         ATTACHMENT_LIST        = (New-HtmlAttachmentList -Paths $AttachmentPaths -Counts $AttachmentCounts)
         GENERATED_AT           = (ConvertTo-HtmlSafe $generatedAtText)
@@ -858,8 +999,10 @@ function Get-EmbeddedEmailTemplate {
                             Hello,
                             <br /><br />
                             The Enterprise Application Team completed the scheduled Entra ID client-secret scan.
-                            This message summarizes what needs attention, lists the most urgent secrets inline,
-                            and attaches full workbooks for triage. SAML and OIDC signing certificates are
+                            This message summarizes what needs attention, lists every application with a secret
+                            expiring in the next <strong>{{FOURTEEN_DAY_WINDOW}} days</strong> (with owners,
+                            identifiers, and an Entra link), and attaches full workbooks for the rest of the
+                            window. SAML and OIDC signing certificates are
                             <strong>intentionally excluded</strong> — only application <strong>client secrets</strong>
                             (password credentials) are in scope.
                         </td>
@@ -945,6 +1088,17 @@ function Get-EmbeddedEmailTemplate {
                     </tr>
 
                     {{ALERT_SECTION}}
+
+                    <!-- Next 14 days — full application details -->
+                    <tr>
+                        <td style="padding:18px 32px 8px 32px;">
+                            <div style="font-family:Segoe UI,Arial,Helvetica,sans-serif;font-size:13px;font-weight:700;color:#1b2a4a;padding-bottom:4px;">Expiring in the next {{FOURTEEN_DAY_WINDOW}} days &nbsp;<span style="font-weight:600;color:#0f4c81;">({{FOURTEEN_DAY_COUNT}})</span></div>
+                            <div style="font-family:Segoe UI,Arial,Helvetica,sans-serif;font-size:12px;line-height:18px;color:#5c5f62;padding-bottom:12px;">
+                                {{FOURTEEN_DAY_INTRO}}
+                            </div>
+                            {{FOURTEEN_DAY_DETAILS}}
+                        </td>
+                    </tr>
 
                     <!-- Priority preview table -->
                     <tr>
@@ -2429,6 +2583,7 @@ try {
         -SeverityWatch $severityWatch `
         -PreviewItems $AllReportable `
         -PreviewRowCount $PreviewRowCount `
+        -InlineDetailDays $InlineDetailDays `
         -AttachmentPaths $Attachments `
         -AttachmentCounts $attachmentCounts `
         -ComputerName $env:COMPUTERNAME
@@ -2460,6 +2615,7 @@ try {
             -SeverityWatch $severityWatch `
             -PreviewItems $AllReportable `
             -PreviewRowCount $PreviewRowCount `
+            -InlineDetailDays $InlineDetailDays `
             -AttachmentPaths $Attachments `
             -AttachmentCounts $attachmentCounts `
             -ComputerName $env:COMPUTERNAME
