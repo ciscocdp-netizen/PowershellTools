@@ -97,6 +97,9 @@
       - Remote event collection had no WinRM fallback when RPC Get-WinEvent failed.
       - Enabling AuditSmb1Access did not ensure the Audit channel itself is on.
       - CSV UTF-8 encoding differed between Windows PowerShell 5.1 and PowerShell 7.
+      - Wrapping a List[object] of PSCustomObject with @() (or binding it to [object[]])
+        throws "Argument types do not match" in Windows PowerShell 5.1, so a successful
+        event query produced 0 summary rows. Collections are ArrayList and copied by index.
 #>
 [CmdletBinding()]
 param(
@@ -124,8 +127,8 @@ $script:Version      = '2.0'
 $script:AuditLogName = 'Microsoft-Windows-SMBServer/Audit'
 $script:AuditEventId = 3000
 $script:Targets      = @()
-$script:Summary      = New-Object System.Collections.Generic.List[object]
-$script:ClientRollup = New-Object System.Collections.Generic.List[object]
+$script:Summary      = New-Object System.Collections.ArrayList
+$script:ClientRollup = New-Object System.Collections.ArrayList
 $script:DnsCache     = @{}
 $script:Credential   = $Credential
 $script:NonInteractive = $false
@@ -170,9 +173,44 @@ function Pause-Menu {
 
 function Show-Table {
     param($InputObject)
-    $rows = @($InputObject)
+    $rows = ConvertTo-ArrayList $InputObject
     if ($rows.Count -eq 0) { return }
     $rows | Format-Table -AutoSize -Wrap | Out-Host
+}
+
+# Windows PowerShell 5.1 throws "Argument types do not match" when @() or an
+# [object[]] parameter conversion is applied to List[object] containing
+# PSCustomObject rows. Copy by index into ArrayList instead (ArrayList is not
+# unrolled on function return, so 0- and 1-row results keep a real .Count).
+function ConvertTo-ArrayList {
+    param($Value)
+
+    $acc = New-Object System.Collections.ArrayList
+    if ($null -eq $Value) { return $acc }
+
+    if ($Value -is [string]) {
+        [void]$acc.Add($Value)
+        return $acc
+    }
+
+    if ($Value -is [System.Collections.IList]) {
+        $count = [int]$Value.Count
+        for ($i = 0; $i -lt $count; $i++) {
+            [void]$acc.Add($Value[$i])
+        }
+        return $acc
+    }
+
+    if ($Value -is [System.Collections.IEnumerable] -and
+        -not ($Value -is [System.Management.Automation.PSObject])) {
+        foreach ($item in $Value) {
+            [void]$acc.Add($item)
+        }
+        return $acc
+    }
+
+    [void]$acc.Add($Value)
+    return $acc
 }
 
 function Test-IsElevated {
@@ -639,21 +677,22 @@ function Get-Smbv1AuditEvents {
 
 function ConvertTo-Smbv1Summary {
     param(
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [object[]]$Events,
+        $Events,
         [bool]$ResolveDns = $false,
         [bool]$LookupAD = $false,
         [scriptblock]$NameResolver = $null
     )
 
-    $list = New-Object System.Collections.Generic.List[object]
-    if ($null -eq $Events -or @($Events).Count -eq 0) { return $list }
+    $out = New-Object System.Collections.ArrayList
+    $eventRows = ConvertTo-ArrayList $Events
+    if ($eventRows.Count -eq 0) { return $out }
 
-    $groups = @($Events | Group-Object DomainController, ClientAddress)
+    $groups = $eventRows | Group-Object DomainController, ClientAddress
     foreach ($g in $groups) {
-        $first = @($g.Group)[0]
-        $times = @($g.Group | Sort-Object TimeCreated)
+        $groupRows = ConvertTo-ArrayList $g.Group
+        $first = $groupRows[0]
+        $times = $groupRows | Sort-Object TimeCreated
+        $timeList = ConvertTo-ArrayList $times
         $address = [string]$first.ClientAddress
         $hostName = 'N/A'
 
@@ -679,62 +718,56 @@ function ConvertTo-Smbv1Summary {
             }
         }
 
-        [void]$list.Add([pscustomobject]@{
-            DomainController = $first.DomainController
-            ClientAddress    = $address
-            HostName         = $hostName
-            OperatingSystem  = $os
+        [void]$out.Add([pscustomobject]@{
+            DomainController  = $first.DomainController
+            ClientAddress     = $address
+            HostName          = $hostName
+            OperatingSystem   = $os
             DistinguishedName = $ou
-            ConnectionCount  = [int]$g.Count
-            FirstSeen        = $times[0].TimeCreated
-            LastSeen         = $times[-1].TimeCreated
+            ConnectionCount   = [int]$g.Count
+            FirstSeen         = $timeList[0].TimeCreated
+            LastSeen          = $timeList[$timeList.Count - 1].TimeCreated
         })
     }
 
-    $sorted = @($list | Sort-Object @{ Expression = 'ConnectionCount'; Descending = $true }, @{ Expression = 'ClientAddress'; Descending = $false })
-    $out = New-Object System.Collections.Generic.List[object]
-    foreach ($row in $sorted) { [void]$out.Add($row) }
-    return $out
+    $sorted = ConvertTo-ArrayList ($out | Sort-Object @{ Expression = 'ConnectionCount'; Descending = $true }, @{ Expression = 'ClientAddress'; Descending = $false })
+    return $sorted
 }
 
 function ConvertTo-Smbv1ClientRollup {
-    param(
-        [AllowEmptyCollection()]
-        [object[]]$SummaryRows
-    )
+    param($SummaryRows)
 
-    $list = New-Object System.Collections.Generic.List[object]
-    if ($null -eq $SummaryRows -or @($SummaryRows).Count -eq 0) { return $list }
+    $out = New-Object System.Collections.ArrayList
+    $summaryList = ConvertTo-ArrayList $SummaryRows
+    if ($summaryList.Count -eq 0) { return $out }
 
-    $groups = @($SummaryRows | Group-Object ClientAddress)
+    $groups = $summaryList | Group-Object ClientAddress
     foreach ($g in $groups) {
-        $rows = @($g.Group)
-        $dcs = @($rows | Select-Object -ExpandProperty DomainController -Unique)
-        $hostName = @($rows | Where-Object { $_.HostName -and $_.HostName -ne 'N/A' } | Select-Object -First 1 -ExpandProperty HostName)
-        if (-not $hostName) { $hostName = 'N/A' }
-        $firsts = @($rows | Sort-Object FirstSeen)
-        $lasts  = @($rows | Sort-Object LastSeen)
-        [void]$list.Add([pscustomobject]@{
-            ClientAddress      = $g.Name
-            HostName           = $hostName
-            DomainControllers  = ($dcs -join ', ')
-            ConnectionCount    = [int](($rows | Measure-Object -Property ConnectionCount -Sum).Sum)
-            FirstSeen          = $firsts[0].FirstSeen
-            LastSeen           = $lasts[-1].LastSeen
+        $rows = ConvertTo-ArrayList $g.Group
+        $dcs = ConvertTo-ArrayList ($rows | Select-Object -ExpandProperty DomainController -Unique)
+        $named = ConvertTo-ArrayList ($rows | Where-Object { $_.HostName -and $_.HostName -ne 'N/A' })
+        $hostName = 'N/A'
+        if ($named.Count -gt 0) { $hostName = [string]$named[0].HostName }
+        $firsts = ConvertTo-ArrayList ($rows | Sort-Object FirstSeen)
+        $lasts  = ConvertTo-ArrayList ($rows | Sort-Object LastSeen)
+        [void]$out.Add([pscustomobject]@{
+            ClientAddress     = $g.Name
+            HostName          = $hostName
+            DomainControllers = ($dcs -join ', ')
+            ConnectionCount   = [int](($rows | Measure-Object -Property ConnectionCount -Sum).Sum)
+            FirstSeen         = $firsts[0].FirstSeen
+            LastSeen          = $lasts[$lasts.Count - 1].LastSeen
         })
     }
 
-    $sorted = @($list | Sort-Object @{ Expression = 'ConnectionCount'; Descending = $true }, @{ Expression = 'ClientAddress'; Descending = $false })
-    $out = New-Object System.Collections.Generic.List[object]
-    foreach ($row in $sorted) { [void]$out.Add($row) }
-    return $out
+    return (ConvertTo-ArrayList ($out | Sort-Object @{ Expression = 'ConnectionCount'; Descending = $true }, @{ Expression = 'ClientAddress'; Descending = $false }))
 }
 
 function ConvertTo-Smbv1Html {
     param(
-        [object[]]$SummaryRows,
-        [object[]]$RollupRows,
-        [string[]]$Targets,
+        $SummaryRows,
+        $RollupRows,
+        $Targets,
         [int]$Days
     )
 
@@ -752,14 +785,17 @@ function ConvertTo-Smbv1Html {
     [void]$sb.AppendLine('th{background:#0b6aa2;color:#fff}tr:nth-child(even){background:#f4f8fb}')
     [void]$sb.AppendLine('.meta{color:#555;margin-bottom:16px}</style></head><body>')
     [void]$sb.AppendLine('<h1>SMBv1 Client Audit</h1>')
-    [void]$sb.AppendLine(('<p class="meta">Generated {0:yyyy-MM-dd HH:mm:ss} | Days: {1} | Targets: {2}</p>' -f (Get-Date), $Days, ((@($Targets) -join ', '))))
+    $targetList  = ConvertTo-ArrayList $Targets
+    $summaryList = ConvertTo-ArrayList $SummaryRows
+    $rollupList  = ConvertTo-ArrayList $RollupRows
+    [void]$sb.AppendLine(('<p class="meta">Generated {0:yyyy-MM-dd HH:mm:ss} | Days: {1} | Targets: {2}</p>' -f (Get-Date), $Days, ($targetList -join ', ')))
 
     [void]$sb.AppendLine('<h2>Unique clients by server</h2><table><tr>')
     foreach ($h in @('DomainController','ClientAddress','HostName','OperatingSystem','ConnectionCount','FirstSeen','LastSeen')) {
         [void]$sb.Append("<th>$h</th>")
     }
     [void]$sb.AppendLine('</tr>')
-    foreach ($row in @($SummaryRows)) {
+    foreach ($row in $summaryList) {
         [void]$sb.Append('<tr>')
         foreach ($h in @('DomainController','ClientAddress','HostName','OperatingSystem','ConnectionCount','FirstSeen','LastSeen')) {
             [void]$sb.Append('<td>' + (ConvertTo-HtmlCell ([string]$row.$h)) + '</td>')
@@ -773,7 +809,7 @@ function ConvertTo-Smbv1Html {
         [void]$sb.Append("<th>$h</th>")
     }
     [void]$sb.AppendLine('</tr>')
-    foreach ($row in @($RollupRows)) {
+    foreach ($row in $rollupList) {
         [void]$sb.Append('<tr>')
         foreach ($h in @('ClientAddress','HostName','DomainControllers','ConnectionCount','FirstSeen','LastSeen')) {
             [void]$sb.Append('<td>' + (ConvertTo-HtmlCell ([string]$row.$h)) + '</td>')
@@ -804,7 +840,7 @@ function Save-Smbv1Results {
 
     try {
         if ($Format -eq 'Html') {
-            $html = ConvertTo-Smbv1Html -SummaryRows @($script:Summary) -RollupRows @($script:ClientRollup) -Targets @($script:Targets) -Days $Days
+            $html = ConvertTo-Smbv1Html -SummaryRows $script:Summary -RollupRows $script:ClientRollup -Targets $script:Targets -Days $Days
             [System.IO.File]::WriteAllText($Path, $html, [System.Text.UTF8Encoding]::new($true))
         }
         else {
@@ -1033,7 +1069,7 @@ function Start-Smbv1Scan {
     }
 
     $startTime = (Get-Date).AddDays(-$DaysBack)
-    $results   = New-Object System.Collections.Generic.List[object]
+    $results   = New-Object System.Collections.ArrayList
 
     Write-Host ""
     foreach ($dc in @($script:Targets)) {
@@ -1082,16 +1118,16 @@ function Start-Smbv1Scan {
     }
 
     if ($results.Count -eq 0) {
-        $script:Summary      = New-Object System.Collections.Generic.List[object]
-        $script:ClientRollup = New-Object System.Collections.Generic.List[object]
+        $script:Summary      = New-Object System.Collections.ArrayList
+        $script:ClientRollup = New-Object System.Collections.ArrayList
         Write-Host ""
         Write-Ok "No SMBv1 client connections found."
         if (-not $Quiet) { Pause-Menu }
         return
     }
 
-    $script:Summary = ConvertTo-Smbv1Summary -Events @($results) -ResolveDns $DoDns -LookupAD $DoAd
-    $script:ClientRollup = ConvertTo-Smbv1ClientRollup -SummaryRows @($script:Summary)
+    $script:Summary = ConvertTo-Smbv1Summary -Events $results -ResolveDns $DoDns -LookupAD $DoAd
+    $script:ClientRollup = ConvertTo-Smbv1ClientRollup -SummaryRows $script:Summary
 
     Write-Host ""
     Write-Ok "[+] $($script:Summary.Count) unique SMBv1 client/server pair(s) found."
@@ -1464,6 +1500,34 @@ function Invoke-Smbv1SelfTest {
 
     $emptySummary = ConvertTo-Smbv1Summary -Events @() -ResolveDns $false
     Assert-True -Condition ($emptySummary.Count -eq 0) -Name 'Empty event list yields an empty summary'
+
+    $genericBag = New-Object System.Collections.Generic.List[object]
+    foreach ($evt in $sampleEvents) { [void]$genericBag.Add($evt) }
+    $copiedBag = ConvertTo-ArrayList $genericBag
+    Assert-True -Condition ($copiedBag.Count -eq 4) `
+        -Name 'ConvertTo-ArrayList copies List[object] of PSCustomObject by index (PS 5.1 @() workaround)'
+
+    $fromGeneric = ConvertTo-Smbv1Summary -Events $genericBag -ResolveDns $false
+    Assert-True -Condition ($fromGeneric.Count -eq 3) `
+        -Name 'Summary accepts List[object] without @() or [object[]] conversion'
+    Assert-True -Condition ($fromGeneric[0].ConnectionCount -ge 1 -and $fromGeneric[0].ClientAddress) `
+        -Name 'Summary rows from List[object] are indexable PSCustomObjects'
+
+    $rollupFromGeneric = ConvertTo-Smbv1ClientRollup -SummaryRows $fromGeneric
+    Assert-True -Condition ($rollupFromGeneric.Count -eq 2) `
+        -Name 'Rollup accepts ArrayList summary rows without @() conversion'
+
+    $showThrew = $false
+    try {
+        $null = (ConvertTo-ArrayList $fromGeneric | Format-Table | Out-String)
+    }
+    catch { $showThrew = $true }
+    Assert-True -Condition (-not $showThrew) -Name 'Formatting ArrayList of PSCustomObject does not throw'
+
+    $oneRow = ConvertTo-ArrayList ([pscustomobject]@{ A = 1 })
+    Assert-True -Condition ($oneRow.Count -eq 1) -Name 'ConvertTo-ArrayList wraps a single PSCustomObject (does not unroll)'
+    $nullList = ConvertTo-ArrayList $null
+    Assert-True -Condition ($nullList.Count -eq 0) -Name 'ConvertTo-ArrayList of null is empty (not one $null)'
 
     Assert-True -Condition ((Get-CsvUtf8Encoding) -match 'UTF8|utf8BOM') -Name 'CSV encoding is UTF-8 (with BOM on PS 7+)'
 
