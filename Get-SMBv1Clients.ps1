@@ -8,6 +8,13 @@
     are written only after SMB1 access auditing is enabled (menu option 3, or
     -EnableAuditing). This does not enable the SMBv1 protocol itself.
 
+    On Windows Server 2012 R2 / Windows 8.1 and later, auditing uses
+    Set-SmbServerConfiguration -AuditSmb1Access. On Server 2012 / Windows 8 and
+    older that parameter does not exist, so the script sets the DWORD
+    HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters\AuditSmb1Access
+    to 1 (or 0 to disable). Those OS versions typically need a Server service
+    restart or a reboot before Event ID 3000 is written.
+
     Also reports SMB1 feature / server configuration, live SMBv1 sessions, and
     optional reverse-DNS / Active Directory enrichment of client addresses.
 
@@ -28,7 +35,9 @@
     Skip the menu and scan audit logs immediately.
 
 .PARAMETER EnableAuditing
-    Skip the menu and enable SMB1 access auditing on the targets.
+    Skip the menu and enable SMB1 access auditing on the targets. Server 2012
+    and older get the LanmanServer AuditSmb1Access registry DWORD (a restart
+    may still be required). This does not enable the SMBv1 protocol.
 
 .PARAMETER DisableAuditing
     Skip the menu and disable SMB1 access auditing on the targets.
@@ -74,7 +83,7 @@
     Runs parser/unit tests and exits 0 on success.
 
 .NOTES
-    Version: 2.0
+    Version: 2.1
     Compatible: Windows PowerShell 5.1 and PowerShell 7+ on Windows
     Requires: Elevation for enabling auditing and (typically) for reading the Audit log
 
@@ -100,6 +109,9 @@
       - Wrapping a List[object] of PSCustomObject with @() (or binding it to [object[]])
         throws "Argument types do not match" in Windows PowerShell 5.1, so a successful
         event query produced 0 summary rows. Collections are ArrayList and copied by index.
+      - Server 2012 / Windows 8 and older have no -AuditSmb1Access parameter; enable
+        and disable now set the LanmanServer AuditSmb1Access registry DWORD and warn
+        that LanmanServer restart or a reboot is required.
 #>
 [CmdletBinding()]
 param(
@@ -123,9 +135,11 @@ param(
 
 Set-StrictMode -Off
 
-$script:Version      = '2.0'
+$script:Version      = '2.1'
 $script:AuditLogName = 'Microsoft-Windows-SMBServer/Audit'
 $script:AuditEventId = 3000
+$script:LanmanParamsPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'
+$script:AuditSmb1ValueName = 'AuditSmb1Access'
 $script:Targets      = @()
 $script:Summary      = New-Object System.Collections.ArrayList
 $script:ClientRollup = New-Object System.Collections.ArrayList
@@ -903,81 +917,397 @@ function Select-Targets {
     }
 }
 
+# Server 2012 / Windows 8 are 6.2; 2012 R2 / 8.1 are 6.3 (AuditSmb1Access cmdlet).
+function Test-OsNeedsSmb1AuditRegistry {
+    param(
+        [version]$OsVersion,
+        [bool]$CmdletHasAuditParameter = $false
+    )
+    if ($null -eq $OsVersion) { return $true }
+    if ($OsVersion.Major -lt 6) { return $true }
+    if ($OsVersion.Major -eq 6 -and $OsVersion.Minor -le 2) { return $true }
+    if (-not $CmdletHasAuditParameter) { return $true }
+    return $false
+}
+
+function Get-Smb1AuditRegistryPath {
+    return 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'
+}
+
+# Self-contained: sent to remote hosts, including Server 2012 (PS 3) and 2008 R2 (PS 2).
+function Invoke-Smb1AuditLocal {
+    param(
+        [string]$Action = 'Get',
+        [bool]$Enable = $true
+    )
+
+    $regPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'
+    $regName = 'AuditSmb1Access'
+    $logName = 'Microsoft-Windows-SMBServer/Audit'
+
+    function Get-LocalOsInfo {
+        $caption = 'Unknown'
+        $verStr = '0.0'
+        try {
+            $os = Get-WmiObject -Class Win32_OperatingSystem -ErrorAction Stop
+            $caption = [string]$os.Caption
+            $verStr = [string]$os.Version
+        }
+        catch {
+            try {
+                $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+                $caption = [string]$os.Caption
+                $verStr = [string]$os.Version
+            }
+            catch {
+                $verStr = [Environment]::OSVersion.Version.ToString()
+            }
+        }
+        $ver = $null
+        try { $ver = [version]$verStr } catch { $ver = [version]'0.0' }
+        New-Object psobject -Property @{ Caption = $caption; Version = $ver; VersionString = $verStr }
+    }
+
+    function Test-NeedsRegistryInner {
+        param([version]$OsVersion, [bool]$HasCmdletParam)
+        if ($null -eq $OsVersion) { return $true }
+        if ($OsVersion.Major -lt 6) { return $true }
+        if ($OsVersion.Major -eq 6 -and $OsVersion.Minor -le 2) { return $true }
+        if (-not $HasCmdletParam) { return $true }
+        return $false
+    }
+
+    function Test-HasAuditCmdletParam {
+        $cmd = Get-Command Set-SmbServerConfiguration -ErrorAction SilentlyContinue
+        if ($null -eq $cmd) { return $false }
+        if ($null -eq $cmd.Parameters) { return $false }
+        return [bool]$cmd.Parameters.ContainsKey('AuditSmb1Access')
+    }
+
+    function Get-RegDword {
+        param([string]$Path, [string]$Name)
+        try {
+            $p = Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop
+            return [int]$p.$Name
+        }
+        catch {
+            return $null
+        }
+    }
+
+    function Set-RegDword {
+        param([string]$Path, [string]$Name, [int]$Value)
+        if (-not (Test-Path -Path $Path)) {
+            New-Item -Path $Path -Force | Out-Null
+        }
+        Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type DWord -Force
+    }
+
+    function Enable-AuditLogChannel {
+        try {
+            $cfg = New-Object System.Diagnostics.Eventing.Reader.EventLogConfiguration $logName
+            if (-not $cfg.IsEnabled) {
+                $cfg.IsEnabled = $true
+                $cfg.SaveChanges()
+            }
+            return $true
+        }
+        catch { }
+        try {
+            $null = & wevtutil.exe sl $logName /e:true 2>&1
+            return $true
+        }
+        catch {
+            return $false
+        }
+    }
+
+    function Get-LogInfo {
+        $enabled = $null
+        $logType = 'Unknown'
+        $count = $null
+        try {
+            $log = Get-WinEvent -ListLog $logName -ErrorAction Stop
+            $enabled = $log.IsEnabled
+            $logType = [string]$log.LogType
+            $count = $log.RecordCount
+        }
+        catch {
+            $enabled = $false
+            $logType = 'Missing'
+            $count = 0
+        }
+        New-Object psobject -Property @{ Enabled = $enabled; LogType = $logType; RecordCount = $count }
+    }
+
+    $os = Get-LocalOsInfo
+    $hasParam = Test-HasAuditCmdletParam
+    $needsReg = Test-NeedsRegistryInner -OsVersion $os.Version -HasCmdletParam $hasParam
+
+    if ($Action -eq 'Set') {
+        $cmdletApplied = $false
+        $cmdletError = ''
+        $regApplied = $false
+        $regError = ''
+        $dword = 0
+        if ($Enable) { $dword = 1 }
+
+        if ($hasParam) {
+            try {
+                Set-SmbServerConfiguration -AuditSmb1Access ([bool]$Enable) -Force -Confirm:$false -ErrorAction Stop
+                $cmdletApplied = $true
+            }
+            catch {
+                $cmdletError = [string]$_.Exception.Message
+            }
+        }
+
+        if ($needsReg -or -not $cmdletApplied) {
+            try {
+                Set-RegDword -Path $regPath -Name $regName -Value $dword
+                $regApplied = $true
+            }
+            catch {
+                $regError = [string]$_.Exception.Message
+            }
+        }
+
+        $logOk = $true
+        if ($Enable) { $logOk = Enable-AuditLogChannel }
+
+        $method = 'None'
+        if ($cmdletApplied -and $regApplied) { $method = 'Cmdlet+Registry' }
+        elseif ($cmdletApplied) { $method = 'Cmdlet' }
+        elseif ($regApplied) { $method = 'Registry' }
+
+        $ok = [bool]($cmdletApplied -or $regApplied)
+        $restart = [bool]($needsReg -and $regApplied -and $Enable)
+        $msg = ''
+        if (-not $ok) {
+            $msg = ($cmdletError + ' ' + $regError).Trim()
+        }
+        elseif ($restart) {
+            $msg = 'Registry AuditSmb1Access written. Restart the Server service (LanmanServer) or reboot before Event ID 3000 is logged.'
+        }
+        else {
+            $msg = 'SMB1 access auditing updated via Set-SmbServerConfiguration.'
+        }
+
+        New-Object psobject -Property @{
+            Action           = 'Set'
+            Ok               = $ok
+            OsCaption        = $os.Caption
+            OsVersion        = $os.VersionString
+            NeedsRegistry    = $needsReg
+            Method           = $method
+            CmdletApplied    = $cmdletApplied
+            RegistryApplied  = $regApplied
+            RegistryValue    = (Get-RegDword -Path $regPath -Name $regName)
+            LogEnabled       = $logOk
+            RestartRequired  = $restart
+            Message          = $msg
+            Error            = $(if ($ok) { '' } else { $msg })
+        }
+        return
+    }
+
+    $cmdletAudit = $null
+    $smb1Enabled = $null
+    try {
+        $cfg = Get-SmbServerConfiguration -ErrorAction Stop
+        if ($cfg.PSObject.Properties['AuditSmb1Access']) {
+            $cmdletAudit = $cfg.AuditSmb1Access
+        }
+        if ($cfg.PSObject.Properties['EnableSMB1Protocol']) {
+            $smb1Enabled = $cfg.EnableSMB1Protocol
+        }
+    }
+    catch { }
+
+    $regAudit = Get-RegDword -Path $regPath -Name $regName
+    $regSmb1  = Get-RegDword -Path $regPath -Name 'SMB1'
+    if ($null -eq $smb1Enabled) {
+        if ($null -eq $regSmb1) { $smb1Enabled = 'Default (on)' }
+        elseif ($regSmb1 -eq 0) { $smb1Enabled = $false }
+        else { $smb1Enabled = $true }
+    }
+
+    $effective = $false
+    if ($cmdletAudit -eq $true) { $effective = $true }
+    if ($regAudit -eq 1) { $effective = $true }
+
+    $method = 'Not configured'
+    if ($needsReg) { $method = 'Registry (2012/older)' }
+    else { $method = 'Cmdlet (2012 R2+)' }
+
+    $log = Get-LogInfo
+    $feature = 'Unknown'
+    try {
+        $feat = Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -ErrorAction Stop
+        $feature = [string]$feat.State
+    }
+    catch {
+        try {
+            $feat = Get-WindowsFeature -Name FS-SMB1 -ErrorAction Stop
+            if ($feat.PSObject.Properties['InstallState'] -and $null -ne $feat.InstallState) {
+                $feature = [string]$feat.InstallState
+            }
+            elseif ($feat.PSObject.Properties['Installed']) {
+                if ($feat.Installed) { $feature = 'Installed' } else { $feature = 'Available' }
+            }
+        }
+        catch { }
+    }
+
+    New-Object psobject -Property @{
+        Action           = 'Get'
+        Ok               = $true
+        OsCaption        = $os.Caption
+        OsVersion        = $os.VersionString
+        NeedsRegistry    = $needsReg
+        Method           = $method
+        SMB1Enabled      = $smb1Enabled
+        SMB1Feature      = $feature
+        SMB1Auditing     = $effective
+        CmdletAudit      = $cmdletAudit
+        RegistryAudit    = $(if ($null -eq $regAudit) { 'Missing' } else { $regAudit })
+        AuditLogEnabled  = $log.Enabled
+        AuditLogType     = $log.LogType
+        AuditRecordCount = $log.RecordCount
+        RestartRequired  = $false
+        Message          = ''
+        Error            = ''
+    }
+}
+
+function Set-Smb1AuditViaRemoteRegistry {
+    param(
+        [string]$Computer,
+        [bool]$Enable
+    )
+
+    $hive = [Microsoft.Win32.RegistryHive]::LocalMachine
+    $view = [Microsoft.Win32.RegistryView]::Registry64
+    $sub  = 'SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'
+    $base = $null
+    $key  = $null
+    try {
+        if (Test-IsLocalComputer $Computer) {
+            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($hive, $view)
+        }
+        else {
+            try {
+                $base = [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey($hive, $Computer, $view)
+            }
+            catch {
+                $base = [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey($hive, $Computer)
+            }
+        }
+        $key = $base.OpenSubKey($sub, $true)
+        if ($null -eq $key) {
+            throw "Cannot open $sub on $Computer. Is the Remote Registry service running?"
+        }
+        $dword = 0
+        if ($Enable) { $dword = 1 }
+        $key.SetValue($script:AuditSmb1ValueName, $dword, [Microsoft.Win32.RegistryValueKind]::DWord)
+    }
+    finally {
+        if ($key) { $key.Close() }
+        if ($base) { $base.Close() }
+    }
+
+    if ($Enable) {
+        try {
+            $null = & wevtutil.exe sl $script:AuditLogName /r:$Computer /e:true 2>&1
+        }
+        catch { }
+    }
+}
+
+function Get-Smb1AuditViaRemoteRegistry {
+    param([string]$Computer)
+
+    $hive = [Microsoft.Win32.RegistryHive]::LocalMachine
+    $view = [Microsoft.Win32.RegistryView]::Registry64
+    $sub  = 'SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'
+    $base = $null
+    $key  = $null
+    try {
+        if (Test-IsLocalComputer $Computer) {
+            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($hive, $view)
+        }
+        else {
+            try {
+                $base = [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey($hive, $Computer, $view)
+            }
+            catch {
+                $base = [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey($hive, $Computer)
+            }
+        }
+        $key = $base.OpenSubKey($sub, $false)
+        if ($null -eq $key) { return $null }
+        return $key.GetValue($script:AuditSmb1ValueName, $null)
+    }
+    finally {
+        if ($key) { $key.Close() }
+        if ($base) { $base.Close() }
+    }
+}
+
 function Show-AuditStatus {
     param([switch]$NoPause)
 
     Write-Banner
     Write-Host "Checking SMB1 configuration..." -ForegroundColor White
-    $statusScript = {
-        $feature = 'Unknown'
-        try {
-            $feat = Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -ErrorAction Stop
-            $feature = [string]$feat.State
-        }
-        catch {
-            try {
-                $feat = Get-WindowsFeature -Name FS-SMB1 -ErrorAction Stop
-                if ($feat.PSObject.Properties['InstallState'] -and $null -ne $feat.InstallState) {
-                    $feature = [string]$feat.InstallState
-                }
-                elseif ($feat.PSObject.Properties['Installed']) {
-                    $feature = $(if ($feat.Installed) { 'Installed' } else { 'Available' })
-                }
-            }
-            catch { }
-        }
-
-        $cfg = Get-SmbServerConfiguration -ErrorAction Stop
-        $logEnabled = $null
-        $logType    = $null
-        $logCount   = $null
-        try {
-            $log = Get-WinEvent -ListLog 'Microsoft-Windows-SMBServer/Audit' -ErrorAction Stop
-            $logEnabled = $log.IsEnabled
-            $logType    = [string]$log.LogType
-            $logCount   = $log.RecordCount
-        }
-        catch {
-            $logEnabled = $false
-            $logType    = 'Missing'
-            $logCount   = 0
-        }
-
-        [pscustomobject]@{
-            SMB1Enabled      = $cfg.EnableSMB1Protocol
-            SMB1Auditing     = $cfg.AuditSmb1Access
-            SMB1Feature      = $feature
-            AuditLogEnabled  = $logEnabled
-            AuditLogType     = $logType
-            AuditRecordCount = $logCount
-        }
-    }
+    Write-Host "Server 2012 / older: auditing is the LanmanServer AuditSmb1Access registry DWORD." -ForegroundColor Gray
+    Write-Host ""
 
     $rows = foreach ($dc in @($script:Targets)) {
         try {
             $cfg = $null
             try {
-                $cfg = Invoke-OnTarget -Computer $dc -ScriptBlock $statusScript
+                $cfg = Invoke-OnTarget -Computer $dc -ArgumentList 'Get' -ScriptBlock ${function:Invoke-Smb1AuditLocal}
             }
             catch {
                 if (Test-IsLocalComputer $dc) { throw }
-                $cim = Get-SmbServerConfiguration -CimSession $dc -ErrorAction Stop
-                $cfg = [pscustomobject]@{
-                    SMB1Enabled      = $cim.EnableSMB1Protocol
-                    SMB1Auditing     = $cim.AuditSmb1Access
+                $regVal = $null
+                try { $regVal = Get-Smb1AuditViaRemoteRegistry -Computer $dc } catch { }
+                $cimAudit = $null
+                $cimSmb1 = $null
+                try {
+                    $cim = Get-SmbServerConfiguration -CimSession $dc -ErrorAction Stop
+                    if ($cim.PSObject.Properties['AuditSmb1Access']) { $cimAudit = $cim.AuditSmb1Access }
+                    if ($cim.PSObject.Properties['EnableSMB1Protocol']) { $cimSmb1 = $cim.EnableSMB1Protocol }
+                }
+                catch { }
+                $effective = $false
+                if ($cimAudit -eq $true -or $regVal -eq 1) { $effective = $true }
+                $cfg = New-Object psobject -Property @{
+                    OsCaption        = 'N/A (WinRM failed)'
+                    OsVersion        = ''
+                    Method           = 'Registry fallback'
+                    SMB1Enabled      = $(if ($null -ne $cimSmb1) { $cimSmb1 } else { 'N/A' })
                     SMB1Feature      = 'N/A'
+                    SMB1Auditing     = $effective
+                    RegistryAudit    = $(if ($null -eq $regVal) { 'N/A' } else { $regVal })
                     AuditLogEnabled  = 'N/A'
                     AuditLogType     = 'N/A'
                     AuditRecordCount = 'N/A'
+                    NeedsRegistry    = $true
                 }
             }
+
+            $osLabel = [string]$cfg.OsCaption
+            if ($cfg.OsVersion) { $osLabel = ($osLabel + ' ' + $cfg.OsVersion).Trim() }
+
             [pscustomobject]@{
                 Server           = $dc
+                OS               = $osLabel
                 SMB1Enabled      = $cfg.SMB1Enabled
                 SMB1Auditing     = $cfg.SMB1Auditing
-                SMB1Feature      = $cfg.SMB1Feature
+                AuditMethod      = $cfg.Method
+                RegistryDWORD    = $cfg.RegistryAudit
                 AuditLogEnabled  = $cfg.AuditLogEnabled
-                AuditLogType     = $cfg.AuditLogType
                 AuditRecordCount = $cfg.AuditRecordCount
                 Status           = 'OK'
             }
@@ -985,11 +1315,12 @@ function Show-AuditStatus {
         catch {
             [pscustomobject]@{
                 Server           = $dc
+                OS               = 'N/A'
                 SMB1Enabled      = 'N/A'
                 SMB1Auditing     = 'N/A'
-                SMB1Feature      = 'N/A'
+                AuditMethod      = 'N/A'
+                RegistryDWORD    = 'N/A'
                 AuditLogEnabled  = 'N/A'
-                AuditLogType     = 'N/A'
                 AuditRecordCount = 'N/A'
                 Status           = "Error: $($_.Exception.Message)"
             }
@@ -997,8 +1328,9 @@ function Show-AuditStatus {
     }
     Show-Table $rows
     Write-Host ""
-    Write-Host "SMB1Enabled = the SMBv1 server protocol (keep this False / disabled)." -ForegroundColor Gray
-    Write-Host "SMB1Auditing = AuditSmb1Access (this is what option 3 turns on)." -ForegroundColor Gray
+    Write-Host "SMB1Enabled  = SMBv1 server protocol (keep False / disabled). Not changed by this tool." -ForegroundColor Gray
+    Write-Host "SMB1Auditing = effective AuditSmb1Access (cmdlet and/or registry DWORD)." -ForegroundColor Gray
+    Write-Host "RegistryDWORD = HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters\AuditSmb1Access" -ForegroundColor Gray
     if (-not $NoPause) { Pause-Menu }
 }
 
@@ -1012,41 +1344,98 @@ function Set-AuditState {
     $verb = if ($Enable) { 'ENABLE' } else { 'DISABLE' }
     Write-Host "This will $verb SMB1 access AUDITING (not the SMBv1 protocol) on:" -ForegroundColor White
     Write-Host ("  {0}" -f ($script:Targets -join ', ')) -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "Server 2012 R2 and later : Set-SmbServerConfiguration -AuditSmb1Access" -ForegroundColor Gray
+    Write-Host "Server 2012 / Windows 8 and older : registry DWORD AuditSmb1Access=1 (restart/reboot needed)" -ForegroundColor Gray
     if (-not $Force) {
         if (-not (Read-YesNo -Prompt "Continue?" -Default $true)) { return }
     }
 
+    $needRestart = New-Object System.Collections.ArrayList
+
     foreach ($dc in @($script:Targets)) {
+        $result = $null
         try {
-            Invoke-OnTarget -Computer $dc -ArgumentList $Enable -ScriptBlock {
-                param($state)
-                Set-SmbServerConfiguration -AuditSmb1Access $state -Force -Confirm:$false -ErrorAction Stop
-                if ($state) {
-                    try {
-                        $cfg = New-Object System.Diagnostics.Eventing.Reader.EventLogConfiguration 'Microsoft-Windows-SMBServer/Audit'
-                        if (-not $cfg.IsEnabled) {
-                            $cfg.IsEnabled = $true
-                            $cfg.SaveChanges()
-                        }
-                    }
-                    catch {
-                        # Channel enable is best-effort; AuditSmb1Access is the supported switch.
-                    }
-                }
-            } | Out-Null
-            Write-Ok "[+] Auditing set to $Enable on $dc"
+            $result = Invoke-OnTarget -Computer $dc -ArgumentList 'Set', $Enable -ScriptBlock ${function:Invoke-Smb1AuditLocal}
         }
         catch {
-            Write-ErrLine "[!] Failed on ${dc}: $($_.Exception.Message)"
-            if ($_.Exception.Message -match 'WinRM|cannot be found|Access is denied') {
-                Write-WarnLine "    Hint: run elevated, enable WinRM (Enable-PSRemoting), or set credentials (option 9)."
+            $winrmError = $_.Exception.Message
+            try {
+                Set-Smb1AuditViaRemoteRegistry -Computer $dc -Enable $Enable
+                $result = New-Object psobject -Property @{
+                    Ok              = $true
+                    OsCaption       = 'Unknown (remote registry)'
+                    OsVersion       = ''
+                    Method          = 'Registry'
+                    RestartRequired = $Enable
+                    Message         = 'WinRM failed; set AuditSmb1Access via Remote Registry. Restart LanmanServer or reboot before scanning.'
+                    Error           = ''
+                }
+                Write-WarnLine "    WinRM/CIM failed on $dc ($winrmError). Used Remote Registry instead."
+            }
+            catch {
+                Write-ErrLine "[!] Failed on ${dc}: $winrmError"
+                Write-ErrLine "    Remote Registry fallback: $($_.Exception.Message)"
+                if ($winrmError -match 'WinRM|cannot be found|Access is denied') {
+                    Write-WarnLine "    Hint: run elevated, enable WinRM, start Remote Registry, or set credentials (option 9)."
+                }
+                continue
             }
         }
+
+        if ($result -and $result.Ok) {
+            $osBit = ([string]$result.OsCaption).Trim()
+            if ($result.OsVersion) { $osBit = ($osBit + ' ' + $result.OsVersion).Trim() }
+            Write-Ok ("[+] {0} on {1} via {2}{3}" -f $(if ($Enable) { 'Enabled' } else { 'Disabled' }), $dc, $result.Method, $(if ($osBit) { " ($osBit)" } else { '' }))
+            if ($result.Message) {
+                Write-Host ("    {0}" -f $result.Message) -ForegroundColor Gray
+            }
+            if ($result.RestartRequired) {
+                [void]$needRestart.Add($dc)
+            }
+        }
+        else {
+            $err = ''
+            if ($result) { $err = [string]$result.Error }
+            if (-not $err) { $err = 'Unknown error' }
+            Write-ErrLine "[!] Failed on ${dc}: $err"
+        }
     }
+
     if ($Enable) {
         Write-Host ""
-        Write-Info "Auditing is on. Give clients time to connect (hours/days), then run a scan."
         Write-Info "This does not turn SMBv1 on. It only logs clients that attempt to use it."
+        if ($needRestart.Count -gt 0) {
+            Write-Host ""
+            Write-WarnLine "Server 2012 / older typically will not log Event ID 3000 until LanmanServer is restarted or the server is rebooted:"
+            foreach ($name in $needRestart) {
+                Write-Host ("    {0}" -f $name) -ForegroundColor Yellow
+            }
+            $doRestart = $false
+            if (-not $script:NonInteractive) {
+                $doRestart = Read-YesNo -Prompt "Restart the Server service (LanmanServer) on those hosts now? Brief SMB/SYSVOL interruption" -Default $false
+            }
+            if ($doRestart) {
+                foreach ($name in $needRestart) {
+                    try {
+                        Invoke-OnTarget -Computer $name -ScriptBlock {
+                            Restart-Service -Name LanmanServer -Force -ErrorAction Stop
+                        } | Out-Null
+                        Write-Ok "[+] Restarted LanmanServer on $name"
+                    }
+                    catch {
+                        Write-ErrLine "[!] Could not restart LanmanServer on ${name}: $($_.Exception.Message)"
+                        Write-WarnLine "    Reboot $name during a maintenance window, then scan."
+                    }
+                }
+            }
+            else {
+                Write-Info "Reboot those servers (or restart LanmanServer) during a maintenance window, then run a scan."
+            }
+        }
+        else {
+            Write-Info "Auditing is on. Give clients time to connect (hours/days), then run a scan."
+        }
     }
     Pause-Menu
 }
@@ -1297,7 +1686,7 @@ function Show-MainMenu {
         }
         Write-Host "  1) Select target servers"
         Write-Host "  2) Check SMB1 / auditing status"
-        Write-Host "  3) Enable SMB1 access auditing"
+        Write-Host "  3) Enable SMB1 access auditing (registry on Server 2012 / older)"
         Write-Host "  4) Disable SMB1 access auditing"
         Write-Host "  5) Scan audit logs for SMBv1 clients"
         Write-Host "  6) View last results"
@@ -1530,6 +1919,21 @@ function Invoke-Smbv1SelfTest {
     Assert-True -Condition ($nullList.Count -eq 0) -Name 'ConvertTo-ArrayList of null is empty (not one $null)'
 
     Assert-True -Condition ((Get-CsvUtf8Encoding) -match 'UTF8|utf8BOM') -Name 'CSV encoding is UTF-8 (with BOM on PS 7+)'
+
+    Assert-True -Condition ((Get-Smb1AuditRegistryPath) -eq 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters') `
+        -Name 'SMB1 audit registry path is LanmanServer\Parameters'
+    Assert-True -Condition (Test-OsNeedsSmb1AuditRegistry -OsVersion ([version]'6.1.7601') -CmdletHasAuditParameter $false) `
+        -Name 'Server 2008 R2 (6.1) uses the AuditSmb1Access registry DWORD'
+    Assert-True -Condition (Test-OsNeedsSmb1AuditRegistry -OsVersion ([version]'6.2.9200') -CmdletHasAuditParameter $false) `
+        -Name 'Server 2012 / Windows 8 (6.2) uses the AuditSmb1Access registry DWORD'
+    Assert-True -Condition (Test-OsNeedsSmb1AuditRegistry -OsVersion ([version]'6.2.9200') -CmdletHasAuditParameter $true) `
+        -Name 'Server 2012 still uses registry even if a later cmdlet parameter exists'
+    Assert-True -Condition (-not (Test-OsNeedsSmb1AuditRegistry -OsVersion ([version]'6.3.9600') -CmdletHasAuditParameter $true)) `
+        -Name 'Server 2012 R2 (6.3) uses Set-SmbServerConfiguration -AuditSmb1Access'
+    Assert-True -Condition (Test-OsNeedsSmb1AuditRegistry -OsVersion ([version]'6.3.9600') -CmdletHasAuditParameter $false) `
+        -Name 'Server 2012 R2 falls back to registry if the cmdlet parameter is missing'
+    Assert-True -Condition (-not (Test-OsNeedsSmb1AuditRegistry -OsVersion ([version]'10.0.17763') -CmdletHasAuditParameter $true)) `
+        -Name 'Server 2019 (10.0) uses the cmdlet, not a forced registry write'
 
     Write-Host ""
     Write-Host ("  {0} passed, {1} failed" -f $script:SelfTestPassed, $script:SelfTestFailed) -ForegroundColor $(if ($script:SelfTestFailed) { 'Red' } else { 'Green' })
