@@ -44,7 +44,7 @@
     .\SMBv1-TrafficAnalyzer.ps1 -SelfTest
 
 .NOTES
-    Version     : 1.1
+    Version     : 1.2
     Compatible  : Windows PowerShell 5.1 (Server 2012 / 2012 R2 / 2008 R2 + WMF 5.1)
                   and PowerShell 7+ on Windows. A Requires-Version 5.1 directive is
                   omitted because pwsh 7 treats it as "Windows PowerShell only".
@@ -62,7 +62,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.1'
+$script:AppVersion = '1.2'
 
 # Version is checked at runtime on purpose. A Requires-Version 5.1 (or 3.0)
 # directive makes PowerShell 7 abort with ScriptRequiresUnmatchedPSVersion
@@ -1205,8 +1205,11 @@ function Get-CaptureInterfaces {
             $desc = $_.Description
             foreach ($ip in @($_.IPAddress)) {
                 if ($ip -match '^\d+\.\d+\.\d+\.\d+$') {
+                    # Parentheses required: a bare "-f $a, $b" inside @{ } is parsed as
+                    # two hash entries and throws "Unexpected token" on PowerShell 7.
+                    $displayName = '{0}   ({1})' -f $ip, $desc
                     [void]$items.Add([pscustomobject]@{
-                        Display = '{0}   ({1})' -f $ip, $desc
+                        Display = $displayName
                         IP      = $ip
                     })
                 }
@@ -1872,11 +1875,18 @@ function Export-HostsCsv {
     if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
     $rows = foreach ($ip in ($script:Smb1Hosts.Keys | Sort-Object)) {
         $h = $script:Smb1Hosts[$ip]
+        $cmdSummary = @($h.Commands.GetEnumerator() | ForEach-Object { $_.Key.ToString() + '=' + $_.Value.ToString() }) -join '; '
         [pscustomobject]@{
-            IP = $h.IP; HostName = $h.HostName; Role = $h.Role; Packets = $h.Packets
-            FirstSeen = $h.FirstSeen; LastSeen = $h.LastSeen
-            Users = ($h.Users -join '; '); Shares = ($h.Shares -join '; ')
-            Files = ($h.Files -join '; '); Commands = (($h.Commands.GetEnumerator() | ForEach-Object { '{0}={1}' -f $_.Key, $_.Value }) -join '; ')
+            IP        = $h.IP
+            HostName  = $h.HostName
+            Role      = $h.Role
+            Packets   = $h.Packets
+            FirstSeen = $h.FirstSeen
+            LastSeen  = $h.LastSeen
+            Users     = ($h.Users -join '; ')
+            Shares    = ($h.Shares -join '; ')
+            Files     = ($h.Files -join '; ')
+            Commands  = $cmdSummary
         }
     }
     $rows | Export-Csv -Path $dlg.FileName -NoTypeInformation -Encoding UTF8

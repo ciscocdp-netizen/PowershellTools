@@ -19,7 +19,9 @@ powershell.exe -ExecutionPolicy Bypass -File .\SMBv1-TrafficAnalyzer.ps1 -SelfTe
 
 Live capture needs Administrator. Offline PCAP review, the built-in **Demo** capture, server SMB config, and event-log scan do not.
 
-If you see `ScriptRequiresUnmatchedPSVersion` / "Windows PowerShell version 3.0", you are running an older copy that still had a `Requires -Version` line. That directive makes **PowerShell 7** refuse to start. Use the current file (v1.1+); it has no such directive.
+If you see `ScriptRequiresUnmatchedPSVersion` / "Windows PowerShell version 3.0", you are running an older copy that still had a `Requires -Version` line. That directive makes **PowerShell 7** refuse to start.
+
+If you see `Unexpected token` / `The hash literal was incomplete` around `Get-CaptureInterfaces`, you are on a copy before v1.2. Re-download the current file.
 
 ## Other tools
 
