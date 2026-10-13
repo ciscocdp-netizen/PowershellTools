@@ -8,9 +8,11 @@
     are written only after SMB1 access auditing is enabled (menu option 3, or
     -EnableAuditing). This does not enable the SMBv1 protocol itself.
 
-    On Windows Server 2012 R2 / Windows 8.1 and later, auditing uses
-    Set-SmbServerConfiguration -AuditSmb1Access. On Server 2012 / Windows 8 and
-    older that parameter does not exist, so the script sets the DWORD
+    On Windows Server 2016 / Windows 10 and later, auditing uses
+    Set-SmbServerConfiguration -AuditSmb1Access. On Server 2012 R2 / Windows 8.1
+    and older that parameter does not exist (the cmdlet throws "A parameter cannot
+    be found that matches parameter name 'AuditSmb1Access'"), so the script sets
+    the DWORD
     HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters\AuditSmb1Access
     to 1 (or 0 to disable). Those OS versions typically need a Server service
     restart or a reboot before Event ID 3000 is written.
@@ -35,7 +37,7 @@
     Skip the menu and scan audit logs immediately.
 
 .PARAMETER EnableAuditing
-    Skip the menu and enable SMB1 access auditing on the targets. Server 2012
+    Skip the menu and enable SMB1 access auditing on the targets. Server 2012 R2
     and older get the LanmanServer AuditSmb1Access registry DWORD (a restart
     may still be required). This does not enable the SMBv1 protocol.
 
@@ -83,7 +85,7 @@
     Runs parser/unit tests and exits 0 on success.
 
 .NOTES
-    Version: 2.1
+    Version: 2.2
     Compatible: Windows PowerShell 5.1 and PowerShell 7+ on Windows
     Requires: Elevation for enabling auditing and (typically) for reading the Audit log
 
@@ -109,9 +111,10 @@
       - Wrapping a List[object] of PSCustomObject with @() (or binding it to [object[]])
         throws "Argument types do not match" in Windows PowerShell 5.1, so a successful
         event query produced 0 summary rows. Collections are ArrayList and copied by index.
-      - Server 2012 / Windows 8 and older have no -AuditSmb1Access parameter; enable
-        and disable now set the LanmanServer AuditSmb1Access registry DWORD and warn
-        that LanmanServer restart or a reboot is required.
+      - Server 2012 R2 / Windows 8.1 and older have no -AuditSmb1Access parameter
+        (it was added in Server 2016 / Windows 10). Enable/disable set the
+        LanmanServer AuditSmb1Access registry DWORD, skip the missing cmdlet
+        parameter, and warn that LanmanServer restart or a reboot is required.
 #>
 [CmdletBinding()]
 param(
@@ -135,7 +138,7 @@ param(
 
 Set-StrictMode -Off
 
-$script:Version      = '2.1'
+$script:Version      = '2.2'
 $script:AuditLogName = 'Microsoft-Windows-SMBServer/Audit'
 $script:AuditEventId = 3000
 $script:LanmanParamsPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'
@@ -917,15 +920,15 @@ function Select-Targets {
     }
 }
 
-# Server 2012 / Windows 8 are 6.2; 2012 R2 / 8.1 are 6.3 (AuditSmb1Access cmdlet).
+# -AuditSmb1Access exists on Windows 10 / Server 2016 (10.0) and later.
+# Server 2012 R2 / Windows 8.1 (6.3) still throw "parameter cannot be found".
 function Test-OsNeedsSmb1AuditRegistry {
     param(
         [version]$OsVersion,
         [bool]$CmdletHasAuditParameter = $false
     )
     if ($null -eq $OsVersion) { return $true }
-    if ($OsVersion.Major -lt 6) { return $true }
-    if ($OsVersion.Major -eq 6 -and $OsVersion.Minor -le 2) { return $true }
+    if ($OsVersion.Major -lt 10) { return $true }
     if (-not $CmdletHasAuditParameter) { return $true }
     return $false
 }
@@ -971,8 +974,7 @@ function Invoke-Smb1AuditLocal {
     function Test-NeedsRegistryInner {
         param([version]$OsVersion, [bool]$HasCmdletParam)
         if ($null -eq $OsVersion) { return $true }
-        if ($OsVersion.Major -lt 6) { return $true }
-        if ($OsVersion.Major -eq 6 -and $OsVersion.Minor -le 2) { return $true }
+        if ($OsVersion.Major -lt 10) { return $true }
         if (-not $HasCmdletParam) { return $true }
         return $false
     }
@@ -1052,7 +1054,9 @@ function Invoke-Smb1AuditLocal {
         $dword = 0
         if ($Enable) { $dword = 1 }
 
-        if ($hasParam) {
+        # Do not call -AuditSmb1Access on 2012 R2 and older: the parameter is
+        # absent and Set-SmbServerConfiguration throws "parameter cannot be found".
+        if ($hasParam -and -not $needsReg) {
             try {
                 Set-SmbServerConfiguration -AuditSmb1Access ([bool]$Enable) -Force -Confirm:$false -ErrorAction Stop
                 $cmdletApplied = $true
@@ -1137,8 +1141,8 @@ function Invoke-Smb1AuditLocal {
     if ($regAudit -eq 1) { $effective = $true }
 
     $method = 'Not configured'
-    if ($needsReg) { $method = 'Registry (2012/older)' }
-    else { $method = 'Cmdlet (2012 R2+)' }
+    if ($needsReg) { $method = 'Registry (2012 R2/older)' }
+    else { $method = 'Cmdlet (2016+)' }
 
     $log = Get-LogInfo
     $feature = 'Unknown'
@@ -1259,7 +1263,7 @@ function Show-AuditStatus {
 
     Write-Banner
     Write-Host "Checking SMB1 configuration..." -ForegroundColor White
-    Write-Host "Server 2012 / older: auditing is the LanmanServer AuditSmb1Access registry DWORD." -ForegroundColor Gray
+    Write-Host "Server 2012 R2 / older: auditing is the LanmanServer AuditSmb1Access registry DWORD." -ForegroundColor Gray
     Write-Host ""
 
     $rows = foreach ($dc in @($script:Targets)) {
@@ -1345,13 +1349,14 @@ function Set-AuditState {
     Write-Host "This will $verb SMB1 access AUDITING (not the SMBv1 protocol) on:" -ForegroundColor White
     Write-Host ("  {0}" -f ($script:Targets -join ', ')) -ForegroundColor Gray
     Write-Host ""
-    Write-Host "Server 2012 R2 and later : Set-SmbServerConfiguration -AuditSmb1Access" -ForegroundColor Gray
-    Write-Host "Server 2012 / Windows 8 and older : registry DWORD AuditSmb1Access=1 (restart/reboot needed)" -ForegroundColor Gray
+    Write-Host "Server 2016 / Windows 10 and later : Set-SmbServerConfiguration -AuditSmb1Access" -ForegroundColor Gray
+    Write-Host "Server 2012 R2 / 8.1 and older     : registry DWORD AuditSmb1Access=1 (restart/reboot needed)" -ForegroundColor Gray
     if (-not $Force) {
         if (-not (Read-YesNo -Prompt "Continue?" -Default $true)) { return }
     }
 
     $needRestart = New-Object System.Collections.ArrayList
+    $anyOk = $false
 
     foreach ($dc in @($script:Targets)) {
         $result = $null
@@ -1376,7 +1381,7 @@ function Set-AuditState {
             catch {
                 Write-ErrLine "[!] Failed on ${dc}: $winrmError"
                 Write-ErrLine "    Remote Registry fallback: $($_.Exception.Message)"
-                if ($winrmError -match 'WinRM|cannot be found|Access is denied') {
+                if ($winrmError -match 'WinRM|WSMan|Access is denied|RPC') {
                     Write-WarnLine "    Hint: run elevated, enable WinRM, start Remote Registry, or set credentials (option 9)."
                 }
                 continue
@@ -1384,6 +1389,7 @@ function Set-AuditState {
         }
 
         if ($result -and $result.Ok) {
+            $anyOk = $true
             $osBit = ([string]$result.OsCaption).Trim()
             if ($result.OsVersion) { $osBit = ($osBit + ' ' + $result.OsVersion).Trim() }
             Write-Ok ("[+] {0} on {1} via {2}{3}" -f $(if ($Enable) { 'Enabled' } else { 'Disabled' }), $dc, $result.Method, $(if ($osBit) { " ($osBit)" } else { '' }))
@@ -1402,12 +1408,12 @@ function Set-AuditState {
         }
     }
 
-    if ($Enable) {
+    if ($Enable -and $anyOk) {
         Write-Host ""
         Write-Info "This does not turn SMBv1 on. It only logs clients that attempt to use it."
         if ($needRestart.Count -gt 0) {
             Write-Host ""
-            Write-WarnLine "Server 2012 / older typically will not log Event ID 3000 until LanmanServer is restarted or the server is rebooted:"
+            Write-WarnLine "Server 2012 R2 / older typically will not log Event ID 3000 until LanmanServer is restarted or the server is rebooted:"
             foreach ($name in $needRestart) {
                 Write-Host ("    {0}" -f $name) -ForegroundColor Yellow
             }
@@ -1686,7 +1692,7 @@ function Show-MainMenu {
         }
         Write-Host "  1) Select target servers"
         Write-Host "  2) Check SMB1 / auditing status"
-        Write-Host "  3) Enable SMB1 access auditing (registry on Server 2012 / older)"
+        Write-Host "  3) Enable SMB1 access auditing (registry on Server 2012 R2 / older)"
         Write-Host "  4) Disable SMB1 access auditing"
         Write-Host "  5) Scan audit logs for SMBv1 clients"
         Write-Host "  6) View last results"
@@ -1928,10 +1934,12 @@ function Invoke-Smbv1SelfTest {
         -Name 'Server 2012 / Windows 8 (6.2) uses the AuditSmb1Access registry DWORD'
     Assert-True -Condition (Test-OsNeedsSmb1AuditRegistry -OsVersion ([version]'6.2.9200') -CmdletHasAuditParameter $true) `
         -Name 'Server 2012 still uses registry even if a later cmdlet parameter exists'
-    Assert-True -Condition (-not (Test-OsNeedsSmb1AuditRegistry -OsVersion ([version]'6.3.9600') -CmdletHasAuditParameter $true)) `
-        -Name 'Server 2012 R2 (6.3) uses Set-SmbServerConfiguration -AuditSmb1Access'
+    Assert-True -Condition (Test-OsNeedsSmb1AuditRegistry -OsVersion ([version]'6.3.9600') -CmdletHasAuditParameter $true) `
+        -Name 'Server 2012 R2 (6.3) uses the AuditSmb1Access registry DWORD (no cmdlet parameter)'
     Assert-True -Condition (Test-OsNeedsSmb1AuditRegistry -OsVersion ([version]'6.3.9600') -CmdletHasAuditParameter $false) `
-        -Name 'Server 2012 R2 falls back to registry if the cmdlet parameter is missing'
+        -Name 'Server 2012 R2 uses registry when the cmdlet parameter is missing'
+    Assert-True -Condition (-not (Test-OsNeedsSmb1AuditRegistry -OsVersion ([version]'10.0.14393') -CmdletHasAuditParameter $true)) `
+        -Name 'Server 2016 (10.0) uses the cmdlet, not a forced registry write'
     Assert-True -Condition (-not (Test-OsNeedsSmb1AuditRegistry -OsVersion ([version]'10.0.17763') -CmdletHasAuditParameter $true)) `
         -Name 'Server 2019 (10.0) uses the cmdlet, not a forced registry write'
 
