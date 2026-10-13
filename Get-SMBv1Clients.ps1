@@ -14,8 +14,8 @@
     be found that matches parameter name 'AuditSmb1Access'"), so the script sets
     the DWORD
     HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters\AuditSmb1Access
-    to 1 (or 0 to disable). Those OS versions typically need a Server service
-    restart or a reboot before Event ID 3000 is written.
+    to 1 (or 0 to disable). After a short delay the script restarts the Server
+    service (LanmanServer) on those hosts so Event ID 3000 can be logged.
 
     Also reports SMB1 feature / server configuration, live SMBv1 sessions, and
     optional reverse-DNS / Active Directory enrichment of client addresses.
@@ -38,8 +38,8 @@
 
 .PARAMETER EnableAuditing
     Skip the menu and enable SMB1 access auditing on the targets. Server 2012 R2
-    and older get the LanmanServer AuditSmb1Access registry DWORD (a restart
-    may still be required). This does not enable the SMBv1 protocol.
+    and older get the LanmanServer AuditSmb1Access registry DWORD, then a short
+    wait and a LanmanServer restart. This does not enable the SMBv1 protocol.
 
 .PARAMETER DisableAuditing
     Skip the menu and disable SMB1 access auditing on the targets.
@@ -85,7 +85,7 @@
     Runs parser/unit tests and exits 0 on success.
 
 .NOTES
-    Version: 2.2
+    Version: 2.3
     Compatible: Windows PowerShell 5.1 and PowerShell 7+ on Windows
     Requires: Elevation for enabling auditing and (typically) for reading the Audit log
 
@@ -114,7 +114,7 @@
       - Server 2012 R2 / Windows 8.1 and older have no -AuditSmb1Access parameter
         (it was added in Server 2016 / Windows 10). Enable/disable set the
         LanmanServer AuditSmb1Access registry DWORD, skip the missing cmdlet
-        parameter, and warn that LanmanServer restart or a reboot is required.
+        parameter, wait a few seconds, then restart LanmanServer automatically.
 #>
 [CmdletBinding()]
 param(
@@ -138,11 +138,12 @@ param(
 
 Set-StrictMode -Off
 
-$script:Version      = '2.2'
+$script:Version      = '2.3'
 $script:AuditLogName = 'Microsoft-Windows-SMBServer/Audit'
 $script:AuditEventId = 3000
 $script:LanmanParamsPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'
 $script:AuditSmb1ValueName = 'AuditSmb1Access'
+$script:LanmanRestartDelaySeconds = 5
 $script:Targets      = @()
 $script:Summary      = New-Object System.Collections.ArrayList
 $script:ClientRollup = New-Object System.Collections.ArrayList
@@ -1091,7 +1092,7 @@ function Invoke-Smb1AuditLocal {
             $msg = ($cmdletError + ' ' + $regError).Trim()
         }
         elseif ($restart) {
-            $msg = 'Registry AuditSmb1Access written. Restart the Server service (LanmanServer) or reboot before Event ID 3000 is logged.'
+            $msg = 'Registry AuditSmb1Access written. LanmanServer will be restarted after a short delay so Event ID 3000 can be logged.'
         }
         else {
             $msg = 'SMB1 access auditing updated via Set-SmbServerConfiguration.'
@@ -1338,6 +1339,46 @@ function Show-AuditStatus {
     if (-not $NoPause) { Pause-Menu }
 }
 
+function Restart-LanmanServerOnTargets {
+    param($Computers)
+
+    $names = ConvertTo-ArrayList $Computers
+    if ($names.Count -eq 0) { return }
+
+    $delay = [int]$script:LanmanRestartDelaySeconds
+    if ($delay -lt 1) { $delay = 5 }
+
+    Write-Host ""
+    Write-WarnLine ("Waiting {0} second(s), then restarting LanmanServer on: {1}" -f $delay, ($names -join ', '))
+    Write-WarnLine "SMB file sharing / SYSVOL will interrupt briefly on those hosts."
+    Start-Sleep -Seconds $delay
+
+    foreach ($name in $names) {
+        Write-Info ("[*] Restarting LanmanServer on {0} ..." -f $name)
+        $restarted = $false
+        try {
+            Invoke-OnTarget -Computer $name -ScriptBlock {
+                Restart-Service -Name LanmanServer -Force -ErrorAction Stop
+            } | Out-Null
+            $restarted = $true
+        }
+        catch {
+            try {
+                Get-Service -Name LanmanServer -ComputerName $name -ErrorAction Stop |
+                    Restart-Service -Force -ErrorAction Stop
+                $restarted = $true
+            }
+            catch {
+                Write-ErrLine "[!] Could not restart LanmanServer on ${name}: $($_.Exception.Message)"
+                Write-WarnLine "    Reboot $name during a maintenance window, then scan."
+            }
+        }
+        if ($restarted) {
+            Write-Ok "[+] Restarted LanmanServer on $name"
+        }
+    }
+}
+
 function Set-AuditState {
     param(
         [bool]$Enable,
@@ -1350,7 +1391,7 @@ function Set-AuditState {
     Write-Host ("  {0}" -f ($script:Targets -join ', ')) -ForegroundColor Gray
     Write-Host ""
     Write-Host "Server 2016 / Windows 10 and later : Set-SmbServerConfiguration -AuditSmb1Access" -ForegroundColor Gray
-    Write-Host "Server 2012 R2 / 8.1 and older     : registry DWORD AuditSmb1Access=1 (restart/reboot needed)" -ForegroundColor Gray
+    Write-Host "Server 2012 R2 / 8.1 and older     : registry DWORD, then restart LanmanServer after $($script:LanmanRestartDelaySeconds)s" -ForegroundColor Gray
     if (-not $Force) {
         if (-not (Read-YesNo -Prompt "Continue?" -Default $true)) { return }
     }
@@ -1373,7 +1414,7 @@ function Set-AuditState {
                     OsVersion       = ''
                     Method          = 'Registry'
                     RestartRequired = $Enable
-                    Message         = 'WinRM failed; set AuditSmb1Access via Remote Registry. Restart LanmanServer or reboot before scanning.'
+                    Message         = 'WinRM failed; set AuditSmb1Access via Remote Registry. LanmanServer will be restarted after a short delay.'
                     Error           = ''
                 }
                 Write-WarnLine "    WinRM/CIM failed on $dc ($winrmError). Used Remote Registry instead."
@@ -1412,32 +1453,7 @@ function Set-AuditState {
         Write-Host ""
         Write-Info "This does not turn SMBv1 on. It only logs clients that attempt to use it."
         if ($needRestart.Count -gt 0) {
-            Write-Host ""
-            Write-WarnLine "Server 2012 R2 / older typically will not log Event ID 3000 until LanmanServer is restarted or the server is rebooted:"
-            foreach ($name in $needRestart) {
-                Write-Host ("    {0}" -f $name) -ForegroundColor Yellow
-            }
-            $doRestart = $false
-            if (-not $script:NonInteractive) {
-                $doRestart = Read-YesNo -Prompt "Restart the Server service (LanmanServer) on those hosts now? Brief SMB/SYSVOL interruption" -Default $false
-            }
-            if ($doRestart) {
-                foreach ($name in $needRestart) {
-                    try {
-                        Invoke-OnTarget -Computer $name -ScriptBlock {
-                            Restart-Service -Name LanmanServer -Force -ErrorAction Stop
-                        } | Out-Null
-                        Write-Ok "[+] Restarted LanmanServer on $name"
-                    }
-                    catch {
-                        Write-ErrLine "[!] Could not restart LanmanServer on ${name}: $($_.Exception.Message)"
-                        Write-WarnLine "    Reboot $name during a maintenance window, then scan."
-                    }
-                }
-            }
-            else {
-                Write-Info "Reboot those servers (or restart LanmanServer) during a maintenance window, then run a scan."
-            }
+            Restart-LanmanServerOnTargets -Computers $needRestart
         }
         else {
             Write-Info "Auditing is on. Give clients time to connect (hours/days), then run a scan."
@@ -1926,6 +1942,8 @@ function Invoke-Smbv1SelfTest {
 
     Assert-True -Condition ((Get-CsvUtf8Encoding) -match 'UTF8|utf8BOM') -Name 'CSV encoding is UTF-8 (with BOM on PS 7+)'
 
+    Assert-True -Condition ($script:LanmanRestartDelaySeconds -ge 1) `
+        -Name 'LanmanServer restart delay is a positive number of seconds'
     Assert-True -Condition ((Get-Smb1AuditRegistryPath) -eq 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters') `
         -Name 'SMB1 audit registry path is LanmanServer\Parameters'
     Assert-True -Condition (Test-OsNeedsSmb1AuditRegistry -OsVersion ([version]'6.1.7601') -CmdletHasAuditParameter $false) `
