@@ -15,7 +15,9 @@
     the DWORD
     HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters\AuditSmb1Access
     to 1 (or 0 to disable). After a short delay the script restarts the Server
-    service (LanmanServer) on those hosts so Event ID 3000 can be logged.
+    service (LanmanServer) on those hosts so Event ID 3000 can be logged. A scan
+    also enables the SMBServer Audit channel with wevtutil /q:true; on 2012 R2
+    that channel is Analytic and otherwise appears missing to Get-WinEvent.
 
     Also reports SMB1 feature / server configuration, live SMBv1 sessions, and
     optional reverse-DNS / Active Directory enrichment of client addresses.
@@ -85,7 +87,7 @@
     Runs parser/unit tests and exits 0 on success.
 
 .NOTES
-    Version: 2.3
+    Version: 2.4
     Compatible: Windows PowerShell 5.1 and PowerShell 7+ on Windows
     Requires: Elevation for enabling auditing and (typically) for reading the Audit log
 
@@ -138,9 +140,16 @@ param(
 
 Set-StrictMode -Off
 
-$script:Version      = '2.3'
+$script:Version      = '2.4'
 $script:AuditLogName = 'Microsoft-Windows-SMBServer/Audit'
 $script:AuditEventId = 3000
+$script:SmbServerLogNames = @(
+    'Microsoft-Windows-SMBServer/Audit',
+    'Microsoft-Windows-SMBServer/Operational',
+    'Microsoft-Windows-SMBServer/Analytic',
+    'Microsoft-Windows-SMBServer/Diagnostic',
+    'Microsoft-Windows-SMBServer/Security'
+)
 $script:LanmanParamsPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'
 $script:AuditSmb1ValueName = 'AuditSmb1Access'
 $script:LanmanRestartDelaySeconds = 5
@@ -418,6 +427,21 @@ function Get-Smbv1ClientAddressFromEvent {
     return 'Unknown'
 }
 
+function Test-IsMissingEventLogError {
+    param($ErrorRecord)
+
+    if ($null -eq $ErrorRecord) { return $false }
+    $msg = ''
+    if ($ErrorRecord.PSObject.Properties['Exception'] -and $ErrorRecord.Exception) {
+        $msg = [string]$ErrorRecord.Exception.Message
+    }
+    if ([string]::IsNullOrWhiteSpace($msg)) { $msg = [string]$ErrorRecord }
+
+    # Do not treat "A parameter cannot be found" as a missing event log.
+    if ($msg -match 'parameter cannot be found') { return $false }
+    return ($msg -match 'There is not an event log|specified channel could not be found|does not exist that matches')
+}
+
 function Test-IsNoEventsError {
     param($ErrorRecord)
 
@@ -437,9 +461,13 @@ function Test-IsNoEventsError {
 }
 
 function New-Smbv1EventFilter {
-    param([datetime]$StartTime)
+    param(
+        [datetime]$StartTime,
+        [string]$LogName = 'Microsoft-Windows-SMBServer/Audit'
+    )
+    if ([string]::IsNullOrWhiteSpace($LogName)) { $LogName = 'Microsoft-Windows-SMBServer/Audit' }
     return @{
-        LogName   = $script:AuditLogName
+        LogName   = $LogName
         Id        = $script:AuditEventId
         StartTime = $StartTime
     }
@@ -585,15 +613,88 @@ function Get-AdComputerDetails {
 # ---------------------------------------------------------------------------
 # SMB configuration / event collection
 # ---------------------------------------------------------------------------
-function Get-Smbv1AuditEvents {
+# The Audit channel is often Analytic/disabled on 2012 R2. Get-WinEvent then
+# reports "There is not an event log ... that matches". Enabling requires
+# wevtutil /q:true (quiet) for analytic/debug logs.
+function Enable-SmbServerAuditChannel {
+    param([string]$Computer)
+
+    $sb = {
+        $logName = 'Microsoft-Windows-SMBServer/Audit'
+        $enabled = $false
+        $justEnabled = $false
+        $noteParts = New-Object System.Collections.ArrayList
+
+        try {
+            $existing = Get-WinEvent -ListLog $logName -Force -ErrorAction Stop
+            if ($existing.IsEnabled) {
+                $enabled = $true
+                [void]$noteParts.Add('Audit channel already enabled')
+            }
+        }
+        catch { }
+
+        if (-not $enabled) {
+            # Analytic/debug channels (typical for SMBServer/Audit on 2012 R2) require /q:true.
+            $out = & wevtutil.exe sl $logName /e:true /q:true 2>&1 | Out-String
+            if ($LASTEXITCODE -eq 0) {
+                $enabled = $true
+                $justEnabled = $true
+                [void]$noteParts.Add('Enabled via wevtutil /q:true')
+            }
+            else {
+                [void]$noteParts.Add(('wevtutil /q:true: {0}' -f $out.Trim()))
+            }
+        }
+
+        if (-not $enabled) {
+            try {
+                $cfg = New-Object System.Diagnostics.Eventing.Reader.EventLogConfiguration $logName
+                if (-not $cfg.IsEnabled) {
+                    $cfg.IsEnabled = $true
+                    $cfg.SaveChanges()
+                    $justEnabled = $true
+                    [void]$noteParts.Add('Enabled via EventLogConfiguration')
+                }
+                else {
+                    [void]$noteParts.Add('Audit channel already enabled')
+                }
+                $enabled = $true
+            }
+            catch {
+                [void]$noteParts.Add(('EventLogConfiguration: {0}' -f $_.Exception.Message))
+            }
+        }
+
+        $found = New-Object System.Collections.ArrayList
+        try {
+            $logs = @(Get-WinEvent -ListLog 'Microsoft-Windows-SMBServer*' -Force -ErrorAction SilentlyContinue)
+            foreach ($l in $logs) {
+                if ($l.LogName) { [void]$found.Add([string]$l.LogName) }
+            }
+        }
+        catch { }
+
+        New-Object psobject -Property @{
+            Enabled      = $enabled
+            JustEnabled  = $justEnabled
+            Notes        = ($noteParts -join '; ')
+            ExistingLogs = ($found -join ', ')
+        }
+    }
+
+    return (Invoke-OnTarget -Computer $Computer -ScriptBlock $sb)
+}
+
+function Get-Smbv1EventsFromLog {
     param(
         [string]$Computer,
+        [string]$LogName,
         [datetime]$StartTime,
         [int]$MaxEventsPerServer = 0
     )
 
-    $filter = New-Smbv1EventFilter -StartTime $StartTime
-
+    $filter = New-Smbv1EventFilter -StartTime $StartTime -LogName $LogName
     $gwe = @{
         FilterHashtable = $filter
         ErrorAction     = 'Stop'
@@ -608,20 +709,23 @@ function Get-Smbv1AuditEvents {
 
     $useOldest = $false
     try {
-        $list = @{ ListLog = $script:AuditLogName; ErrorAction = 'Stop' }
+        $list = @{ ListLog = $LogName; ErrorAction = 'Stop'; Force = $true }
         if (-not $isLocal) {
             $list.ComputerName = $Computer
             if ($script:Credential) { $list.Credential = $script:Credential }
         }
         $logInfo = Get-WinEvent @list
-        if (-not $logInfo.IsEnabled) {
-            throw "The $script:AuditLogName log is disabled on $Computer. Enable SMB1 access auditing first (option 3)."
+        if ($logInfo -and -not $logInfo.IsEnabled) {
+            return @{ Status = 'Disabled'; Events = @() }
         }
-        if ([string]$logInfo.LogType -match 'Analytic|Debug') { $useOldest = $true }
+        if ($logInfo -and [string]$logInfo.LogType -match 'Analytic|Debug') {
+            $useOldest = $true
+        }
     }
     catch {
-        if ($_.Exception.Message -match 'disabled') { throw }
-        # Log list can fail on some hosts; still try the query.
+        if (Test-IsMissingEventLogError $_) {
+            return @{ Status = 'Missing'; Events = @() }
+        }
     }
 
     $invokeQuery = {
@@ -633,64 +737,134 @@ function Get-Smbv1AuditEvents {
     }
 
     try {
-        return @(& $invokeQuery $gwe $useOldest)
+        return @{ Status = 'OK'; Events = @(& $invokeQuery $gwe $useOldest) }
     }
     catch {
-        if (Test-IsNoEventsError $_) { return @() }
-
+        if (Test-IsNoEventsError $_) {
+            return @{ Status = 'OK'; Events = @() }
+        }
+        if (Test-IsMissingEventLogError $_) {
+            return @{ Status = 'Missing'; Events = @() }
+        }
         if (-not $useOldest -and $_.Exception.Message -match 'Oldest') {
             try {
-                return @(& $invokeQuery $gwe $true)
+                return @{ Status = 'OK'; Events = @(& $invokeQuery $gwe $true) }
             }
             catch {
-                if (Test-IsNoEventsError $_) { return @() }
+                if (Test-IsNoEventsError $_) { return @{ Status = 'OK'; Events = @() } }
+                if (Test-IsMissingEventLogError $_) { return @{ Status = 'Missing'; Events = @() } }
                 throw
             }
         }
-
-        if ($isLocal) { throw }
-
-        Write-WarnLine "    RPC/Get-WinEvent failed on $Computer; retrying via PowerShell remoting..."
-        $remote = Invoke-OnTarget -Computer $Computer -ArgumentList $StartTime, $MaxEventsPerServer, $script:AuditLogName, $script:AuditEventId -ScriptBlock {
-            param($start, $max, $logName, $eventId)
-            $filter = @{ LogName = $logName; Id = $eventId; StartTime = $start }
-            $p = @{ FilterHashtable = $filter; ErrorAction = 'Stop' }
-            if ($max -gt 0) { $p.MaxEvents = $max }
-            try {
-                $evts = @(Get-WinEvent @p)
-            }
-            catch {
-                $fq = [string]$_.FullyQualifiedErrorId
-                $msg = [string]$_.Exception.Message
-                if ($fq -match 'NoMatchingEventsFound' -or $msg -match 'No events were found|No matching events found') {
-                    if ($msg -match 'Oldest') {
-                        $p['Oldest'] = $true
-                        try { $evts = @(Get-WinEvent @p) }
-                        catch { return @() }
-                    }
-                    else { return @() }
-                }
-                elseif ($msg -match 'Oldest') {
-                    $p['Oldest'] = $true
-                    $evts = @(Get-WinEvent @p)
-                }
-                else { throw }
-            }
-            foreach ($e in $evts) {
-                $addr = $null
-                if ($e.Properties -and $e.Properties.Count -gt 0) {
-                    $addr = [string]$e.Properties[0].Value
-                }
-                [pscustomobject]@{
-                    TimeCreated   = $e.TimeCreated
-                    ClientAddress = $addr
-                    Message       = $e.Message
-                    Id            = $e.Id
-                }
-            }
-        }
-        return @($remote)
+        throw
     }
+}
+
+function Get-Smbv1AuditEvents {
+    param(
+        [string]$Computer,
+        [datetime]$StartTime,
+        [int]$MaxEventsPerServer = 0
+    )
+
+    $channel = $null
+    try {
+        $channel = Enable-SmbServerAuditChannel -Computer $Computer
+        if ($channel -and $channel.JustEnabled) {
+            Write-WarnLine "    Enabled the SMBServer Audit channel on $Computer (it was disabled or treated as missing)."
+            Start-Sleep -Seconds 2
+        }
+        elseif ($channel -and -not $channel.Enabled -and $channel.Notes) {
+            Write-WarnLine ("    Could not enable Audit channel: {0}" -f $channel.Notes)
+        }
+    }
+    catch {
+        Write-WarnLine ("    Could not enable the Audit channel: {0}" -f $_.Exception.Message)
+    }
+
+    $all = New-Object System.Collections.ArrayList
+    $queried = New-Object System.Collections.ArrayList
+    $missing = New-Object System.Collections.ArrayList
+    $lastError = $null
+
+    foreach ($logName in $script:SmbServerLogNames) {
+        try {
+            $batch = Get-Smbv1EventsFromLog -Computer $Computer -LogName $logName -StartTime $StartTime -MaxEventsPerServer $MaxEventsPerServer
+        }
+        catch {
+            $lastError = $_
+            if (Test-IsMissingEventLogError $_) {
+                [void]$missing.Add($logName)
+                continue
+            }
+            if (-not (Test-IsLocalComputer $Computer)) {
+                Write-WarnLine "    RPC/Get-WinEvent failed for $logName on $Computer; retrying via PowerShell remoting..."
+                try {
+                    $remote = Invoke-OnTarget -Computer $Computer -ArgumentList $StartTime, $MaxEventsPerServer, $logName, $script:AuditEventId -ScriptBlock {
+                        param($start, $max, $logName, $eventId)
+                        $filter = @{ LogName = $logName; Id = $eventId; StartTime = $start }
+                        $p = @{ FilterHashtable = $filter; ErrorAction = 'Stop' }
+                        if ($max -gt 0) { $p.MaxEvents = $max }
+                        try {
+                            return @(Get-WinEvent @p)
+                        }
+                        catch {
+                            $msg = [string]$_.Exception.Message
+                            if ($msg -match 'Oldest') {
+                                $p['Oldest'] = $true
+                                try { return @(Get-WinEvent @p) } catch { return @() }
+                            }
+                            if ($msg -match 'No events were found|No matching events found') { return @() }
+                            throw
+                        }
+                    }
+                    foreach ($e in @($remote)) { [void]$all.Add($e) }
+                    [void]$queried.Add($logName)
+                    continue
+                }
+                catch {
+                    $lastError = $_
+                }
+            }
+            continue
+        }
+
+        if ($batch.Status -eq 'Missing' -or $batch.Status -eq 'Disabled') {
+            [void]$missing.Add($logName)
+            continue
+        }
+        [void]$queried.Add($logName)
+        foreach ($e in @($batch.Events)) {
+            [void]$all.Add($e)
+        }
+        if ($logName -eq $script:AuditLogName -and $all.Count -gt 0) {
+            break
+        }
+    }
+
+    if ($all.Count -gt 0) { return $all }
+
+    if ($queried.Count -eq 0) {
+        $existing = ''
+        if ($channel -and $channel.ExistingLogs) { $existing = [string]$channel.ExistingLogs }
+        $detail = "There is not a queryable Microsoft-Windows-SMBServer/Audit log on $Computer."
+        if ($existing) {
+            $detail = $detail + " SMBServer logs present: $existing."
+        }
+        else {
+            $detail = $detail + " The Audit channel is often Analytic and reports as missing until it is enabled with wevtutil /q:true (this scan tries that automatically)."
+        }
+        $detail = $detail + " On Server 2012 RTM the channel may not exist at all (it shipped in 2012 R2 / 8.1). After enabling, there is no history until new SMBv1 attempts occur."
+        if ($lastError) {
+            $detail = $detail + ' ' + [string]$lastError.Exception.Message
+        }
+        throw $detail
+    }
+
+    if ($channel -and $channel.JustEnabled) {
+        Write-WarnLine "    Audit log is now on, but it has no history. Leave auditing enabled, wait for clients to connect, then scan again."
+    }
+    return @()
 }
 
 function ConvertTo-Smbv1Summary {
@@ -1017,7 +1191,7 @@ function Invoke-Smb1AuditLocal {
         }
         catch { }
         try {
-            $null = & wevtutil.exe sl $logName /e:true 2>&1
+            $null = & wevtutil.exe sl $logName /e:true /q:true 2>&1
             return $true
         }
         catch {
@@ -1223,7 +1397,7 @@ function Set-Smb1AuditViaRemoteRegistry {
 
     if ($Enable) {
         try {
-            $null = & wevtutil.exe sl $script:AuditLogName /r:$Computer /e:true 2>&1
+            $null = & wevtutil.exe sl $script:AuditLogName /r:$Computer /e:true /q:true 2>&1
         }
         catch { }
     }
@@ -1490,9 +1664,10 @@ function Start-Smbv1Scan {
         }
         catch {
             $msg = $_.Exception.Message
-            if ($msg -match 'disabled|does not exist|There is not an event log') {
-                Write-WarnLine "    Audit log missing or disabled (enable auditing with option 3)."
+            if ($msg -match 'disabled|does not exist|There is not an event log|not a queryable') {
+                Write-WarnLine "    Audit log missing or disabled on this OS."
                 Write-WarnLine "    $($msg)"
+                Write-WarnLine "    Option 3 sets the registry; this scan also tries wevtutil /q:true to enable the analytic Audit channel."
             }
             elseif ($msg -match 'Access is denied|UnauthorizedAccess') {
                 Write-ErrLine "    Access denied. Run elevated or add this account to Event Log Readers."
@@ -1504,7 +1679,8 @@ function Start-Smbv1Scan {
         }
 
         if ($events.Count -eq 0) {
-            Write-WarnLine "    No SMBv1 events found in the last $DaysBack day(s) (is auditing enabled?)."
+            Write-WarnLine "    No Event ID 3000 records in the last $DaysBack day(s)."
+            Write-WarnLine "    If the Audit channel was just enabled, there is no history yet — wait for SMBv1 attempts and scan again."
             continue
         }
 
@@ -1860,14 +2036,27 @@ function Invoke-Smbv1SelfTest {
         [System.Management.Automation.ErrorCategory]::ObjectNotFound,
         $null
     )
+    $paramMissing = New-Object System.Management.Automation.ErrorRecord (
+        (New-Object System.Exception "A parameter cannot be found that matches parameter name 'AuditSmb1Access'."),
+        'NamedParameterNotFound',
+        [System.Management.Automation.ErrorCategory]::InvalidArgument,
+        $null
+    )
     Assert-True -Condition (Test-IsNoEventsError -ErrorRecord $noEvents) `
         -Name 'Test-IsNoEventsError recognises NoMatchingEventsFound'
     Assert-True -Condition (-not (Test-IsNoEventsError -ErrorRecord $missingLog)) `
         -Name 'Test-IsNoEventsError does not treat a missing log as "no events"'
+    Assert-True -Condition (Test-IsMissingEventLogError -ErrorRecord $missingLog) `
+        -Name 'Test-IsMissingEventLogError recognises the 2012 R2 disabled-channel message'
+    Assert-True -Condition (-not (Test-IsMissingEventLogError -ErrorRecord $paramMissing)) `
+        -Name 'Test-IsMissingEventLogError does not treat a missing cmdlet parameter as a missing log'
 
     $filter = New-Smbv1EventFilter -StartTime ([datetime]'2026-01-01')
     Assert-True -Condition ($filter.LogName -eq 'Microsoft-Windows-SMBServer/Audit' -and $filter.Id -eq 3000) `
         -Name 'Event filter targets Microsoft-Windows-SMBServer/Audit id 3000'
+    $opFilter = New-Smbv1EventFilter -StartTime ([datetime]'2026-01-01') -LogName 'Microsoft-Windows-SMBServer/Operational'
+    Assert-True -Condition ($opFilter.LogName -eq 'Microsoft-Windows-SMBServer/Operational') `
+        -Name 'Event filter can target Microsoft-Windows-SMBServer/Operational as a fallback'
 
     Assert-True -Condition (Test-IsLocalComputer -Computer 'localhost') -Name 'localhost is treated as local'
     Assert-True -Condition (Test-IsLocalComputer -Computer '.') -Name 'dot is treated as local'
