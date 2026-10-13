@@ -91,6 +91,28 @@ def main() -> int:
         and "Write-OperationStatus -Operation \"Blocking user sign-in\"" in content,
         "Sign-in block only prints [FAILED] when Graph returns an error",
     )
+    assert_true(
+        "function Get-SingleStatusResult" in content,
+        "MIM status unwrap helper exists so a doubled pipeline result is not treated as failure",
+    )
+    assert_true(
+        "Get-SingleStatusResult (Set-MIMIgnoreWorkdayStatus" in content,
+        "MIM caller unwraps the function output before checking Status",
+    )
+    assert_true(
+        'return Add-OperationResult -Action "MIM Ignore Workday Status" -Status Success' in content,
+        "Successful MIM update returns only the operation result",
+    )
+
+    # The false [FAILED] was Add-OperationResult plus a second Success object,
+    # which made $result.Status = @('Success','Success') fail -in @('Success','Skipped').
+    double_return = re.search(
+        r'Add-OperationResult -Action "MIM Ignore Workday Status" -Status Success'
+        r'.*?return \[PSCustomObject\]@\{ Status = \'Success\'',
+        content,
+        re.S,
+    )
+    assert_true(double_return is None, "MIM success path does not emit two Success objects")
 
     # Brace balance is a cheap syntax smoke check for the reconstructed script.
     assert_true(content.count("{") == content.count("}"), "Curly braces are balanced")

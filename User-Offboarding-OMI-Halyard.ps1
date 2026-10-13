@@ -39,9 +39,10 @@
     Anthony Blake (Enhanced version) - split into OMI/Halyard scope
 
 .VERSION
-    2.7.1-OMIHAL - OMI + Halyard AD scope with full Entra/Exchange actions + Accendra alert
+    2.7.2-OMIHAL - OMI + Halyard AD scope with full Entra/Exchange actions + Accendra alert
                    Conditional MIM Workday ignore flags (OMI only vs OMI+Halyard)
                    Graph sign-in block verifies with retries so stale reads are not reported as failures
+                   MIM success is a single pipeline result so the status line is not a false [FAILED]
 
 .NOTES
     - Requires ActiveDirectory module
@@ -379,6 +380,35 @@ function Reset-UserResults {
     
     $script:ValidationResults = [System.Collections.Generic.List[PSCustomObject]]::new()
     $script:OperationResults = [System.Collections.Generic.List[PSCustomObject]]::new()
+}
+
+function Get-SingleStatusResult {
+    <#
+    .SYNOPSIS
+        Returns the last pipeline object that has a Status property.
+
+        PowerShell functions emit every un-captured object. If a helper both
+        calls Add-OperationResult (which writes to the pipeline) and also
+        returns another object, the caller sees an array. Then
+        $result.Status becomes @('Success','Success') and
+        -in @('Success','Skipped') is $false, so a successful MIM update is
+        printed as [FAILED] with a doubled Description.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false, ValueFromPipeline = $true)]
+        $Result
+    )
+
+    $candidates = @($Result) | Where-Object {
+        $_ -and $_.PSObject.Properties['Status']
+    }
+
+    if ($candidates.Count -eq 0) {
+        return $null
+    }
+
+    return $candidates[-1]
 }
 
 # ============================================================================
@@ -1660,7 +1690,7 @@ function Set-MIMIgnoreWorkdayStatus {
         # The client is set once at startup; we set it again here defensively
         # (with the configured service-account credential) in case this function
         # is called standalone or the client context was reset.
-        Connect-MIMService
+        Connect-MIMService | Out-Null
 
         # Locate the MIM Person object by AccountName. Only pull the attributes
         # we intend to change to keep the request lightweight.
@@ -1673,17 +1703,15 @@ function Set-MIMIgnoreWorkdayStatus {
 
         if (-not $person) {
             Write-LogMessage "No MIM Person object found for AccountName '$SamAccountName'." -Level Warning -Indent 1
-            Add-OperationResult -Action "MIM Ignore Workday Status" -Status Warning `
+            return Add-OperationResult -Action "MIM Ignore Workday Status" -Status Warning `
                 -Description "MIM Person not found" -Target $SamAccountName
-            return [PSCustomObject]@{ Status = 'Warning'; Description = 'MIM Person not found' }
         }
 
         # Guard against multiple matches - we only expect one Person per account.
         if ($person -is [System.Array] -and $person.Count -gt 1) {
             Write-LogMessage "Multiple MIM Person objects matched '$SamAccountName' ($($person.Count)). Skipping to avoid ambiguous update." -Level Warning -Indent 1
-            Add-OperationResult -Action "MIM Ignore Workday Status" -Status Warning `
+            return Add-OperationResult -Action "MIM Ignore Workday Status" -Status Warning `
                 -Description "Multiple MIM Person matches ($($person.Count))" -Target $SamAccountName
-            return [PSCustomObject]@{ Status = 'Warning'; Description = 'Multiple MIM Person matches' }
         }
 
         # Always set the OMI/standard Workday ignore flag. The HYH (Halyard)
@@ -1701,19 +1729,17 @@ function Set-MIMIgnoreWorkdayStatus {
             Write-LogMessage "User present in OMI only - setting _Ignore_Workday_Active_Status only." -Level Info -Indent 1
         }
 
-        Save-Resource $person -ErrorAction Stop
+        Save-Resource $person -ErrorAction Stop | Out-Null
 
         $flagList = $flagsSet -join ' and '
         Write-LogMessage "MIM Workday ignore flag(s) set for '$SamAccountName': $flagList (offboarding protected from reversal)." -Level Success -Indent 1
-        Add-OperationResult -Action "MIM Ignore Workday Status" -Status Success `
+        return Add-OperationResult -Action "MIM Ignore Workday Status" -Status Success `
             -Description "Set $flagList" -Target $SamAccountName
-        return [PSCustomObject]@{ Status = 'Success'; Description = "Set $flagList" }
     }
     catch {
         Write-LogMessage "Failed to set MIM Workday ignore flags for '$SamAccountName': $($_.Exception.Message)" -Level Error -Indent 1
-        Add-OperationResult -Action "MIM Ignore Workday Status" -Status Error `
+        return Add-OperationResult -Action "MIM Ignore Workday Status" -Status Error `
             -Description $_.Exception.Message -Target $SamAccountName
-        return [PSCustomObject]@{ Status = 'Error'; Description = $_.Exception.Message }
     }
 }
 
@@ -1993,8 +2019,9 @@ function Process-SingleUser {
 
         try {
             Write-OperationStatus -Operation "Setting MIM Workday ignore flags" -InProgress
-            $result = Set-MIMIgnoreWorkdayStatus -SamAccountName $samAccountName -HasHalyardAccount $hasHalyardAccount
-            if ($result -and $result.Status -in @('Success', 'Skipped')) {
+            $result = Get-SingleStatusResult (Set-MIMIgnoreWorkdayStatus -SamAccountName $samAccountName -HasHalyardAccount $hasHalyardAccount)
+            $mimStatus = if ($result) { [string]$result.Status } else { '' }
+            if ($mimStatus -in @('Success', 'Skipped')) {
                 Write-OperationStatus -Success
             } else {
                 # Coerce to a non-null string; -ErrorMessage is [string] and
@@ -2398,7 +2425,7 @@ function Start-Offboarding {
         
         Write-Host ""
         Write-Host ("=" * 70) -ForegroundColor Cyan
-        Write-Host "  USER OFFBOARDING SCRIPT v2.7.1-OMIHAL - Enhanced Edition" -ForegroundColor Cyan
+        Write-Host "  USER OFFBOARDING SCRIPT v2.7.2-OMIHAL - Enhanced Edition" -ForegroundColor Cyan
         Write-Host "  Author: Anthony Blake | Enhanced: $(Get-Date -Format 'yyyy-MM-dd')" -ForegroundColor DarkCyan
         Write-Host ("=" * 70) -ForegroundColor Cyan
         
