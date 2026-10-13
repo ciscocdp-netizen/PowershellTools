@@ -21,9 +21,16 @@
     A scan tries to enable the SMBServer Audit channel with wevtutil /q:true when
     that channel is present but disabled (Analytic on 2012 R2). On Server 2012 the
     channel is often not registered at all ("specified channel could not be
-    found"); the scan does not treat wevtutil stderr as a hard failure. It then
-    uses Microsoft-Windows-SMBServer/Operational (SMB1-related messages) and live
-    Get-SmbSession dialect 1.x rows.
+    found"); the scan does not treat wevtutil stderr as a hard failure.
+
+    On Server 2012 R2 and older the primary path is therefore:
+      auditpol /set /subcategory:{0CCE9244-69AE-11D9-BED3-505054503030} /success:enable /failure:enable
+    (File Share Object Access) and Security Event ID 5140 (A network share object
+    was accessed), from which the script reads Source Address / IpAddress.
+    Event 5140 is share access for every SMB dialect, not SMBv1-only; live
+    Get-SmbSession dialect 1.x rows still identify confirmed SMBv1 clients.
+    Microsoft-Windows-SMBServer/Operational SMB1-related messages are also used
+    when present.
 
     Also reports SMB1 feature / server configuration, live SMBv1 sessions, and
     optional reverse-DNS / Active Directory enrichment of client addresses.
@@ -46,8 +53,9 @@
 
 .PARAMETER EnableAuditing
     Skip the menu and enable SMB1 access auditing on the targets. Server 2012 R2
-    and older get the LanmanServer AuditSmb1Access registry DWORD, then a short
-    wait and a LanmanServer restart. This does not enable the SMBv1 protocol.
+    and older get the LanmanServer AuditSmb1Access registry DWORD, File Share
+    audit policy via auditpol (Security Event 5140), then a short wait and a
+    LanmanServer restart. This does not enable the SMBv1 protocol.
 
 .PARAMETER DisableAuditing
     Skip the menu and disable SMB1 access auditing on the targets.
@@ -93,7 +101,7 @@
     Runs parser/unit tests and exits 0 on success.
 
 .NOTES
-    Version: 2.5
+    Version: 2.6
     Compatible: Windows PowerShell 5.1 and PowerShell 7+ on Windows
     Requires: Elevation for enabling auditing and (typically) for reading the Audit log
 
@@ -128,6 +136,9 @@
         channel could not be found". The scan classifies that as unregistered
         (without dumping NativeCommandError), inventories existing SMBServer logs,
         and falls back to Operational SMB1 messages plus live Get-SmbSession rows.
+      - Server 2012 R2 and older enable File Share auditing with auditpol (GUID,
+        not the localized "File Share" name) and scrape Security Event 5140 for
+        source IP. Event 5140 is all SMB dialects; Source=Security5140 vs LiveSession.
 #>
 [CmdletBinding()]
 param(
@@ -151,9 +162,14 @@ param(
 
 Set-StrictMode -Off
 
-$script:Version      = '2.5'
+$script:Version      = '2.6'
 $script:AuditLogName = 'Microsoft-Windows-SMBServer/Audit'
 $script:AuditEventId = 3000
+$script:SecurityLogName = 'Security'
+$script:ShareAccessEventId = 5140
+# Object Access \ File Share — GUID so auditpol works on non-English OS.
+$script:FileShareAuditGuid = '{0CCE9244-69AE-11D9-BED3-505054503030}'
+$script:LastChannelRegistered = $null
 $script:SmbServerLogNames = @(
     'Microsoft-Windows-SMBServer/Audit',
     'Microsoft-Windows-SMBServer/Operational',
@@ -374,6 +390,50 @@ function Get-Smbv1ClientAddressFromXml {
     return $null
 }
 
+function Get-EventXmlDataMap {
+    param([string]$XmlText)
+
+    $map = @{}
+    if ([string]::IsNullOrWhiteSpace($XmlText)) { return $map }
+
+    try {
+        $doc = New-Object System.Xml.XmlDocument
+        $doc.XmlResolver = $null
+        $doc.LoadXml($XmlText)
+    }
+    catch {
+        return $map
+    }
+
+    $nodes = $doc.SelectNodes("//*[local-name()='Data']")
+    if ($null -eq $nodes) { return $map }
+
+    foreach ($node in $nodes) {
+        $attr = $node.GetAttribute('Name')
+        if ([string]::IsNullOrWhiteSpace($attr)) { continue }
+        $text = $node.InnerText
+        if ($null -eq $text) { $text = '' }
+        $map[$attr] = $text.Trim()
+    }
+    return $map
+}
+
+function Get-EventXmlDataValue {
+    param(
+        [string]$XmlText,
+        [string[]]$Name
+    )
+
+    if ($null -eq $Name -or @($Name).Count -eq 0) { return $null }
+    $map = Get-EventXmlDataMap -XmlText $XmlText
+    foreach ($n in @($Name)) {
+        if ($map.ContainsKey($n) -and -not [string]::IsNullOrWhiteSpace($map[$n])) {
+            return [string]$map[$n]
+        }
+    }
+    return $null
+}
+
 function Get-EventPropertyValue {
     param($Event, [int]$Index = 0)
 
@@ -436,6 +496,96 @@ function Get-Smbv1ClientAddressFromEvent {
     }
 
     return 'Unknown'
+}
+
+function Test-IsIgnoredShareClientAddress {
+    param([string]$Address)
+
+    if ([string]::IsNullOrWhiteSpace($Address)) { return $true }
+    $a = ConvertTo-NormalizedClientAddress -Address $Address
+    if ($a -eq 'Unknown') { return $true }
+    if ($a -eq '-' -or $a -eq '*' -or $a -eq '::' -or $a -eq '0.0.0.0') { return $true }
+    if ($a -eq '127.0.0.1' -or $a -eq '::1' -or $a -eq 'localhost') { return $true }
+    return $false
+}
+
+function ConvertFrom-AuditPolFileShareOutput {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return 'Unknown' }
+    if ($Text -match '(?i)Success and Failure') { return 'Success and Failure' }
+    if ($Text -match '(?i)No Auditing') { return 'No Auditing' }
+    if ($Text -match '(?i)\bSuccess\b') { return 'Success' }
+    if ($Text -match '(?i)\bFailure\b') { return 'Failure' }
+    return 'Unknown'
+}
+
+function Test-IsFileShareAuditEnabled {
+    param([string]$State)
+    if ([string]::IsNullOrWhiteSpace($State)) { return $false }
+    return ($State -match '(?i)Success')
+}
+
+function Get-ShareAccess5140DetailsFromEvent {
+    param($Event)
+
+    $address = $null
+    $shareName = $null
+    $account = $null
+
+    $xmlText = Get-EventXmlText -Event $Event
+    $map = Get-EventXmlDataMap -XmlText $xmlText
+    if ($map.ContainsKey('IpAddress') -and $map['IpAddress']) {
+        $address = [string]$map['IpAddress']
+    }
+    if ($map.ContainsKey('ShareName') -and $map['ShareName']) {
+        $shareName = [string]$map['ShareName']
+    }
+    $user = $null
+    $domain = $null
+    if ($map.ContainsKey('SubjectUserName') -and $map['SubjectUserName']) {
+        $user = [string]$map['SubjectUserName']
+    }
+    if ($map.ContainsKey('SubjectDomainName') -and $map['SubjectDomainName']) {
+        $domain = [string]$map['SubjectDomainName']
+    }
+    if ($user) {
+        if ($domain) { $account = "$domain\$user" } else { $account = $user }
+    }
+
+    $msg = ''
+    if ($Event -and $Event.PSObject.Properties['Message'] -and $Event.Message) {
+        $msg = [string]$Event.Message
+    }
+    if (-not $address -and $msg -match '(?im)Source Address:\s*(\S+)') {
+        $address = $Matches[1]
+    }
+    if (-not $shareName -and $msg -match '(?im)Share Name:\s*(\S+)') {
+        $shareName = $Matches[1]
+    }
+
+    # Event 5140 Properties[0] is the SID — never treat it as a client address.
+    # IpAddress is typically index 5 (Subject SID, User, Domain, LogonId, ObjectType, IpAddress).
+    if (-not $address) {
+        $candidate = Get-EventPropertyValue -Event $Event -Index 5
+        if ($candidate -and $candidate -notmatch '^S-1-') {
+            $norm = ConvertTo-NormalizedClientAddress -Address $candidate
+            if (Test-IsIpAddress -Value $norm) { $address = $norm }
+        }
+    }
+
+    if ($address) {
+        $address = ConvertTo-NormalizedClientAddress -Address $address
+    }
+    else {
+        $address = 'Unknown'
+    }
+
+    New-Object psobject -Property @{
+        ClientAddress = $address
+        ShareName     = $(if ($shareName) { $shareName } else { '' })
+        AccountName   = $(if ($account) { $account } else { '' })
+    }
 }
 
 function Test-IsMissingEventLogError {
@@ -963,6 +1113,154 @@ function Get-Smbv1LiveSessionRows {
     return $rows
 }
 
+function Enable-FileShareAuditPolicy {
+    param(
+        [string]$Computer,
+        [bool]$Enable = $true
+    )
+
+    $guid = $script:FileShareAuditGuid
+    $sb = {
+        param([bool]$TurnOn, [string]$SubGuid)
+        $state = 'disable'
+        if ($TurnOn) { $state = 'enable' }
+
+        function Invoke-AuditPolLine {
+            param([string]$ArgLine)
+            $prev = $ErrorActionPreference
+            $ErrorActionPreference = 'SilentlyContinue'
+            $raw = $null
+            try {
+                $raw = cmd.exe /c "auditpol.exe $ArgLine 2>&1"
+            }
+            catch {
+                $raw = $_.Exception.Message
+            }
+            $code = 1
+            if ($null -ne $LASTEXITCODE) { $code = [int]$LASTEXITCODE }
+            $ErrorActionPreference = $prev
+            $text = ''
+            if ($null -ne $raw) {
+                $text = ((@($raw) | ForEach-Object { [string]$_ } | Where-Object { $_ }) -join "`n")
+            }
+            New-Object psobject -Property @{ ExitCode = $code; Text = $text }
+        }
+
+        $get = Invoke-AuditPolLine -ArgLine ("/get /subcategory:{0}" -f $SubGuid)
+        $before = 'Unknown'
+        $t = [string]$get.Text
+        if ($t -match '(?i)Success and Failure') { $before = 'Success and Failure' }
+        elseif ($t -match '(?i)No Auditing') { $before = 'No Auditing' }
+        elseif ($t -match '(?i)\bSuccess\b') { $before = 'Success' }
+        elseif ($t -match '(?i)\bFailure\b') { $before = 'Failure' }
+
+        $alreadyOn = ($before -match '(?i)Success')
+        if ($TurnOn -and $alreadyOn) {
+            New-Object psobject -Property @{
+                Ok          = $true
+                JustEnabled = $false
+                State       = $before
+                Notes       = 'File Share audit policy already enabled'
+            }
+            return
+        }
+
+        $set = Invoke-AuditPolLine -ArgLine ("/set /subcategory:{0} /success:{1} /failure:{1}" -f $SubGuid, $state)
+        if ($set.ExitCode -ne 0) {
+            $set = Invoke-AuditPolLine -ArgLine ("/set /subcategory:`"File Share`" /success:{0} /failure:{0}" -f $state)
+        }
+
+        $afterGet = Invoke-AuditPolLine -ArgLine ("/get /subcategory:{0}" -f $SubGuid)
+        $after = 'Unknown'
+        $t2 = [string]$afterGet.Text
+        if ($t2 -match '(?i)Success and Failure') { $after = 'Success and Failure' }
+        elseif ($t2 -match '(?i)No Auditing') { $after = 'No Auditing' }
+        elseif ($t2 -match '(?i)\bSuccess\b') { $after = 'Success' }
+        elseif ($t2 -match '(?i)\bFailure\b') { $after = 'Failure' }
+
+        $ok = ($set.ExitCode -eq 0)
+        if ($TurnOn) { $ok = $ok -or ($after -match '(?i)Success') }
+        else { $ok = $ok -or ($after -match '(?i)No Auditing') }
+
+        New-Object psobject -Property @{
+            Ok          = [bool]$ok
+            JustEnabled = [bool]($TurnOn -and $ok -and -not $alreadyOn)
+            State       = $after
+            Notes       = $(if ($ok) { 'auditpol File Share' } else { ('auditpol failed: {0}' -f $set.Text) })
+        }
+    }
+
+    return (Invoke-OnTarget -Computer $Computer -ScriptBlock $sb -ArgumentList @($Enable, $guid))
+}
+
+function Get-FileShareAccess5140Rows {
+    param(
+        [string]$Computer,
+        [datetime]$StartTime,
+        [int]$MaxEventsPerServer = 0
+    )
+
+    $rows = New-Object System.Collections.ArrayList
+    $incoming = $null
+
+    try {
+        $batch = Get-Smbv1EventsFromLog -Computer $Computer -LogName $script:SecurityLogName -StartTime $StartTime -MaxEventsPerServer $MaxEventsPerServer -EventId $script:ShareAccessEventId
+        if ($batch.Status -eq 'OK') {
+            $incoming = $batch.Events
+        }
+        elseif ($batch.Status -eq 'Missing') {
+            return $rows
+        }
+    }
+    catch {
+        if (Test-IsNoEventsError $_) { return $rows }
+        if (Test-IsMissingEventLogError $_) { return $rows }
+        if (-not (Test-IsLocalComputer $Computer)) {
+            try {
+                $incoming = Invoke-OnTarget -Computer $Computer -ArgumentList $StartTime, $MaxEventsPerServer, $script:SecurityLogName, $script:ShareAccessEventId -ScriptBlock {
+                    param($start, $max, $logName, $eventId)
+                    $filter = @{ LogName = $logName; Id = $eventId; StartTime = $start }
+                    $p = @{ FilterHashtable = $filter; ErrorAction = 'Stop' }
+                    if ($max -gt 0) { $p.MaxEvents = $max }
+                    try {
+                        return @(Get-WinEvent @p)
+                    }
+                    catch {
+                        $msg = [string]$_.Exception.Message
+                        if ($msg -match 'No events were found|No matching events found') { return @() }
+                        throw
+                    }
+                }
+            }
+            catch {
+                throw
+            }
+        }
+        else {
+            throw
+        }
+    }
+
+    foreach ($e in @(ConvertTo-ArrayList $incoming)) {
+        $details = Get-ShareAccess5140DetailsFromEvent -Event $e
+        $addr = [string]$details.ClientAddress
+        if (Test-IsIgnoredShareClientAddress -Address $addr) { continue }
+        $when = Get-Date
+        if ($e.PSObject.Properties['TimeCreated'] -and $e.TimeCreated) {
+            $when = $e.TimeCreated
+        }
+        [void]$rows.Add([pscustomobject]@{
+            DomainController = $Computer
+            TimeCreated      = $when
+            ClientAddress    = $addr
+            ShareName        = [string]$details.ShareName
+            AccountName      = [string]$details.AccountName
+            Source           = 'Security5140'
+        })
+    }
+    return $rows
+}
+
 function Get-Smbv1AuditEvents {
     param(
         [string]$Computer,
@@ -970,6 +1268,7 @@ function Get-Smbv1AuditEvents {
         [int]$MaxEventsPerServer = 0
     )
 
+    $script:LastChannelRegistered = $null
     $channel = $null
     try {
         $channel = Enable-SmbServerAuditChannel -Computer $Computer
@@ -977,8 +1276,9 @@ function Get-Smbv1AuditEvents {
         if ($channel -and $channel.PSObject.Properties['ChannelRegistered']) {
             $registered = [bool]$channel.ChannelRegistered
         }
+        $script:LastChannelRegistered = $registered
         if ($channel -and $registered -eq $false) {
-            Write-WarnLine "    Microsoft-Windows-SMBServer/Audit is not registered on this OS (typical of Server 2012). Using Operational log + live SMBv1 sessions."
+            Write-WarnLine "    Microsoft-Windows-SMBServer/Audit is not registered on this OS (typical of Server 2012). Using Security Event 5140, Operational log, and live SMBv1 sessions."
             if ($channel.ExistingLogs) {
                 Write-Info ("    SMBServer logs present: {0}" -f $channel.ExistingLogs)
             }
@@ -1139,12 +1439,23 @@ function ConvertTo-Smbv1Summary {
         $sourceText = 'Event3000'
         if ($sourceMap.Count -gt 0) { $sourceText = (($sourceMap.Keys | Sort-Object) -join ', ') }
 
+        $shareMap = @{}
+        foreach ($row in $groupRows) {
+            if ($row.PSObject.Properties['ShareName'] -and $row.ShareName) {
+                $share = [string]$row.ShareName
+                if ($share) { $shareMap[$share] = $true }
+            }
+        }
+        $shareText = ''
+        if ($shareMap.Count -gt 0) { $shareText = (($shareMap.Keys | Sort-Object) -join ', ') }
+
         [void]$out.Add([pscustomobject]@{
             DomainController  = $first.DomainController
             ClientAddress     = $address
             HostName          = $hostName
             OperatingSystem   = $os
             DistinguishedName = $ou
+            Shares            = $shareText
             ConnectionCount   = [int]$g.Count
             FirstSeen         = $timeList[0].TimeCreated
             LastSeen          = $timeList[$timeList.Count - 1].TimeCreated
@@ -1213,13 +1524,13 @@ function ConvertTo-Smbv1Html {
     [void]$sb.AppendLine(('<p class="meta">Generated {0:yyyy-MM-dd HH:mm:ss} | Days: {1} | Targets: {2}</p>' -f (Get-Date), $Days, ($targetList -join ', ')))
 
     [void]$sb.AppendLine('<h2>Unique clients by server</h2><table><tr>')
-    foreach ($h in @('DomainController','ClientAddress','HostName','OperatingSystem','ConnectionCount','FirstSeen','LastSeen','Source')) {
+    foreach ($h in @('DomainController','ClientAddress','HostName','OperatingSystem','Shares','ConnectionCount','FirstSeen','LastSeen','Source')) {
         [void]$sb.Append("<th>$h</th>")
     }
     [void]$sb.AppendLine('</tr>')
     foreach ($row in $summaryList) {
         [void]$sb.Append('<tr>')
-        foreach ($h in @('DomainController','ClientAddress','HostName','OperatingSystem','ConnectionCount','FirstSeen','LastSeen','Source')) {
+        foreach ($h in @('DomainController','ClientAddress','HostName','OperatingSystem','Shares','ConnectionCount','FirstSeen','LastSeen','Source')) {
             [void]$sb.Append('<td>' + (ConvertTo-HtmlCell ([string]$row.$h)) + '</td>')
         }
         [void]$sb.AppendLine('</tr>')
@@ -1336,6 +1647,40 @@ function Test-OsNeedsSmb1AuditRegistry {
     if ($OsVersion.Major -lt 10) { return $true }
     if (-not $CmdletHasAuditParameter) { return $true }
     return $false
+}
+
+function Test-OsNeedsFileShareAudit5140 {
+    param([version]$OsVersion)
+    if ($null -eq $OsVersion) { return $false }
+    return ($OsVersion.Major -lt 10)
+}
+
+function Get-TargetOsVersion {
+    param([string]$Computer)
+
+    try {
+        $raw = Invoke-OnTarget -Computer $Computer -ScriptBlock {
+            try {
+                $os = Get-WmiObject -Class Win32_OperatingSystem -ErrorAction Stop
+                [string]$os.Version
+            }
+            catch {
+                try {
+                    $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+                    [string]$os.Version
+                }
+                catch {
+                    [Environment]::OSVersion.Version.ToString()
+                }
+            }
+        }
+        $text = [string]$raw
+        if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+        return [version]$text.Trim()
+    }
+    catch {
+        return $null
+    }
 }
 
 function Get-Smb1AuditRegistryPath {
@@ -1459,6 +1804,68 @@ function Invoke-Smb1AuditLocal {
         New-Object psobject -Property @{ Enabled = $enabled; LogType = $logType; RecordCount = $count }
     }
 
+    function Invoke-AuditPolLine {
+        param([string]$ArgLine)
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = 'SilentlyContinue'
+        $raw = $null
+        try {
+            $raw = cmd.exe /c "auditpol.exe $ArgLine 2>&1"
+        }
+        catch {
+            $raw = $_.Exception.Message
+        }
+        $code = 1
+        if ($null -ne $LASTEXITCODE) { $code = [int]$LASTEXITCODE }
+        $ErrorActionPreference = $prev
+        $text = ''
+        if ($null -ne $raw) {
+            $text = ((@($raw) | ForEach-Object { [string]$_ } | Where-Object { $_ }) -join "`n")
+        }
+        New-Object psobject -Property @{ ExitCode = $code; Text = $text }
+    }
+
+    function Convert-AuditPolState {
+        param([string]$Text)
+        if ([string]::IsNullOrWhiteSpace($Text)) { return 'Unknown' }
+        if ($Text -match '(?i)Success and Failure') { return 'Success and Failure' }
+        if ($Text -match '(?i)No Auditing') { return 'No Auditing' }
+        if ($Text -match '(?i)\bSuccess\b') { return 'Success' }
+        if ($Text -match '(?i)\bFailure\b') { return 'Failure' }
+        return 'Unknown'
+    }
+
+    function Get-FileShareAuditState {
+        $guid = '{0CCE9244-69AE-11D9-BED3-505054503030}'
+        $got = Invoke-AuditPolLine -ArgLine ("/get /subcategory:{0}" -f $guid)
+        $state = Convert-AuditPolState -Text $got.Text
+        if ($state -eq 'Unknown') {
+            $got = Invoke-AuditPolLine -ArgLine '/get /subcategory:"File Share"'
+            $state = Convert-AuditPolState -Text $got.Text
+        }
+        return $state
+    }
+
+    function Set-FileShareAuditState {
+        param([bool]$TurnOn)
+        $guid = '{0CCE9244-69AE-11D9-BED3-505054503030}'
+        $state = 'disable'
+        if ($TurnOn) { $state = 'enable' }
+        $set = Invoke-AuditPolLine -ArgLine ("/set /subcategory:{0} /success:{1} /failure:{1}" -f $guid, $state)
+        if ($set.ExitCode -ne 0) {
+            $set = Invoke-AuditPolLine -ArgLine ("/set /subcategory:`"File Share`" /success:{0} /failure:{0}" -f $state)
+        }
+        $after = Get-FileShareAuditState
+        $ok = ($set.ExitCode -eq 0)
+        if ($TurnOn) { $ok = $ok -or ($after -match '(?i)Success') }
+        else { $ok = $ok -or ($after -match '(?i)No Auditing') }
+        New-Object psobject -Property @{
+            Ok    = [bool]$ok
+            State = $after
+            Text  = [string]$set.Text
+        }
+    }
+
     $os = Get-LocalOsInfo
     $hasParam = Test-HasAuditCmdletParam
     $needsReg = Test-NeedsRegistryInner -OsVersion $os.Version -HasCmdletParam $hasParam
@@ -1496,12 +1903,23 @@ function Invoke-Smb1AuditLocal {
         $logOk = $true
         if ($Enable) { $logOk = Enable-AuditLogChannel }
 
+        $fileShare = $null
+        $fileShareApplied = $false
+        if ($needsReg) {
+            $fileShare = Set-FileShareAuditState -TurnOn $Enable
+            $fileShareApplied = [bool]$fileShare.Ok
+        }
+
         $method = 'None'
         if ($cmdletApplied -and $regApplied) { $method = 'Cmdlet+Registry' }
         elseif ($cmdletApplied) { $method = 'Cmdlet' }
         elseif ($regApplied) { $method = 'Registry' }
+        if ($fileShareApplied) {
+            if ($method -eq 'None') { $method = 'AuditPol-FileShare' }
+            else { $method = ($method + '+AuditPol-FileShare') }
+        }
 
-        $ok = [bool]($cmdletApplied -or $regApplied)
+        $ok = [bool]($cmdletApplied -or $regApplied -or $fileShareApplied)
         $restart = [bool]($needsReg -and $regApplied -and $Enable)
         $msg = ''
         if (-not $ok) {
@@ -1513,8 +1931,14 @@ function Invoke-Smb1AuditLocal {
         else {
             $msg = 'SMB1 access auditing updated via Set-SmbServerConfiguration.'
         }
+        if ($fileShareApplied) {
+            $msg = ($msg + ' File Share audit policy set via auditpol (Security Event 5140).').Trim()
+        }
+        elseif ($needsReg -and $fileShare -and -not $fileShare.Ok) {
+            $msg = ($msg + ' auditpol File Share failed: ' + $fileShare.Text).Trim()
+        }
         if ($Enable -and -not $logOk) {
-            $msg = ($msg + ' Microsoft-Windows-SMBServer/Audit is not registered on this OS (typical of Server 2012); Event ID 3000 will not be written. Scan uses Operational log + live SMBv1 sessions.').Trim()
+            $msg = ($msg + ' Microsoft-Windows-SMBServer/Audit is not registered on this OS (typical of Server 2012); Event ID 3000 will not be written. Scan uses Security Event 5140 + live SMBv1 sessions.').Trim()
         }
 
         New-Object psobject -Property @{
@@ -1528,6 +1952,7 @@ function Invoke-Smb1AuditLocal {
             RegistryApplied  = $regApplied
             RegistryValue    = (Get-RegDword -Path $regPath -Name $regName)
             LogEnabled       = $logOk
+            FileShareAudit   = $(if ($fileShare) { $fileShare.State } else { 'N/A' })
             RestartRequired  = $restart
             Message          = $msg
             Error            = $(if ($ok) { '' } else { $msg })
@@ -1583,6 +2008,9 @@ function Invoke-Smb1AuditLocal {
         catch { }
     }
 
+    $fileShareState = 'Unknown'
+    try { $fileShareState = Get-FileShareAuditState } catch { $fileShareState = 'Unknown' }
+
     New-Object psobject -Property @{
         Action           = 'Get'
         Ok               = $true
@@ -1598,6 +2026,7 @@ function Invoke-Smb1AuditLocal {
         AuditLogEnabled  = $log.Enabled
         AuditLogType     = $log.LogType
         AuditRecordCount = $log.RecordCount
+        FileShareAudit   = $fileShareState
         RestartRequired  = $false
         Message          = ''
         Error            = ''
@@ -1683,7 +2112,7 @@ function Show-AuditStatus {
 
     Write-Banner
     Write-Host "Checking SMB1 configuration..." -ForegroundColor White
-    Write-Host "Server 2012 R2 / older: auditing is the LanmanServer AuditSmb1Access registry DWORD." -ForegroundColor Gray
+    Write-Host "Server 2012 R2 / older: registry AuditSmb1Access + auditpol File Share (Event 5140)." -ForegroundColor Gray
     Write-Host ""
 
     $rows = foreach ($dc in @($script:Targets)) {
@@ -1717,6 +2146,7 @@ function Show-AuditStatus {
                     AuditLogEnabled  = 'N/A'
                     AuditLogType     = 'N/A'
                     AuditRecordCount = 'N/A'
+                    FileShareAudit   = 'N/A'
                     NeedsRegistry    = $true
                 }
             }
@@ -1728,6 +2158,10 @@ function Show-AuditStatus {
             if ($cfg.PSObject.Properties['AuditLogType'] -and $cfg.AuditLogType) {
                 $logType = [string]$cfg.AuditLogType
             }
+            $fileShare = 'N/A'
+            if ($cfg.PSObject.Properties['FileShareAudit'] -and $cfg.FileShareAudit) {
+                $fileShare = [string]$cfg.FileShareAudit
+            }
 
             [pscustomobject]@{
                 Server           = $dc
@@ -1736,6 +2170,7 @@ function Show-AuditStatus {
                 SMB1Auditing     = $cfg.SMB1Auditing
                 AuditMethod      = $cfg.Method
                 RegistryDWORD    = $cfg.RegistryAudit
+                FileShareAudit   = $fileShare
                 AuditLogEnabled  = $cfg.AuditLogEnabled
                 AuditLogType     = $logType
                 AuditRecordCount = $cfg.AuditRecordCount
@@ -1750,6 +2185,7 @@ function Show-AuditStatus {
                 SMB1Auditing     = 'N/A'
                 AuditMethod      = 'N/A'
                 RegistryDWORD    = 'N/A'
+                FileShareAudit   = 'N/A'
                 AuditLogEnabled  = 'N/A'
                 AuditLogType     = 'N/A'
                 AuditRecordCount = 'N/A'
@@ -1763,6 +2199,7 @@ function Show-AuditStatus {
     Write-Host "SMB1Auditing = effective AuditSmb1Access (cmdlet and/or registry DWORD)." -ForegroundColor Gray
     Write-Host "RegistryDWORD = HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters\AuditSmb1Access" -ForegroundColor Gray
     Write-Host "AuditLogType = NotRegistered means Microsoft-Windows-SMBServer/Audit is absent (typical of Server 2012)." -ForegroundColor Gray
+    Write-Host "FileShareAudit = Object Access / File Share (auditpol). Event 5140 source IPs on Server 2012 / older." -ForegroundColor Gray
     if (-not $NoPause) { Pause-Menu }
 }
 
@@ -1818,7 +2255,7 @@ function Set-AuditState {
     Write-Host ("  {0}" -f ($script:Targets -join ', ')) -ForegroundColor Gray
     Write-Host ""
     Write-Host "Server 2016 / Windows 10 and later : Set-SmbServerConfiguration -AuditSmb1Access" -ForegroundColor Gray
-    Write-Host "Server 2012 R2 / 8.1 and older     : registry DWORD, then restart LanmanServer after $($script:LanmanRestartDelaySeconds)s" -ForegroundColor Gray
+    Write-Host "Server 2012 R2 / 8.1 and older     : registry DWORD + auditpol File Share (Event 5140), then restart LanmanServer after $($script:LanmanRestartDelaySeconds)s" -ForegroundColor Gray
     if (-not $Force) {
         if (-not (Read-YesNo -Prompt "Continue?" -Default $true)) { return }
     }
@@ -1959,10 +2396,15 @@ function Start-Smbv1Scan {
             if ($evt.PSObject.Properties['TimeCreated'] -and $evt.TimeCreated) {
                 $timeCreated = $evt.TimeCreated
             }
+            $shareName = ''
+            if ($evt.PSObject.Properties['ShareName'] -and $evt.ShareName) {
+                $shareName = [string]$evt.ShareName
+            }
             [void]$results.Add([pscustomobject]@{
                 DomainController = $dc
                 TimeCreated      = $timeCreated
                 ClientAddress    = $clientAddress
+                ShareName        = $shareName
                 Source           = $source
             })
         }
@@ -1974,12 +2416,57 @@ function Start-Smbv1Scan {
             Write-WarnLine "    No Event ID 3000 / Operational SMB1 records in the last $DaysBack day(s)."
         }
 
+        $osVer = Get-TargetOsVersion -Computer $dc
+        $use5140 = Test-OsNeedsFileShareAudit5140 -OsVersion $osVer
+        if (-not $use5140 -and $script:LastChannelRegistered -eq $false) {
+            $use5140 = $true
+        }
+
+        $shareCount = 0
+        if ($use5140) {
+            Write-WarnLine "    Server 2012 / older path: Security Event 5140 (share access, all SMB dialects) + live SMBv1 sessions."
+            try {
+                $pol = Enable-FileShareAuditPolicy -Computer $dc -Enable $true
+                if ($pol -and $pol.JustEnabled) {
+                    Write-WarnLine "    Enabled File Share audit policy (auditpol). New 5140 records start now; this scan still reads existing history."
+                }
+                elseif ($pol -and -not $pol.Ok -and $pol.Notes) {
+                    Write-WarnLine ("    Could not enable File Share audit policy: {0}" -f $pol.Notes)
+                }
+            }
+            catch {
+                Write-WarnLine ("    Could not set File Share audit policy: {0}" -f $_.Exception.Message)
+            }
+
+            try {
+                $shareRows = Get-FileShareAccess5140Rows -Computer $dc -StartTime $startTime -MaxEventsPerServer $MaxEventsPerServer
+                $shareCount = $shareRows.Count
+                foreach ($row in $shareRows) { [void]$results.Add($row) }
+                if ($shareCount -gt 0) {
+                    Write-Ok ("    Found {0} Security Event 5140 share-access record(s) with a source IP" -f $shareCount)
+                }
+                else {
+                    Write-WarnLine "    No Security Event 5140 records with a source IP in the last $DaysBack day(s)."
+                    Write-WarnLine "    If File Share auditing was just enabled, wait for share access and scan again."
+                }
+            }
+            catch {
+                $shareErr = $_.Exception.Message
+                if ($shareErr -match 'Access is denied|UnauthorizedAccess') {
+                    Write-ErrLine "    Access denied reading the Security log. Run elevated or add this account to Event Log Readers."
+                }
+                else {
+                    Write-ErrLine ("    Security Event 5140 query failed: {0}" -f $shareErr)
+                }
+            }
+        }
+
         $live = Get-Smbv1LiveSessionRows -Computer $dc
         if ($live.Count -gt 0) {
             foreach ($row in $live) { [void]$results.Add($row) }
             Write-Ok ("    Found {0} live SMBv1 session(s)" -f $live.Count)
         }
-        elseif ($events.Count -eq 0) {
+        elseif ($events.Count -eq 0 -and $shareCount -eq 0) {
             Write-WarnLine "    No live SMBv1 sessions either."
         }
     }
@@ -1988,8 +2475,8 @@ function Start-Smbv1Scan {
         $script:Summary      = New-Object System.Collections.ArrayList
         $script:ClientRollup = New-Object System.Collections.ArrayList
         Write-Host ""
-        Write-Ok "No SMBv1 client connections found."
-        Write-WarnLine "On Server 2012 the Audit channel is often not registered; live sessions only catch clients connected right now."
+        Write-Ok "No SMBv1 / share-access client connections found."
+        Write-WarnLine "On Server 2012 use option 3 to enable File Share auditpol, then wait for share access and scan Event 5140. Live sessions only catch clients connected right now."
         if (-not $Quiet) { Pause-Menu }
         return
     }
@@ -1998,7 +2485,17 @@ function Start-Smbv1Scan {
     $script:ClientRollup = ConvertTo-Smbv1ClientRollup -SummaryRows $script:Summary
 
     Write-Host ""
-    Write-Ok "[+] $($script:Summary.Count) unique SMBv1 client/server pair(s) found."
+    Write-Ok "[+] $($script:Summary.Count) unique client/server pair(s) found."
+    $any5140 = $false
+    foreach ($row in $script:Summary) {
+        if ($row.PSObject.Properties['Source'] -and [string]$row.Source -match 'Security5140') {
+            $any5140 = $true
+            break
+        }
+    }
+    if ($any5140) {
+        Write-WarnLine "Source=Security5140 is network share access (all SMB dialects), not SMBv1-only. Source=LiveSession is confirmed dialect 1.x."
+    }
     Show-Table $script:Summary
 
     if ($script:ClientRollup.Count -gt 0 -and $script:Targets.Count -gt 1) {
@@ -2160,9 +2657,9 @@ function Show-MainMenu {
         }
         Write-Host "  1) Select target servers"
         Write-Host "  2) Check SMB1 / auditing status"
-        Write-Host "  3) Enable SMB1 access auditing (registry on Server 2012 R2 / older)"
+        Write-Host "  3) Enable auditing (registry + File Share auditpol on 2012 / older)"
         Write-Host "  4) Disable SMB1 access auditing"
-        Write-Host "  5) Scan for SMBv1 clients (events + live sessions)"
+        Write-Host "  5) Scan for clients (Event 3000 / 5140 on 2012 / live sessions)"
         Write-Host "  6) View last results"
         Write-Host "  7) Export last results to CSV"
         Write-Host "  8) Export last results to HTML"
@@ -2299,6 +2796,76 @@ function Invoke-Smbv1SelfTest {
     }
     Assert-True -Condition ((Get-Smbv1ClientAddressFromEvent -Event $msgOnly) -eq '8.8.4.4') `
         -Name 'Event parser falls back to English "Client Address:" message text'
+
+    $evt5140Xml = @'
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System><EventID>5140</EventID></System>
+  <EventData>
+    <Data Name="SubjectUserSid">S-1-5-21-1-2-3-1001</Data>
+    <Data Name="SubjectUserName">jdoe</Data>
+    <Data Name="SubjectDomainName">CONTOSO</Data>
+    <Data Name="SubjectLogonId">0x12345</Data>
+    <Data Name="ObjectType">File</Data>
+    <Data Name="IpAddress">10.20.30.40</Data>
+    <Data Name="IpPort">50123</Data>
+    <Data Name="ShareName">\\*\SYSVOL</Data>
+    <Data Name="SharePath">\??\C:\Windows\SYSVOL\sysvol</Data>
+  </EventData>
+</Event>
+'@
+    Assert-True -Condition ((Get-EventXmlDataValue -XmlText $evt5140Xml -Name @('IpAddress')) -eq '10.20.30.40') `
+        -Name 'Event XML map reads IpAddress from Security Event 5140'
+    Assert-True -Condition ((Get-EventXmlDataValue -XmlText $evt5140Xml -Name @('ShareName')) -eq '\\*\SYSVOL') `
+        -Name 'Event XML map reads ShareName from Security Event 5140'
+
+    $evt5140 = [pscustomobject]@{
+        Id         = 5140
+        Properties = @([pscustomobject]@{ Value = 'S-1-5-21-1-2-3-1001' })
+        Message    = ''
+        TimeCreated = [datetime]'2026-04-01 09:00:00'
+        Xml        = $evt5140Xml
+    }
+    $from5140 = Get-ShareAccess5140DetailsFromEvent -Event $evt5140
+    Assert-True -Condition ($from5140.ClientAddress -eq '10.20.30.40') `
+        -Name 'Event 5140 parser uses IpAddress, not Properties[0] SID'
+    Assert-True -Condition ($from5140.ShareName -eq '\\*\SYSVOL' -and $from5140.AccountName -eq 'CONTOSO\jdoe') `
+        -Name 'Event 5140 parser reads share name and account'
+
+    $evt5140Msg = [pscustomobject]@{
+        Id         = 5140
+        Properties = $null
+        Message    = "A network share object was accessed.`r`nSource Address:`t192.168.50.8`r`nShare Name:`t\\*\IPC$"
+        TimeCreated = Get-Date
+    }
+    $from5140Msg = Get-ShareAccess5140DetailsFromEvent -Event $evt5140Msg
+    Assert-True -Condition ($from5140Msg.ClientAddress -eq '192.168.50.8' -and $from5140Msg.ShareName -eq '\\*\IPC$') `
+        -Name 'Event 5140 parser falls back to Source Address / Share Name message text'
+
+    $sidAs3000 = Get-Smbv1ClientAddressFromEvent -Event $evt5140
+    Assert-True -Condition ($sidAs3000 -match '^S-1-') `
+        -Name 'Generic Event 3000 parser would misread 5140 SID as the client (5140 uses a dedicated parser)'
+
+    Assert-True -Condition (Test-IsIgnoredShareClientAddress -Address '-') `
+        -Name 'Event 5140 ignores Source Address "-"'
+    Assert-True -Condition (Test-IsIgnoredShareClientAddress -Address '127.0.0.1') `
+        -Name 'Event 5140 ignores loopback 127.0.0.1'
+    Assert-True -Condition (Test-IsIgnoredShareClientAddress -Address '::1') `
+        -Name 'Event 5140 ignores loopback ::1'
+    Assert-True -Condition (-not (Test-IsIgnoredShareClientAddress -Address '10.20.30.40')) `
+        -Name 'Event 5140 keeps a real source IP'
+
+    Assert-True -Condition ((ConvertFrom-AuditPolFileShareOutput -Text "  File Share                              Success and Failure") -eq 'Success and Failure') `
+        -Name 'auditpol parser reads Success and Failure'
+    Assert-True -Condition ((ConvertFrom-AuditPolFileShareOutput -Text "  File Share                              No Auditing") -eq 'No Auditing') `
+        -Name 'auditpol parser reads No Auditing'
+    Assert-True -Condition (Test-IsFileShareAuditEnabled -State 'Success and Failure') `
+        -Name 'File Share Success and Failure counts as enabled'
+    Assert-True -Condition (-not (Test-IsFileShareAuditEnabled -State 'No Auditing')) `
+        -Name 'File Share No Auditing counts as disabled'
+    Assert-True -Condition ($script:FileShareAuditGuid -eq '{0CCE9244-69AE-11D9-BED3-505054503030}') `
+        -Name 'File Share auditpol uses the non-localized subcategory GUID'
+    Assert-True -Condition ($script:ShareAccessEventId -eq 5140) `
+        -Name 'Share-access fallback event id is 5140'
 
     $noEvents = New-Object System.Management.Automation.ErrorRecord (
         (New-Object System.Exception 'No events were found that match the specified selection criteria.'),
@@ -2458,6 +3025,14 @@ function Invoke-Smbv1SelfTest {
         -Name 'Server 2016 (10.0) uses the cmdlet, not a forced registry write'
     Assert-True -Condition (-not (Test-OsNeedsSmb1AuditRegistry -OsVersion ([version]'10.0.17763') -CmdletHasAuditParameter $true)) `
         -Name 'Server 2019 (10.0) uses the cmdlet, not a forced registry write'
+    Assert-True -Condition (Test-OsNeedsFileShareAudit5140 -OsVersion ([version]'6.2.9200')) `
+        -Name 'Server 2012 (6.2) uses Security Event 5140 File Share auditing'
+    Assert-True -Condition (Test-OsNeedsFileShareAudit5140 -OsVersion ([version]'6.3.9600')) `
+        -Name 'Server 2012 R2 (6.3) uses Security Event 5140 File Share auditing'
+    Assert-True -Condition (-not (Test-OsNeedsFileShareAudit5140 -OsVersion ([version]'10.0.14393'))) `
+        -Name 'Server 2016 (10.0) does not use Event 5140 as the primary SMBv1 path'
+    Assert-True -Condition (-not (Test-OsNeedsFileShareAudit5140 -OsVersion $null)) `
+        -Name 'Unknown OS version does not force Event 5140 (avoids noisy 2016+ Security scans)'
 
     Assert-True -Condition ($dc1c1.Source -eq 'Event3000') `
         -Name 'Summary defaults Source to Event3000 when the row has none'
@@ -2478,6 +3053,16 @@ function Invoke-Smbv1SelfTest {
     $liveSummary = @(ConvertTo-Smbv1Summary -Events $liveOnly -ResolveDns $false)
     Assert-True -Condition ($liveSummary.Count -eq 1 -and $liveSummary[0].Source -eq 'LiveSession') `
         -Name 'Summary keeps Source=LiveSession for a live Get-SmbSession row'
+
+    $shareEvents = @(
+        [pscustomobject]@{ DomainController = 'DC1'; TimeCreated = [datetime]'2026-04-01 09:00:00'; ClientAddress = '10.20.30.40'; ShareName = '\\*\SYSVOL'; Source = 'Security5140' }
+        [pscustomobject]@{ DomainController = 'DC1'; TimeCreated = [datetime]'2026-04-01 09:01:00'; ClientAddress = '10.20.30.40'; ShareName = '\\*\NETLOGON'; Source = 'Security5140' }
+    )
+    $shareSummary = @(ConvertTo-Smbv1Summary -Events $shareEvents -ResolveDns $false)
+    Assert-True -Condition ($shareSummary.Count -eq 1 -and $shareSummary[0].Source -eq 'Security5140' -and $shareSummary[0].ConnectionCount -eq 2) `
+        -Name 'Summary groups Security Event 5140 rows by client IP'
+    Assert-True -Condition ($shareSummary[0].Shares -match 'SYSVOL' -and $shareSummary[0].Shares -match 'NETLOGON') `
+        -Name 'Summary lists unique share names from Event 5140'
 
     $htmlWithSource = ConvertTo-Smbv1Html -SummaryRows $mixedSummary -RollupRows @() -Targets @('DC1') -Days 7
     Assert-True -Condition ($htmlWithSource -match 'LiveSession' -and $htmlWithSource -match '<th>Source</th>') `
