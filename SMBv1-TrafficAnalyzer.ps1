@@ -44,14 +44,14 @@
     .\SMBv1-TrafficAnalyzer.ps1 -SelfTest
 
 .NOTES
-    Version     : 1.0
-    Compatible  : Windows PowerShell 5.1 on Windows Server 2012 / 2012 R2 / 2008 R2 (WMF 5.1)
+    Version     : 1.1
+    Compatible  : Windows PowerShell 5.1 (Server 2012 / 2012 R2 / 2008 R2 + WMF 5.1)
+                  and PowerShell 7+ on Windows. A Requires-Version 5.1 directive is
+                  omitted because pwsh 7 treats it as "Windows PowerShell only".
     Privileges  : Administrator for live capture and SMB hardening; offline PCAP review does not
                   require elevation.
     Signature   : SMBv1 = 0xFF 'SMB'   SMBv2/v3 = 0xFE 'SMB'   SMB3 transform = 0xFD 'SMB'
 #>
-
-#Requires -Version 5.1
 
 [CmdletBinding()]
 param(
@@ -62,7 +62,15 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.0'
+$script:AppVersion = '1.1'
+
+# Version is checked at runtime on purpose. A Requires-Version 5.1 (or 3.0)
+# directive makes PowerShell 7 abort with ScriptRequiresUnmatchedPSVersion
+# ("Windows PowerShell version 3.0/5.1") before any script body runs.
+if ($PSVersionTable.PSVersion -lt [version]'5.1') {
+    Write-Host ("This script needs Windows PowerShell 5.1 or PowerShell 7+. Detected {0}" -f $PSVersionTable.PSVersion) -ForegroundColor Red
+    exit 1
+}
 
 # ============================================================
 # STA APARTMENT (required for WinForms)
@@ -73,7 +81,14 @@ if (-not $SelfTest) {
         $argList = "-NoProfile -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`""
         if ($OpenPcap)    { $argList += " -OpenPcap `"$OpenPcap`"" }
         if ($InterfaceIP) { $argList += " -InterfaceIP `"$InterfaceIP`"" }
-        Start-Process -FilePath "powershell.exe" -ArgumentList $argList
+        $hostExe = $null
+        try { $hostExe = (Get-Process -Id $PID).Path } catch { }
+        if ([string]::IsNullOrWhiteSpace($hostExe)) {
+            $candidate = Join-Path $PSHOME 'pwsh.exe'
+            if (Test-Path -LiteralPath $candidate) { $hostExe = $candidate }
+            else { $hostExe = Join-Path $PSHOME 'powershell.exe' }
+        }
+        Start-Process -FilePath $hostExe -ArgumentList $argList
         return
     }
 }
@@ -1164,10 +1179,29 @@ function Write-AppLog {
 
 function Test-IsAdministrator { [bool]$script:IsAdmin }
 
+function Get-LocalCim {
+    param(
+        [Parameter(Mandatory = $true)][string]$ClassName,
+        [string]$Filter
+    )
+    try {
+        $cim = @{ ClassName = $ClassName; ErrorAction = 'Stop' }
+        if ($Filter) { $cim.Filter = $Filter }
+        return Get-CimInstance @cim
+    } catch {
+        if (Get-Command Get-WmiObject -ErrorAction SilentlyContinue) {
+            $wmi = @{ Class = $ClassName; ErrorAction = 'Stop' }
+            if ($Filter) { $wmi.Filter = $Filter }
+            return Get-WmiObject @wmi
+        }
+        throw
+    }
+}
+
 function Get-CaptureInterfaces {
     $items = New-Object System.Collections.Generic.List[object]
     try {
-        Get-WmiObject Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' -ErrorAction Stop | ForEach-Object {
+        Get-LocalCim -ClassName Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' | ForEach-Object {
             $desc = $_.Description
             foreach ($ip in @($_.IPAddress)) {
                 if ($ip -match '^\d+\.\d+\.\d+\.\d+$') {
@@ -1894,7 +1928,7 @@ function Get-SmbServerConfigText {
     [void]$sb.AppendLine("Time     : $(Get-Timestamp)")
     [void]$sb.AppendLine(('=' * 64))
     try {
-        $os = Get-WmiObject Win32_OperatingSystem
+        $os = Get-LocalCim -ClassName Win32_OperatingSystem
         [void]$sb.AppendLine("OS       : $($os.Caption)  (Build $($os.BuildNumber))")
         [void]$sb.AppendLine("Version  : $($os.Version)")
     } catch {
@@ -1915,7 +1949,7 @@ function Get-SmbServerConfigText {
     [void]$sb.AppendLine("Services")
     foreach ($svc in @('LanmanServer', 'LanmanWorkstation', 'mrxsmb10', 'mrxsmb20')) {
         try {
-            $s = Get-WmiObject Win32_Service -Filter "Name='$svc'"
+            $s = Get-LocalCim -ClassName Win32_Service -Filter "Name='$svc'"
             if ($s) { [void]$sb.AppendLine(("  {0,-22} State={1}  Start={2}" -f $svc, $s.State, $s.StartMode)) }
             else { [void]$sb.AppendLine(("  {0,-22} (not installed)" -f $svc)) }
         } catch {
@@ -1938,7 +1972,7 @@ function Get-SmbServerConfigText {
     [void]$sb.AppendLine("")
     [void]$sb.AppendLine("Current inbound SMB sessions (Win32_ServerConnection)")
     try {
-        $conns = @(Get-WmiObject Win32_ServerConnection -ErrorAction Stop)
+        $conns = @(Get-LocalCim -ClassName Win32_ServerConnection)
         [void]$sb.AppendLine("  Count: $($conns.Count)")
         foreach ($c in $conns | Select-Object -First 40) {
             [void]$sb.AppendLine(("  User={0,-20} Computer={1,-18} Share={2}" -f $c.UserName, $c.ComputerName, $c.ShareName))
@@ -2104,7 +2138,7 @@ function Show-GotoPacket {
 function Get-HelpText {
     return @"
 SMBv1 TRAFFIC ANALYZER v$($script:AppVersion)
-Wireshark-style capture for Windows Server 2012 R2 / 2008 R2 (Windows PowerShell 5.1)
+Wireshark-style capture for Windows Server 2012 R2 / 2008 R2 (Windows PowerShell 5.1 and PowerShell 7+)
 
 WHY THIS EXISTS
   SMBv1 (NT LM 0.12) is obsolete. WannaCry/EternalBlue, credential relay, and
@@ -2113,8 +2147,10 @@ WHY THIS EXISTS
 
 HOW TO RUN
   1. Copy SMBv1-TrafficAnalyzer.ps1 to the server.
-  2. Right-click powershell.exe -> Run as administrator.
+  2. Right-click powershell.exe or pwsh.exe -> Run as administrator.
   3. powershell.exe -ExecutionPolicy Bypass -STA -File .\SMBv1-TrafficAnalyzer.ps1
+     (PowerShell 7 is fine too:  pwsh.exe -ExecutionPolicy Bypass -File .\SMBv1-TrafficAnalyzer.ps1)
+     Do not add a Requires-Version 5.1/3.0 directive; pwsh 7 will refuse to start.
   4. Pick the IPv4 address of the interface that faces clients.
   5. Click Start. SMBv1 rows turn red. Hosts tab lists talkers.
 
@@ -2773,7 +2809,7 @@ $helpM = New-Object System.Windows.Forms.ToolStripMenuItem('Help')
 Add-MenuAction $helpM.DropDownItems 'Open Help tab' { $script:tabMain.SelectedTab = $script:tabHelp }
 Add-MenuAction $helpM.DropDownItems 'About' {
     [void][System.Windows.Forms.MessageBox]::Show(
-        "SMBv1 Traffic Analyzer v$($script:AppVersion)`nWindows PowerShell 5.1  |  Server 2012 R2+`n`nLive capture uses a raw IPv4 socket (no Npcap).`nExported PCAPs open in Wireshark.",
+        "SMBv1 Traffic Analyzer v$($script:AppVersion)`nWindows PowerShell 5.1 and PowerShell 7+ on Windows`nCurrently running: $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))`n`nLive capture uses a raw IPv4 socket (no Npcap).`nExported PCAPs open in Wireshark.",
         'About',
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Information)
@@ -2815,7 +2851,7 @@ $form.Add_FormClosing({
     try { $script:Engine.Stop() } catch { }
 })
 
-Write-AppLog "SMBv1 Traffic Analyzer v$($script:AppVersion) started. Elevated=$($script:IsAdmin)  Host=$env:COMPUTERNAME" 'INFO'
+Write-AppLog "SMBv1 Traffic Analyzer v$($script:AppVersion) started. Elevated=$($script:IsAdmin)  Host=$env:COMPUTERNAME  PS=$($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))" 'INFO'
 Write-AppLog 'Pick an interface and click Start, or load the Demo capture / a PCAP.' 'INFO'
 Refresh-ConfigTab
 Update-StatsTab
