@@ -1,11 +1,11 @@
 <#
 .SYNOPSIS
-    SMBv1 Traffic Analyzer - Wireshark-style live capture GUI for Windows PowerShell 5.1.
+    SMBv1 Traffic Analyzer - Wireshark-style live capture GUI for Windows Server 2012 and later.
 
 .DESCRIPTION
     Interactive packet analyzer that finds and decodes SMBv1 (and SMBv2/v3) on the local
-    Windows server. Designed for Windows Server 2012 R2 and older hosts running
-    Windows PowerShell 5.1. No Npcap, WinPcap, or Wireshark install is required.
+    Windows server. Designed for Windows Server 2012 / 2012 R2 (PowerShell 3.0+) and
+    PowerShell 7 on Windows. No Npcap, WinPcap, or Wireshark install is required.
 
     Live capture uses a raw IPv4 socket (SIO_RCVALL) bound to a local interface, which
     requires an elevated Administrator session. Packets are parsed in a background C#
@@ -44,10 +44,10 @@
     .\SMBv1-TrafficAnalyzer.ps1 -SelfTest
 
 .NOTES
-    Version     : 1.2
-    Compatible  : Windows PowerShell 5.1 (Server 2012 / 2012 R2 / 2008 R2 + WMF 5.1)
-                  and PowerShell 7+ on Windows. A Requires-Version 5.1 directive is
-                  omitted because pwsh 7 treats it as "Windows PowerShell only".
+    Version     : 1.3
+    Compatible  : Windows Server 2012 / 2012 R2 (Windows PowerShell 3.0+) and
+                  PowerShell 7+ on Windows. No Requires-Version directive (pwsh 7
+                  treats Version 3.0/5.1 as a Windows PowerShell-only lock).
     Privileges  : Administrator for live capture and SMB hardening; offline PCAP review does not
                   require elevation.
     Signature   : SMBv1 = 0xFF 'SMB'   SMBv2/v3 = 0xFE 'SMB'   SMB3 transform = 0xFD 'SMB'
@@ -62,14 +62,21 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.2'
+$script:AppVersion = '1.3'
 
-# Version is checked at runtime on purpose. A Requires-Version 5.1 (or 3.0)
+# Version is checked at runtime on purpose. A Requires-Version 3.0/5.1
 # directive makes PowerShell 7 abort with ScriptRequiresUnmatchedPSVersion
-# ("Windows PowerShell version 3.0/5.1") before any script body runs.
-if ($PSVersionTable.PSVersion -lt [version]'5.1') {
-    Write-Host ("This script needs Windows PowerShell 5.1 or PowerShell 7+. Detected {0}" -f $PSVersionTable.PSVersion) -ForegroundColor Red
+# before any script body runs. Stock Server 2012 ships PowerShell 3.0.
+if ($PSVersionTable.PSVersion.Major -lt 3) {
+    Write-Host ("This script needs Windows PowerShell 3.0+ (Server 2012) or PowerShell 7+. Detected {0}" -f $PSVersionTable.PSVersion) -ForegroundColor Red
     exit 1
+}
+
+function Get-HostEdition {
+    if ($PSVersionTable -and $PSVersionTable.ContainsKey('PSEdition')) {
+        return [string]$PSVersionTable['PSEdition']
+    }
+    return 'Desktop'
 }
 
 # ============================================================
@@ -1015,7 +1022,11 @@ public class SmbCaptureEngine {
     try {
         Add-Type -TypeDefinition $cs -Language CSharp -ErrorAction Stop
     } catch {
-        throw "Failed to compile the packet engine (needs .NET Framework 4.5+ / Windows PowerShell 5.1): $($_.Exception.Message)"
+        try {
+            Add-Type -TypeDefinition $cs -Language CSharp -ReferencedAssemblies @('System.dll', 'System.Core.dll') -ErrorAction Stop
+        } catch {
+            throw "Failed to compile the packet engine (.NET Framework 4.5 is required on Server 2012 / 2012 R2): $($_.Exception.Message)"
+        }
     }
 }
 
@@ -1098,8 +1109,8 @@ if ($SelfTest) {
 # ============================================================
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-[System.Windows.Forms.Application]::EnableVisualStyles()
-[System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
+try { [System.Windows.Forms.Application]::EnableVisualStyles() } catch { }
+try { [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false) } catch { }
 
 # ============================================================
 # STATE
@@ -1137,30 +1148,37 @@ try {
 
 # ============================================================
 # COLORS
+# Never call FromArgb(r, g, b) inside an @{ } literal. PowerShell treats
+# those commas as new hash keys, stores the method name as a string, and
+# ForeColor then throws: "FromArgb is not a valid value for Int32."
 # ============================================================
-$script:C = @{
-    Header     = [System.Drawing.Color]::FromArgb(24, 42, 68)
-    Header2    = [System.Drawing.Color]::FromArgb(32, 52, 80)
-    Bg         = [System.Drawing.Color]::FromArgb(245, 247, 250)
-    Split      = [System.Drawing.Color]::FromArgb(220, 225, 232)
-    Text       = [System.Drawing.Color]::FromArgb(24, 42, 68)
-    White      = [System.Drawing.Color]::White
-    Blue       = [System.Drawing.Color]::FromArgb(0, 120, 212)
-    Green      = [System.Drawing.Color]::FromArgb(16, 137, 62)
-    Red        = [System.Drawing.Color]::FromArgb(196, 43, 28)
-    Orange     = [System.Drawing.Color]::FromArgb(202, 131, 0)
-    Teal       = [System.Drawing.Color]::FromArgb(0, 150, 136)
-    Gray       = [System.Drawing.Color]::FromArgb(100, 110, 125)
-    Dark       = [System.Drawing.Color]::FromArgb(55, 65, 81)
-    Smb1       = [System.Drawing.Color]::FromArgb(255, 205, 205)
-    Smb1Neg    = [System.Drawing.Color]::FromArgb(255, 170, 170)
-    Smb2       = [System.Drawing.Color]::FromArgb(205, 228, 255)
-    Smb3       = [System.Drawing.Color]::FromArgb(205, 245, 220)
-    Tcp        = [System.Drawing.Color]::FromArgb(248, 249, 251)
-    Marked     = [System.Drawing.Color]::FromArgb(255, 236, 179)
-    AlertBg    = [System.Drawing.Color]::FromArgb(153, 27, 27)
-    OkGreen    = [System.Drawing.Color]::FromArgb(0, 210, 106)
+function New-RgbColor {
+    param([int]$R, [int]$G, [int]$B)
+    return [System.Drawing.Color]::FromArgb($R, $G, $B)
 }
+
+$script:C = @{}
+$script:C['Header']  = New-RgbColor 24 42 68
+$script:C['Header2'] = New-RgbColor 32 52 80
+$script:C['Bg']      = New-RgbColor 245 247 250
+$script:C['Split']   = New-RgbColor 220 225 232
+$script:C['Text']    = New-RgbColor 24 42 68
+$script:C['White']   = [System.Drawing.Color]::White
+$script:C['Blue']    = New-RgbColor 0 120 212
+$script:C['Green']   = New-RgbColor 16 137 62
+$script:C['Red']     = New-RgbColor 196 43 28
+$script:C['Orange']  = New-RgbColor 202 131 0
+$script:C['Teal']    = New-RgbColor 0 150 136
+$script:C['Gray']    = New-RgbColor 100 110 125
+$script:C['Dark']    = New-RgbColor 55 65 81
+$script:C['Smb1']    = New-RgbColor 255 205 205
+$script:C['Smb1Neg'] = New-RgbColor 255 170 170
+$script:C['Smb2']    = New-RgbColor 205 228 255
+$script:C['Smb3']    = New-RgbColor 205 245 220
+$script:C['Tcp']     = New-RgbColor 248 249 251
+$script:C['Marked']  = New-RgbColor 255 236 179
+$script:C['AlertBg'] = New-RgbColor 153 27 27
+$script:C['OkGreen'] = New-RgbColor 0 210 106
 
 # ============================================================
 # HELPERS
@@ -2148,7 +2166,7 @@ function Show-GotoPacket {
 function Get-HelpText {
     return @"
 SMBv1 TRAFFIC ANALYZER v$($script:AppVersion)
-Wireshark-style capture for Windows Server 2012 R2 / 2008 R2 (Windows PowerShell 5.1 and PowerShell 7+)
+Wireshark-style capture for Windows Server 2012 / 2012 R2 (PowerShell 3.0+) and PowerShell 7+
 
 WHY THIS EXISTS
   SMBv1 (NT LM 0.12) is obsolete. WannaCry/EternalBlue, credential relay, and
@@ -2258,7 +2276,7 @@ $lblTitle.AutoSize = $true
 $lblTitle.Location = New-Object System.Drawing.Point(16, 8)
 
 $lblSub = New-Object System.Windows.Forms.Label
-$lblSub.Text = 'PowerShell 5.1  |  Windows Server 2012 R2 and older  |  Live capture + PCAP  |  No Npcap required'
+$lblSub.Text = 'Server 2012 / 2012 R2  |  PowerShell 3.0+ and 7+  |  Live capture + PCAP  |  No Npcap required'
 $lblSub.Font = New-Object System.Drawing.Font('Segoe UI', 8.5)
 $lblSub.ForeColor = [System.Drawing.Color]::FromArgb(160, 185, 215)
 $lblSub.AutoSize = $true
@@ -2819,7 +2837,7 @@ $helpM = New-Object System.Windows.Forms.ToolStripMenuItem('Help')
 Add-MenuAction $helpM.DropDownItems 'Open Help tab' { $script:tabMain.SelectedTab = $script:tabHelp }
 Add-MenuAction $helpM.DropDownItems 'About' {
     [void][System.Windows.Forms.MessageBox]::Show(
-        "SMBv1 Traffic Analyzer v$($script:AppVersion)`nWindows PowerShell 5.1 and PowerShell 7+ on Windows`nCurrently running: $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))`n`nLive capture uses a raw IPv4 socket (no Npcap).`nExported PCAPs open in Wireshark.",
+        "SMBv1 Traffic Analyzer v$($script:AppVersion)`nWindows Server 2012 / 2012 R2 (PowerShell 3.0+) and PowerShell 7+`nCurrently running: $($PSVersionTable.PSVersion) ($(Get-HostEdition))`n`nLive capture uses a raw IPv4 socket (no Npcap).`nExported PCAPs open in Wireshark.",
         'About',
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Information)
@@ -2861,7 +2879,7 @@ $form.Add_FormClosing({
     try { $script:Engine.Stop() } catch { }
 })
 
-Write-AppLog "SMBv1 Traffic Analyzer v$($script:AppVersion) started. Elevated=$($script:IsAdmin)  Host=$env:COMPUTERNAME  PS=$($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))" 'INFO'
+Write-AppLog "SMBv1 Traffic Analyzer v$($script:AppVersion) started. Elevated=$($script:IsAdmin)  Host=$env:COMPUTERNAME  PS=$($PSVersionTable.PSVersion) ($(Get-HostEdition))" 'INFO'
 Write-AppLog 'Pick an interface and click Start, or load the Demo capture / a PCAP.' 'INFO'
 Refresh-ConfigTab
 Update-StatsTab
