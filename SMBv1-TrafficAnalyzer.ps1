@@ -44,7 +44,7 @@
     .\SMBv1-TrafficAnalyzer.ps1 -SelfTest
 
 .NOTES
-    Version     : 1.4
+    Version     : 1.5
     Compatible  : Windows Server 2012 / 2012 R2 (Windows PowerShell 3.0+) and
                   PowerShell 7+ on Windows. No Requires-Version directive (pwsh 7
                   treats Version 3.0/5.1 as a Windows PowerShell-only lock).
@@ -62,7 +62,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.4'
+$script:AppVersion = '1.5'
 
 # Version is checked at runtime on purpose. A Requires-Version 3.0/5.1
 # directive makes PowerShell 7 abort with ScriptRequiresUnmatchedPSVersion
@@ -1138,6 +1138,11 @@ $script:chkSmb1Only     = $null
 $script:chkAutoScroll   = $null
 $script:banner          = $null
 $script:MainForm        = $null
+$script:splitH          = $null
+$script:splitV          = $null
+$script:SplitHRatio     = 0.48
+$script:SplitVRatio     = 0.48
+$script:LayoutBusy      = $false
 
 try {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -1274,7 +1279,7 @@ function New-FlatButton {
     $b.Font = New-Object System.Drawing.Font('Segoe UI', 9, $style)
     $b.FlatAppearance.BorderSize = 0
     $b.Cursor = [System.Windows.Forms.Cursors]::Hand
-    $b.Margin = New-Object System.Windows.Forms.Padding(0, 0, 6, 0)
+    $b.Margin = New-Object System.Windows.Forms.Padding(0, 3, 6, 3)
     if ($OnClick) { $b.Add_Click($OnClick) }
     if ($TipText -and $script:Tip) { $script:Tip.SetToolTip($b, $TipText) }
     return $b
@@ -2209,6 +2214,8 @@ WHAT "LIKE WIRESHARK" MEANS HERE
   - Color by protocol (SMBv1 red, SMB2 blue, SMB3 green)
   - Right-click: filter this IP, copy summary, follow stream
   - Export current view as PCAP or CSV
+  - Resize freely: toolbar/status wrap, the filter box stretches, the Info
+    column fills leftover list width, and the three panes keep their split ratio
 
 DISPLAY FILTERS
   smb1
@@ -2258,6 +2265,81 @@ HARDENING (2012 R2)
 "@
 }
 
+function New-FlowBar {
+    param(
+        [int]$MinHeight = 40,
+        $BackColor
+    )
+    $p = New-Object System.Windows.Forms.FlowLayoutPanel
+    $p.Dock = 'Top'
+    $p.AutoSize = $true
+    $p.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $p.WrapContents = $true
+    $p.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+    $p.Padding = New-Object System.Windows.Forms.Padding(8, 6, 8, 6)
+    $p.MinimumSize = New-Object System.Drawing.Size(0, $MinHeight)
+    if ($null -ne $BackColor) { $p.BackColor = $BackColor }
+    return $p
+}
+
+function Update-PacketListColumns {
+    if (-not $script:lvPackets) { return }
+    $cols = $script:lvPackets.Columns
+    if ($cols.Count -lt 1) { return }
+    $used = 0
+    for ($i = 0; $i -lt ($cols.Count - 1); $i++) { $used += $cols[$i].Width }
+    $remain = $script:lvPackets.ClientSize.Width - $used - 8
+    if ($remain -lt 80) { $remain = 80 }
+    $cols[$cols.Count - 1].Width = $remain
+}
+
+function Remember-SplitterRatios {
+    if ($script:LayoutBusy) { return }
+    try {
+        if ($script:splitH -and $script:splitH.Height -gt 0) {
+            $r = $script:splitH.SplitterDistance / [double]$script:splitH.Height
+            if ($r -gt 0.12 -and $r -lt 0.88) { $script:SplitHRatio = $r }
+        }
+        if ($script:splitV -and $script:splitV.Width -gt 0) {
+            $r = $script:splitV.SplitterDistance / [double]$script:splitV.Width
+            if ($r -gt 0.12 -and $r -lt 0.88) { $script:SplitVRatio = $r }
+        }
+    } catch { }
+}
+
+function Set-SplitterFromRatio {
+    param($Split, [double]$Ratio, [int]$Extent)
+    if (-not $Split -or $Extent -le 40) { return }
+    $min1 = $Split.Panel1MinSize
+    $min2 = $Split.Panel2MinSize
+    $max = $Extent - $Split.SplitterWidth - $min2
+    if ($max -lt $min1) { return }
+    $d = [int]($Extent * $Ratio)
+    if ($d -lt $min1) { $d = $min1 }
+    if ($d -gt $max) { $d = $max }
+    if ($Split.SplitterDistance -ne $d) { $Split.SplitterDistance = $d }
+}
+
+function Update-DynamicLayout {
+    if ($script:LayoutBusy) { return }
+    $script:LayoutBusy = $true
+    try {
+        if ($script:cmbIface -and $script:MainForm) {
+            $w = $script:MainForm.ClientSize.Width
+            $ifaceW = 220
+            if ($w -ge 1600) { $ifaceW = 400 }
+            elseif ($w -ge 1300) { $ifaceW = 340 }
+            elseif ($w -ge 1100) { $ifaceW = 300 }
+            elseif ($w -ge 900) { $ifaceW = 260 }
+            $script:cmbIface.Width = $ifaceW
+        }
+        if ($script:splitH) { Set-SplitterFromRatio $script:splitH $script:SplitHRatio $script:splitH.Height }
+        if ($script:splitV) { Set-SplitterFromRatio $script:splitV $script:SplitVRatio $script:splitV.Width }
+        Update-PacketListColumns
+    } catch { }
+    finally { $script:LayoutBusy = $false }
+}
+
 # ============================================================
 # BUILD GUI
 # ============================================================
@@ -2271,17 +2353,27 @@ $form.Size = New-Object System.Drawing.Size(1440, 920)
 $form.StartPosition = 'CenterScreen'
 $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 $form.BackColor = $script:C.Bg
-$form.MinimumSize = New-Object System.Drawing.Size(1100, 720)
+$form.MinimumSize = New-Object System.Drawing.Size(860, 560)
 $form.KeyPreview = $true
 $form.Icon = [System.Drawing.SystemIcons]::Shield
+$form.SizeGripStyle = 'Show'
 Enable-DoubleBuffer $form
 $script:MainForm = $form
 
-# --- Header ---
-$header = New-Object System.Windows.Forms.Panel
+# --- Header (title left, version stays on the right as the form grows) ---
+$header = New-Object System.Windows.Forms.TableLayoutPanel
 $header.Dock = 'Top'
 $header.Height = 58
+$header.ColumnCount = 2
+$header.RowCount = 1
 $header.BackColor = $script:C.Header
+[void]$header.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+[void]$header.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$header.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+
+$leftHead = New-Object System.Windows.Forms.Panel
+$leftHead.Dock = 'Fill'
+$leftHead.BackColor = $script:C.Header
 
 $lblTitle = New-Object System.Windows.Forms.Label
 $lblTitle.Text = 'SMBv1 Traffic Analyzer'
@@ -2296,38 +2388,36 @@ $lblSub.Font = New-Object System.Drawing.Font('Segoe UI', 8.5)
 $lblSub.ForeColor = $script:C.SubText
 $lblSub.AutoSize = $true
 $lblSub.Location = New-Object System.Drawing.Point(18, 36)
+$leftHead.Controls.AddRange(@($lblTitle, $lblSub))
 
 $lblVer = New-Object System.Windows.Forms.Label
 $lblVer.Text = "v$($script:AppVersion)"
 $lblVer.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 $lblVer.ForeColor = $script:C.SubText
 $lblVer.AutoSize = $true
-$lblVer.Anchor = 'Top, Right'
-$lblVer.Location = New-Object System.Drawing.Point(1360, 20)
-$header.Controls.AddRange(@($lblTitle, $lblSub, $lblVer))
+$lblVer.TextAlign = 'MiddleRight'
+$lblVer.Margin = New-Object System.Windows.Forms.Padding(8, 18, 16, 0)
+$header.Controls.Add($leftHead, 0, 0)
+$header.Controls.Add($lblVer, 1, 0)
 
-# --- Toolbar ---
-$tool = New-Object System.Windows.Forms.Panel
-$tool.Dock = 'Top'
-$tool.Height = 46
-$tool.BackColor = $script:C.Header2
-$tool.Padding = New-Object System.Windows.Forms.Padding(10, 8, 10, 8)
+# --- Toolbar (wraps onto extra rows when the window is narrow) ---
+$tool = New-FlowBar -MinHeight 42 -BackColor $script:C.Header2
 
 $lblIf = New-Object System.Windows.Forms.Label
 $lblIf.Text = 'Interface'
 $lblIf.ForeColor = $script:C.White
 $lblIf.AutoSize = $true
-$lblIf.Location = New-Object System.Drawing.Point(12, 14)
+$lblIf.Margin = New-Object System.Windows.Forms.Padding(4, 10, 6, 4)
 
 $script:cmbIface = New-Object System.Windows.Forms.ComboBox
 $script:cmbIface.DropDownStyle = 'DropDownList'
 $script:cmbIface.Width = 300
-$script:cmbIface.Location = New-Object System.Drawing.Point(78, 10)
 $script:cmbIface.DisplayMember = 'Display'
 $script:cmbIface.ValueMember = 'IP'
 $script:cmbIface.BackColor = $script:C.ComboBg
 $script:cmbIface.ForeColor = $script:C.OkGreen
 $script:cmbIface.FlatStyle = 'Flat'
+$script:cmbIface.Margin = New-Object System.Windows.Forms.Padding(0, 6, 8, 4)
 
 $ifaces = @(Get-CaptureInterfaces)
 foreach ($it in $ifaces) { [void]$script:cmbIface.Items.Add($it) }
@@ -2343,16 +2433,13 @@ $script:btnStop  = New-FlatButton -Text 'Stop'  -Width 78 -BackColor $script:C.R
 $script:btnPause = New-FlatButton -Text 'Pause' -Width 78 -BackColor $script:C.Orange -TipText 'Pause/resume (drops frames while paused)' -OnClick { Toggle-Pause }
 $script:btnStop.Enabled = $false
 $script:btnPause.Enabled = $false
-$script:btnStart.Location = New-Object System.Drawing.Point(390, 8)
-$script:btnStop.Location  = New-Object System.Drawing.Point(474, 8)
-$script:btnPause.Location = New-Object System.Drawing.Point(558, 8)
 
 $script:chkPortsOnly = New-Object System.Windows.Forms.CheckBox
 $script:chkPortsOnly.Text = 'SMB ports (139/445)'
 $script:chkPortsOnly.ForeColor = $script:C.White
 $script:chkPortsOnly.AutoSize = $true
 $script:chkPortsOnly.Checked = $true
-$script:chkPortsOnly.Location = New-Object System.Drawing.Point(650, 12)
+$script:chkPortsOnly.Margin = New-Object System.Windows.Forms.Padding(8, 8, 6, 4)
 $script:Tip.SetToolTip($script:chkPortsOnly, 'Capture filter: only TCP 139 and 445. Uncheck to capture all IPv4 (heavier).')
 $script:chkPortsOnly.Add_CheckedChanged({ if ($script:Engine) { $script:Engine.SmbPortsOnly = $script:chkPortsOnly.Checked } })
 
@@ -2360,7 +2447,7 @@ $script:chkSmbPayload = New-Object System.Windows.Forms.CheckBox
 $script:chkSmbPayload.Text = 'SMB PDUs only'
 $script:chkSmbPayload.ForeColor = $script:C.White
 $script:chkSmbPayload.AutoSize = $true
-$script:chkSmbPayload.Location = New-Object System.Drawing.Point(810, 12)
+$script:chkSmbPayload.Margin = New-Object System.Windows.Forms.Padding(4, 8, 6, 4)
 $script:Tip.SetToolTip($script:chkSmbPayload, 'Capture filter: drop TCP control segments without an SMB header.')
 $script:chkSmbPayload.Add_CheckedChanged({ if ($script:Engine) { $script:Engine.SmbPayloadOnly = $script:chkSmbPayload.Checked } })
 
@@ -2369,35 +2456,48 @@ $script:chkAutoScroll.Text = 'Auto-scroll'
 $script:chkAutoScroll.ForeColor = $script:C.White
 $script:chkAutoScroll.AutoSize = $true
 $script:chkAutoScroll.Checked = $true
-$script:chkAutoScroll.Location = New-Object System.Drawing.Point(940, 12)
+$script:chkAutoScroll.Margin = New-Object System.Windows.Forms.Padding(4, 8, 10, 4)
 
 $btnClear = New-FlatButton -Text 'Clear' -Width 70 -BackColor $script:C.Gray -Bold $false -OnClick { Clear-Capture } -TipText 'Clear packet list'
-$btnClear.Location = New-Object System.Drawing.Point(1040, 8)
 $btnDemo = New-FlatButton -Text 'Demo' -Width 70 -BackColor $script:C.Teal -Bold $false -OnClick { Import-DemoCapture } -TipText 'Load synthetic SMBv1/SMB2 packets'
-$btnDemo.Location = New-Object System.Drawing.Point(1116, 8)
 $btnOpen = New-FlatButton -Text 'Open' -Width 70 -BackColor $script:C.Blue -Bold $false -OnClick { Open-PcapFile } -TipText 'Open a .pcap (Ctrl+O)'
-$btnOpen.Location = New-Object System.Drawing.Point(1192, 8)
 $btnSave = New-FlatButton -Text 'Save' -Width 70 -BackColor $script:C.Dark -Bold $false -OnClick { Save-PcapFile } -TipText 'Save current view as pcap/csv (Ctrl+S)'
-$btnSave.Location = New-Object System.Drawing.Point(1268, 8)
 
 $tool.Controls.AddRange(@($lblIf, $script:cmbIface, $script:btnStart, $script:btnStop, $script:btnPause, $script:chkPortsOnly, $script:chkSmbPayload, $script:chkAutoScroll, $btnClear, $btnDemo, $btnOpen, $btnSave))
 
-# --- Filter bar ---
-$filterBar = New-Object System.Windows.Forms.Panel
+# --- Filter bar (filter box is the percent-width column) ---
+$filterBar = New-Object System.Windows.Forms.TableLayoutPanel
 $filterBar.Dock = 'Top'
 $filterBar.Height = 40
+$filterBar.AutoSize = $false
+$filterBar.ColumnCount = 10
+$filterBar.RowCount = 1
 $filterBar.BackColor = $script:C.FilterBar
+$filterBar.Padding = New-Object System.Windows.Forms.Padding(8, 4, 8, 4)
+[void]$filterBar.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$filterBar.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$filterBar.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+[void]$filterBar.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$filterBar.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$filterBar.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$filterBar.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$filterBar.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$filterBar.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$filterBar.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$filterBar.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
 
 $lblF = New-Object System.Windows.Forms.Label
 $lblF.Text = 'Display filter'
 $lblF.AutoSize = $true
-$lblF.Location = New-Object System.Drawing.Point(12, 11)
 $lblF.ForeColor = $script:C.Text
+$lblF.Anchor = 'Left'
+$lblF.Margin = New-Object System.Windows.Forms.Padding(0, 8, 8, 4)
 
 $script:cmbPreset = New-Object System.Windows.Forms.ComboBox
 $script:cmbPreset.DropDownStyle = 'DropDownList'
 $script:cmbPreset.Width = 160
-$script:cmbPreset.Location = New-Object System.Drawing.Point(100, 8)
+$script:cmbPreset.Anchor = 'Left'
+$script:cmbPreset.Margin = New-Object System.Windows.Forms.Padding(0, 4, 8, 4)
 [void]$script:cmbPreset.Items.AddRange(@(
     '(no preset)',
     'smb1',
@@ -2418,9 +2518,9 @@ $script:cmbPreset.Add_SelectedIndexChanged({
 
 $script:txtFilter = New-Object System.Windows.Forms.TextBox
 $script:txtFilter.Font = New-Object System.Drawing.Font('Consolas', 10)
-$script:txtFilter.Location = New-Object System.Drawing.Point(268, 8)
-$script:txtFilter.Width = 520
-$script:txtFilter.Anchor = 'Top, Left, Right'
+$script:txtFilter.Dock = 'Fill'
+$script:txtFilter.Margin = New-Object System.Windows.Forms.Padding(0, 4, 8, 4)
+$script:txtFilter.MinimumSize = New-Object System.Drawing.Size(120, 0)
 $script:Tip.SetToolTip($script:txtFilter, "Examples: smb1   smb1 and ip.addr==10.1.1.8   user:bob   not smb2   Enter to apply")
 $script:txtFilter.Add_KeyDown({
     param($s, $e)
@@ -2428,58 +2528,48 @@ $script:txtFilter.Add_KeyDown({
 })
 
 $script:btnApply = New-FlatButton -Text 'Apply' -Width 70 -Height 26 -BackColor $script:C.Blue -OnClick { Update-PacketView }
-$script:btnApply.Anchor = 'Top, Right'
 $script:btnReset = New-FlatButton -Text 'Reset' -Width 70 -Height 26 -BackColor $script:C.Gray -Bold $false -OnClick {
     $script:cmbPreset.SelectedIndex = 0
     $script:chkSmb1Only.Checked = $false
     Set-DisplayFilter -Text ''
 }
-$script:btnReset.Anchor = 'Top, Right'
 
 $script:chkSmb1Only = New-Object System.Windows.Forms.CheckBox
 $script:chkSmb1Only.Text = 'SMBv1 only'
 $script:chkSmb1Only.AutoSize = $true
-$script:chkSmb1Only.Anchor = 'Top, Right'
-$script:chkSmb1Only.Location = New-Object System.Drawing.Point(952, 10)
+$script:chkSmb1Only.Anchor = 'Left'
 $script:chkSmb1Only.ForeColor = $script:C.Red
 $script:chkSmb1Only.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+$script:chkSmb1Only.Margin = New-Object System.Windows.Forms.Padding(4, 8, 8, 4)
 $script:chkSmb1Only.Add_CheckedChanged({ Update-PacketView })
 
 $script:lblFind = New-Object System.Windows.Forms.Label
 $script:lblFind.Text = 'Find'
 $script:lblFind.AutoSize = $true
-$script:lblFind.Anchor = 'Top, Right'
-$script:lblFind.Location = New-Object System.Drawing.Point(1070, 11)
+$script:lblFind.Anchor = 'Left'
+$script:lblFind.Margin = New-Object System.Windows.Forms.Padding(4, 8, 4, 4)
 
 $script:txtFind = New-Object System.Windows.Forms.TextBox
-$script:txtFind.Location = New-Object System.Drawing.Point(1104, 8)
 $script:txtFind.Width = 150
-$script:txtFind.Anchor = 'Top, Right'
+$script:txtFind.Anchor = 'Left'
+$script:txtFind.Margin = New-Object System.Windows.Forms.Padding(0, 4, 4, 4)
 $script:txtFind.Add_KeyDown({
     param($s, $e)
     if ($e.KeyCode -eq 'Enter') { $e.SuppressKeyPress = $true; Find-InPackets -Forward $true }
 })
-$script:btnNext = New-FlatButton -Text '>' -Width 28 -Height 26 -BackColor $script:C.Dark -Bold $false -OnClick { Find-InPackets -Forward $true }
-$script:btnNext.Location = New-Object System.Drawing.Point(1260, 7)
 $script:btnPrev = New-FlatButton -Text '<' -Width 28 -Height 26 -BackColor $script:C.Dark -Bold $false -OnClick { Find-InPackets -Forward $false }
-$script:btnPrev.Location = New-Object System.Drawing.Point(1292, 7)
-$script:btnNext.Anchor = 'Top, Right'
-$script:btnPrev.Anchor = 'Top, Right'
+$script:btnNext = New-FlatButton -Text '>' -Width 28 -Height 26 -BackColor $script:C.Dark -Bold $false -OnClick { Find-InPackets -Forward $true }
 
-$filterBar.Controls.AddRange(@($lblF, $script:cmbPreset, $script:txtFilter, $script:btnApply, $script:btnReset, $script:chkSmb1Only, $script:lblFind, $script:txtFind, $script:btnPrev, $script:btnNext))
-
-function Update-FilterBarLayout {
-    $w = $filterBar.ClientSize.Width
-    if ($w -lt 900) { return }
-    $script:btnPrev.Left  = $w - 40
-    $script:btnNext.Left  = $w - 72
-    $script:txtFind.Left  = $w - 230
-    $script:lblFind.Left  = $w - 264
-    $script:chkSmb1Only.Left = $w - 370
-    $script:btnReset.Left = $w - 450
-    $script:btnApply.Left = $w - 526
-    $script:txtFilter.Width = [Math]::Max(160, $script:btnApply.Left - $script:txtFilter.Left - 8)
-}
+$filterBar.Controls.Add($lblF, 0, 0)
+$filterBar.Controls.Add($script:cmbPreset, 1, 0)
+$filterBar.Controls.Add($script:txtFilter, 2, 0)
+$filterBar.Controls.Add($script:btnApply, 3, 0)
+$filterBar.Controls.Add($script:btnReset, 4, 0)
+$filterBar.Controls.Add($script:chkSmb1Only, 5, 0)
+$filterBar.Controls.Add($script:lblFind, 6, 0)
+$filterBar.Controls.Add($script:txtFind, 7, 0)
+$filterBar.Controls.Add($script:btnPrev, 8, 0)
+$filterBar.Controls.Add($script:btnNext, 9, 0)
 
 # --- Alert banner ---
 $script:banner = New-Object System.Windows.Forms.Label
@@ -2545,6 +2635,9 @@ $splitH.SplitterWidth = 6
 $splitH.BackColor = $script:C.Split
 $splitH.Panel1.BackColor = $script:C.Bg
 $splitH.Panel2.BackColor = $script:C.Bg
+$splitH.Panel1MinSize = 80
+$splitH.Panel2MinSize = 80
+$script:splitH = $splitH
 
 $script:lvPackets = New-Object System.Windows.Forms.ListView
 $script:lvPackets.Dock = 'Fill'
@@ -2625,6 +2718,9 @@ $splitV.Dock = 'Fill'
 $splitV.Orientation = 'Vertical'
 $splitV.SplitterWidth = 6
 $splitV.BackColor = $script:C.Split
+$splitV.Panel1MinSize = 120
+$splitV.Panel2MinSize = 120
+$script:splitV = $splitV
 
 $script:tvDetails = New-Object System.Windows.Forms.TreeView
 $script:tvDetails.Dock = 'Fill'
@@ -2652,17 +2748,15 @@ $script:hexBox.DetectUrls = $false
 $splitV.Panel2.Controls.Add($script:hexBox)
 $splitH.Panel2.Controls.Add($splitV)
 $script:tabCapture.Controls.Add($splitH)
+$splitH.Add_SplitterMoved({ Remember-SplitterRatios })
+$splitV.Add_SplitterMoved({ Remember-SplitterRatios })
+$script:lvPackets.Add_Resize({ Update-PacketListColumns })
 
 # --- Hosts tab ---
-$hostTop = New-Object System.Windows.Forms.Panel
-$hostTop.Dock = 'Top'
-$hostTop.Height = 48
-$hostTop.Padding = New-Object System.Windows.Forms.Padding(8)
+$hostTop = New-FlowBar -MinHeight 44
 
 $btnRes = New-FlatButton -Text 'Resolve DNS' -Width 120 -BackColor $script:C.Blue -OnClick { Resolve-HostNames } -TipText 'PTR lookup for each SMBv1 IP'
-$btnRes.Location = New-Object System.Drawing.Point(8, 8)
 $btnExpH = New-FlatButton -Text 'Export CSV' -Width 120 -BackColor $script:C.Dark -OnClick { Export-HostsCsv }
-$btnExpH.Location = New-Object System.Drawing.Point(136, 8)
 $btnFiltH = New-FlatButton -Text 'Filter selected IP' -Width 150 -BackColor $script:C.Teal -OnClick {
     if ($script:dgvHosts.SelectedRows.Count -gt 0) {
         $ip = $script:dgvHosts.SelectedRows[0].Cells['IP'].Value
@@ -2670,7 +2764,6 @@ $btnFiltH = New-FlatButton -Text 'Filter selected IP' -Width 150 -BackColor $scr
         Set-DisplayFilter -Text ("smb1 and ip.addr=={0}" -f $ip)
     }
 }
-$btnFiltH.Location = New-Object System.Drawing.Point(264, 8)
 $hostTop.Controls.AddRange(@($btnRes, $btnExpH, $btnFiltH))
 
 $script:dgvHosts = New-Object System.Windows.Forms.DataGridView
@@ -2716,13 +2809,9 @@ $script:txtStats.WordWrap = $false
 $script:tabStats.Controls.Add($script:txtStats)
 
 # --- Config ---
-$cfgTop = New-Object System.Windows.Forms.Panel
-$cfgTop.Dock = 'Top'
-$cfgTop.Height = 48
+$cfgTop = New-FlowBar -MinHeight 44
 $btnCfg = New-FlatButton -Text 'Refresh config' -Width 140 -BackColor $script:C.Blue -OnClick { Refresh-ConfigTab }
-$btnCfg.Location = New-Object System.Drawing.Point(8, 8)
 $btnDis = New-FlatButton -Text 'Disable SMBv1 on this server' -Width 240 -BackColor $script:C.Red -OnClick { Disable-Smb1OnThisServer } -TipText 'Set-SmbServerConfiguration + registry SMB1=0. Double confirmation. Reboot required.'
-$btnDis.Location = New-Object System.Drawing.Point(156, 8)
 $cfgTop.Controls.AddRange(@($btnCfg, $btnDis))
 $script:txtConfig = New-Object System.Windows.Forms.TextBox
 $script:txtConfig.Dock = 'Fill'
@@ -2736,21 +2825,18 @@ $script:tabConfig.Controls.Add($script:txtConfig)
 $script:tabConfig.Controls.Add($cfgTop)
 
 # --- Events ---
-$evTop = New-Object System.Windows.Forms.Panel
-$evTop.Dock = 'Top'
-$evTop.Height = 48
+$evTop = New-FlowBar -MinHeight 44
 $lblH = New-Object System.Windows.Forms.Label
 $lblH.Text = 'Look back (hours)'
 $lblH.AutoSize = $true
-$lblH.Location = New-Object System.Drawing.Point(12, 14)
+$lblH.Margin = New-Object System.Windows.Forms.Padding(4, 10, 6, 4)
 $script:numHours = New-Object System.Windows.Forms.NumericUpDown
 $script:numHours.Minimum = 1
 $script:numHours.Maximum = 168
 $script:numHours.Value = 24
-$script:numHours.Location = New-Object System.Drawing.Point(130, 10)
 $script:numHours.Width = 60
+$script:numHours.Margin = New-Object System.Windows.Forms.Padding(0, 8, 8, 4)
 $btnScan = New-FlatButton -Text 'Scan SMB event logs' -Width 180 -BackColor $script:C.Blue -OnClick { Scan-SmbEventLogs }
-$btnScan.Location = New-Object System.Drawing.Point(210, 8)
 $evTop.Controls.AddRange(@($lblH, $script:numHours, $btnScan))
 $script:dgvEvents = New-Object System.Windows.Forms.DataGridView
 $script:dgvEvents.Dock = 'Fill'
@@ -2789,32 +2875,35 @@ $script:txtLog.BackColor = $script:C.StatsBg
 $script:txtLog.ForeColor = $script:C.LogFg
 $script:tabLog.Controls.Add($script:txtLog)
 
-# --- Status bar ---
-$status = New-Object System.Windows.Forms.Panel
+# --- Status bar (wraps on a narrow window instead of clipping) ---
+$status = New-Object System.Windows.Forms.FlowLayoutPanel
 $status.Dock = 'Bottom'
-$status.Height = 28
+$status.AutoSize = $true
+$status.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+$status.WrapContents = $true
+$status.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
 $status.BackColor = $script:C.Header
+$status.Padding = New-Object System.Windows.Forms.Padding(8, 2, 8, 2)
+$status.MinimumSize = New-Object System.Drawing.Size(0, 28)
 
 function New-StatusLabel {
-    param($Text, $Width, $X, $Color)
+    param($Text, $Color)
     $l = New-Object System.Windows.Forms.Label
     $l.Text = $Text
     $l.ForeColor = $Color
-    $l.AutoSize = $false
-    $l.Width = $Width
-    $l.Height = 28
+    $l.AutoSize = $true
+    $l.Margin = New-Object System.Windows.Forms.Padding(0, 4, 16, 4)
     $l.TextAlign = 'MiddleLeft'
-    $l.Location = New-Object System.Drawing.Point($X, 0)
     $l.Font = New-Object System.Drawing.Font('Segoe UI', 8.5)
     return $l
 }
-$script:lblState    = New-StatusLabel -Text 'Idle' -Width 110 -X 8 -Color $script:C.OkGreen
-$script:lblPkt      = New-StatusLabel -Text 'Packets: 0   Shown: 0' -Width 280 -X 120 -Color $script:C.White
-$script:lblSmb1     = New-StatusLabel -Text 'SMBv1: 0' -Width 110 -X 410 -Color $script:C.Smb1Idle
-$script:lblDrop     = New-StatusLabel -Text 'Dropped: 0' -Width 110 -X 530 -Color $script:C.White
-$script:lblHosts    = New-StatusLabel -Text 'SMBv1 hosts: 0' -Width 140 -X 650 -Color $script:C.White
-$script:lblElapsed  = New-StatusLabel -Text 'Elapsed: --' -Width 140 -X 800 -Color $script:C.White
-$script:lblStatusMini = New-StatusLabel -Text 'Ready' -Width 360 -X 950 -Color $script:C.SubText
+$script:lblState      = New-StatusLabel -Text 'Idle' -Color $script:C.OkGreen
+$script:lblPkt        = New-StatusLabel -Text 'Packets: 0   Shown: 0' -Color $script:C.White
+$script:lblSmb1       = New-StatusLabel -Text 'SMBv1: 0' -Color $script:C.Smb1Idle
+$script:lblDrop       = New-StatusLabel -Text 'Dropped: 0' -Color $script:C.White
+$script:lblHosts      = New-StatusLabel -Text 'SMBv1 hosts: 0' -Color $script:C.White
+$script:lblElapsed    = New-StatusLabel -Text 'Elapsed: --' -Color $script:C.White
+$script:lblStatusMini = New-StatusLabel -Text 'Ready' -Color $script:C.SubText
 $status.Controls.AddRange(@($script:lblState, $script:lblPkt, $script:lblSmb1, $script:lblDrop, $script:lblHosts, $script:lblElapsed, $script:lblStatusMini))
 
 # --- Layout order: status (bottom), header/tool/filter/banners (top), tabs fill ---
@@ -2876,12 +2965,10 @@ $form.Add_KeyDown({
 })
 
 $form.Add_Shown({
-    $splitH.SplitterDistance = [Math]::Max(220, [int]($splitH.Height * 0.48))
-    $splitV.SplitterDistance = [Math]::Max(280, [int]($splitV.Width * 0.48))
-    Update-FilterBarLayout
+    Update-DynamicLayout
 })
 $form.Add_Resize({
-    try { Update-FilterBarLayout } catch { }
+    try { Update-DynamicLayout } catch { }
 })
 
 $uiTimer = New-Object System.Windows.Forms.Timer
