@@ -19,10 +19,12 @@ powershell.exe -ExecutionPolicy Bypass -File .\SMBv1-TrafficAnalyzer.ps1 -SelfTe
 
 Live capture needs Administrator. Offline PCAP review, the built-in **Demo** capture, server SMB config, and event-log scan do not.
 
-Use **v1.3+**. Older copies fail on PowerShell 7 with:
+Use **v1.4+**. On startup the console should print `SMBv1 Traffic Analyzer v1.4`. If that line is missing, the file on disk is still an older copy.
+
+Older copies fail with:
 - `ScriptRequiresUnmatchedPSVersion` (a Requires-Version line)
 - `Unexpected token` / incomplete hash literal (`-f` inside `@{ }`)
-- `Exception setting ForeColor` / `FromArgb is not a valid value for Int32` (color `FromArgb(r,g,b)` inside `@{ }`)
+- `Exception setting ForeColor` / `FromArgb is not a valid value for Int32` (`FromArgb(r,g,b)` inside `@{ }` or as a command argument such as `-Color [Color]::FromArgb(...)`)
 
 ## Other tools
 

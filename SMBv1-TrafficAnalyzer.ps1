@@ -44,7 +44,7 @@
     .\SMBv1-TrafficAnalyzer.ps1 -SelfTest
 
 .NOTES
-    Version     : 1.3
+    Version     : 1.4
     Compatible  : Windows Server 2012 / 2012 R2 (Windows PowerShell 3.0+) and
                   PowerShell 7+ on Windows. No Requires-Version directive (pwsh 7
                   treats Version 3.0/5.1 as a Windows PowerShell-only lock).
@@ -62,11 +62,12 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.3'
+$script:AppVersion = '1.4'
 
 # Version is checked at runtime on purpose. A Requires-Version 3.0/5.1
 # directive makes PowerShell 7 abort with ScriptRequiresUnmatchedPSVersion
 # before any script body runs. Stock Server 2012 ships PowerShell 3.0.
+Write-Host ("SMBv1 Traffic Analyzer v{0}  |  Windows PowerShell {1}" -f $script:AppVersion, $PSVersionTable.PSVersion)
 if ($PSVersionTable.PSVersion.Major -lt 3) {
     Write-Host ("This script needs Windows PowerShell 3.0+ (Server 2012) or PowerShell 7+. Detected {0}" -f $PSVersionTable.PSVersion) -ForegroundColor Red
     exit 1
@@ -1177,8 +1178,22 @@ $script:C['Smb2']    = New-RgbColor 205 228 255
 $script:C['Smb3']    = New-RgbColor 205 245 220
 $script:C['Tcp']     = New-RgbColor 248 249 251
 $script:C['Marked']  = New-RgbColor 255 236 179
-$script:C['AlertBg'] = New-RgbColor 153 27 27
-$script:C['OkGreen'] = New-RgbColor 0 210 106
+$script:C['AlertBg']   = New-RgbColor 153 27 27
+$script:C['OkGreen']   = New-RgbColor 0 210 106
+$script:C['SubText']   = New-RgbColor 160 185 215
+$script:C['FilterOk']  = New-RgbColor 220 255 220
+$script:C['Smb1Hot']   = New-RgbColor 255 180 180
+$script:C['Smb1Idle']  = New-RgbColor 180 200 180
+$script:C['HexText']   = New-RgbColor 30 30 30
+$script:C['ComboBg']   = New-RgbColor 18 18 22
+$script:C['FilterBar'] = New-RgbColor 236 239 244
+$script:C['AdminHint'] = New-RgbColor 202 131 0
+$script:C['Smb1Ink']   = New-RgbColor 90 0 0
+$script:C['HexBg']     = New-RgbColor 250 250 252
+$script:C['AltRow']    = New-RgbColor 248 250 252
+$script:C['StatsBg']   = New-RgbColor 18 22 28
+$script:C['StatsFg']   = New-RgbColor 180 230 180
+$script:C['LogFg']     = New-RgbColor 200 220 200
 
 # ============================================================
 # HELPERS
@@ -1244,7 +1259,7 @@ function New-FlatButton {
         [string]$Text,
         [int]$Width,
         [int]$Height = 30,
-        [System.Drawing.Color]$BackColor,
+        $BackColor,
         [scriptblock]$OnClick,
         [string]$TipText = '',
         [bool]$Bold = $true
@@ -1381,7 +1396,7 @@ function Update-FilterBoxColor {
         $script:txtFilter.BackColor = $script:C.White
         return
     }
-    $script:txtFilter.BackColor = [System.Drawing.Color]::FromArgb(220, 255, 220)
+    $script:txtFilter.BackColor = $script:C.FilterOk
 }
 
 function Limit-PacketBuffer {
@@ -1491,7 +1506,7 @@ function Update-StatusBar {
     if ($script:lblSmb1) {
         $eng1 = if ($stats) { $stats.Smb1 } else { 0 }
         $script:lblSmb1.Text = 'SMBv1: {0}' -f $eng1
-        $script:lblSmb1.ForeColor = if ($eng1 -gt 0) { [System.Drawing.Color]::FromArgb(255, 180, 180) } else { [System.Drawing.Color]::FromArgb(180, 200, 180) }
+        $script:lblSmb1.ForeColor = if ($eng1 -gt 0) { $script:C.Smb1Hot } else { $script:C.Smb1Idle }
     }
     if ($script:lblDrop) {
         $d = if ($stats) { $stats.Dropped } else { 0 }
@@ -1638,7 +1653,7 @@ function Set-HexDump {
     }
     $box.Text = $sb.ToString()
     $box.SelectAll()
-    $box.SelectionColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
+    $box.SelectionColor = $script:C.HexText
     $box.DeselectAll()
     foreach ($r in $highlightRanges) {
         if ($r.Start -ge 0 -and ($r.Start + $r.Length) -le $box.TextLength) {
@@ -2278,14 +2293,14 @@ $lblTitle.Location = New-Object System.Drawing.Point(16, 8)
 $lblSub = New-Object System.Windows.Forms.Label
 $lblSub.Text = 'Server 2012 / 2012 R2  |  PowerShell 3.0+ and 7+  |  Live capture + PCAP  |  No Npcap required'
 $lblSub.Font = New-Object System.Drawing.Font('Segoe UI', 8.5)
-$lblSub.ForeColor = [System.Drawing.Color]::FromArgb(160, 185, 215)
+$lblSub.ForeColor = $script:C.SubText
 $lblSub.AutoSize = $true
 $lblSub.Location = New-Object System.Drawing.Point(18, 36)
 
 $lblVer = New-Object System.Windows.Forms.Label
 $lblVer.Text = "v$($script:AppVersion)"
 $lblVer.Font = New-Object System.Drawing.Font('Segoe UI', 9)
-$lblVer.ForeColor = [System.Drawing.Color]::FromArgb(160, 185, 215)
+$lblVer.ForeColor = $script:C.SubText
 $lblVer.AutoSize = $true
 $lblVer.Anchor = 'Top, Right'
 $lblVer.Location = New-Object System.Drawing.Point(1360, 20)
@@ -2310,7 +2325,7 @@ $script:cmbIface.Width = 300
 $script:cmbIface.Location = New-Object System.Drawing.Point(78, 10)
 $script:cmbIface.DisplayMember = 'Display'
 $script:cmbIface.ValueMember = 'IP'
-$script:cmbIface.BackColor = [System.Drawing.Color]::FromArgb(18, 18, 22)
+$script:cmbIface.BackColor = $script:C.ComboBg
 $script:cmbIface.ForeColor = $script:C.OkGreen
 $script:cmbIface.FlatStyle = 'Flat'
 
@@ -2371,7 +2386,7 @@ $tool.Controls.AddRange(@($lblIf, $script:cmbIface, $script:btnStart, $script:bt
 $filterBar = New-Object System.Windows.Forms.Panel
 $filterBar.Dock = 'Top'
 $filterBar.Height = 40
-$filterBar.BackColor = [System.Drawing.Color]::FromArgb(236, 239, 244)
+$filterBar.BackColor = $script:C.FilterBar
 
 $lblF = New-Object System.Windows.Forms.Label
 $lblF.Text = 'Display filter'
@@ -2480,7 +2495,7 @@ $script:banner.Visible = $false
 $script:adminHint = New-Object System.Windows.Forms.Label
 $script:adminHint.Dock = 'Top'
 $script:adminHint.Height = 24
-$script:adminHint.BackColor = [System.Drawing.Color]::FromArgb(202, 131, 0)
+$script:adminHint.BackColor = $script:C.AdminHint
 $script:adminHint.ForeColor = $script:C.White
 $script:adminHint.TextAlign = 'MiddleLeft'
 $script:adminHint.Text = '  Not running as Administrator - live capture is disabled. Open a PCAP, load Demo, or relaunch elevated.'
@@ -2571,7 +2586,7 @@ $script:lvPackets.Add_RetrieveVirtualItem({
         [void]$item.SubItems.Add($p.Length.ToString())
         [void]$item.SubItems.Add($p.Info)
         $item.BackColor = Get-PacketRowColor $p
-        if ($p.IsSmb1) { $item.ForeColor = [System.Drawing.Color]::FromArgb(90, 0, 0) }
+        if ($p.IsSmb1) { $item.ForeColor = $script:C.Smb1Ink }
         $e.Item = $item
     } catch {
         $e.Item = New-Object System.Windows.Forms.ListViewItem('')
@@ -2632,7 +2647,7 @@ $script:hexBox.Dock = 'Fill'
 $script:hexBox.Font = New-Object System.Drawing.Font('Consolas', 9)
 $script:hexBox.ReadOnly = $true
 $script:hexBox.WordWrap = $false
-$script:hexBox.BackColor = [System.Drawing.Color]::FromArgb(250, 250, 252)
+$script:hexBox.BackColor = $script:C.HexBg
 $script:hexBox.DetectUrls = $false
 $splitV.Panel2.Controls.Add($script:hexBox)
 $splitH.Panel2.Controls.Add($splitV)
@@ -2674,7 +2689,7 @@ $script:dgvHosts.ColumnHeadersDefaultCellStyle.ForeColor = $script:C.White
 $script:dgvHosts.ColumnHeadersDefaultCellStyle.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
 $script:dgvHosts.ColumnHeadersHeight = 30
 $script:dgvHosts.RowTemplate.Height = 26
-$script:dgvHosts.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(248, 250, 252)
+$script:dgvHosts.AlternatingRowsDefaultCellStyle.BackColor = $script:C.AltRow
 foreach ($col in @('IP','HostName','Role','Packets','FirstSeen','LastSeen','Users','Shares','Commands','Sample')) {
     [void]$script:dgvHosts.Columns.Add($col, $col)
 }
@@ -2695,8 +2710,8 @@ $script:txtStats.Multiline = $true
 $script:txtStats.ScrollBars = 'Both'
 $script:txtStats.ReadOnly = $true
 $script:txtStats.Font = New-Object System.Drawing.Font('Consolas', 10)
-$script:txtStats.BackColor = [System.Drawing.Color]::FromArgb(18, 22, 28)
-$script:txtStats.ForeColor = [System.Drawing.Color]::FromArgb(180, 230, 180)
+$script:txtStats.BackColor = $script:C.StatsBg
+$script:txtStats.ForeColor = $script:C.StatsFg
 $script:txtStats.WordWrap = $false
 $script:tabStats.Controls.Add($script:txtStats)
 
@@ -2770,8 +2785,8 @@ $script:txtLog.Multiline = $true
 $script:txtLog.ScrollBars = 'Vertical'
 $script:txtLog.ReadOnly = $true
 $script:txtLog.Font = New-Object System.Drawing.Font('Consolas', 9)
-$script:txtLog.BackColor = [System.Drawing.Color]::FromArgb(18, 22, 28)
-$script:txtLog.ForeColor = [System.Drawing.Color]::FromArgb(200, 220, 200)
+$script:txtLog.BackColor = $script:C.StatsBg
+$script:txtLog.ForeColor = $script:C.LogFg
 $script:tabLog.Controls.Add($script:txtLog)
 
 # --- Status bar ---
@@ -2795,11 +2810,11 @@ function New-StatusLabel {
 }
 $script:lblState    = New-StatusLabel -Text 'Idle' -Width 110 -X 8 -Color $script:C.OkGreen
 $script:lblPkt      = New-StatusLabel -Text 'Packets: 0   Shown: 0' -Width 280 -X 120 -Color $script:C.White
-$script:lblSmb1     = New-StatusLabel -Text 'SMBv1: 0' -Width 110 -X 410 -Color [System.Drawing.Color]::FromArgb(180, 200, 180)
+$script:lblSmb1     = New-StatusLabel -Text 'SMBv1: 0' -Width 110 -X 410 -Color $script:C.Smb1Idle
 $script:lblDrop     = New-StatusLabel -Text 'Dropped: 0' -Width 110 -X 530 -Color $script:C.White
 $script:lblHosts    = New-StatusLabel -Text 'SMBv1 hosts: 0' -Width 140 -X 650 -Color $script:C.White
 $script:lblElapsed  = New-StatusLabel -Text 'Elapsed: --' -Width 140 -X 800 -Color $script:C.White
-$script:lblStatusMini = New-StatusLabel -Text 'Ready' -Width 360 -X 950 -Color [System.Drawing.Color]::FromArgb(160, 185, 215)
+$script:lblStatusMini = New-StatusLabel -Text 'Ready' -Width 360 -X 950 -Color $script:C.SubText
 $status.Controls.AddRange(@($script:lblState, $script:lblPkt, $script:lblSmb1, $script:lblDrop, $script:lblHosts, $script:lblElapsed, $script:lblStatusMini))
 
 # --- Layout order: status (bottom), header/tool/filter/banners (top), tabs fill ---
