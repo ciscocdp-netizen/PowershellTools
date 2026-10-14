@@ -50,7 +50,7 @@
     .\SMBv1-TrafficAnalyzer.ps1 -SelfTest
 
 .NOTES
-    Version     : 1.8
+    Version     : 1.9
     Compatible  : Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012
                   (PowerShell 3.0), 2012 R2 (PowerShell 4.0), 5.1, and PowerShell 7+.
                   There is no Requires-Version directive. Do not use -shl/-shr
@@ -69,7 +69,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.8'
+$script:AppVersion = '1.9'
 
 # Version is checked at runtime on purpose. Do not add "#Requires -Version".
 # Server 2008 / 2008 R2 is PowerShell 2.0. Server 2012 R2 is 4.0.
@@ -1096,11 +1096,32 @@ public class SmbCaptureEngine {
     }
 }
 
+# PowerShell 2.0 cannot New-Object 'List[SmbPacket]' (in-memory generic args).
+function New-AppList {
+    param([type]$ItemType)
+    if ($null -ne $ItemType) {
+        try {
+            $open = [type]('System.Collections.Generic.List`1')
+            $closed = $open.MakeGenericType(@($ItemType))
+            return [Activator]::CreateInstance($closed)
+        } catch { }
+    }
+    return New-Object System.Collections.ArrayList
+}
+
+function ConvertTo-SmbPacketArray {
+    param($List)
+    if ($null -eq $List) { return [SmbPacket[]]@() }
+    $tmp = @($List)
+    if ($tmp.Count -eq 0) { return [SmbPacket[]]@() }
+    return [SmbPacket[]]$tmp
+}
+
 # ============================================================
 # SELF-TEST (no GUI)
 # ============================================================
 function Invoke-SmbAnalyzerSelfTest {
-    $failures = New-Object 'System.Collections.Generic.List[string]'
+    $failures = New-AppList ([string])
     $demo = [SmbPacketParser]::BuildDemoPackets()
     if ($demo.Length -lt 8) { [void]$failures.Add("Demo packet count $($demo.Length) < 8") }
 
@@ -1182,8 +1203,8 @@ try { [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($fal
 # STATE
 # ============================================================
 $script:Engine          = New-Object SmbCaptureEngine
-$script:AllPackets      = New-Object 'System.Collections.Generic.List[SmbPacket]'
-$script:ViewPackets     = New-Object 'System.Collections.Generic.List[SmbPacket]'
+$script:AllPackets      = New-AppList ([SmbPacket])
+$script:ViewPackets     = New-AppList ([SmbPacket])
 $script:Smb1Hosts       = @{}
 $script:Smb1CommandHist = @{}
 $script:NextNo          = 1
@@ -1316,7 +1337,7 @@ function Get-LocalCim {
 }
 
 function Get-CaptureInterfaces {
-    $items = New-Object 'System.Collections.Generic.List[object]'
+    $items = New-AppList ([object])
     try {
         Get-LocalCim -ClassName Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' | ForEach-Object {
             $desc = $_.Description
@@ -1517,9 +1538,9 @@ function Update-Smb1Host {
                 FirstSeen   = $pkt.Time
                 LastSeen    = $pkt.Time
                 Commands    = @{}
-                Users       = New-Object 'System.Collections.Generic.List[string]'
-                Shares      = New-Object 'System.Collections.Generic.List[string]'
-                Files       = New-Object 'System.Collections.Generic.List[string]'
+                Users       = New-AppList ([string])
+                Shares      = New-AppList ([string])
+                Files       = New-AppList ([string])
                 Sample      = $pkt.Info
             }
         }
@@ -1708,7 +1729,7 @@ function Set-HexDump {
     $hiLen = if ($Packet.IsSmb1) { 4 } elseif ($Packet.HasSmb) { 4 } else { 0 }
 
     $sb = New-Object System.Text.StringBuilder
-    $highlightRanges = New-Object 'System.Collections.Generic.List[object]'
+    $highlightRanges = New-AppList ([object])
     for ($i = 0; $i -lt $bytes.Length; $i += 16) {
         [void]$sb.AppendFormat('{0:X4}  ', $i)
         $chunk = New-Object System.Text.StringBuilder
@@ -1891,7 +1912,7 @@ function Save-PcapFile {
         if ($dlg.FileName -like '*.csv') {
             Export-AppCsv -InputObject ($script:ViewPackets | Select-Object No, Time, Src, SrcPort, Dst, DstPort, Protocol, Length, SmbVersion, SmbCommand, UserName, SharePath, FileName, Info) -Path $dlg.FileName
         } else {
-            [SmbPacketParser]::WritePcap($dlg.FileName, $script:ViewPackets.ToArray())
+            [SmbPacketParser]::WritePcap($dlg.FileName, (ConvertTo-SmbPacketArray $script:ViewPackets))
         }
         Write-AppLog "Saved $($script:ViewPackets.Count) packets to $($dlg.FileName)" 'SUCCESS'
         [void][System.Windows.Forms.MessageBox]::Show("Saved $($script:ViewPackets.Count) packets to:`n$($dlg.FileName)`n`nPCAP files open in Wireshark (LINKTYPE_IPV4 / 228).", 'Saved', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
@@ -2214,14 +2235,14 @@ function Sort-PacketView {
     $script:SortColumn = $Column
     $props = @('No', 'Time', 'Src', 'SrcPort', 'Dst', 'DstPort', 'Protocol', 'Length', 'Info')
     $name = $props[$Column]
-    $arr = $script:ViewPackets.ToArray()
+    $arr = @(ConvertTo-SmbPacketArray $script:ViewPackets)
     if ($script:SortAscending) {
-        $arr = $arr | Sort-Object -Property $name
+        $arr = @($arr | Sort-Object -Property $name)
     } else {
-        $arr = $arr | Sort-Object -Property $name -Descending
+        $arr = @($arr | Sort-Object -Property $name -Descending)
     }
     $script:ViewPackets.Clear()
-    if ($arr) { $script:ViewPackets.AddRange([SmbPacket[]]@($arr)) }
+    foreach ($p in $arr) { [void]$script:ViewPackets.Add($p) }
     $script:lvPackets.Invalidate()
 }
 
