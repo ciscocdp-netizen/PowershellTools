@@ -1,15 +1,17 @@
 # Never add a Requires-Version directive. This script must run on Windows
-# PowerShell 3.0 (Server 2012), 4.0 (Server 2012 R2), 5.1, and PowerShell 7.
-# A Requires-Version 5.1 lock aborts on PS 4.0 with ScriptRequiresUnmatchedPSVersion
-# before any script body runs. Version is checked at runtime below.
+# PowerShell 2.0 (Server 2008 / 2008 R2), 3.0 (Server 2012), 4.0 (2012 R2),
+# 5.1, and PowerShell 7. A Requires-Version 5.1 lock aborts on PS 2.0/4.0
+# with ScriptRequiresUnmatchedPSVersion before any script body runs.
+# Do not use -shl/-shr (PS 3.0+); they parse as minus on PowerShell 2.0.
 <#
 .SYNOPSIS
-    SMBv1 Traffic Analyzer - Wireshark-style live capture GUI for Windows Server 2012 and later.
+    SMBv1 Traffic Analyzer - Wireshark-style live capture GUI for Windows Server 2008 and later.
 
 .DESCRIPTION
     Interactive packet analyzer that finds and decodes SMBv1 (and SMBv2/v3) on the local
-    Windows server. Designed for Windows Server 2012 / 2012 R2 (PowerShell 3.0+) and
-    PowerShell 7 on Windows. No Npcap, WinPcap, or Wireshark install is required.
+    Windows server. Designed for Windows Server 2008 / 2008 R2 (PowerShell 2.0),
+    Server 2012 / 2012 R2, and PowerShell 7 on Windows. No Npcap, WinPcap, or
+    Wireshark install is required.
 
     Live capture uses a raw IPv4 socket (SIO_RCVALL) bound to a local interface, which
     requires an elevated Administrator session. Packets are parsed in a background C#
@@ -48,11 +50,11 @@
     .\SMBv1-TrafficAnalyzer.ps1 -SelfTest
 
 .NOTES
-    Version     : 1.6
-    Compatible  : Windows Server 2012 (PowerShell 3.0), 2012 R2 (PowerShell 4.0),
-                  Windows PowerShell 5.1, and PowerShell 7+ on Windows.
-                  There is no Requires-Version directive: PS 4.0 rejects 5.1,
-                  and pwsh 7 treats 3.0/5.1 as a Windows PowerShell-only lock.
+    Version     : 1.7
+    Compatible  : Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012
+                  (PowerShell 3.0), 2012 R2 (PowerShell 4.0), 5.1, and PowerShell 7+.
+                  There is no Requires-Version directive. Do not use -shl/-shr
+                  (PowerShell 2.0 parses them as the minus operator).
     Privileges  : Administrator for live capture and SMB hardening; offline PCAP review does not
                   require elevation.
     Signature   : SMBv1 = 0xFF 'SMB'   SMBv2/v3 = 0xFE 'SMB'   SMB3 transform = 0xFD 'SMB'
@@ -67,15 +69,14 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.6'
+$script:AppVersion = '1.7'
 
 # Version is checked at runtime on purpose. Do not add "#Requires -Version".
-# Server 2012 R2 is PowerShell 4.0 and rejects Requires-Version 5.1.
-# PowerShell 7 rejects Requires-Version 3.0/5.1 as a Windows PowerShell lock.
-# Stock Server 2012 ships PowerShell 3.0.
+# Server 2008 / 2008 R2 is PowerShell 2.0. Server 2012 R2 is 4.0.
+# Both reject Requires-Version 5.1 before the script body runs.
 Write-Host ("SMBv1 Traffic Analyzer v{0}  |  Windows PowerShell {1}" -f $script:AppVersion, $PSVersionTable.PSVersion)
-if ($PSVersionTable.PSVersion.Major -lt 3) {
-    Write-Host ("This script needs Windows PowerShell 3.0+ (Server 2012 / 2012 R2) or PowerShell 7+. Detected {0}" -f $PSVersionTable.PSVersion) -ForegroundColor Red
+if ($PSVersionTable.PSVersion.Major -lt 2) {
+    Write-Host ("This script needs Windows PowerShell 2.0+ (Server 2008) or PowerShell 7+. Detected {0}" -f $PSVersionTable.PSVersion) -ForegroundColor Red
     exit 1
 }
 
@@ -86,18 +87,32 @@ function Get-HostEdition {
     return 'Desktop'
 }
 
+# PS 2 has no IsNullOrWhiteSpace (.NET 4) and no $PSCommandPath (PS 3).
+function Test-BlankString {
+    param($Value)
+    if ($null -eq $Value) { return $true }
+    $s = [string]$Value
+    if ($s.Length -eq 0) { return $true }
+    return ($s.Trim().Length -eq 0)
+}
+
+$script:OwnPath = $null
+if ($MyInvocation -and $MyInvocation.MyCommand -and $MyInvocation.MyCommand.Path) {
+    $script:OwnPath = [string]$MyInvocation.MyCommand.Path
+}
+
 # ============================================================
 # STA APARTMENT (required for WinForms)
 # ============================================================
 if (-not $SelfTest) {
     $apartment = [System.Threading.Thread]::CurrentThread.GetApartmentState()
-    if ($apartment -ne 'STA' -and $PSCommandPath) {
-        $argList = "-NoProfile -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`""
+    if ($apartment -ne 'STA' -and -not (Test-BlankString $script:OwnPath)) {
+        $argList = "-NoProfile -ExecutionPolicy Bypass -STA -File `"$($script:OwnPath)`""
         if ($OpenPcap)    { $argList += " -OpenPcap `"$OpenPcap`"" }
         if ($InterfaceIP) { $argList += " -InterfaceIP `"$InterfaceIP`"" }
         $hostExe = $null
         try { $hostExe = (Get-Process -Id $PID).Path } catch { }
-        if ([string]::IsNullOrWhiteSpace($hostExe)) {
+        if (Test-BlankString $hostExe) {
             $candidate = Join-Path $PSHOME 'pwsh.exe'
             if (Test-Path -LiteralPath $candidate) { $hostExe = $candidate }
             else { $hostExe = Join-Path $PSHOME 'powershell.exe' }
@@ -109,13 +124,12 @@ if (-not $SelfTest) {
 
 # ============================================================
 # C# PACKET ENGINE
-# C# 5 / .NET 4.5 only (Windows 2012 R2 compiler). No C# 6 syntax.
+# C# 2 / .NET 2.0+ (Server 2008 compiler). No ConcurrentQueue, no C# 6.
 # ============================================================
 $script:EngineTypeName = 'SmbCaptureEngine'
 if (-not ($script:EngineTypeName -as [type])) {
     $cs = @'
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
@@ -917,7 +931,8 @@ public static class SmbPacketParser {
 }
 
 public class SmbCaptureEngine {
-    public ConcurrentQueue<SmbPacket> Queue = new ConcurrentQueue<SmbPacket>();
+    readonly object _gate = new object();
+    Queue<SmbPacket> _queue = new Queue<SmbPacket>();
     public volatile bool Running;
     public volatile bool Paused;
     public volatile bool SmbPortsOnly = true;
@@ -972,8 +987,10 @@ public class SmbCaptureEngine {
 
     public SmbPacket[] Drain(int max) {
         List<SmbPacket> list = new List<SmbPacket>(max);
-        SmbPacket p;
-        while (list.Count < max && Queue.TryDequeue(out p)) list.Add(p);
+        lock (_gate) {
+            while (list.Count < max && _queue.Count > 0)
+                list.Add(_queue.Dequeue());
+        }
         return list.ToArray();
     }
 
@@ -984,7 +1001,7 @@ public class SmbCaptureEngine {
         s.Smb2 = Smb2Count;
         s.Smb3 = Smb3Count;
         s.Dropped = Dropped;
-        s.Queue = Queue.Count;
+        lock (_gate) { s.Queue = _queue.Count; }
         s.Bytes = Bytes;
         return s;
     }
@@ -1005,10 +1022,6 @@ public class SmbCaptureEngine {
                 Interlocked.Increment(ref Dropped);
                 continue;
             }
-            if (Queue.Count >= MaxQueue) {
-                Interlocked.Increment(ref Dropped);
-                continue;
-            }
             byte[] raw = new byte[n];
             Buffer.BlockCopy(buf, 0, raw, 0, n);
             SmbPacket pkt = SmbPacketParser.ParseIpPacket(raw, DateTime.Now);
@@ -1016,12 +1029,23 @@ public class SmbCaptureEngine {
             bool smbPort = pkt.SrcPort == 445 || pkt.DstPort == 445 || pkt.SrcPort == 139 || pkt.DstPort == 139;
             if (SmbPortsOnly && !smbPort) continue;
             if (SmbPayloadOnly && !pkt.HasSmb) continue;
+            bool dropped = false;
+            lock (_gate) {
+                if (_queue.Count >= MaxQueue) {
+                    dropped = true;
+                } else {
+                    _queue.Enqueue(pkt);
+                }
+            }
+            if (dropped) {
+                Interlocked.Increment(ref Dropped);
+                continue;
+            }
             Interlocked.Increment(ref Captured);
             Interlocked.Add(ref Bytes, n);
             if (pkt.IsSmb1) Interlocked.Increment(ref Smb1Count);
             if (pkt.IsSmb2) Interlocked.Increment(ref Smb2Count);
             if (pkt.IsSmb3) Interlocked.Increment(ref Smb3Count);
-            Queue.Enqueue(pkt);
         }
     }
 }
@@ -1032,7 +1056,7 @@ public class SmbCaptureEngine {
         try {
             Add-Type -TypeDefinition $cs -Language CSharp -ReferencedAssemblies @('System.dll', 'System.Core.dll') -ErrorAction Stop
         } catch {
-            throw "Failed to compile the packet engine (.NET Framework 4.5 is required on Server 2012 / 2012 R2): $($_.Exception.Message)"
+            throw "Failed to compile the packet engine (.NET Framework 3.5 or later is required on Server 2008): $($_.Exception.Message)"
         }
     }
 }
@@ -1041,7 +1065,7 @@ public class SmbCaptureEngine {
 # SELF-TEST (no GUI)
 # ============================================================
 function Invoke-SmbAnalyzerSelfTest {
-    $failures = New-Object System.Collections.Generic.List[string]
+    $failures = New-Object 'System.Collections.Generic.List[string]'
     $demo = [SmbPacketParser]::BuildDemoPackets()
     if ($demo.Length -lt 8) { [void]$failures.Add("Demo packet count $($demo.Length) < 8") }
 
@@ -1223,27 +1247,41 @@ function Write-AppLog {
 
 function Test-IsAdministrator { [bool]$script:IsAdmin }
 
+function New-AppObject {
+    param([hashtable]$Property)
+    return New-Object PSObject -Property $Property
+}
+
+function Export-AppCsv {
+    param($InputObject, [string]$Path)
+    $data = @($InputObject)
+    try {
+        $data | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+    } catch {
+        $data | Export-Csv -Path $Path -NoTypeInformation
+    }
+}
+
 function Get-LocalCim {
     param(
         [Parameter(Mandatory = $true)][string]$ClassName,
         [string]$Filter
     )
-    try {
-        $cim = @{ ClassName = $ClassName; ErrorAction = 'Stop' }
-        if ($Filter) { $cim.Filter = $Filter }
-        return Get-CimInstance @cim
-    } catch {
-        if (Get-Command Get-WmiObject -ErrorAction SilentlyContinue) {
-            $wmi = @{ Class = $ClassName; ErrorAction = 'Stop' }
-            if ($Filter) { $wmi.Filter = $Filter }
-            return Get-WmiObject @wmi
-        }
-        throw
+    $hasCim = $null -ne (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)
+    if ($hasCim) {
+        try {
+            $cim = @{ ClassName = $ClassName; ErrorAction = 'Stop' }
+            if ($Filter) { $cim.Filter = $Filter }
+            return Get-CimInstance @cim
+        } catch { }
     }
+    $wmi = @{ Class = $ClassName; ErrorAction = 'Stop' }
+    if ($Filter) { $wmi.Filter = $Filter }
+    return Get-WmiObject @wmi
 }
 
 function Get-CaptureInterfaces {
-    $items = New-Object System.Collections.Generic.List[object]
+    $items = New-Object 'System.Collections.Generic.List[object]'
     try {
         Get-LocalCim -ClassName Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' | ForEach-Object {
             $desc = $_.Description
@@ -1252,10 +1290,10 @@ function Get-CaptureInterfaces {
                     # Parentheses required: a bare "-f $a, $b" inside @{ } is parsed as
                     # two hash entries and throws "Unexpected token" on PowerShell 7.
                     $displayName = '{0}   ({1})' -f $ip, $desc
-                    [void]$items.Add([pscustomobject]@{
+                    [void]$items.Add((New-AppObject -Property @{
                         Display = $displayName
                         IP      = $ip
-                    })
+                    }))
                 }
             }
         }
@@ -1372,7 +1410,7 @@ function Test-PacketFilter {
     param([SmbPacket]$pkt)
     if ($script:chkSmb1Only -and $script:chkSmb1Only.Checked -and -not $pkt.IsSmb1) { return $false }
     $f = $script:FilterText
-    if ([string]::IsNullOrWhiteSpace($f)) { return $true }
+    if (Test-BlankString $f) { return $true }
     $opt = [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
     $parts = [regex]::Split($f.Trim(), '\s+and\s+|\s+&&\s+', $opt)
     foreach ($part in $parts) {
@@ -1444,9 +1482,9 @@ function Update-Smb1Host {
                 FirstSeen   = $pkt.Time
                 LastSeen    = $pkt.Time
                 Commands    = @{}
-                Users       = New-Object System.Collections.Generic.List[string]
-                Shares      = New-Object System.Collections.Generic.List[string]
-                Files       = New-Object System.Collections.Generic.List[string]
+                Users       = New-Object 'System.Collections.Generic.List[string]'
+                Shares      = New-Object 'System.Collections.Generic.List[string]'
+                Files       = New-Object 'System.Collections.Generic.List[string]'
                 Sample      = $pkt.Info
             }
         }
@@ -1594,7 +1632,7 @@ function Show-PacketDetails {
 
     if ($p.PayloadLength -ge 4 -and $p.Raw -and $p.PayloadOffset -ge 0 -and ($p.PayloadOffset + 3) -lt $p.Raw.Length) {
         $nb0 = $p.Raw[$p.PayloadOffset]
-        $nbLen = ($p.Raw[$p.PayloadOffset+1] -shl 16) -bor ($p.Raw[$p.PayloadOffset+2] -shl 8) -bor $p.Raw[$p.PayloadOffset+3]
+        $nbLen = ([int]$p.Raw[$p.PayloadOffset+1] * 65536) -bor ([int]$p.Raw[$p.PayloadOffset+2] * 256) -bor [int]$p.Raw[$p.PayloadOffset+3]
         $nb = $frame.Nodes.Add(("NetBIOS Session Service  Type=0x{0:X2}  Length={1}" -f $nb0, $nbLen))
         [void]$nb.Nodes.Add("Type: $(if ($nb0 -eq 0) { 'Session message (0x00)' } else { '0x{0:X2}' -f $nb0 })")
     }
@@ -1635,7 +1673,7 @@ function Set-HexDump {
     $hiLen = if ($Packet.IsSmb1) { 4 } elseif ($Packet.HasSmb) { 4 } else { 0 }
 
     $sb = New-Object System.Text.StringBuilder
-    $highlightRanges = New-Object System.Collections.Generic.List[object]
+    $highlightRanges = New-Object 'System.Collections.Generic.List[object]'
     for ($i = 0; $i -lt $bytes.Length; $i += 16) {
         [void]$sb.AppendFormat('{0:X4}  ', $i)
         $chunk = New-Object System.Text.StringBuilder
@@ -1648,7 +1686,8 @@ function Set-HexDump {
                 $abs = $i + $j
                 $hexStr = '{0:X2} ' -f $b
                 if ($hiLen -gt 0 -and $abs -ge $hi -and $abs -lt ($hi + $hiLen)) {
-                    [void]$highlightRanges.Add([pscustomobject]@{ Start = $sb.Length + $chunk.Length; Length = 3 })
+                    $rangeStart = $sb.Length + $chunk.Length
+                    [void]$highlightRanges.Add((New-AppObject -Property @{ Start = $rangeStart; Length = 3 }))
                 }
                 [void]$chunk.Append($hexStr)
                 $ch = if ($b -ge 32 -and $b -le 126) { [char]$b } else { '.' }
@@ -1815,8 +1854,7 @@ function Save-PcapFile {
     if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
     try {
         if ($dlg.FileName -like '*.csv') {
-            $script:ViewPackets | Select-Object No, Time, Src, SrcPort, Dst, DstPort, Protocol, Length, SmbVersion, SmbCommand, UserName, SharePath, FileName, Info |
-                Export-Csv -Path $dlg.FileName -NoTypeInformation -Encoding UTF8
+            Export-AppCsv -InputObject ($script:ViewPackets | Select-Object No, Time, Src, SrcPort, Dst, DstPort, Protocol, Length, SmbVersion, SmbCommand, UserName, SharePath, FileName, Info) -Path $dlg.FileName
         } else {
             [SmbPacketParser]::WritePcap($dlg.FileName, $script:ViewPackets.ToArray())
         }
@@ -1857,7 +1895,7 @@ function Toggle-MarkSelected {
 function Find-InPackets {
     param([bool]$Forward = $true)
     $q = $script:txtFind.Text
-    if ([string]::IsNullOrWhiteSpace($q) -or $script:ViewPackets.Count -eq 0) { return }
+    if ((Test-BlankString $q) -or $script:ViewPackets.Count -eq 0) { return }
     $ql = $q.ToLowerInvariant()
     $start = $script:FindIndex
     if ($script:lvPackets.SelectedIndices.Count -gt 0) { $start = $script:lvPackets.SelectedIndices[0] }
@@ -1920,7 +1958,7 @@ function Export-HostsCsv {
     $rows = foreach ($ip in ($script:Smb1Hosts.Keys | Sort-Object)) {
         $h = $script:Smb1Hosts[$ip]
         $cmdSummary = @($h.Commands.GetEnumerator() | ForEach-Object { $_.Key.ToString() + '=' + $_.Value.ToString() }) -join '; '
-        [pscustomobject]@{
+        New-AppObject -Property @{
             IP        = $h.IP
             HostName  = $h.HostName
             Role      = $h.Role
@@ -1933,7 +1971,7 @@ function Export-HostsCsv {
             Commands  = $cmdSummary
         }
     }
-    $rows | Export-Csv -Path $dlg.FileName -NoTypeInformation -Encoding UTF8
+    Export-AppCsv -InputObject $rows -Path $dlg.FileName
     Write-AppLog "Exported SMBv1 hosts to $($dlg.FileName)" 'SUCCESS'
 }
 
@@ -2192,7 +2230,7 @@ function Show-GotoPacket {
 function Get-HelpText {
     return @"
 SMBv1 TRAFFIC ANALYZER v$($script:AppVersion)
-Wireshark-style capture for Windows Server 2012 / 2012 R2 (PowerShell 3.0+) and PowerShell 7+
+Wireshark-style capture for Windows Server 2008 / 2008 R2 (PowerShell 2.0) through PowerShell 7+
 
 WHY THIS EXISTS
   SMBv1 (NT LM 0.12) is obsolete. WannaCry/EternalBlue, credential relay, and
@@ -2204,8 +2242,9 @@ HOW TO RUN
   2. Right-click powershell.exe or pwsh.exe -> Run as administrator.
   3. powershell.exe -ExecutionPolicy Bypass -STA -File .\SMBv1-TrafficAnalyzer.ps1
      (PowerShell 7 is fine too:  pwsh.exe -ExecutionPolicy Bypass -File .\SMBv1-TrafficAnalyzer.ps1)
-     Do not add a Requires-Version 5.1/3.0 directive: PowerShell 4.0 (2012 R2)
-     and pwsh 7 both abort with ScriptRequiresUnmatchedPSVersion.
+     Do not add a Requires-Version directive: PowerShell 2.0 (Server 2008),
+     4.0 (2012 R2), and pwsh 7 abort with ScriptRequiresUnmatchedPSVersion.
+     Do not use -shl / -shr; PowerShell 2.0 parses them as minus.
   4. Pick the IPv4 address of the interface that faces clients.
   5. Click Start. SMBv1 rows turn red. Hosts tab lists talkers.
 
@@ -2259,11 +2298,12 @@ HOW DETECTION WORKS
   (username / domain / workstation). Tree Connect and NT Create extract paths.
 
 LIMITATIONS vs REAL WIRESHARK
-  - IPv4 only (raw sockets on 2012 R2). No Ethernet header on live frames.
+  - IPv4 only (raw sockets). No Ethernet header on live frames.
   - Captures traffic to/from THIS host, not a SPAN/mirror port.
   - No full TCP reassembly; a mid-segment SMB PDU may be missed.
   - Requires Administrator for live capture.
   - Does not exploit, scan, or authenticate to remote hosts.
+  - Server 2008 needs PowerShell 2.0 and .NET Framework 3.5 (for Add-Type).
 
 HARDENING (2012 R2)
   Set-SmbServerConfiguration -EnableSMB1Protocol `$false
@@ -2362,7 +2402,7 @@ $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 $form.BackColor = $script:C.Bg
 $form.MinimumSize = New-Object System.Drawing.Size(860, 560)
 $form.KeyPreview = $true
-$form.Icon = [System.Drawing.SystemIcons]::Shield
+try { $form.Icon = [System.Drawing.SystemIcons]::Shield } catch { }
 $form.SizeGripStyle = 'Show'
 Enable-DoubleBuffer $form
 $script:MainForm = $form
@@ -2390,7 +2430,7 @@ $lblTitle.AutoSize = $true
 $lblTitle.Location = New-Object System.Drawing.Point(16, 8)
 
 $lblSub = New-Object System.Windows.Forms.Label
-$lblSub.Text = 'Server 2012 / 2012 R2  |  PowerShell 3.0+ and 7+  |  Live capture + PCAP  |  No Npcap required'
+$lblSub.Text = 'Server 2008+  |  PowerShell 2.0+ and 7+  |  Live capture + PCAP  |  No Npcap required'
 $lblSub.Font = New-Object System.Drawing.Font('Segoe UI', 8.5)
 $lblSub.ForeColor = $script:C.SubText
 $lblSub.AutoSize = $true
@@ -2948,7 +2988,7 @@ $helpM = New-Object System.Windows.Forms.ToolStripMenuItem('Help')
 Add-MenuAction $helpM.DropDownItems 'Open Help tab' { $script:tabMain.SelectedTab = $script:tabHelp }
 Add-MenuAction $helpM.DropDownItems 'About' {
     [void][System.Windows.Forms.MessageBox]::Show(
-        "SMBv1 Traffic Analyzer v$($script:AppVersion)`nWindows Server 2012 / 2012 R2 (PowerShell 3.0+) and PowerShell 7+`nCurrently running: $($PSVersionTable.PSVersion) ($(Get-HostEdition))`n`nLive capture uses a raw IPv4 socket (no Npcap).`nExported PCAPs open in Wireshark.",
+        "SMBv1 Traffic Analyzer v$($script:AppVersion)`nWindows Server 2008 / 2008 R2 (PowerShell 2.0) through PowerShell 7+`nCurrently running: $($PSVersionTable.PSVersion) ($(Get-HostEdition))`n`nLive capture uses a raw IPv4 socket (no Npcap).`nExported PCAPs open in Wireshark.",
         'About',
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Information)
