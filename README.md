@@ -19,11 +19,12 @@ powershell.exe -ExecutionPolicy Bypass -File .\SMBv1-TrafficAnalyzer.ps1 -SelfTe
 
 Live capture needs Administrator. Offline PCAP review, the built-in **Demo** capture, server SMB config, and event-log scan do not.
 
-Use **v1.7+**. On startup the console should print `SMBv1 Traffic Analyzer v1.7`. If that line is missing — or you still see `ScriptRequiresUnmatchedPSVersion`, a `#requires` lock, or `right-hand side of the '-' operator` around `-shl` — the file on disk is an older copy (often renamed `SMB_Traffic.ps1`). Replace it with this script. There is **no** `#Requires` statement and **no** `-shl`/`-shr` (PowerShell 2.0 on Server 2008 parses those as minus).
+Use **v1.8+**. On startup the console should print `SMBv1 Traffic Analyzer v1.8` (PowerShell 2.0 then prints `Restarting in STA mode for WinForms` in the **same** window). If a second console flashes and closes, or you still see `ScriptRequiresUnmatchedPSVersion` / `-shl` parse errors, the file on disk is an older copy (often renamed `SMB_Traffic.ps1`). Replace it. There is **no** `#Requires` statement and **no** `-shl`/`-shr`.
 
 The window reflows when resized: the toolbar and status bar wrap, the display-filter box stretches, the Info column fills leftover list width, and the three capture panes keep their split ratio.
 
 Older copies fail with:
+- A second command window that opens and closes immediately (STA relaunch via `Start-Process`)
 - `You must provide a value expression on the right-hand side of the '-' operator` (`-shl` / `-shr`; PowerShell 2.0 on Server 2008)
 - `ScriptRequiresUnmatchedPSVersion` (a `#Requires -Version 5.1` line; PowerShell 2.0 and 4.0 cannot run it)
 - `Unexpected token` / incomplete hash literal (`-f` inside `@{ }`)

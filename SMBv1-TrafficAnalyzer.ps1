@@ -50,7 +50,7 @@
     .\SMBv1-TrafficAnalyzer.ps1 -SelfTest
 
 .NOTES
-    Version     : 1.7
+    Version     : 1.8
     Compatible  : Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012
                   (PowerShell 3.0), 2012 R2 (PowerShell 4.0), 5.1, and PowerShell 7+.
                   There is no Requires-Version directive. Do not use -shl/-shr
@@ -69,7 +69,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.7'
+$script:AppVersion = '1.8'
 
 # Version is checked at runtime on purpose. Do not add "#Requires -Version".
 # Server 2008 / 2008 R2 is PowerShell 2.0. Server 2012 R2 is 4.0.
@@ -101,24 +101,59 @@ if ($MyInvocation -and $MyInvocation.MyCommand -and $MyInvocation.MyCommand.Path
     $script:OwnPath = [string]$MyInvocation.MyCommand.Path
 }
 
+function Wait-ErrorAck {
+    param([string]$Message)
+    if (-not (Test-BlankString $Message)) {
+        Write-Host $Message -ForegroundColor Red
+    }
+    if ($SelfTest) { return }
+    Write-Host ''
+    Write-Host 'Press Enter to close this window.' -ForegroundColor Yellow
+    try { $null = Read-Host } catch { Start-Sleep -Seconds 12 }
+}
+
+trap {
+    Write-Host ''
+    Write-Host ('FATAL: ' + $_.Exception.Message) -ForegroundColor Red
+    try {
+        if ($_.InvocationInfo -and $_.InvocationInfo.PositionMessage) {
+            Write-Host $_.InvocationInfo.PositionMessage
+        }
+    } catch { }
+    Wait-ErrorAck
+    exit 1
+}
+
 # ============================================================
 # STA APARTMENT (required for WinForms)
+# PowerShell 2.0 is MTA by default. Start-Process opened a *new* console
+# that vanished on the first error. Relaunch in this same window instead.
 # ============================================================
 if (-not $SelfTest) {
     $apartment = [System.Threading.Thread]::CurrentThread.GetApartmentState()
     if ($apartment -ne 'STA' -and -not (Test-BlankString $script:OwnPath)) {
-        $argList = "-NoProfile -ExecutionPolicy Bypass -STA -File `"$($script:OwnPath)`""
-        if ($OpenPcap)    { $argList += " -OpenPcap `"$OpenPcap`"" }
-        if ($InterfaceIP) { $argList += " -InterfaceIP `"$InterfaceIP`"" }
-        $hostExe = $null
-        try { $hostExe = (Get-Process -Id $PID).Path } catch { }
-        if (Test-BlankString $hostExe) {
-            $candidate = Join-Path $PSHOME 'pwsh.exe'
-            if (Test-Path -LiteralPath $candidate) { $hostExe = $candidate }
-            else { $hostExe = Join-Path $PSHOME 'powershell.exe' }
+        $hostExe = Join-Path $PSHOME 'powershell.exe'
+        $pwsh = Join-Path $PSHOME 'pwsh.exe'
+        if (Test-Path -LiteralPath $pwsh) { $hostExe = $pwsh }
+        try {
+            $procPath = (Get-Process -Id $PID).Path
+            if (-not (Test-BlankString $procPath) -and (Test-Path -LiteralPath $procPath)) {
+                $hostExe = $procPath
+            }
+        } catch { }
+        Write-Host ("Restarting in STA mode for WinForms (host={0})" -f $hostExe)
+        if ($OpenPcap -and $InterfaceIP) {
+            & $hostExe -NoProfile -ExecutionPolicy Bypass -STA -File $script:OwnPath -OpenPcap $OpenPcap -InterfaceIP $InterfaceIP
+        } elseif ($OpenPcap) {
+            & $hostExe -NoProfile -ExecutionPolicy Bypass -STA -File $script:OwnPath -OpenPcap $OpenPcap
+        } elseif ($InterfaceIP) {
+            & $hostExe -NoProfile -ExecutionPolicy Bypass -STA -File $script:OwnPath -InterfaceIP $InterfaceIP
+        } else {
+            & $hostExe -NoProfile -ExecutionPolicy Bypass -STA -File $script:OwnPath
         }
-        Start-Process -FilePath $hostExe -ArgumentList $argList
-        return
+        $code = $LASTEXITCODE
+        if ($null -eq $code) { $code = 0 }
+        exit $code
     }
 }
 
@@ -3037,6 +3072,11 @@ if ($OpenPcap -and (Test-Path -LiteralPath $OpenPcap)) {
     Import-PcapPath -Path $OpenPcap
 }
 
-[void]$form.ShowDialog()
+try {
+    [void]$form.ShowDialog()
+} catch {
+    Wait-ErrorAck ("GUI failed: " + $_.Exception.Message)
+    throw
+}
 try { $script:Engine.Stop() } catch { }
 try { $uiTimer.Dispose() } catch { }
