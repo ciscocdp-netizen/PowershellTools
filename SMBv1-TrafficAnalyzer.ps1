@@ -1,3 +1,7 @@
+# Never add a Requires-Version directive. This script must run on Windows
+# PowerShell 3.0 (Server 2012), 4.0 (Server 2012 R2), 5.1, and PowerShell 7.
+# A Requires-Version 5.1 lock aborts on PS 4.0 with ScriptRequiresUnmatchedPSVersion
+# before any script body runs. Version is checked at runtime below.
 <#
 .SYNOPSIS
     SMBv1 Traffic Analyzer - Wireshark-style live capture GUI for Windows Server 2012 and later.
@@ -44,10 +48,11 @@
     .\SMBv1-TrafficAnalyzer.ps1 -SelfTest
 
 .NOTES
-    Version     : 1.5
-    Compatible  : Windows Server 2012 / 2012 R2 (Windows PowerShell 3.0+) and
-                  PowerShell 7+ on Windows. No Requires-Version directive (pwsh 7
-                  treats Version 3.0/5.1 as a Windows PowerShell-only lock).
+    Version     : 1.6
+    Compatible  : Windows Server 2012 (PowerShell 3.0), 2012 R2 (PowerShell 4.0),
+                  Windows PowerShell 5.1, and PowerShell 7+ on Windows.
+                  There is no Requires-Version directive: PS 4.0 rejects 5.1,
+                  and pwsh 7 treats 3.0/5.1 as a Windows PowerShell-only lock.
     Privileges  : Administrator for live capture and SMB hardening; offline PCAP review does not
                   require elevation.
     Signature   : SMBv1 = 0xFF 'SMB'   SMBv2/v3 = 0xFE 'SMB'   SMB3 transform = 0xFD 'SMB'
@@ -62,14 +67,15 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.5'
+$script:AppVersion = '1.6'
 
-# Version is checked at runtime on purpose. A Requires-Version 3.0/5.1
-# directive makes PowerShell 7 abort with ScriptRequiresUnmatchedPSVersion
-# before any script body runs. Stock Server 2012 ships PowerShell 3.0.
+# Version is checked at runtime on purpose. Do not add "#Requires -Version".
+# Server 2012 R2 is PowerShell 4.0 and rejects Requires-Version 5.1.
+# PowerShell 7 rejects Requires-Version 3.0/5.1 as a Windows PowerShell lock.
+# Stock Server 2012 ships PowerShell 3.0.
 Write-Host ("SMBv1 Traffic Analyzer v{0}  |  Windows PowerShell {1}" -f $script:AppVersion, $PSVersionTable.PSVersion)
 if ($PSVersionTable.PSVersion.Major -lt 3) {
-    Write-Host ("This script needs Windows PowerShell 3.0+ (Server 2012) or PowerShell 7+. Detected {0}" -f $PSVersionTable.PSVersion) -ForegroundColor Red
+    Write-Host ("This script needs Windows PowerShell 3.0+ (Server 2012 / 2012 R2) or PowerShell 7+. Detected {0}" -f $PSVersionTable.PSVersion) -ForegroundColor Red
     exit 1
 }
 
@@ -2198,7 +2204,8 @@ HOW TO RUN
   2. Right-click powershell.exe or pwsh.exe -> Run as administrator.
   3. powershell.exe -ExecutionPolicy Bypass -STA -File .\SMBv1-TrafficAnalyzer.ps1
      (PowerShell 7 is fine too:  pwsh.exe -ExecutionPolicy Bypass -File .\SMBv1-TrafficAnalyzer.ps1)
-     Do not add a Requires-Version 5.1/3.0 directive; pwsh 7 will refuse to start.
+     Do not add a Requires-Version 5.1/3.0 directive: PowerShell 4.0 (2012 R2)
+     and pwsh 7 both abort with ScriptRequiresUnmatchedPSVersion.
   4. Pick the IPv4 address of the interface that faces clients.
   5. Click Start. SMBv1 rows turn red. Hosts tab lists talkers.
 
