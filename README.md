@@ -19,11 +19,12 @@ powershell.exe -ExecutionPolicy Bypass -File .\SMBv1-TrafficAnalyzer.ps1 -SelfTe
 
 Live capture needs Administrator. Offline PCAP review, the built-in **Demo** capture, server SMB config, and event-log scan do not.
 
-Use **v1.9+**. On startup the console should print `SMBv1 Traffic Analyzer v1.9` (PowerShell 2.0 then prints `Restarting in STA mode for WinForms` in the **same** window). If you still see `Cannot find type List[SmbPacket]`, `-shl` parse errors, or a flashing second console, the file on disk is an older copy (often renamed `SMB_Traffic.ps1`). Replace it.
+Use **v1.10+**. On startup the console should print `SMBv1 Traffic Analyzer v1.10`. If you still see `Value cannot be null` when filling the interface list, `List[SmbPacket]`, `-shl`, or a flashing second console, the file on disk is an older copy (often renamed `SMB_Traffic.ps1`). Replace it.
 
 The window reflows when resized: the toolbar and status bar wrap, the display-filter box stretches, the Info column fills leftover list width, and the three capture panes keep their split ratio.
 
 Older copies fail with:
+- `Value cannot be null. Parameter name: item` on `ComboBox.Items.Add` (PowerShell 2.0 unwraps an empty adapter list to `@($null)`)
 - `Cannot find type [System.Collections.Generic.List[SmbPacket]]` (PowerShell 2.0 cannot construct generic lists of in-memory types)
 - A second command window that opens and closes immediately (STA relaunch via `Start-Process`)
 - `You must provide a value expression on the right-hand side of the '-' operator` (`-shl` / `-shr`; PowerShell 2.0 on Server 2008)

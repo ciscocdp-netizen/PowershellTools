@@ -50,7 +50,7 @@
     .\SMBv1-TrafficAnalyzer.ps1 -SelfTest
 
 .NOTES
-    Version     : 1.9
+    Version     : 1.10
     Compatible  : Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012
                   (PowerShell 3.0), 2012 R2 (PowerShell 4.0), 5.1, and PowerShell 7+.
                   There is no Requires-Version directive. Do not use -shl/-shr
@@ -69,7 +69,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.9'
+$script:AppVersion = '1.10'
 
 # Version is checked at runtime on purpose. Do not add "#Requires -Version".
 # Server 2008 / 2008 R2 is PowerShell 2.0. Server 2012 R2 is 4.0.
@@ -1337,18 +1337,18 @@ function Get-LocalCim {
 }
 
 function Get-CaptureInterfaces {
-    $items = New-AppList ([object])
+    $items = New-Object System.Collections.ArrayList
     try {
-        Get-LocalCim -ClassName Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' | ForEach-Object {
-            $desc = $_.Description
-            foreach ($ip in @($_.IPAddress)) {
+        $nics = @(Get-LocalCim -ClassName Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True')
+        foreach ($nic in $nics) {
+            if ($null -eq $nic) { continue }
+            $desc = [string]$nic.Description
+            foreach ($ip in @($nic.IPAddress)) {
                 if ($ip -match '^\d+\.\d+\.\d+\.\d+$') {
-                    # Parentheses required: a bare "-f $a, $b" inside @{ } is parsed as
-                    # two hash entries and throws "Unexpected token" on PowerShell 7.
                     $displayName = '{0}   ({1})' -f $ip, $desc
                     [void]$items.Add((New-AppObject -Property @{
                         Display = $displayName
-                        IP      = $ip
+                        IP      = [string]$ip
                     }))
                 }
             }
@@ -1356,7 +1356,20 @@ function Get-CaptureInterfaces {
     } catch {
         Write-AppLog "Adapter enumeration failed: $($_.Exception.Message)" 'ERROR'
     }
-    return $items
+    # Leading comma keeps PowerShell from unwrapping the list into $null / @($null).
+    return ,$items
+}
+
+function Get-SelectedInterfaceIP {
+    $item = $script:cmbIface.SelectedItem
+    if ($null -eq $item) { return $null }
+    try {
+        $ipProp = $item.IP
+        if (-not (Test-BlankString $ipProp)) { return [string]$ipProp }
+    } catch { }
+    $s = [string]$item
+    if ($s -match '^(\d+\.\d+\.\d+\.\d+)') { return $Matches[1] }
+    return $null
 }
 
 function New-FlatButton {
@@ -1789,12 +1802,11 @@ function Start-Capture {
         return
     }
     if ($script:Engine.Running) { return }
-    $item = $script:cmbIface.SelectedItem
-    if (-not $item) {
+    $ip = Get-SelectedInterfaceIP
+    if (Test-BlankString $ip) {
         [void][System.Windows.Forms.MessageBox]::Show('Select a capture interface (local IPv4 address).', 'No Interface', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
         return
     }
-    $ip = $item.IP
     $script:Engine.SmbPortsOnly = $script:chkPortsOnly.Checked
     $script:Engine.SmbPayloadOnly = $script:chkSmbPayload.Checked
     Write-AppLog "Starting capture on $ip (SMB ports only=$($script:Engine.SmbPortsOnly))" 'INFO'
@@ -2515,18 +2527,26 @@ $lblIf.Margin = New-Object System.Windows.Forms.Padding(4, 10, 6, 4)
 $script:cmbIface = New-Object System.Windows.Forms.ComboBox
 $script:cmbIface.DropDownStyle = 'DropDownList'
 $script:cmbIface.Width = 300
-$script:cmbIface.DisplayMember = 'Display'
-$script:cmbIface.ValueMember = 'IP'
 $script:cmbIface.BackColor = $script:C.ComboBg
 $script:cmbIface.ForeColor = $script:C.OkGreen
 $script:cmbIface.FlatStyle = 'Flat'
 $script:cmbIface.Margin = New-Object System.Windows.Forms.Padding(0, 6, 8, 4)
 
-$ifaces = @(Get-CaptureInterfaces)
-foreach ($it in $ifaces) { [void]$script:cmbIface.Items.Add($it) }
+$ifaces = Get-CaptureInterfaces
+foreach ($it in $ifaces) {
+    if ($null -eq $it) { continue }
+    $text = $null
+    try { $text = [string]$it.Display } catch { }
+    if (Test-BlankString $text) {
+        try { $text = [string]$it.IP } catch { $text = [string]$it }
+    }
+    if (Test-BlankString $text) { continue }
+    [void]$script:cmbIface.Items.Add($text)
+}
 if ($InterfaceIP) {
     for ($i = 0; $i -lt $script:cmbIface.Items.Count; $i++) {
-        if ($script:cmbIface.Items[$i].IP -eq $InterfaceIP) { $script:cmbIface.SelectedIndex = $i; break }
+        $row = [string]$script:cmbIface.Items[$i]
+        if ($row.StartsWith($InterfaceIP)) { $script:cmbIface.SelectedIndex = $i; break }
     }
 }
 if ($script:cmbIface.SelectedIndex -lt 0 -and $script:cmbIface.Items.Count -gt 0) { $script:cmbIface.SelectedIndex = 0 }
