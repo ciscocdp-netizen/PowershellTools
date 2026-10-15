@@ -19,7 +19,7 @@ powershell.exe -ExecutionPolicy Bypass -File .\SMBv1-TrafficAnalyzer.ps1 -SelfTe
 
 Live capture needs Administrator. Offline PCAP review, the built-in **Demo** capture, server SMB config, and event-log scan do not.
 
-Use **v1.10+**. On startup the console should print `SMBv1 Traffic Analyzer v1.10`. If you still see `Value cannot be null` when filling the interface list, `List[SmbPacket]`, `-shl`, or a flashing second console, the file on disk is an older copy (often renamed `SMB_Traffic.ps1`). Replace it.
+Use **v1.11+**. On startup the console should print `SMBv1 Traffic Analyzer v1.11`. If you still see `Property 'Count' cannot be found`, `Value cannot be null`, `List[SmbPacket]`, `-shl`, or a flashing second console, the file on disk is an older copy (often renamed `SMB_Traffic.ps1`). Replace it.
 
 The window reflows when resized: the toolbar and status bar wrap, the display-filter box stretches, the Info column fills leftover list width, and the three capture panes keep their split ratio.
 

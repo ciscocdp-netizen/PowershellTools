@@ -50,7 +50,7 @@
     .\SMBv1-TrafficAnalyzer.ps1 -SelfTest
 
 .NOTES
-    Version     : 1.10
+    Version     : 1.11
     Compatible  : Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012
                   (PowerShell 3.0), 2012 R2 (PowerShell 4.0), 5.1, and PowerShell 7+.
                   There is no Requires-Version directive. Do not use -shl/-shr
@@ -69,7 +69,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.10'
+$script:AppVersion = '1.11'
 
 # Version is checked at runtime on purpose. Do not add "#Requires -Version".
 # Server 2008 / 2008 R2 is PowerShell 2.0. Server 2012 R2 is 4.0.
@@ -1097,23 +1097,37 @@ public class SmbCaptureEngine {
 }
 
 # PowerShell 2.0 cannot New-Object 'List[SmbPacket]' (in-memory generic args).
+# Returning an empty collection without a leading comma unwraps to $null, and
+# StrictMode then throws "Property 'Count' cannot be found".
 function New-AppList {
     param([type]$ItemType)
+    $list = $null
     if ($null -ne $ItemType) {
         try {
             $open = [type]('System.Collections.Generic.List`1')
             $closed = $open.MakeGenericType(@($ItemType))
-            return [Activator]::CreateInstance($closed)
+            $list = [Activator]::CreateInstance($closed)
         } catch { }
     }
-    return New-Object System.Collections.ArrayList
+    if ($null -eq $list) {
+        $list = New-Object System.Collections.ArrayList
+    }
+    return ,$list
+}
+
+function Get-AppCount {
+    param($Collection)
+    if ($null -eq $Collection) { return 0 }
+    try { return [int]$Collection.Count } catch { }
+    try { return @($Collection).Count } catch { }
+    return 0
 }
 
 function ConvertTo-SmbPacketArray {
     param($List)
     if ($null -eq $List) { return [SmbPacket[]]@() }
     $tmp = @($List)
-    if ($tmp.Count -eq 0) { return [SmbPacket[]]@() }
+    if ((Get-AppCount $tmp) -eq 0) { return [SmbPacket[]]@() }
     return [SmbPacket[]]$tmp
 }
 
@@ -1205,6 +1219,8 @@ try { [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($fal
 $script:Engine          = New-Object SmbCaptureEngine
 $script:AllPackets      = New-AppList ([SmbPacket])
 $script:ViewPackets     = New-AppList ([SmbPacket])
+if ($null -eq $script:AllPackets)  { $script:AllPackets  = New-Object System.Collections.ArrayList }
+if ($null -eq $script:ViewPackets) { $script:ViewPackets = New-Object System.Collections.ArrayList }
 $script:Smb1Hosts       = @{}
 $script:Smb1CommandHist = @{}
 $script:NextNo          = 1
@@ -1500,7 +1516,7 @@ function Update-PacketView {
         if (Test-PacketFilter $p) { [void]$script:ViewPackets.Add($p) }
     }
     if ($script:lvPackets) {
-        $script:lvPackets.VirtualListSize = $script:ViewPackets.Count
+        $script:lvPackets.VirtualListSize = (Get-AppCount $script:ViewPackets)
         $script:lvPackets.Invalidate()
     }
     Update-FilterBoxColor
@@ -1518,7 +1534,7 @@ function Update-FilterBoxColor {
 }
 
 function Limit-PacketBuffer {
-    if ($script:AllPackets.Count -le $script:MaxPackets) { return }
+    if ((Get-AppCount $script:AllPackets) -le $script:MaxPackets) { return }
     $trim = [Math]::Max(500, [int]($script:MaxPackets * 0.15))
     $script:AllPackets.RemoveRange(0, $trim)
     Update-PacketView
@@ -1591,9 +1607,9 @@ function Add-PacketsToUi {
 function Refresh-PacketListView {
     param([switch]$ScrollEnd)
     if (-not $script:lvPackets) { return }
-    $script:lvPackets.VirtualListSize = $script:ViewPackets.Count
-    if ($ScrollEnd -and $script:chkAutoScroll -and $script:chkAutoScroll.Checked -and $script:ViewPackets.Count -gt 0) {
-        try { $script:lvPackets.EnsureVisible($script:ViewPackets.Count - 1) } catch { }
+    $script:lvPackets.VirtualListSize = (Get-AppCount $script:ViewPackets)
+    if ($ScrollEnd -and $script:chkAutoScroll -and $script:chkAutoScroll.Checked -and (Get-AppCount $script:ViewPackets) -gt 0) {
+        try { $script:lvPackets.EnsureVisible((Get-AppCount $script:ViewPackets) - 1) } catch { }
     } else {
         $script:lvPackets.Invalidate()
     }
@@ -1616,9 +1632,9 @@ function Update-StatusBar {
     if ($script:lblState) { $script:lblState.Text = $state }
     if ($script:lblPkt) {
         $cap = if ($stats) { $stats.Captured } else { 0 }
-        $script:lblPkt.Text = 'Packets: {0}   Shown: {1}' -f $script:AllPackets.Count, $script:ViewPackets.Count
-        if ($cap -gt 0 -and $script:AllPackets.Count -ne $cap) {
-            $script:lblPkt.Text = 'Packets: {0} (engine {1})   Shown: {2}' -f $script:AllPackets.Count, $cap, $script:ViewPackets.Count
+        $script:lblPkt.Text = 'Packets: {0}   Shown: {1}' -f (Get-AppCount $script:AllPackets), (Get-AppCount $script:ViewPackets)
+        if ($cap -gt 0 -and (Get-AppCount $script:AllPackets) -ne $cap) {
+            $script:lblPkt.Text = 'Packets: {0} (engine {1})   Shown: {2}' -f (Get-AppCount $script:AllPackets), $cap, (Get-AppCount $script:ViewPackets)
         }
     }
     if ($script:lblSmb1) {
@@ -1654,7 +1670,7 @@ function Update-CaptureUi {
             if ($batch.Length -gt 0) {
                 [void](Add-PacketsToUi -Packets $batch)
                 Refresh-PacketListView -ScrollEnd
-                if ($script:AllPackets.Count -gt $script:MaxPackets) { Limit-PacketBuffer }
+                if ((Get-AppCount $script:AllPackets) -gt $script:MaxPackets) { Limit-PacketBuffer }
             }
         }
         Update-StatusBar
@@ -1788,7 +1804,7 @@ function Set-HexDump {
 function Get-SelectedPacket {
     if (-not $script:lvPackets -or $script:lvPackets.SelectedIndices.Count -eq 0) { return $null }
     $idx = $script:lvPackets.SelectedIndices[0]
-    if ($idx -lt 0 -or $idx -ge $script:ViewPackets.Count) { return $null }
+    if ($idx -lt 0 -or $idx -ge (Get-AppCount $script:ViewPackets)) { return $null }
     return $script:ViewPackets[$idx]
 }
 
@@ -1911,7 +1927,7 @@ function Import-PcapPath {
 }
 
 function Save-PcapFile {
-    if ($script:ViewPackets.Count -eq 0) {
+    if ((Get-AppCount $script:ViewPackets) -eq 0) {
         [void][System.Windows.Forms.MessageBox]::Show('No packets in the current view to save.', 'Nothing to Save', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
         return
     }
@@ -1926,8 +1942,8 @@ function Save-PcapFile {
         } else {
             [SmbPacketParser]::WritePcap($dlg.FileName, (ConvertTo-SmbPacketArray $script:ViewPackets))
         }
-        Write-AppLog "Saved $($script:ViewPackets.Count) packets to $($dlg.FileName)" 'SUCCESS'
-        [void][System.Windows.Forms.MessageBox]::Show("Saved $($script:ViewPackets.Count) packets to:`n$($dlg.FileName)`n`nPCAP files open in Wireshark (LINKTYPE_IPV4 / 228).", 'Saved', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+        Write-AppLog "Saved $((Get-AppCount $script:ViewPackets)) packets to $($dlg.FileName)" 'SUCCESS'
+        [void][System.Windows.Forms.MessageBox]::Show("Saved $((Get-AppCount $script:ViewPackets)) packets to:`n$($dlg.FileName)`n`nPCAP files open in Wireshark (LINKTYPE_IPV4 / 228).", 'Saved', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
     } catch {
         [void][System.Windows.Forms.MessageBox]::Show("Save failed:`n$($_.Exception.Message)", 'Save Failed', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
     }
@@ -1963,11 +1979,11 @@ function Toggle-MarkSelected {
 function Find-InPackets {
     param([bool]$Forward = $true)
     $q = $script:txtFind.Text
-    if ((Test-BlankString $q) -or $script:ViewPackets.Count -eq 0) { return }
+    if ((Test-BlankString $q) -or (Get-AppCount $script:ViewPackets) -eq 0) { return }
     $ql = $q.ToLowerInvariant()
     $start = $script:FindIndex
     if ($script:lvPackets.SelectedIndices.Count -gt 0) { $start = $script:lvPackets.SelectedIndices[0] }
-    $n = $script:ViewPackets.Count
+    $n = (Get-AppCount $script:ViewPackets)
     for ($k = 1; $k -le $n; $k++) {
         $idx = if ($Forward) { ($start + $k) % $n } else { ($start - $k + $n) % $n }
         $p = $script:ViewPackets[$idx]
@@ -2046,7 +2062,7 @@ function Export-HostsCsv {
 function Update-StatsTab {
     if (-not $script:txtStats) { return }
     $stats = $script:Engine.GetStats()
-    $total = [Math]::Max(1, $script:AllPackets.Count)
+    $total = [Math]::Max(1, (Get-AppCount $script:AllPackets))
     $c1 = @($script:AllPackets | Where-Object { $_.IsSmb1 }).Count
     $c2 = @($script:AllPackets | Where-Object { $_.IsSmb2 -or $_.Protocol -eq 'SMB2' }).Count
     $c3 = @($script:AllPackets | Where-Object { $_.IsSmb3 -or $_.Protocol -eq 'SMB3' }).Count
@@ -2055,8 +2071,8 @@ function Update-StatsTab {
     [void]$sb.AppendLine("SMBv1 Traffic Analyzer v$($script:AppVersion)  -  Statistics")
     [void]$sb.AppendLine(('=' * 64))
     [void]$sb.AppendLine("Engine captured : $($stats.Captured)")
-    [void]$sb.AppendLine("Buffered frames : $($script:AllPackets.Count)")
-    [void]$sb.AppendLine("Displayed       : $($script:ViewPackets.Count)")
+    [void]$sb.AppendLine("Buffered frames : $((Get-AppCount $script:AllPackets))")
+    [void]$sb.AppendLine("Displayed       : $((Get-AppCount $script:ViewPackets))")
     [void]$sb.AppendLine("Dropped         : $($stats.Dropped)")
     [void]$sb.AppendLine("Bytes (engine)  : $($stats.Bytes)")
     [void]$sb.AppendLine("")
@@ -2282,7 +2298,7 @@ function Show-GotoPacket {
     if ($inputBox.ShowDialog($script:MainForm) -eq [System.Windows.Forms.DialogResult]::OK) {
         $n = 0
         if ([int]::TryParse($tb.Text, [ref]$n)) {
-            for ($i = 0; $i -lt $script:ViewPackets.Count; $i++) {
+            for ($i = 0; $i -lt (Get-AppCount $script:ViewPackets); $i++) {
                 if ($script:ViewPackets[$i].No -eq $n) {
                     $script:lvPackets.SelectedIndices.Clear()
                     $script:lvPackets.SelectedIndices.Add($i)
@@ -2787,7 +2803,7 @@ $script:lvPackets.Add_RetrieveVirtualItem({
     param($s, $e)
     try {
         $idx = $e.ItemIndex
-        if ($idx -lt 0 -or $idx -ge $script:ViewPackets.Count) {
+        if ($idx -lt 0 -or $idx -ge (Get-AppCount $script:ViewPackets)) {
             $e.Item = New-Object System.Windows.Forms.ListViewItem('')
             return
         }
