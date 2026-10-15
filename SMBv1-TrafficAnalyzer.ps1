@@ -50,7 +50,7 @@
     .\SMBv1-TrafficAnalyzer.ps1 -SelfTest
 
 .NOTES
-    Version     : 1.13
+    Version     : 1.15
     Compatible  : Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012
                   (PowerShell 3.0), 2012 R2 (PowerShell 4.0), 5.1, and PowerShell 7+.
                   There is no Requires-Version directive. Do not use -shl/-shr
@@ -69,7 +69,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.13'
+$script:AppVersion = '1.15'
 
 # Version is checked at runtime on purpose. Do not add "#Requires -Version".
 # Server 2008 / 2008 R2 is PowerShell 2.0. Server 2012 R2 is 4.0.
@@ -169,6 +169,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 
@@ -244,6 +245,17 @@ public static class SmbPacketParser {
         p.Dst = raw[16] + "." + raw[17] + "." + raw[18] + "." + raw[19];
 
         int proto = raw[9];
+        if (proto == 17) {
+            p.Protocol = "UDP";
+            if (raw.Length >= ihl + 8) {
+                p.SrcPort = (raw[ihl] << 8) | raw[ihl + 1];
+                p.DstPort = (raw[ihl + 2] << 8) | raw[ihl + 3];
+                p.Info = "UDP " + p.SrcPort + " -> " + p.DstPort;
+            } else {
+                p.Info = "Truncated UDP header";
+            }
+            return p;
+        }
         if (proto != 6) {
             p.Protocol = "IP";
             p.Info = "IP protocol " + proto;
@@ -797,7 +809,7 @@ public static class SmbPacketParser {
         int ihl = (vi & 0x0F) * 4;
         if (ihl < 20 || off + ihl > f.Length) return false;
         int tot = (f[off + 2] << 8) | f[off + 3];
-        if (tot < 20) return false;
+        if (tot != 0 && tot < 20) return false;
         return true;
     }
 
@@ -1028,13 +1040,36 @@ public class SmbCaptureEngine {
     public long Bytes;
     public int RecvCount;
     public int ParseFail;
-    public string Error = "";
+    public volatile string Error = "";
+    public volatile string LastSetup = "";
+    public volatile string FirstFrameHex = "";
     public int MaxQueue = 25000;
     Socket _sock;
     Thread _thread;
+    object _sockGate = new object();
+    IPAddress[] _bindIps;
+    int[] _hdrs;
+    int[] _modes;
+    int _recipeCount;
+    int _recipeIndex;
+    const int SioRcvall = -1744830463;
+
+    [DllImport("ws2_32.dll", SetLastError = true)]
+    static extern int WSAIoctl(
+        IntPtr socketHandle,
+        int ioControlCode,
+        byte[] inBuffer,
+        int inBufferSize,
+        byte[] outBuffer,
+        int outBufferSize,
+        out int bytesReturned,
+        IntPtr overlapped,
+        IntPtr completionRoutine);
 
     public bool Start(string localIp) {
         Error = "";
+        LastSetup = "";
+        FirstFrameHex = "";
         Captured = 0;
         Smb1Count = 0;
         Smb2Count = 0;
@@ -1045,32 +1080,11 @@ public class SmbCaptureEngine {
         ParseFail = 0;
         lock (_gate) { _queue = new Queue<SmbPacket>(); }
         try {
-            IPAddress ip = IPAddress.Parse(localIp);
-            _sock = new Socket(AddressFamily.InterNetwork, SocketType.Raw, ProtocolType.IP);
-            _sock.Bind(new IPEndPoint(ip, 0));
-            _sock.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.HeaderIncluded, true);
-            try { _sock.ReceiveBufferSize = 2 * 1024 * 1024; } catch { }
-            _sock.ReceiveTimeout = 400;
-            bool okIoctl = false;
-            int[] modes = GetRcvallModes();
-            Exception last = null;
-            for (int i = 0; i < modes.Length; i++) {
-                try {
-                    byte[] inVal = BitConverter.GetBytes(modes[i]);
-                    byte[] outVal = new byte[4];
-                    _sock.IOControl(IOControlCode.ReceiveAll, inVal, outVal);
-                    okIoctl = true;
-                    Error = "";
-                    break;
-                } catch (Exception ex) {
-                    last = ex;
-                }
-            }
-            if (!okIoctl) {
-                Error = last != null ? last.Message : "SIO_RCVALL failed";
+            BuildRecipes(localIp);
+            _sock = OpenFirstSocket();
+            if (_sock == null) {
+                if (Error == null || Error.Length == 0) Error = "SIO_RCVALL failed";
                 Running = false;
-                try { _sock.Close(); } catch { }
-                _sock = null;
                 return false;
             }
             Running = true;
@@ -1084,8 +1098,121 @@ public class SmbCaptureEngine {
             Error = ex.Message;
             Running = false;
             try { if (_sock != null) _sock.Close(); } catch { }
+            _sock = null;
             return false;
         }
+    }
+
+    void BuildRecipes(string localIp) {
+        IPAddress ifaceIp = IPAddress.Parse(localIp);
+        IPAddress[] binds = new IPAddress[] { ifaceIp, IPAddress.Any };
+        int[] hdrs = new int[] { 1, 0 };
+        int[] modes = GetRcvallModes();
+        _recipeCount = binds.Length * hdrs.Length * modes.Length;
+        _bindIps = new IPAddress[_recipeCount];
+        _hdrs = new int[_recipeCount];
+        _modes = new int[_recipeCount];
+        int n = 0;
+        int b, h, m;
+        for (b = 0; b < binds.Length; b++) {
+            for (h = 0; h < hdrs.Length; h++) {
+                for (m = 0; m < modes.Length; m++) {
+                    _bindIps[n] = binds[b];
+                    _hdrs[n] = hdrs[h];
+                    _modes[n] = modes[m];
+                    n++;
+                }
+            }
+        }
+        _recipeIndex = 0;
+    }
+
+    Socket OpenIndexedSocket(int index) {
+        if (index < 0 || index >= _recipeCount) return null;
+        return TryOneSocket(_bindIps[index], _hdrs[index], _modes[index]);
+    }
+
+    Socket OpenFirstSocket() {
+        int i;
+        for (i = 0; i < _recipeCount; i++) {
+            Socket s = OpenIndexedSocket(i);
+            if (s != null) {
+                _recipeIndex = i;
+                return s;
+            }
+        }
+        return null;
+    }
+
+    public bool TryNextRecipe() {
+        if (RecvCount > 0) return false;
+        int oldIndex = _recipeIndex;
+        int start = _recipeIndex + 1;
+        Socket old = null;
+        lock (_sockGate) {
+            old = _sock;
+            _sock = null;
+        }
+        try { if (old != null) old.Close(); } catch { }
+        int i;
+        for (i = start; i < _recipeCount; i++) {
+            Socket next = OpenIndexedSocket(i);
+            if (next != null) {
+                lock (_sockGate) {
+                    _sock = next;
+                    _recipeIndex = i;
+                }
+                return true;
+            }
+        }
+        Socket fallback = OpenIndexedSocket(oldIndex);
+        if (fallback != null) {
+            lock (_sockGate) {
+                _sock = fallback;
+                _recipeIndex = oldIndex;
+            }
+        }
+        return false;
+    }
+
+    Socket TryOneSocket(IPAddress bindIp, int hdrIncluded, int rcvallMode) {
+        Socket s = null;
+        try {
+            s = new Socket(AddressFamily.InterNetwork, SocketType.Raw, ProtocolType.IP);
+            s.Blocking = true;
+            try { s.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true); } catch { }
+            s.Bind(new IPEndPoint(bindIp, 0));
+            // int 1, not bool true: .NET 2.0 bool option is unreliable on Vista/2008.
+            s.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.HeaderIncluded, hdrIncluded);
+            try { s.ReceiveBufferSize = 2 * 1024 * 1024; } catch { }
+            // Do NOT set ReceiveTimeout. On Server 2008 it makes every raw Receive fail.
+            if (!TryRcvall(s, rcvallMode)) {
+                try { s.Close(); } catch { }
+                return null;
+            }
+            LastSetup = "bind=" + bindIp.ToString() + " hdr=" + hdrIncluded.ToString() + " rcvall=" + rcvallMode.ToString();
+            Error = "";
+            return s;
+        } catch (Exception ex) {
+            Error = ex.Message;
+            try { if (s != null) s.Close(); } catch { }
+            return null;
+        }
+    }
+
+    static bool TryRcvall(Socket sock, int mode) {
+        byte[] inVal = BitConverter.GetBytes(mode);
+        byte[] outVal = new byte[4];
+        try {
+            sock.IOControl(IOControlCode.ReceiveAll, inVal, outVal);
+            return true;
+        } catch { }
+        try {
+            int bytes;
+            int rc = WSAIoctl(sock.Handle, SioRcvall, inVal, inVal.Length, outVal, outVal.Length, out bytes, IntPtr.Zero, IntPtr.Zero);
+            return rc == 0;
+        } catch { }
+        return false;
     }
 
     static int[] GetRcvallModes() {
@@ -1095,14 +1222,16 @@ public class SmbCaptureEngine {
             Version v = Environment.OSVersion.Version;
             if (v.Major < 6 || (v.Major == 6 && v.Minor < 2)) primary = 3;
         } catch { }
-        if (primary == 3) return new int[] { 3, 1 };
-        return new int[] { 1, 3 };
+        if (primary == 3) return new int[] { 3, 1, 2 };
+        return new int[] { 1, 3, 2 };
     }
 
     public void Stop() {
         Running = false;
-        try { if (_sock != null) _sock.Close(); } catch { }
-        _sock = null;
+        lock (_sockGate) {
+            try { if (_sock != null) _sock.Close(); } catch { }
+            _sock = null;
+        }
         try {
             if (_thread != null && _thread.IsAlive) _thread.Join(1500);
         } catch { }
@@ -1134,23 +1263,32 @@ public class SmbCaptureEngine {
 
     void CaptureLoop() {
         byte[] buf = new byte[65535];
-        EndPoint remote = new IPEndPoint(IPAddress.Any, 0);
         while (Running) {
+            Socket s = null;
+            lock (_sockGate) { s = _sock; }
+            if (s == null) {
+                if (!Running) break;
+                Thread.Sleep(30);
+                continue;
+            }
             int n = 0;
             try {
-                remote = new IPEndPoint(IPAddress.Any, 0);
-                n = _sock.ReceiveFrom(buf, ref remote);
+                n = s.Receive(buf, 0, buf.Length, SocketFlags.None);
             } catch (SocketException) {
-                try {
-                    n = _sock.Receive(buf);
-                } catch (SocketException) {
-                    continue;
-                }
+                if (!Running) break;
+                continue;
             } catch {
                 break;
             }
-            if (n < 14) continue;
+            if (n <= 0) continue;
             Interlocked.Increment(ref RecvCount);
+            if (FirstFrameHex == null || FirstFrameHex.Length == 0) {
+                int take = n < 32 ? n : 32;
+                StringBuilder hx = new StringBuilder(take * 3);
+                for (int i = 0; i < take; i++) hx.Append(buf[i].ToString("X2")).Append(' ');
+                FirstFrameHex = hx.ToString();
+            }
+            if (n < 14) continue;
             if (Paused) {
                 Interlocked.Increment(ref Dropped);
                 continue;
@@ -1342,6 +1480,16 @@ function Invoke-SmbAnalyzerSelfTest {
         [void]$failures.Add("Ethernet-wrapped SMB1 live unwrap failed")
     }
 
+    $udp = [byte[]]@(
+        0x45,0x00,0x00,0x1C,0x00,0x00,0x00,0x00,0x40,0x11,0x00,0x00,
+        10,1,1,8, 10,1,1,1,
+        0xC0,0x00, 0x01,0xBD, 0x00,0x08, 0x00,0x00
+    )
+    $pu = [SmbPacketParser]::ParseIpPacket($udp, [datetime]::UtcNow)
+    if (-not $pu -or $pu.Protocol -ne 'UDP' -or $pu.DstPort -ne 445) {
+        [void]$failures.Add("UDP parse failed for probe-style frame")
+    }
+
     if ($failures.Count -gt 0) {
         Write-Host "SELFTEST FAIL ($($failures.Count))" -ForegroundColor Red
         $failures | ForEach-Object { Write-Host " - $_" -ForegroundColor Red }
@@ -1378,6 +1526,9 @@ $script:NextNo          = 1
 $script:MaxPackets      = 25000
 $script:IsAdmin         = $false
 $script:CaptureStarted  = $null
+$script:LastRecipeRotate = $null
+$script:WireZeroLogged  = $false
+$script:LoggedFirstFrame = $false
 $script:SortColumn      = 0
 $script:SortAscending   = $true
 $script:FindIndex       = -1
@@ -1806,7 +1957,31 @@ function Update-StatusBar {
         if ($stats.Recv -eq 0) {
             $script:lblStatusMini.Text = 'No frames from NIC (firewall, 32-bit PowerShell, or wrong interface)'
         } elseif ($stats.Captured -eq 0) {
-            $script:lblStatusMini.Text = 'Frames on wire but none on TCP 139/445 — uncheck SMB ports'
+            $script:lblStatusMini.Text = 'Frames on wire but none matched the capture filter — uncheck SMB ports'
+        }
+    }
+    if ($script:Engine -and $script:Engine.Running -and $stats -and $script:CaptureStarted) {
+        if ($stats.Recv -gt 0 -and -not $script:LoggedFirstFrame) {
+            $script:LoggedFirstFrame = $true
+            Write-AppLog ("First wire frame. setup={0} head={1}" -f $script:Engine.LastSetup, $script:Engine.FirstFrameHex) 'INFO'
+        }
+        if ($stats.Recv -eq 0) {
+            $now = Get-Date
+            $age = ($now - $script:CaptureStarted).TotalSeconds
+            $since = 99
+            if ($script:LastRecipeRotate) { $since = ($now - $script:LastRecipeRotate).TotalSeconds }
+            if ($age -ge 2 -and $since -ge 1.5) {
+                $rotated = $false
+                try { $rotated = [bool]$script:Engine.TryNextRecipe() } catch { $rotated = $false }
+                $script:LastRecipeRotate = $now
+                if ($rotated) {
+                    Write-AppLog ("Wire still 0; switched raw-socket recipe to {0}" -f $script:Engine.LastSetup) 'WARN'
+                    Send-CaptureProbe -Ip (Get-SelectedInterfaceIP)
+                } elseif (-not $script:WireZeroLogged) {
+                    $script:WireZeroLogged = $true
+                    Write-AppLog 'Wire still 0 after every socket recipe. Disable Windows Firewall, use 64-bit powershell.exe from System32, and confirm this NIC faces the SMB clients.' 'ERROR'
+                }
+            }
         }
     }
     if ($script:lblElapsed) { $script:lblElapsed.Text = if ($elapsed) { "Elapsed: $elapsed" } else { 'Elapsed: --' } }
@@ -1971,6 +2146,51 @@ function Get-SelectedPacket {
     return $script:ViewPackets[$idx]
 }
 
+function Enable-RawCaptureFirewall {
+    $exe = $null
+    try { $exe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName } catch { }
+    if (Test-BlankString $exe) {
+        try { $exe = (Get-Process -Id $PID).Path } catch { }
+    }
+    if (Test-BlankString $exe) { $exe = Join-Path $PSHOME 'powershell.exe' }
+    $netsh = Join-Path $env:SystemRoot 'system32\netsh.exe'
+    if (-not (Test-Path -LiteralPath $netsh)) { return }
+    $name = 'SMBv1TrafficAnalyzer'
+    Write-AppLog ("Windows Firewall allow for {0}" -f $exe) 'INFO'
+    foreach ($dir in @('in', 'out')) {
+        try {
+            $out = & $netsh advfirewall firewall add rule "name=$name" "dir=$dir" action=allow "program=$exe" enable=yes profile=any 2>&1 | Out-String
+            if (-not (Test-BlankString $out)) { Write-AppLog ("netsh advfirewall ($dir): {0}" -f $out.Trim()) 'INFO' }
+        } catch {
+            Write-AppLog ("netsh advfirewall ($dir): {0}" -f $_.Exception.Message) 'WARN'
+        }
+    }
+    try {
+        $out2 = & $netsh firewall add allowedprogram $exe $name ENABLE 2>&1 | Out-String
+        if (-not (Test-BlankString $out2)) { Write-AppLog ("netsh firewall: {0}" -f $out2.Trim()) 'INFO' }
+    } catch { }
+}
+
+function Send-CaptureProbe {
+    param([string]$Ip)
+    if (Test-BlankString $Ip) { return }
+    $i = 0
+    while ($i -lt 3) {
+        $udp = $null
+        try {
+            $udp = New-Object System.Net.Sockets.UdpClient
+            $bytes = [byte[]](83, 77, 66, 80, 82, 79, 66, 69)
+            [void]$udp.Send($bytes, $bytes.Length, $Ip, 445)
+        } catch {
+            Write-AppLog ("UDP probe failed: {0}" -f $_.Exception.Message) 'WARN'
+        } finally {
+            if ($udp) { try { $udp.Close() } catch { } }
+        }
+        $i++
+    }
+    Write-AppLog ("Sent UDP probes to {0}:445 (Wire should rise even without SMB clients)." -f $Ip) 'INFO'
+}
+
 function Start-Capture {
     if (-not $script:IsAdmin) {
         [void][System.Windows.Forms.MessageBox]::Show(
@@ -1999,7 +2219,8 @@ function Start-Capture {
     try {
         $osv = [Environment]::OSVersion.Version
         if ($osv.Major -lt 6 -or ($osv.Major -eq 6 -and $osv.Minor -lt 2)) {
-            Write-AppLog 'Server 2008/R2: if Wire stays 0, Windows Firewall may be blocking the raw socket.' 'WARN'
+            Write-AppLog 'Server 2008/R2: allowing this powershell.exe through Windows Firewall, then probing the NIC.' 'INFO'
+            Enable-RawCaptureFirewall
         }
     } catch { }
     $ok = $script:Engine.Start($ip)
@@ -2013,11 +2234,15 @@ function Start-Capture {
         return
     }
     $script:CaptureStarted = Get-Date
+    $script:LastRecipeRotate = Get-Date
+    $script:WireZeroLogged = $false
+    $script:LoggedFirstFrame = $false
     $script:btnStart.Enabled = $false
     $script:btnStop.Enabled = $true
     $script:btnPause.Enabled = $true
     $script:cmbIface.Enabled = $false
-    Write-AppLog "Capture running on $ip." 'SUCCESS'
+    Write-AppLog ("Capture running on {0} ({1})" -f $ip, $script:Engine.LastSetup) 'SUCCESS'
+    Send-CaptureProbe -Ip $ip
 }
 
 function Stop-Capture {
@@ -2269,6 +2494,8 @@ function Update-StatsTab {
     [void]$sb.AppendLine("Buffered frames : $((Get-AppCount $script:AllPackets))")
     [void]$sb.AppendLine("Displayed       : $((Get-AppCount $script:ViewPackets))")
     [void]$sb.AppendLine("Dropped         : $($stats.Dropped)")
+    [void]$sb.AppendLine("NIC frames      : $($stats.Recv)")
+    [void]$sb.AppendLine("Unparsed frames : $($stats.ParseFail)")
     [void]$sb.AppendLine("Bytes (engine)  : $($stats.Bytes)")
     [void]$sb.AppendLine("")
     [void]$sb.AppendLine("Protocol hierarchy")
@@ -2529,6 +2756,12 @@ HOW TO RUN
   5. Click Start. SMBv1 rows turn red. Hosts tab lists talkers.
 
 NO LIVE TRAFFIC?
+  Watch Wire in the status bar after Start.
+    Wire = 0  The raw socket is not receiving. Typical on Server 2008:
+              Windows Firewall / WFP, or 32-bit powershell.exe from SysWOW64.
+              Run C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe as
+              Administrator. Start adds a firewall allow for this executable.
+    Wire > 0, Packets = 0  Uncheck "SMB ports (139/445)" (default on 2008).
   File > Load demo capture injects synthetic SMBv1 + SMB2 frames so you can
   learn the UI. File > Open PCAP loads a Wireshark capture (Ethernet or raw IPv4).
   Saved files from this tool open in Wireshark (LINKTYPE 228 / IPv4).
@@ -2774,6 +3007,12 @@ $script:chkPortsOnly.Text = 'SMB ports (139/445)'
 $script:chkPortsOnly.ForeColor = $script:C.White
 $script:chkPortsOnly.AutoSize = $true
 $script:chkPortsOnly.Checked = $true
+try {
+    $osvPorts = [Environment]::OSVersion.Version
+    if ($osvPorts.Major -lt 6 -or ($osvPorts.Major -eq 6 -and $osvPorts.Minor -lt 2)) {
+        $script:chkPortsOnly.Checked = $false
+    }
+} catch { }
 $script:chkPortsOnly.Margin = New-Object System.Windows.Forms.Padding(8, 8, 6, 4)
 $script:Tip.SetToolTip($script:chkPortsOnly, 'Capture filter: only TCP 139 and 445. Uncheck to capture all IPv4 (heavier).')
 $script:chkPortsOnly.Add_CheckedChanged({ if ($script:Engine) { $script:Engine.SmbPortsOnly = $script:chkPortsOnly.Checked } })
