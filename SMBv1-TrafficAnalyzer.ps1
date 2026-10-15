@@ -50,7 +50,7 @@
     .\SMBv1-TrafficAnalyzer.ps1 -SelfTest
 
 .NOTES
-    Version     : 1.12
+    Version     : 1.13
     Compatible  : Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012
                   (PowerShell 3.0), 2012 R2 (PowerShell 4.0), 5.1, and PowerShell 7+.
                   There is no Requires-Version directive. Do not use -shl/-shr
@@ -69,7 +69,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.12'
+$script:AppVersion = '1.13'
 
 # Version is checked at runtime on purpose. Do not add "#Requires -Version".
 # Server 2008 / 2008 R2 is PowerShell 2.0. Server 2012 R2 is 4.0.
@@ -223,6 +223,8 @@ public class CaptureStats {
     public int Dropped;
     public int Queue;
     public long Bytes;
+    public int Recv;
+    public int ParseFail;
 }
 
 public static class SmbPacketParser {
@@ -756,9 +758,55 @@ public static class SmbPacketParser {
             Buffer.BlockCopy(frame, ipOff, ip, 0, n);
             return ip;
         }
-        if (link == 101 || link == 12 || link == 228 || link == 14) return frame;
-        if (frame[0] == 0x45) return frame;
+        if (link == 101 || link == 12 || link == 228 || link == 14) {
+            byte[] u = UnwrapToIp(frame);
+            return u != null ? u : frame;
+        }
+        return UnwrapToIp(frame);
+    }
+
+    // Server 2008 SIO_RCVALL often delivers Ethernet (or VLAN) frames, not raw IPv4.
+    public static byte[] UnwrapToIp(byte[] frame) {
+        if (frame == null || frame.Length < 20) return null;
+        if (IsIpv4Header(frame, 0)) return frame;
+        if (frame.Length >= 34) {
+            int typeOff = 12;
+            int etype = (frame[12] << 8) | frame[13];
+            if (etype == 0x8100 && frame.Length >= 38) {
+                typeOff = 16;
+                etype = (frame[16] << 8) | frame[17];
+            }
+            if (etype == 0x0800) {
+                int ipOff = typeOff + 2;
+                if (IsIpv4Header(frame, ipOff)) return SliceBytes(frame, ipOff);
+            }
+        }
+        if (frame.Length >= 36 && IsIpv4Header(frame, 16)) return SliceBytes(frame, 16);
+        int max = frame.Length - 20;
+        if (max > 80) max = 80;
+        for (int off = 1; off <= max; off++) {
+            if (IsIpv4Header(frame, off)) return SliceBytes(frame, off);
+        }
         return null;
+    }
+
+    static bool IsIpv4Header(byte[] f, int off) {
+        if (f == null || off < 0 || off + 20 > f.Length) return false;
+        int vi = f[off];
+        if (((vi >> 4) & 0x0F) != 4) return false;
+        int ihl = (vi & 0x0F) * 4;
+        if (ihl < 20 || off + ihl > f.Length) return false;
+        int tot = (f[off + 2] << 8) | f[off + 3];
+        if (tot < 20) return false;
+        return true;
+    }
+
+    static byte[] SliceBytes(byte[] src, int off) {
+        int n = src.Length - off;
+        if (n < 20) return null;
+        byte[] d = new byte[n];
+        Buffer.BlockCopy(src, off, d, 0, n);
+        return d;
     }
 
     static ushort Swap16(ushort v) { return (ushort)((v << 8) | (v >> 8)); }
@@ -978,6 +1026,8 @@ public class SmbCaptureEngine {
     public int Smb3Count;
     public int Dropped;
     public long Bytes;
+    public int RecvCount;
+    public int ParseFail;
     public string Error = "";
     public int MaxQueue = 25000;
     Socket _sock;
@@ -985,16 +1035,44 @@ public class SmbCaptureEngine {
 
     public bool Start(string localIp) {
         Error = "";
+        Captured = 0;
+        Smb1Count = 0;
+        Smb2Count = 0;
+        Smb3Count = 0;
+        Dropped = 0;
+        Bytes = 0;
+        RecvCount = 0;
+        ParseFail = 0;
+        lock (_gate) { _queue = new Queue<SmbPacket>(); }
         try {
             IPAddress ip = IPAddress.Parse(localIp);
             _sock = new Socket(AddressFamily.InterNetwork, SocketType.Raw, ProtocolType.IP);
             _sock.Bind(new IPEndPoint(ip, 0));
             _sock.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.HeaderIncluded, true);
-            byte[] inVal = BitConverter.GetBytes(1);
-            byte[] outVal = new byte[4];
-            _sock.IOControl(IOControlCode.ReceiveAll, inVal, outVal);
-            _sock.ReceiveBufferSize = 2 * 1024 * 1024;
+            try { _sock.ReceiveBufferSize = 2 * 1024 * 1024; } catch { }
             _sock.ReceiveTimeout = 400;
+            bool okIoctl = false;
+            int[] modes = GetRcvallModes();
+            Exception last = null;
+            for (int i = 0; i < modes.Length; i++) {
+                try {
+                    byte[] inVal = BitConverter.GetBytes(modes[i]);
+                    byte[] outVal = new byte[4];
+                    _sock.IOControl(IOControlCode.ReceiveAll, inVal, outVal);
+                    okIoctl = true;
+                    Error = "";
+                    break;
+                } catch (Exception ex) {
+                    last = ex;
+                }
+            }
+            if (!okIoctl) {
+                Error = last != null ? last.Message : "SIO_RCVALL failed";
+                Running = false;
+                try { _sock.Close(); } catch { }
+                _sock = null;
+                return false;
+            }
             Running = true;
             Paused = false;
             _thread = new Thread(CaptureLoop);
@@ -1008,6 +1086,17 @@ public class SmbCaptureEngine {
             try { if (_sock != null) _sock.Close(); } catch { }
             return false;
         }
+    }
+
+    static int[] GetRcvallModes() {
+        // 1 = RCVALL_ON, 3 = RCVALL_IPLEVEL. Vista/2008 often need IPLEVEL.
+        int primary = 1;
+        try {
+            Version v = Environment.OSVersion.Version;
+            if (v.Major < 6 || (v.Major == 6 && v.Minor < 2)) primary = 3;
+        } catch { }
+        if (primary == 3) return new int[] { 3, 1 };
+        return new int[] { 1, 3 };
     }
 
     public void Stop() {
@@ -1038,29 +1127,46 @@ public class SmbCaptureEngine {
         s.Dropped = Dropped;
         lock (_gate) { s.Queue = _queue.Count; }
         s.Bytes = Bytes;
+        s.Recv = RecvCount;
+        s.ParseFail = ParseFail;
         return s;
     }
 
     void CaptureLoop() {
         byte[] buf = new byte[65535];
+        EndPoint remote = new IPEndPoint(IPAddress.Any, 0);
         while (Running) {
             int n = 0;
             try {
-                n = _sock.Receive(buf);
+                remote = new IPEndPoint(IPAddress.Any, 0);
+                n = _sock.ReceiveFrom(buf, ref remote);
             } catch (SocketException) {
-                continue;
+                try {
+                    n = _sock.Receive(buf);
+                } catch (SocketException) {
+                    continue;
+                }
             } catch {
                 break;
             }
-            if (n < 20) continue;
+            if (n < 14) continue;
+            Interlocked.Increment(ref RecvCount);
             if (Paused) {
                 Interlocked.Increment(ref Dropped);
                 continue;
             }
             byte[] raw = new byte[n];
             Buffer.BlockCopy(buf, 0, raw, 0, n);
-            SmbPacket pkt = SmbPacketParser.ParseIpPacket(raw, DateTime.Now);
-            if (pkt == null) continue;
+            byte[] ip = SmbPacketParser.UnwrapToIp(raw);
+            if (ip == null) {
+                Interlocked.Increment(ref ParseFail);
+                continue;
+            }
+            SmbPacket pkt = SmbPacketParser.ParseIpPacket(ip, DateTime.Now);
+            if (pkt == null) {
+                Interlocked.Increment(ref ParseFail);
+                continue;
+            }
             bool smbPort = pkt.SrcPort == 445 || pkt.DstPort == 445 || pkt.SrcPort == 139 || pkt.DstPort == 139;
             if (SmbPortsOnly && !smbPort) continue;
             if (SmbPayloadOnly && !pkt.HasSmb) continue;
@@ -1223,6 +1329,17 @@ function Invoke-SmbAnalyzerSelfTest {
     }
     if (-not $p -or $p.Src -ne '10.1.1.8' -or $p.DstPort -ne 445) {
         [void]$failures.Add("IP/TCP parse failed for crafted frame")
+    }
+
+    $eth = New-Object byte[] ($crafted.Length + 14)
+    $eth[12] = 0x08
+    $eth[13] = 0x00
+    [Buffer]::BlockCopy($crafted, 0, $eth, 14, $crafted.Length)
+    $un = [SmbPacketParser]::UnwrapToIp($eth)
+    $pe = $null
+    if ($un) { $pe = [SmbPacketParser]::ParseIpPacket($un, [datetime]::UtcNow) }
+    if (-not $pe -or -not $pe.IsSmb1 -or $pe.DstPort -ne 445) {
+        [void]$failures.Add("Ethernet-wrapped SMB1 live unwrap failed")
     }
 
     if ($failures.Count -gt 0) {
@@ -1677,8 +1794,20 @@ function Update-StatusBar {
         $script:lblSmb1.ForeColor = if ($eng1 -gt 0) { $script:C.Smb1Hot } else { $script:C.Smb1Idle }
     }
     if ($script:lblDrop) {
-        $d = if ($stats) { $stats.Dropped } else { 0 }
-        $script:lblDrop.Text = 'Dropped: {0}' -f $d
+        $recv = 0; $bad = 0; $d = 0
+        if ($stats) {
+            $recv = $stats.Recv
+            $bad = $stats.ParseFail
+            $d = $stats.Dropped
+        }
+        $script:lblDrop.Text = 'Wire: {0}  Bad: {1}  Drop: {2}' -f $recv, $bad, $d
+    }
+    if ($script:lblStatusMini -and $script:Engine.Running -and $stats) {
+        if ($stats.Recv -eq 0) {
+            $script:lblStatusMini.Text = 'No frames from NIC (firewall, 32-bit PowerShell, or wrong interface)'
+        } elseif ($stats.Captured -eq 0) {
+            $script:lblStatusMini.Text = 'Frames on wire but none on TCP 139/445 — uncheck SMB ports'
+        }
     }
     if ($script:lblElapsed) { $script:lblElapsed.Text = if ($elapsed) { "Elapsed: $elapsed" } else { 'Elapsed: --' } }
     if ($script:lblHosts) { $script:lblHosts.Text = 'SMBv1 hosts: {0}' -f $script:Smb1Hosts.Count }
@@ -1860,6 +1989,19 @@ function Start-Capture {
     $script:Engine.SmbPortsOnly = $script:chkPortsOnly.Checked
     $script:Engine.SmbPayloadOnly = $script:chkSmbPayload.Checked
     Write-AppLog "Starting capture on $ip (SMB ports only=$($script:Engine.SmbPortsOnly))" 'INFO'
+    if ([IntPtr]::Size -eq 4) {
+        $pf86 = $null
+        try { $pf86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)') } catch { }
+        if (-not (Test-BlankString $pf86)) {
+            Write-AppLog '32-bit PowerShell on 64-bit Windows: SIO_RCVALL often captures nothing. Use C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' 'WARN'
+        }
+    }
+    try {
+        $osv = [Environment]::OSVersion.Version
+        if ($osv.Major -lt 6 -or ($osv.Major -eq 6 -and $osv.Minor -lt 2)) {
+            Write-AppLog 'Server 2008/R2: if Wire stays 0, Windows Firewall may be blocking the raw socket.' 'WARN'
+        }
+    } catch { }
     $ok = $script:Engine.Start($ip)
     if (-not $ok) {
         [void][System.Windows.Forms.MessageBox]::Show(

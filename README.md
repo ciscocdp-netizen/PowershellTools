@@ -19,7 +19,7 @@ powershell.exe -ExecutionPolicy Bypass -File .\SMBv1-TrafficAnalyzer.ps1 -SelfTe
 
 Live capture needs Administrator. Offline PCAP review, the built-in **Demo** capture, server SMB config, and event-log scan do not.
 
-Use **v1.12+**. On startup the console should print `SMBv1 Traffic Analyzer v1.12`. If you still see `Property 'IP' cannot be found`, `Property 'Count' cannot be found`, or the earlier Server 2008 errors, the file on disk is an older copy (often renamed `SMB_Traffic.ps1`). Replace it.
+Use **v1.13+**. On startup the console should print `SMBv1 Traffic Analyzer v1.13`. Server 2008 live capture now unwraps Ethernet frames from `SIO_RCVALL` (2012 often delivers raw IPv4). Watch the status bar **Wire** counter: 0 means the raw socket is blocked; rising Wire with 0 Packets means uncheck **SMB ports**.
 
 The window reflows when resized: the toolbar and status bar wrap, the display-filter box stretches, the Info column fills leftover list width, and the three capture panes keep their split ratio.
 
