@@ -19,7 +19,7 @@ powershell.exe -ExecutionPolicy Bypass -File .\SMBv1-TrafficAnalyzer.ps1 -SelfTe
 
 Live capture needs Administrator. Offline PCAP review, the built-in **Demo** capture, server SMB config, and event-log scan do not.
 
-Use **v1.15+**. On startup the console should print `SMBv1 Traffic Analyzer v1.15`. On Server 2008, live capture no longer sets `ReceiveTimeout` on the raw socket (that made every receive fail), tries several bind/header/`SIO_RCVALL` recipes, adds a Windows Firewall allow for this `powershell.exe`, and sends a UDP probe so **Wire** should rise even without SMB clients. Watch the status bar: Wire = 0 means the NIC is still blocked (firewall or 32-bit SysWOW64 PowerShell); rising Wire with 0 Packets means uncheck **SMB ports**.
+Use **v1.16+**. On startup the console should print `SMBv1 Traffic Analyzer v1.16`. On Server 2008, live capture no longer sets `ReceiveTimeout` on the raw socket (that made every receive fail), tries several bind/header/`SIO_RCVALL` recipes, adds a Windows Firewall allow for this `powershell.exe`, and sends a UDP probe so **Wire** should rise even without SMB clients. Watch the status bar: Wire = 0 means the NIC is still blocked (firewall or 32-bit SysWOW64 PowerShell); rising Wire with 0 Packets means uncheck **SMB ports**. **Export CSV** / Save on PowerShell 2.0 enumerates host command maps by key (calling `.ToString()` on a raw hashtable enumerator threw `You cannot call a method on a null-valued expression`).
 
 The window reflows when resized: the toolbar and status bar wrap, the display-filter box stretches, the Info column fills leftover list width, and the three capture panes keep their split ratio.
 

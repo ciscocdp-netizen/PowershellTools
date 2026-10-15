@@ -50,7 +50,7 @@
     .\SMBv1-TrafficAnalyzer.ps1 -SelfTest
 
 .NOTES
-    Version     : 1.15
+    Version     : 1.16
     Compatible  : Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012
                   (PowerShell 3.0), 2012 R2 (PowerShell 4.0), 5.1, and PowerShell 7+.
                   There is no Requires-Version directive. Do not use -shl/-shr
@@ -69,7 +69,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.15'
+$script:AppVersion = '1.16'
 
 # Version is checked at runtime on purpose. Do not add "#Requires -Version".
 # Server 2008 / 2008 R2 is PowerShell 2.0. Server 2012 R2 is 4.0.
@@ -1376,6 +1376,14 @@ function Get-AppEnumerable {
         [void]$out.Add($Value)
         return ,$out
     }
+    if ($Value -is [System.Collections.IEnumerator]) {
+        try {
+            while ($Value.MoveNext()) {
+                if ($null -ne $Value.Current) { [void]$out.Add($Value.Current) }
+            }
+        } catch { }
+        return ,$out
+    }
     try {
         foreach ($v in ([System.Collections.IEnumerable]$Value)) {
             if ($null -ne $v) { [void]$out.Add($v) }
@@ -1384,6 +1392,40 @@ function Get-AppEnumerable {
         [void]$out.Add($Value)
     }
     return ,$out
+}
+
+function Join-AppStrings {
+    param($Values, [string]$Separator = '; ', [switch]$KeepEmpty)
+    $parts = New-Object System.Collections.ArrayList
+    foreach ($v in (Get-AppEnumerable $Values)) {
+        $s = [string]$v
+        if ($KeepEmpty -or -not (Test-BlankString $s)) { [void]$parts.Add($s) }
+    }
+    if ($parts.Count -eq 0) { return '' }
+    return [string]::Join($Separator, [string[]]$parts.ToArray())
+}
+
+function Format-AppCommandMap {
+    param($Map)
+    $parts = New-Object System.Collections.ArrayList
+    if ($null -eq $Map) { return '' }
+    $keys = $null
+    try { $keys = $Map.Keys } catch { }
+    foreach ($k in (Get-AppEnumerable $keys)) {
+        $val = ''
+        try { $val = [string]$Map[$k] } catch { }
+        [void]$parts.Add(('{0}={1}' -f [string]$k, $val))
+    }
+    if ($parts.Count -eq 0) { return '' }
+    return [string]::Join('; ', [string[]]$parts.ToArray())
+}
+
+function ConvertTo-AppTimeText {
+    param($Value, [string]$Format = 'yyyy-MM-dd HH:mm:ss')
+    if ($null -eq $Value) { return '' }
+    try { return ([datetime]$Value).ToString($Format) } catch { }
+    try { return [string]$Value } catch { }
+    return ''
 }
 
 function Get-AppNote {
@@ -1488,6 +1530,25 @@ function Invoke-SmbAnalyzerSelfTest {
     $pu = [SmbPacketParser]::ParseIpPacket($udp, [datetime]::UtcNow)
     if (-not $pu -or $pu.Protocol -ne 'UDP' -or $pu.DstPort -ne 445) {
         [void]$failures.Add("UDP parse failed for probe-style frame")
+    }
+
+    $map = @{ Negotiate = 2; SessionSetup = 1 }
+    $fmt = Format-AppCommandMap $map
+    if ($fmt -notmatch 'Negotiate=2') { [void]$failures.Add("Format-AppCommandMap failed: $fmt") }
+    $csvTmp = Join-Path ([System.IO.Path]::GetTempPath()) ("smb1-csv-{0}.csv" -f [guid]::NewGuid().ToString('N'))
+    try {
+        $emptyUsers = New-AppList ([string])
+        $csvRow = New-AppObject -Property @{
+            IP = '10.0.0.1'
+            Commands = $fmt
+            Users = (Join-AppStrings -Values $emptyUsers)
+        }
+        Export-AppCsv -InputObject $csvRow -Path $csvTmp
+        if (-not (Test-Path -LiteralPath $csvTmp)) { [void]$failures.Add('Export-AppCsv did not write a file') }
+    } catch {
+        [void]$failures.Add("Export-AppCsv: $($_.Exception.Message)")
+    } finally {
+        if (Test-Path -LiteralPath $csvTmp) { Remove-Item -LiteralPath $csvTmp -Force -ErrorAction SilentlyContinue }
     }
 
     if ($failures.Count -gt 0) {
@@ -1626,14 +1687,50 @@ function New-AppObject {
     return New-Object PSObject -Property $Property
 }
 
+function ConvertTo-CsvField {
+    param($Value)
+    $s = ''
+    if ($null -ne $Value) {
+        try { $s = [string]$Value } catch { $s = '' }
+    }
+    $s = $s.Replace('"', '""')
+    $needsQuotes = $false
+    if ($s.IndexOf(',') -ge 0) { $needsQuotes = $true }
+    if ($s.IndexOf('"') -ge 0) { $needsQuotes = $true }
+    if ($s.IndexOf([char]10) -ge 0) { $needsQuotes = $true }
+    if ($s.IndexOf([char]13) -ge 0) { $needsQuotes = $true }
+    if ($needsQuotes) { return '"' + $s + '"' }
+    return $s
+}
+
 function Export-AppCsv {
     param($InputObject, [string]$Path)
     $data = @($InputObject)
+    if ((Get-AppCount $data) -eq 0) { throw 'No rows to export' }
     try {
-        $data | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
-    } catch {
-        $data | Export-Csv -Path $Path -NoTypeInformation
+        $data | Export-Csv -Path $Path -NoTypeInformation -ErrorAction Stop
+        return
+    } catch { }
+    $first = $null
+    foreach ($row in (Get-AppEnumerable $data)) {
+        if ($null -ne $row) { $first = $row; break }
     }
+    if ($null -eq $first) { throw 'No rows to export' }
+    $headers = New-Object System.Collections.ArrayList
+    foreach ($prop in (Get-AppEnumerable $first.PSObject.Properties)) {
+        [void]$headers.Add([string]$prop.Name)
+    }
+    $lines = New-Object System.Collections.ArrayList
+    [void]$lines.Add((Join-AppStrings -Values $headers -Separator ',' -KeepEmpty))
+    foreach ($row in (Get-AppEnumerable $data)) {
+        if ($null -eq $row) { continue }
+        $fields = New-Object System.Collections.ArrayList
+        foreach ($name in (Get-AppEnumerable $headers)) {
+            [void]$fields.Add((ConvertTo-CsvField (Get-AppNote $row $name)))
+        }
+        [void]$lines.Add((Join-AppStrings -Values $fields -Separator ',' -KeepEmpty))
+    }
+    [System.IO.File]::WriteAllLines($Path, [string[]]$lines.ToArray())
 }
 
 function Get-LocalCim {
@@ -2339,7 +2436,41 @@ function Save-PcapFile {
     if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
     try {
         if ($dlg.FileName -like '*.csv') {
-            Export-AppCsv -InputObject ($script:ViewPackets | Select-Object No, Time, Src, SrcPort, Dst, DstPort, Protocol, Length, SmbVersion, SmbCommand, UserName, SharePath, FileName, Info) -Path $dlg.FileName
+            $csvRows = New-Object System.Collections.ArrayList
+            foreach ($p in (Get-AppEnumerable $script:ViewPackets)) {
+                if ($null -eq $p) { continue }
+                $rowNo = [string]$p.No
+                $rowTime = ConvertTo-AppTimeText $p.Time
+                $rowSrc = [string]$p.Src
+                $rowSp = [string]$p.SrcPort
+                $rowDst = [string]$p.Dst
+                $rowDp = [string]$p.DstPort
+                $rowProto = [string]$p.Protocol
+                $rowLen = [string]$p.Length
+                $rowVer = [string]$p.SmbVersion
+                $rowCmd = [string]$p.SmbCommand
+                $rowUser = [string]$p.UserName
+                $rowShare = [string]$p.SharePath
+                $rowFile = [string]$p.FileName
+                $rowInfo = [string]$p.Info
+                [void]$csvRows.Add((New-AppObject -Property @{
+                    No         = $rowNo
+                    Time       = $rowTime
+                    Src        = $rowSrc
+                    SrcPort    = $rowSp
+                    Dst        = $rowDst
+                    DstPort    = $rowDp
+                    Protocol   = $rowProto
+                    Length     = $rowLen
+                    SmbVersion = $rowVer
+                    SmbCommand = $rowCmd
+                    UserName   = $rowUser
+                    SharePath  = $rowShare
+                    FileName   = $rowFile
+                    Info       = $rowInfo
+                }))
+            }
+            Export-AppCsv -InputObject $csvRows -Path $dlg.FileName
         } else {
             [SmbPacketParser]::WritePcap($dlg.FileName, (ConvertTo-SmbPacketArray $script:ViewPackets))
         }
@@ -2409,19 +2540,20 @@ function Update-HostsGrid {
     foreach ($ip in (Get-AppEnumerable ($script:Smb1Hosts.Keys | Sort-Object))) {
         $h = $script:Smb1Hosts[$ip]
         if ($null -eq $h) { continue }
+        $cmdMap = Get-AppNote $h 'Commands'
+        $cmdKeys = $null
+        if ($null -ne $cmdMap) { try { $cmdKeys = $cmdMap.Keys } catch { } }
         $cmdParts = New-Object System.Collections.ArrayList
-        foreach ($cmd in (Get-AppEnumerable ($h.Commands.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 4))) {
-            [void]$cmdParts.Add(('{0}({1})' -f $cmd.Key, $cmd.Value))
+        foreach ($k in (Get-AppEnumerable $cmdKeys)) {
+            $val = ''
+            try { $val = [string]$cmdMap[$k] } catch { }
+            [void]$cmdParts.Add(('{0}({1})' -f [string]$k, $val))
         }
-        $cmds = [string]::Join(', ', $cmdParts.ToArray())
-        $users = @((Get-AppNote $h 'Users')) -join '; '
-        $shares = @((Get-AppNote $h 'Shares')) -join '; '
-        $firstSeen = Get-AppNote $h 'FirstSeen'
-        $lastSeen = Get-AppNote $h 'LastSeen'
-        $firstText = ''
-        $lastText = ''
-        try { $firstText = $firstSeen.ToString('HH:mm:ss') } catch { }
-        try { $lastText = $lastSeen.ToString('HH:mm:ss') } catch { }
+        $cmds = Join-AppStrings -Values $cmdParts -Separator ', '
+        $users = Join-AppStrings -Values (Get-AppNote $h 'Users')
+        $shares = Join-AppStrings -Values (Get-AppNote $h 'Shares')
+        $firstText = ConvertTo-AppTimeText -Value (Get-AppNote $h 'FirstSeen') -Format 'HH:mm:ss'
+        $lastText = ConvertTo-AppTimeText -Value (Get-AppNote $h 'LastSeen') -Format 'HH:mm:ss'
         $idx = $script:dgvHosts.Rows.Add((Get-AppNote $h 'IP'), (Get-AppNote $h 'HostName'), (Get-AppNote $h 'Role'), (Get-AppNote $h 'Packets'), $firstText, $lastText, $users, $shares, $cmds, (Get-AppNote $h 'Sample'))
         $script:dgvHosts.Rows[$idx].DefaultCellStyle.BackColor = $script:C.Smb1
         if ($sel -and ((Get-AppNote $h 'IP') -eq $sel)) { $script:dgvHosts.Rows[$idx].Selected = $true }
@@ -2451,29 +2583,41 @@ function Export-HostsCsv {
     $dlg.Filter = 'CSV (*.csv)|*.csv'
     $dlg.FileName = "smbv1-hosts-$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
     if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
-    $rows = foreach ($ip in (Get-AppEnumerable ($script:Smb1Hosts.Keys | Sort-Object))) {
-        $h = $script:Smb1Hosts[$ip]
-        if ($null -eq $h) { continue }
-        $cmdBits = New-Object System.Collections.ArrayList
-        foreach ($cmd in (Get-AppEnumerable $h.Commands.GetEnumerator())) {
-            [void]$cmdBits.Add($cmd.Key.ToString() + '=' + $cmd.Value.ToString())
+    try {
+        $rows = New-Object System.Collections.ArrayList
+        foreach ($ip in (Get-AppEnumerable ($script:Smb1Hosts.Keys | Sort-Object))) {
+            $h = $script:Smb1Hosts[$ip]
+            if ($null -eq $h) { continue }
+            $rowIp = [string](Get-AppNote $h 'IP')
+            $rowHost = [string](Get-AppNote $h 'HostName')
+            $rowRole = [string](Get-AppNote $h 'Role')
+            $rowPkts = [string](Get-AppNote $h 'Packets')
+            $rowFirst = ConvertTo-AppTimeText (Get-AppNote $h 'FirstSeen')
+            $rowLast = ConvertTo-AppTimeText (Get-AppNote $h 'LastSeen')
+            $rowUsers = Join-AppStrings -Values (Get-AppNote $h 'Users')
+            $rowShares = Join-AppStrings -Values (Get-AppNote $h 'Shares')
+            $rowFiles = Join-AppStrings -Values (Get-AppNote $h 'Files')
+            $rowCmds = Format-AppCommandMap (Get-AppNote $h 'Commands')
+            [void]$rows.Add((New-AppObject -Property @{
+                IP        = $rowIp
+                HostName  = $rowHost
+                Role      = $rowRole
+                Packets   = $rowPkts
+                FirstSeen = $rowFirst
+                LastSeen  = $rowLast
+                Users     = $rowUsers
+                Shares    = $rowShares
+                Files     = $rowFiles
+                Commands  = $rowCmds
+            }))
         }
-        $cmdSummary = [string]::Join('; ', $cmdBits.ToArray())
-        New-AppObject -Property @{
-            IP        = (Get-AppNote $h 'IP')
-            HostName  = (Get-AppNote $h 'HostName')
-            Role      = (Get-AppNote $h 'Role')
-            Packets   = (Get-AppNote $h 'Packets')
-            FirstSeen = (Get-AppNote $h 'FirstSeen')
-            LastSeen  = (Get-AppNote $h 'LastSeen')
-            Users     = (@((Get-AppNote $h 'Users')) -join '; ')
-            Shares    = (@((Get-AppNote $h 'Shares')) -join '; ')
-            Files     = (@((Get-AppNote $h 'Files')) -join '; ')
-            Commands  = $cmdSummary
-        }
+        Export-AppCsv -InputObject $rows -Path $dlg.FileName
+        Write-AppLog "Exported SMBv1 hosts to $($dlg.FileName)" 'SUCCESS'
+        [void][System.Windows.Forms.MessageBox]::Show("Exported $((Get-AppCount $rows)) host(s) to:`n$($dlg.FileName)", 'Exported', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+    } catch {
+        Write-AppLog ("Host CSV export failed: {0}" -f $_.Exception.Message) 'ERROR'
+        [void][System.Windows.Forms.MessageBox]::Show("Export failed:`n$($_.Exception.Message)", 'Export Failed', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
     }
-    Export-AppCsv -InputObject $rows -Path $dlg.FileName
-    Write-AppLog "Exported SMBv1 hosts to $($dlg.FileName)" 'SUCCESS'
 }
 
 function Update-StatsTab {
@@ -2772,7 +2916,7 @@ WHAT "LIKE WIRESHARK" MEANS HERE
   - Follow TCP stream, mark packets (Space), go to packet (Ctrl+G)
   - Color by protocol (SMBv1 red, SMB2 blue, SMB3 green)
   - Right-click: filter this IP, copy summary, follow stream
-  - Export current view as PCAP or CSV
+  - Export current view as PCAP or CSV (Hosts tab Export CSV is PowerShell 2.0-safe)
   - Resize freely: toolbar/status wrap, the filter box stretches, the Info
     column fills leftover list width, and the three panes keep their split ratio
 
