@@ -19,11 +19,13 @@ powershell.exe -ExecutionPolicy Bypass -File .\SMBv1-TrafficAnalyzer.ps1 -SelfTe
 
 Live capture needs Administrator. Offline PCAP review, the built-in **Demo** capture, server SMB config, and event-log scan do not.
 
-Use **v1.11+**. On startup the console should print `SMBv1 Traffic Analyzer v1.11`. If you still see `Property 'Count' cannot be found`, `Value cannot be null`, `List[SmbPacket]`, `-shl`, or a flashing second console, the file on disk is an older copy (often renamed `SMB_Traffic.ps1`). Replace it.
+Use **v1.12+**. On startup the console should print `SMBv1 Traffic Analyzer v1.12`. If you still see `Property 'IP' cannot be found`, `Property 'Count' cannot be found`, or the earlier Server 2008 errors, the file on disk is an older copy (often renamed `SMB_Traffic.ps1`). Replace it.
 
 The window reflows when resized: the toolbar and status bar wrap, the display-filter box stretches, the Info column fills leftover list width, and the three capture panes keep their split ratio.
 
 Older copies fail with:
+- `Property 'IP' cannot be found` (PowerShell 2.0 `foreach ($x in $null)` runs once; StrictMode then rejects `$x.IP`)
+- `Property 'Count' cannot be found` (PowerShell 2.0 unwraps an empty list return to `$null`; StrictMode then rejects `.Count`)
 - `Value cannot be null. Parameter name: item` on `ComboBox.Items.Add` (PowerShell 2.0 unwraps an empty adapter list to `@($null)`)
 - `Cannot find type [System.Collections.Generic.List[SmbPacket]]` (PowerShell 2.0 cannot construct generic lists of in-memory types)
 - A second command window that opens and closes immediately (STA relaunch via `Start-Process`)

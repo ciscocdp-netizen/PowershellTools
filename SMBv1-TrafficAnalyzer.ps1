@@ -50,7 +50,7 @@
     .\SMBv1-TrafficAnalyzer.ps1 -SelfTest
 
 .NOTES
-    Version     : 1.11
+    Version     : 1.12
     Compatible  : Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012
                   (PowerShell 3.0), 2012 R2 (PowerShell 4.0), 5.1, and PowerShell 7+.
                   There is no Requires-Version directive. Do not use -shl/-shr
@@ -69,7 +69,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.11'
+$script:AppVersion = '1.12'
 
 # Version is checked at runtime on purpose. Do not add "#Requires -Version".
 # Server 2008 / 2008 R2 is PowerShell 2.0. Server 2012 R2 is 4.0.
@@ -1123,6 +1123,40 @@ function Get-AppCount {
     return 0
 }
 
+# PowerShell 2.0 foreach ($x in $null) runs once with $x = $null.
+function Get-AppEnumerable {
+    param($Value)
+    $out = New-Object System.Collections.ArrayList
+    if ($null -eq $Value) { return ,$out }
+    if ($Value -is [string]) {
+        [void]$out.Add($Value)
+        return ,$out
+    }
+    try {
+        foreach ($v in ([System.Collections.IEnumerable]$Value)) {
+            if ($null -ne $v) { [void]$out.Add($v) }
+        }
+    } catch {
+        [void]$out.Add($Value)
+    }
+    return ,$out
+}
+
+function Get-AppNote {
+    param($Object, [string]$Name)
+    if ($null -eq $Object -or (Test-BlankString $Name)) { return $null }
+    try {
+        if ($Object -is [System.Collections.IDictionary] -and $Object.Contains($Name)) {
+            return $Object[$Name]
+        }
+    } catch { }
+    try {
+        $prop = $Object.PSObject.Properties[$Name]
+        if ($prop) { return $prop.Value }
+    } catch { }
+    return $null
+}
+
 function ConvertTo-SmbPacketArray {
     param($List)
     if ($null -eq $List) { return [SmbPacket[]]@() }
@@ -1512,7 +1546,7 @@ function Test-PacketFilter {
 function Update-PacketView {
     $script:FilterText = if ($script:txtFilter) { $script:txtFilter.Text } else { '' }
     $script:ViewPackets.Clear()
-    foreach ($p in $script:AllPackets) {
+    foreach ($p in (Get-AppEnumerable $script:AllPackets)) {
         if (Test-PacketFilter $p) { [void]$script:ViewPackets.Add($p) }
     }
     if ($script:lvPackets) {
@@ -1619,7 +1653,7 @@ function Update-StatusBar {
     $stats = $null
     if ($script:Engine) { $stats = $script:Engine.GetStats() }
     $smb1View = 0
-    foreach ($p in $script:ViewPackets) { if ($p.IsSmb1) { $smb1View++ } }
+    foreach ($p in (Get-AppEnumerable $script:ViewPackets)) { if ($p.IsSmb1) { $smb1View++ } }
     $elapsed = ''
     if ($script:CaptureStarted) {
         $ts = (Get-Date) - $script:CaptureStarted
@@ -1790,7 +1824,7 @@ function Set-HexDump {
     $box.SelectAll()
     $box.SelectionColor = $script:C.HexText
     $box.DeselectAll()
-    foreach ($r in $highlightRanges) {
+    foreach ($r in (Get-AppEnumerable $highlightRanges)) {
         if ($r.Start -ge 0 -and ($r.Start + $r.Length) -le $box.TextLength) {
             $box.Select($r.Start, $r.Length)
             $box.SelectionColor = $script:C.Red
@@ -2005,19 +2039,30 @@ function Update-HostsGrid {
     $sel = $null
     if ($script:dgvHosts.SelectedRows.Count -gt 0) { $sel = $script:dgvHosts.SelectedRows[0].Cells['IP'].Value }
     $script:dgvHosts.Rows.Clear()
-    foreach ($ip in ($script:Smb1Hosts.Keys | Sort-Object)) {
+    foreach ($ip in (Get-AppEnumerable ($script:Smb1Hosts.Keys | Sort-Object))) {
         $h = $script:Smb1Hosts[$ip]
-        $cmds = ($h.Commands.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 4 | ForEach-Object { '{0}({1})' -f $_.Key, $_.Value }) -join ', '
-        $users = ($h.Users -join '; ')
-        $shares = ($h.Shares -join '; ')
-        $idx = $script:dgvHosts.Rows.Add($h.IP, $h.HostName, $h.Role, $h.Packets, $h.FirstSeen.ToString('HH:mm:ss'), $h.LastSeen.ToString('HH:mm:ss'), $users, $shares, $cmds, $h.Sample)
+        if ($null -eq $h) { continue }
+        $cmdParts = New-Object System.Collections.ArrayList
+        foreach ($cmd in (Get-AppEnumerable ($h.Commands.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 4))) {
+            [void]$cmdParts.Add(('{0}({1})' -f $cmd.Key, $cmd.Value))
+        }
+        $cmds = [string]::Join(', ', $cmdParts.ToArray())
+        $users = @((Get-AppNote $h 'Users')) -join '; '
+        $shares = @((Get-AppNote $h 'Shares')) -join '; '
+        $firstSeen = Get-AppNote $h 'FirstSeen'
+        $lastSeen = Get-AppNote $h 'LastSeen'
+        $firstText = ''
+        $lastText = ''
+        try { $firstText = $firstSeen.ToString('HH:mm:ss') } catch { }
+        try { $lastText = $lastSeen.ToString('HH:mm:ss') } catch { }
+        $idx = $script:dgvHosts.Rows.Add((Get-AppNote $h 'IP'), (Get-AppNote $h 'HostName'), (Get-AppNote $h 'Role'), (Get-AppNote $h 'Packets'), $firstText, $lastText, $users, $shares, $cmds, (Get-AppNote $h 'Sample'))
         $script:dgvHosts.Rows[$idx].DefaultCellStyle.BackColor = $script:C.Smb1
-        if ($sel -and $h.IP -eq $sel) { $script:dgvHosts.Rows[$idx].Selected = $true }
+        if ($sel -and ((Get-AppNote $h 'IP') -eq $sel)) { $script:dgvHosts.Rows[$idx].Selected = $true }
     }
 }
 
 function Resolve-HostNames {
-    foreach ($ip in @($script:Smb1Hosts.Keys)) {
+    foreach ($ip in (Get-AppEnumerable $script:Smb1Hosts.Keys)) {
         try {
             $entry = [System.Net.Dns]::GetHostEntry($ip)
             $script:Smb1Hosts[$ip].HostName = $entry.HostName
@@ -2039,19 +2084,24 @@ function Export-HostsCsv {
     $dlg.Filter = 'CSV (*.csv)|*.csv'
     $dlg.FileName = "smbv1-hosts-$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
     if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
-    $rows = foreach ($ip in ($script:Smb1Hosts.Keys | Sort-Object)) {
+    $rows = foreach ($ip in (Get-AppEnumerable ($script:Smb1Hosts.Keys | Sort-Object))) {
         $h = $script:Smb1Hosts[$ip]
-        $cmdSummary = @($h.Commands.GetEnumerator() | ForEach-Object { $_.Key.ToString() + '=' + $_.Value.ToString() }) -join '; '
+        if ($null -eq $h) { continue }
+        $cmdBits = New-Object System.Collections.ArrayList
+        foreach ($cmd in (Get-AppEnumerable $h.Commands.GetEnumerator())) {
+            [void]$cmdBits.Add($cmd.Key.ToString() + '=' + $cmd.Value.ToString())
+        }
+        $cmdSummary = [string]::Join('; ', $cmdBits.ToArray())
         New-AppObject -Property @{
-            IP        = $h.IP
-            HostName  = $h.HostName
-            Role      = $h.Role
-            Packets   = $h.Packets
-            FirstSeen = $h.FirstSeen
-            LastSeen  = $h.LastSeen
-            Users     = ($h.Users -join '; ')
-            Shares    = ($h.Shares -join '; ')
-            Files     = ($h.Files -join '; ')
+            IP        = (Get-AppNote $h 'IP')
+            HostName  = (Get-AppNote $h 'HostName')
+            Role      = (Get-AppNote $h 'Role')
+            Packets   = (Get-AppNote $h 'Packets')
+            FirstSeen = (Get-AppNote $h 'FirstSeen')
+            LastSeen  = (Get-AppNote $h 'LastSeen')
+            Users     = (@((Get-AppNote $h 'Users')) -join '; ')
+            Shares    = (@((Get-AppNote $h 'Shares')) -join '; ')
+            Files     = (@((Get-AppNote $h 'Files')) -join '; ')
             Commands  = $cmdSummary
         }
     }
@@ -2063,10 +2113,13 @@ function Update-StatsTab {
     if (-not $script:txtStats) { return }
     $stats = $script:Engine.GetStats()
     $total = [Math]::Max(1, (Get-AppCount $script:AllPackets))
-    $c1 = @($script:AllPackets | Where-Object { $_.IsSmb1 }).Count
-    $c2 = @($script:AllPackets | Where-Object { $_.IsSmb2 -or $_.Protocol -eq 'SMB2' }).Count
-    $c3 = @($script:AllPackets | Where-Object { $_.IsSmb3 -or $_.Protocol -eq 'SMB3' }).Count
-    $tcp = @($script:AllPackets | Where-Object { $_.Protocol -eq 'TCP' }).Count
+    $c1 = 0; $c2 = 0; $c3 = 0; $tcp = 0
+    foreach ($p in (Get-AppEnumerable $script:AllPackets)) {
+        if ($p.IsSmb1) { $c1++ }
+        elseif ($p.IsSmb2 -or $p.Protocol -eq 'SMB2') { $c2++ }
+        elseif ($p.IsSmb3 -or $p.Protocol -eq 'SMB3') { $c3++ }
+        elseif ($p.Protocol -eq 'TCP') { $tcp++ }
+    }
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine("SMBv1 Traffic Analyzer v$($script:AppVersion)  -  Statistics")
     [void]$sb.AppendLine(('=' * 64))
@@ -2084,14 +2137,15 @@ function Update-StatsTab {
     [void]$sb.AppendLine("")
     [void]$sb.AppendLine("SMBv1 hosts     : $($script:Smb1Hosts.Count)")
     [void]$sb.AppendLine("SMBv1 commands")
-    foreach ($e in ($script:Smb1CommandHist.GetEnumerator() | Sort-Object Value -Descending)) {
+    foreach ($e in (Get-AppEnumerable ($script:Smb1CommandHist.GetEnumerator() | Sort-Object Value -Descending))) {
         [void]$sb.AppendLine(("  {0,-24} {1}" -f $e.Key, $e.Value))
     }
     [void]$sb.AppendLine("")
     [void]$sb.AppendLine("Top SMBv1 talkers")
     $top = $script:Smb1Hosts.Values | Sort-Object Packets -Descending | Select-Object -First 12
-    foreach ($h in $top) {
-        [void]$sb.AppendLine(("  {0,-16} {1,-8} {2,6} pkts  {3}" -f $h.IP, $h.Role, $h.Packets, $h.HostName))
+    foreach ($h in (Get-AppEnumerable $top)) {
+        $line = "  {0,-16} {1,-8} {2,6} pkts  {3}" -f (Get-AppNote $h 'IP'), (Get-AppNote $h 'Role'), (Get-AppNote $h 'Packets'), (Get-AppNote $h 'HostName')
+        [void]$sb.AppendLine($line)
     }
     $script:txtStats.Text = $sb.ToString()
 }
@@ -2150,7 +2204,7 @@ function Get-SmbServerConfigText {
     try {
         $conns = @(Get-LocalCim -ClassName Win32_ServerConnection)
         [void]$sb.AppendLine("  Count: $($conns.Count)")
-        foreach ($c in $conns | Select-Object -First 40) {
+        foreach ($c in (Get-AppEnumerable ($conns | Select-Object -First 40))) {
             [void]$sb.AppendLine(("  User={0,-20} Computer={1,-18} Share={2}" -f $c.UserName, $c.ComputerName, $c.ShareName))
         }
     } catch {
@@ -2231,7 +2285,7 @@ function Scan-SmbEventLogs {
     foreach ($log in $logs) {
         try {
             $events = Get-WinEvent -FilterHashtable @{ LogName = $log; StartTime = $since } -ErrorAction Stop -MaxEvents 400
-            foreach ($e in $events) {
+            foreach ($e in (Get-AppEnumerable $events)) {
                 $msg = ''
                 try { $msg = $e.Message } catch { $msg = '' }
                 if ($msg.Length -gt 300) { $msg = $msg.Substring(0, 300) }
