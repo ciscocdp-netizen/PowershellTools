@@ -13,7 +13,9 @@
     The key column may contain IPv4 addresses, hostnames, or a mix (auto per
     row). IPs are resolved (DNS PTR, falling back to System.Net.Dns) and then
     looked up in Active Directory. Hostnames skip PTR and go to AD (with an
-    optional DNS A lookup for the IP). Results are saved via a Save dialog.
+    optional DNS A lookup for the IP). You pick which AD domain to connect to
+    (current forest domains and trusts are listed; you can also type a domain
+    or DC). Results are saved via a Save dialog.
 
     Reading/writing .xlsx uses Excel (COM) if installed, otherwise the
     ImportExcel module if available, otherwise falls back to CSV.
@@ -34,8 +36,13 @@
 .PARAMETER DnsServer
     DNS server for PTR/A queries. Blank uses the system default.
 
+.PARAMETER Domain
+    AD domain DNS name or NetBIOS name to bind to. When omitted, discovered
+    forest domains and trusts are listed and you choose one.
+
 .PARAMETER Server
-    Domain controller or domain DNS name for AD queries.
+    Domain controller (or domain DNS name) for AD queries. When set, the
+    domain picker is skipped and this DC is used.
 
 .PARAMETER Ping
     Ping each host to record Online / No reply.
@@ -56,7 +63,7 @@
     .\Resolve-SMBv1Hosts.ps1 -SelfTest
 
 .NOTES
-    Version      : 1.1
+    Version      : 1.2
     Requirements : Windows PowerShell 5.1, RSAT ActiveDirectory module
                    (for OS / OU / Enabled lookups).
     Run with     : powershell.exe -ExecutionPolicy Bypass -File .\Resolve-SMBv1Hosts.ps1
@@ -90,6 +97,7 @@ param(
     [ValidateSet('Auto', 'IPv4', 'Hostname')]
     [string]$KeyKind,
     [string]$DnsServer,
+    [string]$Domain,
     [string]$Server,
     [switch]$Ping,
     [switch]$NonInteractive,
@@ -99,7 +107,7 @@ param(
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.1'
+$script:Version = '1.2'
 $script:NonInteractive = [bool]$NonInteractive -or [bool]$SelfTest
 
 #region ---------- Small utilities ----------
@@ -793,6 +801,19 @@ function Invoke-SelfTest {
     $hs = Get-SuggestedKeyProfile -Profiles $hp
     Assert-SelfTest ($hs.Name -eq 'ComputerName' -and $hs.KindHint -eq 'Hostname') 'Suggest hostname when no IP column exists'
 
+    $domList = New-Object System.Collections.ArrayList
+    $domList = Add-AdDomainChoice -List $domList -DnsRoot 'corp.example.com' -NetBIOS 'CORP' -PDC 'dc01.corp.example.com' -Kind 'Current logon domain' -IsCurrent $true
+    $domList = Add-AdDomainChoice -List $domList -DnsRoot 'CORP.EXAMPLE.COM' -Kind 'Forest root'
+    Assert-SelfTest ($domList.Count -eq 1 -and $domList[0].Kind -eq 'Current logon domain' -and $domList[0].PDC -eq 'dc01.corp.example.com') 'Duplicate domain DNS names are merged'
+    $domList = Add-AdDomainChoice -List $domList -DnsRoot 'child.corp.example.com' -NetBIOS 'CHILD' -Kind 'Forest domain'
+    Assert-SelfTest ($domList.Count -eq 2) 'Second forest domain is added'
+    Assert-SelfTest (Test-AdDomainChoiceMatch -Choice $domList[0] -Name 'CORP') 'Match domain by NetBIOS'
+    Assert-SelfTest (Test-AdDomainChoiceMatch -Choice $domList[0] -Name 'dc01.corp.example.com') 'Match domain by PDC host'
+    Assert-SelfTest (Test-AdDomainChoiceMatch -Choice $domList[0] -Name 'corp.example.com') 'Match domain by DNS root'
+    Assert-SelfTest (-not (Test-AdDomainChoiceMatch -Choice $domList[0] -Name 'child.corp.example.com')) 'Do not match a different domain'
+    $domLabel = Format-AdDomainChoiceLabel $domList[0]
+    Assert-SelfTest ($domLabel -match 'corp.example.com' -and $domLabel -match 'CORP' -and $domLabel -match 'Current logon domain') 'Domain picker label includes DNS, NetBIOS, and kind'
+
     Write-Host ''
     Write-Host 'All self-tests passed.' -ForegroundColor Green
 }
@@ -1473,6 +1494,242 @@ function Get-OUPathFromCanonicalName {
     $CanonicalName
 }
 
+function New-AdDomainChoice {
+    param(
+        [Parameter(Mandatory)][string]$DnsRoot,
+        [string]$NetBIOS,
+        [string]$PDC,
+        [string]$Kind = 'Domain',
+        [bool]$IsCurrent = $false
+    )
+    [pscustomobject]@{
+        DnsRoot   = $DnsRoot.Trim()
+        NetBIOS   = $NetBIOS
+        PDC       = $PDC
+        Kind      = $Kind
+        IsCurrent = [bool]$IsCurrent
+    }
+}
+
+function Add-AdDomainChoice {
+    param(
+        $List,
+        [string]$DnsRoot,
+        [string]$NetBIOS,
+        [string]$PDC,
+        [string]$Kind = 'Domain',
+        [bool]$IsCurrent = $false
+    )
+    $acc = ConvertTo-ArrayList $List
+    if ([string]::IsNullOrWhiteSpace($DnsRoot)) { return $acc }
+    $key = $DnsRoot.Trim().ToLowerInvariant()
+    foreach ($existing in $acc) {
+        if ($existing.DnsRoot -and $existing.DnsRoot.ToLowerInvariant() -eq $key) {
+            if ($IsCurrent) {
+                $existing.IsCurrent = $true
+                $existing.Kind = $Kind
+            }
+            if (-not $existing.PDC -and $PDC) { $existing.PDC = $PDC }
+            if (-not $existing.NetBIOS -and $NetBIOS) { $existing.NetBIOS = $NetBIOS }
+            return $acc
+        }
+    }
+    [void]$acc.Add((New-AdDomainChoice -DnsRoot $DnsRoot -NetBIOS $NetBIOS -PDC $PDC -Kind $Kind -IsCurrent $IsCurrent))
+    $acc
+}
+
+function Test-AdDomainChoiceMatch {
+    param($Choice, [string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name) -or $null -eq $Choice) { return $false }
+    $n = $Name.Trim()
+    foreach ($candidate in @($Choice.DnsRoot, $Choice.NetBIOS, $Choice.PDC)) {
+        if ($candidate -and [string]::Equals([string]$candidate, $n, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    $false
+}
+
+function Format-AdDomainChoiceLabel {
+    param($Choice)
+    if ($null -eq $Choice) { return '' }
+    $parts = New-Object System.Collections.Generic.List[string]
+    $parts.Add([string]$Choice.DnsRoot)
+    if ($Choice.NetBIOS) { $parts.Add('[' + $Choice.NetBIOS + ']') }
+    $parts.Add('-')
+    $parts.Add([string]$Choice.Kind)
+    if ($Choice.PDC) { $parts.Add('(PDC ' + $Choice.PDC + ')') }
+    $parts -join ' '
+}
+
+function Get-AdDomainCatalog {
+    param([hashtable]$DiscoverParams)
+    if ($null -eq $DiscoverParams) { $DiscoverParams = @{} }
+    $list = New-Object System.Collections.ArrayList
+
+    $current = $null
+    try {
+        $current = Get-ADDomain @DiscoverParams -ErrorAction Stop
+    }
+    catch {
+        Write-Host "  Current domain not detected: $($_.Exception.Message)" -ForegroundColor DarkYellow
+    }
+
+    if ($current) {
+        $list = Add-AdDomainChoice -List $list -DnsRoot $current.DNSRoot -NetBIOS $current.NetBIOSName `
+            -PDC $current.PDCEmulator -Kind 'Current logon domain' -IsCurrent $true
+
+        try {
+            $forest = Get-ADForest @DiscoverParams -ErrorAction Stop
+            $root = [string]$forest.RootDomain
+            foreach ($name in (ConvertTo-ArrayList $forest.Domains)) {
+                $dns = [string]$name
+                if ([string]::IsNullOrWhiteSpace($dns)) { continue }
+                if ([string]::Equals($dns, $current.DNSRoot, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+                $kind = 'Forest domain'
+                if ($root -and [string]::Equals($dns, $root, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $kind = 'Forest root'
+                }
+                $child = $null
+                try {
+                    $child = Get-ADDomain -Identity $dns @DiscoverParams -ErrorAction Stop
+                }
+                catch {
+                    try {
+                        $childParams = @{} + $DiscoverParams
+                        $childParams.Server = $dns
+                        $child = Get-ADDomain -Identity $dns @childParams -ErrorAction Stop
+                    }
+                    catch { }
+                }
+                if ($child) {
+                    $list = Add-AdDomainChoice -List $list -DnsRoot $child.DNSRoot -NetBIOS $child.NetBIOSName `
+                        -PDC $child.PDCEmulator -Kind $kind
+                }
+                else {
+                    $list = Add-AdDomainChoice -List $list -DnsRoot $dns -Kind $kind
+                }
+            }
+        }
+        catch {
+            Write-Host "  Forest domains could not be enumerated: $($_.Exception.Message)" -ForegroundColor DarkYellow
+        }
+
+        try {
+            $rawTrusts = Get-ADTrust -Filter * @DiscoverParams -ErrorAction Stop
+            $trustItems = New-Object System.Collections.ArrayList
+            if ($null -eq $rawTrusts) { }
+            elseif ($rawTrusts -is [System.Array] -or ($rawTrusts -is [System.Collections.IList] -and -not ($rawTrusts.PSObject.Properties['Target']))) {
+                $count = [int]$rawTrusts.Count
+                for ($i = 0; $i -lt $count; $i++) { [void]$trustItems.Add($rawTrusts[$i]) }
+            }
+            else {
+                [void]$trustItems.Add($rawTrusts)
+            }
+            foreach ($t in $trustItems) {
+                if ($null -eq $t) { continue }
+                $target = [string]$t.Target
+                if ([string]::IsNullOrWhiteSpace($target)) { continue }
+                $kind = 'Trusted domain'
+                if ($t.TrustType) { $kind = "Trust: $($t.TrustType)" }
+                if ($t.Direction) { $kind = "$kind ($($t.Direction))" }
+                $list = Add-AdDomainChoice -List $list -DnsRoot $target -Kind $kind
+            }
+        }
+        catch {
+            Write-Host "  Trusted domains could not be enumerated: $($_.Exception.Message)" -ForegroundColor DarkYellow
+        }
+    }
+
+    ConvertTo-ArrayList $list
+}
+
+function Select-AdDomainInteractive {
+    param(
+        $Catalog,
+        [string]$Preselected
+    )
+    $list = ConvertTo-ArrayList $Catalog
+    Write-Host ''
+    if ($list.Count -eq 0) {
+        Write-Host '  No domains were discovered automatically.' -ForegroundColor DarkYellow
+    }
+    else {
+        Write-Host '  Discovered domains (current forest + trusts). Lookups use the one you pick.' -ForegroundColor White
+        Write-Host '  Child domains are listed separately — pick the domain the computers live in.' -ForegroundColor DarkGray
+        Write-Host ''
+        Write-Host ('    {0} {1,-4} {2}' -f ' ', '#', 'Domain') -ForegroundColor DarkGray
+        Write-Host ('    {0} {1,-4} {2}' -f ' ', '--', '------') -ForegroundColor DarkGray
+        $starDefault = 0
+        for ($i = 0; $i -lt $list.Count; $i++) {
+            if ($list[$i].IsCurrent) { $starDefault = $i }
+            if ($Preselected -and (Test-AdDomainChoiceMatch -Choice $list[$i] -Name $Preselected)) { $starDefault = $i }
+        }
+        for ($i = 0; $i -lt $list.Count; $i++) {
+            $marker = if ($i -eq $starDefault) { '*' } else { ' ' }
+            Write-Host ('    {0}[{1,2}] {2}' -f $marker, ($i + 1), (Format-AdDomainChoiceLabel $list[$i]))
+        }
+        Write-Host ('     [{0,2}] {1}' -f ($list.Count + 1), 'Type a domain DNS name or domain controller')
+        Write-Host '    * = default' -ForegroundColor DarkGray
+    }
+
+    if ($Preselected) {
+        foreach ($c in $list) {
+            if (Test-AdDomainChoiceMatch -Choice $c -Name $Preselected) {
+                Write-Host "  Using -Domain '$($c.DnsRoot)'." -ForegroundColor Green
+                return $c
+            }
+        }
+        Write-Host "  -Domain '$Preselected' was not in the discovered list; connecting to it directly." -ForegroundColor DarkYellow
+        return (New-AdDomainChoice -DnsRoot $Preselected -Kind 'Specified')
+    }
+
+    if ($list.Count -eq 0) {
+        $typed = (Read-Host '  Domain DNS name, NetBIOS name, or DC hostname').Trim()
+        if (-not $typed) { return $null }
+        return (New-AdDomainChoice -DnsRoot $typed -Kind 'Typed')
+    }
+
+    $default = 0
+    for ($i = 0; $i -lt $list.Count; $i++) {
+        if ($list[$i].IsCurrent) { $default = $i }
+    }
+    $idx = Read-ListIndex -Count ($list.Count + 1) -DefaultIndex $default -Prompt '  Which domain should AD lookups connect to?'
+    if ($idx -eq $list.Count) {
+        while ($true) {
+            $typed = (Read-Host '  Domain DNS name, NetBIOS name, or DC hostname').Trim()
+            if ($typed) { return (New-AdDomainChoice -DnsRoot $typed -Kind 'Typed') }
+            Write-Host '  Please enter a domain or DC name.' -ForegroundColor DarkYellow
+            if ($script:NonInteractive) { return $null }
+        }
+    }
+    $list[$idx]
+}
+
+function Connect-ChosenAdDomain {
+    param(
+        [Parameter(Mandatory)][string]$Identity,
+        [hashtable]$AdParams
+    )
+    if ($null -eq $AdParams) { $AdParams = @{} }
+
+    $firstError = $null
+    try {
+        return Get-ADDomain -Identity $Identity @AdParams -ErrorAction Stop
+    }
+    catch {
+        $firstError = $_.Exception.Message
+    }
+    try {
+        $asServer = @{} + $AdParams
+        $asServer.Server = $Identity
+        return Get-ADDomain @asServer -ErrorAction Stop
+    }
+    catch {
+        throw "Could not connect to '$Identity' as a domain or DC. $($firstError); $($_.Exception.Message)"
+    }
+}
+
 function Get-HostEnrichment {
     param(
         [string]$KeyValue,
@@ -1482,7 +1739,8 @@ function Get-HostEnrichment {
         [string]$DnsServer,
         [hashtable]$AdParams,
         [bool]$AdAvailable,
-        [bool]$DoPing
+        [bool]$DoPing,
+        [string]$AdDomain
     )
 
     $info = [ordered]@{
@@ -1493,6 +1751,7 @@ function Get-HostEnrichment {
         Resolved_FQDN      = $null
         Resolve_Method     = $null
         Ping               = $null
+        AD_Domain          = $AdDomain
         AD_Found           = $null
         AD_Enabled         = $null
         AD_OperatingSystem = $null
@@ -1730,30 +1989,78 @@ if (-not (Read-YesNo -Prompt '  Continue with this key column?' -Default $true))
     Write-Host 'Exiting.'; return
 }
 
+$adParams = @{}
+$chosenAdDomain = $null
+if ($adAvailable) {
+    Write-Section 'Active Directory domain'
+    if ($Server) {
+        $adParams.Server = $Server
+        Write-Host "  Using -Server '$Server'." -ForegroundColor Green
+        if (Read-YesNo -Prompt '  Use alternate credentials for AD?' -Default $false) {
+            $adParams.Credential = Get-Credential -Message "Enter credentials for $Server"
+        }
+        try {
+            $identity = if ($Domain) { $Domain } else { $Server }
+            $domainInfo = Connect-ChosenAdDomain -Identity $identity -AdParams $adParams
+            $adParams.Server = $(if ($domainInfo.PDCEmulator) { $domainInfo.PDCEmulator } else { $Server })
+            $chosenAdDomain = $domainInfo.DNSRoot
+            Write-Host "  Connected to AD domain: $chosenAdDomain" -ForegroundColor Green
+            Write-Host "  Domain controller    : $($adParams.Server)" -ForegroundColor Green
+        }
+        catch {
+            Write-Host "  Could not contact AD via -Server: $($_.Exception.Message)" -ForegroundColor Red
+            if (-not (Read-YesNo -Prompt '  Continue with DNS resolution only?' -Default $true)) { Write-Host 'Exiting.'; return }
+            $adAvailable = $false
+        }
+    }
+    else {
+        Write-Host '  Discovering domains in the current forest and trusts...' -ForegroundColor DarkGray
+        $catalog = Get-AdDomainCatalog
+        $connected = $false
+        while (-not $connected) {
+            $choice = Select-AdDomainInteractive -Catalog $catalog -Preselected $Domain
+            if ($null -eq $choice -or [string]::IsNullOrWhiteSpace($choice.DnsRoot)) {
+                if (-not (Read-YesNo -Prompt '  No domain selected. Continue with DNS resolution only?' -Default $false)) {
+                    Write-Host 'Exiting.'; return
+                }
+                $adAvailable = $false
+                break
+            }
+            $adParams = @{}
+            if (Read-YesNo -Prompt "  Use alternate credentials for '$($choice.DnsRoot)'?" -Default $false) {
+                $adParams.Credential = Get-Credential -Message "Enter credentials for $($choice.DnsRoot)"
+            }
+            try {
+                $domainInfo = Connect-ChosenAdDomain -Identity $choice.DnsRoot -AdParams $adParams
+                $adParams.Server = $(if ($domainInfo.PDCEmulator) { $domainInfo.PDCEmulator } else { $domainInfo.DNSRoot })
+                $chosenAdDomain = $domainInfo.DNSRoot
+                Write-Host "  Connected to AD domain: $chosenAdDomain" -ForegroundColor Green
+                if ($domainInfo.NetBIOSName) {
+                    Write-Host "  NetBIOS name         : $($domainInfo.NetBIOSName)" -ForegroundColor Green
+                }
+                Write-Host "  Domain controller    : $($adParams.Server)" -ForegroundColor Green
+                $connected = $true
+            }
+            catch {
+                Write-Host "  Could not contact $($choice.DnsRoot): $($_.Exception.Message)" -ForegroundColor Red
+                $Domain = $null
+                if ($script:NonInteractive) {
+                    if (-not (Read-YesNo -Prompt '  Continue with DNS resolution only?' -Default $true)) { Write-Host 'Exiting.'; return }
+                    $adAvailable = $false
+                    break
+                }
+                if (Read-YesNo -Prompt '  Pick a different domain?' -Default $true) { continue }
+                if (-not (Read-YesNo -Prompt '  Continue with DNS resolution only?' -Default $true)) { Write-Host 'Exiting.'; return }
+                $adAvailable = $false
+                break
+            }
+        }
+    }
+}
+
 Write-Section 'Lookup options'
 if (-not $PSBoundParameters.ContainsKey('DnsServer')) {
     $DnsServer = (Read-Host '  DNS server to query (blank = system default)').Trim()
-}
-
-$adParams = @{}
-if ($Server) { $adParams.Server = $Server }
-if ($adAvailable) {
-    if (-not $Server) {
-        $adServer = (Read-Host '  Domain controller or domain to query (blank = current domain)').Trim()
-        if ($adServer) { $adParams.Server = $adServer }
-    }
-    if (Read-YesNo -Prompt '  Use alternate credentials for AD?' -Default $false) {
-        $adParams.Credential = Get-Credential -Message 'Enter credentials for Active Directory'
-    }
-    try {
-        $domainInfo = Get-ADDomain @adParams
-        Write-Host "  Connected to AD domain: $($domainInfo.DNSRoot)" -ForegroundColor Green
-    }
-    catch {
-        Write-Host "  Could not contact AD: $($_.Exception.Message)" -ForegroundColor Red
-        if (-not (Read-YesNo -Prompt '  Continue with DNS resolution only?' -Default $true)) { Write-Host 'Exiting.'; return }
-        $adAvailable = $false
-    }
 }
 
 $doPing = if ($Ping) { $true } else { Read-YesNo -Prompt '  Ping each host to check if it is online? (slower)' -Default $false }
@@ -1784,7 +2091,7 @@ foreach ($row in $rows) {
     if (-not $cache.ContainsKey($cacheKey)) {
         $cache[$cacheKey] = Get-HostEnrichment -KeyValue $rawKey -KeyKind $effectiveKind `
             -FallbackHost $fallbackHost -FallbackIp $fallbackIp -DnsServer $DnsServer `
-            -AdParams $adParams -AdAvailable $adAvailable -DoPing $doPing
+            -AdParams $adParams -AdAvailable $adAvailable -DoPing $doPing -AdDomain $chosenAdDomain
     }
 
     $lookup = $cache[$cacheKey]
@@ -1822,6 +2129,9 @@ $resultArray = ConvertTo-ObjectArray $results
 $resolved = @($resultArray | Where-Object { $_.Resolved_FQDN }).Count
 Write-Host ("  Total rows        : {0}" -f $resultArray.Count)
 Write-Host ("  Unique keys       : {0}" -f $cache.Count)
+if ($chosenAdDomain) {
+    Write-Host ("  AD domain         : {0}" -f $chosenAdDomain) -ForegroundColor Green
+}
 Write-Host ("  Resolved to name  : {0}" -f $resolved) -ForegroundColor Green
 Write-Host ("  Unresolved        : {0}" -f ($resultArray.Count - $resolved)) -ForegroundColor Yellow
 if ($adAvailable) {
