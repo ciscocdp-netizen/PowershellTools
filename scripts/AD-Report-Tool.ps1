@@ -338,6 +338,79 @@ function Escape-ODataString ([string]$Value) {
     return ($Value -replace "'", "''")
 }
 
+function ConvertTo-SidString {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [System.Security.Principal.SecurityIdentifier]) {
+        return $Value.Value
+    }
+    if ($Value -is [byte[]]) {
+        try {
+            return (New-Object System.Security.Principal.SecurityIdentifier($Value, 0)).Value
+        } catch { return $null }
+    }
+    $s = [string]$Value
+    if ($s -match '^S-\d-') { return $s }
+    return $null
+}
+
+function Get-SelectedGroupFilterNames {
+    $sel = New-Object System.Collections.Generic.List[string]
+    if (-not $gbGroup.Visible) { return @() }
+    if ($rdoNoGroup.Checked) { return @() }
+    for ($i = 0; $i -lt $lstGroups.Items.Count; $i++) {
+        if (-not $lstGroups.GetItemChecked($i)) { continue }
+        $n = [string]$lstGroups.Items[$i]
+        if (-not $n -or $n -eq "(no groups found)") { continue }
+        $sel.Add($n)
+    }
+    return @($sel)
+}
+
+function Resolve-ADGroupObjects {
+    param([Parameter(Mandatory)][string[]]$Names)
+    $resolved = [System.Collections.Generic.List[object]]::new()
+    $errors = [System.Collections.Generic.List[string]]::new()
+    foreach ($gn in $Names) {
+        try {
+            $g = Get-ADGroup -Identity $gn -Properties objectSid -ErrorAction Stop
+            $sid = $null
+            if (Test-ObjectHasProp -Object $g -Name 'SID') {
+                $sid = ConvertTo-SidString (Get-ObjectPropValue -Object $g -Name 'SID')
+            }
+            if (-not $sid -and (Test-ObjectHasProp -Object $g -Name 'objectSid')) {
+                $sid = ConvertTo-SidString (Get-ObjectPropValue -Object $g -Name 'objectSid')
+            }
+            $resolved.Add([pscustomobject]@{
+                Name              = [string]$g.Name
+                DistinguishedName = [string]$g.DistinguishedName
+                Sid               = $sid
+            })
+        } catch {
+            $errors.Add("${gn}: $_")
+        }
+    }
+    return @{ Groups = @($resolved); Errors = @($errors) }
+}
+
+# Nested group membership via LDAP_MATCHING_RULE_IN_CHAIN (server-side).
+# Avoids enumerating huge groups with Get-ADGroupMember (which silently fails
+# on size limits and made NOT-member filters include people who ARE members).
+function Build-GroupMembershipLdapClause {
+    param(
+        [Parameter(Mandatory)][object[]]$Groups,
+        [bool]$WantMemberOf
+    )
+    if (-not $Groups -or $Groups.Count -eq 0) { return $null }
+    $parts = foreach ($g in $Groups) {
+        $dnEsc = Escape-LdapFilterValue ([string]$g.DistinguishedName)
+        "(memberOf:1.2.840.113556.1.4.1941:=$dnEsc)"
+    }
+    $union = if (@($parts).Count -eq 1) { $parts[0] } else { "(|$($parts -join ''))" }
+    if ($WantMemberOf) { return $union }
+    return "(!$union)"
+}
+
 function Get-UacLdapClause ([int]$Bit, [bool]$WantSet, [bool]$InvertMeaning = $false) {
     # OID 1.2.840.113556.1.4.803 = LDAP_MATCHING_RULE_BIT_AND
     $want = $WantSet
@@ -733,20 +806,20 @@ $gbLogic.Controls.AddRange(@($rdoAND,$rdoOR))
 # ---------------------------------------------------------------------------
 # 6. GROUP MEMBERSHIP
 # ---------------------------------------------------------------------------
-$gbGroup = New-GroupBox "Group Membership (member of ANY selected)" 190
+$gbGroup = New-GroupBox "Group Membership (nested / LDAP)" 190
 Add-LeftRow $gbGroup
 
 $rdoMemberOf = New-Object System.Windows.Forms.RadioButton
-$rdoMemberOf.Text = "Member of"; $rdoMemberOf.AutoSize = $true; $rdoMemberOf.Checked = $true
+$rdoMemberOf.Text = "Member of any"; $rdoMemberOf.AutoSize = $true; $rdoMemberOf.Checked = $true
 $rdoMemberOf.Location = New-Object System.Drawing.Point(12,22); $rdoMemberOf.BackColor = $Theme.Card
 
 $rdoNotMember = New-Object System.Windows.Forms.RadioButton
-$rdoNotMember.Text = "NOT member of"; $rdoNotMember.AutoSize = $true
-$rdoNotMember.Location = New-Object System.Drawing.Point(115,22); $rdoNotMember.BackColor = $Theme.Card
+$rdoNotMember.Text = "Not in any"; $rdoNotMember.AutoSize = $true
+$rdoNotMember.Location = New-Object System.Drawing.Point(120,22); $rdoNotMember.BackColor = $Theme.Card
 
 $rdoNoGroup = New-Object System.Windows.Forms.RadioButton
 $rdoNoGroup.Text = "No group filter"; $rdoNoGroup.AutoSize = $true
-$rdoNoGroup.Location = New-Object System.Drawing.Point(240,22); $rdoNoGroup.BackColor = $Theme.Card
+$rdoNoGroup.Location = New-Object System.Drawing.Point(220,22); $rdoNoGroup.BackColor = $Theme.Card
 
 $txtGroupSearch = New-Object System.Windows.Forms.TextBox
 $txtGroupSearch.Location = New-Object System.Drawing.Point(12,50); $txtGroupSearch.Width = 258
@@ -769,6 +842,21 @@ $lnkClear.Location = New-Object System.Drawing.Point(12,164); $lnkClear.BackColo
 $lnkClear.LinkColor = $Theme.Accent
 
 $gbGroup.Controls.AddRange(@($rdoMemberOf,$rdoNotMember,$rdoNoGroup,$txtGroupSearch,$btnGroupSearch,$lstGroups,$lnkClear))
+foreach ($r in @($rdoMemberOf,$rdoNotMember,$rdoNoGroup)) {
+    $r.Add_CheckedChanged({ Update-FilterPreview })
+}
+$lstGroups.Add_ItemCheck({
+    # ItemCheck fires before the check state changes; defer preview refresh
+    $script:GroupPreviewTimer = New-Object System.Windows.Forms.Timer
+    $script:GroupPreviewTimer.Interval = 10
+    $script:GroupPreviewTimer.Add_Tick({
+        $script:GroupPreviewTimer.Stop()
+        try { $script:GroupPreviewTimer.Dispose() } catch { }
+        $script:GroupPreviewTimer = $null
+        Update-FilterPreview
+    })
+    $script:GroupPreviewTimer.Start()
+})
 
 # ---------------------------------------------------------------------------
 # 7. ENTRA ID (Microsoft Graph enrichment — Users only)
@@ -1542,13 +1630,13 @@ function Update-FilterPreview {
         }
     }
     if ($gbGroup.Visible -and -not $rdoNoGroup.Checked) {
-        $sel = @()
-        for ($i = 0; $i -lt $lstGroups.Items.Count; $i++) {
-            if ($lstGroups.GetItemChecked($i)) { $sel += $lstGroups.Items[$i].ToString() }
-        }
+        $sel = @(Get-SelectedGroupFilterNames)
         if ($sel.Count -gt 0) {
-            $mode = if ($rdoMemberOf.Checked) { "member of ANY of" } else { "NOT member of ANY of" }
-            [void]$sb.AppendLine("Groups: $mode $($sel -join ', ')")
+            if ($rdoMemberOf.Checked) {
+                [void]$sb.AppendLine("Groups: member of at least one of $($sel -join ', ')")
+            } else {
+                [void]$sb.AppendLine("Groups: not a member of any of $($sel -join ', ') (exclude if in any selected group)")
+            }
         }
     }
     if ($gbEntra.Visible -and $chkEntraEnrich.Checked) {
@@ -1567,6 +1655,11 @@ function Update-FilterPreview {
     try { $txtLdap.Text = Build-LDAPFilter } catch { $txtLdap.Text = "(error building filter)" }
     if ($script:PostFilters.Count -gt 0) {
         $txtLdap.Text += "`r`n+ $($script:PostFilters.Count) client-side post-filter(s)"
+    }
+    $previewGroups = @(Get-SelectedGroupFilterNames)
+    if ($previewGroups.Count -gt 0) {
+        $gMode = if ($rdoMemberOf.Checked) { "member of at least one" } else { "not a member of any" }
+        $txtLdap.Text += "`r`n+ group filter at query time ($gMode, nested LDAP): $($previewGroups -join ', ')"
     }
 }
 
@@ -1637,7 +1730,10 @@ $btnGroupSearch.Add_Click({
     $t = if ($txtGroupSearch.Text -notin @("","Search groups...")) { "*$($txtGroupSearch.Text)*" } else { "*" }
     Search-ADGroups $t
 })
-$lnkClear.Add_LinkClicked({ for ($i=0;$i -lt $lstGroups.Items.Count;$i++) { $lstGroups.SetItemChecked($i,$false) } })
+$lnkClear.Add_LinkClicked({
+    for ($i=0;$i -lt $lstGroups.Items.Count;$i++) { $lstGroups.SetItemChecked($i,$false) }
+    Update-FilterPreview
+})
 
 # ===========================================================================
 # RESULTS SEARCH BOX  (rebinds filtered view from $script:Results)
@@ -2731,6 +2827,24 @@ function Invoke-Query {
             }
         }
 
+        # Group membership via server-side nested LDAP (accurate for large groups)
+        $groupLdapApplied = $false
+        $selectedGroupNames = @(Get-SelectedGroupFilterNames)
+        $resolvedGroups = @()
+        if ($selectedGroupNames.Count -gt 0 -and $objType -in @("Users","Computers","Groups")) {
+            Update-Progress "Resolving group(s) for membership filter..."
+            $gres = Resolve-ADGroupObjects -Names $selectedGroupNames
+            if ($gres.Errors.Count -gt 0) {
+                throw "Could not resolve selected group(s):`r`n$($gres.Errors -join "`r`n")"
+            }
+            $resolvedGroups = @($gres.Groups)
+            $gClause = Build-GroupMembershipLdapClause -Groups $resolvedGroups -WantMemberOf:$rdoMemberOf.Checked
+            if ($gClause) {
+                $finalLdap = "(&{0}{1})" -f $finalLdap, $gClause
+                $groupLdapApplied = $true
+            }
+        }
+
         if (-not (Test-LdapFilterSyntax $finalLdap)) {
             throw "Generated LDAP filter is invalid:`r`n$finalLdap"
         }
@@ -2738,6 +2852,10 @@ function Invoke-Query {
         $txtLdap.Text = $finalLdap
         if ($script:PostFilters.Count -gt 0) {
             $txtLdap.Text += "`r`n+ $($script:PostFilters.Count) client-side post-filter(s)"
+        }
+        if ($groupLdapApplied) {
+            $gMode = if ($rdoMemberOf.Checked) { "member of at least one" } else { "not a member of any" }
+            $txtLdap.Text += "`r`n+ group filter ($gMode): $($selectedGroupNames -join ', ')"
         }
 
         $queryParams = @{ LDAPFilter = $finalLdap; Properties = $props; ResultSetSize = $null; ErrorAction = "Stop" }
@@ -2774,26 +2892,21 @@ function Invoke-Query {
             )
         }
 
-        # ---- Group membership filter (OR across selected groups) ----
-        $groupFilter = $false
-        $mfaMembers  = @{}
-        $selectedGroups = @()
-        if ($gbGroup.Visible) {
-            for ($gi = 0; $gi -lt $lstGroups.Items.Count; $gi++) {
-                if ($lstGroups.GetItemChecked($gi)) { $selectedGroups += $lstGroups.Items[$gi].ToString() }
-            }
-        }
-        if ($selectedGroups.Count -gt 0 -and -not $rdoNoGroup.Checked) {
-            $groupFilter = $true
-            foreach ($gn in $selectedGroups) {
-                Update-Progress "Resolving group: $gn..."
+        # ---- Fallback group membership filter (only if LDAP clause was not applied) ----
+        if (-not $groupLdapApplied -and $resolvedGroups.Count -gt 0) {
+            Update-Progress "Applying client-side group membership filter..."
+            $memberSids = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $memberDns  = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($rg in $resolvedGroups) {
+                Update-Progress "Resolving members: $($rg.Name)..."
+                $groupMembers = @()
                 try {
-                    $groupMembers = @(Get-ADGroupMember -Identity $gn -Recursive -ErrorAction Stop)
+                    $groupMembers = @(Get-ADGroupMember -Identity $rg.DistinguishedName -Recursive -ErrorAction Stop)
                 } catch {
-                    $groupMembers = @()
+                    # Ranged/BFS expansion when Get-ADGroupMember hits size limits
                     $bfsQueue   = [System.Collections.Generic.Queue[string]]::new()
                     $bfsVisited = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-                    $bfsQueue.Enqueue($gn)
+                    $bfsQueue.Enqueue([string]$rg.DistinguishedName)
                     while ($bfsQueue.Count -gt 0) {
                         $cur = $bfsQueue.Dequeue()
                         if (-not $bfsVisited.Add($cur)) { continue }
@@ -2803,7 +2916,8 @@ function Invoke-Query {
                                 if (-not $mDN) { continue }
                                 try {
                                     $o = Get-ADObject -Identity $mDN -Properties objectClass,SamAccountName,objectSid -ErrorAction Stop
-                                    if ($o.objectClass -eq 'group') { $bfsQueue.Enqueue($mDN) } else { $groupMembers += $o }
+                                    if ($o.objectClass -eq 'group') { $bfsQueue.Enqueue($mDN) }
+                                    else { $groupMembers += $o }
                                 } catch { continue }
                             }
                         } catch { continue }
@@ -2812,28 +2926,40 @@ function Invoke-Query {
                 foreach ($m in @($groupMembers)) {
                     if (-not $m) { continue }
                     $sid = $null
-                    if ((Test-ObjectHasProp -Object $m -Name 'SID') -and (Get-ObjectPropValue -Object $m -Name 'SID')) {
-                        $sid = (Get-ObjectPropValue -Object $m -Name 'SID').ToString()
+                    if (Test-ObjectHasProp -Object $m -Name 'SID') {
+                        $sid = ConvertTo-SidString (Get-ObjectPropValue -Object $m -Name 'SID')
                     }
-                    elseif ((Test-ObjectHasProp -Object $m -Name 'objectSid') -and (Get-ObjectPropValue -Object $m -Name 'objectSid')) {
-                        $sid = (Get-ObjectPropValue -Object $m -Name 'objectSid').ToString()
+                    if (-not $sid -and (Test-ObjectHasProp -Object $m -Name 'objectSid')) {
+                        $sid = ConvertTo-SidString (Get-ObjectPropValue -Object $m -Name 'objectSid')
                     }
-                    if ($sid) { $mfaMembers[$sid] = $true }
+                    if ($sid) { [void]$memberSids.Add($sid) }
+                    $mdn = $null
+                    if (Test-ObjectHasProp -Object $m -Name 'DistinguishedName') {
+                        $mdn = [string](Get-ObjectPropValue -Object $m -Name 'DistinguishedName')
+                    }
+                    if ($mdn) { [void]$memberDns.Add($mdn) }
                 }
             }
-        }
-        if ($groupFilter) {
+            if ($memberSids.Count -eq 0 -and $memberDns.Count -eq 0) {
+                throw "Group membership filter resolved 0 members for: $($selectedGroupNames -join ', ').`r`nRefusing to apply a NOT-member filter that would incorrectly include everyone."
+            }
             $rawResults = @(
                 $rawResults | Where-Object {
                     $sid = $null
-                    if ((Test-ObjectHasProp -Object $_ -Name 'SID') -and (Get-ObjectPropValue -Object $_ -Name 'SID')) {
-                        $sid = (Get-ObjectPropValue -Object $_ -Name 'SID').ToString()
+                    if (Test-ObjectHasProp -Object $_ -Name 'SID') {
+                        $sid = ConvertTo-SidString (Get-ObjectPropValue -Object $_ -Name 'SID')
                     }
-                    elseif ((Test-ObjectHasProp -Object $_ -Name 'objectSid') -and (Get-ObjectPropValue -Object $_ -Name 'objectSid')) {
-                        $sid = (Get-ObjectPropValue -Object $_ -Name 'objectSid').ToString()
+                    if (-not $sid -and (Test-ObjectHasProp -Object $_ -Name 'objectSid')) {
+                        $sid = ConvertTo-SidString (Get-ObjectPropValue -Object $_ -Name 'objectSid')
                     }
-                    if (-not $sid) { return $false }
-                    if ($rdoMemberOf.Checked) { $mfaMembers.ContainsKey($sid) } else { -not $mfaMembers.ContainsKey($sid) }
+                    $dn = $null
+                    if (Test-ObjectHasProp -Object $_ -Name 'DistinguishedName') {
+                        $dn = [string](Get-ObjectPropValue -Object $_ -Name 'DistinguishedName')
+                    }
+                    $isMember = $false
+                    if ($sid -and $memberSids.Contains($sid)) { $isMember = $true }
+                    elseif ($dn -and $memberDns.Contains($dn)) { $isMember = $true }
+                    if ($rdoMemberOf.Checked) { $isMember } else { -not $isMember }
                 }
             )
         }
