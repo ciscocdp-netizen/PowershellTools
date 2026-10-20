@@ -239,14 +239,11 @@ function Split-IdentityList {
     param([AllowEmptyString()][string]$Raw)
 
     $raw = ConvertTo-CleanIdentityValue -Value $Raw
-    if (-not $raw) { return , [string[]]@() }
-    if ($raw -match '^[A-Za-z]{1,3}=.+,.+=') { return , [string[]]@($raw) }
-    $parts = @(
-        $raw -split '\s*,\s*' |
-            ForEach-Object { ConvertTo-CleanIdentityValue -Value $_ } |
-            Where-Object { $_ }
-    )
-    return , [string[]]$parts
+    if (-not $raw) { return }
+    if ($raw -match '^[A-Za-z]{1,3}=.+,.+=') { $raw; return }
+    $raw -split '\s*,\s*' |
+        ForEach-Object { ConvertTo-CleanIdentityValue -Value $_ } |
+        Where-Object { $_ }
 }
 
 function Get-RecommendedCsvColumn {
@@ -310,7 +307,7 @@ function Test-BackupIdentityMatch {
 function Get-BackupEntries {
     param($Rows)
 
-    $valid = foreach ($row in @($Rows)) {
+    $valid = @(foreach ($row in @($Rows)) {
         $sam  = ConvertTo-CleanIdentityValue -Value (Get-NotePropertyValue -Object $row -Name 'SamAccountName')
         $path = ConvertTo-CleanIdentityValue -Value (Get-NotePropertyValue -Object $row -Name 'OriginalScriptPath')
         if (-not $sam -or -not $path) { continue }
@@ -324,16 +321,12 @@ function Get-BackupEntries {
             OriginalScriptPath = $path
             RemovedOn          = ConvertTo-CleanIdentityValue -Value (Get-NotePropertyValue -Object $row -Name 'RemovedOn')
         }
-    }
-    $valid = @($valid)
-    if ($valid.Count -eq 0) { return , @() }
+    })
+    if ($valid.Count -eq 0) { return }
 
     # Sort-Object on ISO-8601 's' timestamps is chronological. Group[0] after
     # an ascending sort is the earliest row = the true original scriptPath.
-    $deduped = @(
-        $valid | Sort-Object RemovedOn | Group-Object SamAccountName | ForEach-Object { $_.Group[0] }
-    )
-    return , $deduped
+    $valid | Sort-Object RemovedOn | Group-Object SamAccountName | ForEach-Object { $_.Group[0] }
 }
 
 # ---------------------------------------------------------------------------
@@ -386,7 +379,7 @@ function Import-CsvSafe {
     } catch {
         $rows = @(Import-Csv -LiteralPath $Path -Delimiter $delimiter)
     }
-    return , @($rows | Where-Object { $_ })
+    $rows | Where-Object { $_ }
 }
 
 function Write-BackupRow {
@@ -443,7 +436,7 @@ function Get-Ids {
         [switch]$AutoSelect
     )
 
-    $rows = Import-CsvSafe -Path $Path
+    $rows = @(Import-CsvSafe -Path $Path)
     if ($rows.Count -eq 0) { throw "CSV has headers but no data rows: $Path" }
 
     $columns = @($rows[0].PSObject.Properties.Name)
@@ -480,7 +473,7 @@ function Get-Ids {
         $seen[$key] = $true
         $ids.Add($value)
     }
-    return , $ids.ToArray()
+    foreach ($id in $ids) { $id }
 }
 
 function Read-ConfirmPhrase {
@@ -632,7 +625,7 @@ function Restore-Scripts {
         return
     }
 
-    $rows = @(Get-BackupEntries -Rows (Import-CsvSafe -Path $path))
+    $rows = @(Get-BackupEntries -Rows @(Import-CsvSafe -Path $path))
     if ($rows.Count -eq 0) {
         Write-Log "No restorable rows in $path"
         return
@@ -820,11 +813,11 @@ function Invoke-SelfTest {
     try { Resolve-CsvColumn -Columns @('Dept', 'Title') -Pick '' -Default $null | Out-Null } catch { $noDefaultThrew = $true }
     Assert-True -Condition $noDefaultThrew -Name 'Resolve-CsvColumn errors when Enter is pressed and there is no recommended column'
 
-    $list = Split-IdentityList -Raw 'jsmith, ajones'
+    $list = @(Split-IdentityList -Raw 'jsmith, ajones')
     Assert-True -Condition ($list.Count -eq 2 -and $list[0] -eq 'jsmith' -and $list[1] -eq 'ajones') -Name 'Split-IdentityList splits comma-separated SAM names'
-    $dnList = Split-IdentityList -Raw $dn
+    $dnList = @(Split-IdentityList -Raw $dn)
     Assert-True -Condition ($dnList.Count -eq 1 -and $dnList[0] -eq $dn) -Name 'Split-IdentityList does not split a distinguishedName on commas'
-    $emptyList = Split-IdentityList -Raw ''
+    $emptyList = @(Split-IdentityList -Raw '')
     Assert-True -Condition ($emptyList.Count -eq 0) -Name 'Split-IdentityList returns an empty array for a blank prompt'
 
     $backupRows = @(
@@ -848,6 +841,12 @@ function Invoke-SelfTest {
     ))
     Assert-True -Condition ($mixed.Count -eq 1 -and $mixed[0].SamAccountName -eq 'keep') -Name 'Get-BackupEntries ignores dry-run and skipped rows when a Status column is present'
 
+    $none = @(Get-BackupEntries -Rows @(
+        [pscustomobject]@{ SamAccountName = ''; OriginalScriptPath = 'x.bat' },
+        [pscustomobject]@{ SamAccountName = 'dry'; OriginalScriptPath = 'b.bat'; Status = 'DryRun-WouldRemove' }
+    ))
+    Assert-True -Condition ($none.Count -eq 0) -Name 'Get-BackupEntries returns an empty array when every row is dropped'
+
     $matchSam = Test-BackupIdentityMatch -Entry $jsmith -Token 'CONTOSO\jsmith'
     $matchMiss = Test-BackupIdentityMatch -Entry $jsmith -Token 'nobody'
     Assert-True -Condition $matchSam -Name 'Test-BackupIdentityMatch matches DOMAIN\user against a SAM backup row'
@@ -856,8 +855,8 @@ function Invoke-SelfTest {
     $tempCsv = Join-Path -Path $testRoot -ChildPath 'users.csv'
     try {
         [System.IO.File]::WriteAllText($tempCsv, "SamAccountName`r`n", $script:Utf8NoBom)
-        $emptyImport = Import-CsvSafe -Path $tempCsv
-        Assert-True -Condition ($null -ne $emptyImport -and @($emptyImport).Count -eq 0) -Name 'Import-CsvSafe returns an empty array for a header-only CSV'
+        $emptyImport = @(Import-CsvSafe -Path $tempCsv)
+        Assert-True -Condition ($emptyImport.Count -eq 0) -Name 'Import-CsvSafe returns an empty array for a header-only CSV'
         $emptyThrew = $false
         try { Get-Ids -Path $tempCsv -AutoSelect | Out-Null } catch { $emptyThrew = $_.Exception.Message -match 'no data rows' }
         Assert-True -Condition $emptyThrew -Name 'Get-Ids throws on a header-only CSV instead of indexing $rows[0]'
@@ -882,7 +881,7 @@ function Invoke-SelfTest {
         Write-BackupRow -Path $bak -Row ([pscustomobject]@{
             SamAccountName = 'jsmith'; ObjectGUID = $guid.ToString(); OriginalScriptPath = 'logon.bat'; RemovedOn = '2024-01-01T00:00:00'; Status = 'Removed'
         })
-        $fromDisk = @(Get-BackupEntries -Rows (Import-CsvSafe -Path $bak))
+        $fromDisk = @(Get-BackupEntries -Rows @(Import-CsvSafe -Path $bak))
         Assert-True -Condition ($fromDisk.Count -eq 1 -and $fromDisk[0].OriginalScriptPath -eq 'logon.bat' -and $fromDisk[0].ObjectGUID -eq $guid.ToString()) -Name 'Write-BackupRow round-trips ObjectGUID and OriginalScriptPath'
     } finally {
         if (Test-Path -LiteralPath $testRoot) {
