@@ -592,15 +592,44 @@ function Set-Status ([string]$State,[int]$Total=0,[int]$En=0,[int]$Dis=0) {
     $sState.Text = $State; $sTotal.Text = "Total: $Total"
     $sEnabled.Text = "Enabled: $En"; $sDisabled.Text = "Disabled: $Dis"
     $StatusStrip.Refresh()
+    [System.Windows.Forms.Application]::DoEvents()
 }
 function Start-Progress ([string]$Label) {
-    $sProgress.Visible = $true; $sLive.Text = $Label; $sLive.Visible = $true; $StatusStrip.Refresh()
+    $sProgress.Style = [System.Windows.Forms.ProgressBarStyle]::Marquee
+    $sProgress.Visible = $true
+    $sLive.Text = $Label
+    $sLive.Visible = $true
+    $StatusStrip.Refresh()
+    [System.Windows.Forms.Application]::DoEvents()
 }
 function Update-Progress ([string]$Label) {
-    $sLive.Text = $Label; $StatusStrip.Refresh(); [System.Windows.Forms.Application]::DoEvents()
+    $sLive.Text = $Label
+    $StatusStrip.Refresh()
+    [System.Windows.Forms.Application]::DoEvents()
+}
+function Update-EnrichProgress {
+    param([int]$Current, [int]$Total, [string]$Detail = "")
+    if ($Total -gt 0) {
+        $sProgress.Style = [System.Windows.Forms.ProgressBarStyle]::Continuous
+        $sProgress.Maximum = [Math]::Max(1, $Total)
+        $sProgress.Value = [Math]::Min($Current, $Total)
+    }
+    $msg = "Enriching with Entra ID ($Current / $Total)..."
+    if ($Detail) { $msg = "$msg $Detail" }
+    $sLive.Text = $msg
+    $sLive.Visible = $true
+    $sProgress.Visible = $true
+    $StatusStrip.Refresh()
+    [System.Windows.Forms.Application]::DoEvents()
 }
 function Stop-Progress {
-    $sProgress.Visible = $false; $sLive.Text = ""; $sLive.Visible = $false; $StatusStrip.Refresh()
+    $sProgress.Visible = $false
+    $sProgress.Style = [System.Windows.Forms.ProgressBarStyle]::Marquee
+    $sProgress.Value = 0
+    $sLive.Text = ""
+    $sLive.Visible = $false
+    $StatusStrip.Refresh()
+    [System.Windows.Forms.Application]::DoEvents()
 }
 
 # ---------------------------------------------------------------------------
@@ -2290,10 +2319,45 @@ function Disconnect-EntraGraph {
     $script:EntraAccountUpn = ""
     $script:EntraAuthMode = ""
     $script:EntraTenant = ""
+    $script:EntraUserIdCache = @{}
     Update-EntraStatusLabel
 }
 
 # Single Graph entry point used by all Entra enrichment helpers below.
+$script:GraphHttpTimeoutSec = 30
+$script:EntraUserIdCache = @{}
+
+function Get-EntraBearerToken {
+    if ($script:EntraAuthMode -eq "MgGraph") {
+        # Prefer REST with an explicit token so we can enforce timeouts.
+        try {
+            foreach ($asm in [AppDomain]::CurrentDomain.GetAssemblies()) {
+                if ($asm.GetName().Name -ne "Microsoft.Graph.Authentication") { continue }
+                $sessionType = $asm.GetType("Microsoft.Graph.PowerShell.Authentication.GraphSession", $false)
+                if (-not $sessionType) { continue }
+                $prop = $sessionType.GetProperty("Instance")
+                if (-not $prop) { continue }
+                $inst = $prop.GetValue($null)
+                if (-not $inst) { continue }
+                $authProp = $inst.GetType().GetProperty("AuthContext")
+                if (-not $authProp) { continue }
+                $auth = $authProp.GetValue($inst)
+                if (-not $auth) { continue }
+                $tokProp = $auth.GetType().GetProperty("AccessToken")
+                if ($tokProp) {
+                    $tok = $tokProp.GetValue($auth)
+                    if ($tok) { return [string]$tok }
+                }
+            }
+        } catch { }
+        return $null
+    }
+    if ($script:EntraAccessToken -and $script:EntraAccessToken -ne "MGGRAPH") {
+        return [string]$script:EntraAccessToken
+    }
+    return $null
+}
+
 function Invoke-GraphGet {
     param(
         [Parameter(Mandatory)][string]$Uri,
@@ -2317,33 +2381,37 @@ function Invoke-GraphGet {
 
     while ($next -and $page -lt $MaxPages) {
         $page++
-        if ($script:EntraAuthMode -eq "MgGraph") {
+        # Keep UI alive during long Graph calls
+        [System.Windows.Forms.Application]::DoEvents()
+
+        $bearer = Get-EntraBearerToken
+        # Refresh Az token if missing or close to expiry
+        if ($script:EntraAuthMode -eq "Az" -and (
+                -not $bearer -or
+                [datetime]::UtcNow -ge $script:EntraTokenExpires.AddMinutes(-5)
+            )) {
+            try {
+                $tokObj = Get-AzAccessToken -ResourceUrl "https://graph.microsoft.com" -ErrorAction Stop
+                $script:EntraAccessToken = ConvertFrom-SecureToken $tokObj
+                $bearer = [string]$script:EntraAccessToken
+                if ($tokObj.PSObject.Properties['ExpiresOn'] -and $tokObj.ExpiresOn) {
+                    $script:EntraTokenExpires = ([datetime]$tokObj.ExpiresOn).ToUniversalTime()
+                } else {
+                    $script:EntraTokenExpires = [datetime]::UtcNow.AddMinutes(45)
+                }
+            } catch { }
+        }
+
+        if ($bearer) {
+            $reqHeaders = @{ Authorization = "Bearer $bearer" }
+            foreach ($k in $extraHeaders.Keys) { $reqHeaders[$k] = $extraHeaders[$k] }
+            $resp = Invoke-RestMethod -Method Get -Uri $next -Headers $reqHeaders `
+                -TimeoutSec $script:GraphHttpTimeoutSec -ErrorAction Stop
+        } elseif ($script:EntraAuthMode -eq "MgGraph") {
             $resp = Invoke-MgGraphRequest -Method GET -Uri $next -Headers $extraHeaders `
                 -OutputType PSObject -ErrorAction Stop
         } else {
-            # Refresh Az token if missing or close to expiry (lazy attach leaves token empty)
-            if ($script:EntraAuthMode -eq "Az" -and (
-                    -not $script:EntraAccessToken -or
-                    [datetime]::UtcNow -ge $script:EntraTokenExpires.AddMinutes(-5)
-                )) {
-                try {
-                    $tokObj = Get-AzAccessToken -ResourceUrl "https://graph.microsoft.com" -ErrorAction Stop
-                    $script:EntraAccessToken = ConvertFrom-SecureToken $tokObj
-                    if ($tokObj.PSObject.Properties['ExpiresOn'] -and $tokObj.ExpiresOn) {
-                        $script:EntraTokenExpires = ([datetime]$tokObj.ExpiresOn).ToUniversalTime()
-                    } else {
-                        $script:EntraTokenExpires = [datetime]::UtcNow.AddMinutes(45)
-                    }
-                } catch { }
-            }
-            if (-not $script:EntraAccessToken) {
-                throw "No Graph access token. Click Sign in to Entra ID."
-            }
-            $reqHeaders = @{
-                Authorization = "Bearer $($script:EntraAccessToken)"
-            }
-            foreach ($k in $extraHeaders.Keys) { $reqHeaders[$k] = $extraHeaders[$k] }
-            $resp = Invoke-RestMethod -Method Get -Uri $next -Headers $reqHeaders -ErrorAction Stop
+            throw "No Graph access token. Click Sign in to Entra ID."
         }
         $last = $resp
         # Normalize hashtable / PSCustomObject / Dictionary responses from Graph
@@ -2439,6 +2507,20 @@ function ConvertTo-EnrichableRow {
 function Resolve-EntraUserId {
     param([string]$Upn, [string]$Mail, [string]$Sam)
 
+    $cacheKeys = New-Object System.Collections.Generic.List[string]
+    foreach ($k in @($Upn, $Mail, $Sam)) {
+        if ($k -and $k.Trim() -ne "") {
+            $ck = $k.Trim().ToLowerInvariant()
+            if (-not $cacheKeys.Contains($ck)) { $cacheKeys.Add($ck) }
+        }
+    }
+    foreach ($ck in $cacheKeys) {
+        if ($script:EntraUserIdCache.ContainsKey($ck)) {
+            return $script:EntraUserIdCache[$ck]
+        }
+    }
+
+    # Fast path only — avoid proxyAddresses advanced queries (very slow / hang-prone).
     $candidates = New-Object System.Collections.Generic.List[string]
     foreach ($c in @($Upn, $Mail)) {
         if ($c -and $c.Trim() -ne "") {
@@ -2447,76 +2529,50 @@ function Resolve-EntraUserId {
         }
     }
 
+    $foundId = $null
     foreach ($c in $candidates) {
-        # 1) Direct path lookup (works for UPN and often mail nicknames)
+        # Direct /users/{upn-or-id} lookup (fastest)
         try {
             $enc = [uri]::EscapeDataString($c)
-            $u = Invoke-GraphGet -Uri "https://graph.microsoft.com/v1.0/users/$enc`?`$select=id,userPrincipalName,mail" -MaxPages 1
-            if ($u -and $u.id) { return [string]$u.id }
+            $u = Invoke-GraphGet -Uri "https://graph.microsoft.com/v1.0/users/$enc`?`$select=id" -MaxPages 1
+            if ($u -and $u.id) { $foundId = [string]$u.id; break }
         } catch { }
 
-        # 2) Simple equality filters (no OR — avoids advanced-query requirements)
+        # Exact UPN / mail equality (no OR, no $count)
         $safe = Escape-ODataString $c
-        foreach ($filter in @(
-                "userPrincipalName eq '$safe'",
-                "mail eq '$safe'",
-                "proxyAddresses/any(p:p eq 'smtp:$safe')",
-                "proxyAddresses/any(p:p eq 'SMTP:$safe')"
-            )) {
+        foreach ($filter in @("userPrincipalName eq '$safe'", "mail eq '$safe'")) {
             try {
-                $needsCount = ($filter -match 'proxyAddresses')
-                $uri = "https://graph.microsoft.com/v1.0/users?`$filter=$([uri]::EscapeDataString($filter))&`$select=id,userPrincipalName,mail&`$top=1"
-                if ($needsCount) { $uri += "&`$count=true" }
+                $uri = "https://graph.microsoft.com/v1.0/users?`$filter=$([uri]::EscapeDataString($filter))&`$select=id&`$top=1"
                 $resp = Invoke-GraphGet -Uri $uri -MaxPages 1
                 $val = Get-GraphCollectionValue $resp
-                if ($val.Count -gt 0 -and $val[0].id) { return [string]$val[0].id }
+                if ($val.Count -gt 0 -and $val[0].id) { $foundId = [string]$val[0].id; break }
             } catch { }
         }
+        if ($foundId) { break }
     }
 
-    # 3) Hybrid: match on-premises SAM account name
-    if ($Sam -and $Sam.Trim() -ne "") {
+    if (-not $foundId -and $Sam -and $Sam.Trim() -ne "") {
         $safeSam = Escape-ODataString $Sam.Trim()
         try {
             $filter = "onPremisesSamAccountName eq '$safeSam'"
-            $uri = "https://graph.microsoft.com/v1.0/users?`$filter=$([uri]::EscapeDataString($filter))&`$select=id,userPrincipalName,mail&`$top=5&`$count=true"
+            $uri = "https://graph.microsoft.com/v1.0/users?`$filter=$([uri]::EscapeDataString($filter))&`$select=id&`$top=1&`$count=true"
             $resp = Invoke-GraphGet -Uri $uri -MaxPages 1
             $val = Get-GraphCollectionValue $resp
-            if ($val.Count -eq 1 -and $val[0].id) { return [string]$val[0].id }
-            # If multiple, prefer exact UPN/mail match among them
-            foreach ($u in $val) {
-                foreach ($c in $candidates) {
-                    if ($u.userPrincipalName -and [string]::Equals($u.userPrincipalName, $c, 'OrdinalIgnoreCase')) {
-                        return [string]$u.id
-                    }
-                    if ($u.mail -and [string]::Equals($u.mail, $c, 'OrdinalIgnoreCase')) {
-                        return [string]$u.id
-                    }
-                }
-            }
-            if ($val.Count -gt 0 -and $val[0].id) { return [string]$val[0].id }
+            if ($val.Count -gt 0 -and $val[0].id) { $foundId = [string]$val[0].id }
         } catch { }
     }
-    return $null
+
+    foreach ($ck in $cacheKeys) { $script:EntraUserIdCache[$ck] = $foundId }
+    return $foundId
 }
 
 function Get-EntraAssignedRoles ([string]$UserId) {
     $roles = [System.Collections.Generic.List[string]]::new()
     try {
         $uri = "https://graph.microsoft.com/v1.0/users/$UserId/memberOf/microsoft.graph.directoryRole?`$select=displayName"
-        $resp = Invoke-GraphGet -Uri $uri
+        $resp = Invoke-GraphGet -Uri $uri -MaxPages 2
         foreach ($r in (Get-GraphCollectionValue $resp)) {
             if ($r.displayName) { $roles.Add([string]$r.displayName) }
-        }
-    } catch { }
-    # Unified role assignments (directory)
-    try {
-        $uri2 = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?`$filter=principalId eq '$UserId'&`$expand=roleDefinition(`$select=displayName)&`$top=50"
-        $resp2 = Invoke-GraphGet -Uri $uri2
-        foreach ($a in (Get-GraphCollectionValue $resp2)) {
-            $dn = $null
-            if ($a.roleDefinition -and $a.roleDefinition.displayName) { $dn = [string]$a.roleDefinition.displayName }
-            if ($dn -and -not $roles.Contains($dn)) { $roles.Add($dn) }
         }
     } catch { }
     if ($roles.Count -eq 0) { return "" }
@@ -2662,24 +2718,39 @@ function Invoke-EntraEnrichment {
     $wantAuth = $chkEntraAuth.Checked
     $wantFail = $chkEntraFailSignIn.Checked
 
+    $total = $script:Results.Count
+    if ($total -ge 25) {
+        $bits = @()
+        if ($wantRoles) { $bits += "roles" }
+        if ($wantDev) { $bits += "devices" }
+        if ($wantAuth) { $bits += "auth methods" }
+        if ($wantFail) { $bits += "failed sign-ins (slow)" }
+        $est = "This calls Microsoft Graph for each user"
+        if ($wantFail) { $est += "; failed sign-in lookups are especially slow" }
+        $ans = [System.Windows.Forms.MessageBox]::Show(
+            "Enrich $total users with: $($bits -join ', ')?`r`n`r`n$est.`r`nProgress will update in the status bar.`r`n`r`nContinue?",
+            "Entra ID enrichment",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Question)
+        if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+    }
+
     $newRows = [System.Collections.Generic.List[object]]::new()
     $i = 0
-    $total = $script:Results.Count
     $matched = 0
     $unmatched = 0
     $failed = 0
     $firstError = ""
-    Start-Progress "Enriching with Entra ID (0 / $total)..."
+    Update-EnrichProgress -Current 0 -Total $total -Detail "starting..."
     foreach ($obj in $script:Results) {
         $i++
-        if ($i % 5 -eq 0 -or $i -eq $total) {
-            Update-Progress "Enriching with Entra ID ($i / $total)..."
-        }
         $row = ConvertTo-EnrichableRow -Object $obj
         $upn = [string](Get-ObjectPropValue -Object $row -Name "UserPrincipalName")
         $mail = [string](Get-ObjectPropValue -Object $row -Name "EmailAddress")
         if (-not $mail) { $mail = [string](Get-ObjectPropValue -Object $row -Name "mail") }
         $sam = [string](Get-ObjectPropValue -Object $row -Name "SamAccountName")
+        $who = if ($sam) { $sam } elseif ($upn) { $upn } else { "user $i" }
+        Update-EnrichProgress -Current $i -Total $total -Detail $who
 
         # Ensure Entra note properties exist on the PSCustomObject row
         foreach ($ep in (Get-SelectedEntraColumns)) {
