@@ -14,13 +14,19 @@
     (SMB1/2/3, NFS, SRVSVC).
 
     Capture filter dropdown: All traffic, Active Directory, File shares, SMB, LDAP,
-    Kerberos, DNS, RPC, NFS. Display filters work on the current view.
+    Kerberos, DNS, RPC, NFS, Domain collapse. Display filters work on the current view.
 
     Designed for Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012 / 2012 R2,
     and PowerShell 7 on Windows. Live capture needs an elevated Administrator session.
 
     Display filters (examples):
       ad
+      collapse
+      machine
+      gpo
+      simplebind
+      dclocator
+      domain:contoso
       fileshare
       ldap and bind
       kerberos
@@ -46,7 +52,7 @@
     .\PowerShark.ps1 -SelfTest
 
 .NOTES
-    Version     : 1.0
+    Version     : 1.1
     Compatible  : Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012
                   (PowerShell 3.0), 2012 R2 (PowerShell 4.0), 5.1, and PowerShell 7+.
                   There is no Requires-Version directive. Do not use -shl/-shr
@@ -65,7 +71,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.0'
+$script:AppVersion = '1.1'
 
 # Version is checked at runtime on purpose. Do not add "#Requires -Version".
 # Server 2008 / 2008 R2 is PowerShell 2.0. Server 2012 R2 is 4.0.
@@ -223,6 +229,32 @@ public class PowerSharkPacket {
     public string Family = "";
     public int HighlightOffset = -1;
     public int HighlightLength;
+    public bool IsSimpleBind;
+    public bool IsNtlm;
+    public bool IsNtlmV1;
+    public bool IsDcLocator;
+    public bool IsSysvol;
+    public bool IsNetlogonShare;
+    public bool IsReplication;
+    public bool IsWins;
+    public bool IsGc;
+    public bool IsLdaps;
+    public bool IsKpasswd;
+    public bool IsLegacy;
+    public bool IsCollapse;
+    public bool IsMachine;
+    public bool IsGpo;
+    public bool IsNtp;
+    public bool IsAdws;
+    public bool IsCldap;
+    public bool IsLlmnr;
+    public bool IsAnonymous;
+    public bool IsDfs;
+    public bool IsSamr;
+    public bool IsDnsUpdate;
+    public bool IsKdc;
+    public bool IsWinRm;
+    public bool IsCert;
 }
 
 public class PowerSharkStats {
@@ -242,6 +274,12 @@ public class PowerSharkStats {
     public int Kerberos;
     public int Rpc;
     public int Nfs;
+    public int Legacy;
+    public int SimpleBind;
+    public int Ntlm;
+    public int DcLocator;
+    public int Sysvol;
+    public int Collapse;
 }
 
 public static class PowerSharkParser {
@@ -568,16 +606,27 @@ public static class PowerSharkParser {
             if (raw[i] == 0x4E && raw[i + 1] == 0x54 && raw[i + 2] == 0x4C && raw[i + 3] == 0x4D
                 && raw[i + 4] == 0x53 && raw[i + 5] == 0x53 && raw[i + 6] == 0x50 && raw[i + 7] == 0x00) {
                 int type = BitConverter.ToInt32(raw, i + 8);
+                p.IsNtlm = true;
                 if (type == 1) p.Info += ", NTLMSSP_NEGOTIATE";
                 else if (type == 2) p.Info += ", NTLMSSP_CHALLENGE";
                 else if (type == 3) {
                     p.Info += ", NTLMSSP_AUTH";
+                    if (i + 22 <= end) {
+                        int ntLen = BitConverter.ToUInt16(raw, i + 20);
+                        if (ntLen == 24) {
+                            p.IsNtlmV1 = true;
+                            p.Info += ", NTLMv1";
+                        } else if (ntLen > 24) {
+                            p.Info += ", NTLMv2";
+                        }
+                    }
                     string domain = ReadNtlmSecBuf(raw, i, 28, end);
                     string user = ReadNtlmSecBuf(raw, i, 36, end);
                     string ws = ReadNtlmSecBuf(raw, i, 44, end);
                     if (user.Length > 0) {
                         p.UserName = domain.Length > 0 ? domain + "\\" + user : user;
                         p.Info += ", User: " + p.UserName;
+                        if (user[user.Length - 1] == '$') p.IsMachine = true;
                     }
                     if (ws.Length > 0) {
                         p.Workstation = ws;
@@ -819,6 +868,7 @@ public static class PowerSharkParser {
         if (mode == 6) return p.IsDns;
         if (mode == 7) return p.IsRpc;
         if (mode == 8) return p.IsNfs;
+        if (mode == 9) return p.IsCollapse;
         return true;
     }
 
@@ -829,24 +879,91 @@ public static class PowerSharkParser {
             p.IsFileShare = true;
         if (p.IsNfs || PortIs(p.SrcPort, p.DstPort, 2049) || PortIs(p.SrcPort, p.DstPort, 111))
             p.IsFileShare = true;
-        if (p.IsLdap || p.IsKerberos || p.IsDns || p.IsRpc ||
+        if (p.IsLdap || p.IsKerberos || p.IsDns || p.IsRpc || p.IsAdws || p.IsWinRm || p.IsCert ||
             PortIs(p.SrcPort, p.DstPort, 53) || PortIs(p.SrcPort, p.DstPort, 88) ||
             PortIs(p.SrcPort, p.DstPort, 135) || PortIs(p.SrcPort, p.DstPort, 137) ||
             PortIs(p.SrcPort, p.DstPort, 139) || PortIs(p.SrcPort, p.DstPort, 389) ||
             PortIs(p.SrcPort, p.DstPort, 445) || PortIs(p.SrcPort, p.DstPort, 464) ||
             PortIs(p.SrcPort, p.DstPort, 636) || PortIs(p.SrcPort, p.DstPort, 3268) ||
             PortIs(p.SrcPort, p.DstPort, 3269) || PortIs(p.SrcPort, p.DstPort, 9389) ||
-            PortIs(p.SrcPort, p.DstPort, 5722))
+            PortIs(p.SrcPort, p.DstPort, 5722) || PortIs(p.SrcPort, p.DstPort, 5985) ||
+            PortIs(p.SrcPort, p.DstPort, 5986) || PortIs(p.SrcPort, p.DstPort, 42))
             p.IsAd = true;
         if (p.IsAd && p.IsFileShare) p.Family = "AD+File";
         else if (p.IsAd) p.Family = "AD";
         else if (p.IsFileShare) p.Family = "FileShare";
         else p.Family = "Other";
+        MarkCollapseFindings(p);
+    }
+
+    static void MarkCollapseFindings(PowerSharkPacket p) {
+        if (PortIs(p.SrcPort, p.DstPort, 137) || PortIs(p.SrcPort, p.DstPort, 42) ||
+            p.Protocol == "NBNS" || p.Protocol == "WINS") p.IsWins = true;
+        if (p.Protocol == "NBDS") p.IsWins = true;
+        if (PortIs(p.SrcPort, p.DstPort, 3268) || PortIs(p.SrcPort, p.DstPort, 3269)) p.IsGc = true;
+        if (PortIs(p.SrcPort, p.DstPort, 636) || PortIs(p.SrcPort, p.DstPort, 3269)) p.IsLdaps = true;
+        if (PortIs(p.SrcPort, p.DstPort, 464)) p.IsKpasswd = true;
+        if (PortIs(p.SrcPort, p.DstPort, 123) || p.Protocol == "NTP") p.IsNtp = true;
+        if (PortIs(p.SrcPort, p.DstPort, 9389) || p.Protocol == "ADWS") p.IsAdws = true;
+        if (PortIs(p.SrcPort, p.DstPort, 5355) || p.Protocol == "LLMNR") p.IsLlmnr = true;
+        if (PortIs(p.SrcPort, p.DstPort, 5985) || PortIs(p.SrcPort, p.DstPort, 5986) || p.Protocol == "WinRM")
+            p.IsWinRm = true;
+        if (p.IsLdap && p.IsUdp) p.IsCldap = true;
+        if (p.Protocol == "DFSR" || p.QueryName == "DRSUAPI" || p.QueryName == "NETLOGON" || p.QueryName == "NTFRS")
+            p.IsReplication = true;
+        if (p.QueryName == "SAMR" || p.QueryName == "LSARPC") p.IsSamr = true;
+        if (p.QueryName == "DFS") p.IsDfs = true;
+        if (p.QueryName == "ICERT") p.IsCert = true;
+        if (p.AppOp == "AS-REQ" || p.AppOp == "AS-REP" || p.AppOp == "TGS-REQ" || p.AppOp == "TGS-REP")
+            p.IsKdc = true;
+        if (p.UserName != null && p.UserName.Length > 1) {
+            if (p.UserName[p.UserName.Length - 1] == '$') p.IsMachine = true;
+        }
+        if (p.IsSimpleBind && (p.QueryName == null || p.QueryName.Length == 0)) p.IsAnonymous = true;
+        if (p.QueryName != null && p.QueryName.Length > 0) {
+            string n = p.QueryName.ToLowerInvariant();
+            if (n.IndexOf("_ldap._tcp") >= 0 || n.IndexOf("_ldap._udp") >= 0 ||
+                n.IndexOf("_kerberos") >= 0 || n.IndexOf("_gc._tcp") >= 0 ||
+                n.IndexOf("_kpasswd") >= 0 || n.IndexOf("_msdcs") >= 0 ||
+                n.IndexOf("dc._msdcs") >= 0 || n.IndexOf("_sites.") >= 0 ||
+                n.IndexOf("pdc._msdcs") >= 0 || n.IndexOf("gc._msdcs") >= 0 ||
+                n.IndexOf("msdcs") >= 0)
+                p.IsDcLocator = true;
+            if (n.IndexOf("dc=") >= 0 || n.IndexOf("cn=") >= 0) {
+                if (p.IsLdap && !p.IsSimpleBind) p.IsCollapse = true;
+            }
+        }
+        string blob = ((p.SharePath == null ? "" : p.SharePath) + " " +
+                       (p.FileName == null ? "" : p.FileName) + " " +
+                       (p.Info == null ? "" : p.Info)).ToUpperInvariant();
+        if (blob.IndexOf("SYSVOL") >= 0) p.IsSysvol = true;
+        if (blob.IndexOf("NETLOGON") >= 0) p.IsNetlogonShare = true;
+        if (blob.IndexOf("POLICIES") >= 0 || blob.IndexOf("GPT.INI") >= 0 ||
+            blob.IndexOf("REGISTRY.POL") >= 0 || blob.IndexOf("\\SCRIPTS\\") >= 0 ||
+            blob.IndexOf("GROUP POLICY") >= 0)
+            p.IsGpo = true;
+        if (blob.IndexOf("\\DFS") >= 0 || blob.IndexOf("DFS$") >= 0 || blob.IndexOf("DFSN") >= 0)
+            p.IsDfs = true;
+        if (p.IsSmb1 || p.IsNtlmV1 || p.IsSimpleBind || p.IsWins) p.IsLegacy = true;
+        if (p.IsLegacy || p.IsSimpleBind || p.IsNtlm || p.IsDcLocator || p.IsSysvol ||
+            p.IsNetlogonShare || p.IsReplication || p.IsKpasswd || p.IsGc ||
+            p.IsMachine || p.IsGpo || p.IsNtp || p.IsAdws || p.IsCldap || p.IsLlmnr ||
+            p.IsAnonymous || p.IsDfs || p.IsSamr || p.IsDnsUpdate || p.IsKdc ||
+            p.IsWinRm || p.IsCert)
+            p.IsCollapse = true;
     }
 
     static void ParseAppLayer(PowerSharkPacket p) {
         int a = p.SrcPort, b = p.DstPort;
         if (PortIs(a, b, 53)) { ParseDns(p); return; }
+        if (PortIs(a, b, 5355)) {
+            ParseDns(p);
+            p.Protocol = "LLMNR";
+            p.IsLlmnr = true;
+            p.IsDns = false;
+            if (p.Info != null && p.Info.StartsWith("DNS")) p.Info = "LLMNR" + p.Info.Substring(3);
+            return;
+        }
         if (PortIs(a, b, 88) || PortIs(a, b, 464)) { ParseKerberos(p); return; }
         if (PortIs(a, b, 389) || PortIs(a, b, 636) || PortIs(a, b, 3268) || PortIs(a, b, 3269)) { ParseLdap(p); return; }
         if (PortIs(a, b, 135)) { ParseRpc(p); return; }
@@ -865,11 +982,18 @@ public static class PowerSharkParser {
             p.Info = "RPC portmapper (NFS)";
             return;
         }
-        if (PortIs(a, b, 137)) { p.Protocol = "NBNS"; p.Info = "NetBIOS name service"; return; }
-        if (PortIs(a, b, 138)) { p.Protocol = "NBDS"; p.Info = "NetBIOS datagram"; return; }
-        if (PortIs(a, b, 123)) { p.Protocol = "NTP"; p.Info = "NTP"; return; }
-        if (PortIs(a, b, 9389)) { p.Protocol = "ADWS"; p.Info = "Active Directory Web Services"; return; }
+        if (PortIs(a, b, 137)) { p.Protocol = "NBNS"; p.Info = "NetBIOS name service (WINS)"; p.IsWins = true; return; }
+        if (PortIs(a, b, 138)) { p.Protocol = "NBDS"; p.Info = "NetBIOS datagram"; p.IsWins = true; return; }
+        if (PortIs(a, b, 42)) { p.Protocol = "WINS"; p.Info = "WINS replication"; p.IsWins = true; return; }
+        if (PortIs(a, b, 123)) { p.Protocol = "NTP"; p.Info = "NTP (DC time source?)"; p.IsNtp = true; return; }
+        if (PortIs(a, b, 9389)) { p.Protocol = "ADWS"; p.Info = "Active Directory Web Services"; p.IsAdws = true; return; }
         if (PortIs(a, b, 5722)) { p.Protocol = "DFSR"; p.Info = "DFS Replication"; p.IsFileShare = true; return; }
+        if (PortIs(a, b, 5985) || PortIs(a, b, 5986)) {
+            p.Protocol = "WinRM";
+            p.IsWinRm = true;
+            p.Info = PortIs(a, b, 5986) ? "WinRM HTTPS" : "WinRM HTTP";
+            return;
+        }
         ParseRpc(p);
     }
 
@@ -884,11 +1008,18 @@ public static class PowerSharkParser {
         p.HighlightLength = 12;
         int flags = (r[off + 2] << 8) | r[off + 3];
         bool qr = (flags & 0x8000) != 0;
+        int opcode = (flags >> 11) & 0x0F;
         string name = ReadDnsName(r, off, off + 12, off + len, 0);
         p.QueryName = name;
-        p.AppOp = qr ? "Response" : "Query";
-        if (name != null && name.Length > 0) p.Info = (qr ? "DNS Response " : "DNS Query ") + name;
-        else p.Info = qr ? "DNS Response" : "DNS Query";
+        if (opcode == 5) {
+            p.IsDnsUpdate = true;
+            p.AppOp = "Update";
+            p.Info = (name != null && name.Length > 0) ? ("DNS Update " + name) : "DNS dynamic update";
+        } else {
+            p.AppOp = qr ? "Response" : "Query";
+            if (name != null && name.Length > 0) p.Info = (qr ? "DNS Response " : "DNS Query ") + name;
+            else p.Info = qr ? "DNS Response" : "DNS Query";
+        }
     }
 
     static string ReadDnsName(byte[] r, int dnsOff, int start, int end, int jumps) {
@@ -935,7 +1066,12 @@ public static class PowerSharkParser {
         p.IsLdap = true;
         bool ssl = PortIs(p.SrcPort, p.DstPort, 636) || PortIs(p.SrcPort, p.DstPort, 3269);
         bool gc = PortIs(p.SrcPort, p.DstPort, 3268) || PortIs(p.SrcPort, p.DstPort, 3269);
-        p.Protocol = ssl ? "LDAPS" : (gc ? "LDAP-GC" : "LDAP");
+        if (p.IsUdp) {
+            p.IsCldap = true;
+            p.Protocol = "CLDAP";
+        } else {
+            p.Protocol = ssl ? "LDAPS" : (gc ? "LDAP-GC" : "LDAP");
+        }
         p.HighlightOffset = off;
         p.HighlightLength = Math.Min(8, Math.Max(0, end - off));
         if (off >= end || r[off] != 0x30) {
@@ -982,8 +1118,20 @@ public static class PowerSharkParser {
                 if (pos < end && r[pos] == 0x04) {
                     pos++;
                     int dnLen = ReadBerLen(r, ref pos, end);
+                    if (dnLen < 0) dnLen = 0;
                     if (dnLen > 0 && pos + dnLen <= end) {
                         p.QueryName = Encoding.UTF8.GetString(r, pos, dnLen);
+                    }
+                    if (dnLen > 0) pos += dnLen;
+                    if (pos < end) {
+                        int authN = r[pos] & 0x1F;
+                        if (authN == 0) {
+                            p.IsSimpleBind = true;
+                            op = "Simple Bind";
+                        } else if (authN == 3) {
+                            op = "SASL Bind";
+                            ParseNtlm(p, r, pos, end);
+                        }
                     }
                 }
             }
@@ -996,8 +1144,17 @@ public static class PowerSharkParser {
             }
         }
         p.AppOp = op;
-        if (p.QueryName != null && p.QueryName.Length > 0) p.Info = p.Protocol + " " + op + " " + p.QueryName;
-        else p.Info = p.Protocol + " " + op;
+        if (p.IsSimpleBind && (p.QueryName == null || p.QueryName.Length == 0)) p.IsAnonymous = true;
+        if (p.IsSimpleBind) {
+            if (p.QueryName != null && p.QueryName.Length > 0)
+                p.Info = p.Protocol + " simple bind " + p.QueryName + " (password on the wire)";
+            else
+                p.Info = p.Protocol + " anonymous simple bind (cleartext)";
+        } else if (p.QueryName != null && p.QueryName.Length > 0) {
+            p.Info = p.Protocol + " " + op + " " + p.QueryName;
+        } else {
+            p.Info = p.Protocol + " " + op;
+        }
     }
 
     static void ParseKerberos(PowerSharkPacket p) {
@@ -1023,6 +1180,7 @@ public static class PowerSharkParser {
         else if (app == 30) op = "KRB-ERROR";
         else if (PortIs(p.SrcPort, p.DstPort, 464)) op = "Kpasswd";
         p.AppOp = op;
+        if (app == 10 || app == 11 || app == 12 || app == 13) p.IsKdc = true;
         p.Info = "Kerberos " + op;
         string realm = ExtractPrintable(r, off, Math.Min(end - off, 80));
         if (realm != null && realm.Length >= 3) {
@@ -1074,7 +1232,12 @@ public static class PowerSharkParser {
             if (mapped.Length > 0) {
                 p.QueryName = mapped;
                 p.Info = "RPC " + op + " " + mapped;
-                if (mapped == "SRVSVC" || mapped == "WKSSVC") p.IsFileShare = true;
+                if (mapped == "SRVSVC" || mapped == "WKSSVC" || mapped == "DFS" || mapped == "SPOOLSS")
+                    p.IsFileShare = true;
+                if (mapped == "SAMR" || mapped == "LSARPC") p.IsSamr = true;
+                if (mapped == "DFS") p.IsDfs = true;
+                if (mapped == "ICERT") p.IsCert = true;
+                if (mapped == "DRSUAPI" || mapped == "NETLOGON" || mapped == "NTFRS") p.IsReplication = true;
                 return;
             }
             p.QueryName = iface;
@@ -1103,6 +1266,10 @@ public static class PowerSharkParser {
         if (x.IndexOf("4B324FC8-1670-01D3-1278-5A47BF6EE188") >= 0) return "SRVSVC";
         if (x.IndexOf("6BFFD098-A112-3610-9833-46C3F87E345A") >= 0) return "WKSSVC";
         if (x.IndexOf("367ABB81-9844-35F1-AD32-98F038001003") >= 0) return "SVCCTL";
+        if (x.IndexOf("F5CC59B4-4264-101A-8C59-08002B2F8426") >= 0) return "NTFRS";
+        if (x.IndexOf("4FC742E0-4A10-11CF-8273-00AA004AE673") >= 0) return "DFS";
+        if (x.IndexOf("91AE6020-9E3C-11CF-8D7C-00AA00C074EA") >= 0) return "ICERT";
+        if (x.IndexOf("12345678-1234-ABCD-EF00-0123456789AB") >= 0) return "SPOOLSS";
         return "";
     }
 
@@ -1209,6 +1376,27 @@ public static class PowerSharkParser {
         t = t.AddMilliseconds(8);
         list.Add(Wrap(BuildIpTcp(client, server, 55127, 2049, 0x18, new byte[] { 0x80, 0x00, 0x00, 0x04, 0, 0, 0, 0 }), t));
 
+        t = t.AddMilliseconds(8);
+        byte[] sessM = WithNetbios(Concat(BuildSmb1Header(0x73, false, 0, 1, 0, 5), BuildNtlmType3("CONTOSO", "XPCLIENT01$", "XPCLIENT01")));
+        list.Add(Wrap(BuildIpTcp(client, server, 55128, 445, 0x18, sessM), t));
+
+        t = t.AddMilliseconds(6);
+        byte[] treeSys = BuildSmb1TreeConnect("\\\\dc01\\SYSVOL");
+        list.Add(Wrap(BuildIpTcp(client, server, 55128, 445, 0x18, treeSys), t));
+
+        t = t.AddMilliseconds(4);
+        byte[] gpo = BuildSmb1TreeConnect("\\\\dc01\\SYSVOL\\contoso.local\\Policies\\{31B2F340-016D-11D2-945F-00C04FB984F9}\\GPT.INI");
+        list.Add(Wrap(BuildIpTcp(client, server, 55128, 445, 0x18, gpo), t));
+
+        t = t.AddMilliseconds(8);
+        list.Add(Wrap(BuildIpUdp(client, "10.10.50.11", 12345, 123, new byte[] { 0x1B, 0, 0, 0, 0, 0, 0, 0 }), t));
+
+        t = t.AddMilliseconds(6);
+        list.Add(Wrap(BuildIpUdp(client, "224.0.0.252", 5355, 5355, BuildDnsQuery()), t));
+
+        t = t.AddMilliseconds(6);
+        list.Add(Wrap(BuildIpTcp(client, "10.10.50.11", 55129, 9389, 0x18, new byte[] { 0x16, 0x03, 0x01, 0x00, 0x00 }), t));
+
         return list.ToArray();
     }
 
@@ -1248,10 +1436,10 @@ public static class PowerSharkParser {
     static byte[] BuildDnsQuery() {
         byte[] q = new byte[] {
             0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x05, (byte)'l', (byte)'d', (byte)'a', (byte)'p', (byte)'s',
-            0x04, (byte)'t', (byte)'c', (byte)'p',
+            0x05, (byte)'_', (byte)'l', (byte)'d', (byte)'a', (byte)'p',
+            0x04, (byte)'_', (byte)'t', (byte)'c', (byte)'p',
             0x02, (byte)'d', (byte)'c',
-            0x06, (byte)'m', (byte)'s', (byte)'d', (byte)'c', (byte)'s',
+            0x06, (byte)'_', (byte)'m', (byte)'s', (byte)'d', (byte)'c', (byte)'s',
             0x07, (byte)'c', (byte)'o', (byte)'n', (byte)'t', (byte)'o', (byte)'s', (byte)'o',
             0x05, (byte)'l', (byte)'o', (byte)'c', (byte)'a', (byte)'l',
             0x00, 0x00, 0x21, 0x00, 0x01
@@ -1440,6 +1628,12 @@ public class PowerSharkEngine {
     public int KerberosCount;
     public int RpcCount;
     public int NfsCount;
+    public int LegacyCount;
+    public int SimpleBindCount;
+    public int NtlmCount;
+    public int DcLocatorCount;
+    public int SysvolCount;
+    public int CollapseCount;
     public int Dropped;
     public long Bytes;
     public int RecvCount;
@@ -1485,6 +1679,12 @@ public class PowerSharkEngine {
         KerberosCount = 0;
         RpcCount = 0;
         NfsCount = 0;
+        LegacyCount = 0;
+        SimpleBindCount = 0;
+        NtlmCount = 0;
+        DcLocatorCount = 0;
+        SysvolCount = 0;
+        CollapseCount = 0;
         Dropped = 0;
         Bytes = 0;
         RecvCount = 0;
@@ -1671,6 +1871,12 @@ public class PowerSharkEngine {
         s.Kerberos = KerberosCount;
         s.Rpc = RpcCount;
         s.Nfs = NfsCount;
+        s.Legacy = LegacyCount;
+        s.SimpleBind = SimpleBindCount;
+        s.Ntlm = NtlmCount;
+        s.DcLocator = DcLocatorCount;
+        s.Sysvol = SysvolCount;
+        s.Collapse = CollapseCount;
         s.Dropped = Dropped;
         lock (_gate) { s.Queue = _queue.Count; }
         s.Bytes = Bytes;
@@ -1749,6 +1955,12 @@ public class PowerSharkEngine {
             if (pkt.IsKerberos) Interlocked.Increment(ref KerberosCount);
             if (pkt.IsRpc) Interlocked.Increment(ref RpcCount);
             if (pkt.IsNfs) Interlocked.Increment(ref NfsCount);
+            if (pkt.IsLegacy) Interlocked.Increment(ref LegacyCount);
+            if (pkt.IsSimpleBind) Interlocked.Increment(ref SimpleBindCount);
+            if (pkt.IsNtlm) Interlocked.Increment(ref NtlmCount);
+            if (pkt.IsDcLocator) Interlocked.Increment(ref DcLocatorCount);
+            if (pkt.IsSysvol || pkt.IsNetlogonShare) Interlocked.Increment(ref SysvolCount);
+            if (pkt.IsCollapse) Interlocked.Increment(ref CollapseCount);
         }
     }
 }
@@ -1969,6 +2181,27 @@ function Invoke-SmbAnalyzerSelfTest {
     if ($smbDemo -and -not [PowerSharkParser]::MatchesFilter($smbDemo, 2)) {
         [void]$failures.Add('File-share capture filter rejected SMB')
     }
+    $simple = $demo | Where-Object { $_.IsSimpleBind } | Select-Object -First 1
+    if (-not $simple) { [void]$failures.Add('Demo LDAP simple bind not flagged') }
+    $loc = $demo | Where-Object { $_.IsDcLocator } | Select-Object -First 1
+    if (-not $loc) { [void]$failures.Add('Demo DC-locator DNS not flagged') }
+    $mach = $demo | Where-Object { $_.IsMachine } | Select-Object -First 1
+    if (-not $mach) { [void]$failures.Add('Demo machine account (user$) not flagged') }
+    $sysv = $demo | Where-Object { $_.IsSysvol } | Select-Object -First 1
+    if (-not $sysv) { [void]$failures.Add('Demo SYSVOL tree connect not flagged') }
+    $gpo = $demo | Where-Object { $_.IsGpo } | Select-Object -First 1
+    if (-not $gpo) { [void]$failures.Add('Demo GPO GPT.INI not flagged') }
+    $ntp = $demo | Where-Object { $_.IsNtp } | Select-Object -First 1
+    if (-not $ntp) { [void]$failures.Add('Demo NTP packet not flagged') }
+    $kdc = $demo | Where-Object { $_.IsKdc } | Select-Object -First 1
+    if (-not $kdc) { [void]$failures.Add('Demo Kerberos AS-REQ not flagged as KDC') }
+    $col = $demo | Where-Object { $_.IsCollapse } | Select-Object -First 1
+    if (-not $col) { [void]$failures.Add('No domain-collapse demo packets') }
+    elseif (-not [PowerSharkParser]::MatchesFilter($col, 9)) {
+        [void]$failures.Add('Domain-collapse capture filter rejected a collapse packet')
+    }
+    $anon = $demo | Where-Object { $_.IsAnonymous } | Select-Object -First 1
+    if (-not $anon) { [void]$failures.Add('Demo anonymous LDAP bind not flagged') }
 
     $map = @{ Negotiate = 2; SessionSetup = 1 }
     $fmt = Format-AppCommandMap $map
@@ -1976,12 +2209,12 @@ function Invoke-SmbAnalyzerSelfTest {
     $csvTmp = Join-Path ([System.IO.Path]::GetTempPath()) ("smb1-csv-{0}.csv" -f [guid]::NewGuid().ToString('N'))
     try {
         $emptyUsers = New-AppList ([string])
-        $csvRow = New-AppObject -Property @{
+        $csvRow = New-Object PSObject -Property @{
             IP = '10.0.0.1'
             Commands = $fmt
             Users = (Join-AppStrings -Values $emptyUsers)
         }
-        Export-AppCsv -InputObject $csvRow -Path $csvTmp
+        $csvRow | Export-Csv -Path $csvTmp -NoTypeInformation -ErrorAction Stop
         if (-not (Test-Path -LiteralPath $csvTmp)) { [void]$failures.Add('Export-AppCsv did not write a file') }
     } catch {
         [void]$failures.Add("Export-AppCsv: $($_.Exception.Message)")
@@ -2272,6 +2505,7 @@ function Get-PacketRowColor {
     if ($p.IsSmb1) { return $script:C.Smb1 }
     if ($p.Protocol -eq 'SMB3' -or $p.IsSmb3) { return $script:C.Smb3 }
     if ($p.IsSmb2 -or $p.Protocol -eq 'SMB2') { return $script:C.Smb2 }
+    if ($p.IsSimpleBind -or $p.IsNtlmV1) { return $script:C.Smb1Neg }
     if ($p.IsLdap) { return $script:C.Ldap }
     if ($p.IsKerberos) { return $script:C.Kerberos }
     if ($p.IsDns) { return $script:C.Dns }
@@ -2295,7 +2529,9 @@ function Test-FilterToken {
         '^smb$'                  { return [bool]$pkt.HasSmb }
         '^(ad|activedirectory)$' { return [bool]$pkt.IsAd }
         '^(fileshare|file.?share|fileserver)$' { return [bool]$pkt.IsFileShare }
-        '^(ldap|ldaps|gc)$'      { return [bool]$pkt.IsLdap }
+        '^ldap$'                 { return [bool]$pkt.IsLdap }
+        '^ldaps$'                { return [bool]$pkt.IsLdaps }
+        '^gc$'                   { return [bool]$pkt.IsGc }
         '^(kerberos|krb5|krb)$'  { return [bool]$pkt.IsKerberos }
         '^dns$'                  { return [bool]$pkt.IsDns }
         '^rpc$'                  { return [bool]$pkt.IsRpc }
@@ -2305,6 +2541,30 @@ function Test-FilterToken {
         '^(bind)$'               { return ($pkt.IsLdap -and $pkt.AppOp -and ($pkt.AppOp -match 'Bind')) }
         '^(as-req|asreq)$'       { return ($pkt.AppOp -eq 'AS-REQ') }
         '^(tgs-req|tgsreq)$'     { return ($pkt.AppOp -eq 'TGS-REQ') }
+        '^(legacy|old|insecure)$' { return [bool]$pkt.IsLegacy }
+        '^(collapse|precollapse|pre-collapse)$' { return [bool]$pkt.IsCollapse }
+        '^(simplebind|simple-bind|cleartext)$' { return [bool]$pkt.IsSimpleBind }
+        '^ntlm$'                 { return [bool]$pkt.IsNtlm }
+        '^(ntlmv1|ntlm1)$'       { return [bool]$pkt.IsNtlmV1 }
+        '^(dclocator|locator|srv)$' { return [bool]$pkt.IsDcLocator }
+        '^sysvol$'               { return [bool]$pkt.IsSysvol }
+        '^netlogon$'             { return [bool]$pkt.IsNetlogonShare }
+        '^(replication|drs|drsuapi|frs)$' { return [bool]$pkt.IsReplication }
+        '^(wins|nbns|netbios)$'  { return [bool]$pkt.IsWins }
+        '^(kpasswd|password)$'   { return [bool]$pkt.IsKpasswd }
+        '^(machine|computer|machineacct)$' { return [bool]$pkt.IsMachine }
+        '^(gpo|gpt|grouppolicy)$' { return [bool]$pkt.IsGpo }
+        '^(ntp|time)$'           { return [bool]$pkt.IsNtp }
+        '^adws$'                 { return [bool]$pkt.IsAdws }
+        '^(cldap|ldapping)$'     { return [bool]$pkt.IsCldap }
+        '^llmnr$'                { return [bool]$pkt.IsLlmnr }
+        '^(anonymous|anonbind)$' { return [bool]$pkt.IsAnonymous }
+        '^dfs$'                  { return [bool]$pkt.IsDfs }
+        '^(samr|lsa|lsarpc)$'    { return [bool]$pkt.IsSamr }
+        '^(dnsupdate|dns-update|dynamic)$' { return [bool]$pkt.IsDnsUpdate }
+        '^(kdc|ticket)$'         { return [bool]$pkt.IsKdc }
+        '^winrm$'                { return [bool]$pkt.IsWinRm }
+        '^(cert|icert|enrollment)$' { return [bool]$pkt.IsCert }
         '^marked$'               { return [bool]$pkt.Marked }
         '^(negotiate|neg)$'      { return [bool]$pkt.IsNegotiate }
         '^(session|sess|setup)$' { return [bool]$pkt.IsSessionSetup }
@@ -2340,6 +2600,22 @@ function Test-FilterToken {
     }
     if ($tl -match '^file:(.+)$') {
         return ($pkt.FileName -and $pkt.FileName.ToLowerInvariant().Contains($Matches[1]))
+    }
+    if ($tl -match '^share:(.+)$') {
+        $q = $Matches[1]
+        return ($pkt.SharePath -and $pkt.SharePath.ToLowerInvariant().Contains($q))
+    }
+    if ($tl -match '^dns:(.+)$') {
+        $q = $Matches[1]
+        return ($pkt.QueryName -and $pkt.QueryName.ToLowerInvariant().Contains($q))
+    }
+    if ($tl -match '^(domain|realm|dn):(.+)$') {
+        $q = $Matches[2]
+        if ($pkt.QueryName -and $pkt.QueryName.ToLowerInvariant().Contains($q)) { return $true }
+        if ($pkt.UserName -and $pkt.UserName.ToLowerInvariant().Contains($q)) { return $true }
+        if ($pkt.SharePath -and $pkt.SharePath.ToLowerInvariant().Contains($q)) { return $true }
+        if ($pkt.Info -and $pkt.Info.ToLowerInvariant().Contains($q)) { return $true }
+        return $false
     }
     if ($tl -match '^contains:(.+)$') {
         return ($pkt.Info -and $pkt.Info.ToLowerInvariant().Contains($Matches[1]))
@@ -2406,7 +2682,7 @@ function Limit-PacketBuffer {
 
 function Test-AppServerPort {
     param([int]$Port)
-    foreach ($p in @(53, 88, 135, 139, 389, 445, 464, 636, 2049, 3268, 3269, 9389, 5722)) {
+    foreach ($p in @(53, 88, 123, 135, 137, 139, 389, 445, 464, 636, 2049, 3268, 3269, 9389, 5722, 5985, 5986, 5355, 42)) {
         if ($Port -eq $p) { return $true }
     }
     return $false
@@ -2444,6 +2720,10 @@ function Update-Smb1Host {
                 Sample      = $pkt.Info
                 IsAd        = $false
                 IsFileShare = $false
+                IsCollapse  = $false
+                IsLegacy    = $false
+                IsMachine   = $false
+                IsGpo       = $false
             }
         }
         $h = $script:Smb1Hosts[$ip]
@@ -2452,6 +2732,10 @@ function Update-Smb1Host {
         if ($h.Role -ne $role -and $h.Role -ne 'Both') { $h.Role = 'Both' }
         if ($pkt.IsAd) { $h.IsAd = $true }
         if ($pkt.IsFileShare) { $h.IsFileShare = $true }
+        if ($pkt.IsCollapse) { $h.IsCollapse = $true }
+        if ($pkt.IsLegacy) { $h.IsLegacy = $true }
+        if ($pkt.IsMachine) { $h.IsMachine = $true }
+        if ($pkt.IsGpo) { $h.IsGpo = $true }
         $protoName = [string]$pkt.Protocol
         if (-not (Test-BlankString $protoName)) {
             if ($h.Protocols.ContainsKey($protoName)) { $h.Protocols[$protoName]++ } else { $h.Protocols[$protoName] = 1 }
@@ -2573,10 +2857,14 @@ function Update-StatusBar {
                 Write-AppLog "First SMBv1 packet observed on the wire." 'WARN'
             }
             $script:LastBannerCount = $stats.Smb1
+        } elseif ($stats.SimpleBind -gt 0 -or $stats.Legacy -gt 0 -or $stats.Collapse -gt 0) {
+            $script:banner.Visible = $true
+            $script:banner.BackColor = $script:C.AlertBg
+            $script:banner.Text = "  PRE-COLLAPSE  -  $($stats.Collapse) leftover(s)  SMBv1 $($stats.Smb1)  simple-bind $($stats.SimpleBind)  NTLM $($stats.Ntlm)  DC-locator $($stats.DcLocator)  SYSVOL $($stats.Sysvol)"
         } elseif ($stats.Ad -gt 0) {
             $script:banner.Visible = $true
             $script:banner.BackColor = $script:C.Blue
-            $script:banner.Text = "  Active Directory traffic  -  LDAP $($stats.Ldap)  Kerberos $($stats.Kerberos)  DNS $($stats.Dns)  RPC $($stats.Rpc)"
+            $script:banner.Text = "  Active Directory traffic  -  LDAP $($stats.Ldap)  Kerberos $($stats.Kerberos)  DNS $($stats.Dns)  RPC $($stats.Rpc)  DC-locator $($stats.DcLocator)"
         }
     }
 }
@@ -2660,12 +2948,39 @@ function Show-PacketDetails {
             $warn = $smb.Nodes.Add("SECURITY: SMBv1 has no modern encryption, is vulnerable to relay and downgrade attacks, and is disabled by default on current Windows.")
             $warn.ForeColor = $script:C.Red
         }
-    } elseif ($p.IsLdap -or $p.IsKerberos -or $p.IsDns -or $p.IsRpc -or $p.IsNfs) {
+    } elseif ($p.IsLdap -or $p.IsKerberos -or $p.IsDns -or $p.IsRpc -or $p.IsNfs -or $p.IsNtp -or $p.IsAdws -or $p.IsLlmnr -or $p.IsWinRm) {
         $app = $frame.Nodes.Add($p.Protocol)
         [void]$app.Nodes.Add("Family: $($p.Family)")
         if ($p.AppOp) { [void]$app.Nodes.Add("Operation: $($p.AppOp)") }
         if ($p.QueryName) { [void]$app.Nodes.Add("Name / DN: $($p.QueryName)") }
         [void]$app.Nodes.Add("Summary: $($p.Info)")
+    }
+    if ($p.IsCollapse) {
+        $find = $frame.Nodes.Add('Domain collapse findings (fix before cutover)')
+        $find.ForeColor = $script:C.Red
+        if ($p.IsSimpleBind) { [void]$find.Nodes.Add('LDAP simple bind — password may be on the wire. Move this app to Kerberos/SASL/LDAPS.') }
+        if ($p.IsAnonymous) { [void]$find.Nodes.Add('Anonymous LDAP bind — an app is probing this directory without credentials.') }
+        if ($p.IsDcLocator) { [void]$find.Nodes.Add('DC locator DNS/CLDAP — this client still finds this domain via SRV or LDAP ping.') }
+        if ($p.IsSysvol -or $p.IsNetlogonShare) { [void]$find.Nodes.Add('SYSVOL/NETLOGON — logon scripts or GPOs still served from this domain.') }
+        if ($p.IsGpo) { [void]$find.Nodes.Add('Group Policy file (Policies / GPT.INI) — GPOs still applied from this domain.') }
+        if ($p.IsNtlmV1) { [void]$find.Nodes.Add('NTLMv1 — replace with Kerberos/NTLMv2.') }
+        elseif ($p.IsNtlm) { [void]$find.Nodes.Add('NTLM (not Kerberos) — this app will break when the domain is gone; move it to Kerberos or a local account.') }
+        if ($p.IsReplication) { [void]$find.Nodes.Add('AD replication RPC — another DC still talks to this domain.') }
+        if ($p.IsMachine) { [void]$find.Nodes.Add('Machine account (ends with $) — this computer is still domain-joined. Unjoin or migrate it.') }
+        if ($p.IsKdc) { [void]$find.Nodes.Add('Kerberos AS/TGS — this client still gets tickets from this KDC (still a domain member or service).') }
+        if ($p.IsNtp) { [void]$find.Nodes.Add('NTP — this host may still use a DC as its time source. Point clients at a new NTP server.') }
+        if ($p.IsAdws) { [void]$find.Nodes.Add('ADWS (9389) — RSAT / PowerShell AD module still targeting this domain.') }
+        if ($p.IsCldap) { [void]$find.Nodes.Add('CLDAP (UDP 389) — NetLogon LDAP ping; clients still locating this DC.') }
+        if ($p.IsLlmnr) { [void]$find.Nodes.Add('LLMNR — name fallback after DNS/WINS. Disable or expect name-resolution failures.') }
+        if ($p.IsDfs) { [void]$find.Nodes.Add('DFS namespace — domain DFS roots/folders still in use.') }
+        if ($p.IsSamr) { [void]$find.Nodes.Add('SAMR/LSARPC — account lookup from NAS, printers, or apps against this domain.') }
+        if ($p.IsDnsUpdate) { [void]$find.Nodes.Add('DNS dynamic update — a machine is still registering names in this DNS zone.') }
+        if ($p.IsWinRm) { [void]$find.Nodes.Add('WinRM — remoting that typically uses Kerberos to this domain.') }
+        if ($p.IsCert) { [void]$find.Nodes.Add('Certificate enrollment RPC — clients still using this CA/domain for certs.') }
+        if ($p.IsWins) { [void]$find.Nodes.Add('WINS/NetBIOS name service — break WINS and NetBIOS-dependent apps first.') }
+        if ($p.IsKpasswd) { [void]$find.Nodes.Add('Kerberos password change (464) — password changes still go through this KDC.') }
+        if ($p.IsGc) { [void]$find.Nodes.Add('Global Catalog (3268/3269) — forest-wide lookups still hit this domain.') }
+        if ($p.IsSmb1) { [void]$find.Nodes.Add('SMBv1 — remaining NT LM 0.12 client; replace before the file server / DC is retired.') }
     }
 
     $frame.Expand()
@@ -2796,6 +3111,7 @@ function Get-CaptureFilterMode {
     if ($v -eq 'DNS') { return 6 }
     if ($v -eq 'RPC') { return 7 }
     if ($v -eq 'NFS') { return 8 }
+    if ($v -eq 'Domain collapse') { return 9 }
     return 0
 }
 
@@ -3074,6 +3390,9 @@ function Update-HostsGrid {
         try { if ($script:cmbHostView -and $script:cmbHostView.SelectedItem) { $view = [string]$script:cmbHostView.SelectedItem } } catch { }
         if ($view -eq 'Active Directory' -and -not $isAd) { continue }
         if ($view -eq 'File shares' -and -not $isFs) { continue }
+        $isCol = $false
+        try { $isCol = [bool](Get-AppNote $h 'IsCollapse') } catch { }
+        if ($view -eq 'Domain collapse' -and -not $isCol) { continue }
         $kind = 'Other'
         if ($isAd -and $isFs) { $kind = 'AD+File' }
         elseif ($isAd) { $kind = 'AD' }
@@ -3161,11 +3480,20 @@ function Update-StatsTab {
     $stats = $script:Engine.GetStats()
     $total = [Math]::Max(1, (Get-AppCount $script:AllPackets))
     $c1 = 0; $c2 = 0; $c3 = 0; $tcp = 0
+    $nMach = 0; $nGpo = 0; $nNtp = 0; $nKdc = 0; $nAnon = 0; $nLlmnr = 0; $nSamr = 0; $nAdws = 0
     foreach ($p in (Get-AppEnumerable $script:AllPackets)) {
         if ($p.IsSmb1) { $c1++ }
         elseif ($p.IsSmb2 -or $p.Protocol -eq 'SMB2') { $c2++ }
         elseif ($p.IsSmb3 -or $p.Protocol -eq 'SMB3') { $c3++ }
         elseif ($p.Protocol -eq 'TCP') { $tcp++ }
+        if ($p.IsMachine) { $nMach++ }
+        if ($p.IsGpo) { $nGpo++ }
+        if ($p.IsNtp) { $nNtp++ }
+        if ($p.IsKdc) { $nKdc++ }
+        if ($p.IsAnonymous) { $nAnon++ }
+        if ($p.IsLlmnr) { $nLlmnr++ }
+        if ($p.IsSamr) { $nSamr++ }
+        if ($p.IsAdws) { $nAdws++ }
     }
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine("PowerShark v$($script:AppVersion)  -  Statistics")
@@ -3186,6 +3514,8 @@ function Update-StatsTab {
     [void]$sb.AppendLine("")
     [void]$sb.AppendLine("Active Directory : $($stats.Ad)   LDAP $($stats.Ldap)  Kerberos $($stats.Kerberos)  DNS $($stats.Dns)  RPC $($stats.Rpc)")
     [void]$sb.AppendLine("File shares      : $($stats.FileShare)   NFS $($stats.Nfs)")
+    [void]$sb.AppendLine("Pre-collapse     : $($stats.Collapse)  legacy $($stats.Legacy)  simple-bind $($stats.SimpleBind)  NTLM $($stats.Ntlm)  DC-locator $($stats.DcLocator)  SYSVOL/NETLOGON $($stats.Sysvol)")
+    [void]$sb.AppendLine(("  machine accounts {0}  GPO {1}  KDC tickets {2}  NTP {3}  ADWS {4}  anon-bind {5}  LLMNR {6}  SAMR/LSA {7}" -f $nMach, $nGpo, $nKdc, $nNtp, $nAdws, $nAnon, $nLlmnr, $nSamr))
     [void]$sb.AppendLine("Talkers          : $($script:Smb1Hosts.Count)")
     [void]$sb.AppendLine("SMBv1 commands")
     foreach ($e in (Get-AppEnumerable ($script:Smb1CommandHist.GetEnumerator() | Sort-Object Value -Descending))) {
@@ -3431,8 +3761,8 @@ HOW TO RUN
   2. Right-click powershell.exe or pwsh.exe -> Run as administrator.
   3. powershell.exe -ExecutionPolicy Bypass -STA -File .\PowerShark.ps1
   4. Pick the IPv4 address of the interface that faces clients / DCs.
-  5. Capture dropdown: All traffic (default), Active Directory, or File shares.
-  6. Click Start. Use display filters (ad, fileshare, ldap, kerberos, dns).
+  5. Capture dropdown: All traffic (default), Active Directory, File shares, or Domain collapse.
+  6. Click Start. Use display filters (collapse, machine, gpo, dclocator, ad, ldap).
 
 NO LIVE TRAFFIC?
   Watch Wire in the status bar after Start.
@@ -3441,28 +3771,73 @@ NO LIVE TRAFFIC?
   File > Load demo capture injects synthetic AD + SMB + DNS + Kerberos + LDAP + NFS.
   Saved PCAPs open in Wireshark (LINKTYPE 228 / IPv4).
 
+BEFORE A DOMAIN COLLAPSE
+  Capture dropdown: Domain collapse. Then work these display filters and fix
+  whoever still talks before you decommission DCs / trusts / DNS:
+    collapse       anything still depending on this domain
+    legacy         SMBv1, NTLMv1, WINS/NetBIOS, LDAP simple bind
+    machine        computer accounts (user ends with $) still domain-joined
+    kdc / as-req   Kerberos tickets from this KDC — members and services
+    gpo            Policies / GPT.INI under SYSVOL
+    simplebind     LDAP simple binds (passwords in cleartext on 389)
+    anonymous      LDAP binds with an empty DN
+    ntlm / ntlmv1  apps not using Kerberos (harder cutover)
+    dclocator      DNS SRV _ldap._tcp / _kerberos / _msdcs / _sites
+    cldap          UDP 389 NetLogon LDAP ping (DC locator)
+    dns:old.domain.tld     who still queries the old DNS name
+    domain:CONTOSO         user/DN/realm/share containing that name
+    dnsupdate      DNS dynamic updates (machines registering in the zone)
+    sysvol / netlogon      GPO and logon scripts from this domain
+    dfs            domain DFS namespaces
+    replication            DRSUAPI / NETLOGON / NTFRS / DFSR from other DCs
+    samr / lsa     account lookups (NAS, printers, apps)
+    ntp            clients using this host as a time source
+    adws           PowerShell / RSAT against this domain (9389)
+    winrm          remoting that typically uses Kerberos
+    llmnr          name fallback after DNS/WINS goes away
+    wins           NetBIOS name service — break WINS before collapse
+    cert           certificate enrollment RPC
+    gc             Global Catalog 3268/3269
+    kpasswd        Kerberos password-change (464)
+    smb1           remaining NT LM 0.12 clients
+  Talkers tab -> Show: Domain collapse lists the IPs to chase.
+  Packet details show FINDING lines for each leftover.
+
 DISPLAY FILTERS
   ad
+  collapse
+  legacy
+  machine
+  kdc
+  gpo
+  simplebind
+  anonymous
+  ntlm
+  dclocator
+  cldap
+  ntp
+  adws
+  llmnr
+  samr
+  dfs
+  dnsupdate
+  sysvol
   fileshare
   ldap
-  ldap and bind
   kerberos
   dns
-  rpc
-  nfs
-  smb
-  smb1
+  dns:_msdcs
+  domain:contoso
+  share:sysvol
   tcp.port==389
-  udp.port==88
   ip.addr==10.10.50.88
-  user:legacyapp
-  file:data.mdb
   marked
 
 ACTIVE DIRECTORY PORTS
-  53 DNS   88 Kerberos   135 RPC   137/139 NetBIOS   389 LDAP
+  53 DNS   88 Kerberos   123 NTP   135 RPC   137/139 NetBIOS   389 LDAP
   445 SMB (SYSVOL/NETLOGON)   464 kpasswd   636 LDAPS
   3268/3269 Global Catalog   9389 ADWS   5722 DFSR
+  5985/5986 WinRM   5355 LLMNR   42 WINS replication
 
 FILE SHARE PORTS
   139/445 SMB   2049 NFS   111 portmap   SRVSVC named pipe over SMB
@@ -3685,7 +4060,7 @@ $lblCap.Margin = New-Object System.Windows.Forms.Padding(8, 10, 6, 4)
 
 $script:cmbCap = New-Object System.Windows.Forms.ComboBox
 $script:cmbCap.DropDownStyle = 'DropDownList'
-$script:cmbCap.Width = 150
+$script:cmbCap.Width = 170
 $script:cmbCap.FlatStyle = 'Flat'
 $script:cmbCap.Margin = New-Object System.Windows.Forms.Padding(0, 6, 8, 4)
 [void]$script:cmbCap.Items.AddRange(@(
@@ -3697,7 +4072,8 @@ $script:cmbCap.Margin = New-Object System.Windows.Forms.Padding(0, 6, 8, 4)
     'Kerberos',
     'DNS',
     'RPC',
-    'NFS'
+    'NFS',
+    'Domain collapse'
 ))
 $script:cmbCap.SelectedIndex = 0
 $script:Tip.SetToolTip($script:cmbCap, 'Capture filter applied on the sniffer thread. All traffic is the default.')
@@ -3763,6 +4139,27 @@ $script:cmbPreset.Margin = New-Object System.Windows.Forms.Padding(0, 4, 8, 4)
 [void]$script:cmbPreset.Items.AddRange(@(
     '(no preset)',
     'ad',
+    'collapse',
+    'legacy',
+    'machine',
+    'kdc',
+    'gpo',
+    'simplebind',
+    'anonymous',
+    'ntlm',
+    'ntlmv1',
+    'dclocator',
+    'cldap',
+    'sysvol',
+    'netlogon',
+    'dfs',
+    'replication',
+    'samr',
+    'ntp',
+    'adws',
+    'llmnr',
+    'wins',
+    'gc',
     'fileshare',
     'ldap',
     'kerberos',
@@ -3788,7 +4185,7 @@ $script:txtFilter.Font = New-Object System.Drawing.Font('Consolas', 10)
 $script:txtFilter.Dock = 'Fill'
 $script:txtFilter.Margin = New-Object System.Windows.Forms.Padding(0, 4, 8, 4)
 $script:txtFilter.MinimumSize = New-Object System.Drawing.Size(120, 0)
-$script:Tip.SetToolTip($script:txtFilter, "Examples: ad   fileshare   ldap   kerberos   dns   smb1   tcp.port==389   Enter to apply")
+$script:Tip.SetToolTip($script:txtFilter, "Examples: collapse   machine   gpo   dclocator   domain:contoso   simplebind   ntp   ad   ldap   Enter to apply")
 $script:txtFilter.Add_KeyDown({
     param($s, $e)
     if ($e.KeyCode -eq 'Enter') { $e.SuppressKeyPress = $true; Update-PacketView }
@@ -4034,7 +4431,7 @@ $script:cmbHostView = New-Object System.Windows.Forms.ComboBox
 $script:cmbHostView.DropDownStyle = 'DropDownList'
 $script:cmbHostView.Width = 160
 $script:cmbHostView.Margin = New-Object System.Windows.Forms.Padding(0, 6, 8, 4)
-[void]$script:cmbHostView.Items.AddRange(@('All talkers', 'Active Directory', 'File shares'))
+[void]$script:cmbHostView.Items.AddRange(@('All talkers', 'Active Directory', 'File shares', 'Domain collapse'))
 $script:cmbHostView.SelectedIndex = 0
 $script:cmbHostView.Add_SelectedIndexChanged({ Update-HostsGrid })
 
@@ -4224,7 +4621,7 @@ $helpM = New-Object System.Windows.Forms.ToolStripMenuItem('Help')
 Add-MenuAction $helpM.DropDownItems 'Open Help tab' { $script:tabMain.SelectedTab = $script:tabHelp }
 Add-MenuAction $helpM.DropDownItems 'About' {
     [void][System.Windows.Forms.MessageBox]::Show(
-        "PowerShark v$($script:AppVersion)`nWindows Server 2008 / 2008 R2 (PowerShell 2.0) through PowerShell 7+`nCurrently running: $($PSVersionTable.PSVersion) ($(Get-HostEdition))`n`nCaptures all IPv4. Filters: Active Directory and file shares.`nLive capture uses a raw IPv4 socket (no Npcap). PCAPs open in Wireshark.",
+        "PowerShark v$($script:AppVersion)`nWindows Server 2008 / 2008 R2 (PowerShell 2.0) through PowerShell 7+`nCurrently running: $($PSVersionTable.PSVersion) ($(Get-HostEdition))`n`nCaptures all IPv4. Filters: Active Directory, file shares, and Domain collapse (leftover machine accounts, GPO, simple bind, DC locator, NTP, NTLM).`nLive capture uses a raw IPv4 socket (no Npcap). PCAPs open in Wireshark.",
         'About',
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Information)
@@ -4265,7 +4662,7 @@ $form.Add_FormClosing({
 })
 
 Write-AppLog "PowerShark v$($script:AppVersion) started. Elevated=$($script:IsAdmin)  Host=$env:COMPUTERNAME  PS=$($PSVersionTable.PSVersion) ($(Get-HostEdition))" 'INFO'
-Write-AppLog 'Capture=All traffic. Use the Capture dropdown for Active Directory or File shares.' 'INFO'
+Write-AppLog 'Capture=All traffic. Use the Capture dropdown for Active Directory, File shares, or Domain collapse.' 'INFO'
 Refresh-ConfigTab
 Update-StatsTab
 

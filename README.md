@@ -4,7 +4,7 @@ Windows PowerShell admin tools (WinForms) for Server 2008 and later.
 
 ## PowerShark
 
-`PowerShark.ps1` is a Wireshark-style live capture GUI for **all IPv4** on the local server, with capture and display filters for **Active Directory** (LDAP, Kerberos, DNS, RPC, SYSVOL/SMB) and **file server / file share** traffic (SMB1/2/3, NFS). No Npcap or Wireshark install is required. Same Server 2008 / PowerShell 2.0 bar as the SMBv1 analyzer.
+`PowerShark.ps1` is a Wireshark-style live capture GUI for **all IPv4** on the local server, with capture and display filters for **Active Directory** (LDAP, Kerberos, DNS, RPC, SYSVOL/SMB), **file server / file share** traffic (SMB1/2/3, NFS), and **domain collapse** leftovers (machine accounts, GPO, simple bind, DC locator, NTP, NTLM, WINS). No Npcap or Wireshark install is required. Same Server 2008 / PowerShell 2.0 bar as the SMBv1 analyzer.
 
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -STA -File .\PowerShark.ps1
@@ -12,7 +12,7 @@ pwsh.exe -ExecutionPolicy Bypass -File .\PowerShark.ps1
 powershell.exe -ExecutionPolicy Bypass -File .\PowerShark.ps1 -SelfTest
 ```
 
-On Start, **Capture** defaults to **All traffic**. Switch it to **Active Directory** or **File shares** to keep only those families on the sniffer thread. Display filters (`ad`, `fileshare`, `ldap`, `kerberos`, `dns`, `rpc`, `nfs`, `smb`, `tcp.port==389`) slice the packet list. Talkers tab can show All / AD / File shares. Console must print `PowerShark v1.0`.
+On Start, **Capture** defaults to **All traffic**. Switch it to **Active Directory**, **File shares**, or **Domain collapse** to keep only those families on the sniffer thread. Before decommissioning a domain, use **Domain collapse** plus display filters such as `collapse`, `machine`, `kdc`, `gpo`, `simplebind`, `dclocator`, `ntp`, `domain:contoso`. Talkers tab can show All / AD / File shares / Domain collapse. Console must print `PowerShark v1.1`.
 
 ## SMBv1 Traffic Analyzer
 
