@@ -2,6 +2,18 @@
 
 Windows PowerShell admin tools (WinForms) for Server 2008 and later.
 
+## PowerShark
+
+`PowerShark.ps1` is a Wireshark-style live capture GUI for **all IPv4** on the local server, with capture and display filters for **Active Directory** (LDAP, Kerberos, DNS, RPC, SYSVOL/SMB), **file server / file share** traffic (SMB1/2/3, NFS), and **domain collapse** leftovers (machine accounts, GPO, simple bind, DC locator, NTP, NTLM, WINS). No Npcap or Wireshark install is required. Same Server 2008 / PowerShell 2.0 bar as the SMBv1 analyzer.
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -STA -File .\PowerShark.ps1
+pwsh.exe -ExecutionPolicy Bypass -File .\PowerShark.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\PowerShark.ps1 -SelfTest
+```
+
+On Start, **Capture** defaults to **All traffic**. Switch it to **Active Directory**, **File shares**, or **Domain collapse** to keep only those families on the sniffer thread. Before decommissioning a domain, use **Domain collapse** plus display filters such as `collapse`, `machine`, `kdc`, `gpo`, `simplebind`, `dclocator`, `ntp`, `domain:contoso`. Talkers tab can show All / AD / File shares / Domain collapse. Console must print `PowerShark v1.1`.
+
 ## SMBv1 Traffic Analyzer
 
 `SMBv1-TrafficAnalyzer.ps1` is a Wireshark-style live capture GUI that finds **SMBv1** on the wire (TCP 139/445), plus SMB2/SMB3 for contrast. No Npcap or Wireshark install is required. Targets **Windows Server 2008 / 2008 R2** (PowerShell 2.0), Server 2012 (3.0), 2012 R2 (4.0), and PowerShell 7 on Windows.
