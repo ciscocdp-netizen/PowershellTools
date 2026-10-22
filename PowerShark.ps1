@@ -49,6 +49,10 @@
     Optional unattended session length. After this many minutes the app saves
     the entire capture to the Desktop and closes. 0 (default) leaves it open.
 
+.PARAMETER AutoSaveFormat
+    pcap (default) or csv. Used by CLOSE AFTER / -AutoCloseMinutes and as the
+    default for Save all / Save view dialogs.
+
 .EXAMPLE
     powershell.exe -ExecutionPolicy Bypass -STA -File .\PowerShark.ps1
 
@@ -74,7 +78,8 @@ param(
     [switch]$SelfTest,
     [string]$OpenPcap,
     [string]$InterfaceIP,
-    [int]$AutoCloseMinutes = 0
+    [int]$AutoCloseMinutes = 0,
+    [string]$AutoSaveFormat = 'pcap'
 )
 
 Set-StrictMode -Version Latest
@@ -142,11 +147,27 @@ function Get-DesktopDirectory {
     return $d
 }
 
+function Get-SaveFormat {
+    param($Value, [string]$Path)
+    if (-not (Test-BlankString $Path)) {
+        $p = $Path.ToLowerInvariant()
+        if ($p.EndsWith('.csv')) { return 'csv' }
+        if ($p.EndsWith('.pcap') -or $p.EndsWith('.cap')) { return 'pcap' }
+    }
+    if (Test-BlankString $Value) { return 'pcap' }
+    $t = ([string]$Value).Trim().ToLowerInvariant()
+    if ($t -eq 'csv' -or $t.StartsWith('csv')) { return 'csv' }
+    return 'pcap'
+}
+
 function Get-CaptureSavePath {
-    param([string]$Directory, [string]$Prefix = 'PowerShark')
+    param([string]$Directory, [string]$Prefix = 'PowerShark', [string]$Format = 'pcap')
     if (Test-BlankString $Directory) { $Directory = Get-DesktopDirectory }
+    $fmt = Get-SaveFormat $Format
+    $ext = 'pcap'
+    if ($fmt -eq 'csv') { $ext = 'csv' }
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    return (Join-Path $Directory ("{0}-{1}.pcap" -f $Prefix, $stamp))
+    return (Join-Path $Directory ("{0}-{1}.{2}" -f $Prefix, $stamp, $ext))
 }
 
 $script:OwnPath = $null
@@ -2261,6 +2282,11 @@ function Invoke-SmbAnalyzerSelfTest {
     if (Test-BlankString $desk) { [void]$failures.Add('Get-DesktopDirectory returned blank') }
     $saveName = Get-CaptureSavePath -Directory $desk
     if ($saveName -notmatch 'PowerShark-.*\.pcap$') { [void]$failures.Add("Get-CaptureSavePath name: $saveName") }
+    if ((Get-SaveFormat 'CSV') -ne 'csv') { [void]$failures.Add('Get-SaveFormat CSV') }
+    if ((Get-SaveFormat 'pcap') -ne 'pcap') { [void]$failures.Add('Get-SaveFormat pcap') }
+    if ((Get-SaveFormat -Path 'C:\tmp\out.csv') -ne 'csv') { [void]$failures.Add('Get-SaveFormat path csv') }
+    $csvName = Get-CaptureSavePath -Directory $desk -Format 'csv'
+    if ($csvName -notmatch 'PowerShark-.*\.csv$') { [void]$failures.Add("Get-CaptureSavePath csv name: $csvName") }
 
     $map = @{ Negotiate = 2; SessionSetup = 1 }
     $fmt = Format-AppCommandMap $map
@@ -2333,6 +2359,9 @@ $script:lvPackets       = $null
 $script:txtFilter       = $null
 $script:chkSmb1Only     = $null
 $script:chkAutoScroll   = $null
+$script:cmbSaveFormat   = $null
+$script:cmbTimer        = $null
+$script:lblTimer        = $null
 $script:banner          = $null
 $script:MainForm        = $null
 $script:splitH          = $null
@@ -3317,6 +3346,45 @@ function Import-PcapPath {
     }
 }
 
+function New-PacketCsvRows {
+    param($Packets)
+    $csvRows = New-Object System.Collections.ArrayList
+    foreach ($p in (Get-AppEnumerable $Packets)) {
+        if ($null -eq $p) { continue }
+        [void]$csvRows.Add((New-AppObject -Property @{
+            No         = [string]$p.No
+            Time       = (ConvertTo-AppTimeText $p.Time)
+            Src        = [string]$p.Src
+            SrcPort    = [string]$p.SrcPort
+            Dst        = [string]$p.Dst
+            DstPort    = [string]$p.DstPort
+            Protocol   = [string]$p.Protocol
+            Family     = [string]$p.Family
+            Length     = [string]$p.Length
+            UserName   = [string]$p.UserName
+            SharePath  = [string]$p.SharePath
+            FileName   = [string]$p.FileName
+            QueryName  = [string]$p.QueryName
+            SmbVersion = [string]$p.SmbVersion
+            SmbCommand = [string]$p.SmbCommand
+            Info       = [string]$p.Info
+        }))
+    }
+    return ,$csvRows
+}
+
+function Get-UiSaveFormat {
+    $txt = 'pcap'
+    try {
+        if ($script:cmbSaveFormat -and $script:cmbSaveFormat.SelectedItem) {
+            $txt = [string]$script:cmbSaveFormat.SelectedItem
+        } elseif ($script:cmbSaveFormat) {
+            $txt = [string]$script:cmbSaveFormat.Text
+        }
+    } catch { }
+    return (Get-SaveFormat $txt)
+}
+
 function Save-PcapFile {
     if ((Get-AppCount $script:ViewPackets) -eq 0) {
         [void][System.Windows.Forms.MessageBox]::Show('No packets in the current view to save.', 'Nothing to Save', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
@@ -3326,49 +3394,19 @@ function Save-PcapFile {
     $dlg.Filter = 'pcap (*.pcap)|*.pcap|CSV summary (*.csv)|*.csv'
     $dlg.FileName = "PowerShark-view-$(Get-Date -Format 'yyyyMMdd_HHmmss')"
     $dlg.Title = 'Save current view'
+    $dlg.AddExtension = $true
+    $uiFmt = Get-UiSaveFormat
+    if ($uiFmt -eq 'csv') { $dlg.FilterIndex = 2 } else { $dlg.FilterIndex = 1 }
     if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
     try {
-        if ($dlg.FileName -like '*.csv') {
-            $csvRows = New-Object System.Collections.ArrayList
-            foreach ($p in (Get-AppEnumerable $script:ViewPackets)) {
-                if ($null -eq $p) { continue }
-                $rowNo = [string]$p.No
-                $rowTime = ConvertTo-AppTimeText $p.Time
-                $rowSrc = [string]$p.Src
-                $rowSp = [string]$p.SrcPort
-                $rowDst = [string]$p.Dst
-                $rowDp = [string]$p.DstPort
-                $rowProto = [string]$p.Protocol
-                $rowLen = [string]$p.Length
-                $rowVer = [string]$p.SmbVersion
-                $rowCmd = [string]$p.SmbCommand
-                $rowUser = [string]$p.UserName
-                $rowShare = [string]$p.SharePath
-                $rowFile = [string]$p.FileName
-                $rowInfo = [string]$p.Info
-                [void]$csvRows.Add((New-AppObject -Property @{
-                    No         = $rowNo
-                    Time       = $rowTime
-                    Src        = $rowSrc
-                    SrcPort    = $rowSp
-                    Dst        = $rowDst
-                    DstPort    = $rowDp
-                    Protocol   = $rowProto
-                    Length     = $rowLen
-                    SmbVersion = $rowVer
-                    SmbCommand = $rowCmd
-                    UserName   = $rowUser
-                    SharePath  = $rowShare
-                    FileName   = $rowFile
-                    Info       = $rowInfo
-                }))
-            }
-            Export-AppCsv -InputObject $csvRows -Path $dlg.FileName
+        $fmt = Get-SaveFormat -Path $dlg.FileName
+        if ($fmt -eq 'csv') {
+            Export-AppCsv -InputObject (New-PacketCsvRows $script:ViewPackets) -Path $dlg.FileName
         } else {
             [PowerSharkParser]::WritePcap($dlg.FileName, (ConvertTo-PowerSharkPacketArray $script:ViewPackets))
         }
         Write-AppLog "Saved $((Get-AppCount $script:ViewPackets)) packets to $($dlg.FileName)" 'SUCCESS'
-        [void][System.Windows.Forms.MessageBox]::Show("Saved $((Get-AppCount $script:ViewPackets)) packets to:`n$($dlg.FileName)`n`nPCAP files open in Wireshark (LINKTYPE_IPV4 / 228).", 'Saved', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+        [void][System.Windows.Forms.MessageBox]::Show("Saved $((Get-AppCount $script:ViewPackets)) packets to:`n$($dlg.FileName)", 'Saved', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
     } catch {
         [void][System.Windows.Forms.MessageBox]::Show("Save failed:`n$($_.Exception.Message)", 'Save Failed', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
     }
@@ -3377,6 +3415,7 @@ function Save-PcapFile {
 function Save-AllCaptureTraffic {
     param(
         [string]$Path,
+        [string]$Format,
         [switch]$Silent,
         [switch]$ToDesktop
     )
@@ -3387,9 +3426,14 @@ function Save-AllCaptureTraffic {
         } catch { }
     }
     $count = Get-AppCount $script:AllPackets
-    if ($ToDesktop -or (Test-BlankString $Path)) {
-        $Path = Get-CaptureSavePath -Directory (Get-DesktopDirectory)
+    $fmt = Get-SaveFormat -Value $Format -Path $Path
+    if ((Test-BlankString $Format) -and (Test-BlankString $Path)) {
+        $fmt = Get-UiSaveFormat
     }
+    if ($ToDesktop -or (Test-BlankString $Path)) {
+        $Path = Get-CaptureSavePath -Directory (Get-DesktopDirectory) -Format $fmt
+    }
+    $fmt = Get-SaveFormat -Value $fmt -Path $Path
     if ($count -eq 0) {
         Write-AppLog 'Save all: no packets in the capture buffer.' 'WARN'
         if (-not $Silent) {
@@ -3398,11 +3442,15 @@ function Save-AllCaptureTraffic {
         return $null
     }
     try {
-        [PowerSharkParser]::WritePcap($Path, (ConvertTo-PowerSharkPacketArray $script:AllPackets))
-        Write-AppLog ("Saved all {0} packet(s) to {1}" -f $count, $Path) 'SUCCESS'
+        if ($fmt -eq 'csv') {
+            Export-AppCsv -InputObject (New-PacketCsvRows $script:AllPackets) -Path $Path
+        } else {
+            [PowerSharkParser]::WritePcap($Path, (ConvertTo-PowerSharkPacketArray $script:AllPackets))
+        }
+        Write-AppLog ("Saved all {0} packet(s) as {1} to {2}" -f $count, $fmt.ToUpper(), $Path) 'SUCCESS'
         if (-not $Silent) {
             [void][System.Windows.Forms.MessageBox]::Show(
-                "Saved $count packet(s) — the entire capture, not just the filtered view.`n`n$Path",
+                "Saved $count packet(s) as $($fmt.ToUpper()) — the entire capture, not just the filtered view.`n`n$Path",
                 'Saved all traffic',
                 [System.Windows.Forms.MessageBoxButtons]::OK,
                 [System.Windows.Forms.MessageBoxIcon]::Information)
@@ -3420,16 +3468,20 @@ function Save-AllCaptureTraffic {
 function Show-SaveAllDialog {
     $dlg = New-Object System.Windows.Forms.SaveFileDialog
     $dlg.Title = 'Save all captured traffic'
-    $dlg.Filter = 'pcap (*.pcap)|*.pcap'
+    $dlg.Filter = 'pcap (*.pcap)|*.pcap|CSV summary (*.csv)|*.csv'
+    $dlg.AddExtension = $true
     $desk = Get-DesktopDirectory
     if (-not (Test-BlankString $desk) -and (Test-Path -LiteralPath $desk)) { $dlg.InitialDirectory = $desk }
-    $dlg.FileName = ('PowerShark-{0}.pcap' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    $dlg.FileName = ('PowerShark-{0}' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    $uiFmt = Get-UiSaveFormat
+    if ($uiFmt -eq 'csv') { $dlg.FilterIndex = 2 } else { $dlg.FilterIndex = 1 }
     if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
     [void](Save-AllCaptureTraffic -Path $dlg.FileName)
 }
 
 function Save-AllCaptureToDesktop {
-    $path = Save-AllCaptureTraffic -ToDesktop
+    $fmt = Get-UiSaveFormat
+    $path = Save-AllCaptureTraffic -ToDesktop -Format $fmt
     return $path
 }
 
@@ -3451,7 +3503,8 @@ function Apply-SessionTimerFromUi {
         return
     }
     $script:SessionEndsAt = (Get-Date).AddMinutes($mins)
-    Write-AppLog ("Session timer armed: keep the app open {0} minute(s), then save all traffic to the Desktop and close." -f $mins) 'INFO'
+    $fmt = Get-UiSaveFormat
+    Write-AppLog ("Session timer armed: keep the app open {0} minute(s), then save all traffic to the Desktop as {1} and close." -f $mins, $fmt.ToUpper()) 'INFO'
     Update-SessionTimerLabel
 }
 
@@ -3484,9 +3537,10 @@ function Check-SessionTimer {
 function Complete-TimedSession {
     if ($script:TimedExitBusy) { return }
     $script:TimedExitBusy = $true
-    Write-AppLog 'Session time is up. Saving all captured traffic to the Desktop, then closing.' 'INFO'
+    $fmt = Get-UiSaveFormat
+    Write-AppLog ("Session time is up. Saving all captured traffic to the Desktop as {0}, then closing." -f $fmt.ToUpper()) 'INFO'
     try { Stop-Capture } catch { }
-    try { [void](Save-AllCaptureTraffic -ToDesktop -Silent) } catch {
+    try { [void](Save-AllCaptureTraffic -ToDesktop -Format $fmt -Silent) } catch {
         Write-AppLog ("Timed Desktop save failed: {0}" -f $_.Exception.Message) 'ERROR'
     }
     try {
@@ -3953,11 +4007,11 @@ HOW TO RUN
 SESSION TIMER AND SAVE ALL
   CLOSE AFTER (toolbar): pick 5 minutes / 15 minutes / 1 hour, or type a number
   of minutes. When that time is up, PowerShark writes the ENTIRE capture buffer
-  to the Desktop as PowerShark-yyyyMMdd_HHmmss.pcap and closes.
+  to the Desktop and closes. SAVE AS chooses PCAP (Wireshark) or CSV (spreadsheet).
   Off (default) keeps the window open until you quit.
   Save all / Ctrl+Shift+S / File > Save all traffic... writes the same full
-  buffer on demand (dialog starts on the Desktop).
-  Save view / Ctrl+S writes only the filtered packet list.
+  buffer on demand. The save dialog lets you pick pcap or CSV; SAVE AS is the default.
+  Save view / Ctrl+S writes only the filtered packet list (pcap or CSV).
   Unattended:  .\PowerShark.ps1 -AutoCloseMinutes 60
 
 NO LIVE TRAFFIC?
@@ -4310,7 +4364,7 @@ $btnClear = New-FlatButton -Text 'Clear' -Width 78 -BackColor $script:C.Gray -Bo
 $btnDemo = New-FlatButton -Text 'Demo' -Width 78 -BackColor $script:C.Teal -Bold $false -OnClick { Import-DemoCapture } -TipText 'Load synthetic AD, file-share, DNS, Kerberos, LDAP, NFS packets'
 $btnOpen = New-FlatButton -Text 'Open' -Width 78 -BackColor $script:C.Blue -Bold $false -OnClick { Open-PcapFile } -TipText 'Open a .pcap (Ctrl+O)'
 $btnSaveView = New-FlatButton -Text 'Save view' -Width 92 -BackColor $script:C.Dark -Bold $false -OnClick { Save-PcapFile } -TipText 'Save the filtered view as pcap/csv (Ctrl+S)'
-$script:btnSaveAll = New-FlatButton -Text 'Save all' -Width 88 -BackColor $script:C.Accent -OnClick { Show-SaveAllDialog } -TipText 'Save the entire capture buffer (Ctrl+Shift+S). Defaults to the Desktop.'
+$script:btnSaveAll = New-FlatButton -Text 'Save all' -Width 88 -BackColor $script:C.Accent -OnClick { Show-SaveAllDialog } -TipText 'Save the entire capture buffer as PCAP or CSV (Ctrl+Shift+S). Dialog starts on the Desktop.'
 
 $tool.Controls.AddRange(@($lblIf, $script:cmbIface, $script:btnStart, $script:btnStop, $script:btnPause, $lblCap, $script:cmbCap, $script:chkSmbPayload, $script:chkAutoScroll, $btnClear, $btnDemo, $btnOpen, $btnSaveView, $script:btnSaveAll))
 
@@ -4357,9 +4411,27 @@ $script:lblTimer.AutoSize = $true
 $script:lblTimer.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
 $script:lblTimer.Margin = New-Object System.Windows.Forms.Padding(8, 11, 16, 4)
 
-$btnSaveDesk = New-FlatButton -Text 'Save all to Desktop' -Width 168 -BackColor $script:C.Accent -OnClick { [void](Save-AllCaptureToDesktop) } -TipText 'Write the entire capture buffer to a timestamped .pcap on the Desktop now.'
+$lblFmt = New-Object System.Windows.Forms.Label
+$lblFmt.Text = 'SAVE AS'
+$lblFmt.ForeColor = $script:C.Accent
+$lblFmt.AutoSize = $true
+$lblFmt.Font = New-Object System.Drawing.Font('Segoe UI', 8.5, [System.Drawing.FontStyle]::Bold)
+$lblFmt.Margin = New-Object System.Windows.Forms.Padding(12, 12, 8, 4)
 
-$sessionBar.Controls.AddRange(@($lblSess, $script:cmbTimer, $script:lblTimer, $btnSaveDesk))
+$script:cmbSaveFormat = New-Object System.Windows.Forms.ComboBox
+$script:cmbSaveFormat.DropDownStyle = 'DropDownList'
+$script:cmbSaveFormat.Width = 80
+$script:cmbSaveFormat.FlatStyle = 'Flat'
+$script:cmbSaveFormat.BackColor = $script:C.ComboBg
+$script:cmbSaveFormat.ForeColor = $script:C.White
+$script:cmbSaveFormat.Margin = New-Object System.Windows.Forms.Padding(0, 8, 10, 4)
+[void]$script:cmbSaveFormat.Items.AddRange(@('PCAP', 'CSV'))
+$script:cmbSaveFormat.SelectedIndex = 0
+$script:Tip.SetToolTip($script:cmbSaveFormat, 'Format for Save all, Save all to Desktop, and the CLOSE AFTER auto-save. PCAP opens in Wireshark. CSV is a packet summary spreadsheet.')
+
+$btnSaveDesk = New-FlatButton -Text 'Save all to Desktop' -Width 168 -BackColor $script:C.Accent -OnClick { [void](Save-AllCaptureToDesktop) } -TipText 'Write the entire capture buffer to the Desktop now, using SAVE AS (PCAP or CSV).'
+
+$sessionBar.Controls.AddRange(@($lblSess, $script:cmbTimer, $script:lblTimer, $lblFmt, $script:cmbSaveFormat, $btnSaveDesk))
 
 # --- Filter bar (filter box is the percent-width column) ---
 $filterBar = New-Object System.Windows.Forms.TableLayoutPanel
@@ -4919,6 +4991,13 @@ $form.Add_FormClosing({
 
 Write-AppLog "PowerShark v$($script:AppVersion) started. Elevated=$($script:IsAdmin)  Host=$env:COMPUTERNAME  PS=$($PSVersionTable.PSVersion) ($(Get-HostEdition))" 'INFO'
 Write-AppLog 'Capture=All traffic. CLOSE AFTER saves the full buffer to the Desktop and exits. Save all dumps on demand.' 'INFO'
+if ($script:cmbSaveFormat) {
+    try {
+        $bootFmt = Get-SaveFormat $AutoSaveFormat
+        if ($bootFmt -eq 'csv') { $script:cmbSaveFormat.SelectedIndex = 1 }
+        else { $script:cmbSaveFormat.SelectedIndex = 0 }
+    } catch { }
+}
 if ($AutoCloseMinutes -gt 0) {
     try {
         $script:cmbTimer.Text = ('{0} minutes' -f $AutoCloseMinutes)
