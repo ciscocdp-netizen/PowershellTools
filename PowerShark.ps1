@@ -160,6 +160,67 @@ function Get-SaveFormat {
     return 'pcap'
 }
 
+function Get-PacketServiceName {
+    param($Packet)
+    if ($null -eq $Packet) { return 'Unknown' }
+    $proto = [string]$Packet.Protocol
+    if ($proto -eq 'KRB5') { return 'Kerberos' }
+    if ($proto -eq 'RPC' -and -not (Test-BlankString $Packet.QueryName)) {
+        return ('RPC-{0}' -f $Packet.QueryName)
+    }
+    if (-not (Test-BlankString $proto) -and $proto -ne 'TCP' -and $proto -ne 'UDP' -and $proto -ne 'IP') {
+        return $proto
+    }
+    if ($Packet.IsSmb1) { return 'SMBv1' }
+    if ($Packet.IsSmb3) { return 'SMBv3' }
+    if ($Packet.IsSmb2) { return 'SMBv2' }
+    if ($Packet.HasSmb) { return 'SMB' }
+    if ($Packet.IsCldap) { return 'CLDAP' }
+    if ($Packet.IsLdaps) { return 'LDAPS' }
+    if ($Packet.IsGc -and $Packet.IsLdap) { return 'LDAP-GC' }
+    if ($Packet.IsLdap) { return 'LDAP' }
+    if ($Packet.IsKerberos) { return 'Kerberos' }
+    if ($Packet.IsDns) { return 'DNS' }
+    if ($Packet.IsNfs) { return 'NFS' }
+    if ($Packet.IsRpc -and -not (Test-BlankString $Packet.QueryName)) {
+        return ('RPC-{0}' -f $Packet.QueryName)
+    }
+    if ($Packet.IsRpc) { return 'RPC' }
+    if ($Packet.IsNtp) { return 'NTP' }
+    if ($Packet.IsAdws) { return 'ADWS' }
+    if ($Packet.IsLlmnr) { return 'LLMNR' }
+    if ($Packet.IsWinRm) { return 'WinRM' }
+    if ($Packet.IsWins) { return 'NBNS' }
+    $a = 0; $b = 0
+    try { $a = [int]$Packet.SrcPort } catch { }
+    try { $b = [int]$Packet.DstPort } catch { }
+    foreach ($port in @($a, $b)) {
+        if ($port -eq 53) { return 'DNS' }
+        if ($port -eq 88 -or $port -eq 464) { return 'Kerberos' }
+        if ($port -eq 389) {
+            if ($Packet.IsUdp) { return 'CLDAP' }
+            return 'LDAP'
+        }
+        if ($port -eq 636) { return 'LDAPS' }
+        if ($port -eq 3268) { return 'LDAP-GC' }
+        if ($port -eq 3269) { return 'LDAPS-GC' }
+        if ($port -eq 135) { return 'RPC' }
+        if (-not $Packet.IsUdp -and ($port -eq 445 -or $port -eq 139)) { return 'SMB' }
+        if ($port -eq 2049) { return 'NFS' }
+        if ($port -eq 111) { return 'Portmap' }
+        if ($port -eq 123) { return 'NTP' }
+        if ($port -eq 9389) { return 'ADWS' }
+        if ($port -eq 5722) { return 'DFSR' }
+        if ($port -eq 5985 -or $port -eq 5986) { return 'WinRM' }
+        if ($port -eq 5355) { return 'LLMNR' }
+        if ($port -eq 137) { return 'NBNS' }
+        if ($port -eq 138) { return 'NBDS' }
+        if ($port -eq 42) { return 'WINS' }
+    }
+    if (Test-BlankString $proto) { return 'Unknown' }
+    return $proto
+}
+
 function Get-CaptureSavePath {
     param([string]$Directory, [string]$Prefix = 'PowerShark', [string]$Format = 'pcap')
     if (Test-BlankString $Directory) { $Directory = Get-DesktopDirectory }
@@ -966,6 +1027,43 @@ public static class PowerSharkParser {
         else if (p.IsFileShare) p.Family = "FileShare";
         else p.Family = "Other";
         MarkCollapseFindings(p);
+        ApplyWellKnownProtocol(p);
+    }
+
+    static string WellKnownService(PowerSharkPacket p) {
+        int a = p.SrcPort, b = p.DstPort;
+        if (PortIs(a, b, 53)) return "DNS";
+        if (PortIs(a, b, 88) || PortIs(a, b, 464)) return "Kerberos";
+        if (PortIs(a, b, 389)) return p.IsUdp ? "CLDAP" : "LDAP";
+        if (PortIs(a, b, 636)) return "LDAPS";
+        if (PortIs(a, b, 3268)) return "LDAP-GC";
+        if (PortIs(a, b, 3269)) return "LDAPS-GC";
+        if (PortIs(a, b, 135)) return "RPC";
+        if (!p.IsUdp && (PortIs(a, b, 445) || PortIs(a, b, 139))) return "SMB";
+        if (PortIs(a, b, 2049)) return "NFS";
+        if (PortIs(a, b, 111)) return "Portmap";
+        if (PortIs(a, b, 123)) return "NTP";
+        if (PortIs(a, b, 9389)) return "ADWS";
+        if (PortIs(a, b, 5722)) return "DFSR";
+        if (PortIs(a, b, 5985) || PortIs(a, b, 5986)) return "WinRM";
+        if (PortIs(a, b, 5355)) return "LLMNR";
+        if (PortIs(a, b, 137)) return "NBNS";
+        if (PortIs(a, b, 138)) return "NBDS";
+        if (PortIs(a, b, 42)) return "WINS";
+        return "";
+    }
+
+    static void ApplyWellKnownProtocol(PowerSharkPacket p) {
+        if (p.Protocol == "KRB5") p.Protocol = "Kerberos";
+        if (p.IsRpc && p.QueryName != null && p.QueryName.Length > 0) {
+            if (p.Protocol == "RPC" || p.Protocol == "TCP" || p.Protocol == "UDP")
+                p.Protocol = "RPC-" + p.QueryName;
+            return;
+        }
+        if (p.Protocol != null && p.Protocol != "TCP" && p.Protocol != "UDP" && p.Protocol != "IP")
+            return;
+        string s = WellKnownService(p);
+        if (s != null && s.Length > 0) p.Protocol = s;
     }
 
     static void MarkCollapseFindings(PowerSharkPacket p) {
@@ -1237,7 +1335,7 @@ public static class PowerSharkParser {
         if (!p.IsUdp && p.PayloadLength >= 4) off += 4;
         if (off >= end) return;
         p.IsKerberos = true;
-        p.Protocol = "KRB5";
+        p.Protocol = "Kerberos";
         p.HighlightOffset = off;
         p.HighlightLength = 1;
         int tag = r[off];
@@ -1303,6 +1401,7 @@ public static class PowerSharkParser {
             string mapped = MapRpcUuid(iface);
             if (mapped.Length > 0) {
                 p.QueryName = mapped;
+                p.Protocol = "RPC-" + mapped;
                 p.Info = "RPC " + op + " " + mapped;
                 if (mapped == "SRVSVC" || mapped == "WKSSVC" || mapped == "DFS" || mapped == "SPOOLSS")
                     p.IsFileShare = true;
@@ -2274,6 +2373,19 @@ function Invoke-SmbAnalyzerSelfTest {
     }
     $anon = $demo | Where-Object { $_.IsAnonymous } | Select-Object -First 1
     if (-not $anon) { [void]$failures.Add('Demo anonymous LDAP bind not flagged') }
+    $syn445 = $demo | Where-Object { $_.DstPort -eq 445 -and -not $_.HasSmb } | Select-Object -First 1
+    if ($syn445 -and $syn445.Protocol -ne 'SMB') {
+        [void]$failures.Add("TCP 445 without SMB header should be named SMB, got $($syn445.Protocol)")
+    }
+    if ($ldap -and (Get-PacketServiceName $ldap) -ne 'LDAP') {
+        [void]$failures.Add("Get-PacketServiceName LDAP got $(Get-PacketServiceName $ldap)")
+    }
+    if ($dns -and (Get-PacketServiceName $dns) -ne 'DNS') {
+        [void]$failures.Add("Get-PacketServiceName DNS got $(Get-PacketServiceName $dns)")
+    }
+    if ($krb -and (Get-PacketServiceName $krb) -ne 'Kerberos') {
+        [void]$failures.Add("Get-PacketServiceName Kerberos got $(Get-PacketServiceName $krb)")
+    }
     if ((Get-SessionMinutes 'Off') -ne 0) { [void]$failures.Add('Get-SessionMinutes Off should be 0') }
     if ((Get-SessionMinutes '15 minutes') -ne 15) { [void]$failures.Add('Get-SessionMinutes 15 minutes') }
     if ((Get-SessionMinutes '1 hour') -ne 60) { [void]$failures.Add('Get-SessionMinutes 1 hour') }
@@ -3043,7 +3155,8 @@ function Show-PacketDetails {
         }
     } elseif ($p.IsLdap -or $p.IsKerberos -or $p.IsDns -or $p.IsRpc -or $p.IsNfs -or $p.IsNtp -or $p.IsAdws -or $p.IsLlmnr -or $p.IsWinRm) {
         $app = $frame.Nodes.Add($p.Protocol)
-        [void]$app.Nodes.Add("Family: $($p.Family)")
+        [void]$app.Nodes.Add("Protocol: $(Get-PacketServiceName $p)")
+        [void]$app.Nodes.Add("Category: $($p.Family)")
         if ($p.AppOp) { [void]$app.Nodes.Add("Operation: $($p.AppOp)") }
         if ($p.QueryName) { [void]$app.Nodes.Add("Name / DN: $($p.QueryName)") }
         [void]$app.Nodes.Add("Summary: $($p.Info)")
@@ -3346,29 +3459,41 @@ function Import-PcapPath {
     }
 }
 
+function New-PacketCsvRow {
+    param($Packet)
+    $svc = Get-PacketServiceName $Packet
+    $op = ''
+    try { $op = [string]$Packet.AppOp } catch { }
+    $cat = [string]$Packet.Family
+    if (Test-BlankString $cat) { $cat = 'Other' }
+    $row = New-Object PSObject
+    Add-Member -InputObject $row -MemberType NoteProperty -Name No -Value ([string]$Packet.No)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Time -Value (ConvertTo-AppTimeText $Packet.Time)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Protocol -Value $svc
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Operation -Value $op
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Family -Value $svc
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Category -Value $cat
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Src -Value ([string]$Packet.Src)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name SrcPort -Value ([string]$Packet.SrcPort)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Dst -Value ([string]$Packet.Dst)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name DstPort -Value ([string]$Packet.DstPort)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Length -Value ([string]$Packet.Length)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name UserName -Value ([string]$Packet.UserName)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name SharePath -Value ([string]$Packet.SharePath)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name FileName -Value ([string]$Packet.FileName)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name QueryName -Value ([string]$Packet.QueryName)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name SmbVersion -Value ([string]$Packet.SmbVersion)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name SmbCommand -Value ([string]$Packet.SmbCommand)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Info -Value ([string]$Packet.Info)
+    return $row
+}
+
 function New-PacketCsvRows {
     param($Packets)
     $csvRows = New-Object System.Collections.ArrayList
     foreach ($p in (Get-AppEnumerable $Packets)) {
         if ($null -eq $p) { continue }
-        [void]$csvRows.Add((New-AppObject -Property @{
-            No         = [string]$p.No
-            Time       = (ConvertTo-AppTimeText $p.Time)
-            Src        = [string]$p.Src
-            SrcPort    = [string]$p.SrcPort
-            Dst        = [string]$p.Dst
-            DstPort    = [string]$p.DstPort
-            Protocol   = [string]$p.Protocol
-            Family     = [string]$p.Family
-            Length     = [string]$p.Length
-            UserName   = [string]$p.UserName
-            SharePath  = [string]$p.SharePath
-            FileName   = [string]$p.FileName
-            QueryName  = [string]$p.QueryName
-            SmbVersion = [string]$p.SmbVersion
-            SmbCommand = [string]$p.SmbCommand
-            Info       = [string]$p.Info
-        }))
+        [void]$csvRows.Add((New-PacketCsvRow $p))
     }
     return ,$csvRows
 }
@@ -4012,6 +4137,8 @@ SESSION TIMER AND SAVE ALL
   Save all / Ctrl+Shift+S / File > Save all traffic... writes the same full
   buffer on demand. The save dialog lets you pick pcap or CSV; SAVE AS is the default.
   Save view / Ctrl+S writes only the filtered packet list (pcap or CSV).
+  CSV Protocol and Family are the exact service (LDAP, Kerberos, SMB, DNS, RPC-SAMR).
+  Category is the coarse AD / FileShare / Other bucket. Operation is Bind / AS-REQ / Query.
   Unattended:  .\PowerShark.ps1 -AutoCloseMinutes 60
 
 NO LIVE TRAFFIC?
@@ -4640,7 +4767,7 @@ Enable-DoubleBuffer $script:lvPackets
 [void]$script:lvPackets.Columns.Add('Src Port', 70)
 [void]$script:lvPackets.Columns.Add('Destination', 120)
 [void]$script:lvPackets.Columns.Add('Dst Port', 70)
-[void]$script:lvPackets.Columns.Add('Protocol', 70)
+[void]$script:lvPackets.Columns.Add('Protocol', 96)
 [void]$script:lvPackets.Columns.Add('Length', 70)
 [void]$script:lvPackets.Columns.Add('Info', 620)
 
