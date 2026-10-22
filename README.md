@@ -12,7 +12,9 @@ pwsh.exe -ExecutionPolicy Bypass -File .\PowerShark.ps1
 powershell.exe -ExecutionPolicy Bypass -File .\PowerShark.ps1 -SelfTest
 ```
 
-On Start, **Capture** defaults to **All traffic**. Switch it to **Active Directory**, **File shares**, or **Domain collapse** to keep only those families on the sniffer thread. Before decommissioning a domain, use **Domain collapse** plus display filters such as `collapse`, `machine`, `kdc`, `gpo`, `simplebind`, `dclocator`, `ntp`, `domain:contoso`. Talkers tab can show All / AD / File shares / Domain collapse. Console must print `PowerShark v1.1`.
+On Start, **Capture** defaults to **All traffic**. Switch it to **Active Directory**, **File shares**, or **Domain collapse** to keep only those families on the sniffer thread. Before decommissioning a domain, use **Domain collapse** plus display filters such as `collapse`, `machine`, `kdc`, `gpo`, `simplebind`, `dclocator`, `ntp`, `domain:contoso`. Talkers tab can show All / AD / File shares / Domain collapse. Console must print `PowerShark v1.2`.
+
+The window uses a Windows 8-style Metro chrome (charcoal hub header, teal accent, tile buttons). **CLOSE AFTER** keeps the app open for a chosen time, then writes the entire capture to the Desktop as `PowerShark-yyyyMMdd_HHmmss.pcap` and exits. **Save all** (or Ctrl+Shift+S) dumps the full buffer on demand. **Save view** (Ctrl+S) writes only the filtered list. Unattended: `.\PowerShark.ps1 -AutoCloseMinutes 60`.
 
 ## SMBv1 Traffic Analyzer
 

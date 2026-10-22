@@ -45,14 +45,21 @@
 .PARAMETER InterfaceIP
     Optional IPv4 address of the capture interface to pre-select.
 
+.PARAMETER AutoCloseMinutes
+    Optional unattended session length. After this many minutes the app saves
+    the entire capture to the Desktop and closes. 0 (default) leaves it open.
+
 .EXAMPLE
     powershell.exe -ExecutionPolicy Bypass -STA -File .\PowerShark.ps1
 
 .EXAMPLE
     .\PowerShark.ps1 -SelfTest
 
+.EXAMPLE
+    .\PowerShark.ps1 -AutoCloseMinutes 60
+
 .NOTES
-    Version     : 1.1
+    Version     : 1.2
     Compatible  : Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012
                   (PowerShell 3.0), 2012 R2 (PowerShell 4.0), 5.1, and PowerShell 7+.
                   There is no Requires-Version directive. Do not use -shl/-shr
@@ -66,12 +73,13 @@
 param(
     [switch]$SelfTest,
     [string]$OpenPcap,
-    [string]$InterfaceIP
+    [string]$InterfaceIP,
+    [int]$AutoCloseMinutes = 0
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.1'
+$script:AppVersion = '1.2'
 
 # Version is checked at runtime on purpose. Do not add "#Requires -Version".
 # Server 2008 / 2008 R2 is PowerShell 2.0. Server 2012 R2 is 4.0.
@@ -96,6 +104,49 @@ function Test-BlankString {
     $s = [string]$Value
     if ($s.Length -eq 0) { return $true }
     return ($s.Trim().Length -eq 0)
+}
+
+function Get-SessionMinutes {
+    param($Value)
+    if (Test-BlankString $Value) { return 0 }
+    $t = ([string]$Value).Trim()
+    if ($t -match '^(?i)(off|none|never)$') { return 0 }
+    if ($t -match '(?i)^(\d+)\s*h') { return ([int]$Matches[1] * 60) }
+    if ($t -match '(?i)^(\d+)\s*m') { return [int]$Matches[1] }
+    $n = 0
+    if ([int]::TryParse($t, [ref]$n)) {
+        if ($n -lt 0) { return 0 }
+        if ($n -gt 10080) { return 10080 }
+        return $n
+    }
+    return 0
+}
+
+function Get-DesktopDirectory {
+    $d = $null
+    try { $d = [Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop) } catch { }
+    if (Test-BlankString $d) {
+        try { $d = [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory) } catch { }
+    }
+    $homeDir = $null
+    if (-not (Test-BlankString $env:USERPROFILE)) { $homeDir = [string]$env:USERPROFILE }
+    elseif (-not (Test-BlankString $env:HOME)) { $homeDir = [string]$env:HOME }
+    if ((Test-BlankString $d) -and -not (Test-BlankString $homeDir)) {
+        $d = Join-Path $homeDir 'Desktop'
+    }
+    if (Test-BlankString $d) {
+        try { $d = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments) } catch { }
+    }
+    if (Test-BlankString $d) { $d = [System.IO.Path]::GetTempPath() }
+    if (Test-BlankString $d) { $d = '.' }
+    return $d
+}
+
+function Get-CaptureSavePath {
+    param([string]$Directory, [string]$Prefix = 'PowerShark')
+    if (Test-BlankString $Directory) { $Directory = Get-DesktopDirectory }
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    return (Join-Path $Directory ("{0}-{1}.pcap" -f $Prefix, $stamp))
 }
 
 $script:OwnPath = $null
@@ -2202,6 +2253,14 @@ function Invoke-SmbAnalyzerSelfTest {
     }
     $anon = $demo | Where-Object { $_.IsAnonymous } | Select-Object -First 1
     if (-not $anon) { [void]$failures.Add('Demo anonymous LDAP bind not flagged') }
+    if ((Get-SessionMinutes 'Off') -ne 0) { [void]$failures.Add('Get-SessionMinutes Off should be 0') }
+    if ((Get-SessionMinutes '15 minutes') -ne 15) { [void]$failures.Add('Get-SessionMinutes 15 minutes') }
+    if ((Get-SessionMinutes '1 hour') -ne 60) { [void]$failures.Add('Get-SessionMinutes 1 hour') }
+    if ((Get-SessionMinutes '2 hours') -ne 120) { [void]$failures.Add('Get-SessionMinutes 2 hours') }
+    $desk = Get-DesktopDirectory
+    if (Test-BlankString $desk) { [void]$failures.Add('Get-DesktopDirectory returned blank') }
+    $saveName = Get-CaptureSavePath -Directory $desk
+    if ($saveName -notmatch 'PowerShark-.*\.pcap$') { [void]$failures.Add("Get-CaptureSavePath name: $saveName") }
 
     $map = @{ Negotiate = 2; SessionSetup = 1 }
     $fmt = Format-AppCommandMap $map
@@ -2266,6 +2325,8 @@ $script:SortAscending   = $true
 $script:FindIndex       = -1
 $script:LastBannerCount = 0
 $script:UiBusy          = $false
+$script:SessionEndsAt   = $null
+$script:TimedExitBusy   = $false
 $script:FilterText      = ''
 $script:txtLog          = $null
 $script:lvPackets       = $null
@@ -2300,35 +2361,36 @@ function New-RgbColor {
 }
 
 $script:C = @{}
-$script:C['Header']  = New-RgbColor 24 42 68
-$script:C['Header2'] = New-RgbColor 32 52 80
-$script:C['Bg']      = New-RgbColor 245 247 250
-$script:C['Split']   = New-RgbColor 220 225 232
-$script:C['Text']    = New-RgbColor 24 42 68
+$script:C['Header']  = New-RgbColor 29 29 29
+$script:C['Header2'] = New-RgbColor 45 45 48
+$script:C['Accent']  = New-RgbColor 0 171 169
+$script:C['Bg']      = New-RgbColor 242 242 242
+$script:C['Split']   = New-RgbColor 210 210 210
+$script:C['Text']    = New-RgbColor 29 29 29
 $script:C['White']   = [System.Drawing.Color]::White
-$script:C['Blue']    = New-RgbColor 0 120 212
-$script:C['Green']   = New-RgbColor 16 137 62
-$script:C['Red']     = New-RgbColor 196 43 28
-$script:C['Orange']  = New-RgbColor 202 131 0
-$script:C['Teal']    = New-RgbColor 0 150 136
-$script:C['Gray']    = New-RgbColor 100 110 125
-$script:C['Dark']    = New-RgbColor 55 65 81
+$script:C['Blue']    = New-RgbColor 46 141 239
+$script:C['Green']   = New-RgbColor 16 124 16
+$script:C['Red']     = New-RgbColor 229 20 0
+$script:C['Orange']  = New-RgbColor 235 60 0
+$script:C['Teal']    = New-RgbColor 0 171 169
+$script:C['Gray']    = New-RgbColor 102 102 102
+$script:C['Dark']    = New-RgbColor 45 45 48
 $script:C['Smb1']    = New-RgbColor 255 205 205
 $script:C['Smb1Neg'] = New-RgbColor 255 170 170
 $script:C['Smb2']    = New-RgbColor 205 228 255
 $script:C['Smb3']    = New-RgbColor 205 245 220
-$script:C['Tcp']     = New-RgbColor 248 249 251
+$script:C['Tcp']     = New-RgbColor 248 248 248
 $script:C['Marked']  = New-RgbColor 255 236 179
-$script:C['AlertBg']   = New-RgbColor 153 27 27
-$script:C['OkGreen']   = New-RgbColor 0 210 106
-$script:C['SubText']   = New-RgbColor 160 185 215
-$script:C['FilterOk']  = New-RgbColor 220 255 220
+$script:C['AlertBg']   = New-RgbColor 229 20 0
+$script:C['OkGreen']   = New-RgbColor 57 210 106
+$script:C['SubText']   = New-RgbColor 176 176 176
+$script:C['FilterOk']  = New-RgbColor 210 245 230
 $script:C['Smb1Hot']   = New-RgbColor 255 180 180
-$script:C['Smb1Idle']  = New-RgbColor 180 200 180
+$script:C['Smb1Idle']  = New-RgbColor 160 160 160
 $script:C['HexText']   = New-RgbColor 30 30 30
-$script:C['ComboBg']   = New-RgbColor 18 18 22
-$script:C['FilterBar'] = New-RgbColor 236 239 244
-$script:C['AdminHint'] = New-RgbColor 202 131 0
+$script:C['ComboBg']   = New-RgbColor 26 26 26
+$script:C['FilterBar'] = New-RgbColor 230 230 230
+$script:C['AdminHint'] = New-RgbColor 235 60 0
 $script:C['Smb1Ink']   = New-RgbColor 90 0 0
 $script:C['Ldap']      = New-RgbColor 232 210 255
 $script:C['Kerberos']  = New-RgbColor 255 224 190
@@ -2336,11 +2398,11 @@ $script:C['Dns']       = New-RgbColor 190 245 245
 $script:C['Rpc']       = New-RgbColor 255 228 200
 $script:C['Nfs']       = New-RgbColor 220 235 180
 $script:C['AdRow']     = New-RgbColor 230 236 255
-$script:C['HexBg']     = New-RgbColor 250 250 252
-$script:C['AltRow']    = New-RgbColor 248 250 252
-$script:C['StatsBg']   = New-RgbColor 18 22 28
-$script:C['StatsFg']   = New-RgbColor 180 230 180
-$script:C['LogFg']     = New-RgbColor 200 220 200
+$script:C['HexBg']     = New-RgbColor 250 250 250
+$script:C['AltRow']    = New-RgbColor 248 248 248
+$script:C['StatsBg']   = New-RgbColor 29 29 29
+$script:C['StatsFg']   = New-RgbColor 224 224 224
+$script:C['LogFg']     = New-RgbColor 210 210 210
 
 # ============================================================
 # HELPERS
@@ -2468,7 +2530,7 @@ function New-FlatButton {
     param(
         [string]$Text,
         [int]$Width,
-        [int]$Height = 30,
+        [int]$Height = 36,
         $BackColor,
         [scriptblock]$OnClick,
         [string]$TipText = '',
@@ -2484,7 +2546,7 @@ function New-FlatButton {
     $b.Font = New-Object System.Drawing.Font('Segoe UI', 9, $style)
     $b.FlatAppearance.BorderSize = 0
     $b.Cursor = [System.Windows.Forms.Cursors]::Hand
-    $b.Margin = New-Object System.Windows.Forms.Padding(0, 3, 6, 3)
+    $b.Margin = New-Object System.Windows.Forms.Padding(0, 4, 8, 4)
     if ($OnClick) { $b.Add_Click($OnClick) }
     if ($TipText -and $script:Tip) { $script:Tip.SetToolTip($b, $TipText) }
     return $b
@@ -2882,6 +2944,8 @@ function Update-CaptureUi {
             }
         }
         Update-StatusBar
+        Update-SessionTimerLabel
+        Check-SessionTimer
         if ($script:tabMain -and $script:tabMain.SelectedTab -eq $script:tabStats) { Update-StatsTab }
         if ($script:tabMain -and $script:tabMain.SelectedTab -eq $script:tabHosts) { Update-HostsGrid }
     } catch {
@@ -3118,7 +3182,7 @@ function Get-CaptureFilterMode {
 function Start-Capture {
     if (-not $script:IsAdmin) {
         [void][System.Windows.Forms.MessageBox]::Show(
-            "Live capture requires an elevated Administrator PowerShell session.`n`nRight-click powershell.exe -> Run as administrator, then relaunch this script.`n`nYou can still open a PCAP, load the demo capture, inspect SMB configuration, and scan event logs.",
+            "Live capture requires an elevated Administrator PowerShell session.`n`nRight-click powershell.exe -> Run as administrator, then relaunch this script.`n`nYou can still open a PCAP, load the demo capture, inspect server configuration, and scan event logs.",
             'Administrator Required',
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Warning)
@@ -3221,7 +3285,7 @@ function Import-DemoCapture {
     Update-StatusBar
     Write-AppLog "Loaded $($demo.Length) synthetic demo packets (SMB, LDAP, Kerberos, DNS, NFS)." 'INFO'
     [void][System.Windows.Forms.MessageBox]::Show(
-        "Loaded $($demo.Length) synthetic packets.`n`nPurple = LDAP, orange = Kerberos, teal = DNS, red = SMBv1, blue = SMB2.`nSet the display filter to ad or fileshare to slice the view.",
+        "Loaded $($demo.Length) synthetic packets.`n`nPurple = LDAP, orange = Kerberos, teal = DNS, red = legacy SMB, blue = SMB2+.`nTry display filters: ad, collapse, machine, fileshare.",
         'Demo Capture Loaded',
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Information)
@@ -3260,7 +3324,7 @@ function Save-PcapFile {
     }
     $dlg = New-Object System.Windows.Forms.SaveFileDialog
     $dlg.Filter = 'pcap (*.pcap)|*.pcap|CSV summary (*.csv)|*.csv'
-    $dlg.FileName = "smbv1-capture-$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    $dlg.FileName = "PowerShark-view-$(Get-Date -Format 'yyyyMMdd_HHmmss')"
     $dlg.Title = 'Save current view'
     if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
     try {
@@ -3307,6 +3371,128 @@ function Save-PcapFile {
         [void][System.Windows.Forms.MessageBox]::Show("Saved $((Get-AppCount $script:ViewPackets)) packets to:`n$($dlg.FileName)`n`nPCAP files open in Wireshark (LINKTYPE_IPV4 / 228).", 'Saved', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
     } catch {
         [void][System.Windows.Forms.MessageBox]::Show("Save failed:`n$($_.Exception.Message)", 'Save Failed', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+    }
+}
+
+function Save-AllCaptureTraffic {
+    param(
+        [string]$Path,
+        [switch]$Silent,
+        [switch]$ToDesktop
+    )
+    if ($script:Engine -and $script:Engine.Running) {
+        try {
+            $batch = $script:Engine.Drain(800)
+            if ($batch -and $batch.Length -gt 0) { [void](Add-PacketsToUi -Packets $batch) }
+        } catch { }
+    }
+    $count = Get-AppCount $script:AllPackets
+    if ($ToDesktop -or (Test-BlankString $Path)) {
+        $Path = Get-CaptureSavePath -Directory (Get-DesktopDirectory)
+    }
+    if ($count -eq 0) {
+        Write-AppLog 'Save all: no packets in the capture buffer.' 'WARN'
+        if (-not $Silent) {
+            [void][System.Windows.Forms.MessageBox]::Show('No captured traffic to save yet.', 'Nothing to Save', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+        }
+        return $null
+    }
+    try {
+        [PowerSharkParser]::WritePcap($Path, (ConvertTo-PowerSharkPacketArray $script:AllPackets))
+        Write-AppLog ("Saved all {0} packet(s) to {1}" -f $count, $Path) 'SUCCESS'
+        if (-not $Silent) {
+            [void][System.Windows.Forms.MessageBox]::Show(
+                "Saved $count packet(s) — the entire capture, not just the filtered view.`n`n$Path",
+                'Saved all traffic',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information)
+        }
+        return $Path
+    } catch {
+        Write-AppLog ("Save all failed: {0}" -f $_.Exception.Message) 'ERROR'
+        if (-not $Silent) {
+            [void][System.Windows.Forms.MessageBox]::Show("Save all failed:`n$($_.Exception.Message)", 'Save Failed', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        }
+        return $null
+    }
+}
+
+function Show-SaveAllDialog {
+    $dlg = New-Object System.Windows.Forms.SaveFileDialog
+    $dlg.Title = 'Save all captured traffic'
+    $dlg.Filter = 'pcap (*.pcap)|*.pcap'
+    $desk = Get-DesktopDirectory
+    if (-not (Test-BlankString $desk) -and (Test-Path -LiteralPath $desk)) { $dlg.InitialDirectory = $desk }
+    $dlg.FileName = ('PowerShark-{0}.pcap' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+    [void](Save-AllCaptureTraffic -Path $dlg.FileName)
+}
+
+function Save-AllCaptureToDesktop {
+    $path = Save-AllCaptureTraffic -ToDesktop
+    return $path
+}
+
+function Apply-SessionTimerFromUi {
+    $mins = 0
+    try {
+        $txt = ''
+        if ($script:cmbTimer) { $txt = [string]$script:cmbTimer.Text }
+        $mins = Get-SessionMinutes $txt
+    } catch { $mins = 0 }
+    if ($mins -le 0) {
+        if ($null -eq $script:SessionEndsAt) {
+            if ($script:lblTimer) { $script:lblTimer.Text = 'Session: stays open' }
+            return
+        }
+        $script:SessionEndsAt = $null
+        if ($script:lblTimer) { $script:lblTimer.Text = 'Session: stays open' }
+        Write-AppLog 'Session timer off. The app stays open until you close it.' 'INFO'
+        return
+    }
+    $script:SessionEndsAt = (Get-Date).AddMinutes($mins)
+    Write-AppLog ("Session timer armed: keep the app open {0} minute(s), then save all traffic to the Desktop and close." -f $mins) 'INFO'
+    Update-SessionTimerLabel
+}
+
+function Update-SessionTimerLabel {
+    if (-not $script:lblTimer) { return }
+    if ($null -eq $script:SessionEndsAt) {
+        $script:lblTimer.Text = 'Session: stays open'
+        return
+    }
+    $left = $script:SessionEndsAt - (Get-Date)
+    if ($left.TotalSeconds -le 0) {
+        $script:lblTimer.Text = 'Session: saving...'
+        return
+    }
+    $h = [int][Math]::Floor($left.TotalHours)
+    $m = $left.Minutes
+    $s = $left.Seconds
+    $script:lblTimer.Text = ('Closes in {0:00}:{1:00}:{2:00}' -f $h, $m, $s)
+}
+
+function Check-SessionTimer {
+    if ($script:TimedExitBusy) { return }
+    if ($null -eq $script:SessionEndsAt) { return }
+    Update-SessionTimerLabel
+    if ((Get-Date) -ge $script:SessionEndsAt) {
+        Complete-TimedSession
+    }
+}
+
+function Complete-TimedSession {
+    if ($script:TimedExitBusy) { return }
+    $script:TimedExitBusy = $true
+    Write-AppLog 'Session time is up. Saving all captured traffic to the Desktop, then closing.' 'INFO'
+    try { Stop-Capture } catch { }
+    try { [void](Save-AllCaptureTraffic -ToDesktop -Silent) } catch {
+        Write-AppLog ("Timed Desktop save failed: {0}" -f $_.Exception.Message) 'ERROR'
+    }
+    try {
+        if ($script:MainForm) { $script:MainForm.Close() }
+    } catch {
+        try { [System.Windows.Forms.Application]::Exit() } catch { }
     }
 }
 
@@ -3764,6 +3950,16 @@ HOW TO RUN
   5. Capture dropdown: All traffic (default), Active Directory, File shares, or Domain collapse.
   6. Click Start. Use display filters (collapse, machine, gpo, dclocator, ad, ldap).
 
+SESSION TIMER AND SAVE ALL
+  CLOSE AFTER (toolbar): pick 5 minutes / 15 minutes / 1 hour, or type a number
+  of minutes. When that time is up, PowerShark writes the ENTIRE capture buffer
+  to the Desktop as PowerShark-yyyyMMdd_HHmmss.pcap and closes.
+  Off (default) keeps the window open until you quit.
+  Save all / Ctrl+Shift+S / File > Save all traffic... writes the same full
+  buffer on demand (dialog starts on the Desktop).
+  Save view / Ctrl+S writes only the filtered packet list.
+  Unattended:  .\PowerShark.ps1 -AutoCloseMinutes 60
+
 NO LIVE TRAFFIC?
   Watch Wire in the status bar after Start.
     Wire = 0  firewall / 32-bit SysWOW64 PowerShell. Use System32 powershell.exe.
@@ -3848,6 +4044,7 @@ KEYBOARD
   Ctrl+F   Find
   Ctrl+G   Go to packet number
   Ctrl+S   Save current view
+  Ctrl+Shift+S  Save all captured traffic
   Ctrl+O   Open PCAP
   Space    Mark / unmark selected packet
   Enter    Apply filter
@@ -3958,22 +4155,22 @@ $script:Tip.AutoPopDelay = 14000
 $script:Tip.InitialDelay = 350
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "PowerShark v$($script:AppVersion) - AD, file shares, and all IPv4"
+$form.Text = "PowerShark"
 $form.Size = New-Object System.Drawing.Size(1440, 920)
 $form.StartPosition = 'CenterScreen'
 $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 $form.BackColor = $script:C.Bg
 $form.MinimumSize = New-Object System.Drawing.Size(860, 560)
 $form.KeyPreview = $true
-try { $form.Icon = [System.Drawing.SystemIcons]::Shield } catch { }
+try { $form.Icon = [System.Drawing.SystemIcons]::Information } catch { }
 $form.SizeGripStyle = 'Show'
 Enable-DoubleBuffer $form
 $script:MainForm = $form
 
-# --- Header (title left, version stays on the right as the form grows) ---
+# --- Metro header (Windows 8 hub: large title, charcoal chrome) ---
 $header = New-Object System.Windows.Forms.TableLayoutPanel
 $header.Dock = 'Top'
-$header.Height = 58
+$header.Height = 78
 $header.ColumnCount = 2
 $header.RowCount = 1
 $header.BackColor = $script:C.Header
@@ -3987,31 +4184,44 @@ $leftHead.BackColor = $script:C.Header
 
 $lblTitle = New-Object System.Windows.Forms.Label
 $lblTitle.Text = 'PowerShark'
-$lblTitle.Font = New-Object System.Drawing.Font('Segoe UI', 16, [System.Drawing.FontStyle]::Bold)
+$titleFont = $null
+foreach ($fn in @('Segoe UI Light', 'Segoe UI Semilight', 'Segoe UI')) {
+    try {
+        $titleFont = New-Object System.Drawing.Font($fn, 26, [System.Drawing.FontStyle]::Regular)
+        if ($titleFont) { break }
+    } catch { $titleFont = $null }
+}
+if (-not $titleFont) { $titleFont = New-Object System.Drawing.Font('Segoe UI', 22, [System.Drawing.FontStyle]::Regular) }
+$lblTitle.Font = $titleFont
 $lblTitle.ForeColor = $script:C.White
 $lblTitle.AutoSize = $true
-$lblTitle.Location = New-Object System.Drawing.Point(16, 8)
+$lblTitle.Location = New-Object System.Drawing.Point(16, 6)
 
 $lblSub = New-Object System.Windows.Forms.Label
-$lblSub.Text = 'All IPv4  |  Active Directory  |  File shares  |  Server 2008+  |  No Npcap required'
-$lblSub.Font = New-Object System.Drawing.Font('Segoe UI', 8.5)
-$lblSub.ForeColor = $script:C.SubText
+$lblSub.Text = 'Live IPv4    Active Directory    File shares    Domain collapse'
+$lblSub.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$lblSub.ForeColor = $script:C.Accent
 $lblSub.AutoSize = $true
-$lblSub.Location = New-Object System.Drawing.Point(18, 36)
+$lblSub.Location = New-Object System.Drawing.Point(20, 52)
 $leftHead.Controls.AddRange(@($lblTitle, $lblSub))
 
 $lblVer = New-Object System.Windows.Forms.Label
 $lblVer.Text = "v$($script:AppVersion)"
-$lblVer.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$lblVer.Font = New-Object System.Drawing.Font('Segoe UI', 10)
 $lblVer.ForeColor = $script:C.SubText
 $lblVer.AutoSize = $true
 $lblVer.TextAlign = 'MiddleRight'
-$lblVer.Margin = New-Object System.Windows.Forms.Padding(8, 18, 16, 0)
+$lblVer.Margin = New-Object System.Windows.Forms.Padding(8, 28, 20, 0)
 $header.Controls.Add($leftHead, 0, 0)
 $header.Controls.Add($lblVer, 1, 0)
 
+$accentBar = New-Object System.Windows.Forms.Panel
+$accentBar.Dock = 'Top'
+$accentBar.Height = 5
+$accentBar.BackColor = $script:C.Accent
+
 # --- Toolbar (wraps onto extra rows when the window is narrow) ---
-$tool = New-FlowBar -MinHeight 42 -BackColor $script:C.Header2
+$tool = New-FlowBar -MinHeight 48 -BackColor $script:C.Header2
 
 $lblIf = New-Object System.Windows.Forms.Label
 $lblIf.Text = 'Interface'
@@ -4082,11 +4292,11 @@ $script:cmbCap.Add_SelectedIndexChanged({
 })
 
 $script:chkSmbPayload = New-Object System.Windows.Forms.CheckBox
-$script:chkSmbPayload.Text = 'SMB PDUs only'
+$script:chkSmbPayload.Text = 'File-share PDUs'
 $script:chkSmbPayload.ForeColor = $script:C.White
 $script:chkSmbPayload.AutoSize = $true
-$script:chkSmbPayload.Margin = New-Object System.Windows.Forms.Padding(4, 8, 6, 4)
-$script:Tip.SetToolTip($script:chkSmbPayload, 'Capture filter: drop TCP control segments without an SMB header.')
+$script:chkSmbPayload.Margin = New-Object System.Windows.Forms.Padding(4, 10, 6, 4)
+$script:Tip.SetToolTip($script:chkSmbPayload, 'Optional: keep only SMB payloads (drop empty TCP control segments).')
 $script:chkSmbPayload.Add_CheckedChanged({ if ($script:Engine) { $script:Engine.SmbPayloadOnly = $script:chkSmbPayload.Checked } })
 
 $script:chkAutoScroll = New-Object System.Windows.Forms.CheckBox
@@ -4096,12 +4306,60 @@ $script:chkAutoScroll.AutoSize = $true
 $script:chkAutoScroll.Checked = $true
 $script:chkAutoScroll.Margin = New-Object System.Windows.Forms.Padding(4, 8, 10, 4)
 
-$btnClear = New-FlatButton -Text 'Clear' -Width 70 -BackColor $script:C.Gray -Bold $false -OnClick { Clear-Capture } -TipText 'Clear packet list'
-$btnDemo = New-FlatButton -Text 'Demo' -Width 70 -BackColor $script:C.Teal -Bold $false -OnClick { Import-DemoCapture } -TipText 'Load synthetic AD, SMB, DNS, Kerberos, LDAP, NFS packets'
-$btnOpen = New-FlatButton -Text 'Open' -Width 70 -BackColor $script:C.Blue -Bold $false -OnClick { Open-PcapFile } -TipText 'Open a .pcap (Ctrl+O)'
-$btnSave = New-FlatButton -Text 'Save' -Width 70 -BackColor $script:C.Dark -Bold $false -OnClick { Save-PcapFile } -TipText 'Save current view as pcap/csv (Ctrl+S)'
+$btnClear = New-FlatButton -Text 'Clear' -Width 78 -BackColor $script:C.Gray -Bold $false -OnClick { Clear-Capture } -TipText 'Clear packet list'
+$btnDemo = New-FlatButton -Text 'Demo' -Width 78 -BackColor $script:C.Teal -Bold $false -OnClick { Import-DemoCapture } -TipText 'Load synthetic AD, file-share, DNS, Kerberos, LDAP, NFS packets'
+$btnOpen = New-FlatButton -Text 'Open' -Width 78 -BackColor $script:C.Blue -Bold $false -OnClick { Open-PcapFile } -TipText 'Open a .pcap (Ctrl+O)'
+$btnSaveView = New-FlatButton -Text 'Save view' -Width 92 -BackColor $script:C.Dark -Bold $false -OnClick { Save-PcapFile } -TipText 'Save the filtered view as pcap/csv (Ctrl+S)'
+$script:btnSaveAll = New-FlatButton -Text 'Save all' -Width 88 -BackColor $script:C.Accent -OnClick { Show-SaveAllDialog } -TipText 'Save the entire capture buffer (Ctrl+Shift+S). Defaults to the Desktop.'
 
-$tool.Controls.AddRange(@($lblIf, $script:cmbIface, $script:btnStart, $script:btnStop, $script:btnPause, $lblCap, $script:cmbCap, $script:chkSmbPayload, $script:chkAutoScroll, $btnClear, $btnDemo, $btnOpen, $btnSave))
+$tool.Controls.AddRange(@($lblIf, $script:cmbIface, $script:btnStart, $script:btnStop, $script:btnPause, $lblCap, $script:cmbCap, $script:chkSmbPayload, $script:chkAutoScroll, $btnClear, $btnDemo, $btnOpen, $btnSaveView, $script:btnSaveAll))
+
+# --- Session timer (keep open N minutes, then save all to Desktop and close) ---
+$sessionBar = New-FlowBar -MinHeight 44 -BackColor $script:C.Header2
+
+$lblSess = New-Object System.Windows.Forms.Label
+$lblSess.Text = 'CLOSE AFTER'
+$lblSess.ForeColor = $script:C.Accent
+$lblSess.AutoSize = $true
+$lblSess.Font = New-Object System.Drawing.Font('Segoe UI', 8.5, [System.Drawing.FontStyle]::Bold)
+$lblSess.Margin = New-Object System.Windows.Forms.Padding(8, 12, 8, 4)
+
+$script:cmbTimer = New-Object System.Windows.Forms.ComboBox
+$script:cmbTimer.DropDownStyle = 'DropDown'
+$script:cmbTimer.Width = 130
+$script:cmbTimer.FlatStyle = 'Flat'
+$script:cmbTimer.BackColor = $script:C.ComboBg
+$script:cmbTimer.ForeColor = $script:C.White
+$script:cmbTimer.Margin = New-Object System.Windows.Forms.Padding(0, 8, 8, 4)
+[void]$script:cmbTimer.Items.AddRange(@(
+    'Off',
+    '5 minutes',
+    '15 minutes',
+    '30 minutes',
+    '1 hour',
+    '2 hours',
+    '4 hours',
+    '8 hours'
+))
+$script:cmbTimer.Text = 'Off'
+$script:Tip.SetToolTip($script:cmbTimer, 'How long to keep PowerShark open. When the timer ends it saves ALL captured traffic to the Desktop and closes. Type a number of minutes if you need a custom value.')
+$script:cmbTimer.Add_SelectedIndexChanged({ Apply-SessionTimerFromUi })
+$script:cmbTimer.Add_Leave({ Apply-SessionTimerFromUi })
+$script:cmbTimer.Add_KeyDown({
+    param($s, $e)
+    if ($e.KeyCode -eq 'Enter') { $e.SuppressKeyPress = $true; Apply-SessionTimerFromUi }
+})
+
+$script:lblTimer = New-Object System.Windows.Forms.Label
+$script:lblTimer.Text = 'Session: stays open'
+$script:lblTimer.ForeColor = $script:C.White
+$script:lblTimer.AutoSize = $true
+$script:lblTimer.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
+$script:lblTimer.Margin = New-Object System.Windows.Forms.Padding(8, 11, 16, 4)
+
+$btnSaveDesk = New-FlatButton -Text 'Save all to Desktop' -Width 168 -BackColor $script:C.Accent -OnClick { [void](Save-AllCaptureToDesktop) } -TipText 'Write the entire capture buffer to a timestamped .pcap on the Desktop now.'
+
+$sessionBar.Controls.AddRange(@($lblSess, $script:cmbTimer, $script:lblTimer, $btnSaveDesk))
 
 # --- Filter bar (filter box is the percent-width column) ---
 $filterBar = New-Object System.Windows.Forms.TableLayoutPanel
@@ -4194,18 +4452,8 @@ $script:txtFilter.Add_KeyDown({
 $script:btnApply = New-FlatButton -Text 'Apply' -Width 70 -Height 26 -BackColor $script:C.Blue -OnClick { Update-PacketView }
 $script:btnReset = New-FlatButton -Text 'Reset' -Width 70 -Height 26 -BackColor $script:C.Gray -Bold $false -OnClick {
     $script:cmbPreset.SelectedIndex = 0
-    $script:chkSmb1Only.Checked = $false
     Set-DisplayFilter -Text ''
 }
-
-$script:chkSmb1Only = New-Object System.Windows.Forms.CheckBox
-$script:chkSmb1Only.Text = 'SMBv1 only'
-$script:chkSmb1Only.AutoSize = $true
-$script:chkSmb1Only.Anchor = 'Left'
-$script:chkSmb1Only.ForeColor = $script:C.Red
-$script:chkSmb1Only.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
-$script:chkSmb1Only.Margin = New-Object System.Windows.Forms.Padding(4, 8, 8, 4)
-$script:chkSmb1Only.Add_CheckedChanged({ Update-PacketView })
 
 $script:lblFind = New-Object System.Windows.Forms.Label
 $script:lblFind.Text = 'Find'
@@ -4229,11 +4477,10 @@ $filterBar.Controls.Add($script:cmbPreset, 1, 0)
 $filterBar.Controls.Add($script:txtFilter, 2, 0)
 $filterBar.Controls.Add($script:btnApply, 3, 0)
 $filterBar.Controls.Add($script:btnReset, 4, 0)
-$filterBar.Controls.Add($script:chkSmb1Only, 5, 0)
-$filterBar.Controls.Add($script:lblFind, 6, 0)
-$filterBar.Controls.Add($script:txtFind, 7, 0)
-$filterBar.Controls.Add($script:btnPrev, 8, 0)
-$filterBar.Controls.Add($script:btnNext, 9, 0)
+$filterBar.Controls.Add($script:lblFind, 5, 0)
+$filterBar.Controls.Add($script:txtFind, 6, 0)
+$filterBar.Controls.Add($script:btnPrev, 7, 0)
+$filterBar.Controls.Add($script:btnNext, 8, 0)
 
 # --- Alert banner ---
 $script:banner = New-Object System.Windows.Forms.Label
@@ -4258,11 +4505,12 @@ $script:adminHint.Visible = -not $script:IsAdmin
 # --- Tabs ---
 $script:tabMain = New-Object System.Windows.Forms.TabControl
 $script:tabMain.Dock = 'Fill'
-$script:tabMain.Font = New-Object System.Drawing.Font('Segoe UI', 9.5, [System.Drawing.FontStyle]::Bold)
-$script:tabMain.Padding = New-Object System.Drawing.Point(10, 5)
+$script:tabMain.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
+$script:tabMain.Padding = New-Object System.Drawing.Point(12, 6)
+try { $script:tabMain.Appearance = [System.Windows.Forms.TabAppearance]::FlatButtons } catch { }
 
 $script:tabCapture = New-Object System.Windows.Forms.TabPage
-$script:tabCapture.Text = '  Live Capture  '
+$script:tabCapture.Text = '  Packets  '
 $script:tabCapture.BackColor = $script:C.Bg
 
 $script:tabHosts = New-Object System.Windows.Forms.TabPage
@@ -4274,11 +4522,11 @@ $script:tabStats.Text = '  Statistics  '
 $script:tabStats.BackColor = $script:C.Bg
 
 $script:tabConfig = New-Object System.Windows.Forms.TabPage
-$script:tabConfig.Text = '  Server Config  '
+$script:tabConfig.Text = '  Server  '
 $script:tabConfig.BackColor = $script:C.Bg
 
 $script:tabEvents = New-Object System.Windows.Forms.TabPage
-$script:tabEvents.Text = '  Event Log  '
+$script:tabEvents.Text = '  Events  '
 $script:tabEvents.BackColor = $script:C.Bg
 
 $script:tabHelp = New-Object System.Windows.Forms.TabPage
@@ -4470,7 +4718,7 @@ $script:dgvHosts.Add_CellDoubleClick({
     if ($script:dgvHosts.SelectedRows.Count -gt 0) {
         $ip = $script:dgvHosts.SelectedRows[0].Cells['IP'].Value
         $script:tabMain.SelectedTab = $script:tabCapture
-        Set-DisplayFilter -Text ("smb1 and ip.addr=={0}" -f $ip)
+        Set-DisplayFilter -Text ("ip.addr=={0}" -f $ip)
     }
 })
 $script:tabHosts.Controls.Add($script:dgvHosts)
@@ -4516,7 +4764,7 @@ $script:numHours.Maximum = 168
 $script:numHours.Value = 24
 $script:numHours.Width = 60
 $script:numHours.Margin = New-Object System.Windows.Forms.Padding(0, 8, 8, 4)
-$btnScan = New-FlatButton -Text 'Scan SMB event logs' -Width 180 -BackColor $script:C.Blue -OnClick { Scan-SmbEventLogs }
+$btnScan = New-FlatButton -Text 'Scan event logs' -Width 160 -BackColor $script:C.Blue -OnClick { Scan-SmbEventLogs }
 $evTop.Controls.AddRange(@($lblH, $script:numHours, $btnScan))
 $script:dgvEvents = New-Object System.Windows.Forms.DataGridView
 $script:dgvEvents.Dock = 'Fill'
@@ -4592,11 +4840,16 @@ $form.Controls.Add($status)
 $form.Controls.Add($script:banner)
 $form.Controls.Add($script:adminHint)
 $form.Controls.Add($filterBar)
+$form.Controls.Add($sessionBar)
 $form.Controls.Add($tool)
+$form.Controls.Add($accentBar)
 $form.Controls.Add($header)
 
 # --- Menu ---
 $menu = New-Object System.Windows.Forms.MenuStrip
+$menu.BackColor = $script:C.Header
+$menu.ForeColor = $script:C.White
+$menu.Padding = New-Object System.Windows.Forms.Padding(8, 2, 0, 2)
 function Add-MenuAction {
     param($ParentItems, [string]$Text, [scriptblock]$Action)
     $item = $ParentItems.Add($Text)
@@ -4606,6 +4859,8 @@ function Add-MenuAction {
 $fileM = New-Object System.Windows.Forms.ToolStripMenuItem('File')
 Add-MenuAction $fileM.DropDownItems 'Open PCAP...' { Open-PcapFile }
 Add-MenuAction $fileM.DropDownItems 'Save current view...' { Save-PcapFile }
+Add-MenuAction $fileM.DropDownItems 'Save all traffic...' { Show-SaveAllDialog }
+Add-MenuAction $fileM.DropDownItems 'Save all to Desktop' { [void](Save-AllCaptureToDesktop) }
 Add-MenuAction $fileM.DropDownItems 'Load demo capture' { Import-DemoCapture }
 [void]$fileM.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 Add-MenuAction $fileM.DropDownItems 'Exit' { $script:MainForm.Close() }
@@ -4621,8 +4876,8 @@ $helpM = New-Object System.Windows.Forms.ToolStripMenuItem('Help')
 Add-MenuAction $helpM.DropDownItems 'Open Help tab' { $script:tabMain.SelectedTab = $script:tabHelp }
 Add-MenuAction $helpM.DropDownItems 'About' {
     [void][System.Windows.Forms.MessageBox]::Show(
-        "PowerShark v$($script:AppVersion)`nWindows Server 2008 / 2008 R2 (PowerShell 2.0) through PowerShell 7+`nCurrently running: $($PSVersionTable.PSVersion) ($(Get-HostEdition))`n`nCaptures all IPv4. Filters: Active Directory, file shares, and Domain collapse (leftover machine accounts, GPO, simple bind, DC locator, NTP, NTLM).`nLive capture uses a raw IPv4 socket (no Npcap). PCAPs open in Wireshark.",
-        'About',
+        "PowerShark v$($script:AppVersion)`nWindows Server 2008 / 2008 R2 (PowerShell 2.0) through PowerShell 7+`nCurrently running: $($PSVersionTable.PSVersion) ($(Get-HostEdition))`n`nLive IPv4 capture for Active Directory, file shares, and domain collapse.`nUse CLOSE AFTER to keep the app open, then auto-save the full capture to the Desktop and exit.`nSave all writes every buffered packet (not just the filtered view).`nRaw IPv4 socket — no Npcap. PCAPs open in Wireshark.",
+        'About PowerShark',
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Information)
 }
@@ -4640,6 +4895,7 @@ $form.Add_KeyDown({
     elseif ($e.Control -and $e.KeyCode -eq 'L') { $script:txtFilter.Focus(); $e.Handled = $true }
     elseif ($e.Control -and $e.KeyCode -eq 'F') { $script:txtFind.Focus(); $e.Handled = $true }
     elseif ($e.Control -and $e.KeyCode -eq 'G') { Show-GotoPacket; $e.Handled = $true }
+    elseif ($e.Control -and $e.Shift -and $e.KeyCode -eq 'S') { Show-SaveAllDialog; $e.Handled = $true }
     elseif ($e.Control -and $e.KeyCode -eq 'S') { Save-PcapFile; $e.Handled = $true }
     elseif ($e.Control -and $e.KeyCode -eq 'O') { Open-PcapFile; $e.Handled = $true }
 })
@@ -4662,7 +4918,13 @@ $form.Add_FormClosing({
 })
 
 Write-AppLog "PowerShark v$($script:AppVersion) started. Elevated=$($script:IsAdmin)  Host=$env:COMPUTERNAME  PS=$($PSVersionTable.PSVersion) ($(Get-HostEdition))" 'INFO'
-Write-AppLog 'Capture=All traffic. Use the Capture dropdown for Active Directory, File shares, or Domain collapse.' 'INFO'
+Write-AppLog 'Capture=All traffic. CLOSE AFTER saves the full buffer to the Desktop and exits. Save all dumps on demand.' 'INFO'
+if ($AutoCloseMinutes -gt 0) {
+    try {
+        $script:cmbTimer.Text = ('{0} minutes' -f $AutoCloseMinutes)
+        Apply-SessionTimerFromUi
+    } catch { }
+}
 Refresh-ConfigTab
 Update-StatsTab
 
