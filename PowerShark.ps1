@@ -2950,15 +2950,49 @@ function Test-PacketFilter {
     return $true
 }
 
+function Set-PacketListVirtualSize {
+    param([int]$Size)
+    if (-not $script:lvPackets) { return }
+    if ($Size -lt 0) { $Size = 0 }
+    $old = 0
+    try { $old = [int]$script:lvPackets.VirtualListSize } catch { $old = 0 }
+    $selBad = $false
+    try {
+        if ($script:lvPackets.SelectedIndices.Count -gt 0) {
+            $sel = [int]$script:lvPackets.SelectedIndices[0]
+            if ($sel -lt 0 -or $sel -ge $Size) { $selBad = $true }
+        }
+    } catch { $selBad = $true }
+    if ($Size -eq $old -and -not $selBad) { return }
+    try { $script:lvPackets.BeginUpdate() } catch { }
+    try {
+        if ($selBad -or $Size -lt $old) {
+            try { $script:lvPackets.SelectedIndices.Clear() } catch { }
+            try { $script:lvPackets.FocusedItem = $null } catch { }
+        }
+        try { $script:lvPackets.VirtualListSize = $Size } catch { }
+    } finally {
+        try { $script:lvPackets.EndUpdate() } catch { }
+    }
+}
+
 function Update-PacketView {
     $script:FilterText = if ($script:txtFilter) { $script:txtFilter.Text } else { '' }
-    $script:ViewPackets.Clear()
-    foreach ($p in (Get-AppEnumerable $script:AllPackets)) {
-        if (Test-PacketFilter $p) { [void]$script:ViewPackets.Add($p) }
-    }
     if ($script:lvPackets) {
-        $script:lvPackets.VirtualListSize = (Get-AppCount $script:ViewPackets)
-        $script:lvPackets.Invalidate()
+        try { $script:lvPackets.BeginUpdate() } catch { }
+    }
+    try {
+        $script:ViewPackets.Clear()
+        Set-PacketListVirtualSize 0
+        foreach ($p in (Get-AppEnumerable $script:AllPackets)) {
+            if (Test-PacketFilter $p) { [void]$script:ViewPackets.Add($p) }
+        }
+        Set-PacketListVirtualSize (Get-AppCount $script:ViewPackets)
+        try { if ($script:lvPackets) { $script:lvPackets.Invalidate() } } catch { }
+    } finally {
+        if ($script:lvPackets) {
+            try { $script:lvPackets.EndUpdate() } catch { }
+        }
     }
     Update-FilterBoxColor
     Update-StatusBar
@@ -3102,7 +3136,7 @@ function Refresh-PacketListView {
     if (-not $script:lvPackets) { return }
     $n = Get-AppCount $script:ViewPackets
     if ($n -lt 0) { $n = 0 }
-    try { $script:lvPackets.VirtualListSize = $n } catch { }
+    Set-PacketListVirtualSize $n
     if ($ScrollEnd -and $script:chkAutoScroll -and $script:chkAutoScroll.Checked -and $n -gt 0) {
         try { $script:lvPackets.EnsureVisible($n - 1) } catch { }
     } else {
@@ -3493,18 +3527,24 @@ function Show-SelectedFindingPacket {
 }
 
 function Show-BannerAlertPackets {
-    $kind = Get-ActiveBannerKind
-    $filter = Get-BannerFilterText $kind
-    Set-DisplayFilter -Text $filter
-    Update-FindingsGrid -Force
-    if ($script:tabFindings) {
-        $script:tabMain.SelectedTab = $script:tabFindings
-    } elseif ($script:tabCapture) {
-        $script:tabMain.SelectedTab = $script:tabCapture
+    $kind = 'collapse'
+    $filter = 'collapse'
+    try {
+        $kind = Get-ActiveBannerKind
+        $filter = Get-BannerFilterText $kind
+        Set-DisplayFilter -Text $filter
+        Update-FindingsGrid -Force
+        if ($script:tabFindings) {
+            $script:tabMain.SelectedTab = $script:tabFindings
+        } elseif ($script:tabCapture) {
+            $script:tabMain.SelectedTab = $script:tabCapture
+        }
+        $n = 0
+        try { $n = $script:dgvFindings.Rows.Count } catch { }
+        Write-AppLog ("Banner click: listing {0} {1} packet(s) (filter {2})." -f $n, $kind, $filter) 'INFO'
+    } catch {
+        Write-AppLog ("Banner click failed: {0}" -f $_.Exception.Message) 'ERROR'
     }
-    $n = 0
-    try { $n = $script:dgvFindings.Rows.Count } catch { }
-    Write-AppLog ("Banner click: listing {0} {1} packet(s) (filter {2})." -f $n, $kind, $filter) 'INFO'
 }
 
 function Enable-RawCaptureFirewall {
@@ -3668,10 +3708,8 @@ function Clear-Capture {
         $script:LastFindingsCount = -1
         $script:LastFindingsKind = ''
         if ($script:banner) { $script:banner.Visible = $false }
-        if ($script:lvPackets) {
-            try { $script:lvPackets.VirtualListSize = 0 } catch { }
-            try { $script:lvPackets.Invalidate() } catch { }
-        }
+        Set-PacketListVirtualSize 0
+        try { if ($script:lvPackets) { $script:lvPackets.Invalidate() } } catch { }
     } finally {
         if ($script:lvPackets) {
             try { $script:lvPackets.EndUpdate() } catch { }
@@ -3951,8 +3989,12 @@ function Complete-TimedSession {
 
 function Set-DisplayFilter {
     param([string]$Text)
-    $script:txtFilter.Text = $Text
-    Update-PacketView
+    try {
+        if ($script:txtFilter) { $script:txtFilter.Text = $Text }
+        Update-PacketView
+    } catch {
+        Write-AppLog ("Display filter failed: {0}" -f $_.Exception.Message) 'ERROR'
+    }
 }
 
 function Use-FollowStream {
