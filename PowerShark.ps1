@@ -2970,14 +2970,44 @@ function Add-PacketsToUi {
     return $added
 }
 
+function Get-PacketListColumnCount {
+    $n = 9
+    try {
+        if ($script:lvPackets) { $n = [int]$script:lvPackets.Columns.Count }
+    } catch { }
+    if ($n -lt 1) { $n = 9 }
+    return $n
+}
+
+function New-BlankPacketListItem {
+    $item = New-Object System.Windows.Forms.ListViewItem('')
+    $need = Get-PacketListColumnCount
+    while ($item.SubItems.Count -lt $need) {
+        [void]$item.SubItems.Add('')
+    }
+    return $item
+}
+
+function Complete-PacketListItem {
+    param($Item)
+    if ($null -eq $Item) { return (New-BlankPacketListItem) }
+    $need = Get-PacketListColumnCount
+    while ($Item.SubItems.Count -lt $need) {
+        [void]$Item.SubItems.Add('')
+    }
+    return $Item
+}
+
 function Refresh-PacketListView {
     param([switch]$ScrollEnd)
     if (-not $script:lvPackets) { return }
-    $script:lvPackets.VirtualListSize = (Get-AppCount $script:ViewPackets)
-    if ($ScrollEnd -and $script:chkAutoScroll -and $script:chkAutoScroll.Checked -and (Get-AppCount $script:ViewPackets) -gt 0) {
-        try { $script:lvPackets.EnsureVisible((Get-AppCount $script:ViewPackets) - 1) } catch { }
+    $n = Get-AppCount $script:ViewPackets
+    if ($n -lt 0) { $n = 0 }
+    try { $script:lvPackets.VirtualListSize = $n } catch { }
+    if ($ScrollEnd -and $script:chkAutoScroll -and $script:chkAutoScroll.Checked -and $n -gt 0) {
+        try { $script:lvPackets.EnsureVisible($n - 1) } catch { }
     } else {
-        $script:lvPackets.Invalidate()
+        try { $script:lvPackets.Invalidate() } catch { }
     }
 }
 
@@ -3402,18 +3432,33 @@ function Clear-Capture {
         $r = [System.Windows.Forms.MessageBox]::Show('Clear the packet list while still capturing?', 'Clear', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
         if ($r -ne [System.Windows.Forms.DialogResult]::Yes) { return }
     }
-    $script:AllPackets.Clear()
-    $script:ViewPackets.Clear()
-    $script:Smb1Hosts.Clear()
-    $script:Smb1CommandHist.Clear()
-    $script:NextNo = 1
-    $script:LastBannerCount = 0
-    if ($script:banner) { $script:banner.Visible = $false }
-    $script:lvPackets.VirtualListSize = 0
-    $script:lvPackets.Invalidate()
-    $script:tvDetails.Nodes.Clear()
-    $script:hexBox.Clear()
-    $script:dgvHosts.Rows.Clear()
+    if ($script:lvPackets) {
+        try { $script:lvPackets.BeginUpdate() } catch { }
+    }
+    try {
+        if ($script:lvPackets) {
+            try { $script:lvPackets.SelectedIndices.Clear() } catch { }
+        }
+        $script:FindIndex = -1
+        $script:AllPackets.Clear()
+        $script:ViewPackets.Clear()
+        $script:Smb1Hosts.Clear()
+        $script:Smb1CommandHist.Clear()
+        $script:NextNo = 1
+        $script:LastBannerCount = 0
+        if ($script:banner) { $script:banner.Visible = $false }
+        if ($script:lvPackets) {
+            try { $script:lvPackets.VirtualListSize = 0 } catch { }
+            try { $script:lvPackets.Invalidate() } catch { }
+        }
+    } finally {
+        if ($script:lvPackets) {
+            try { $script:lvPackets.EndUpdate() } catch { }
+        }
+    }
+    try { $script:tvDetails.Nodes.Clear() } catch { }
+    try { $script:hexBox.Clear() } catch { }
+    try { $script:dgvHosts.Rows.Clear() } catch { }
     Update-StatusBar
     Write-AppLog 'Packet list cleared.' 'INFO'
 }
@@ -4775,25 +4820,37 @@ $script:lvPackets.Add_RetrieveVirtualItem({
     param($s, $e)
     try {
         $idx = $e.ItemIndex
-        if ($idx -lt 0 -or $idx -ge (Get-AppCount $script:ViewPackets)) {
-            $e.Item = New-Object System.Windows.Forms.ListViewItem('')
+        $count = Get-AppCount $script:ViewPackets
+        if ($idx -lt 0 -or $idx -ge $count) {
+            $e.Item = New-BlankPacketListItem
             return
         }
         $p = $script:ViewPackets[$idx]
-        $item = New-Object System.Windows.Forms.ListViewItem($p.No.ToString())
-        [void]$item.SubItems.Add($p.Time.ToString('HH:mm:ss.fff'))
-        [void]$item.SubItems.Add($p.Src)
-        [void]$item.SubItems.Add($p.SrcPort.ToString())
-        [void]$item.SubItems.Add($p.Dst)
-        [void]$item.SubItems.Add($p.DstPort.ToString())
-        [void]$item.SubItems.Add($p.Protocol)
-        [void]$item.SubItems.Add($p.Length.ToString())
-        [void]$item.SubItems.Add($p.Info)
-        $item.BackColor = Get-PacketRowColor $p
-        if ($p.IsSmb1) { $item.ForeColor = $script:C.Smb1Ink }
-        $e.Item = $item
+        if ($null -eq $p) {
+            $e.Item = New-BlankPacketListItem
+            return
+        }
+        $noText = ''
+        try { $noText = [string]$p.No } catch { $noText = '' }
+        $item = New-Object System.Windows.Forms.ListViewItem($noText)
+        $timeText = ''
+        try { $timeText = $p.Time.ToString('HH:mm:ss.fff') } catch { }
+        [void]$item.SubItems.Add($timeText)
+        [void]$item.SubItems.Add(([string]$p.Src))
+        [void]$item.SubItems.Add(([string]$p.SrcPort))
+        [void]$item.SubItems.Add(([string]$p.Dst))
+        [void]$item.SubItems.Add(([string]$p.DstPort))
+        [void]$item.SubItems.Add(([string]$p.Protocol))
+        [void]$item.SubItems.Add(([string]$p.Length))
+        $infoText = ''
+        try { $infoText = [string]$p.Info } catch { }
+        if ($null -eq $infoText) { $infoText = '' }
+        [void]$item.SubItems.Add($infoText)
+        try { $item.BackColor = Get-PacketRowColor $p } catch { }
+        try { if ($p.IsSmb1) { $item.ForeColor = $script:C.Smb1Ink } } catch { }
+        $e.Item = Complete-PacketListItem $item
     } catch {
-        $e.Item = New-Object System.Windows.Forms.ListViewItem('')
+        $e.Item = New-BlankPacketListItem
     }
 })
 $script:lvPackets.Add_SelectedIndexChanged({
