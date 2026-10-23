@@ -15,6 +15,7 @@
 
     Capture filter dropdown: All traffic, Active Directory, File shares, SMB, LDAP,
     Kerberos, DNS, RPC, NFS, Domain collapse. Display filters work on the current view.
+    Click the red PRE-COLLAPSE (or SMBv1) banner to list leftover packets on Findings.
 
     Designed for Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012 / 2012 R2,
     and PowerShell 7 on Windows. Live capture needs an elevated Administrator session.
@@ -63,7 +64,7 @@
     .\PowerShark.ps1 -AutoCloseMinutes 60
 
 .NOTES
-    Version     : 1.2
+    Version     : 1.3
     Compatible  : Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012
                   (PowerShell 3.0), 2012 R2 (PowerShell 4.0), 5.1, and PowerShell 7+.
                   There is no Requires-Version directive. Do not use -shl/-shr
@@ -84,7 +85,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.2'
+$script:AppVersion = '1.3'
 
 # Version is checked at runtime on purpose. Do not add "#Requires -Version".
 # Server 2008 / 2008 R2 is PowerShell 2.0. Server 2012 R2 is 4.0.
@@ -219,6 +220,69 @@ function Get-PacketServiceName {
     }
     if (Test-BlankString $proto) { return 'Unknown' }
     return $proto
+}
+
+function Get-PacketFindingReasons {
+    param($Packet)
+    $list = New-Object System.Collections.ArrayList
+    if ($null -eq $Packet) { return $list }
+    if ($Packet.IsSimpleBind) { [void]$list.Add('LDAP simple bind — password may be on the wire. Move this app to Kerberos/SASL/LDAPS.') }
+    if ($Packet.IsAnonymous) { [void]$list.Add('Anonymous LDAP bind — an app is probing this directory without credentials.') }
+    if ($Packet.IsDcLocator) { [void]$list.Add('DC locator DNS/CLDAP — this client still finds this domain via SRV or LDAP ping.') }
+    if ($Packet.IsSysvol -or $Packet.IsNetlogonShare) { [void]$list.Add('SYSVOL/NETLOGON — logon scripts or GPOs still served from this domain.') }
+    if ($Packet.IsGpo) { [void]$list.Add('Group Policy file (Policies / GPT.INI) — GPOs still applied from this domain.') }
+    if ($Packet.IsNtlmV1) { [void]$list.Add('NTLMv1 — replace with Kerberos/NTLMv2.') }
+    elseif ($Packet.IsNtlm) { [void]$list.Add('NTLM (not Kerberos) — this app will break when the domain is gone; move it to Kerberos or a local account.') }
+    if ($Packet.IsReplication) { [void]$list.Add('AD replication RPC — another DC still talks to this domain.') }
+    if ($Packet.IsMachine) { [void]$list.Add('Machine account (ends with $) — this computer is still domain-joined. Unjoin or migrate it.') }
+    if ($Packet.IsKdc) { [void]$list.Add('Kerberos AS/TGS — this client still gets tickets from this KDC (still a domain member or service).') }
+    if ($Packet.IsNtp) { [void]$list.Add('NTP — this host may still use a DC as its time source. Point clients at a new NTP server.') }
+    if ($Packet.IsAdws) { [void]$list.Add('ADWS (9389) — RSAT / PowerShell AD module still targeting this domain.') }
+    if ($Packet.IsCldap) { [void]$list.Add('CLDAP (UDP 389) — NetLogon LDAP ping; clients still locating this DC.') }
+    if ($Packet.IsLlmnr) { [void]$list.Add('LLMNR — name fallback after DNS/WINS. Disable or expect name-resolution failures.') }
+    if ($Packet.IsDfs) { [void]$list.Add('DFS namespace — domain DFS roots/folders still in use.') }
+    if ($Packet.IsSamr) { [void]$list.Add('SAMR/LSARPC — account lookup from NAS, printers, or apps against this domain.') }
+    if ($Packet.IsDnsUpdate) { [void]$list.Add('DNS dynamic update — a machine is still registering names in this DNS zone.') }
+    if ($Packet.IsWinRm) { [void]$list.Add('WinRM — remoting that typically uses Kerberos to this domain.') }
+    if ($Packet.IsCert) { [void]$list.Add('Certificate enrollment RPC — clients still using this CA/domain for certs.') }
+    if ($Packet.IsWins) { [void]$list.Add('WINS/NetBIOS name service — break WINS and NetBIOS-dependent apps first.') }
+    if ($Packet.IsKpasswd) { [void]$list.Add('Kerberos password change (464) — password changes still go through this KDC.') }
+    if ($Packet.IsGc) { [void]$list.Add('Global Catalog (3268/3269) — forest-wide lookups still hit this domain.') }
+    if ($Packet.IsSmb1) { [void]$list.Add('SMBv1 — remaining NT LM 0.12 client; replace before the file server / DC is retired.') }
+    return $list
+}
+
+function Get-PacketFindingSummary {
+    param($Packet)
+    if ($null -eq $Packet) { return '' }
+    $reasons = Get-PacketFindingReasons $Packet
+    if ((Get-AppCount $reasons) -eq 0) {
+        if ($Packet.IsCollapse) { return 'Domain leftover' }
+        if ($Packet.IsSmb1) { return 'SMBv1' }
+        if ($Packet.IsAd) { return 'Active Directory' }
+        return ''
+    }
+    return (Join-AppStrings -Values $reasons -Separator '; ')
+}
+
+function Get-BannerFilterText {
+    param([string]$Kind)
+    if ($Kind -eq 'smb1') { return 'smb1' }
+    if ($Kind -eq 'ad') { return 'ad' }
+    return 'collapse'
+}
+
+function Test-BannerPacket {
+    param($Packet, [string]$Kind)
+    if ($null -eq $Packet) { return $false }
+    if ($Kind -eq 'smb1') { return [bool]$Packet.IsSmb1 }
+    if ($Kind -eq 'ad') { return [bool]$Packet.IsAd }
+    return [bool]$Packet.IsCollapse
+}
+
+function Get-ActiveBannerKind {
+    if (-not (Test-BlankString $script:BannerKind)) { return $script:BannerKind }
+    return 'collapse'
 }
 
 function Get-CaptureSavePath {
@@ -2371,6 +2435,35 @@ function Invoke-SmbAnalyzerSelfTest {
     elseif (-not [PowerSharkParser]::MatchesFilter($col, 9)) {
         [void]$failures.Add('Domain-collapse capture filter rejected a collapse packet')
     }
+    if ($simple) {
+        $simpleWhy = Get-PacketFindingSummary $simple
+        if ($simpleWhy -notmatch 'simple bind') {
+            [void]$failures.Add("Simple-bind finding text missing: $simpleWhy")
+        }
+        if (-not (Test-BannerPacket $simple 'collapse')) {
+            [void]$failures.Add('Test-BannerPacket collapse missed simple bind')
+        }
+    }
+    if ($col) {
+        $colWhy = Get-PacketFindingSummary $col
+        if (Test-BlankString $colWhy) { [void]$failures.Add('Collapse packet has empty finding summary') }
+    }
+    if ($smb1) {
+        $oneSmb1 = @($smb1)[0]
+        if (-not (Test-BannerPacket $oneSmb1 'smb1')) {
+            [void]$failures.Add('Test-BannerPacket smb1 missed SMBv1 demo packet')
+        }
+        $smb1Why = Get-PacketFindingSummary $oneSmb1
+        if ($smb1Why -notmatch 'SMBv1') { [void]$failures.Add("SMBv1 finding text missing: $smb1Why") }
+    }
+    if ((Get-BannerFilterText 'collapse') -ne 'collapse') { [void]$failures.Add('Get-BannerFilterText collapse') }
+    if ((Get-BannerFilterText 'smb1') -ne 'smb1') { [void]$failures.Add('Get-BannerFilterText smb1') }
+    if ((Get-BannerFilterText 'ad') -ne 'ad') { [void]$failures.Add('Get-BannerFilterText ad') }
+    $collapseHits = 0
+    foreach ($dp in $demo) {
+        if (Test-BannerPacket $dp 'collapse') { $collapseHits++ }
+    }
+    if ($collapseHits -lt 1) { [void]$failures.Add('Demo set has no collapse leftover packets for Findings') }
     $anon = $demo | Where-Object { $_.IsAnonymous } | Select-Object -First 1
     if (-not $anon) { [void]$failures.Add('Demo anonymous LDAP bind not flagged') }
     $syn445 = $demo | Where-Object { $_.DstPort -eq 445 -and -not $_.HasSmb } | Select-Object -First 1
@@ -2462,6 +2555,9 @@ $script:SortColumn      = 0
 $script:SortAscending   = $true
 $script:FindIndex       = -1
 $script:LastBannerCount = 0
+$script:BannerKind      = ''
+$script:LastFindingsCount = -1
+$script:LastFindingsKind  = ''
 $script:UiBusy          = $false
 $script:SessionEndsAt   = $null
 $script:TimedExitBusy   = $false
@@ -2475,6 +2571,9 @@ $script:cmbSaveFormat   = $null
 $script:cmbTimer        = $null
 $script:lblTimer        = $null
 $script:banner          = $null
+$script:tabFindings     = $null
+$script:dgvFindings     = $null
+$script:lblFindingsCount = $null
 $script:MainForm        = $null
 $script:splitH          = $null
 $script:splitV          = $null
@@ -3084,21 +3183,29 @@ function Update-StatusBar {
 
     if ($script:banner -and $stats) {
         if ($stats.Smb1 -gt 0) {
+            $script:BannerKind = 'smb1'
             $script:banner.Visible = $true
-            $script:banner.Text = "  SMBv1 DETECTED  -  $($stats.Smb1) SMBv1 packet(s). This dialect is deprecated and insecure."
+            $script:banner.BackColor = $script:C.AlertBg
+            $script:banner.Text = "  SMBv1 DETECTED  -  $($stats.Smb1) SMBv1 packet(s). This dialect is deprecated and insecure.  -  click to list packets"
             if ($stats.Smb1 -gt $script:LastBannerCount -and $script:LastBannerCount -eq 0) {
                 Write-AppLog "First SMBv1 packet observed on the wire." 'WARN'
             }
             $script:LastBannerCount = $stats.Smb1
         } elseif ($stats.SimpleBind -gt 0 -or $stats.Legacy -gt 0 -or $stats.Collapse -gt 0) {
+            $script:BannerKind = 'collapse'
             $script:banner.Visible = $true
             $script:banner.BackColor = $script:C.AlertBg
-            $script:banner.Text = "  PRE-COLLAPSE  -  $($stats.Collapse) leftover(s)  SMBv1 $($stats.Smb1)  simple-bind $($stats.SimpleBind)  NTLM $($stats.Ntlm)  DC-locator $($stats.DcLocator)  SYSVOL $($stats.Sysvol)"
+            $script:banner.Text = "  PRE-COLLAPSE  -  $($stats.Collapse) leftover(s)  SMBv1 $($stats.Smb1)  simple-bind $($stats.SimpleBind)  NTLM $($stats.Ntlm)  DC-locator $($stats.DcLocator)  SYSVOL $($stats.Sysvol)  -  click to list packets"
         } elseif ($stats.Ad -gt 0) {
+            $script:BannerKind = 'ad'
             $script:banner.Visible = $true
             $script:banner.BackColor = $script:C.Blue
-            $script:banner.Text = "  Active Directory traffic  -  LDAP $($stats.Ldap)  Kerberos $($stats.Kerberos)  DNS $($stats.Dns)  RPC $($stats.Rpc)  DC-locator $($stats.DcLocator)"
+            $script:banner.Text = "  Active Directory traffic  -  LDAP $($stats.Ldap)  Kerberos $($stats.Kerberos)  DNS $($stats.Dns)  RPC $($stats.Rpc)  DC-locator $($stats.DcLocator)  -  click to list packets"
+        } else {
+            $script:BannerKind = ''
+            $script:banner.Visible = $false
         }
+        Set-BannerClickHint
     }
 }
 
@@ -3119,6 +3226,7 @@ function Update-CaptureUi {
         Check-SessionTimer
         if ($script:tabMain -and $script:tabMain.SelectedTab -eq $script:tabStats) { Update-StatsTab }
         if ($script:tabMain -and $script:tabMain.SelectedTab -eq $script:tabHosts) { Update-HostsGrid }
+        if ($script:tabMain -and $script:tabFindings -and $script:tabMain.SelectedTab -eq $script:tabFindings) { Update-FindingsGrid }
     } catch {
         Write-AppLog "UI update error: $($_.Exception.Message)" 'ERROR'
     } finally {
@@ -3194,29 +3302,13 @@ function Show-PacketDetails {
     if ($p.IsCollapse) {
         $find = $frame.Nodes.Add('Domain collapse findings (fix before cutover)')
         $find.ForeColor = $script:C.Red
-        if ($p.IsSimpleBind) { [void]$find.Nodes.Add('LDAP simple bind — password may be on the wire. Move this app to Kerberos/SASL/LDAPS.') }
-        if ($p.IsAnonymous) { [void]$find.Nodes.Add('Anonymous LDAP bind — an app is probing this directory without credentials.') }
-        if ($p.IsDcLocator) { [void]$find.Nodes.Add('DC locator DNS/CLDAP — this client still finds this domain via SRV or LDAP ping.') }
-        if ($p.IsSysvol -or $p.IsNetlogonShare) { [void]$find.Nodes.Add('SYSVOL/NETLOGON — logon scripts or GPOs still served from this domain.') }
-        if ($p.IsGpo) { [void]$find.Nodes.Add('Group Policy file (Policies / GPT.INI) — GPOs still applied from this domain.') }
-        if ($p.IsNtlmV1) { [void]$find.Nodes.Add('NTLMv1 — replace with Kerberos/NTLMv2.') }
-        elseif ($p.IsNtlm) { [void]$find.Nodes.Add('NTLM (not Kerberos) — this app will break when the domain is gone; move it to Kerberos or a local account.') }
-        if ($p.IsReplication) { [void]$find.Nodes.Add('AD replication RPC — another DC still talks to this domain.') }
-        if ($p.IsMachine) { [void]$find.Nodes.Add('Machine account (ends with $) — this computer is still domain-joined. Unjoin or migrate it.') }
-        if ($p.IsKdc) { [void]$find.Nodes.Add('Kerberos AS/TGS — this client still gets tickets from this KDC (still a domain member or service).') }
-        if ($p.IsNtp) { [void]$find.Nodes.Add('NTP — this host may still use a DC as its time source. Point clients at a new NTP server.') }
-        if ($p.IsAdws) { [void]$find.Nodes.Add('ADWS (9389) — RSAT / PowerShell AD module still targeting this domain.') }
-        if ($p.IsCldap) { [void]$find.Nodes.Add('CLDAP (UDP 389) — NetLogon LDAP ping; clients still locating this DC.') }
-        if ($p.IsLlmnr) { [void]$find.Nodes.Add('LLMNR — name fallback after DNS/WINS. Disable or expect name-resolution failures.') }
-        if ($p.IsDfs) { [void]$find.Nodes.Add('DFS namespace — domain DFS roots/folders still in use.') }
-        if ($p.IsSamr) { [void]$find.Nodes.Add('SAMR/LSARPC — account lookup from NAS, printers, or apps against this domain.') }
-        if ($p.IsDnsUpdate) { [void]$find.Nodes.Add('DNS dynamic update — a machine is still registering names in this DNS zone.') }
-        if ($p.IsWinRm) { [void]$find.Nodes.Add('WinRM — remoting that typically uses Kerberos to this domain.') }
-        if ($p.IsCert) { [void]$find.Nodes.Add('Certificate enrollment RPC — clients still using this CA/domain for certs.') }
-        if ($p.IsWins) { [void]$find.Nodes.Add('WINS/NetBIOS name service — break WINS and NetBIOS-dependent apps first.') }
-        if ($p.IsKpasswd) { [void]$find.Nodes.Add('Kerberos password change (464) — password changes still go through this KDC.') }
-        if ($p.IsGc) { [void]$find.Nodes.Add('Global Catalog (3268/3269) — forest-wide lookups still hit this domain.') }
-        if ($p.IsSmb1) { [void]$find.Nodes.Add('SMBv1 — remaining NT LM 0.12 client; replace before the file server / DC is retired.') }
+        $findLines = Get-PacketFindingReasons $p
+        foreach ($line in (Get-AppEnumerable $findLines)) {
+            [void]$find.Nodes.Add([string]$line)
+        }
+        if ((Get-AppCount $findLines) -eq 0) {
+            [void]$find.Nodes.Add('Domain leftover — this frame still depends on this domain.')
+        }
     }
 
     $frame.Expand()
@@ -3287,6 +3379,132 @@ function Get-SelectedPacket {
     $idx = $script:lvPackets.SelectedIndices[0]
     if ($idx -lt 0 -or $idx -ge (Get-AppCount $script:ViewPackets)) { return $null }
     return $script:ViewPackets[$idx]
+}
+
+function Select-PacketByNumber {
+    param([int]$Number)
+    if (-not $script:lvPackets) { return $false }
+    $n = Get-AppCount $script:ViewPackets
+    for ($i = 0; $i -lt $n; $i++) {
+        $p = $script:ViewPackets[$i]
+        if ($null -eq $p) { continue }
+        $no = 0
+        try { $no = [int]$p.No } catch { continue }
+        if ($no -eq $Number) {
+            try { $script:lvPackets.SelectedIndices.Clear() } catch { }
+            try { [void]$script:lvPackets.SelectedIndices.Add($i) } catch { }
+            try { $script:lvPackets.EnsureVisible($i) } catch { }
+            Show-PacketDetails $p
+            return $true
+        }
+    }
+    return $false
+}
+
+function Set-BannerClickHint {
+    if (-not $script:banner) { return }
+    try { $script:banner.Cursor = [System.Windows.Forms.Cursors]::Hand } catch { }
+    $kind = $script:BannerKind
+    $msg = 'Click to list the packets this alert is about on the Findings tab. Double-click a row to open it on Packets.'
+    if ($kind -eq 'smb1') {
+        $msg = 'Click to list every SMBv1 packet this red banner is alerting about.'
+    } elseif ($kind -eq 'collapse') {
+        $msg = 'Click to list every pre-collapse leftover packet this red banner is alerting about.'
+    } elseif ($kind -eq 'ad') {
+        $msg = 'Click to list Active Directory packets this banner is reporting.'
+    }
+    if ($script:Tip) {
+        try { $script:Tip.SetToolTip($script:banner, $msg) } catch { }
+    }
+}
+
+function Update-FindingsGrid {
+    param([switch]$Force)
+    if (-not $script:dgvFindings) { return }
+    $kind = Get-ActiveBannerKind
+    $count = Get-AppCount $script:AllPackets
+    if (-not $Force -and $count -eq $script:LastFindingsCount -and $kind -eq $script:LastFindingsKind) {
+        return
+    }
+    $script:LastFindingsCount = $count
+    $script:LastFindingsKind = $kind
+    $selNo = $null
+    try {
+        if ($script:dgvFindings.SelectedRows.Count -gt 0) {
+            $selNo = [string]$script:dgvFindings.SelectedRows[0].Cells['No'].Value
+        }
+    } catch { }
+    try { $script:dgvFindings.SuspendLayout() } catch { }
+    try {
+        $script:dgvFindings.Rows.Clear()
+        $n = 0
+        foreach ($p in (Get-AppEnumerable $script:AllPackets)) {
+            if (-not (Test-BannerPacket $p $kind)) { continue }
+            $timeText = ''
+            try { $timeText = $p.Time.ToString('HH:mm:ss.fff') } catch { }
+            $finding = Get-PacketFindingSummary $p
+            $infoText = ''
+            try { $infoText = [string]$p.Info } catch { }
+            $idx = $script:dgvFindings.Rows.Add(
+                [string]$p.No,
+                $timeText,
+                [string]$p.Src,
+                [string]$p.SrcPort,
+                [string]$p.Dst,
+                [string]$p.DstPort,
+                [string]$p.Protocol,
+                $finding,
+                $infoText
+            )
+            try { $script:dgvFindings.Rows[$idx].DefaultCellStyle.BackColor = Get-PacketRowColor $p } catch { }
+            if ($selNo -and ([string]$p.No -eq $selNo)) {
+                try { $script:dgvFindings.Rows[$idx].Selected = $true } catch { }
+            }
+            $n++
+        }
+        if ($script:lblFindingsCount) {
+            $label = 'pre-collapse leftover packet(s)'
+            if ($kind -eq 'smb1') { $label = 'SMBv1 packet(s)' }
+            elseif ($kind -eq 'ad') { $label = 'Active Directory packet(s)' }
+            $script:lblFindingsCount.Text = ('{0} {1}  —  double-click a row to open it on Packets' -f $n, $label)
+        }
+    } catch {
+        Write-AppLog ("Findings list error: {0}" -f $_.Exception.Message) 'ERROR'
+    } finally {
+        try { $script:dgvFindings.ResumeLayout() } catch { }
+    }
+}
+
+function Show-SelectedFindingPacket {
+    if (-not $script:dgvFindings -or $script:dgvFindings.SelectedRows.Count -eq 0) { return }
+    $n = 0
+    try {
+        $raw = [string]$script:dgvFindings.SelectedRows[0].Cells['No'].Value
+        if (-not [int]::TryParse($raw, [ref]$n)) { return }
+    } catch { return }
+    $kind = Get-ActiveBannerKind
+    $filter = Get-BannerFilterText $kind
+    if ($script:tabCapture) { $script:tabMain.SelectedTab = $script:tabCapture }
+    Set-DisplayFilter -Text $filter
+    if (-not (Select-PacketByNumber $n)) {
+        Set-DisplayFilter -Text ''
+        [void](Select-PacketByNumber $n)
+    }
+}
+
+function Show-BannerAlertPackets {
+    $kind = Get-ActiveBannerKind
+    $filter = Get-BannerFilterText $kind
+    Set-DisplayFilter -Text $filter
+    Update-FindingsGrid -Force
+    if ($script:tabFindings) {
+        $script:tabMain.SelectedTab = $script:tabFindings
+    } elseif ($script:tabCapture) {
+        $script:tabMain.SelectedTab = $script:tabCapture
+    }
+    $n = 0
+    try { $n = $script:dgvFindings.Rows.Count } catch { }
+    Write-AppLog ("Banner click: listing {0} {1} packet(s) (filter {2})." -f $n, $kind, $filter) 'INFO'
 }
 
 function Enable-RawCaptureFirewall {
@@ -3446,6 +3664,9 @@ function Clear-Capture {
         $script:Smb1CommandHist.Clear()
         $script:NextNo = 1
         $script:LastBannerCount = 0
+        $script:BannerKind = ''
+        $script:LastFindingsCount = -1
+        $script:LastFindingsKind = ''
         if ($script:banner) { $script:banner.Visible = $false }
         if ($script:lvPackets) {
             try { $script:lvPackets.VirtualListSize = 0 } catch { }
@@ -3459,6 +3680,12 @@ function Clear-Capture {
     try { $script:tvDetails.Nodes.Clear() } catch { }
     try { $script:hexBox.Clear() } catch { }
     try { $script:dgvHosts.Rows.Clear() } catch { }
+    try { if ($script:dgvFindings) { $script:dgvFindings.Rows.Clear() } } catch { }
+    try {
+        if ($script:lblFindingsCount) {
+            $script:lblFindingsCount.Text = 'No leftover packets yet. Click the red PRE-COLLAPSE banner after traffic arrives.'
+        }
+    } catch { }
     Update-StatusBar
     Write-AppLog 'Packet list cleared.' 'INFO'
 }
@@ -3470,9 +3697,10 @@ function Import-DemoCapture {
     Update-HostsGrid
     Update-StatsTab
     Update-StatusBar
+    Update-FindingsGrid -Force
     Write-AppLog "Loaded $($demo.Length) synthetic demo packets (SMB, LDAP, Kerberos, DNS, NFS)." 'INFO'
     [void][System.Windows.Forms.MessageBox]::Show(
-        "Loaded $($demo.Length) synthetic packets.`n`nPurple = LDAP, orange = Kerberos, teal = DNS, red = legacy SMB, blue = SMB2+.`nTry display filters: ad, collapse, machine, fileshare.",
+        "Loaded $($demo.Length) synthetic packets.`n`nPurple = LDAP, orange = Kerberos, teal = DNS, red = legacy SMB, blue = SMB2+.`nClick the red banner (SMBv1 / PRE-COLLAPSE) to list leftover packets on Findings, or try display filters: ad, collapse, machine, fileshare.",
         'Demo Capture Loaded',
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Information)
@@ -3497,6 +3725,7 @@ function Import-PcapPath {
         Update-HostsGrid
         Update-StatsTab
         Update-StatusBar
+        Update-FindingsGrid -Force
         Write-AppLog "Opened $Path ($($pkts.Length) IPv4/TCP frames parsed)." 'INFO'
     } catch {
         Write-AppLog "PCAP open failed: $($_.Exception.Message)" 'ERROR'
@@ -4143,14 +4372,8 @@ function Show-GotoPacket {
     if ($inputBox.ShowDialog($script:MainForm) -eq [System.Windows.Forms.DialogResult]::OK) {
         $n = 0
         if ([int]::TryParse($tb.Text, [ref]$n)) {
-            for ($i = 0; $i -lt (Get-AppCount $script:ViewPackets); $i++) {
-                if ($script:ViewPackets[$i].No -eq $n) {
-                    $script:lvPackets.SelectedIndices.Clear()
-                    $script:lvPackets.SelectedIndices.Add($i)
-                    $script:lvPackets.EnsureVisible($i)
-                    Show-PacketDetails $script:ViewPackets[$i]
-                    return
-                }
+            if (-not (Select-PacketByNumber $n)) {
+                $script:lblStatusMini.Text = ("Go to packet {0}: not in the current view" -f $n)
             }
         }
     }
@@ -4173,6 +4396,9 @@ HOW TO RUN
   4. Pick the IPv4 address of the interface that faces clients / DCs.
   5. Capture dropdown: All traffic (default), Active Directory, File shares, or Domain collapse.
   6. Click Start. Use display filters (collapse, machine, gpo, dclocator, ad, ldap).
+  7. When the red PRE-COLLAPSE (or SMBv1) banner appears, click it. The Findings
+     tab lists every leftover packet the alert is about. Double-click a row to
+     jump to that frame on the Packets tab.
 
 SESSION TIMER AND SAVE ALL
   CLOSE AFTER (toolbar): pick 5 minutes / 15 minutes / 1 hour, or type a number
@@ -4223,6 +4449,7 @@ BEFORE A DOMAIN COLLAPSE
     kpasswd        Kerberos password-change (464)
     smb1           remaining NT LM 0.12 clients
   Talkers tab -> Show: Domain collapse lists the IPs to chase.
+  Click the red PRE-COLLAPSE header to open Findings (leftover packets + why).
   Packet details show FINDING lines for each leftover.
 
 DISPLAY FILTERS
@@ -4735,6 +4962,9 @@ $script:banner.ForeColor = $script:C.White
 $script:banner.Font = New-Object System.Drawing.Font('Segoe UI', 9.5, [System.Drawing.FontStyle]::Bold)
 $script:banner.TextAlign = 'MiddleLeft'
 $script:banner.Visible = $false
+try { $script:banner.Cursor = [System.Windows.Forms.Cursors]::Hand } catch { }
+$script:Tip.SetToolTip($script:banner, 'Click to list the packets this alert is about on the Findings tab.')
+$script:banner.Add_Click({ Show-BannerAlertPackets })
 
 # --- Admin hint ---
 $script:adminHint = New-Object System.Windows.Forms.Label
@@ -4756,6 +4986,10 @@ try { $script:tabMain.Appearance = [System.Windows.Forms.TabAppearance]::FlatBut
 $script:tabCapture = New-Object System.Windows.Forms.TabPage
 $script:tabCapture.Text = '  Packets  '
 $script:tabCapture.BackColor = $script:C.Bg
+
+$script:tabFindings = New-Object System.Windows.Forms.TabPage
+$script:tabFindings.Text = '  Findings  '
+$script:tabFindings.BackColor = $script:C.Bg
 
 $script:tabHosts = New-Object System.Windows.Forms.TabPage
 $script:tabHosts.Text = '  Talkers  '
@@ -4781,7 +5015,12 @@ $script:tabLog = New-Object System.Windows.Forms.TabPage
 $script:tabLog.Text = '  Log  '
 $script:tabLog.BackColor = $script:C.Bg
 
-[void]$script:tabMain.TabPages.AddRange(@($script:tabCapture, $script:tabHosts, $script:tabStats, $script:tabConfig, $script:tabEvents, $script:tabHelp, $script:tabLog))
+[void]$script:tabMain.TabPages.AddRange(@($script:tabCapture, $script:tabFindings, $script:tabHosts, $script:tabStats, $script:tabConfig, $script:tabEvents, $script:tabHelp, $script:tabLog))
+$script:tabMain.Add_SelectedIndexChanged({
+    if ($script:tabMain.SelectedTab -eq $script:tabFindings) { Update-FindingsGrid }
+    elseif ($script:tabMain.SelectedTab -eq $script:tabStats) { Update-StatsTab }
+    elseif ($script:tabMain.SelectedTab -eq $script:tabHosts) { Update-HostsGrid }
+})
 
 # --- Capture tab: 3-pane Wireshark layout ---
 $splitH = New-Object System.Windows.Forms.SplitContainer
@@ -4875,6 +5114,10 @@ $mFs = $ctx.Items.Add('Display filter: fileshare')
 $mFs.add_Click({ Set-DisplayFilter -Text 'fileshare' })
 $mSmb1 = $ctx.Items.Add('Display filter: smb1')
 $mSmb1.add_Click({ Set-DisplayFilter -Text 'smb1' })
+$mCol = $ctx.Items.Add('Display filter: collapse')
+$mCol.add_Click({ Set-DisplayFilter -Text 'collapse' })
+$mFind = $ctx.Items.Add('Show banner findings')
+$mFind.add_Click({ Show-BannerAlertPackets })
 [void]$ctx.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 $mMark = $ctx.Items.Add('Mark / unmark (Space)')
 $mMark.add_Click({ Toggle-MarkSelected })
@@ -4923,6 +5166,55 @@ $script:tabCapture.Controls.Add($splitH)
 $splitH.Add_SplitterMoved({ Remember-SplitterRatios })
 $splitV.Add_SplitterMoved({ Remember-SplitterRatios })
 $script:lvPackets.Add_Resize({ Update-PacketListColumns })
+
+# --- Findings tab (packets the red PRE-COLLAPSE / SMBv1 banner is alerting about) ---
+$findTop = New-FlowBar -MinHeight 44
+$script:lblFindingsCount = New-Object System.Windows.Forms.Label
+$script:lblFindingsCount.Text = 'No leftover packets yet. Click the red PRE-COLLAPSE banner after traffic arrives.'
+$script:lblFindingsCount.AutoSize = $true
+$script:lblFindingsCount.Margin = New-Object System.Windows.Forms.Padding(8, 10, 12, 4)
+$btnFindRefresh = New-FlatButton -Text 'Refresh' -Width 90 -BackColor $script:C.Blue -OnClick { Update-FindingsGrid -Force } -TipText 'Rebuild the leftover list from the capture buffer'
+$btnFindPackets = New-FlatButton -Text 'Open on Packets' -Width 150 -BackColor $script:C.Teal -OnClick { Show-SelectedFindingPacket } -TipText 'Jump to the selected leftover on the Packets tab'
+$btnFindBanner = New-FlatButton -Text 'Filter Packets' -Width 130 -BackColor $script:C.Dark -OnClick {
+    $kind = Get-ActiveBannerKind
+    $script:tabMain.SelectedTab = $script:tabCapture
+    Set-DisplayFilter -Text (Get-BannerFilterText $kind)
+} -TipText 'Show the same leftover packets on the Packets tab'
+$findTop.Controls.AddRange(@($script:lblFindingsCount, $btnFindRefresh, $btnFindPackets, $btnFindBanner))
+
+$script:dgvFindings = New-Object System.Windows.Forms.DataGridView
+$script:dgvFindings.Dock = 'Fill'
+$script:dgvFindings.AllowUserToAddRows = $false
+$script:dgvFindings.AllowUserToDeleteRows = $false
+$script:dgvFindings.ReadOnly = $true
+$script:dgvFindings.SelectionMode = 'FullRowSelect'
+$script:dgvFindings.MultiSelect = $false
+$script:dgvFindings.AutoSizeColumnsMode = 'Fill'
+$script:dgvFindings.BackgroundColor = $script:C.White
+$script:dgvFindings.BorderStyle = 'None'
+$script:dgvFindings.EnableHeadersVisualStyles = $false
+$script:dgvFindings.ColumnHeadersDefaultCellStyle.BackColor = $script:C.Header
+$script:dgvFindings.ColumnHeadersDefaultCellStyle.ForeColor = $script:C.White
+$script:dgvFindings.ColumnHeadersDefaultCellStyle.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+$script:dgvFindings.ColumnHeadersHeight = 30
+$script:dgvFindings.RowTemplate.Height = 26
+$script:dgvFindings.AlternatingRowsDefaultCellStyle.BackColor = $script:C.AltRow
+$script:dgvFindings.Font = New-Object System.Drawing.Font('Consolas', 9)
+foreach ($col in @('No','Time','Source','SrcPort','Destination','DstPort','Protocol','Finding','Info')) {
+    [void]$script:dgvFindings.Columns.Add($col, $col)
+}
+try { $script:dgvFindings.Columns['Finding'].FillWeight = 40 } catch { }
+try { $script:dgvFindings.Columns['Info'].FillWeight = 28 } catch { }
+$script:dgvFindings.Add_CellDoubleClick({ Show-SelectedFindingPacket })
+$script:dgvFindings.Add_KeyDown({
+    param($s, $e)
+    if ($e.KeyCode -eq 'Enter') {
+        $e.SuppressKeyPress = $true
+        Show-SelectedFindingPacket
+    }
+})
+$script:tabFindings.Controls.Add($script:dgvFindings)
+$script:tabFindings.Controls.Add($findTop)
 
 # --- Hosts tab ---
 $hostTop = New-FlowBar -MinHeight 44
@@ -5128,11 +5420,13 @@ Add-MenuAction $capM.DropDownItems 'Clear' { Clear-Capture }
 $navM = New-Object System.Windows.Forms.ToolStripMenuItem('Go')
 Add-MenuAction $navM.DropDownItems 'Go to packet...' { Show-GotoPacket }
 Add-MenuAction $navM.DropDownItems 'Follow stream' { Use-FollowStream }
+Add-MenuAction $navM.DropDownItems 'Open Findings tab' { $script:tabMain.SelectedTab = $script:tabFindings; Update-FindingsGrid -Force }
+Add-MenuAction $navM.DropDownItems 'Show banner packets' { Show-BannerAlertPackets }
 $helpM = New-Object System.Windows.Forms.ToolStripMenuItem('Help')
 Add-MenuAction $helpM.DropDownItems 'Open Help tab' { $script:tabMain.SelectedTab = $script:tabHelp }
 Add-MenuAction $helpM.DropDownItems 'About' {
     [void][System.Windows.Forms.MessageBox]::Show(
-        "PowerShark v$($script:AppVersion)`nWindows Server 2008 / 2008 R2 (PowerShell 2.0) through PowerShell 7+`nCurrently running: $($PSVersionTable.PSVersion) ($(Get-HostEdition))`n`nLive IPv4 capture for Active Directory, file shares, and domain collapse.`nUse CLOSE AFTER to keep the app open, then auto-save the full capture to the Desktop and exit.`nSave all writes every buffered packet (not just the filtered view).`nRaw IPv4 socket — no Npcap. PCAPs open in Wireshark.",
+        "PowerShark v$($script:AppVersion)`nWindows Server 2008 / 2008 R2 (PowerShell 2.0) through PowerShell 7+`nCurrently running: $($PSVersionTable.PSVersion) ($(Get-HostEdition))`n`nLive IPv4 capture for Active Directory, file shares, and domain collapse.`nClick the red PRE-COLLAPSE banner to list leftover packets on Findings.`nUse CLOSE AFTER to keep the app open, then auto-save the full capture to the Desktop and exit.`nSave all writes every buffered packet (not just the filtered view).`nRaw IPv4 socket — no Npcap. PCAPs open in Wireshark.",
         'About PowerShark',
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Information)
