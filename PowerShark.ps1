@@ -64,6 +64,7 @@
     .\PowerShark.ps1 -AutoCloseMinutes 60
 
 .NOTES
+    Author      : Anthony Blake
     Version     : 1.3
     Compatible  : Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012
                   (PowerShell 3.0), 2012 R2 (PowerShell 4.0), 5.1, and PowerShell 7+.
@@ -86,6 +87,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $script:AppVersion = '1.3'
+$script:AppAuthor  = 'Anthony Blake'
 
 # Version is checked at runtime on purpose. Do not add "#Requires -Version".
 # Server 2008 / 2008 R2 is PowerShell 2.0. Server 2012 R2 is 4.0.
@@ -2488,6 +2490,7 @@ function Invoke-SmbAnalyzerSelfTest {
     $saveName = Get-CaptureSavePath -Directory $desk
     if ($saveName -notmatch 'PowerShark-.*\.pcap$') { [void]$failures.Add("Get-CaptureSavePath name: $saveName") }
     if ((Get-SaveFormat 'CSV') -ne 'csv') { [void]$failures.Add('Get-SaveFormat CSV') }
+    if ($script:AppAuthor -ne 'Anthony Blake') { [void]$failures.Add("AppAuthor=$($script:AppAuthor)") }
     if ((Get-SaveFormat 'pcap') -ne 'pcap') { [void]$failures.Add('Get-SaveFormat pcap') }
     if ((Get-SaveFormat -Path 'C:\tmp\out.csv') -ne 'csv') { [void]$failures.Add('Get-SaveFormat path csv') }
     $csvName = Get-CaptureSavePath -Directory $desk -Format 'csv'
@@ -4700,15 +4703,39 @@ $lblSub.AutoSize = $true
 $lblSub.Location = New-Object System.Drawing.Point(20, 52)
 $leftHead.Controls.AddRange(@($lblTitle, $lblSub))
 
+$rightHead = New-Object System.Windows.Forms.TableLayoutPanel
+$rightHead.AutoSize = $true
+$rightHead.ColumnCount = 1
+$rightHead.RowCount = 2
+$rightHead.BackColor = $script:C.Header
+$rightHead.Margin = New-Object System.Windows.Forms.Padding(8, 14, 16, 8)
+[void]$rightHead.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$rightHead.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$rightHead.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+
+$lblAuthor = New-Object System.Windows.Forms.Label
+$lblAuthor.Text = $script:AppAuthor
+$lblAuthor.Font = New-Object System.Drawing.Font('Segoe UI', 11)
+$lblAuthor.ForeColor = $script:C.White
+$lblAuthor.AutoSize = $true
+$lblAuthor.TextAlign = 'MiddleRight'
+$lblAuthor.Dock = 'Fill'
+$lblAuthor.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 0)
+$script:Tip.SetToolTip($lblAuthor, 'Author')
+
 $lblVer = New-Object System.Windows.Forms.Label
 $lblVer.Text = "v$($script:AppVersion)"
-$lblVer.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+$lblVer.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 $lblVer.ForeColor = $script:C.SubText
 $lblVer.AutoSize = $true
 $lblVer.TextAlign = 'MiddleRight'
-$lblVer.Margin = New-Object System.Windows.Forms.Padding(8, 28, 20, 0)
+$lblVer.Dock = 'Fill'
+$lblVer.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 0)
+
+$rightHead.Controls.Add($lblAuthor, 0, 0)
+$rightHead.Controls.Add($lblVer, 0, 1)
 $header.Controls.Add($leftHead, 0, 0)
-$header.Controls.Add($lblVer, 1, 0)
+$header.Controls.Add($rightHead, 1, 0)
 
 $accentBar = New-Object System.Windows.Forms.Panel
 $accentBar.Dock = 'Top'
@@ -5468,7 +5495,7 @@ $helpM = New-Object System.Windows.Forms.ToolStripMenuItem('Help')
 Add-MenuAction $helpM.DropDownItems 'Open Help tab' { $script:tabMain.SelectedTab = $script:tabHelp }
 Add-MenuAction $helpM.DropDownItems 'About' {
     [void][System.Windows.Forms.MessageBox]::Show(
-        "PowerShark v$($script:AppVersion)`nWindows Server 2008 / 2008 R2 (PowerShell 2.0) through PowerShell 7+`nCurrently running: $($PSVersionTable.PSVersion) ($(Get-HostEdition))`n`nLive IPv4 capture for Active Directory, file shares, and domain collapse.`nClick the red PRE-COLLAPSE banner to list leftover packets on Findings.`nUse CLOSE AFTER to keep the app open, then auto-save the full capture to the Desktop and exit.`nSave all writes every buffered packet (not just the filtered view).`nRaw IPv4 socket — no Npcap. PCAPs open in Wireshark.",
+        "PowerShark v$($script:AppVersion)`nAuthor: $($script:AppAuthor)`nWindows Server 2008 / 2008 R2 (PowerShell 2.0) through PowerShell 7+`nCurrently running: $($PSVersionTable.PSVersion) ($(Get-HostEdition))`n`nLive IPv4 capture for Active Directory, file shares, and domain collapse.`nClick the red PRE-COLLAPSE banner to list leftover packets on Findings.`nUse CLOSE AFTER to keep the app open, then auto-save the full capture to the Desktop and exit.`nSave all writes every buffered packet (not just the filtered view).`nRaw IPv4 socket — no Npcap. PCAPs open in Wireshark.",
         'About PowerShark',
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Information)
