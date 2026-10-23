@@ -15,6 +15,7 @@
 
     Capture filter dropdown: All traffic, Active Directory, File shares, SMB, LDAP,
     Kerberos, DNS, RPC, NFS, Domain collapse. Display filters work on the current view.
+    Click the red PRE-COLLAPSE (or SMBv1) banner to list leftover packets on Findings.
 
     Designed for Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012 / 2012 R2,
     and PowerShell 7 on Windows. Live capture needs an elevated Administrator session.
@@ -45,14 +46,26 @@
 .PARAMETER InterfaceIP
     Optional IPv4 address of the capture interface to pre-select.
 
+.PARAMETER AutoCloseMinutes
+    Optional unattended session length. After this many minutes the app saves
+    the entire capture to the Desktop and closes. 0 (default) leaves it open.
+
+.PARAMETER AutoSaveFormat
+    pcap (default) or csv. Used by CLOSE AFTER / -AutoCloseMinutes and as the
+    default for Save all / Save view dialogs.
+
 .EXAMPLE
     powershell.exe -ExecutionPolicy Bypass -STA -File .\PowerShark.ps1
 
 .EXAMPLE
     .\PowerShark.ps1 -SelfTest
 
+.EXAMPLE
+    .\PowerShark.ps1 -AutoCloseMinutes 60
+
 .NOTES
-    Version     : 1.1
+    Author      : Anthony Blake
+    Version     : 1.3
     Compatible  : Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012
                   (PowerShell 3.0), 2012 R2 (PowerShell 4.0), 5.1, and PowerShell 7+.
                   There is no Requires-Version directive. Do not use -shl/-shr
@@ -66,12 +79,15 @@
 param(
     [switch]$SelfTest,
     [string]$OpenPcap,
-    [string]$InterfaceIP
+    [string]$InterfaceIP,
+    [int]$AutoCloseMinutes = 0,
+    [string]$AutoSaveFormat = 'pcap'
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.1'
+$script:AppVersion = '1.3'
+$script:AppAuthor  = 'Anthony Blake'
 
 # Version is checked at runtime on purpose. Do not add "#Requires -Version".
 # Server 2008 / 2008 R2 is PowerShell 2.0. Server 2012 R2 is 4.0.
@@ -96,6 +112,189 @@ function Test-BlankString {
     $s = [string]$Value
     if ($s.Length -eq 0) { return $true }
     return ($s.Trim().Length -eq 0)
+}
+
+function Get-SessionMinutes {
+    param($Value)
+    if (Test-BlankString $Value) { return 0 }
+    $t = ([string]$Value).Trim()
+    if ($t -match '^(?i)(off|none|never)$') { return 0 }
+    if ($t -match '(?i)^(\d+)\s*h') { return ([int]$Matches[1] * 60) }
+    if ($t -match '(?i)^(\d+)\s*m') { return [int]$Matches[1] }
+    $n = 0
+    if ([int]::TryParse($t, [ref]$n)) {
+        if ($n -lt 0) { return 0 }
+        if ($n -gt 10080) { return 10080 }
+        return $n
+    }
+    return 0
+}
+
+function Get-DesktopDirectory {
+    $d = $null
+    try { $d = [Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop) } catch { }
+    if (Test-BlankString $d) {
+        try { $d = [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory) } catch { }
+    }
+    $homeDir = $null
+    if (-not (Test-BlankString $env:USERPROFILE)) { $homeDir = [string]$env:USERPROFILE }
+    elseif (-not (Test-BlankString $env:HOME)) { $homeDir = [string]$env:HOME }
+    if ((Test-BlankString $d) -and -not (Test-BlankString $homeDir)) {
+        $d = Join-Path $homeDir 'Desktop'
+    }
+    if (Test-BlankString $d) {
+        try { $d = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments) } catch { }
+    }
+    if (Test-BlankString $d) { $d = [System.IO.Path]::GetTempPath() }
+    if (Test-BlankString $d) { $d = '.' }
+    return $d
+}
+
+function Get-SaveFormat {
+    param($Value, [string]$Path)
+    if (-not (Test-BlankString $Path)) {
+        $p = $Path.ToLowerInvariant()
+        if ($p.EndsWith('.csv')) { return 'csv' }
+        if ($p.EndsWith('.pcap') -or $p.EndsWith('.cap')) { return 'pcap' }
+    }
+    if (Test-BlankString $Value) { return 'pcap' }
+    $t = ([string]$Value).Trim().ToLowerInvariant()
+    if ($t -eq 'csv' -or $t.StartsWith('csv')) { return 'csv' }
+    return 'pcap'
+}
+
+function Get-PacketServiceName {
+    param($Packet)
+    if ($null -eq $Packet) { return 'Unknown' }
+    $proto = [string]$Packet.Protocol
+    if ($proto -eq 'KRB5') { return 'Kerberos' }
+    if ($proto -eq 'RPC' -and -not (Test-BlankString $Packet.QueryName)) {
+        return ('RPC-{0}' -f $Packet.QueryName)
+    }
+    if (-not (Test-BlankString $proto) -and $proto -ne 'TCP' -and $proto -ne 'UDP' -and $proto -ne 'IP') {
+        return $proto
+    }
+    if ($Packet.IsSmb1) { return 'SMBv1' }
+    if ($Packet.IsSmb3) { return 'SMBv3' }
+    if ($Packet.IsSmb2) { return 'SMBv2' }
+    if ($Packet.HasSmb) { return 'SMB' }
+    if ($Packet.IsCldap) { return 'CLDAP' }
+    if ($Packet.IsLdaps) { return 'LDAPS' }
+    if ($Packet.IsGc -and $Packet.IsLdap) { return 'LDAP-GC' }
+    if ($Packet.IsLdap) { return 'LDAP' }
+    if ($Packet.IsKerberos) { return 'Kerberos' }
+    if ($Packet.IsDns) { return 'DNS' }
+    if ($Packet.IsNfs) { return 'NFS' }
+    if ($Packet.IsRpc -and -not (Test-BlankString $Packet.QueryName)) {
+        return ('RPC-{0}' -f $Packet.QueryName)
+    }
+    if ($Packet.IsRpc) { return 'RPC' }
+    if ($Packet.IsNtp) { return 'NTP' }
+    if ($Packet.IsAdws) { return 'ADWS' }
+    if ($Packet.IsLlmnr) { return 'LLMNR' }
+    if ($Packet.IsWinRm) { return 'WinRM' }
+    if ($Packet.IsWins) { return 'NBNS' }
+    $a = 0; $b = 0
+    try { $a = [int]$Packet.SrcPort } catch { }
+    try { $b = [int]$Packet.DstPort } catch { }
+    foreach ($port in @($a, $b)) {
+        if ($port -eq 53) { return 'DNS' }
+        if ($port -eq 88 -or $port -eq 464) { return 'Kerberos' }
+        if ($port -eq 389) {
+            if ($Packet.IsUdp) { return 'CLDAP' }
+            return 'LDAP'
+        }
+        if ($port -eq 636) { return 'LDAPS' }
+        if ($port -eq 3268) { return 'LDAP-GC' }
+        if ($port -eq 3269) { return 'LDAPS-GC' }
+        if ($port -eq 135) { return 'RPC' }
+        if (-not $Packet.IsUdp -and ($port -eq 445 -or $port -eq 139)) { return 'SMB' }
+        if ($port -eq 2049) { return 'NFS' }
+        if ($port -eq 111) { return 'Portmap' }
+        if ($port -eq 123) { return 'NTP' }
+        if ($port -eq 9389) { return 'ADWS' }
+        if ($port -eq 5722) { return 'DFSR' }
+        if ($port -eq 5985 -or $port -eq 5986) { return 'WinRM' }
+        if ($port -eq 5355) { return 'LLMNR' }
+        if ($port -eq 137) { return 'NBNS' }
+        if ($port -eq 138) { return 'NBDS' }
+        if ($port -eq 42) { return 'WINS' }
+    }
+    if (Test-BlankString $proto) { return 'Unknown' }
+    return $proto
+}
+
+function Get-PacketFindingReasons {
+    param($Packet)
+    $list = New-Object System.Collections.ArrayList
+    if ($null -eq $Packet) { return $list }
+    if ($Packet.IsSimpleBind) { [void]$list.Add('LDAP simple bind — password may be on the wire. Move this app to Kerberos/SASL/LDAPS.') }
+    if ($Packet.IsAnonymous) { [void]$list.Add('Anonymous LDAP bind — an app is probing this directory without credentials.') }
+    if ($Packet.IsDcLocator) { [void]$list.Add('DC locator DNS/CLDAP — this client still finds this domain via SRV or LDAP ping.') }
+    if ($Packet.IsSysvol -or $Packet.IsNetlogonShare) { [void]$list.Add('SYSVOL/NETLOGON — logon scripts or GPOs still served from this domain.') }
+    if ($Packet.IsGpo) { [void]$list.Add('Group Policy file (Policies / GPT.INI) — GPOs still applied from this domain.') }
+    if ($Packet.IsNtlmV1) { [void]$list.Add('NTLMv1 — replace with Kerberos/NTLMv2.') }
+    elseif ($Packet.IsNtlm) { [void]$list.Add('NTLM (not Kerberos) — this app will break when the domain is gone; move it to Kerberos or a local account.') }
+    if ($Packet.IsReplication) { [void]$list.Add('AD replication RPC — another DC still talks to this domain.') }
+    if ($Packet.IsMachine) { [void]$list.Add('Machine account (ends with $) — this computer is still domain-joined. Unjoin or migrate it.') }
+    if ($Packet.IsKdc) { [void]$list.Add('Kerberos AS/TGS — this client still gets tickets from this KDC (still a domain member or service).') }
+    if ($Packet.IsNtp) { [void]$list.Add('NTP — this host may still use a DC as its time source. Point clients at a new NTP server.') }
+    if ($Packet.IsAdws) { [void]$list.Add('ADWS (9389) — RSAT / PowerShell AD module still targeting this domain.') }
+    if ($Packet.IsCldap) { [void]$list.Add('CLDAP (UDP 389) — NetLogon LDAP ping; clients still locating this DC.') }
+    if ($Packet.IsLlmnr) { [void]$list.Add('LLMNR — name fallback after DNS/WINS. Disable or expect name-resolution failures.') }
+    if ($Packet.IsDfs) { [void]$list.Add('DFS namespace — domain DFS roots/folders still in use.') }
+    if ($Packet.IsSamr) { [void]$list.Add('SAMR/LSARPC — account lookup from NAS, printers, or apps against this domain.') }
+    if ($Packet.IsDnsUpdate) { [void]$list.Add('DNS dynamic update — a machine is still registering names in this DNS zone.') }
+    if ($Packet.IsWinRm) { [void]$list.Add('WinRM — remoting that typically uses Kerberos to this domain.') }
+    if ($Packet.IsCert) { [void]$list.Add('Certificate enrollment RPC — clients still using this CA/domain for certs.') }
+    if ($Packet.IsWins) { [void]$list.Add('WINS/NetBIOS name service — break WINS and NetBIOS-dependent apps first.') }
+    if ($Packet.IsKpasswd) { [void]$list.Add('Kerberos password change (464) — password changes still go through this KDC.') }
+    if ($Packet.IsGc) { [void]$list.Add('Global Catalog (3268/3269) — forest-wide lookups still hit this domain.') }
+    if ($Packet.IsSmb1) { [void]$list.Add('SMBv1 — remaining NT LM 0.12 client; replace before the file server / DC is retired.') }
+    return $list
+}
+
+function Get-PacketFindingSummary {
+    param($Packet)
+    if ($null -eq $Packet) { return '' }
+    $reasons = Get-PacketFindingReasons $Packet
+    if ((Get-AppCount $reasons) -eq 0) {
+        if ($Packet.IsCollapse) { return 'Domain leftover' }
+        if ($Packet.IsSmb1) { return 'SMBv1' }
+        if ($Packet.IsAd) { return 'Active Directory' }
+        return ''
+    }
+    return (Join-AppStrings -Values $reasons -Separator '; ')
+}
+
+function Get-BannerFilterText {
+    param([string]$Kind)
+    if ($Kind -eq 'smb1') { return 'smb1' }
+    if ($Kind -eq 'ad') { return 'ad' }
+    return 'collapse'
+}
+
+function Test-BannerPacket {
+    param($Packet, [string]$Kind)
+    if ($null -eq $Packet) { return $false }
+    if ($Kind -eq 'smb1') { return [bool]$Packet.IsSmb1 }
+    if ($Kind -eq 'ad') { return [bool]$Packet.IsAd }
+    return [bool]$Packet.IsCollapse
+}
+
+function Get-ActiveBannerKind {
+    if (-not (Test-BlankString $script:BannerKind)) { return $script:BannerKind }
+    return 'collapse'
+}
+
+function Get-CaptureSavePath {
+    param([string]$Directory, [string]$Prefix = 'PowerShark', [string]$Format = 'pcap')
+    if (Test-BlankString $Directory) { $Directory = Get-DesktopDirectory }
+    $fmt = Get-SaveFormat $Format
+    $ext = 'pcap'
+    if ($fmt -eq 'csv') { $ext = 'csv' }
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    return (Join-Path $Directory ("{0}-{1}.{2}" -f $Prefix, $stamp, $ext))
 }
 
 $script:OwnPath = $null
@@ -894,6 +1093,43 @@ public static class PowerSharkParser {
         else if (p.IsFileShare) p.Family = "FileShare";
         else p.Family = "Other";
         MarkCollapseFindings(p);
+        ApplyWellKnownProtocol(p);
+    }
+
+    static string WellKnownService(PowerSharkPacket p) {
+        int a = p.SrcPort, b = p.DstPort;
+        if (PortIs(a, b, 53)) return "DNS";
+        if (PortIs(a, b, 88) || PortIs(a, b, 464)) return "Kerberos";
+        if (PortIs(a, b, 389)) return p.IsUdp ? "CLDAP" : "LDAP";
+        if (PortIs(a, b, 636)) return "LDAPS";
+        if (PortIs(a, b, 3268)) return "LDAP-GC";
+        if (PortIs(a, b, 3269)) return "LDAPS-GC";
+        if (PortIs(a, b, 135)) return "RPC";
+        if (!p.IsUdp && (PortIs(a, b, 445) || PortIs(a, b, 139))) return "SMB";
+        if (PortIs(a, b, 2049)) return "NFS";
+        if (PortIs(a, b, 111)) return "Portmap";
+        if (PortIs(a, b, 123)) return "NTP";
+        if (PortIs(a, b, 9389)) return "ADWS";
+        if (PortIs(a, b, 5722)) return "DFSR";
+        if (PortIs(a, b, 5985) || PortIs(a, b, 5986)) return "WinRM";
+        if (PortIs(a, b, 5355)) return "LLMNR";
+        if (PortIs(a, b, 137)) return "NBNS";
+        if (PortIs(a, b, 138)) return "NBDS";
+        if (PortIs(a, b, 42)) return "WINS";
+        return "";
+    }
+
+    static void ApplyWellKnownProtocol(PowerSharkPacket p) {
+        if (p.Protocol == "KRB5") p.Protocol = "Kerberos";
+        if (p.IsRpc && p.QueryName != null && p.QueryName.Length > 0) {
+            if (p.Protocol == "RPC" || p.Protocol == "TCP" || p.Protocol == "UDP")
+                p.Protocol = "RPC-" + p.QueryName;
+            return;
+        }
+        if (p.Protocol != null && p.Protocol != "TCP" && p.Protocol != "UDP" && p.Protocol != "IP")
+            return;
+        string s = WellKnownService(p);
+        if (s != null && s.Length > 0) p.Protocol = s;
     }
 
     static void MarkCollapseFindings(PowerSharkPacket p) {
@@ -1165,7 +1401,7 @@ public static class PowerSharkParser {
         if (!p.IsUdp && p.PayloadLength >= 4) off += 4;
         if (off >= end) return;
         p.IsKerberos = true;
-        p.Protocol = "KRB5";
+        p.Protocol = "Kerberos";
         p.HighlightOffset = off;
         p.HighlightLength = 1;
         int tag = r[off];
@@ -1231,6 +1467,7 @@ public static class PowerSharkParser {
             string mapped = MapRpcUuid(iface);
             if (mapped.Length > 0) {
                 p.QueryName = mapped;
+                p.Protocol = "RPC-" + mapped;
                 p.Info = "RPC " + op + " " + mapped;
                 if (mapped == "SRVSVC" || mapped == "WKSSVC" || mapped == "DFS" || mapped == "SPOOLSS")
                     p.IsFileShare = true;
@@ -2200,8 +2437,64 @@ function Invoke-SmbAnalyzerSelfTest {
     elseif (-not [PowerSharkParser]::MatchesFilter($col, 9)) {
         [void]$failures.Add('Domain-collapse capture filter rejected a collapse packet')
     }
+    if ($simple) {
+        $simpleWhy = Get-PacketFindingSummary $simple
+        if ($simpleWhy -notmatch 'simple bind') {
+            [void]$failures.Add("Simple-bind finding text missing: $simpleWhy")
+        }
+        if (-not (Test-BannerPacket $simple 'collapse')) {
+            [void]$failures.Add('Test-BannerPacket collapse missed simple bind')
+        }
+    }
+    if ($col) {
+        $colWhy = Get-PacketFindingSummary $col
+        if (Test-BlankString $colWhy) { [void]$failures.Add('Collapse packet has empty finding summary') }
+    }
+    if ($smb1) {
+        $oneSmb1 = @($smb1)[0]
+        if (-not (Test-BannerPacket $oneSmb1 'smb1')) {
+            [void]$failures.Add('Test-BannerPacket smb1 missed SMBv1 demo packet')
+        }
+        $smb1Why = Get-PacketFindingSummary $oneSmb1
+        if ($smb1Why -notmatch 'SMBv1') { [void]$failures.Add("SMBv1 finding text missing: $smb1Why") }
+    }
+    if ((Get-BannerFilterText 'collapse') -ne 'collapse') { [void]$failures.Add('Get-BannerFilterText collapse') }
+    if ((Get-BannerFilterText 'smb1') -ne 'smb1') { [void]$failures.Add('Get-BannerFilterText smb1') }
+    if ((Get-BannerFilterText 'ad') -ne 'ad') { [void]$failures.Add('Get-BannerFilterText ad') }
+    $collapseHits = 0
+    foreach ($dp in $demo) {
+        if (Test-BannerPacket $dp 'collapse') { $collapseHits++ }
+    }
+    if ($collapseHits -lt 1) { [void]$failures.Add('Demo set has no collapse leftover packets for Findings') }
     $anon = $demo | Where-Object { $_.IsAnonymous } | Select-Object -First 1
     if (-not $anon) { [void]$failures.Add('Demo anonymous LDAP bind not flagged') }
+    $syn445 = $demo | Where-Object { $_.DstPort -eq 445 -and -not $_.HasSmb } | Select-Object -First 1
+    if ($syn445 -and $syn445.Protocol -ne 'SMB') {
+        [void]$failures.Add("TCP 445 without SMB header should be named SMB, got $($syn445.Protocol)")
+    }
+    if ($ldap -and (Get-PacketServiceName $ldap) -ne 'LDAP') {
+        [void]$failures.Add("Get-PacketServiceName LDAP got $(Get-PacketServiceName $ldap)")
+    }
+    if ($dns -and (Get-PacketServiceName $dns) -ne 'DNS') {
+        [void]$failures.Add("Get-PacketServiceName DNS got $(Get-PacketServiceName $dns)")
+    }
+    if ($krb -and (Get-PacketServiceName $krb) -ne 'Kerberos') {
+        [void]$failures.Add("Get-PacketServiceName Kerberos got $(Get-PacketServiceName $krb)")
+    }
+    if ((Get-SessionMinutes 'Off') -ne 0) { [void]$failures.Add('Get-SessionMinutes Off should be 0') }
+    if ((Get-SessionMinutes '15 minutes') -ne 15) { [void]$failures.Add('Get-SessionMinutes 15 minutes') }
+    if ((Get-SessionMinutes '1 hour') -ne 60) { [void]$failures.Add('Get-SessionMinutes 1 hour') }
+    if ((Get-SessionMinutes '2 hours') -ne 120) { [void]$failures.Add('Get-SessionMinutes 2 hours') }
+    $desk = Get-DesktopDirectory
+    if (Test-BlankString $desk) { [void]$failures.Add('Get-DesktopDirectory returned blank') }
+    $saveName = Get-CaptureSavePath -Directory $desk
+    if ($saveName -notmatch 'PowerShark-.*\.pcap$') { [void]$failures.Add("Get-CaptureSavePath name: $saveName") }
+    if ((Get-SaveFormat 'CSV') -ne 'csv') { [void]$failures.Add('Get-SaveFormat CSV') }
+    if ($script:AppAuthor -ne 'Anthony Blake') { [void]$failures.Add("AppAuthor=$($script:AppAuthor)") }
+    if ((Get-SaveFormat 'pcap') -ne 'pcap') { [void]$failures.Add('Get-SaveFormat pcap') }
+    if ((Get-SaveFormat -Path 'C:\tmp\out.csv') -ne 'csv') { [void]$failures.Add('Get-SaveFormat path csv') }
+    $csvName = Get-CaptureSavePath -Directory $desk -Format 'csv'
+    if ($csvName -notmatch 'PowerShark-.*\.csv$') { [void]$failures.Add("Get-CaptureSavePath csv name: $csvName") }
 
     $map = @{ Negotiate = 2; SessionSetup = 1 }
     $fmt = Format-AppCommandMap $map
@@ -2265,14 +2558,25 @@ $script:SortColumn      = 0
 $script:SortAscending   = $true
 $script:FindIndex       = -1
 $script:LastBannerCount = 0
+$script:BannerKind      = ''
+$script:LastFindingsCount = -1
+$script:LastFindingsKind  = ''
 $script:UiBusy          = $false
+$script:SessionEndsAt   = $null
+$script:TimedExitBusy   = $false
 $script:FilterText      = ''
 $script:txtLog          = $null
 $script:lvPackets       = $null
 $script:txtFilter       = $null
 $script:chkSmb1Only     = $null
 $script:chkAutoScroll   = $null
+$script:cmbSaveFormat   = $null
+$script:cmbTimer        = $null
+$script:lblTimer        = $null
 $script:banner          = $null
+$script:tabFindings     = $null
+$script:dgvFindings     = $null
+$script:lblFindingsCount = $null
 $script:MainForm        = $null
 $script:splitH          = $null
 $script:splitV          = $null
@@ -2300,35 +2604,36 @@ function New-RgbColor {
 }
 
 $script:C = @{}
-$script:C['Header']  = New-RgbColor 24 42 68
-$script:C['Header2'] = New-RgbColor 32 52 80
-$script:C['Bg']      = New-RgbColor 245 247 250
-$script:C['Split']   = New-RgbColor 220 225 232
-$script:C['Text']    = New-RgbColor 24 42 68
+$script:C['Header']  = New-RgbColor 29 29 29
+$script:C['Header2'] = New-RgbColor 45 45 48
+$script:C['Accent']  = New-RgbColor 0 171 169
+$script:C['Bg']      = New-RgbColor 242 242 242
+$script:C['Split']   = New-RgbColor 210 210 210
+$script:C['Text']    = New-RgbColor 29 29 29
 $script:C['White']   = [System.Drawing.Color]::White
-$script:C['Blue']    = New-RgbColor 0 120 212
-$script:C['Green']   = New-RgbColor 16 137 62
-$script:C['Red']     = New-RgbColor 196 43 28
-$script:C['Orange']  = New-RgbColor 202 131 0
-$script:C['Teal']    = New-RgbColor 0 150 136
-$script:C['Gray']    = New-RgbColor 100 110 125
-$script:C['Dark']    = New-RgbColor 55 65 81
+$script:C['Blue']    = New-RgbColor 46 141 239
+$script:C['Green']   = New-RgbColor 16 124 16
+$script:C['Red']     = New-RgbColor 229 20 0
+$script:C['Orange']  = New-RgbColor 235 60 0
+$script:C['Teal']    = New-RgbColor 0 171 169
+$script:C['Gray']    = New-RgbColor 102 102 102
+$script:C['Dark']    = New-RgbColor 45 45 48
 $script:C['Smb1']    = New-RgbColor 255 205 205
 $script:C['Smb1Neg'] = New-RgbColor 255 170 170
 $script:C['Smb2']    = New-RgbColor 205 228 255
 $script:C['Smb3']    = New-RgbColor 205 245 220
-$script:C['Tcp']     = New-RgbColor 248 249 251
+$script:C['Tcp']     = New-RgbColor 248 248 248
 $script:C['Marked']  = New-RgbColor 255 236 179
-$script:C['AlertBg']   = New-RgbColor 153 27 27
-$script:C['OkGreen']   = New-RgbColor 0 210 106
-$script:C['SubText']   = New-RgbColor 160 185 215
-$script:C['FilterOk']  = New-RgbColor 220 255 220
+$script:C['AlertBg']   = New-RgbColor 229 20 0
+$script:C['OkGreen']   = New-RgbColor 57 210 106
+$script:C['SubText']   = New-RgbColor 176 176 176
+$script:C['FilterOk']  = New-RgbColor 210 245 230
 $script:C['Smb1Hot']   = New-RgbColor 255 180 180
-$script:C['Smb1Idle']  = New-RgbColor 180 200 180
+$script:C['Smb1Idle']  = New-RgbColor 160 160 160
 $script:C['HexText']   = New-RgbColor 30 30 30
-$script:C['ComboBg']   = New-RgbColor 18 18 22
-$script:C['FilterBar'] = New-RgbColor 236 239 244
-$script:C['AdminHint'] = New-RgbColor 202 131 0
+$script:C['ComboBg']   = New-RgbColor 26 26 26
+$script:C['FilterBar'] = New-RgbColor 230 230 230
+$script:C['AdminHint'] = New-RgbColor 235 60 0
 $script:C['Smb1Ink']   = New-RgbColor 90 0 0
 $script:C['Ldap']      = New-RgbColor 232 210 255
 $script:C['Kerberos']  = New-RgbColor 255 224 190
@@ -2336,11 +2641,11 @@ $script:C['Dns']       = New-RgbColor 190 245 245
 $script:C['Rpc']       = New-RgbColor 255 228 200
 $script:C['Nfs']       = New-RgbColor 220 235 180
 $script:C['AdRow']     = New-RgbColor 230 236 255
-$script:C['HexBg']     = New-RgbColor 250 250 252
-$script:C['AltRow']    = New-RgbColor 248 250 252
-$script:C['StatsBg']   = New-RgbColor 18 22 28
-$script:C['StatsFg']   = New-RgbColor 180 230 180
-$script:C['LogFg']     = New-RgbColor 200 220 200
+$script:C['HexBg']     = New-RgbColor 250 250 250
+$script:C['AltRow']    = New-RgbColor 248 248 248
+$script:C['StatsBg']   = New-RgbColor 29 29 29
+$script:C['StatsFg']   = New-RgbColor 224 224 224
+$script:C['LogFg']     = New-RgbColor 210 210 210
 
 # ============================================================
 # HELPERS
@@ -2468,7 +2773,7 @@ function New-FlatButton {
     param(
         [string]$Text,
         [int]$Width,
-        [int]$Height = 30,
+        [int]$Height = 36,
         $BackColor,
         [scriptblock]$OnClick,
         [string]$TipText = '',
@@ -2484,7 +2789,7 @@ function New-FlatButton {
     $b.Font = New-Object System.Drawing.Font('Segoe UI', 9, $style)
     $b.FlatAppearance.BorderSize = 0
     $b.Cursor = [System.Windows.Forms.Cursors]::Hand
-    $b.Margin = New-Object System.Windows.Forms.Padding(0, 3, 6, 3)
+    $b.Margin = New-Object System.Windows.Forms.Padding(0, 4, 8, 4)
     if ($OnClick) { $b.Add_Click($OnClick) }
     if ($TipText -and $script:Tip) { $script:Tip.SetToolTip($b, $TipText) }
     return $b
@@ -2648,15 +2953,49 @@ function Test-PacketFilter {
     return $true
 }
 
+function Set-PacketListVirtualSize {
+    param([int]$Size)
+    if (-not $script:lvPackets) { return }
+    if ($Size -lt 0) { $Size = 0 }
+    $old = 0
+    try { $old = [int]$script:lvPackets.VirtualListSize } catch { $old = 0 }
+    $selBad = $false
+    try {
+        if ($script:lvPackets.SelectedIndices.Count -gt 0) {
+            $sel = [int]$script:lvPackets.SelectedIndices[0]
+            if ($sel -lt 0 -or $sel -ge $Size) { $selBad = $true }
+        }
+    } catch { $selBad = $true }
+    if ($Size -eq $old -and -not $selBad) { return }
+    try { $script:lvPackets.BeginUpdate() } catch { }
+    try {
+        if ($selBad -or $Size -lt $old) {
+            try { $script:lvPackets.SelectedIndices.Clear() } catch { }
+            try { $script:lvPackets.FocusedItem = $null } catch { }
+        }
+        try { $script:lvPackets.VirtualListSize = $Size } catch { }
+    } finally {
+        try { $script:lvPackets.EndUpdate() } catch { }
+    }
+}
+
 function Update-PacketView {
     $script:FilterText = if ($script:txtFilter) { $script:txtFilter.Text } else { '' }
-    $script:ViewPackets.Clear()
-    foreach ($p in (Get-AppEnumerable $script:AllPackets)) {
-        if (Test-PacketFilter $p) { [void]$script:ViewPackets.Add($p) }
-    }
     if ($script:lvPackets) {
-        $script:lvPackets.VirtualListSize = (Get-AppCount $script:ViewPackets)
-        $script:lvPackets.Invalidate()
+        try { $script:lvPackets.BeginUpdate() } catch { }
+    }
+    try {
+        $script:ViewPackets.Clear()
+        Set-PacketListVirtualSize 0
+        foreach ($p in (Get-AppEnumerable $script:AllPackets)) {
+            if (Test-PacketFilter $p) { [void]$script:ViewPackets.Add($p) }
+        }
+        Set-PacketListVirtualSize (Get-AppCount $script:ViewPackets)
+        try { if ($script:lvPackets) { $script:lvPackets.Invalidate() } } catch { }
+    } finally {
+        if ($script:lvPackets) {
+            try { $script:lvPackets.EndUpdate() } catch { }
+        }
     }
     Update-FilterBoxColor
     Update-StatusBar
@@ -2767,14 +3106,44 @@ function Add-PacketsToUi {
     return $added
 }
 
+function Get-PacketListColumnCount {
+    $n = 9
+    try {
+        if ($script:lvPackets) { $n = [int]$script:lvPackets.Columns.Count }
+    } catch { }
+    if ($n -lt 1) { $n = 9 }
+    return $n
+}
+
+function New-BlankPacketListItem {
+    $item = New-Object System.Windows.Forms.ListViewItem('')
+    $need = Get-PacketListColumnCount
+    while ($item.SubItems.Count -lt $need) {
+        [void]$item.SubItems.Add('')
+    }
+    return $item
+}
+
+function Complete-PacketListItem {
+    param($Item)
+    if ($null -eq $Item) { return (New-BlankPacketListItem) }
+    $need = Get-PacketListColumnCount
+    while ($Item.SubItems.Count -lt $need) {
+        [void]$Item.SubItems.Add('')
+    }
+    return $Item
+}
+
 function Refresh-PacketListView {
     param([switch]$ScrollEnd)
     if (-not $script:lvPackets) { return }
-    $script:lvPackets.VirtualListSize = (Get-AppCount $script:ViewPackets)
-    if ($ScrollEnd -and $script:chkAutoScroll -and $script:chkAutoScroll.Checked -and (Get-AppCount $script:ViewPackets) -gt 0) {
-        try { $script:lvPackets.EnsureVisible((Get-AppCount $script:ViewPackets) - 1) } catch { }
+    $n = Get-AppCount $script:ViewPackets
+    if ($n -lt 0) { $n = 0 }
+    Set-PacketListVirtualSize $n
+    if ($ScrollEnd -and $script:chkAutoScroll -and $script:chkAutoScroll.Checked -and $n -gt 0) {
+        try { $script:lvPackets.EnsureVisible($n - 1) } catch { }
     } else {
-        $script:lvPackets.Invalidate()
+        try { $script:lvPackets.Invalidate() } catch { }
     }
 }
 
@@ -2851,21 +3220,29 @@ function Update-StatusBar {
 
     if ($script:banner -and $stats) {
         if ($stats.Smb1 -gt 0) {
+            $script:BannerKind = 'smb1'
             $script:banner.Visible = $true
-            $script:banner.Text = "  SMBv1 DETECTED  -  $($stats.Smb1) SMBv1 packet(s). This dialect is deprecated and insecure."
+            $script:banner.BackColor = $script:C.AlertBg
+            $script:banner.Text = "  SMBv1 DETECTED  -  $($stats.Smb1) SMBv1 packet(s). This dialect is deprecated and insecure.  -  click to list packets"
             if ($stats.Smb1 -gt $script:LastBannerCount -and $script:LastBannerCount -eq 0) {
                 Write-AppLog "First SMBv1 packet observed on the wire." 'WARN'
             }
             $script:LastBannerCount = $stats.Smb1
         } elseif ($stats.SimpleBind -gt 0 -or $stats.Legacy -gt 0 -or $stats.Collapse -gt 0) {
+            $script:BannerKind = 'collapse'
             $script:banner.Visible = $true
             $script:banner.BackColor = $script:C.AlertBg
-            $script:banner.Text = "  PRE-COLLAPSE  -  $($stats.Collapse) leftover(s)  SMBv1 $($stats.Smb1)  simple-bind $($stats.SimpleBind)  NTLM $($stats.Ntlm)  DC-locator $($stats.DcLocator)  SYSVOL $($stats.Sysvol)"
+            $script:banner.Text = "  PRE-COLLAPSE  -  $($stats.Collapse) leftover(s)  SMBv1 $($stats.Smb1)  simple-bind $($stats.SimpleBind)  NTLM $($stats.Ntlm)  DC-locator $($stats.DcLocator)  SYSVOL $($stats.Sysvol)  -  click to list packets"
         } elseif ($stats.Ad -gt 0) {
+            $script:BannerKind = 'ad'
             $script:banner.Visible = $true
             $script:banner.BackColor = $script:C.Blue
-            $script:banner.Text = "  Active Directory traffic  -  LDAP $($stats.Ldap)  Kerberos $($stats.Kerberos)  DNS $($stats.Dns)  RPC $($stats.Rpc)  DC-locator $($stats.DcLocator)"
+            $script:banner.Text = "  Active Directory traffic  -  LDAP $($stats.Ldap)  Kerberos $($stats.Kerberos)  DNS $($stats.Dns)  RPC $($stats.Rpc)  DC-locator $($stats.DcLocator)  -  click to list packets"
+        } else {
+            $script:BannerKind = ''
+            $script:banner.Visible = $false
         }
+        Set-BannerClickHint
     }
 }
 
@@ -2882,8 +3259,11 @@ function Update-CaptureUi {
             }
         }
         Update-StatusBar
+        Update-SessionTimerLabel
+        Check-SessionTimer
         if ($script:tabMain -and $script:tabMain.SelectedTab -eq $script:tabStats) { Update-StatsTab }
         if ($script:tabMain -and $script:tabMain.SelectedTab -eq $script:tabHosts) { Update-HostsGrid }
+        if ($script:tabMain -and $script:tabFindings -and $script:tabMain.SelectedTab -eq $script:tabFindings) { Update-FindingsGrid }
     } catch {
         Write-AppLog "UI update error: $($_.Exception.Message)" 'ERROR'
     } finally {
@@ -2950,7 +3330,8 @@ function Show-PacketDetails {
         }
     } elseif ($p.IsLdap -or $p.IsKerberos -or $p.IsDns -or $p.IsRpc -or $p.IsNfs -or $p.IsNtp -or $p.IsAdws -or $p.IsLlmnr -or $p.IsWinRm) {
         $app = $frame.Nodes.Add($p.Protocol)
-        [void]$app.Nodes.Add("Family: $($p.Family)")
+        [void]$app.Nodes.Add("Protocol: $(Get-PacketServiceName $p)")
+        [void]$app.Nodes.Add("Category: $($p.Family)")
         if ($p.AppOp) { [void]$app.Nodes.Add("Operation: $($p.AppOp)") }
         if ($p.QueryName) { [void]$app.Nodes.Add("Name / DN: $($p.QueryName)") }
         [void]$app.Nodes.Add("Summary: $($p.Info)")
@@ -2958,29 +3339,13 @@ function Show-PacketDetails {
     if ($p.IsCollapse) {
         $find = $frame.Nodes.Add('Domain collapse findings (fix before cutover)')
         $find.ForeColor = $script:C.Red
-        if ($p.IsSimpleBind) { [void]$find.Nodes.Add('LDAP simple bind — password may be on the wire. Move this app to Kerberos/SASL/LDAPS.') }
-        if ($p.IsAnonymous) { [void]$find.Nodes.Add('Anonymous LDAP bind — an app is probing this directory without credentials.') }
-        if ($p.IsDcLocator) { [void]$find.Nodes.Add('DC locator DNS/CLDAP — this client still finds this domain via SRV or LDAP ping.') }
-        if ($p.IsSysvol -or $p.IsNetlogonShare) { [void]$find.Nodes.Add('SYSVOL/NETLOGON — logon scripts or GPOs still served from this domain.') }
-        if ($p.IsGpo) { [void]$find.Nodes.Add('Group Policy file (Policies / GPT.INI) — GPOs still applied from this domain.') }
-        if ($p.IsNtlmV1) { [void]$find.Nodes.Add('NTLMv1 — replace with Kerberos/NTLMv2.') }
-        elseif ($p.IsNtlm) { [void]$find.Nodes.Add('NTLM (not Kerberos) — this app will break when the domain is gone; move it to Kerberos or a local account.') }
-        if ($p.IsReplication) { [void]$find.Nodes.Add('AD replication RPC — another DC still talks to this domain.') }
-        if ($p.IsMachine) { [void]$find.Nodes.Add('Machine account (ends with $) — this computer is still domain-joined. Unjoin or migrate it.') }
-        if ($p.IsKdc) { [void]$find.Nodes.Add('Kerberos AS/TGS — this client still gets tickets from this KDC (still a domain member or service).') }
-        if ($p.IsNtp) { [void]$find.Nodes.Add('NTP — this host may still use a DC as its time source. Point clients at a new NTP server.') }
-        if ($p.IsAdws) { [void]$find.Nodes.Add('ADWS (9389) — RSAT / PowerShell AD module still targeting this domain.') }
-        if ($p.IsCldap) { [void]$find.Nodes.Add('CLDAP (UDP 389) — NetLogon LDAP ping; clients still locating this DC.') }
-        if ($p.IsLlmnr) { [void]$find.Nodes.Add('LLMNR — name fallback after DNS/WINS. Disable or expect name-resolution failures.') }
-        if ($p.IsDfs) { [void]$find.Nodes.Add('DFS namespace — domain DFS roots/folders still in use.') }
-        if ($p.IsSamr) { [void]$find.Nodes.Add('SAMR/LSARPC — account lookup from NAS, printers, or apps against this domain.') }
-        if ($p.IsDnsUpdate) { [void]$find.Nodes.Add('DNS dynamic update — a machine is still registering names in this DNS zone.') }
-        if ($p.IsWinRm) { [void]$find.Nodes.Add('WinRM — remoting that typically uses Kerberos to this domain.') }
-        if ($p.IsCert) { [void]$find.Nodes.Add('Certificate enrollment RPC — clients still using this CA/domain for certs.') }
-        if ($p.IsWins) { [void]$find.Nodes.Add('WINS/NetBIOS name service — break WINS and NetBIOS-dependent apps first.') }
-        if ($p.IsKpasswd) { [void]$find.Nodes.Add('Kerberos password change (464) — password changes still go through this KDC.') }
-        if ($p.IsGc) { [void]$find.Nodes.Add('Global Catalog (3268/3269) — forest-wide lookups still hit this domain.') }
-        if ($p.IsSmb1) { [void]$find.Nodes.Add('SMBv1 — remaining NT LM 0.12 client; replace before the file server / DC is retired.') }
+        $findLines = Get-PacketFindingReasons $p
+        foreach ($line in (Get-AppEnumerable $findLines)) {
+            [void]$find.Nodes.Add([string]$line)
+        }
+        if ((Get-AppCount $findLines) -eq 0) {
+            [void]$find.Nodes.Add('Domain leftover — this frame still depends on this domain.')
+        }
     }
 
     $frame.Expand()
@@ -3053,6 +3418,138 @@ function Get-SelectedPacket {
     return $script:ViewPackets[$idx]
 }
 
+function Select-PacketByNumber {
+    param([int]$Number)
+    if (-not $script:lvPackets) { return $false }
+    $n = Get-AppCount $script:ViewPackets
+    for ($i = 0; $i -lt $n; $i++) {
+        $p = $script:ViewPackets[$i]
+        if ($null -eq $p) { continue }
+        $no = 0
+        try { $no = [int]$p.No } catch { continue }
+        if ($no -eq $Number) {
+            try { $script:lvPackets.SelectedIndices.Clear() } catch { }
+            try { [void]$script:lvPackets.SelectedIndices.Add($i) } catch { }
+            try { $script:lvPackets.EnsureVisible($i) } catch { }
+            Show-PacketDetails $p
+            return $true
+        }
+    }
+    return $false
+}
+
+function Set-BannerClickHint {
+    if (-not $script:banner) { return }
+    try { $script:banner.Cursor = [System.Windows.Forms.Cursors]::Hand } catch { }
+    $kind = $script:BannerKind
+    $msg = 'Click to list the packets this alert is about on the Findings tab. Double-click a row to open it on Packets.'
+    if ($kind -eq 'smb1') {
+        $msg = 'Click to list every SMBv1 packet this red banner is alerting about.'
+    } elseif ($kind -eq 'collapse') {
+        $msg = 'Click to list every pre-collapse leftover packet this red banner is alerting about.'
+    } elseif ($kind -eq 'ad') {
+        $msg = 'Click to list Active Directory packets this banner is reporting.'
+    }
+    if ($script:Tip) {
+        try { $script:Tip.SetToolTip($script:banner, $msg) } catch { }
+    }
+}
+
+function Update-FindingsGrid {
+    param([switch]$Force)
+    if (-not $script:dgvFindings) { return }
+    $kind = Get-ActiveBannerKind
+    $count = Get-AppCount $script:AllPackets
+    if (-not $Force -and $count -eq $script:LastFindingsCount -and $kind -eq $script:LastFindingsKind) {
+        return
+    }
+    $script:LastFindingsCount = $count
+    $script:LastFindingsKind = $kind
+    $selNo = $null
+    try {
+        if ($script:dgvFindings.SelectedRows.Count -gt 0) {
+            $selNo = [string]$script:dgvFindings.SelectedRows[0].Cells['No'].Value
+        }
+    } catch { }
+    try { $script:dgvFindings.SuspendLayout() } catch { }
+    try {
+        $script:dgvFindings.Rows.Clear()
+        $n = 0
+        foreach ($p in (Get-AppEnumerable $script:AllPackets)) {
+            if (-not (Test-BannerPacket $p $kind)) { continue }
+            $timeText = ''
+            try { $timeText = $p.Time.ToString('HH:mm:ss.fff') } catch { }
+            $finding = Get-PacketFindingSummary $p
+            $infoText = ''
+            try { $infoText = [string]$p.Info } catch { }
+            $idx = $script:dgvFindings.Rows.Add(
+                [string]$p.No,
+                $timeText,
+                [string]$p.Src,
+                [string]$p.SrcPort,
+                [string]$p.Dst,
+                [string]$p.DstPort,
+                [string]$p.Protocol,
+                $finding,
+                $infoText
+            )
+            try { $script:dgvFindings.Rows[$idx].DefaultCellStyle.BackColor = Get-PacketRowColor $p } catch { }
+            if ($selNo -and ([string]$p.No -eq $selNo)) {
+                try { $script:dgvFindings.Rows[$idx].Selected = $true } catch { }
+            }
+            $n++
+        }
+        if ($script:lblFindingsCount) {
+            $label = 'pre-collapse leftover packet(s)'
+            if ($kind -eq 'smb1') { $label = 'SMBv1 packet(s)' }
+            elseif ($kind -eq 'ad') { $label = 'Active Directory packet(s)' }
+            $script:lblFindingsCount.Text = ('{0} {1}  —  double-click a row to open it on Packets' -f $n, $label)
+        }
+    } catch {
+        Write-AppLog ("Findings list error: {0}" -f $_.Exception.Message) 'ERROR'
+    } finally {
+        try { $script:dgvFindings.ResumeLayout() } catch { }
+    }
+}
+
+function Show-SelectedFindingPacket {
+    if (-not $script:dgvFindings -or $script:dgvFindings.SelectedRows.Count -eq 0) { return }
+    $n = 0
+    try {
+        $raw = [string]$script:dgvFindings.SelectedRows[0].Cells['No'].Value
+        if (-not [int]::TryParse($raw, [ref]$n)) { return }
+    } catch { return }
+    $kind = Get-ActiveBannerKind
+    $filter = Get-BannerFilterText $kind
+    if ($script:tabCapture) { $script:tabMain.SelectedTab = $script:tabCapture }
+    Set-DisplayFilter -Text $filter
+    if (-not (Select-PacketByNumber $n)) {
+        Set-DisplayFilter -Text ''
+        [void](Select-PacketByNumber $n)
+    }
+}
+
+function Show-BannerAlertPackets {
+    $kind = 'collapse'
+    $filter = 'collapse'
+    try {
+        $kind = Get-ActiveBannerKind
+        $filter = Get-BannerFilterText $kind
+        Set-DisplayFilter -Text $filter
+        Update-FindingsGrid -Force
+        if ($script:tabFindings) {
+            $script:tabMain.SelectedTab = $script:tabFindings
+        } elseif ($script:tabCapture) {
+            $script:tabMain.SelectedTab = $script:tabCapture
+        }
+        $n = 0
+        try { $n = $script:dgvFindings.Rows.Count } catch { }
+        Write-AppLog ("Banner click: listing {0} {1} packet(s) (filter {2})." -f $n, $kind, $filter) 'INFO'
+    } catch {
+        Write-AppLog ("Banner click failed: {0}" -f $_.Exception.Message) 'ERROR'
+    }
+}
+
 function Enable-RawCaptureFirewall {
     $exe = $null
     try { $exe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName } catch { }
@@ -3118,7 +3615,7 @@ function Get-CaptureFilterMode {
 function Start-Capture {
     if (-not $script:IsAdmin) {
         [void][System.Windows.Forms.MessageBox]::Show(
-            "Live capture requires an elevated Administrator PowerShell session.`n`nRight-click powershell.exe -> Run as administrator, then relaunch this script.`n`nYou can still open a PCAP, load the demo capture, inspect SMB configuration, and scan event logs.",
+            "Live capture requires an elevated Administrator PowerShell session.`n`nRight-click powershell.exe -> Run as administrator, then relaunch this script.`n`nYou can still open a PCAP, load the demo capture, inspect server configuration, and scan event logs.",
             'Administrator Required',
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Warning)
@@ -3196,18 +3693,40 @@ function Clear-Capture {
         $r = [System.Windows.Forms.MessageBox]::Show('Clear the packet list while still capturing?', 'Clear', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
         if ($r -ne [System.Windows.Forms.DialogResult]::Yes) { return }
     }
-    $script:AllPackets.Clear()
-    $script:ViewPackets.Clear()
-    $script:Smb1Hosts.Clear()
-    $script:Smb1CommandHist.Clear()
-    $script:NextNo = 1
-    $script:LastBannerCount = 0
-    if ($script:banner) { $script:banner.Visible = $false }
-    $script:lvPackets.VirtualListSize = 0
-    $script:lvPackets.Invalidate()
-    $script:tvDetails.Nodes.Clear()
-    $script:hexBox.Clear()
-    $script:dgvHosts.Rows.Clear()
+    if ($script:lvPackets) {
+        try { $script:lvPackets.BeginUpdate() } catch { }
+    }
+    try {
+        if ($script:lvPackets) {
+            try { $script:lvPackets.SelectedIndices.Clear() } catch { }
+        }
+        $script:FindIndex = -1
+        $script:AllPackets.Clear()
+        $script:ViewPackets.Clear()
+        $script:Smb1Hosts.Clear()
+        $script:Smb1CommandHist.Clear()
+        $script:NextNo = 1
+        $script:LastBannerCount = 0
+        $script:BannerKind = ''
+        $script:LastFindingsCount = -1
+        $script:LastFindingsKind = ''
+        if ($script:banner) { $script:banner.Visible = $false }
+        Set-PacketListVirtualSize 0
+        try { if ($script:lvPackets) { $script:lvPackets.Invalidate() } } catch { }
+    } finally {
+        if ($script:lvPackets) {
+            try { $script:lvPackets.EndUpdate() } catch { }
+        }
+    }
+    try { $script:tvDetails.Nodes.Clear() } catch { }
+    try { $script:hexBox.Clear() } catch { }
+    try { $script:dgvHosts.Rows.Clear() } catch { }
+    try { if ($script:dgvFindings) { $script:dgvFindings.Rows.Clear() } } catch { }
+    try {
+        if ($script:lblFindingsCount) {
+            $script:lblFindingsCount.Text = 'No leftover packets yet. Click the red PRE-COLLAPSE banner after traffic arrives.'
+        }
+    } catch { }
     Update-StatusBar
     Write-AppLog 'Packet list cleared.' 'INFO'
 }
@@ -3219,9 +3738,10 @@ function Import-DemoCapture {
     Update-HostsGrid
     Update-StatsTab
     Update-StatusBar
+    Update-FindingsGrid -Force
     Write-AppLog "Loaded $($demo.Length) synthetic demo packets (SMB, LDAP, Kerberos, DNS, NFS)." 'INFO'
     [void][System.Windows.Forms.MessageBox]::Show(
-        "Loaded $($demo.Length) synthetic packets.`n`nPurple = LDAP, orange = Kerberos, teal = DNS, red = SMBv1, blue = SMB2.`nSet the display filter to ad or fileshare to slice the view.",
+        "Loaded $($demo.Length) synthetic packets.`n`nPurple = LDAP, orange = Kerberos, teal = DNS, red = legacy SMB, blue = SMB2+.`nClick the red banner (SMBv1 / PRE-COLLAPSE) to list leftover packets on Findings, or try display filters: ad, collapse, machine, fileshare.",
         'Demo Capture Loaded',
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Information)
@@ -3246,11 +3766,63 @@ function Import-PcapPath {
         Update-HostsGrid
         Update-StatsTab
         Update-StatusBar
+        Update-FindingsGrid -Force
         Write-AppLog "Opened $Path ($($pkts.Length) IPv4/TCP frames parsed)." 'INFO'
     } catch {
         Write-AppLog "PCAP open failed: $($_.Exception.Message)" 'ERROR'
         [void][System.Windows.Forms.MessageBox]::Show("Failed to open PCAP:`n$($_.Exception.Message)", 'Open Failed', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
     }
+}
+
+function New-PacketCsvRow {
+    param($Packet)
+    $svc = Get-PacketServiceName $Packet
+    $op = ''
+    try { $op = [string]$Packet.AppOp } catch { }
+    $cat = [string]$Packet.Family
+    if (Test-BlankString $cat) { $cat = 'Other' }
+    $row = New-Object PSObject
+    Add-Member -InputObject $row -MemberType NoteProperty -Name No -Value ([string]$Packet.No)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Time -Value (ConvertTo-AppTimeText $Packet.Time)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Protocol -Value $svc
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Operation -Value $op
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Family -Value $svc
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Category -Value $cat
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Src -Value ([string]$Packet.Src)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name SrcPort -Value ([string]$Packet.SrcPort)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Dst -Value ([string]$Packet.Dst)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name DstPort -Value ([string]$Packet.DstPort)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Length -Value ([string]$Packet.Length)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name UserName -Value ([string]$Packet.UserName)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name SharePath -Value ([string]$Packet.SharePath)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name FileName -Value ([string]$Packet.FileName)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name QueryName -Value ([string]$Packet.QueryName)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name SmbVersion -Value ([string]$Packet.SmbVersion)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name SmbCommand -Value ([string]$Packet.SmbCommand)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Info -Value ([string]$Packet.Info)
+    return $row
+}
+
+function New-PacketCsvRows {
+    param($Packets)
+    $csvRows = New-Object System.Collections.ArrayList
+    foreach ($p in (Get-AppEnumerable $Packets)) {
+        if ($null -eq $p) { continue }
+        [void]$csvRows.Add((New-PacketCsvRow $p))
+    }
+    return ,$csvRows
+}
+
+function Get-UiSaveFormat {
+    $txt = 'pcap'
+    try {
+        if ($script:cmbSaveFormat -and $script:cmbSaveFormat.SelectedItem) {
+            $txt = [string]$script:cmbSaveFormat.SelectedItem
+        } elseif ($script:cmbSaveFormat) {
+            $txt = [string]$script:cmbSaveFormat.Text
+        }
+    } catch { }
+    return (Get-SaveFormat $txt)
 }
 
 function Save-PcapFile {
@@ -3260,60 +3832,172 @@ function Save-PcapFile {
     }
     $dlg = New-Object System.Windows.Forms.SaveFileDialog
     $dlg.Filter = 'pcap (*.pcap)|*.pcap|CSV summary (*.csv)|*.csv'
-    $dlg.FileName = "smbv1-capture-$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    $dlg.FileName = "PowerShark-view-$(Get-Date -Format 'yyyyMMdd_HHmmss')"
     $dlg.Title = 'Save current view'
+    $dlg.AddExtension = $true
+    $uiFmt = Get-UiSaveFormat
+    if ($uiFmt -eq 'csv') { $dlg.FilterIndex = 2 } else { $dlg.FilterIndex = 1 }
     if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
     try {
-        if ($dlg.FileName -like '*.csv') {
-            $csvRows = New-Object System.Collections.ArrayList
-            foreach ($p in (Get-AppEnumerable $script:ViewPackets)) {
-                if ($null -eq $p) { continue }
-                $rowNo = [string]$p.No
-                $rowTime = ConvertTo-AppTimeText $p.Time
-                $rowSrc = [string]$p.Src
-                $rowSp = [string]$p.SrcPort
-                $rowDst = [string]$p.Dst
-                $rowDp = [string]$p.DstPort
-                $rowProto = [string]$p.Protocol
-                $rowLen = [string]$p.Length
-                $rowVer = [string]$p.SmbVersion
-                $rowCmd = [string]$p.SmbCommand
-                $rowUser = [string]$p.UserName
-                $rowShare = [string]$p.SharePath
-                $rowFile = [string]$p.FileName
-                $rowInfo = [string]$p.Info
-                [void]$csvRows.Add((New-AppObject -Property @{
-                    No         = $rowNo
-                    Time       = $rowTime
-                    Src        = $rowSrc
-                    SrcPort    = $rowSp
-                    Dst        = $rowDst
-                    DstPort    = $rowDp
-                    Protocol   = $rowProto
-                    Length     = $rowLen
-                    SmbVersion = $rowVer
-                    SmbCommand = $rowCmd
-                    UserName   = $rowUser
-                    SharePath  = $rowShare
-                    FileName   = $rowFile
-                    Info       = $rowInfo
-                }))
-            }
-            Export-AppCsv -InputObject $csvRows -Path $dlg.FileName
+        $fmt = Get-SaveFormat -Path $dlg.FileName
+        if ($fmt -eq 'csv') {
+            Export-AppCsv -InputObject (New-PacketCsvRows $script:ViewPackets) -Path $dlg.FileName
         } else {
             [PowerSharkParser]::WritePcap($dlg.FileName, (ConvertTo-PowerSharkPacketArray $script:ViewPackets))
         }
         Write-AppLog "Saved $((Get-AppCount $script:ViewPackets)) packets to $($dlg.FileName)" 'SUCCESS'
-        [void][System.Windows.Forms.MessageBox]::Show("Saved $((Get-AppCount $script:ViewPackets)) packets to:`n$($dlg.FileName)`n`nPCAP files open in Wireshark (LINKTYPE_IPV4 / 228).", 'Saved', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+        [void][System.Windows.Forms.MessageBox]::Show("Saved $((Get-AppCount $script:ViewPackets)) packets to:`n$($dlg.FileName)", 'Saved', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
     } catch {
         [void][System.Windows.Forms.MessageBox]::Show("Save failed:`n$($_.Exception.Message)", 'Save Failed', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
     }
 }
 
+function Save-AllCaptureTraffic {
+    param(
+        [string]$Path,
+        [string]$Format,
+        [switch]$Silent,
+        [switch]$ToDesktop
+    )
+    if ($script:Engine -and $script:Engine.Running) {
+        try {
+            $batch = $script:Engine.Drain(800)
+            if ($batch -and $batch.Length -gt 0) { [void](Add-PacketsToUi -Packets $batch) }
+        } catch { }
+    }
+    $count = Get-AppCount $script:AllPackets
+    $fmt = Get-SaveFormat -Value $Format -Path $Path
+    if ((Test-BlankString $Format) -and (Test-BlankString $Path)) {
+        $fmt = Get-UiSaveFormat
+    }
+    if ($ToDesktop -or (Test-BlankString $Path)) {
+        $Path = Get-CaptureSavePath -Directory (Get-DesktopDirectory) -Format $fmt
+    }
+    $fmt = Get-SaveFormat -Value $fmt -Path $Path
+    if ($count -eq 0) {
+        Write-AppLog 'Save all: no packets in the capture buffer.' 'WARN'
+        if (-not $Silent) {
+            [void][System.Windows.Forms.MessageBox]::Show('No captured traffic to save yet.', 'Nothing to Save', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+        }
+        return $null
+    }
+    try {
+        if ($fmt -eq 'csv') {
+            Export-AppCsv -InputObject (New-PacketCsvRows $script:AllPackets) -Path $Path
+        } else {
+            [PowerSharkParser]::WritePcap($Path, (ConvertTo-PowerSharkPacketArray $script:AllPackets))
+        }
+        Write-AppLog ("Saved all {0} packet(s) as {1} to {2}" -f $count, $fmt.ToUpper(), $Path) 'SUCCESS'
+        if (-not $Silent) {
+            [void][System.Windows.Forms.MessageBox]::Show(
+                "Saved $count packet(s) as $($fmt.ToUpper()) — the entire capture, not just the filtered view.`n`n$Path",
+                'Saved all traffic',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information)
+        }
+        return $Path
+    } catch {
+        Write-AppLog ("Save all failed: {0}" -f $_.Exception.Message) 'ERROR'
+        if (-not $Silent) {
+            [void][System.Windows.Forms.MessageBox]::Show("Save all failed:`n$($_.Exception.Message)", 'Save Failed', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        }
+        return $null
+    }
+}
+
+function Show-SaveAllDialog {
+    $dlg = New-Object System.Windows.Forms.SaveFileDialog
+    $dlg.Title = 'Save all captured traffic'
+    $dlg.Filter = 'pcap (*.pcap)|*.pcap|CSV summary (*.csv)|*.csv'
+    $dlg.AddExtension = $true
+    $desk = Get-DesktopDirectory
+    if (-not (Test-BlankString $desk) -and (Test-Path -LiteralPath $desk)) { $dlg.InitialDirectory = $desk }
+    $dlg.FileName = ('PowerShark-{0}' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    $uiFmt = Get-UiSaveFormat
+    if ($uiFmt -eq 'csv') { $dlg.FilterIndex = 2 } else { $dlg.FilterIndex = 1 }
+    if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+    [void](Save-AllCaptureTraffic -Path $dlg.FileName)
+}
+
+function Save-AllCaptureToDesktop {
+    $fmt = Get-UiSaveFormat
+    $path = Save-AllCaptureTraffic -ToDesktop -Format $fmt
+    return $path
+}
+
+function Apply-SessionTimerFromUi {
+    $mins = 0
+    try {
+        $txt = ''
+        if ($script:cmbTimer) { $txt = [string]$script:cmbTimer.Text }
+        $mins = Get-SessionMinutes $txt
+    } catch { $mins = 0 }
+    if ($mins -le 0) {
+        if ($null -eq $script:SessionEndsAt) {
+            if ($script:lblTimer) { $script:lblTimer.Text = 'Session: stays open' }
+            return
+        }
+        $script:SessionEndsAt = $null
+        if ($script:lblTimer) { $script:lblTimer.Text = 'Session: stays open' }
+        Write-AppLog 'Session timer off. The app stays open until you close it.' 'INFO'
+        return
+    }
+    $script:SessionEndsAt = (Get-Date).AddMinutes($mins)
+    $fmt = Get-UiSaveFormat
+    Write-AppLog ("Session timer armed: keep the app open {0} minute(s), then save all traffic to the Desktop as {1} and close." -f $mins, $fmt.ToUpper()) 'INFO'
+    Update-SessionTimerLabel
+}
+
+function Update-SessionTimerLabel {
+    if (-not $script:lblTimer) { return }
+    if ($null -eq $script:SessionEndsAt) {
+        $script:lblTimer.Text = 'Session: stays open'
+        return
+    }
+    $left = $script:SessionEndsAt - (Get-Date)
+    if ($left.TotalSeconds -le 0) {
+        $script:lblTimer.Text = 'Session: saving...'
+        return
+    }
+    $h = [int][Math]::Floor($left.TotalHours)
+    $m = $left.Minutes
+    $s = $left.Seconds
+    $script:lblTimer.Text = ('Closes in {0:00}:{1:00}:{2:00}' -f $h, $m, $s)
+}
+
+function Check-SessionTimer {
+    if ($script:TimedExitBusy) { return }
+    if ($null -eq $script:SessionEndsAt) { return }
+    Update-SessionTimerLabel
+    if ((Get-Date) -ge $script:SessionEndsAt) {
+        Complete-TimedSession
+    }
+}
+
+function Complete-TimedSession {
+    if ($script:TimedExitBusy) { return }
+    $script:TimedExitBusy = $true
+    $fmt = Get-UiSaveFormat
+    Write-AppLog ("Session time is up. Saving all captured traffic to the Desktop as {0}, then closing." -f $fmt.ToUpper()) 'INFO'
+    try { Stop-Capture } catch { }
+    try { [void](Save-AllCaptureTraffic -ToDesktop -Format $fmt -Silent) } catch {
+        Write-AppLog ("Timed Desktop save failed: {0}" -f $_.Exception.Message) 'ERROR'
+    }
+    try {
+        if ($script:MainForm) { $script:MainForm.Close() }
+    } catch {
+        try { [System.Windows.Forms.Application]::Exit() } catch { }
+    }
+}
+
 function Set-DisplayFilter {
     param([string]$Text)
-    $script:txtFilter.Text = $Text
-    Update-PacketView
+    try {
+        if ($script:txtFilter) { $script:txtFilter.Text = $Text }
+        Update-PacketView
+    } catch {
+        Write-AppLog ("Display filter failed: {0}" -f $_.Exception.Message) 'ERROR'
+    }
 }
 
 function Use-FollowStream {
@@ -3733,14 +4417,8 @@ function Show-GotoPacket {
     if ($inputBox.ShowDialog($script:MainForm) -eq [System.Windows.Forms.DialogResult]::OK) {
         $n = 0
         if ([int]::TryParse($tb.Text, [ref]$n)) {
-            for ($i = 0; $i -lt (Get-AppCount $script:ViewPackets); $i++) {
-                if ($script:ViewPackets[$i].No -eq $n) {
-                    $script:lvPackets.SelectedIndices.Clear()
-                    $script:lvPackets.SelectedIndices.Add($i)
-                    $script:lvPackets.EnsureVisible($i)
-                    Show-PacketDetails $script:ViewPackets[$i]
-                    return
-                }
+            if (-not (Select-PacketByNumber $n)) {
+                $script:lblStatusMini.Text = ("Go to packet {0}: not in the current view" -f $n)
             }
         }
     }
@@ -3763,6 +4441,21 @@ HOW TO RUN
   4. Pick the IPv4 address of the interface that faces clients / DCs.
   5. Capture dropdown: All traffic (default), Active Directory, File shares, or Domain collapse.
   6. Click Start. Use display filters (collapse, machine, gpo, dclocator, ad, ldap).
+  7. When the red PRE-COLLAPSE (or SMBv1) banner appears, click it. The Findings
+     tab lists every leftover packet the alert is about. Double-click a row to
+     jump to that frame on the Packets tab.
+
+SESSION TIMER AND SAVE ALL
+  CLOSE AFTER (toolbar): pick 5 minutes / 15 minutes / 1 hour, or type a number
+  of minutes. When that time is up, PowerShark writes the ENTIRE capture buffer
+  to the Desktop and closes. SAVE AS chooses PCAP (Wireshark) or CSV (spreadsheet).
+  Off (default) keeps the window open until you quit.
+  Save all / Ctrl+Shift+S / File > Save all traffic... writes the same full
+  buffer on demand. The save dialog lets you pick pcap or CSV; SAVE AS is the default.
+  Save view / Ctrl+S writes only the filtered packet list (pcap or CSV).
+  CSV Protocol and Family are the exact service (LDAP, Kerberos, SMB, DNS, RPC-SAMR).
+  Category is the coarse AD / FileShare / Other bucket. Operation is Bind / AS-REQ / Query.
+  Unattended:  .\PowerShark.ps1 -AutoCloseMinutes 60
 
 NO LIVE TRAFFIC?
   Watch Wire in the status bar after Start.
@@ -3801,6 +4494,7 @@ BEFORE A DOMAIN COLLAPSE
     kpasswd        Kerberos password-change (464)
     smb1           remaining NT LM 0.12 clients
   Talkers tab -> Show: Domain collapse lists the IPs to chase.
+  Click the red PRE-COLLAPSE header to open Findings (leftover packets + why).
   Packet details show FINDING lines for each leftover.
 
 DISPLAY FILTERS
@@ -3848,6 +4542,7 @@ KEYBOARD
   Ctrl+F   Find
   Ctrl+G   Go to packet number
   Ctrl+S   Save current view
+  Ctrl+Shift+S  Save all captured traffic
   Ctrl+O   Open PCAP
   Space    Mark / unmark selected packet
   Enter    Apply filter
@@ -3958,22 +4653,22 @@ $script:Tip.AutoPopDelay = 14000
 $script:Tip.InitialDelay = 350
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "PowerShark v$($script:AppVersion) - AD, file shares, and all IPv4"
+$form.Text = "PowerShark"
 $form.Size = New-Object System.Drawing.Size(1440, 920)
 $form.StartPosition = 'CenterScreen'
 $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 $form.BackColor = $script:C.Bg
 $form.MinimumSize = New-Object System.Drawing.Size(860, 560)
 $form.KeyPreview = $true
-try { $form.Icon = [System.Drawing.SystemIcons]::Shield } catch { }
+try { $form.Icon = [System.Drawing.SystemIcons]::Information } catch { }
 $form.SizeGripStyle = 'Show'
 Enable-DoubleBuffer $form
 $script:MainForm = $form
 
-# --- Header (title left, version stays on the right as the form grows) ---
+# --- Metro header (Windows 8 hub: large title, charcoal chrome) ---
 $header = New-Object System.Windows.Forms.TableLayoutPanel
 $header.Dock = 'Top'
-$header.Height = 58
+$header.Height = 78
 $header.ColumnCount = 2
 $header.RowCount = 1
 $header.BackColor = $script:C.Header
@@ -3987,18 +4682,46 @@ $leftHead.BackColor = $script:C.Header
 
 $lblTitle = New-Object System.Windows.Forms.Label
 $lblTitle.Text = 'PowerShark'
-$lblTitle.Font = New-Object System.Drawing.Font('Segoe UI', 16, [System.Drawing.FontStyle]::Bold)
+$titleFont = $null
+foreach ($fn in @('Segoe UI Light', 'Segoe UI Semilight', 'Segoe UI')) {
+    try {
+        $titleFont = New-Object System.Drawing.Font($fn, 26, [System.Drawing.FontStyle]::Regular)
+        if ($titleFont) { break }
+    } catch { $titleFont = $null }
+}
+if (-not $titleFont) { $titleFont = New-Object System.Drawing.Font('Segoe UI', 22, [System.Drawing.FontStyle]::Regular) }
+$lblTitle.Font = $titleFont
 $lblTitle.ForeColor = $script:C.White
 $lblTitle.AutoSize = $true
-$lblTitle.Location = New-Object System.Drawing.Point(16, 8)
+$lblTitle.Location = New-Object System.Drawing.Point(16, 6)
 
 $lblSub = New-Object System.Windows.Forms.Label
-$lblSub.Text = 'All IPv4  |  Active Directory  |  File shares  |  Server 2008+  |  No Npcap required'
-$lblSub.Font = New-Object System.Drawing.Font('Segoe UI', 8.5)
-$lblSub.ForeColor = $script:C.SubText
+$lblSub.Text = 'Live IPv4    Active Directory    File shares    Domain collapse'
+$lblSub.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$lblSub.ForeColor = $script:C.Accent
 $lblSub.AutoSize = $true
-$lblSub.Location = New-Object System.Drawing.Point(18, 36)
+$lblSub.Location = New-Object System.Drawing.Point(20, 52)
 $leftHead.Controls.AddRange(@($lblTitle, $lblSub))
+
+$rightHead = New-Object System.Windows.Forms.TableLayoutPanel
+$rightHead.AutoSize = $true
+$rightHead.ColumnCount = 1
+$rightHead.RowCount = 2
+$rightHead.BackColor = $script:C.Header
+$rightHead.Margin = New-Object System.Windows.Forms.Padding(8, 14, 16, 8)
+[void]$rightHead.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$rightHead.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$rightHead.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+
+$lblAuthor = New-Object System.Windows.Forms.Label
+$lblAuthor.Text = $script:AppAuthor
+$lblAuthor.Font = New-Object System.Drawing.Font('Segoe UI', 11)
+$lblAuthor.ForeColor = $script:C.White
+$lblAuthor.AutoSize = $true
+$lblAuthor.TextAlign = 'MiddleRight'
+$lblAuthor.Dock = 'Fill'
+$lblAuthor.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 0)
+$script:Tip.SetToolTip($lblAuthor, 'Author')
 
 $lblVer = New-Object System.Windows.Forms.Label
 $lblVer.Text = "v$($script:AppVersion)"
@@ -4006,12 +4729,21 @@ $lblVer.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 $lblVer.ForeColor = $script:C.SubText
 $lblVer.AutoSize = $true
 $lblVer.TextAlign = 'MiddleRight'
-$lblVer.Margin = New-Object System.Windows.Forms.Padding(8, 18, 16, 0)
+$lblVer.Dock = 'Fill'
+$lblVer.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 0)
+
+$rightHead.Controls.Add($lblAuthor, 0, 0)
+$rightHead.Controls.Add($lblVer, 0, 1)
 $header.Controls.Add($leftHead, 0, 0)
-$header.Controls.Add($lblVer, 1, 0)
+$header.Controls.Add($rightHead, 1, 0)
+
+$accentBar = New-Object System.Windows.Forms.Panel
+$accentBar.Dock = 'Top'
+$accentBar.Height = 5
+$accentBar.BackColor = $script:C.Accent
 
 # --- Toolbar (wraps onto extra rows when the window is narrow) ---
-$tool = New-FlowBar -MinHeight 42 -BackColor $script:C.Header2
+$tool = New-FlowBar -MinHeight 48 -BackColor $script:C.Header2
 
 $lblIf = New-Object System.Windows.Forms.Label
 $lblIf.Text = 'Interface'
@@ -4082,11 +4814,11 @@ $script:cmbCap.Add_SelectedIndexChanged({
 })
 
 $script:chkSmbPayload = New-Object System.Windows.Forms.CheckBox
-$script:chkSmbPayload.Text = 'SMB PDUs only'
+$script:chkSmbPayload.Text = 'File-share PDUs'
 $script:chkSmbPayload.ForeColor = $script:C.White
 $script:chkSmbPayload.AutoSize = $true
-$script:chkSmbPayload.Margin = New-Object System.Windows.Forms.Padding(4, 8, 6, 4)
-$script:Tip.SetToolTip($script:chkSmbPayload, 'Capture filter: drop TCP control segments without an SMB header.')
+$script:chkSmbPayload.Margin = New-Object System.Windows.Forms.Padding(4, 10, 6, 4)
+$script:Tip.SetToolTip($script:chkSmbPayload, 'Optional: keep only SMB payloads (drop empty TCP control segments).')
 $script:chkSmbPayload.Add_CheckedChanged({ if ($script:Engine) { $script:Engine.SmbPayloadOnly = $script:chkSmbPayload.Checked } })
 
 $script:chkAutoScroll = New-Object System.Windows.Forms.CheckBox
@@ -4096,12 +4828,78 @@ $script:chkAutoScroll.AutoSize = $true
 $script:chkAutoScroll.Checked = $true
 $script:chkAutoScroll.Margin = New-Object System.Windows.Forms.Padding(4, 8, 10, 4)
 
-$btnClear = New-FlatButton -Text 'Clear' -Width 70 -BackColor $script:C.Gray -Bold $false -OnClick { Clear-Capture } -TipText 'Clear packet list'
-$btnDemo = New-FlatButton -Text 'Demo' -Width 70 -BackColor $script:C.Teal -Bold $false -OnClick { Import-DemoCapture } -TipText 'Load synthetic AD, SMB, DNS, Kerberos, LDAP, NFS packets'
-$btnOpen = New-FlatButton -Text 'Open' -Width 70 -BackColor $script:C.Blue -Bold $false -OnClick { Open-PcapFile } -TipText 'Open a .pcap (Ctrl+O)'
-$btnSave = New-FlatButton -Text 'Save' -Width 70 -BackColor $script:C.Dark -Bold $false -OnClick { Save-PcapFile } -TipText 'Save current view as pcap/csv (Ctrl+S)'
+$btnClear = New-FlatButton -Text 'Clear' -Width 78 -BackColor $script:C.Gray -Bold $false -OnClick { Clear-Capture } -TipText 'Clear packet list'
+$btnDemo = New-FlatButton -Text 'Demo' -Width 78 -BackColor $script:C.Teal -Bold $false -OnClick { Import-DemoCapture } -TipText 'Load synthetic AD, file-share, DNS, Kerberos, LDAP, NFS packets'
+$btnOpen = New-FlatButton -Text 'Open' -Width 78 -BackColor $script:C.Blue -Bold $false -OnClick { Open-PcapFile } -TipText 'Open a .pcap (Ctrl+O)'
+$btnSaveView = New-FlatButton -Text 'Save view' -Width 92 -BackColor $script:C.Dark -Bold $false -OnClick { Save-PcapFile } -TipText 'Save the filtered view as pcap/csv (Ctrl+S)'
+$script:btnSaveAll = New-FlatButton -Text 'Save all' -Width 88 -BackColor $script:C.Accent -OnClick { Show-SaveAllDialog } -TipText 'Save the entire capture buffer as PCAP or CSV (Ctrl+Shift+S). Dialog starts on the Desktop.'
 
-$tool.Controls.AddRange(@($lblIf, $script:cmbIface, $script:btnStart, $script:btnStop, $script:btnPause, $lblCap, $script:cmbCap, $script:chkSmbPayload, $script:chkAutoScroll, $btnClear, $btnDemo, $btnOpen, $btnSave))
+$tool.Controls.AddRange(@($lblIf, $script:cmbIface, $script:btnStart, $script:btnStop, $script:btnPause, $lblCap, $script:cmbCap, $script:chkSmbPayload, $script:chkAutoScroll, $btnClear, $btnDemo, $btnOpen, $btnSaveView, $script:btnSaveAll))
+
+# --- Session timer (keep open N minutes, then save all to Desktop and close) ---
+$sessionBar = New-FlowBar -MinHeight 44 -BackColor $script:C.Header2
+
+$lblSess = New-Object System.Windows.Forms.Label
+$lblSess.Text = 'CLOSE AFTER'
+$lblSess.ForeColor = $script:C.Accent
+$lblSess.AutoSize = $true
+$lblSess.Font = New-Object System.Drawing.Font('Segoe UI', 8.5, [System.Drawing.FontStyle]::Bold)
+$lblSess.Margin = New-Object System.Windows.Forms.Padding(8, 12, 8, 4)
+
+$script:cmbTimer = New-Object System.Windows.Forms.ComboBox
+$script:cmbTimer.DropDownStyle = 'DropDown'
+$script:cmbTimer.Width = 130
+$script:cmbTimer.FlatStyle = 'Flat'
+$script:cmbTimer.BackColor = $script:C.ComboBg
+$script:cmbTimer.ForeColor = $script:C.White
+$script:cmbTimer.Margin = New-Object System.Windows.Forms.Padding(0, 8, 8, 4)
+[void]$script:cmbTimer.Items.AddRange(@(
+    'Off',
+    '5 minutes',
+    '15 minutes',
+    '30 minutes',
+    '1 hour',
+    '2 hours',
+    '4 hours',
+    '8 hours'
+))
+$script:cmbTimer.Text = 'Off'
+$script:Tip.SetToolTip($script:cmbTimer, 'How long to keep PowerShark open. When the timer ends it saves ALL captured traffic to the Desktop and closes. Type a number of minutes if you need a custom value.')
+$script:cmbTimer.Add_SelectedIndexChanged({ Apply-SessionTimerFromUi })
+$script:cmbTimer.Add_Leave({ Apply-SessionTimerFromUi })
+$script:cmbTimer.Add_KeyDown({
+    param($s, $e)
+    if ($e.KeyCode -eq 'Enter') { $e.SuppressKeyPress = $true; Apply-SessionTimerFromUi }
+})
+
+$script:lblTimer = New-Object System.Windows.Forms.Label
+$script:lblTimer.Text = 'Session: stays open'
+$script:lblTimer.ForeColor = $script:C.White
+$script:lblTimer.AutoSize = $true
+$script:lblTimer.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
+$script:lblTimer.Margin = New-Object System.Windows.Forms.Padding(8, 11, 16, 4)
+
+$lblFmt = New-Object System.Windows.Forms.Label
+$lblFmt.Text = 'SAVE AS'
+$lblFmt.ForeColor = $script:C.Accent
+$lblFmt.AutoSize = $true
+$lblFmt.Font = New-Object System.Drawing.Font('Segoe UI', 8.5, [System.Drawing.FontStyle]::Bold)
+$lblFmt.Margin = New-Object System.Windows.Forms.Padding(12, 12, 8, 4)
+
+$script:cmbSaveFormat = New-Object System.Windows.Forms.ComboBox
+$script:cmbSaveFormat.DropDownStyle = 'DropDownList'
+$script:cmbSaveFormat.Width = 80
+$script:cmbSaveFormat.FlatStyle = 'Flat'
+$script:cmbSaveFormat.BackColor = $script:C.ComboBg
+$script:cmbSaveFormat.ForeColor = $script:C.White
+$script:cmbSaveFormat.Margin = New-Object System.Windows.Forms.Padding(0, 8, 10, 4)
+[void]$script:cmbSaveFormat.Items.AddRange(@('PCAP', 'CSV'))
+$script:cmbSaveFormat.SelectedIndex = 0
+$script:Tip.SetToolTip($script:cmbSaveFormat, 'Format for Save all, Save all to Desktop, and the CLOSE AFTER auto-save. PCAP opens in Wireshark. CSV is a packet summary spreadsheet.')
+
+$btnSaveDesk = New-FlatButton -Text 'Save all to Desktop' -Width 168 -BackColor $script:C.Accent -OnClick { [void](Save-AllCaptureToDesktop) } -TipText 'Write the entire capture buffer to the Desktop now, using SAVE AS (PCAP or CSV).'
+
+$sessionBar.Controls.AddRange(@($lblSess, $script:cmbTimer, $script:lblTimer, $lblFmt, $script:cmbSaveFormat, $btnSaveDesk))
 
 # --- Filter bar (filter box is the percent-width column) ---
 $filterBar = New-Object System.Windows.Forms.TableLayoutPanel
@@ -4194,18 +4992,8 @@ $script:txtFilter.Add_KeyDown({
 $script:btnApply = New-FlatButton -Text 'Apply' -Width 70 -Height 26 -BackColor $script:C.Blue -OnClick { Update-PacketView }
 $script:btnReset = New-FlatButton -Text 'Reset' -Width 70 -Height 26 -BackColor $script:C.Gray -Bold $false -OnClick {
     $script:cmbPreset.SelectedIndex = 0
-    $script:chkSmb1Only.Checked = $false
     Set-DisplayFilter -Text ''
 }
-
-$script:chkSmb1Only = New-Object System.Windows.Forms.CheckBox
-$script:chkSmb1Only.Text = 'SMBv1 only'
-$script:chkSmb1Only.AutoSize = $true
-$script:chkSmb1Only.Anchor = 'Left'
-$script:chkSmb1Only.ForeColor = $script:C.Red
-$script:chkSmb1Only.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
-$script:chkSmb1Only.Margin = New-Object System.Windows.Forms.Padding(4, 8, 8, 4)
-$script:chkSmb1Only.Add_CheckedChanged({ Update-PacketView })
 
 $script:lblFind = New-Object System.Windows.Forms.Label
 $script:lblFind.Text = 'Find'
@@ -4229,11 +5017,10 @@ $filterBar.Controls.Add($script:cmbPreset, 1, 0)
 $filterBar.Controls.Add($script:txtFilter, 2, 0)
 $filterBar.Controls.Add($script:btnApply, 3, 0)
 $filterBar.Controls.Add($script:btnReset, 4, 0)
-$filterBar.Controls.Add($script:chkSmb1Only, 5, 0)
-$filterBar.Controls.Add($script:lblFind, 6, 0)
-$filterBar.Controls.Add($script:txtFind, 7, 0)
-$filterBar.Controls.Add($script:btnPrev, 8, 0)
-$filterBar.Controls.Add($script:btnNext, 9, 0)
+$filterBar.Controls.Add($script:lblFind, 5, 0)
+$filterBar.Controls.Add($script:txtFind, 6, 0)
+$filterBar.Controls.Add($script:btnPrev, 7, 0)
+$filterBar.Controls.Add($script:btnNext, 8, 0)
 
 # --- Alert banner ---
 $script:banner = New-Object System.Windows.Forms.Label
@@ -4244,6 +5031,9 @@ $script:banner.ForeColor = $script:C.White
 $script:banner.Font = New-Object System.Drawing.Font('Segoe UI', 9.5, [System.Drawing.FontStyle]::Bold)
 $script:banner.TextAlign = 'MiddleLeft'
 $script:banner.Visible = $false
+try { $script:banner.Cursor = [System.Windows.Forms.Cursors]::Hand } catch { }
+$script:Tip.SetToolTip($script:banner, 'Click to list the packets this alert is about on the Findings tab.')
+$script:banner.Add_Click({ Show-BannerAlertPackets })
 
 # --- Admin hint ---
 $script:adminHint = New-Object System.Windows.Forms.Label
@@ -4258,12 +5048,17 @@ $script:adminHint.Visible = -not $script:IsAdmin
 # --- Tabs ---
 $script:tabMain = New-Object System.Windows.Forms.TabControl
 $script:tabMain.Dock = 'Fill'
-$script:tabMain.Font = New-Object System.Drawing.Font('Segoe UI', 9.5, [System.Drawing.FontStyle]::Bold)
-$script:tabMain.Padding = New-Object System.Drawing.Point(10, 5)
+$script:tabMain.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
+$script:tabMain.Padding = New-Object System.Drawing.Point(12, 6)
+try { $script:tabMain.Appearance = [System.Windows.Forms.TabAppearance]::FlatButtons } catch { }
 
 $script:tabCapture = New-Object System.Windows.Forms.TabPage
-$script:tabCapture.Text = '  Live Capture  '
+$script:tabCapture.Text = '  Packets  '
 $script:tabCapture.BackColor = $script:C.Bg
+
+$script:tabFindings = New-Object System.Windows.Forms.TabPage
+$script:tabFindings.Text = '  Findings  '
+$script:tabFindings.BackColor = $script:C.Bg
 
 $script:tabHosts = New-Object System.Windows.Forms.TabPage
 $script:tabHosts.Text = '  Talkers  '
@@ -4274,11 +5069,11 @@ $script:tabStats.Text = '  Statistics  '
 $script:tabStats.BackColor = $script:C.Bg
 
 $script:tabConfig = New-Object System.Windows.Forms.TabPage
-$script:tabConfig.Text = '  Server Config  '
+$script:tabConfig.Text = '  Server  '
 $script:tabConfig.BackColor = $script:C.Bg
 
 $script:tabEvents = New-Object System.Windows.Forms.TabPage
-$script:tabEvents.Text = '  Event Log  '
+$script:tabEvents.Text = '  Events  '
 $script:tabEvents.BackColor = $script:C.Bg
 
 $script:tabHelp = New-Object System.Windows.Forms.TabPage
@@ -4289,7 +5084,12 @@ $script:tabLog = New-Object System.Windows.Forms.TabPage
 $script:tabLog.Text = '  Log  '
 $script:tabLog.BackColor = $script:C.Bg
 
-[void]$script:tabMain.TabPages.AddRange(@($script:tabCapture, $script:tabHosts, $script:tabStats, $script:tabConfig, $script:tabEvents, $script:tabHelp, $script:tabLog))
+[void]$script:tabMain.TabPages.AddRange(@($script:tabCapture, $script:tabFindings, $script:tabHosts, $script:tabStats, $script:tabConfig, $script:tabEvents, $script:tabHelp, $script:tabLog))
+$script:tabMain.Add_SelectedIndexChanged({
+    if ($script:tabMain.SelectedTab -eq $script:tabFindings) { Update-FindingsGrid }
+    elseif ($script:tabMain.SelectedTab -eq $script:tabStats) { Update-StatsTab }
+    elseif ($script:tabMain.SelectedTab -eq $script:tabHosts) { Update-HostsGrid }
+})
 
 # --- Capture tab: 3-pane Wireshark layout ---
 $splitH = New-Object System.Windows.Forms.SplitContainer
@@ -4320,7 +5120,7 @@ Enable-DoubleBuffer $script:lvPackets
 [void]$script:lvPackets.Columns.Add('Src Port', 70)
 [void]$script:lvPackets.Columns.Add('Destination', 120)
 [void]$script:lvPackets.Columns.Add('Dst Port', 70)
-[void]$script:lvPackets.Columns.Add('Protocol', 70)
+[void]$script:lvPackets.Columns.Add('Protocol', 96)
 [void]$script:lvPackets.Columns.Add('Length', 70)
 [void]$script:lvPackets.Columns.Add('Info', 620)
 
@@ -4328,25 +5128,37 @@ $script:lvPackets.Add_RetrieveVirtualItem({
     param($s, $e)
     try {
         $idx = $e.ItemIndex
-        if ($idx -lt 0 -or $idx -ge (Get-AppCount $script:ViewPackets)) {
-            $e.Item = New-Object System.Windows.Forms.ListViewItem('')
+        $count = Get-AppCount $script:ViewPackets
+        if ($idx -lt 0 -or $idx -ge $count) {
+            $e.Item = New-BlankPacketListItem
             return
         }
         $p = $script:ViewPackets[$idx]
-        $item = New-Object System.Windows.Forms.ListViewItem($p.No.ToString())
-        [void]$item.SubItems.Add($p.Time.ToString('HH:mm:ss.fff'))
-        [void]$item.SubItems.Add($p.Src)
-        [void]$item.SubItems.Add($p.SrcPort.ToString())
-        [void]$item.SubItems.Add($p.Dst)
-        [void]$item.SubItems.Add($p.DstPort.ToString())
-        [void]$item.SubItems.Add($p.Protocol)
-        [void]$item.SubItems.Add($p.Length.ToString())
-        [void]$item.SubItems.Add($p.Info)
-        $item.BackColor = Get-PacketRowColor $p
-        if ($p.IsSmb1) { $item.ForeColor = $script:C.Smb1Ink }
-        $e.Item = $item
+        if ($null -eq $p) {
+            $e.Item = New-BlankPacketListItem
+            return
+        }
+        $noText = ''
+        try { $noText = [string]$p.No } catch { $noText = '' }
+        $item = New-Object System.Windows.Forms.ListViewItem($noText)
+        $timeText = ''
+        try { $timeText = $p.Time.ToString('HH:mm:ss.fff') } catch { }
+        [void]$item.SubItems.Add($timeText)
+        [void]$item.SubItems.Add(([string]$p.Src))
+        [void]$item.SubItems.Add(([string]$p.SrcPort))
+        [void]$item.SubItems.Add(([string]$p.Dst))
+        [void]$item.SubItems.Add(([string]$p.DstPort))
+        [void]$item.SubItems.Add(([string]$p.Protocol))
+        [void]$item.SubItems.Add(([string]$p.Length))
+        $infoText = ''
+        try { $infoText = [string]$p.Info } catch { }
+        if ($null -eq $infoText) { $infoText = '' }
+        [void]$item.SubItems.Add($infoText)
+        try { $item.BackColor = Get-PacketRowColor $p } catch { }
+        try { if ($p.IsSmb1) { $item.ForeColor = $script:C.Smb1Ink } } catch { }
+        $e.Item = Complete-PacketListItem $item
     } catch {
-        $e.Item = New-Object System.Windows.Forms.ListViewItem('')
+        $e.Item = New-BlankPacketListItem
     }
 })
 $script:lvPackets.Add_SelectedIndexChanged({
@@ -4371,6 +5183,10 @@ $mFs = $ctx.Items.Add('Display filter: fileshare')
 $mFs.add_Click({ Set-DisplayFilter -Text 'fileshare' })
 $mSmb1 = $ctx.Items.Add('Display filter: smb1')
 $mSmb1.add_Click({ Set-DisplayFilter -Text 'smb1' })
+$mCol = $ctx.Items.Add('Display filter: collapse')
+$mCol.add_Click({ Set-DisplayFilter -Text 'collapse' })
+$mFind = $ctx.Items.Add('Show banner findings')
+$mFind.add_Click({ Show-BannerAlertPackets })
 [void]$ctx.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 $mMark = $ctx.Items.Add('Mark / unmark (Space)')
 $mMark.add_Click({ Toggle-MarkSelected })
@@ -4419,6 +5235,55 @@ $script:tabCapture.Controls.Add($splitH)
 $splitH.Add_SplitterMoved({ Remember-SplitterRatios })
 $splitV.Add_SplitterMoved({ Remember-SplitterRatios })
 $script:lvPackets.Add_Resize({ Update-PacketListColumns })
+
+# --- Findings tab (packets the red PRE-COLLAPSE / SMBv1 banner is alerting about) ---
+$findTop = New-FlowBar -MinHeight 44
+$script:lblFindingsCount = New-Object System.Windows.Forms.Label
+$script:lblFindingsCount.Text = 'No leftover packets yet. Click the red PRE-COLLAPSE banner after traffic arrives.'
+$script:lblFindingsCount.AutoSize = $true
+$script:lblFindingsCount.Margin = New-Object System.Windows.Forms.Padding(8, 10, 12, 4)
+$btnFindRefresh = New-FlatButton -Text 'Refresh' -Width 90 -BackColor $script:C.Blue -OnClick { Update-FindingsGrid -Force } -TipText 'Rebuild the leftover list from the capture buffer'
+$btnFindPackets = New-FlatButton -Text 'Open on Packets' -Width 150 -BackColor $script:C.Teal -OnClick { Show-SelectedFindingPacket } -TipText 'Jump to the selected leftover on the Packets tab'
+$btnFindBanner = New-FlatButton -Text 'Filter Packets' -Width 130 -BackColor $script:C.Dark -OnClick {
+    $kind = Get-ActiveBannerKind
+    $script:tabMain.SelectedTab = $script:tabCapture
+    Set-DisplayFilter -Text (Get-BannerFilterText $kind)
+} -TipText 'Show the same leftover packets on the Packets tab'
+$findTop.Controls.AddRange(@($script:lblFindingsCount, $btnFindRefresh, $btnFindPackets, $btnFindBanner))
+
+$script:dgvFindings = New-Object System.Windows.Forms.DataGridView
+$script:dgvFindings.Dock = 'Fill'
+$script:dgvFindings.AllowUserToAddRows = $false
+$script:dgvFindings.AllowUserToDeleteRows = $false
+$script:dgvFindings.ReadOnly = $true
+$script:dgvFindings.SelectionMode = 'FullRowSelect'
+$script:dgvFindings.MultiSelect = $false
+$script:dgvFindings.AutoSizeColumnsMode = 'Fill'
+$script:dgvFindings.BackgroundColor = $script:C.White
+$script:dgvFindings.BorderStyle = 'None'
+$script:dgvFindings.EnableHeadersVisualStyles = $false
+$script:dgvFindings.ColumnHeadersDefaultCellStyle.BackColor = $script:C.Header
+$script:dgvFindings.ColumnHeadersDefaultCellStyle.ForeColor = $script:C.White
+$script:dgvFindings.ColumnHeadersDefaultCellStyle.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+$script:dgvFindings.ColumnHeadersHeight = 30
+$script:dgvFindings.RowTemplate.Height = 26
+$script:dgvFindings.AlternatingRowsDefaultCellStyle.BackColor = $script:C.AltRow
+$script:dgvFindings.Font = New-Object System.Drawing.Font('Consolas', 9)
+foreach ($col in @('No','Time','Source','SrcPort','Destination','DstPort','Protocol','Finding','Info')) {
+    [void]$script:dgvFindings.Columns.Add($col, $col)
+}
+try { $script:dgvFindings.Columns['Finding'].FillWeight = 40 } catch { }
+try { $script:dgvFindings.Columns['Info'].FillWeight = 28 } catch { }
+$script:dgvFindings.Add_CellDoubleClick({ Show-SelectedFindingPacket })
+$script:dgvFindings.Add_KeyDown({
+    param($s, $e)
+    if ($e.KeyCode -eq 'Enter') {
+        $e.SuppressKeyPress = $true
+        Show-SelectedFindingPacket
+    }
+})
+$script:tabFindings.Controls.Add($script:dgvFindings)
+$script:tabFindings.Controls.Add($findTop)
 
 # --- Hosts tab ---
 $hostTop = New-FlowBar -MinHeight 44
@@ -4470,7 +5335,7 @@ $script:dgvHosts.Add_CellDoubleClick({
     if ($script:dgvHosts.SelectedRows.Count -gt 0) {
         $ip = $script:dgvHosts.SelectedRows[0].Cells['IP'].Value
         $script:tabMain.SelectedTab = $script:tabCapture
-        Set-DisplayFilter -Text ("smb1 and ip.addr=={0}" -f $ip)
+        Set-DisplayFilter -Text ("ip.addr=={0}" -f $ip)
     }
 })
 $script:tabHosts.Controls.Add($script:dgvHosts)
@@ -4516,7 +5381,7 @@ $script:numHours.Maximum = 168
 $script:numHours.Value = 24
 $script:numHours.Width = 60
 $script:numHours.Margin = New-Object System.Windows.Forms.Padding(0, 8, 8, 4)
-$btnScan = New-FlatButton -Text 'Scan SMB event logs' -Width 180 -BackColor $script:C.Blue -OnClick { Scan-SmbEventLogs }
+$btnScan = New-FlatButton -Text 'Scan event logs' -Width 160 -BackColor $script:C.Blue -OnClick { Scan-SmbEventLogs }
 $evTop.Controls.AddRange(@($lblH, $script:numHours, $btnScan))
 $script:dgvEvents = New-Object System.Windows.Forms.DataGridView
 $script:dgvEvents.Dock = 'Fill'
@@ -4592,11 +5457,16 @@ $form.Controls.Add($status)
 $form.Controls.Add($script:banner)
 $form.Controls.Add($script:adminHint)
 $form.Controls.Add($filterBar)
+$form.Controls.Add($sessionBar)
 $form.Controls.Add($tool)
+$form.Controls.Add($accentBar)
 $form.Controls.Add($header)
 
 # --- Menu ---
 $menu = New-Object System.Windows.Forms.MenuStrip
+$menu.BackColor = $script:C.Header
+$menu.ForeColor = $script:C.White
+$menu.Padding = New-Object System.Windows.Forms.Padding(8, 2, 0, 2)
 function Add-MenuAction {
     param($ParentItems, [string]$Text, [scriptblock]$Action)
     $item = $ParentItems.Add($Text)
@@ -4606,6 +5476,8 @@ function Add-MenuAction {
 $fileM = New-Object System.Windows.Forms.ToolStripMenuItem('File')
 Add-MenuAction $fileM.DropDownItems 'Open PCAP...' { Open-PcapFile }
 Add-MenuAction $fileM.DropDownItems 'Save current view...' { Save-PcapFile }
+Add-MenuAction $fileM.DropDownItems 'Save all traffic...' { Show-SaveAllDialog }
+Add-MenuAction $fileM.DropDownItems 'Save all to Desktop' { [void](Save-AllCaptureToDesktop) }
 Add-MenuAction $fileM.DropDownItems 'Load demo capture' { Import-DemoCapture }
 [void]$fileM.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 Add-MenuAction $fileM.DropDownItems 'Exit' { $script:MainForm.Close() }
@@ -4617,12 +5489,14 @@ Add-MenuAction $capM.DropDownItems 'Clear' { Clear-Capture }
 $navM = New-Object System.Windows.Forms.ToolStripMenuItem('Go')
 Add-MenuAction $navM.DropDownItems 'Go to packet...' { Show-GotoPacket }
 Add-MenuAction $navM.DropDownItems 'Follow stream' { Use-FollowStream }
+Add-MenuAction $navM.DropDownItems 'Open Findings tab' { $script:tabMain.SelectedTab = $script:tabFindings; Update-FindingsGrid -Force }
+Add-MenuAction $navM.DropDownItems 'Show banner packets' { Show-BannerAlertPackets }
 $helpM = New-Object System.Windows.Forms.ToolStripMenuItem('Help')
 Add-MenuAction $helpM.DropDownItems 'Open Help tab' { $script:tabMain.SelectedTab = $script:tabHelp }
 Add-MenuAction $helpM.DropDownItems 'About' {
     [void][System.Windows.Forms.MessageBox]::Show(
-        "PowerShark v$($script:AppVersion)`nWindows Server 2008 / 2008 R2 (PowerShell 2.0) through PowerShell 7+`nCurrently running: $($PSVersionTable.PSVersion) ($(Get-HostEdition))`n`nCaptures all IPv4. Filters: Active Directory, file shares, and Domain collapse (leftover machine accounts, GPO, simple bind, DC locator, NTP, NTLM).`nLive capture uses a raw IPv4 socket (no Npcap). PCAPs open in Wireshark.",
-        'About',
+        "PowerShark v$($script:AppVersion)`nAuthor: $($script:AppAuthor)`nWindows Server 2008 / 2008 R2 (PowerShell 2.0) through PowerShell 7+`nCurrently running: $($PSVersionTable.PSVersion) ($(Get-HostEdition))`n`nLive IPv4 capture for Active Directory, file shares, and domain collapse.`nClick the red PRE-COLLAPSE banner to list leftover packets on Findings.`nUse CLOSE AFTER to keep the app open, then auto-save the full capture to the Desktop and exit.`nSave all writes every buffered packet (not just the filtered view).`nRaw IPv4 socket — no Npcap. PCAPs open in Wireshark.",
+        'About PowerShark',
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Information)
 }
@@ -4640,6 +5514,7 @@ $form.Add_KeyDown({
     elseif ($e.Control -and $e.KeyCode -eq 'L') { $script:txtFilter.Focus(); $e.Handled = $true }
     elseif ($e.Control -and $e.KeyCode -eq 'F') { $script:txtFind.Focus(); $e.Handled = $true }
     elseif ($e.Control -and $e.KeyCode -eq 'G') { Show-GotoPacket; $e.Handled = $true }
+    elseif ($e.Control -and $e.Shift -and $e.KeyCode -eq 'S') { Show-SaveAllDialog; $e.Handled = $true }
     elseif ($e.Control -and $e.KeyCode -eq 'S') { Save-PcapFile; $e.Handled = $true }
     elseif ($e.Control -and $e.KeyCode -eq 'O') { Open-PcapFile; $e.Handled = $true }
 })
@@ -4662,7 +5537,20 @@ $form.Add_FormClosing({
 })
 
 Write-AppLog "PowerShark v$($script:AppVersion) started. Elevated=$($script:IsAdmin)  Host=$env:COMPUTERNAME  PS=$($PSVersionTable.PSVersion) ($(Get-HostEdition))" 'INFO'
-Write-AppLog 'Capture=All traffic. Use the Capture dropdown for Active Directory, File shares, or Domain collapse.' 'INFO'
+Write-AppLog 'Capture=All traffic. CLOSE AFTER saves the full buffer to the Desktop and exits. Save all dumps on demand.' 'INFO'
+if ($script:cmbSaveFormat) {
+    try {
+        $bootFmt = Get-SaveFormat $AutoSaveFormat
+        if ($bootFmt -eq 'csv') { $script:cmbSaveFormat.SelectedIndex = 1 }
+        else { $script:cmbSaveFormat.SelectedIndex = 0 }
+    } catch { }
+}
+if ($AutoCloseMinutes -gt 0) {
+    try {
+        $script:cmbTimer.Text = ('{0} minutes' -f $AutoCloseMinutes)
+        Apply-SessionTimerFromUi
+    } catch { }
+}
 Refresh-ConfigTab
 Update-StatsTab
 
