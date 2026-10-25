@@ -418,6 +418,24 @@ Assert-True (-not $splat.Contains('noConsole')) 'splat omits false switches'
 Assert-True $splat.Contains('STA') 'splat includes default STA'
 
 Write-Host ''
+Write-Host 'Script encoding'
+$bom = [byte[]](0xEF, 0xBB, 0xBF)
+foreach ($rel in @(
+        'PS2EXE-GUI.ps1',
+        'ps2exe/Invoke-ps2exe.ps1',
+        'ps2exe/PS2EXE-StudioCore.ps1',
+        'ps2exe/PS2EXE-StudioUI.ps1',
+        'tests/PS2EXE-Studio.Tests.ps1'
+    )) {
+    $path = Join-Path $repoRoot $rel
+    $bytes = [System.IO.File]::ReadAllBytes($path)
+    $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq $bom[0] -and $bytes[1] -eq $bom[1] -and $bytes[2] -eq $bom[2])
+    Assert-True (-not $hasBom) "$rel has no UTF-8 BOM"
+    $head = [System.Text.Encoding]::UTF8.GetString($bytes, 0, [Math]::Min(16, $bytes.Length))
+    Assert-True ($head.StartsWith('#Requires') -or $head.StartsWith('<#')) "$rel starts with a PowerShell directive"
+}
+
+Write-Host ''
 Write-Host ("Results: {0} passed, {1} failed" -f $script:Pass, $script:Fail)
 if ($script:Fail -gt 0) {
     Write-Host ''

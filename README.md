@@ -39,6 +39,8 @@ pwsh -File .\tests\PS2EXE-Studio.Tests.ps1
 
 The bundled compiler is `ps2exe/Invoke-ps2exe.ps1` (Ingo Karstein / Markus Scholtes, Microsoft Public License). See `ps2exe/THIRD-PARTY-NOTICES.txt`.
 
+If Windows PowerShell reports `The term '﻿#Requires' is not recognized`, the script was saved with a UTF-8 BOM. Re-copy `ps2exe/Invoke-ps2exe.ps1` from this repo (BOM-free) or re-save the file as **UTF-8 without BOM**. Do not run the compiler by pasting it into a console — use `.\PS2EXE-GUI.ps1` or `.\ps2exe\Invoke-ps2exe.ps1`.
+
 ## Other tools
 
 | Tool | Script |
