@@ -116,10 +116,14 @@ $script:Office365AppIds = @(
 )
 
 $script:AdminPortalAppIds = @(
-    'c44b4083-3bb0-49c1-b47d-974e53cbdf3c',
-    '00000006-0000-0ff1-ce00-000000000000',
-    '0000000a-0000-0000-c000-000000000000',
-    '00000002-0000-0000-c000-000000000000'
+    'c44b4083-3bb0-49c1-b47d-974e53cbdf3c', # Azure Portal
+    '797f4846-ba00-4fd7-ba43-dac1f8f63013', # Azure Service Management / ARM
+    '00000006-0000-0ff1-ce00-000000000000', # Office 365 Portal / Microsoft 365 admin
+    '0000000a-0000-0000-c000-000000000000', # Microsoft Intune
+    '00000002-0000-0000-c000-000000000000', # Microsoft Entra / Azure AD
+    '74658136-14ec-4630-ad9b-26e160ff0fc6', # Microsoft Entra admin center (ADIbizaUX)
+    '80ccca67-54bd-44ab-8625-4b79c4dc7775', # Microsoft 365 Security / compliance
+    '499b84ac-1321-427f-aa17-267ca6975798'  # Azure DevOps (sometimes admin-adjacent)
 )
 
 $script:UserActionMap = [ordered]@{
@@ -342,6 +346,51 @@ function Get-AppDisplayName {
         if ($script:WellKnownApps[$name] -eq $AppId) { return $name }
     }
     return $AppId
+}
+
+function Get-PolicyTargetSummary {
+    param($Conditions)
+    $apps = Get-Prop $Conditions 'applications'
+    $include = ConvertTo-StringArray (Get-Prop $apps 'includeApplications')
+    if ((Get-ItemCount $include) -eq 0) {
+        $actions = ConvertTo-StringArray (Get-Prop $apps 'includeUserActions')
+        if ((Get-ItemCount $actions) -gt 0) { return 'User actions: ' + ($actions -join ', ') }
+        return '(none)'
+    }
+    $names = New-Object System.Collections.Generic.List[string]
+    foreach ($id in $include) { [void]$names.Add((Get-AppDisplayName $id)) }
+    return ($names -join ', ')
+}
+
+function Test-PolicyCoversSelectedTarget {
+    param($PolicyApps, [string]$SelectedAppId)
+    $include = ConvertTo-StringArray (Get-Prop $PolicyApps 'includeApplications')
+    $exclude = ConvertTo-StringArray (Get-Prop $PolicyApps 'excludeApplications')
+    if ((Get-ItemCount $include) -eq 0) { return $false }
+    if (Test-CollectionContains $include 'None') { return $false }
+
+    if ($SelectedAppId -eq 'All') { return $true }
+
+    $covered = $false
+    if (Test-CollectionContains $include 'All') {
+        $covered = $true
+    } else {
+        foreach ($app in $include) {
+            if (Test-AppBundleMatch -SelectedAppId $SelectedAppId -PolicyAppId $app) {
+                $covered = $true
+                break
+            }
+        }
+    }
+    if (-not $covered) { return $false }
+
+    # Specific-app excludes only drop the policy when the selected
+    # target is that app. All-apps coverage still applies to the rest.
+    if ($SelectedAppId -eq 'All') { return $true }
+    foreach ($app in $exclude) {
+        if (Test-AppBundleMatch -SelectedAppId $SelectedAppId -PolicyAppId $app) { return $false }
+    }
+    return $true
 }
 
 # ============================================================
@@ -632,7 +681,10 @@ function Test-UserAssignment {
 
 function Test-AppBundleMatch {
     param([string]$SelectedAppId, [string]$PolicyAppId)
+    if ([string]::IsNullOrWhiteSpace($SelectedAppId) -or [string]::IsNullOrWhiteSpace($PolicyAppId)) { return $false }
     if ([string]::Equals($SelectedAppId, $PolicyAppId, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    # All cloud apps includes every policy target (Admin Portals, Office 365, custom apps).
+    if ($SelectedAppId -eq 'All' -or $PolicyAppId -eq 'All') { return $true }
     if ($PolicyAppId -eq 'Office365' -and ($SelectedAppId -eq 'Office365' -or $script:Office365AppIds -contains $SelectedAppId)) { return $true }
     if ($SelectedAppId -eq 'Office365' -and ($PolicyAppId -eq 'Office365' -or $script:Office365AppIds -contains $PolicyAppId)) { return $true }
     if ($PolicyAppId -eq 'MicrosoftAdminPortals' -and ($SelectedAppId -eq 'MicrosoftAdminPortals' -or $script:AdminPortalAppIds -contains $SelectedAppId)) { return $true }
@@ -678,23 +730,17 @@ function Test-ApplicationAssignment {
     }
 
     $selected = $Scenario.CloudAppId
-    $included = $false
-    if (Test-CollectionContains $includeApps 'All') {
-        $included = $true
-    } else {
-        foreach ($app in $includeApps) {
-            if (Test-AppBundleMatch -SelectedAppId $selected -PolicyAppId $app) { $included = $true; break }
-        }
-    }
-    if (-not $included) {
+    if (-not (Test-PolicyCoversSelectedTarget -PolicyApps $PolicyApps -SelectedAppId $selected)) {
         return @{ Matches = $false; Reason = 'application'; Detail = 'Cloud app is not in include applications' }
     }
-    foreach ($app in $excludeApps) {
-        if (Test-AppBundleMatch -SelectedAppId $selected -PolicyAppId $app) {
-            return @{ Matches = $false; Reason = 'application'; Detail = 'Cloud app is excluded' }
-        }
+    $targetNames = New-Object System.Collections.Generic.List[string]
+    foreach ($app in $includeApps) { [void]$targetNames.Add((Get-AppDisplayName $app)) }
+    $detail = if ($selected -eq 'All') {
+        'All cloud apps coverage includes policy target: ' + ($targetNames -join ', ')
+    } else {
+        'Cloud app matches policy target: ' + ($targetNames -join ', ')
     }
-    return @{ Matches = $true; Reason = $null; Detail = 'Cloud app matches' }
+    return @{ Matches = $true; Reason = $null; Detail = $detail }
 }
 
 function Test-PlatformCondition {
@@ -1099,6 +1145,7 @@ function New-WhatIfRow {
         GrantObject     = $grant
         SessionObject   = $session
         Conditions      = Get-Prop $Policy 'conditions'
+        TargetResources = Get-PolicyTargetSummary -Conditions (Get-Prop $Policy 'conditions')
         MatchNotes      = ($MatchNotes -join ' | ')
         Source          = 'local'
     }
@@ -1134,10 +1181,11 @@ function New-GraphEvaluateBody {
         default {
             $appId = $Scenario.CloudAppId
             if ($appId -eq 'All' -or $appId -eq 'Office365' -or $appId -eq 'MicrosoftAdminPortals') {
-                # Graph evaluate does not accept bundle tokens. Use a
-                # representative first-party app and flag the limitation.
-                $appId = '00000003-0000-0ff1-ce00-000000000000'
+                $reps = @(Get-RepresentativeAppIds -SelectedAppId $appId)
+                $appId = $reps[0]
             }
+            $overrideApp = Get-Prop $Scenario 'EvaluateAppId'
+            if ($overrideApp) { $appId = $overrideApp }
             $context = @{
                 '@odata.type'         = '#microsoft.graph.applicationContext'
                 includeApplications   = @($appId)
@@ -1211,9 +1259,108 @@ function ConvertFrom-GraphWhatIfResult {
         GrantObject     = $grant
         SessionObject   = $session
         Conditions      = Get-Prop $GraphItem 'conditions'
+        TargetResources = Get-PolicyTargetSummary -Conditions (Get-Prop $GraphItem 'conditions')
         MatchNotes      = ''
         Source          = 'graph'
     }
+}
+
+function Get-RepresentativeAppIds {
+    param([string]$SelectedAppId)
+    $ids = New-Object System.Collections.Generic.List[string]
+    switch ($SelectedAppId) {
+        'MicrosoftAdminPortals' {
+            [void]$ids.Add('c44b4083-3bb0-49c1-b47d-974e53cbdf3c')
+            [void]$ids.Add('00000006-0000-0ff1-ce00-000000000000')
+            [void]$ids.Add('0000000a-0000-0000-c000-000000000000')
+        }
+        'Office365' {
+            [void]$ids.Add('00000003-0000-0ff1-ce00-000000000000')
+            [void]$ids.Add('00000002-0000-0ff1-ce00-000000000000')
+            [void]$ids.Add('1fec8e78-bce4-4aaf-ab1b-5451cc387264')
+        }
+        'All' {
+            [void]$ids.Add('c44b4083-3bb0-49c1-b47d-974e53cbdf3c')
+            [void]$ids.Add('00000003-0000-0ff1-ce00-000000000000')
+            [void]$ids.Add('00000002-0000-0ff1-ce00-000000000000')
+            [void]$ids.Add('1fec8e78-bce4-4aaf-ab1b-5451cc387264')
+        }
+        default {
+            if ($SelectedAppId) { [void]$ids.Add($SelectedAppId) }
+        }
+    }
+    return $ids
+}
+
+function Merge-WhatIfResultSets {
+    param([Parameter(Mandatory = $true)][System.Collections.IEnumerable]$Sets)
+
+    $byId = @{}
+    foreach ($set in $Sets) {
+        $appName = [string]$set.AppName
+        foreach ($row in @($set.Rows)) {
+            $id = [string]$row.PolicyId
+            if (-not $byId.ContainsKey($id)) {
+                $byId[$id] = $row
+                $row | Add-Member -NotePropertyName EvaluatedTargets -NotePropertyValue (New-Object System.Collections.Generic.List[string]) -Force
+            }
+            $existing = $byId[$id]
+            if ($appName) { [void]$existing.EvaluatedTargets.Add($appName) }
+            if ($row.Applies) {
+                $existing.Applies = $true
+                $existing.AnalysisReason = 'notSet'
+                $existing.ReasonText = ConvertTo-AnalysisReasonText -Reason 'notSet'
+                $existing.Detail = "Applies when accessing $appName"
+                $existing.GrantControls = $row.GrantControls
+                $existing.SessionControls = $row.SessionControls
+                $existing.GrantObject = $row.GrantObject
+                $existing.SessionObject = $row.SessionObject
+            }
+        }
+    }
+    return @($byId.Values)
+}
+
+function Repair-BundleApplicationResults {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Results,
+        [Parameter(Mandatory = $true)]$Scenario,
+        $Policies
+    )
+    if ($Scenario.ContextType -ne 'application') { return $Results }
+    $selected = [string]$Scenario.CloudAppId
+    if ($selected -notin @('All', 'Office365', 'MicrosoftAdminPortals')) { return $Results }
+
+    $policyById = @{}
+    foreach ($policy in @($Policies)) {
+        $id = [string](Get-Prop $policy 'id')
+        if ($id) { $policyById[$id] = $policy }
+    }
+
+    foreach ($row in $Results) {
+        if ($row.Applies) { continue }
+        if ([string]$row.AnalysisReason -notmatch 'application') { continue }
+
+        $policyApps = $null
+        if ($policyById.ContainsKey([string]$row.PolicyId)) {
+            $policyApps = Get-Prop (Get-Prop $policyById[[string]$row.PolicyId] 'conditions') 'applications'
+        }
+        if (-not $policyApps) {
+            $policyApps = Get-Prop $row.Conditions 'applications'
+        }
+        if (-not (Test-PolicyCoversSelectedTarget -PolicyApps $policyApps -SelectedAppId $selected)) {
+            continue
+        }
+
+        $row.Applies = $true
+        $row.AnalysisReason = 'notSet'
+        $targets = Get-PolicyTargetSummary -Conditions ([pscustomobject]@{ applications = $policyApps })
+        $row.TargetResources = $targets
+        $row.ReasonText = "Applies to this user for target: $targets"
+        $row.Detail = "Graph evaluate cannot send All / Office 365 / Admin Portals as a single app token. Rechecked the policy assignment and it covers '$selected'."
+        $row.MatchNotes = $row.Detail
+    }
+    return $Results
 }
 
 function Invoke-GraphWhatIfEvaluate {
@@ -1505,6 +1652,35 @@ function Invoke-CaSelfTest {
     Assert-True ($rows[0].Applies -eq $true) 'Trusted named location matches RFC1918 IP'
     $script:NamedLocationCache = @{}
 
+    $adminPolicy = New-MockPolicy -Name 'O365 Admin Portal MFA' -Users @{ includeUsers = @('All'); excludeUsers = @(); includeGroups = @(); excludeGroups = @(); includeRoles = @(); excludeRoles = @() } -Applications @{ includeApplications = @('MicrosoftAdminPortals'); excludeApplications = @(); includeUserActions = @(); includeAuthenticationContextClassReferences = @() } -Grant @{ builtInControls = @('mfa'); operator = 'AND' }
+    $allScenario = $scenario.PSObject.Copy()
+    $allScenario.CloudAppId = 'All'
+    $rows = @(Invoke-LocalWhatIfEvaluate -UserSnapshot $user -Scenario $allScenario -Policies @($adminPolicy))
+    Assert-True ($rows[0].Applies -eq $true) 'All cloud apps includes Microsoft Admin Portals policies'
+
+    $sharePointScenario = $scenario.PSObject.Copy()
+    $sharePointScenario.CloudAppId = '00000003-0000-0ff1-ce00-000000000000'
+    $rows = @(Invoke-LocalWhatIfEvaluate -UserSnapshot $user -Scenario $sharePointScenario -Policies @($adminPolicy))
+    Assert-True ($rows[0].Applies -eq $false -and $rows[0].AnalysisReason -eq 'application') 'Admin Portal policy does not apply to a SharePoint-only sign-in'
+
+    $graphMiss = [pscustomobject]@{
+        PolicyId        = $adminPolicy.id
+        PolicyName      = $adminPolicy.displayName
+        PolicyState     = 'Report-Only'
+        Applies         = $false
+        AnalysisReason  = 'application'
+        ReasonText      = 'Cloud app does not match'
+        Detail          = 'Cloud app does not match'
+        GrantControls   = 'Require multifactor authentication'
+        SessionControls = ''
+        Conditions      = $adminPolicy.conditions
+        TargetResources = 'Microsoft Admin Portals'
+        MatchNotes      = ''
+        Source          = 'graph'
+    }
+    $repaired = @(Repair-BundleApplicationResults -Results @($graphMiss) -Scenario $allScenario -Policies @($adminPolicy))
+    Assert-True ($repaired[0].Applies -eq $true) 'All-apps repair flips Graph application-miss for Admin Portals'
+
     $pass = $script:__pass
     $fail = $script:__fail
     Write-Host ''
@@ -1637,15 +1813,27 @@ function Invoke-WhatIfEvaluation {
         throw 'Device platform and client app are required, matching the Entra What If tool.'
     }
 
-    Write-AppLog ("Evaluating {0} ({1}) against {2} cached policies." -f $snapshot.Upn, $snapshot.UserId, $script:PolicyCache.Count) 'INFO'
+    Write-AppLog ("Evaluating {0} ({1}) against {2} cached policies. Target: {3}" -f $snapshot.Upn, $snapshot.UserId, $script:PolicyCache.Count, $scenario.CloudAppId) 'INFO'
 
     $results = @()
     try {
-        $results = @(Invoke-GraphWhatIfEvaluate -User $user -Scenario $scenario)
-        if ($results.Count -eq 0) { throw 'Evaluate API returned no policies.' }
+        $repIds = @(Get-RepresentativeAppIds -SelectedAppId $scenario.CloudAppId)
+        if ((Get-ItemCount $repIds) -eq 0) { $repIds = @($scenario.CloudAppId) }
+        $sets = New-Object System.Collections.Generic.List[object]
+        foreach ($repId in $repIds) {
+            $probe = $scenario.PSObject.Copy()
+            $probe | Add-Member -NotePropertyName EvaluateAppId -NotePropertyValue $repId -Force
+            $appName = Get-AppDisplayName $repId
+            Write-AppLog ("What If probe against {0} ({1})" -f $appName, $repId) 'INFO'
+            $probeRows = @(Invoke-GraphWhatIfEvaluate -User $user -Scenario $probe)
+            [void]$sets.Add([pscustomobject]@{ AppName = $appName; Rows = $probeRows })
+        }
+        $results = @(Merge-WhatIfResultSets -Sets $sets)
+        if ((Get-ItemCount $results) -eq 0) { throw 'Evaluate API returned no policies.' }
+        $results = @(Repair-BundleApplicationResults -Results $results -Scenario $scenario -Policies $script:PolicyCache)
         $script:EngineName = 'Microsoft Graph What If API'
         if ($scenario.CloudAppId -in @('All', 'Office365', 'MicrosoftAdminPortals')) {
-            Write-AppLog 'Graph evaluate does not accept bundle app tokens. SharePoint Online was used as the representative target. Re-run with a specific app for tighter results.' 'WARN'
+            Write-AppLog ("Target '{0}' is a bundle. Evaluated representative apps and rechecked policy assignments so Admin Portals / Office 365 are not dropped." -f $scenario.CloudAppId) 'INFO'
         }
     } catch {
         Write-AppLog ("Graph What If API unavailable, using local evaluator: {0}" -f $_.Exception.Message) 'WARN'
@@ -1821,11 +2009,12 @@ function Add-ResultColumns {
     param($Grid)
     $Grid.Columns.Clear()
     foreach ($spec in @(
-            @{ Name = 'PolicyName'; Header = 'Policy'; Weight = 28 },
-            @{ Name = 'PolicyState'; Header = 'State'; Weight = 10 },
-            @{ Name = 'GrantControls'; Header = 'Grant controls'; Weight = 26 },
-            @{ Name = 'SessionControls'; Header = 'Session controls'; Weight = 16 },
-            @{ Name = 'ReasonText'; Header = 'Why'; Weight = 20 }
+            @{ Name = 'PolicyName'; Header = 'Policy'; Weight = 24 },
+            @{ Name = 'PolicyState'; Header = 'State'; Weight = 9 },
+            @{ Name = 'TargetResources'; Header = 'Policy targets'; Weight = 16 },
+            @{ Name = 'GrantControls'; Header = 'Grant controls'; Weight = 20 },
+            @{ Name = 'SessionControls'; Header = 'Session controls'; Weight = 13 },
+            @{ Name = 'ReasonText'; Header = 'Why'; Weight = 18 }
         )) {
         $col = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
         $col.Name = $spec.Name
@@ -1856,13 +2045,14 @@ function Update-StatusBar {
 function Bind-ResultGrid {
     param($Grid, $Rows)
     $table = New-Object System.Data.DataTable
-    foreach ($name in @('PolicyName', 'PolicyState', 'GrantControls', 'SessionControls', 'ReasonText', 'PolicyId')) {
+    foreach ($name in @('PolicyName', 'PolicyState', 'TargetResources', 'GrantControls', 'SessionControls', 'ReasonText', 'PolicyId')) {
         [void]$table.Columns.Add($name)
     }
     foreach ($row in $Rows) {
         $dr = $table.NewRow()
         $dr['PolicyName'] = $row.PolicyName
         $dr['PolicyState'] = $row.PolicyState
+        $dr['TargetResources'] = $row.TargetResources
         $dr['GrantControls'] = $row.GrantControls
         $dr['SessionControls'] = $row.SessionControls
         $dr['ReasonText'] = $row.ReasonText
@@ -1951,7 +2141,7 @@ function Export-WhatIfReport {
     if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
     if ($dlg.FileName -like '*.csv') {
         $script:LastResults |
-            Select-Object PolicyName, PolicyState, Applies, ReasonText, Detail, GrantControls, SessionControls, PolicyId, Source |
+            Select-Object PolicyName, PolicyState, TargetResources, Applies, ReasonText, Detail, GrantControls, SessionControls, PolicyId, Source |
             Export-Csv -Path $dlg.FileName -NoTypeInformation -Encoding UTF8
     } else {
         $script:txtDetail.Text + [Environment]::NewLine + ($script:LogEntries -join [Environment]::NewLine) |
@@ -2073,11 +2263,11 @@ function Show-WhatIfForm {
     $grpTarget.Location = New-Object System.Drawing.Point(12, 136)
     $grpTarget.Size = New-Object System.Drawing.Size(340, 168)
 
-    $script:cmbCloudApp = New-FieldCombo -X 12 -Y 42 -Width 316 -Items @($script:WellKnownApps.Keys) -SelectedIndex 4
+    $script:cmbCloudApp = New-FieldCombo -X 12 -Y 42 -Width 316 -Items @($script:WellKnownApps.Keys) -SelectedIndex 0
     $script:cmbUserAction = New-FieldCombo -X 12 -Y 86 -Width 316 -Items @($script:UserActionMap.Keys) -SelectedIndex 0
     $script:txtAuthContext = New-FieldBox -X 12 -Y 130 -Width 316
     $grpTarget.Controls.AddRange(@(
-            (New-FieldLabel -Text 'Cloud app *' -X 12 -Y 22),
+            (New-FieldLabel -Text 'Target resource *  (All apps includes Admin Portals)' -X 12 -Y 22 -Width 330),
             $script:cmbCloudApp,
             (New-FieldLabel -Text 'User action (optional)' -X 12 -Y 68),
             $script:cmbUserAction,
@@ -2218,7 +2408,8 @@ function Show-WhatIfForm {
     $script:txtDetail.Text = @"
 This tool follows the Entra Conditional Access What If model.
 
-Required: user, cloud app (or user action / auth context), device platform, client app.
+Required: user, target resource (or user action / auth context), device platform, client app.
+All cloud apps means coverage across every policy target, including Microsoft Admin Portals and Office 365. It is not a SharePoint-only probe.
 Optional conditions (IP, country, device, risk, authentication flow) should be filled in whenever a policy in the tenant uses them. Empty optional conditions can produce "not enough information" — that is safer than guessing.
 
 Accuracy notes
