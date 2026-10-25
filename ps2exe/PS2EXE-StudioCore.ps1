@@ -15,13 +15,34 @@ function Get-PS2EXEStudioVersion {
     return $script:PS2EXEStudioVersion
 }
 
-function Get-PS2EXEStudioAppData {
-    $root = Join-Path $env:APPDATA 'PS2EXE-Studio'
-    if ([string]::IsNullOrWhiteSpace($env:APPDATA)) {
-        $root = Join-Path ([System.IO.Path]::GetTempPath()) 'PS2EXE-Studio'
+function Test-PS2EXEPathExists {
+    param(
+        [string]$LiteralPath,
+        [ValidateSet('Any', 'Leaf', 'Container')]
+        [string]$PathType = 'Any'
+    )
+
+    if ([string]::IsNullOrWhiteSpace($LiteralPath)) {
+        return $false
     }
+    try {
+        if ($PathType -eq 'Any') {
+            return [bool](Test-Path -LiteralPath $LiteralPath -ErrorAction Stop)
+        }
+        return [bool](Test-Path -LiteralPath $LiteralPath -PathType $PathType -ErrorAction Stop)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-PS2EXEStudioAppData {
+    $base = [string]$env:APPDATA
+    if ([string]::IsNullOrWhiteSpace($base)) { $base = [string]$env:LOCALAPPDATA }
+    if ([string]::IsNullOrWhiteSpace($base)) { $base = [System.IO.Path]::GetTempPath() }
+    $root = Join-Path $base 'PS2EXE-Studio'
     $profiles = Join-Path $root 'profiles'
-    if (-not (Test-Path -LiteralPath $profiles)) {
+    if (-not (Test-PS2EXEPathExists -LiteralPath $profiles -PathType Container)) {
         New-Item -ItemType Directory -Path $profiles -Force | Out-Null
     }
     return [pscustomobject]@{
@@ -367,7 +388,7 @@ function Get-PS2EXEResolvedOutput {
     }
 
     $outputLooksLikeDirectory = $false
-    if ($RequireExistingPaths -and (Test-Path -LiteralPath $outputFile -PathType Container)) {
+    if ($RequireExistingPaths -and (Test-PS2EXEPathExists -LiteralPath $outputFile -PathType Container)) {
         $outputLooksLikeDirectory = $true
     }
     elseif (-not $RequireExistingPaths) {
@@ -400,7 +421,7 @@ function Test-PS2EXEOptions {
         $issues += ,(ConvertTo-PS2EXEIssue Error 'INPUT_REQUIRED' 'Select a PowerShell script to compile.' @('inputFile'))
     }
     elseif (-not $SkipFileSystem) {
-        if (-not (Test-Path -LiteralPath $Options.inputFile -PathType Leaf)) {
+        if (-not (Test-PS2EXEPathExists -LiteralPath $Options.inputFile -PathType Leaf)) {
             $issues += ,(ConvertTo-PS2EXEIssue Error 'INPUT_MISSING' "Input file not found: $($Options.inputFile)" @('inputFile'))
         }
         else {
@@ -432,7 +453,7 @@ function Test-PS2EXEOptions {
         if ($iconExt -and $iconExt -notin @('.ico', '.icon')) {
             $issues += ,(ConvertTo-PS2EXEIssue Warning 'ICON_EXT' 'Icon should be a .ico file. Other formats are usually rejected by the C# compiler.' @('iconFile'))
         }
-        if (-not $SkipFileSystem -and -not (Test-Path -LiteralPath $Options.iconFile -PathType Leaf)) {
+        if (-not $SkipFileSystem -and -not (Test-PS2EXEPathExists -LiteralPath $Options.iconFile -PathType Leaf)) {
             $issues += ,(ConvertTo-PS2EXEIssue Error 'ICON_MISSING' "Icon file not found: $($Options.iconFile)" @('iconFile'))
         }
     }
@@ -527,7 +548,7 @@ function Test-PS2EXEOptions {
             $issues += ,(ConvertTo-PS2EXEIssue Error 'EMBED_PAIR' "Embedded file #$embedIndex needs both a source path and a runtime target path." @('embedFiles'))
             continue
         }
-        if (-not $SkipFileSystem -and -not (Test-Path -LiteralPath $src -PathType Leaf)) {
+        if (-not $SkipFileSystem -and -not (Test-PS2EXEPathExists -LiteralPath $src -PathType Leaf)) {
             $issues += ,(ConvertTo-PS2EXEIssue Error 'EMBED_MISSING' "Embedded source file not found: $src" @('embedFiles'))
         }
     }
@@ -755,7 +776,7 @@ function Export-PS2EXEProfile {
     $profileObject = ConvertTo-PS2EXEProfile -Options $Options -Name $Name
     $json = $profileObject | ConvertTo-Json -Depth 6
     $dir = [System.IO.Path]::GetDirectoryName($Path)
-    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+    if ($dir -and -not (Test-PS2EXEPathExists -LiteralPath $dir -PathType Container)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
     Set-Content -LiteralPath $Path -Value $json -Encoding UTF8
@@ -768,7 +789,7 @@ function Import-PS2EXEProfile {
         [string]$Path
     )
 
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    if (-not (Test-PS2EXEPathExists -LiteralPath $Path -PathType Leaf)) {
         throw "Profile not found: $Path"
     }
     $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
@@ -779,7 +800,6 @@ function Import-PS2EXEProfile {
 function Get-PS2EXEScriptInfo {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)]
         [string]$Path
     )
 
@@ -797,7 +817,7 @@ function Get-PS2EXEScriptInfo {
         LastWrite   = $null
     }
 
-    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-PS2EXEPathExists -LiteralPath $Path -PathType Leaf)) {
         return $info
     }
 
@@ -928,7 +948,7 @@ function Add-PS2EXERecentFile {
 
     $paths = Get-PS2EXEStudioAppData
     $list = @()
-    if (Test-Path -LiteralPath $paths.RecentFiles) {
+    if (Test-PS2EXEPathExists -LiteralPath $paths.RecentFiles -PathType Leaf) {
         try {
             $list = @((Get-Content -LiteralPath $paths.RecentFiles -Raw -Encoding UTF8 | ConvertFrom-Json))
         }
@@ -941,7 +961,7 @@ function Add-PS2EXERecentFile {
     $list = @($full) + @($list | Where-Object { $_ -and $_ -ne $full })
     $list = @($list | Select-Object -First $Keep)
     $dir = [System.IO.Path]::GetDirectoryName($paths.RecentFiles)
-    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+    if ($dir -and -not (Test-PS2EXEPathExists -LiteralPath $dir -PathType Container)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
     ($list | ConvertTo-Json) | Set-Content -LiteralPath $paths.RecentFiles -Encoding UTF8
@@ -950,7 +970,7 @@ function Add-PS2EXERecentFile {
 
 function Get-PS2EXERecentFiles {
     $paths = Get-PS2EXEStudioAppData
-    if (-not (Test-Path -LiteralPath $paths.RecentFiles)) { return @() }
+    if (-not (Test-PS2EXEPathExists -LiteralPath $paths.RecentFiles -PathType Leaf)) { return @() }
     try {
         return @((Get-Content -LiteralPath $paths.RecentFiles -Raw -Encoding UTF8 | ConvertFrom-Json))
     }

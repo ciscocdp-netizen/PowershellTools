@@ -6,6 +6,23 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
+try {
+    [System.Windows.Forms.Application]::SetUnhandledExceptionMode(
+        [System.Windows.Forms.UnhandledExceptionMode]::CatchException
+    )
+    [System.Windows.Forms.Application]::add_ThreadException({
+        param($sender, $eventArgs)
+        $message = $eventArgs.Exception.Message
+        try { Write-StudioLog $message 'ERROR' } catch { }
+        [System.Windows.Forms.MessageBox]::Show(
+            $message,
+            'PS2EXE Studio',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        ) | Out-Null
+    })
+}
+catch { }
 
 $script:EngineLoaded = Import-PS2EXEEngine
 $script:Options = New-PS2EXEOptions
@@ -209,7 +226,10 @@ function Update-StudioDependentControls {
 }
 
 function Update-StudioScriptInfo {
-    $path = $script:txtInput.Text.Trim()
+    $path = ''
+    if ($script:txtInput -and $null -ne $script:txtInput.Text) {
+        $path = $script:txtInput.Text.Trim()
+    }
     $info = Get-PS2EXEScriptInfo -Path $path
     if (-not $info.Exists) {
         $script:txtPreview.Text = 'Select a PowerShell script to preview the first 80 lines, encoding, and comment-based help.'
@@ -234,7 +254,7 @@ function Update-StudioIconPreview {
         $script:picIcon.Image = $null
     }
     $iconPath = $script:txtIcon.Text.Trim()
-    if ($iconPath -and (Test-Path -LiteralPath $iconPath -PathType Leaf)) {
+    if (Test-PS2EXEPathExists -LiteralPath $iconPath -PathType Leaf) {
         try {
             $icon = New-Object System.Drawing.Icon($iconPath)
             $script:picIcon.Image = $icon.ToBitmap()
@@ -248,6 +268,7 @@ function Update-StudioIconPreview {
 
 function Update-StudioValidation {
     if ($script:Updating) { return }
+    try {
     $script:Options = Read-StudioOptionsFromUi
     Update-StudioDependentControls
     $issues = @(Test-PS2EXEOptions -Options $script:Options)
@@ -289,6 +310,13 @@ function Update-StudioValidation {
     else {
         $script:lblResolvedOut.Text = 'Resolved output: (select an input script)'
     }
+    }
+    catch {
+        Set-StudioStatus $_.Exception.Message $script:Theme.Error
+        if ($script:txtLog) {
+            Write-StudioLog $_.Exception.Message 'ERROR'
+        }
+    }
 }
 
 function Use-StudioInputFile {
@@ -326,7 +354,7 @@ function Browse-StudioFile {
     $dlg.Title = $Title
     $dlg.Filter = $Filter
     $dlg.CheckFileExists = $true
-    if ($Current -and (Test-Path -LiteralPath $Current)) {
+    if (Test-PS2EXEPathExists -LiteralPath $Current) {
         $dlg.InitialDirectory = [System.IO.Path]::GetDirectoryName($Current)
         $dlg.FileName = [System.IO.Path]::GetFileName($Current)
     }
@@ -429,7 +457,7 @@ function Invoke-StudioCompile {
         foreach ($w in @($warnRec)) { Write-StudioLog ([string]$w) 'WARN' }
         foreach ($e in @($errRec)) { Write-StudioLog ([string]$e) 'ERROR' }
 
-        if ($resolved -and (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+        if (Test-PS2EXEPathExists -LiteralPath $resolved -PathType Leaf) {
             $ok = $true
             $script:LastOutputPath = $resolved
             $item = Get-Item -LiteralPath $resolved
@@ -1141,7 +1169,7 @@ $btnApplyPreset.Add_Click({
 $script:cmbRecent.Add_SelectedIndexChanged({
     if ($script:Updating) { return }
     $path = [string]$script:cmbRecent.SelectedItem
-    if ($path -and (Test-Path -LiteralPath $path)) { Use-StudioInputFile -Path $path }
+    if (Test-PS2EXEPathExists -LiteralPath $path -PathType Leaf) { Use-StudioInputFile -Path $path }
 })
 
 $btnSaveProfile.Add_Click({
@@ -1192,16 +1220,16 @@ $script:btnCopyCmd.Add_Click({
 $script:btnOpenFolder.Add_Click({
     $target = $script:LastOutputPath
     if (-not $target) { $target = Get-PS2EXEResolvedOutput -Options $script:Options }
-    if ($target -and (Test-Path -LiteralPath $target)) {
+    if (Test-PS2EXEPathExists -LiteralPath $target -PathType Leaf) {
         Start-Process explorer.exe -ArgumentList "/select,`"$target`""
     }
     elseif ($target) {
         $dir = [System.IO.Path]::GetDirectoryName($target)
-        if (Test-Path -LiteralPath $dir) { Start-Process explorer.exe -ArgumentList $dir }
+        if (Test-PS2EXEPathExists -LiteralPath $dir -PathType Container) { Start-Process explorer.exe -ArgumentList $dir }
     }
 })
 $script:btnRunExe.Add_Click({
-    if ($script:LastOutputPath -and (Test-Path -LiteralPath $script:LastOutputPath)) {
+    if (Test-PS2EXEPathExists -LiteralPath $script:LastOutputPath -PathType Leaf) {
         Start-Process -FilePath $script:LastOutputPath
     }
 })
@@ -1292,42 +1320,48 @@ $script:form.Add_FormClosing({
 })
 
 $script:form.Add_Shown({
-    $split.SplitterDistance = [Math]::Max(420, [int]($split.ClientSize.Height * 0.72))
-    $script:form.PerformLayout()
-    $x = $script:form.ClientSize.Width - 20
-    foreach ($b in @($script:btnClearLog, $script:btnCopyCmd, $script:btnRunExe, $script:btnOpenFolder, $script:btnCompile)) {
-        $x -= $b.Width + 8
-        $b.Location = New-Object System.Drawing.Point($x, 12)
-    }
-    Refresh-StudioRecent
-    $restored = $false
-    if ($ProfilePath -and (Test-Path -LiteralPath $ProfilePath)) {
-        $script:Options = Import-PS2EXEProfile -Path $ProfilePath
-        $restored = $true
-    }
-    else {
-        $paths = Get-PS2EXEStudioAppData
-        if (Test-Path -LiteralPath $paths.LastSession) {
-            try {
-                $script:Options = Import-PS2EXEProfile -Path $paths.LastSession
-                $restored = $true
-            }
-            catch { }
+    try {
+        $split.SplitterDistance = [Math]::Max(420, [int]($split.ClientSize.Height * 0.72))
+        $script:form.PerformLayout()
+        $x = $script:form.ClientSize.Width - 20
+        foreach ($b in @($script:btnClearLog, $script:btnCopyCmd, $script:btnRunExe, $script:btnOpenFolder, $script:btnCompile)) {
+            $x -= $b.Width + 8
+            $b.Location = New-Object System.Drawing.Point($x, 12)
         }
+        Refresh-StudioRecent
+        $restored = $false
+        if (Test-PS2EXEPathExists -LiteralPath $ProfilePath -PathType Leaf) {
+            $script:Options = Import-PS2EXEProfile -Path $ProfilePath
+            $restored = $true
+        }
+        else {
+            $paths = Get-PS2EXEStudioAppData
+            if (Test-PS2EXEPathExists -LiteralPath $paths.LastSession -PathType Leaf) {
+                try {
+                    $script:Options = Import-PS2EXEProfile -Path $paths.LastSession
+                    $restored = $true
+                }
+                catch { }
+            }
+        }
+        if ($restored) { Write-StudioOptionsToUi -Options $script:Options }
+        if ($InputFile) { Use-StudioInputFile -Path $InputFile }
+        Update-StudioScriptInfo
+        Update-StudioIconPreview
+        Update-StudioValidation
+        Write-StudioLog "PS2EXE Studio $($script:PS2EXEStudioVersion) ready." 'INFO'
+        if ($script:EngineLoaded) {
+            Write-StudioLog 'Invoke-ps2exe engine loaded.' 'SUCCESS'
+        }
+        else {
+            Write-StudioLog 'Engine not loaded. Compilation is disabled until ps2exe\Invoke-ps2exe.ps1 or the ps2exe module is available.' 'ERROR'
+        }
+        Write-StudioLog 'Set an input script, adjust options, and press F5 to compile.' 'INFO'
     }
-    if ($restored) { Write-StudioOptionsToUi -Options $script:Options }
-    if ($InputFile) { Use-StudioInputFile -Path $InputFile }
-    Update-StudioScriptInfo
-    Update-StudioIconPreview
-    Update-StudioValidation
-    Write-StudioLog "PS2EXE Studio $($script:PS2EXEStudioVersion) ready." 'INFO'
-    if ($script:EngineLoaded) {
-        Write-StudioLog 'Invoke-ps2exe engine loaded.' 'SUCCESS'
+    catch {
+        Write-StudioLog $_.Exception.Message 'ERROR'
+        Set-StudioStatus $_.Exception.Message $script:Theme.Error
     }
-    else {
-        Write-StudioLog 'Engine not loaded. Compilation is disabled until ps2exe\Invoke-ps2exe.ps1 or the ps2exe module is available.' 'ERROR'
-    }
-    Write-StudioLog 'Set an input script, adjust options, and press F5 to compile.' 'INFO'
 })
 
 [System.Windows.Forms.Application]::Run($script:form)

@@ -391,6 +391,18 @@ finally {
 $infoMissing = Get-PS2EXEScriptInfo -Path (Join-Path ([System.IO.Path]::GetTempPath()) 'does-not-exist-ps2exe.ps1')
 Assert-True (-not $infoMissing.Exists) 'missing script reported as not exists'
 
+$emptyInfo = $null
+$emptyThrew = $false
+try {
+    $emptyInfo = Get-PS2EXEScriptInfo -Path ''
+} catch {
+    $emptyThrew = $true
+}
+Assert-True (-not $emptyThrew) 'empty script path does not throw'
+Assert-True ($null -ne $emptyInfo -and -not $emptyInfo.Exists) 'empty script path returns missing info'
+Assert-True (-not (Test-PS2EXEPathExists -LiteralPath '')) 'empty path is treated as missing'
+Assert-True (-not (Test-PS2EXEPathExists -LiteralPath '   ')) 'whitespace path is treated as missing'
+
 # --- Copy options ---
 Write-Host ''
 Write-Host 'Options copy'
