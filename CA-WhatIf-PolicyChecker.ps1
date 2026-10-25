@@ -279,12 +279,12 @@ function Test-CollectionContains {
 
 function ConvertTo-PolicyStateLabel {
     param([string]$State)
-    switch -Regex ($State) {
-        '^(enabled|enabledForEnforcement)$' { return 'Enforced' }
-        '^(reportOnly|enabledForReportingButNotEnforced)$' { return 'Report-Only' }
-        '^(disabled)$' { return 'Disabled' }
-        default { return $(if ($State) { $State } else { 'Unknown' }) }
-    }
+    $text = [string]$State
+    if ([string]::IsNullOrWhiteSpace($text)) { return 'Unknown' }
+    if ($text -match 'report|ReportingButNotEnforced') { return 'Report-Only' }
+    if ($text -match '^disabled$') { return 'Disabled' }
+    if ($text -match '^enabled') { return 'Enforced' }
+    return $text
 }
 
 function ConvertTo-AnalysisReasonText {
@@ -655,7 +655,10 @@ function Test-UserAssignment {
     }
 
     if (-not $included) {
-        return @{ Matches = $false; Detail = 'User is not in include users, groups, roles, or guests' }
+        return @{
+            Matches = $false
+            Detail  = ("{0} is not in this policy include list ({1} user(s), {2} group(s), {3} role(s))." -f $UserSnapshot.Upn, (Get-ItemCount $includeUsers), (Get-ItemCount $includeGroups), (Get-ItemCount $includeRoles))
+        }
     }
 
     if (Test-CollectionContains $excludeUsers $UserSnapshot.UserId) {
@@ -1325,6 +1328,7 @@ function Repair-BundleApplicationResults {
     param(
         [Parameter(Mandatory = $true)][object[]]$Results,
         [Parameter(Mandatory = $true)]$Scenario,
+        [Parameter(Mandatory = $true)]$UserSnapshot,
         $Policies
     )
     if ($Scenario.ContextType -ne 'application') { return $Results }
@@ -1340,25 +1344,79 @@ function Repair-BundleApplicationResults {
     foreach ($row in $Results) {
         if ($row.Applies) { continue }
         if ([string]$row.AnalysisReason -notmatch 'application') { continue }
+        if (-not $policyById.ContainsKey([string]$row.PolicyId)) { continue }
 
-        $policyApps = $null
+        $policy = $policyById[[string]$row.PolicyId]
+        $local = @(Invoke-LocalWhatIfEvaluate -UserSnapshot $UserSnapshot -Scenario $Scenario -Policies @($policy)) | Select-Object -First 1
+        if (-not $local) { continue }
+
+        $row.Applies = [bool]$local.Applies
+        $row.AnalysisReason = $local.AnalysisReason
+        $row.ReasonText = $local.ReasonText
+        $row.Detail = $local.Detail
+        $row.MatchNotes = $local.MatchNotes
+        $row.TargetResources = $local.TargetResources
+        if ($local.Applies) {
+            $row.Detail = "All-apps / bundle target rechecked locally. User assignment and conditions match. Policy targets: $($local.TargetResources)"
+        }
+    }
+    return $Results
+}
+
+function Confirm-UserAssignmentOnResults {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Results,
+        [Parameter(Mandatory = $true)]$UserSnapshot,
+        $Policies
+    )
+    $policyById = @{}
+    foreach ($policy in @($Policies)) {
+        $id = [string](Get-Prop $policy 'id')
+        if ($id) { $policyById[$id] = $policy }
+    }
+
+    foreach ($row in $Results) {
+        $policy = $null
         if ($policyById.ContainsKey([string]$row.PolicyId)) {
-            $policyApps = Get-Prop (Get-Prop $policyById[[string]$row.PolicyId] 'conditions') 'applications'
+            $policy = $policyById[[string]$row.PolicyId]
         }
-        if (-not $policyApps) {
-            $policyApps = Get-Prop $row.Conditions 'applications'
+        $users = $null
+        if ($policy) {
+            $users = Get-Prop (Get-Prop $policy 'conditions') 'users'
         }
-        if (-not (Test-PolicyCoversSelectedTarget -PolicyApps $policyApps -SelectedAppId $selected)) {
-            continue
+        if (-not $users) {
+            $users = Get-Prop $row.Conditions 'users'
         }
+        if (-not $users) { continue }
 
-        $row.Applies = $true
-        $row.AnalysisReason = 'notSet'
-        $targets = Get-PolicyTargetSummary -Conditions ([pscustomobject]@{ applications = $policyApps })
-        $row.TargetResources = $targets
-        $row.ReasonText = "Applies to this user for target: $targets"
-        $row.Detail = "Graph evaluate cannot send All / Office 365 / Admin Portals as a single app token. Rechecked the policy assignment and it covers '$selected'."
-        $row.MatchNotes = $row.Detail
+        $test = Test-UserAssignment -PolicyUsers $users -UserSnapshot $UserSnapshot
+        if (-not $test.Matches) {
+            $row.Applies = $false
+            $row.AnalysisReason = 'users'
+            $row.ReasonText = ConvertTo-AnalysisReasonText -Reason 'users'
+            $row.Detail = $test.Detail
+            $row.MatchNotes = $test.Detail
+        }
+    }
+    return $Results
+}
+
+function Sync-ResultStateFromCache {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Results,
+        $Policies
+    )
+    $policyById = @{}
+    foreach ($policy in @($Policies)) {
+        $id = [string](Get-Prop $policy 'id')
+        if ($id) { $policyById[$id] = $policy }
+    }
+    foreach ($row in $Results) {
+        if (-not $policyById.ContainsKey([string]$row.PolicyId)) { continue }
+        $raw = [string](Get-Prop $policyById[[string]$row.PolicyId] 'state')
+        if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+        $row.RawState = $raw
+        $row.PolicyState = ConvertTo-PolicyStateLabel -State $raw
     }
     return $Results
 }
@@ -1678,8 +1736,48 @@ function Invoke-CaSelfTest {
         MatchNotes      = ''
         Source          = 'graph'
     }
-    $repaired = @(Repair-BundleApplicationResults -Results @($graphMiss) -Scenario $allScenario -Policies @($adminPolicy))
+    $repaired = @(Repair-BundleApplicationResults -Results @($graphMiss) -Scenario $allScenario -UserSnapshot $user -Policies @($adminPolicy))
     Assert-True ($repaired[0].Applies -eq $true) 'All-apps repair flips Graph application-miss for Admin Portals'
+
+    $twoUserPolicy = New-MockPolicy -Name 'CA4002 Salesforce MFA' -State 'enabledForReportingButNotEnforced' -Users @{ includeUsers = @('99999999-9999-9999-9999-999999999999'); excludeUsers = @(); includeGroups = @(); excludeGroups = @(); includeRoles = @(); excludeRoles = @() } -Applications @{ includeApplications = @('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'); excludeApplications = @(); includeUserActions = @(); includeAuthenticationContextClassReferences = @() } -Grant @{ builtInControls = @('mfa'); operator = 'AND' }
+    $graphMissTwoUser = [pscustomobject]@{
+        PolicyId        = $twoUserPolicy.id
+        PolicyName      = $twoUserPolicy.displayName
+        PolicyState     = 'Enforced'
+        RawState        = 'enabled'
+        Applies         = $true
+        AnalysisReason  = 'notSet'
+        ReasonText      = 'Policy applies to this sign-in'
+        Detail          = 'Policy applies to this sign-in'
+        GrantControls   = 'Require multifactor authentication'
+        SessionControls = ''
+        Conditions      = $twoUserPolicy.conditions
+        TargetResources = 'Salesforce'
+        MatchNotes      = ''
+        Source          = 'graph'
+    }
+    $confirmed = @(Confirm-UserAssignmentOnResults -Results @($graphMissTwoUser) -UserSnapshot $user -Policies @($twoUserPolicy))
+    Assert-True ($confirmed[0].Applies -eq $false -and $confirmed[0].AnalysisReason -eq 'users') 'Specific-user policy does not apply to a user who is not included'
+    $synced = @(Sync-ResultStateFromCache -Results @($confirmed) -Policies @($twoUserPolicy))
+    Assert-True ($synced[0].PolicyState -eq 'Report-Only') 'Cached report-only state wins over a Graph enabled label'
+
+    $graphAppMissTwoUser = [pscustomobject]@{
+        PolicyId        = $twoUserPolicy.id
+        PolicyName      = $twoUserPolicy.displayName
+        PolicyState     = 'Enforced'
+        Applies         = $false
+        AnalysisReason  = 'application'
+        ReasonText      = 'Cloud app does not match'
+        Detail          = 'Cloud app does not match'
+        GrantControls   = 'Require multifactor authentication'
+        SessionControls = ''
+        Conditions      = $twoUserPolicy.conditions
+        TargetResources = 'Salesforce'
+        MatchNotes      = ''
+        Source          = 'graph'
+    }
+    $repairedTwo = @(Repair-BundleApplicationResults -Results @($graphAppMissTwoUser) -Scenario $allScenario -UserSnapshot $user -Policies @($twoUserPolicy))
+    Assert-True ($repairedTwo[0].Applies -eq $false -and $repairedTwo[0].AnalysisReason -eq 'users') 'All-apps repair does not ignore a two-user include list'
 
     $pass = $script:__pass
     $fail = $script:__fail
@@ -1830,7 +1928,9 @@ function Invoke-WhatIfEvaluation {
         }
         $results = @(Merge-WhatIfResultSets -Sets $sets)
         if ((Get-ItemCount $results) -eq 0) { throw 'Evaluate API returned no policies.' }
-        $results = @(Repair-BundleApplicationResults -Results $results -Scenario $scenario -Policies $script:PolicyCache)
+        $results = @(Repair-BundleApplicationResults -Results $results -Scenario $scenario -UserSnapshot $snapshot -Policies $script:PolicyCache)
+        $results = @(Confirm-UserAssignmentOnResults -Results $results -UserSnapshot $snapshot -Policies $script:PolicyCache)
+        $results = @(Sync-ResultStateFromCache -Results $results -Policies $script:PolicyCache)
         $script:EngineName = 'Microsoft Graph What If API'
         if ($scenario.CloudAppId -in @('All', 'Office365', 'MicrosoftAdminPortals')) {
             Write-AppLog ("Target '{0}' is a bundle. Evaluated representative apps and rechecked policy assignments so Admin Portals / Office 365 are not dropped." -f $scenario.CloudAppId) 'INFO'
@@ -1838,6 +1938,8 @@ function Invoke-WhatIfEvaluation {
     } catch {
         Write-AppLog ("Graph What If API unavailable, using local evaluator: {0}" -f $_.Exception.Message) 'WARN'
         $results = @(Invoke-LocalWhatIfEvaluate -UserSnapshot $snapshot -Scenario $scenario -Policies $script:PolicyCache)
+        $results = @(Confirm-UserAssignmentOnResults -Results $results -UserSnapshot $snapshot -Policies $script:PolicyCache)
+        $results = @(Sync-ResultStateFromCache -Results $results -Policies $script:PolicyCache)
         $script:EngineName = 'Local fallback evaluator'
     }
 
