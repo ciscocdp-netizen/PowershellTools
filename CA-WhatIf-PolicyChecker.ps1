@@ -198,6 +198,8 @@ $script:lblCombined          = $null
 $script:pnlCombined          = $null
 $script:dgvApply             = $null
 $script:dgvSkip              = $null
+$script:splitMain            = $null
+$script:splitResults         = $null
 $script:tabApply             = $null
 $script:tabSkip              = $null
 
@@ -1746,6 +1748,51 @@ function New-AeroButton {
     return $btn
 }
 
+function Set-SplitContainerLayout {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Forms.SplitContainer]$Split,
+        [int]$DesiredDistance,
+        [int]$Panel1Min = 150,
+        [int]$Panel2Min = 150
+    )
+    if ($null -eq $Split -or $Split.IsDisposed) { return }
+
+    $span = if ($Split.Orientation -eq [System.Windows.Forms.Orientation]::Vertical) {
+        $Split.Width
+    } else {
+        $Split.Height
+    }
+    $bar = [Math]::Max(1, $Split.SplitterWidth)
+    if ($span -le ($bar + 40)) { return }
+
+    $usable = $span - $bar
+    $p1 = [Math]::Min($Panel1Min, [int]($usable / 3))
+    $p2 = [Math]::Min($Panel2Min, [int]($usable / 3))
+    if ($p1 -lt 25) { $p1 = 25 }
+    if ($p2 -lt 25) { $p2 = 25 }
+    if (($p1 + $p2) -ge $usable) {
+        $p1 = 25
+        $p2 = 25
+    }
+
+    try {
+        # Reset mins first so SplitterDistance can be assigned on the current size.
+        $Split.Panel1MinSize = 25
+        $Split.Panel2MinSize = 25
+        $min = $p1
+        $max = $usable - $p2
+        if ($max -lt $min) { return }
+        $distance = $DesiredDistance
+        if ($distance -lt $min) { $distance = $min }
+        if ($distance -gt $max) { $distance = $max }
+        $Split.SplitterDistance = $distance
+        $Split.Panel1MinSize = $p1
+        $Split.Panel2MinSize = $p2
+    } catch {
+        # Control handle or size is not ready yet; Shown will retry.
+    }
+}
+
 function Set-GridChrome {
     param($Grid)
     $Grid.AllowUserToAddRows = $false
@@ -1989,15 +2036,12 @@ function Show-WhatIfForm {
     $script:lblTenant.Text = 'Tenant: not connected'
     [void]$status.Items.AddRange(@($script:lblStatus, $script:lblEngine, $script:lblTenant))
 
-    $split = New-Object System.Windows.Forms.SplitContainer
-    $split.Dock = 'Fill'
-    $split.SplitterDistance = 370
-    $split.SplitterWidth = 6
-    $split.BackColor = $panelEdge
-    $split.Panel1.BackColor = $glass
-    $split.Panel2.BackColor = $aeroBg
-    $split.Panel1MinSize = 320
-    $split.Panel2MinSize = 500
+    $script:splitMain = New-Object System.Windows.Forms.SplitContainer
+    $script:splitMain.Dock = 'Fill'
+    $script:splitMain.SplitterWidth = 6
+    $script:splitMain.BackColor = $panelEdge
+    $script:splitMain.Panel1.BackColor = $glass
+    $script:splitMain.Panel2.BackColor = $aeroBg
 
     # ----- Left: sign-in conditions (scrollable Aero group) -----
     $leftScroll = New-Object System.Windows.Forms.Panel
@@ -2092,7 +2136,7 @@ function Show-WhatIfForm {
     $grpActions.Controls.AddRange(@($btnConnect, $btnWhatIf, $btnExport, $btnClear))
 
     $leftScroll.Controls.AddRange(@($grpIdentity, $grpTarget, $grpCond, $grpActions))
-    $split.Panel1.Controls.Add($leftScroll)
+    $script:splitMain.Panel1.Controls.Add($leftScroll)
 
     # ----- Right: combined result + tabs + detail -----
     $right = New-Object System.Windows.Forms.Panel
@@ -2113,14 +2157,13 @@ function Show-WhatIfForm {
     $script:lblCombined.Text = 'Configure a sign-in and select What If. Combined enforced controls appear here.'
     $script:pnlCombined.Controls.Add($script:lblCombined)
 
-    $bottomSplit = New-Object System.Windows.Forms.SplitContainer
-    $bottomSplit.Dock = 'Fill'
-    $bottomSplit.Orientation = 'Horizontal'
-    $bottomSplit.SplitterDistance = 360
-    $bottomSplit.SplitterWidth = 6
-    $bottomSplit.BackColor = $panelEdge
-    $bottomSplit.Panel1.BackColor = $aeroBg
-    $bottomSplit.Panel2.BackColor = $glass
+    $script:splitResults = New-Object System.Windows.Forms.SplitContainer
+    $script:splitResults.Dock = 'Fill'
+    $script:splitResults.Orientation = 'Horizontal'
+    $script:splitResults.SplitterWidth = 6
+    $script:splitResults.BackColor = $panelEdge
+    $script:splitResults.Panel1.BackColor = $aeroBg
+    $script:splitResults.Panel2.BackColor = $glass
 
     $script:tabs = New-Object System.Windows.Forms.TabControl
     $script:tabs.Dock = 'Fill'
@@ -2187,17 +2230,17 @@ Accuracy notes
 "@
     $grpDetail.Controls.Add($script:txtDetail)
 
-    $bottomSplit.Panel1.Controls.Add($script:tabs)
-    $bottomSplit.Panel2.Controls.Add($grpDetail)
+    $script:splitResults.Panel1.Controls.Add($script:tabs)
+    $script:splitResults.Panel2.Controls.Add($grpDetail)
 
     $rightInner = New-Object System.Windows.Forms.Panel
     $rightInner.Dock = 'Fill'
     $rightInner.Padding = New-Object System.Windows.Forms.Padding(10, 8, 10, 8)
-    $rightInner.Controls.Add($bottomSplit)
+    $rightInner.Controls.Add($script:splitResults)
     $rightInner.Controls.Add($script:pnlCombined)
-    $split.Panel2.Controls.Add($rightInner)
+    $script:splitMain.Panel2.Controls.Add($rightInner)
 
-    $form.Controls.Add($split)
+    $form.Controls.Add($script:splitMain)
     $form.Controls.Add($status)
     $form.Controls.Add($header)
 
@@ -2267,6 +2310,9 @@ Accuracy notes
     })
 
     $form.Add_Shown({
+        $form.PerformLayout()
+        Set-SplitContainerLayout -Split $script:splitMain -DesiredDistance 370 -Panel1Min 300 -Panel2Min 420
+        Set-SplitContainerLayout -Split $script:splitResults -DesiredDistance 360 -Panel1Min 160 -Panel2Min 140
         $script:txtUpn.Focus()
         Write-AppLog "Conditional Access What If v$script:AppVersion started." 'INFO'
     })
