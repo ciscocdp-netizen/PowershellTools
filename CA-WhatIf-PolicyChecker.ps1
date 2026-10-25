@@ -2313,6 +2313,16 @@ function Show-WhatIfForm {
     $lblSub.BackColor = [System.Drawing.Color]::Transparent
     $lblSub.Location = New-Object System.Drawing.Point(20, 46)
     $lblSub.AutoSize = $true
+
+    $pnlConnect = New-Object System.Windows.Forms.Panel
+    $pnlConnect.Dock = 'Right'
+    $pnlConnect.Width = 168
+    $pnlConnect.BackColor = [System.Drawing.Color]::Transparent
+    $btnConnect = New-AeroButton -Text 'Connect' -X 14 -Y 22 -Width 140 -Height 34 -Kind Ok
+    $btnConnect.BackColor = [System.Drawing.Color]::White
+    $btnConnect.ForeColor = New-AeroColor 22 82 145
+    $pnlConnect.Controls.Add($btnConnect)
+    $header.Controls.Add($pnlConnect)
     $header.Controls.AddRange(@($lblTitle, $lblSub))
 
     $status = New-Object System.Windows.Forms.StatusStrip
@@ -2419,13 +2429,12 @@ function Show-WhatIfForm {
     $grpActions.Font = New-UiFont -Size 9 -Style ([System.Drawing.FontStyle]::Bold)
     $grpActions.ForeColor = $navy
     $grpActions.Location = New-Object System.Drawing.Point(12, 750)
-    $grpActions.Size = New-Object System.Drawing.Size(340, 118)
+    $grpActions.Size = New-Object System.Drawing.Size(340, 78)
 
-    $btnConnect = New-AeroButton -Text 'Connect' -X 12 -Y 28 -Width 150 -Kind Secondary
-    $btnWhatIf  = New-AeroButton -Text 'What If' -X 174 -Y 28 -Width 150 -Kind Primary
-    $btnExport  = New-AeroButton -Text 'Export' -X 12 -Y 70 -Width 150 -Kind Secondary
-    $btnClear   = New-AeroButton -Text 'Clear' -X 174 -Y 70 -Width 150 -Kind Secondary
-    $grpActions.Controls.AddRange(@($btnConnect, $btnWhatIf, $btnExport, $btnClear))
+    $btnWhatIf = New-AeroButton -Text 'What If' -X 12 -Y 28 -Width 150 -Kind Primary
+    $btnExport = New-AeroButton -Text 'Export' -X 174 -Y 28 -Width 74 -Kind Secondary
+    $btnClear  = New-AeroButton -Text 'Clear' -X 254 -Y 28 -Width 74 -Kind Secondary
+    $grpActions.Controls.AddRange(@($btnWhatIf, $btnExport, $btnClear))
 
     $leftScroll.Controls.AddRange(@($grpIdentity, $grpTarget, $grpCond, $grpActions))
     $script:splitMain.Panel1.Controls.Add($leftScroll)
