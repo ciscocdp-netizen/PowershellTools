@@ -57,6 +57,18 @@ if (-not $SelfTest) {
         Start-Process -FilePath $exe -ArgumentList $argList -Wait -NoNewWindow
         exit $LASTEXITCODE
     }
+
+    # Load WinForms before any window exists. SetCompatibleTextRenderingDefault
+    # throws if ISE, VS Code, or a previous run already created an IWin32Window.
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    Add-Type -AssemblyName System.Data
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+    try {
+        [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
+    } catch [System.InvalidOperationException] {
+        # Host already created a window; visual styles still apply.
+    }
 }
 
 # ============================================================
@@ -1914,7 +1926,6 @@ function Show-WhatIfForm {
     Add-Type -AssemblyName System.Drawing
     Add-Type -AssemblyName System.Data
     [System.Windows.Forms.Application]::EnableVisualStyles()
-    [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
 
     $aeroBg     = New-AeroColor 227 238 249
     $glass      = New-AeroColor 244 249 253
