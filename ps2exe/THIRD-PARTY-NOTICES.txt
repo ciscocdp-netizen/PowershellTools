@@ -1,0 +1,12 @@
+PS2EXE compiler engine
+======================
+
+ps2exe/Invoke-ps2exe.ps1 is the PS2EXE compiler originally written by
+Ingo Karstein and reworked (with GUI support) by Markus Scholtes.
+
+Upstream: https://github.com/MScholtes/PS2EXE
+License : Microsoft Public License (Ms-PL)
+          https://opensource.org/licenses/MS-PL
+
+The interactive studio GUI (PS2EXE-GUI.ps1 and PS2EXE-StudioCore.ps1) is
+original work for this repository and calls the bundled engine.
