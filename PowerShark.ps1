@@ -14,8 +14,11 @@
     (SMB1/2/3, NFS, SRVSVC).
 
     Capture filter dropdown: All traffic, Active Directory, File shares, SMB, LDAP,
-    LDAPS, Kerberos, DNS, RPC, NFS, Domain collapse, RC4. Display filters work on the current view.
-    Click the red PRE-COLLAPSE (or SMBv1) banner to list leftover packets on Findings.
+    LDAPS, Kerberos, DNS, RPC, NFS, Domain collapse, RC4. RC4 rows show the TCP/UDP
+    session (src:port -> dst:port) and the Kerberos account (user@REALM) when the
+    cname is in the clear (AS-REQ / TGS-REQ / AS-REP / TGS-REP). Display filters
+    work on the current view. Click the red PRE-COLLAPSE (or SMBv1) banner to list
+    leftover packets on Findings.
 
     Designed for Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012 / 2012 R2,
     and PowerShell 7 on Windows. Live capture needs an elevated Administrator session.
@@ -35,6 +38,8 @@
       smb1
       rc4
       ldaps
+      user:legacyapp
+      account:legacyapp
       tcp.port==389
       ip.addr==10.1.1.8
 
@@ -67,7 +72,7 @@
 
 .NOTES
     Author      : Anthony Blake
-    Version     : 1.5
+    Version     : 1.6
     Compatible  : Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012
                   (PowerShell 3.0), 2012 R2 (PowerShell 4.0), 5.1, and PowerShell 7+.
                   There is no Requires-Version directive. Do not use -shl/-shr
@@ -88,7 +93,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.5'
+$script:AppVersion = '1.6'
 $script:AppAuthor  = 'Anthony Blake'
 
 # Version is checked at runtime on purpose. Do not add "#Requires -Version".
@@ -226,6 +231,30 @@ function Get-PacketServiceName {
     return $proto
 }
 
+function Get-PacketSessionText {
+    param($Packet)
+    if ($null -eq $Packet) { return '' }
+    $src = ''
+    $dst = ''
+    $sp = ''
+    $dp = ''
+    try { $src = [string]$Packet.Src } catch { }
+    try { $dst = [string]$Packet.Dst } catch { }
+    try { $sp = [string]$Packet.SrcPort } catch { }
+    try { $dp = [string]$Packet.DstPort } catch { }
+    return ('{0}:{1} -> {2}:{3}' -f $src, $sp, $dst, $dp)
+}
+
+function Get-PacketAccountText {
+    param($Packet)
+    if ($null -eq $Packet) { return '' }
+    $u = ''
+    try { $u = [string]$Packet.UserName } catch { }
+    if (-not (Test-BlankString $u)) { return $u }
+    if ($Packet.IsRc4) { return '(account not in cleartext)' }
+    return ''
+}
+
 function Get-PacketFindingReasons {
     param($Packet)
     $list = New-Object System.Collections.ArrayList
@@ -253,7 +282,16 @@ function Get-PacketFindingReasons {
     if ($Packet.IsKpasswd) { [void]$list.Add('Kerberos password change (464) — password changes still go through this KDC.') }
     if ($Packet.IsGc) { [void]$list.Add('Global Catalog (3268/3269) — forest-wide lookups still hit this domain.') }
     if ($Packet.IsSmb1) { [void]$list.Add('SMBv1 — remaining NT LM 0.12 client; replace before the file server / DC is retired.') }
-    if ($Packet.IsRc4) { [void]$list.Add('RC4 (Kerberos etype 23 rc4-hmac, or TLS-RC4) — weak cipher. Move tickets to AES (etype 17/18) and disable RC4 on the KDC.') }
+    if ($Packet.IsRc4) {
+        $sess = Get-PacketSessionText $Packet
+        $acct = Get-PacketAccountText $Packet
+        $svc = ''
+        try { $svc = [string]$Packet.QueryName } catch { }
+        $line = 'RC4 (Kerberos etype 23 rc4-hmac, or TLS-RC4) — session {0}  account {1}' -f $sess, $acct
+        if (-not (Test-BlankString $svc)) { $line = $line + ('  service {0}' -f $svc) }
+        $line = $line + '. Weak cipher. Move tickets to AES (etype 17/18) and disable RC4 on the KDC.'
+        [void]$list.Add($line)
+    }
     return $list
 }
 
@@ -1162,7 +1200,12 @@ public static class PowerSharkParser {
         if (p.AppOp == "AS-REQ" || p.AppOp == "AS-REP" || p.AppOp == "TGS-REQ" || p.AppOp == "TGS-REP")
             p.IsKdc = true;
         if (p.UserName != null && p.UserName.Length > 1) {
-            if (p.UserName[p.UserName.Length - 1] == '$') p.IsMachine = true;
+            string u = p.UserName;
+            if (u[u.Length - 1] == '$') p.IsMachine = true;
+            else {
+                int at = u.IndexOf('@');
+                if (at > 0 && u[at - 1] == '$') p.IsMachine = true;
+            }
         }
         if (p.IsSimpleBind && (p.QueryName == null || p.QueryName.Length == 0)) p.IsAnonymous = true;
         if (p.QueryName != null && p.QueryName.Length > 0) {
@@ -1303,6 +1346,196 @@ public static class PowerSharkParser {
         return v;
     }
 
+    static bool NextBerTlv(byte[] r, ref int pos, int end, out int tag, out int contentPos, out int contentLen) {
+        tag = 0;
+        contentPos = 0;
+        contentLen = 0;
+        if (pos >= end || pos >= r.Length) return false;
+        tag = r[pos++];
+        if ((tag & 0x1F) == 0x1F) {
+            while (pos < end && (r[pos] & 0x80) != 0) pos++;
+            if (pos < end) pos++;
+        }
+        contentLen = ReadBerLen(r, ref pos, end);
+        if (contentLen < 0 || pos + contentLen > end) return false;
+        contentPos = pos;
+        pos += contentLen;
+        return true;
+    }
+
+    static int FindDirectContext(byte[] r, int pos, int end, int ctx) {
+        int wantC = 0xA0 | ctx;
+        int wantP = 0x80 | ctx;
+        int tag, cp, cl;
+        int p = pos;
+        while (NextBerTlv(r, ref p, end, out tag, out cp, out cl)) {
+            if (tag == wantC || tag == wantP) return cp;
+        }
+        return -1;
+    }
+
+    static bool LooksLikeKrName(string s) {
+        if (s == null || s.Length < 1 || s.Length > 64) return false;
+        int i;
+        for (i = 0; i < s.Length; i++) {
+            char c = s[i];
+            if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+                || c == '.' || c == '-' || c == '_' || c == '$' || c == '/'))
+                return false;
+        }
+        return true;
+    }
+
+    static string ReadKerberosStringAt(byte[] r, int pos, int end) {
+        if (r == null || pos < 0 || pos >= end) return "";
+        int tag = r[pos];
+        if (tag == 0x1B || tag == 0x16 || tag == 0x13 || tag == 0x04 || tag == 0x1A) {
+            int p = pos + 1;
+            int len = ReadBerLen(r, ref p, end);
+            if (len < 1 || p + len > end) return "";
+            string s = Encoding.ASCII.GetString(r, p, len);
+            return LooksLikeKrName(s) ? s : "";
+        }
+        if (tag == 0x30) return ReadPrincipalName(r, pos, end);
+        if ((tag & 0x20) != 0) {
+            int p = pos + 1;
+            int len = ReadBerLen(r, ref p, end);
+            if (len < 1 || p + len > end) return "";
+            return ReadKerberosStringAt(r, p, p + len);
+        }
+        return "";
+    }
+
+    static string ReadPrincipalName(byte[] r, int pos, int end) {
+        if (r == null || pos < 0 || pos >= end) return "";
+        if (r[pos] != 0x30) return ReadKerberosStringAt(r, pos, end);
+        int p = pos + 1;
+        int slen = ReadBerLen(r, ref p, end);
+        if (slen < 0) return "";
+        int seqEnd = p + slen;
+        if (seqEnd > end) seqEnd = end;
+        int strPos = FindDirectContext(r, p, seqEnd, 1);
+        int walk = (strPos >= 0) ? strPos : p;
+        int walkEnd = seqEnd;
+        if (walk < walkEnd && r[walk] == 0x30) {
+            walk++;
+            int inner = ReadBerLen(r, ref walk, walkEnd);
+            if (inner >= 0) walkEnd = walk + inner;
+        }
+        string[] parts = new string[6];
+        int n = 0;
+        int tag, cp, cl;
+        while (n < 6 && NextBerTlv(r, ref walk, walkEnd, out tag, out cp, out cl)) {
+            if (tag == 0x1B || tag == 0x16 || tag == 0x13 || tag == 0x04 || tag == 0x1A) {
+                string s = Encoding.ASCII.GetString(r, cp, cl);
+                if (LooksLikeKrName(s)) parts[n++] = s;
+            } else if (tag == 0x30 || (tag & 0x20) != 0) {
+                string inner = ReadPrincipalName(r, cp - 0, (cp + cl) > end ? end : (cp + cl));
+                if (inner != null && inner.Length > 0 && n == 0) return inner;
+            }
+        }
+        if (n == 0) return "";
+        if (n == 1) return parts[0];
+        string[] used = new string[n];
+        int i;
+        for (i = 0; i < n; i++) used[i] = parts[i];
+        return string.Join("/", used);
+    }
+
+    static void ApplyKerberosNames(PowerSharkPacket p, string cname, string realm, string sname) {
+        if (cname == null) cname = "";
+        if (realm == null) realm = "";
+        if (sname == null) sname = "";
+        if (cname.Length > 0 && (p.UserName == null || p.UserName.Length == 0)) {
+            p.UserName = realm.Length > 0 ? cname + "@" + realm : cname;
+        }
+        if (sname.Length > 0) p.QueryName = sname;
+        else if (realm.Length > 0 && (p.QueryName == null || p.QueryName.Length == 0))
+            p.QueryName = realm;
+    }
+
+    static void UnwrapSeq(byte[] r, ref int pos, ref int end) {
+        if (pos < end && r[pos] == 0x30) {
+            pos++;
+            int sl = ReadBerLen(r, ref pos, end);
+            if (sl >= 0 && pos + sl <= end) end = pos + sl;
+        }
+    }
+
+    static void ExtractKdcReqNames(PowerSharkPacket p, byte[] r, int seqPos, int seqEnd) {
+        int body = FindDirectContext(r, seqPos, seqEnd, 4);
+        if (body < 0) return;
+        int bp = body;
+        int bend = seqEnd;
+        UnwrapSeq(r, ref bp, ref bend);
+        string cname = "";
+        string realm = "";
+        string sname = "";
+        int cp = FindDirectContext(r, bp, bend, 1);
+        int rp = FindDirectContext(r, bp, bend, 2);
+        int sp = FindDirectContext(r, bp, bend, 3);
+        if (cp >= 0) cname = ReadPrincipalName(r, cp, bend);
+        if (rp >= 0) realm = ReadKerberosStringAt(r, rp, bend);
+        if (sp >= 0) sname = ReadPrincipalName(r, sp, bend);
+        ApplyKerberosNames(p, cname, realm, sname);
+    }
+
+    static void ExtractKdcRepNames(PowerSharkPacket p, byte[] r, int seqPos, int seqEnd) {
+        string realm = "";
+        string cname = "";
+        string sname = "";
+        int rp = FindDirectContext(r, seqPos, seqEnd, 3);
+        int cp = FindDirectContext(r, seqPos, seqEnd, 4);
+        if (rp >= 0) realm = ReadKerberosStringAt(r, rp, seqEnd);
+        if (cp >= 0) cname = ReadPrincipalName(r, cp, seqEnd);
+        int tp = FindDirectContext(r, seqPos, seqEnd, 5);
+        if (tp >= 0 && tp < seqEnd && (r[tp] == 0x61 || r[tp] == 0x30)) {
+            int tpos = tp;
+            int tag, tContent, tLen;
+            int cursor = tp;
+            if (NextBerTlv(r, ref cursor, seqEnd, out tag, out tContent, out tLen)) {
+                int te = tContent + tLen;
+                int inner = tContent;
+                UnwrapSeq(r, ref inner, ref te);
+                int sr = FindDirectContext(r, inner, te, 1);
+                int sn = FindDirectContext(r, inner, te, 2);
+                if ((realm == null || realm.Length == 0) && sr >= 0)
+                    realm = ReadKerberosStringAt(r, sr, te);
+                if (sn >= 0) sname = ReadPrincipalName(r, sn, te);
+            }
+        }
+        ApplyKerberosNames(p, cname, realm, sname);
+    }
+
+    static void ExtractKerberosNamesAt(PowerSharkPacket p, byte[] r, int appOff, int end, int app) {
+        int pos = appOff;
+        int tag, cp, cl;
+        if (!NextBerTlv(r, ref pos, end, out tag, out cp, out cl)) return;
+        int seqPos = cp;
+        int seqEnd = cp + cl;
+        UnwrapSeq(r, ref seqPos, ref seqEnd);
+        if (app == 10 || app == 12) ExtractKdcReqNames(p, r, seqPos, seqEnd);
+        else if (app == 11 || app == 13) ExtractKdcRepNames(p, r, seqPos, seqEnd);
+        else if (app == 14) {
+            int tp = FindDirectContext(r, seqPos, seqEnd, 3);
+            if (tp >= 0) ExtractKdcRepNames(p, r, tp, seqEnd);
+        }
+    }
+
+    static void ExtractKerberosNames(PowerSharkPacket p, byte[] r, int off, int end) {
+        if (p == null || r == null || off < 0) return;
+        int i;
+        for (i = off; i < end; i++) {
+            int tag = r[i];
+            int cls = tag & 0xC0;
+            int app = tag & 0x1F;
+            if (cls == 0x40 && app >= 10 && app <= 15) {
+                ExtractKerberosNamesAt(p, r, i, end, app);
+                return;
+            }
+        }
+    }
+
     static bool LooksLikeTls(byte[] r, int off, int end) {
         if (r == null || off + 2 >= end || off + 2 >= r.Length) return false;
         return r[off] == 0x16 && r[off + 1] == 0x03 && r[off + 2] <= 3;
@@ -1440,13 +1673,23 @@ public static class PowerSharkParser {
         else if (PortIs(p.SrcPort, p.DstPort, 464)) op = "Kpasswd";
         p.AppOp = op;
         if (app == 10 || app == 11 || app == 12 || app == 13) p.IsKdc = true;
-        p.Info = "Kerberos " + op;
-        string realm = ExtractPrintable(r, off, Math.Min(end - off, 80));
-        if (realm != null && realm.Length >= 3) {
-            p.QueryName = realm;
-            p.Info = p.Info + " " + realm;
+        ExtractKerberosNames(p, r, off, end);
+        if (p.QueryName == null || p.QueryName.Length == 0) {
+            string realm = ExtractPrintable(r, off, Math.Min(end - off, 80));
+            if (realm != null && realm.Length >= 3) p.QueryName = realm;
         }
+        p.Info = "Kerberos " + op;
+        if (p.UserName != null && p.UserName.Length > 0) p.Info = p.Info + " " + p.UserName;
+        if (p.QueryName != null && p.QueryName.Length > 0) p.Info = p.Info + " " + p.QueryName;
         ScanRc4(p);
+    }
+
+    static void FillKerberosAccount(PowerSharkPacket p, byte[] r, int off, int end) {
+        if (p == null || r == null) return;
+        if (p.UserName != null && p.UserName.Length > 0) return;
+        ExtractKerberosNames(p, r, off, end);
+        if (p.UserName != null && p.UserName.Length > 0 && p.Info != null && p.Info.IndexOf(p.UserName) < 0)
+            p.Info = p.Info + " " + p.UserName;
     }
 
     static bool EtypeIsRc4(int etype) {
@@ -1518,6 +1761,7 @@ public static class PowerSharkParser {
         for (i = off; i + 4 < end; i++) {
             if (MatchEncryptedRc4(r, i, end, ref etype, ref n)) {
                 MarkRc4Packet(p, etype, true, i, n, "RC4");
+                FillKerberosAccount(p, r, off, end);
                 return;
             }
         }
@@ -1525,10 +1769,12 @@ public static class PowerSharkParser {
             for (i = off; i + 2 < end; i++) {
                 if (r[i] == 0x02 && r[i + 1] == 0x01 && EtypeIsRc4(r[i + 2])) {
                     MarkRc4Packet(p, r[i + 2], false, i, 3, "RC4");
+                    FillKerberosAccount(p, r, off, end);
                     return;
                 }
                 if (i + 3 < end && r[i] == 0x02 && r[i + 1] == 0x02 && r[i + 2] == 0 && EtypeIsRc4(r[i + 3])) {
                     MarkRc4Packet(p, r[i + 3], false, i, 4, "RC4");
+                    FillKerberosAccount(p, r, off, end);
                     return;
                 }
             }
@@ -1882,24 +2128,66 @@ public static class PowerSharkParser {
         return pkt;
     }
 
-    static byte[] BuildKerberosAsReqRc4() {
-        byte[] realm = Encoding.ASCII.GetBytes("CONTOSO.LOCAL");
-        int innerLen = 5 + realm.Length + 3;
-        byte[] inner = new byte[innerLen];
-        inner[0] = 0xA0;
-        inner[1] = 0x03;
-        inner[2] = 0x02;
-        inner[3] = 0x01;
-        inner[4] = 23;
-        Array.Copy(realm, 0, inner, 5, realm.Length);
-        inner[5 + realm.Length] = 0x02;
-        inner[6 + realm.Length] = 0x01;
-        inner[7 + realm.Length] = 23;
-        byte[] pkt = new byte[2 + inner.Length];
-        pkt[0] = 0x6A;
-        pkt[1] = (byte)inner.Length;
-        Array.Copy(inner, 0, pkt, 2, inner.Length);
+    static byte[] BerTlv(byte tag, byte[] content) {
+        if (content == null) content = new byte[0];
+        int n = content.Length;
+        byte[] pkt;
+        int i;
+        if (n < 128) {
+            pkt = new byte[2 + n];
+            pkt[0] = tag;
+            pkt[1] = (byte)n;
+            i = 2;
+        } else if (n < 256) {
+            pkt = new byte[3 + n];
+            pkt[0] = tag;
+            pkt[1] = 0x81;
+            pkt[2] = (byte)n;
+            i = 3;
+        } else {
+            pkt = new byte[4 + n];
+            pkt[0] = tag;
+            pkt[1] = 0x82;
+            pkt[2] = (byte)(n >> 8);
+            pkt[3] = (byte)n;
+            i = 4;
+        }
+        if (n > 0) Array.Copy(content, 0, pkt, i, n);
         return pkt;
+    }
+
+    static byte[] BerInt(int v) {
+        return new byte[] { 0x02, 0x01, (byte)v };
+    }
+
+    static byte[] BerGstr(string s) {
+        return BerTlv(0x1B, Encoding.ASCII.GetBytes(s));
+    }
+
+    static byte[] BerCtx(int ctx, byte[] content) {
+        return BerTlv((byte)(0xA0 | ctx), content);
+    }
+
+    static byte[] BerSeq(byte[] content) {
+        return BerTlv(0x30, content);
+    }
+
+    static byte[] BuildPrincipalName(int nameType, string[] parts) {
+        byte[] strings = new byte[0];
+        int i;
+        for (i = 0; i < parts.Length; i++) strings = Concat(strings, BerGstr(parts[i]));
+        byte[] body = Concat(BerCtx(0, BerInt(nameType)), BerCtx(1, BerSeq(strings)));
+        return BerSeq(body);
+    }
+
+    static byte[] BuildKerberosAsReqRc4() {
+        byte[] cname = BuildPrincipalName(1, new string[] { "legacyapp" });
+        byte[] realm = BerGstr("CONTOSO.LOCAL");
+        byte[] sname = BuildPrincipalName(2, new string[] { "krbtgt", "CONTOSO.LOCAL" });
+        byte[] enc = BerSeq(Concat(BerCtx(0, BerInt(23)), BerCtx(2, new byte[] { 0x04, 0x01, 0x00 })));
+        byte[] body = Concat(BerCtx(1, cname), Concat(BerCtx(2, realm), Concat(BerCtx(3, sname), enc)));
+        byte[] req = Concat(BerCtx(1, BerInt(5)), Concat(BerCtx(2, BerInt(10)), BerCtx(4, BerSeq(body))));
+        return BerTlv(0x6A, BerSeq(req));
     }
 
     static byte[] BuildIpTcp(string src, string dst, int sp, int dp, byte flags, byte[] payload) {
@@ -2656,6 +2944,17 @@ function Invoke-SmbAnalyzerSelfTest {
         $rc4Why = Get-PacketFindingSummary $rc4
         if ($rc4Why -notmatch 'RC4') { [void]$failures.Add("RC4 finding text missing: $rc4Why") }
         if ($rc4.Info -notmatch 'rc4-hmac') { [void]$failures.Add("RC4 info missing rc4-hmac: $($rc4.Info)") }
+        if ($rc4.UserName -notmatch 'legacyapp') { [void]$failures.Add("RC4 account missing cname: '$($rc4.UserName)'") }
+        if ($rc4.UserName -notmatch 'CONTOSO') { [void]$failures.Add("RC4 account missing realm: '$($rc4.UserName)'") }
+        if ($rc4.QueryName -notmatch 'krbtgt') { [void]$failures.Add("RC4 service missing sname: '$($rc4.QueryName)'") }
+        $rc4Sess = Get-PacketSessionText $rc4
+        if ($rc4Sess -notmatch '55131' -or $rc4Sess -notmatch ':88') {
+            [void]$failures.Add("RC4 session 4-tuple missing: $rc4Sess")
+        }
+        if ($rc4Why -notmatch 'legacyapp') { [void]$failures.Add("RC4 finding missing account: $rc4Why") }
+        if ($rc4Why -notmatch '55131') { [void]$failures.Add("RC4 finding missing session: $rc4Why") }
+        $acctText = Get-PacketAccountText $rc4
+        if ($acctText -notmatch 'legacyapp') { [void]$failures.Add("Get-PacketAccountText missed RC4 cname: $acctText") }
     }
     $plainKrb = $demo | Where-Object { $_.IsKerberos -and -not $_.IsRc4 } | Select-Object -First 1
     if (-not $plainKrb) { [void]$failures.Add('Demo should still include a non-RC4 Kerberos packet') }
@@ -3128,8 +3427,8 @@ function Test-FilterToken {
     if ($tl -match '^smb\.cmd\s*(==|=)\s*(0x[0-9a-f]+|\d+)$') {
         $n = [int]($Matches[2]); return $pkt.SmbCommandCode -eq $n
     }
-    if ($tl -match '^user:(.+)$') {
-        return ($pkt.UserName -and $pkt.UserName.ToLowerInvariant().Contains($Matches[1]))
+    if ($tl -match '^(user|account|cname):(.+)$') {
+        return ($pkt.UserName -and $pkt.UserName.ToLowerInvariant().Contains($Matches[2]))
     }
     if ($tl -match '^file:(.+)$') {
         return ($pkt.FileName -and $pkt.FileName.ToLowerInvariant().Contains($Matches[1]))
@@ -3339,7 +3638,7 @@ function Add-PacketsToUi {
 }
 
 function Get-PacketListColumnCount {
-    $n = 9
+    $n = 10
     try {
         if ($script:lvPackets) { $n = [int]$script:lvPackets.Columns.Count }
     } catch { }
@@ -3567,8 +3866,16 @@ function Show-PacketDetails {
         [void]$app.Nodes.Add("Protocol: $(Get-PacketServiceName $p)")
         [void]$app.Nodes.Add("Category: $($p.Family)")
         if ($p.AppOp) { [void]$app.Nodes.Add("Operation: $($p.AppOp)") }
+        if ($p.UserName) { [void]$app.Nodes.Add("Account: $($p.UserName)") }
         if ($p.QueryName) { [void]$app.Nodes.Add("Name / DN: $($p.QueryName)") }
+        [void]$app.Nodes.Add("Session: $(Get-PacketSessionText $p)")
         [void]$app.Nodes.Add("Summary: $($p.Info)")
+    }
+    if ($p.IsRc4 -and -not ($p.IsLdap -or $p.IsKerberos -or $p.IsDns -or $p.IsRpc -or $p.IsNfs -or $p.IsNtp -or $p.IsAdws -or $p.IsLlmnr -or $p.IsWinRm -or $p.HasSmb)) {
+        $rc4n = $frame.Nodes.Add('RC4')
+        [void]$rc4n.Nodes.Add("Account: $(Get-PacketAccountText $p)")
+        [void]$rc4n.Nodes.Add("Session: $(Get-PacketSessionText $p)")
+        [void]$rc4n.Nodes.Add("Summary: $($p.Info)")
     }
     if ($p.IsCollapse) {
         $find = $frame.Nodes.Add('Domain collapse findings (fix before cutover)')
@@ -3716,6 +4023,8 @@ function Update-FindingsGrid {
             $finding = Get-PacketFindingSummary $p
             $infoText = ''
             try { $infoText = [string]$p.Info } catch { }
+            $acctText = ''
+            try { $acctText = [string]$p.UserName } catch { }
             $idx = $script:dgvFindings.Rows.Add(
                 [string]$p.No,
                 $timeText,
@@ -3724,6 +4033,7 @@ function Update-FindingsGrid {
                 [string]$p.Dst,
                 [string]$p.DstPort,
                 [string]$p.Protocol,
+                $acctText,
                 $finding,
                 $infoText
             )
@@ -3977,7 +4287,7 @@ function Import-DemoCapture {
     Update-FindingsGrid -Force
     Write-AppLog "Loaded $($demo.Length) synthetic demo packets (SMB, LDAP, Kerberos, DNS, NFS)." 'INFO'
     [void][System.Windows.Forms.MessageBox]::Show(
-        "Loaded $($demo.Length) synthetic packets.`n`nPurple = LDAP, orange = Kerberos, teal = DNS, red = legacy SMB / RC4, blue = SMB2+.`nClick the red banner (SMBv1 / PRE-COLLAPSE) to list leftover packets on Findings, or try display filters: ad, collapse, rc4, ldaps, machine, fileshare.",
+        "Loaded $($demo.Length) synthetic packets.`n`nPurple = LDAP, orange = Kerberos, teal = DNS, red = legacy SMB / RC4, blue = SMB2+.`nRC4 Kerberos rows include the session and account (legacyapp@CONTOSO.LOCAL). Click the red banner (SMBv1 / PRE-COLLAPSE) to list leftover packets on Findings, or try display filters: ad, collapse, rc4, user:legacyapp, ldaps, machine, fileshare.",
         'Demo Capture Loaded',
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Information)
@@ -4028,6 +4338,7 @@ function New-PacketCsvRow {
     Add-Member -InputObject $row -MemberType NoteProperty -Name SrcPort -Value ([string]$Packet.SrcPort)
     Add-Member -InputObject $row -MemberType NoteProperty -Name Dst -Value ([string]$Packet.Dst)
     Add-Member -InputObject $row -MemberType NoteProperty -Name DstPort -Value ([string]$Packet.DstPort)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Session -Value (Get-PacketSessionText $Packet)
     Add-Member -InputObject $row -MemberType NoteProperty -Name Length -Value ([string]$Packet.Length)
     Add-Member -InputObject $row -MemberType NoteProperty -Name UserName -Value ([string]$Packet.UserName)
     Add-Member -InputObject $row -MemberType NoteProperty -Name SharePath -Value ([string]$Packet.SharePath)
@@ -4256,6 +4567,17 @@ function Use-FilterSelectedIp {
     Set-DisplayFilter -Text ("ip.addr=={0}" -f $peer.Client)
 }
 
+function Use-FilterSelectedAccount {
+    $p = Get-SelectedPacket
+    if (-not $p) { return }
+    $u = ''
+    try { $u = [string]$p.UserName } catch { }
+    if (Test-BlankString $u) { return }
+    $short = $u
+    if ($short -match '^([^@\\]+)') { $short = $Matches[1] }
+    Set-DisplayFilter -Text ("user:{0}" -f $short.ToLowerInvariant())
+}
+
 function Toggle-MarkSelected {
     $p = Get-SelectedPacket
     if (-not $p) { return }
@@ -4449,6 +4771,40 @@ function Update-StatsTab {
     [void]$sb.AppendLine("File shares      : $($stats.FileShare)   NFS $($stats.Nfs)")
     [void]$sb.AppendLine("Pre-collapse     : $($stats.Collapse)  legacy $($stats.Legacy)  simple-bind $($stats.SimpleBind)  NTLM $($stats.Ntlm)  RC4 $($stats.Rc4)  DC-locator $($stats.DcLocator)  SYSVOL/NETLOGON $($stats.Sysvol)")
     [void]$sb.AppendLine(("  machine accounts {0}  GPO {1}  KDC tickets {2}  NTP {3}  ADWS {4}  anon-bind {5}  LLMNR {6}  SAMR/LSA {7}  RC4 {8}" -f $nMach, $nGpo, $nKdc, $nNtp, $nAdws, $nAnon, $nLlmnr, $nSamr, $nRc4))
+    [void]$sb.AppendLine("")
+    [void]$sb.AppendLine("RC4 sessions (client:port -> server:port  account)")
+    $rc4Map = @{}
+    foreach ($p in (Get-AppEnumerable $script:AllPackets)) {
+        if (-not $p.IsRc4) { continue }
+        $acct = Get-PacketAccountText $p
+        $sess = Get-PacketSessionText $p
+        $key = '{0}|{1}' -f $sess, $acct
+        if (-not $rc4Map.ContainsKey($key)) {
+            $o = New-Object PSObject
+            Add-Member -InputObject $o -MemberType NoteProperty -Name Session -Value $sess
+            Add-Member -InputObject $o -MemberType NoteProperty -Name Account -Value $acct
+            Add-Member -InputObject $o -MemberType NoteProperty -Name Service -Value ([string]$p.QueryName)
+            Add-Member -InputObject $o -MemberType NoteProperty -Name Packets -Value 0
+            $rc4Map[$key] = $o
+        }
+        $cur = $rc4Map[$key]
+        $cur.Packets = [int]$cur.Packets + 1
+    }
+    $rc4Keys = $null
+    try { $rc4Keys = $rc4Map.Keys } catch { }
+    $rc4SessN = 0
+    foreach ($k in (Get-AppEnumerable $rc4Keys)) {
+        $e = $rc4Map[$k]
+        $svc = [string](Get-AppNote $e 'Service')
+        $pktN = [int](Get-AppNote $e 'Packets')
+        $pktWord = 'pkts'
+        if ($pktN -eq 1) { $pktWord = 'pkt' }
+        $svcBit = ''
+        if (-not (Test-BlankString $svc)) { $svcBit = "  service $svc" }
+        [void]$sb.AppendLine(('  {0}  {1}  {2} {3}{4}' -f (Get-AppNote $e 'Session'), (Get-AppNote $e 'Account'), $pktN, $pktWord, $svcBit))
+        $rc4SessN++
+    }
+    if ($rc4SessN -eq 0) { [void]$sb.AppendLine('  (none)') }
     [void]$sb.AppendLine("Talkers          : $($script:Smb1Hosts.Count)")
     [void]$sb.AppendLine("SMBv1 commands")
     foreach ($e in (Get-AppEnumerable ($script:Smb1CommandHist.GetEnumerator() | Sort-Object Value -Descending))) {
@@ -4621,7 +4977,7 @@ function Scan-SmbEventLogs {
 function Copy-SelectedSummary {
     $p = Get-SelectedPacket
     if (-not $p) { return }
-    $text = "No={0} Time={1} {2}:{3} -> {4}:{5} {6} len={7} {8}" -f $p.No, $p.Time.ToString('o'), $p.Src, $p.SrcPort, $p.Dst, $p.DstPort, $p.Protocol, $p.Length, $p.Info
+    $text = "No={0} Time={1} {2} {3} account={4} len={5} {6}" -f $p.No, $p.Time.ToString('o'), (Get-PacketSessionText $p), $p.Protocol, (Get-PacketAccountText $p), $p.Length, $p.Info
     [System.Windows.Forms.Clipboard]::SetText($text)
 }
 
@@ -4629,7 +4985,7 @@ function Sort-PacketView {
     param([int]$Column)
     if ($script:SortColumn -eq $Column) { $script:SortAscending = -not $script:SortAscending } else { $script:SortAscending = $true }
     $script:SortColumn = $Column
-    $props = @('No', 'Time', 'Src', 'SrcPort', 'Dst', 'DstPort', 'Protocol', 'Length', 'Info')
+    $props = @('No', 'Time', 'Src', 'SrcPort', 'Dst', 'DstPort', 'Protocol', 'UserName', 'Length', 'Info')
     $name = $props[$Column]
     $arr = @(ConvertTo-PowerSharkPacketArray $script:ViewPackets)
     if ($script:SortAscending) {
@@ -4689,7 +5045,7 @@ HOW TO RUN
   3. powershell.exe -ExecutionPolicy Bypass -STA -File .\PowerShark.ps1
   4. Pick the IPv4 address of the interface that faces clients / DCs.
   5. Capture dropdown: All traffic (default), Active Directory, File shares, Domain collapse, RC4, or LDAPS.
-  6. Click Start. Use display filters (collapse, rc4, ldaps, machine, gpo, dclocator, ad, ldap).
+  6. Click Start. Use display filters (collapse, rc4, user:legacyapp, ldaps, machine, gpo, dclocator, ad, ldap).
   7. When the red PRE-COLLAPSE (or SMBv1) banner appears, click it. The Findings
      tab lists every leftover packet the alert is about. Double-click a row to
      jump to that frame on the Packets tab.
@@ -4704,6 +5060,7 @@ SESSION TIMER AND SAVE ALL
   Save view / Ctrl+S writes only the filtered packet list (pcap or CSV).
   CSV Protocol and Family are the exact service (LDAP, Kerberos, SMB, DNS, RPC-SAMR).
   Category is the coarse AD / FileShare / Other bucket. Operation is Bind / AS-REQ / Query.
+  CSV Session is src:port -> dst:port. UserName is the Kerberos or NTLM account.
   Unattended:  .\PowerShark.ps1 -AutoCloseMinutes 60
 
 NO LIVE TRAFFIC?
@@ -4725,6 +5082,10 @@ BEFORE A DOMAIN COLLAPSE
     anonymous      LDAP binds with an empty DN
     ntlm / ntlmv1  apps not using Kerberos (harder cutover)
     rc4            Kerberos etype 23/24 (rc4-hmac) or TLS RC4 cipher suites
+                   Packets/Findings Account column + Statistics "RC4 sessions"
+                   list src:port -> dst:port with the Kerberos account (user@REALM)
+                   when cname is in the clear. AP-REQ authenticators are encrypted.
+    user:legacyapp / account:legacyapp   filter by Kerberos cname or NTLM user
     ldaps          LDAP over TLS (TCP 636 / GC 3269), including STARTTLS
     dclocator      DNS SRV _ldap._tcp / _kerberos / _msdcs / _sites
     cldap          UDP 389 NetLogon LDAP ping (DC locator)
@@ -4759,6 +5120,8 @@ DISPLAY FILTERS
   anonymous
   ntlm
   rc4
+  user:legacyapp
+  account:legacyapp
   dclocator
   cldap
   ntp
@@ -4808,7 +5171,11 @@ HOW DETECTION WORKS
   Negotiate requests list dialects. Session Setup is scanned for NTLMSSP Type 3
   (username / domain / workstation). Tree Connect and NT Create extract paths.
   Kerberos (UDP/TCP 88 and GSS blobs) is scanned for encryption type 23
-  (rc4-hmac) and 24 (rc4-hmac-exp) in EncryptedData and etype lists. TLS
+  (rc4-hmac) and 24 (rc4-hmac-exp) in EncryptedData and etype lists. AS-REQ,
+  TGS-REQ, AS-REP, and TGS-REP also yield the client principal (cname@realm)
+  and service (sname) from the cleartext KDC body, so RC4 rows show the
+  session 4-tuple plus the account. AP-REQ authenticators stay encrypted, so
+  those frames may show the session without an account. TLS
   ClientHello/ServerHello is checked for RC4 cipher suites (0x0004/0x0005/…).
 
 LIMITATIONS vs REAL WIRESHARK
@@ -5382,8 +5749,9 @@ Enable-DoubleBuffer $script:lvPackets
 [void]$script:lvPackets.Columns.Add('Destination', 120)
 [void]$script:lvPackets.Columns.Add('Dst Port', 70)
 [void]$script:lvPackets.Columns.Add('Protocol', 96)
+[void]$script:lvPackets.Columns.Add('Account', 150)
 [void]$script:lvPackets.Columns.Add('Length', 70)
-[void]$script:lvPackets.Columns.Add('Info', 620)
+[void]$script:lvPackets.Columns.Add('Info', 520)
 
 $script:lvPackets.Add_RetrieveVirtualItem({
     param($s, $e)
@@ -5410,6 +5778,10 @@ $script:lvPackets.Add_RetrieveVirtualItem({
         [void]$item.SubItems.Add(([string]$p.Dst))
         [void]$item.SubItems.Add(([string]$p.DstPort))
         [void]$item.SubItems.Add(([string]$p.Protocol))
+        $acctText = ''
+        try { $acctText = [string]$p.UserName } catch { }
+        if ($null -eq $acctText) { $acctText = '' }
+        [void]$item.SubItems.Add($acctText)
         [void]$item.SubItems.Add(([string]$p.Length))
         $infoText = ''
         try { $infoText = [string]$p.Info } catch { }
@@ -5448,6 +5820,8 @@ $mRc4 = $ctx.Items.Add('Display filter: rc4')
 $mRc4.add_Click({ Set-DisplayFilter -Text 'rc4' })
 $mLdaps = $ctx.Items.Add('Display filter: ldaps')
 $mLdaps.add_Click({ Set-DisplayFilter -Text 'ldaps' })
+$mAcct = $ctx.Items.Add('Display filter: this account')
+$mAcct.add_Click({ Use-FilterSelectedAccount })
 $mCol = $ctx.Items.Add('Display filter: collapse')
 $mCol.add_Click({ Set-DisplayFilter -Text 'collapse' })
 $mFind = $ctx.Items.Add('Show banner findings')
@@ -5534,11 +5908,12 @@ $script:dgvFindings.ColumnHeadersHeight = 30
 $script:dgvFindings.RowTemplate.Height = 26
 $script:dgvFindings.AlternatingRowsDefaultCellStyle.BackColor = $script:C.AltRow
 $script:dgvFindings.Font = New-Object System.Drawing.Font('Consolas', 9)
-foreach ($col in @('No','Time','Source','SrcPort','Destination','DstPort','Protocol','Finding','Info')) {
+foreach ($col in @('No','Time','Source','SrcPort','Destination','DstPort','Protocol','Account','Finding','Info')) {
     [void]$script:dgvFindings.Columns.Add($col, $col)
 }
-try { $script:dgvFindings.Columns['Finding'].FillWeight = 40 } catch { }
-try { $script:dgvFindings.Columns['Info'].FillWeight = 28 } catch { }
+try { $script:dgvFindings.Columns['Finding'].FillWeight = 36 } catch { }
+try { $script:dgvFindings.Columns['Account'].FillWeight = 16 } catch { }
+try { $script:dgvFindings.Columns['Info'].FillWeight = 24 } catch { }
 $script:dgvFindings.Add_CellDoubleClick({ Show-SelectedFindingPacket })
 $script:dgvFindings.Add_KeyDown({
     param($s, $e)
