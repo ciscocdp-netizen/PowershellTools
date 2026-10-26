@@ -21,6 +21,17 @@
                                                                  # fails, the way Graph
                                                                  # answers for an address
                                                                  # with no mailbox
+      $script:FailFolderListing['<userId>'] = '<error message>'   # only the plain
+                                                                 # /mailFolders listing
+                                                                 # fails, so a probe of
+                                                                 # a named folder still
+                                                                 # answers
+      $script:FailCalendar['<userId>']     = '<error message>'   # Get-MgUserCalendar fails
+      $script:FailDirectoryLookup          = '<error message>'   # Get-MgUser fails, the
+                                                                 # way it does when the
+                                                                 # sign-in has no
+                                                                 # directory scope
+      $script:Directory['<userId>']        = @{ ... }            # what Get-MgUser returns
       $script:FailChildListing[<folderId>] = '<error message>'   # listing fails
       $script:HideFromFilter['<name>']     = $true               # $filter finds nothing
       $script:FailFilterQueries            = $true               # $filter itself errors
@@ -33,8 +44,12 @@
       $script:FailFolderCreate['<name>']   = '<error message>'   # creating fails
 #>
 
-$script:Store             = @{}
-$script:FailMailbox       = @{}
+$script:Store                = @{}
+$script:FailMailbox          = @{}
+$script:FailFolderListing    = @{}
+$script:FailCalendar         = @{}
+$script:Directory            = @{}
+$script:FailDirectoryLookup  = $null
 $script:FailChildListing  = @{}
 $script:HideFromFilter    = @{}
 $script:HideFromListing   = @{}
@@ -54,6 +69,10 @@ $script:MailFolderCallCount = 0
 function Reset-FakeGraph {
     $script:Store.Clear()
     $script:FailMailbox.Clear()
+    $script:FailFolderListing.Clear()
+    $script:FailCalendar.Clear()
+    $script:Directory.Clear()
+    $script:FailDirectoryLookup = $null
     $script:FailChildListing.Clear()
     $script:HideFromFilter.Clear()
     $script:HideFromListing.Clear()
@@ -196,6 +215,13 @@ function Get-MgUserMailFolder {
     )
     $script:MailFolderCallCount++
 
+    # The listing-only knob is the more specific one, so it wins: that is how a
+    # mailbox answers one way to a listing and another way to a named folder.
+    if (-not $MailFolderId -and $script:FailFolderListing.ContainsKey($UserId)) {
+        Write-FakeGraphError -Message $script:FailFolderListing[$UserId] -ErrorAction $ErrorAction
+        return
+    }
+
     if ($script:FailMailbox.ContainsKey($UserId)) {
         Write-FakeGraphError -Message $script:FailMailbox[$UserId] -ErrorAction $ErrorAction
         return
@@ -230,6 +256,45 @@ function Get-MgUserMailFolder {
     }
 
     return (Select-FakeFolders -Folders (Get-FakeChildren -UserId $UserId -ParentId $null) -Filter $Filter -UserId $UserId)
+}
+
+function Get-MgUserCalendar {
+    param(
+        [string]$UserId,
+        [string]$Filter,
+        [int]$Top,
+        $ErrorAction
+    )
+    if ($script:FailCalendar.ContainsKey($UserId)) {
+        Write-FakeGraphError -Message $script:FailCalendar[$UserId] -ErrorAction $ErrorAction
+        return
+    }
+    if (-not $script:Store.ContainsKey($UserId)) {
+        Write-FakeGraphError -Message "Status: 404 (NotFound) Code: ErrorItemNotFound Message: The specified object was not found in the store." -ErrorAction $ErrorAction
+        return
+    }
+    return [pscustomobject]@{ Id = "CAL:$UserId"; Name = 'Calendar' }
+}
+
+<#
+.SYNOPSIS
+    The directory half of the diagnosis. The tool asks for no directory scope, so
+    the usual answer in the field is a refusal rather than an account.
+#>
+function Get-MgUser {
+    param(
+        [string]$UserId,
+        [string[]]$Property,
+        $ErrorAction
+    )
+    if ($script:FailDirectoryLookup) {
+        Write-FakeGraphError -Message $script:FailDirectoryLookup -ErrorAction $ErrorAction
+        return
+    }
+    if ($script:Directory.ContainsKey($UserId)) {
+        return [pscustomobject]$script:Directory[$UserId]
+    }
+    Write-FakeGraphError -Message "Status: 404 (NotFound) Code: Request_ResourceNotFound Message: Resource '$UserId' does not exist or one of its queried reference-property objects are not present." -ErrorAction $ErrorAction
 }
 
 function Get-MgUserMailFolderChildFolder {

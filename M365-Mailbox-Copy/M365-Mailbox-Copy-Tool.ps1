@@ -13,9 +13,32 @@
 
 .NOTES
     Author: v0
-    Version: 1.17
+    Version: 1.18
     Requires: Microsoft.Graph PowerShell SDK
     Authentication: Interactive (Delegated Permissions via browser)
+
+    Changelog v1.18:
+    - Fixed: The access check told an operator with two perfectly good mailboxes
+      that one of them did not exist. Exchange answers "The specified object was
+      not found in the store., Default folder Root not found." both for a mailbox
+      that is absent AND for one the signed-in account may not open, and the
+      check reported only the first of those as fact. It now says both causes are
+      possible and gives the two commands that tell them apart.
+    - New: When a mailbox will not open, the check asks Graph three more
+      questions - the mailbox root, the Inbox, and the calendar - and reports what
+      each answered, so the log shows the evidence and not just a conclusion. A
+      cause Graph does name outright (a mailbox that is not in Exchange Online)
+      overrides the listing's vague answer.
+    - New: Best-effort directory lookup of the address, reported when the sign-in
+      happens to carry a directory scope. It names the account the address
+      actually belongs to, which exposes an alias pointing at an account other
+      than the one holding the mailbox - common right after a rename - and an
+      account with no mail address or a disabled one.
+    - Changed: The check now lists the mailbox's top-level folders, the same call
+      the copy itself starts with, rather than reading the folder root. A mailbox
+      that passes the check can no longer fail the copy's first call.
+    - Changed: Commands in the advice are filled in with the signed-in address, so
+      they can be pasted as they are.
 
     Changelog v1.17:
     - Fixed: Graph reports mailbox failures as NON-terminating errors, which the
@@ -1998,12 +2021,14 @@ function Get-GraphFailureKind {
     if ([string]::IsNullOrWhiteSpace($Message)) { return 'Unknown' }
 
     switch -Regex ($Message) {
-        'Default folder Root not found'          { return 'NoMailbox' }
-        'MailboxNotEnabledForRESTAPI'            { return 'NoMailbox' }
-        'hosted on-?premis'                      { return 'NoMailbox' }
-        'mailbox is either inactive'             { return 'NoMailbox' }
+        'not recognized as (a|the) name of a cmdlet' { return 'NotAvailable' }
+        'CommandNotFoundException'               { return 'NotAvailable' }
+        'MailboxNotEnabledForRESTAPI'            { return 'NotInExchangeOnline' }
+        'hosted on-?premis'                      { return 'NotInExchangeOnline' }
+        'mailbox is either inactive'             { return 'NotInExchangeOnline' }
         'ErrorNonExistentMailbox'                { return 'NoMailbox' }
         'ErrorMailboxNotFound'                   { return 'NoMailbox' }
+        'Default folder Root not found'          { return 'StoreNotOpened' }
         'ErrorInvalidUser'                       { return 'UnknownUser' }
         'Request_ResourceNotFound'               { return 'UnknownUser' }
         'does not exist or one of its queried'   { return 'UnknownUser' }
@@ -2016,10 +2041,11 @@ function Get-GraphFailureKind {
         'Forbidden'                              { return 'AccessDenied' }
         'ApplicationThrottled'                   { return 'Throttled' }
         'Too many requests'                      { return 'Throttled' }
-        # Checked last: Exchange uses this wording for anything it cannot open,
-        # so a more specific match above always wins.
-        'The specified object was not found in the store' { return 'NoMailbox' }
-        'ErrorItemNotFound'                      { return 'NoMailbox' }
+        # Checked last: Exchange answers with this wording for anything it will
+        # not open, whether the mailbox is absent or merely off limits, so a more
+        # specific match above always wins and this one promises nothing.
+        'The specified object was not found in the store' { return 'StoreNotOpened' }
+        'ErrorItemNotFound'                      { return 'StoreNotOpened' }
     }
     return 'Unknown'
 }
@@ -2042,18 +2068,47 @@ function Get-MailboxProblemAdvice {
                 "A display name ('Kirk Smith') or a bare alias ('ksmith') is not something Graph can open."
             )
         }
+        'StoreNotOpened' {
+            # Exchange gives the same answer for a mailbox that is not there and
+            # for one the caller may not open, so this must not claim either.
+            # The mailbox opening in Outlook proves nothing about this error:
+            # Outlook opens it as its owner, the copy opens it as you.
+            return @(
+                "Exchange would not open the mailbox. It answers exactly this way in two cases, and",
+                "does not say which: the mailbox is not there, OR the signed-in account may not open it.",
+                "Run both of these in Exchange Online PowerShell - between them they settle it:",
+                "  Get-Mailbox -Identity '$Address' | Format-List Name,RecipientTypeDetails,ExchangeGuid,UserPrincipalName,PrimarySmtpAddress",
+                "  Get-MailboxPermission -Identity '$Address' -User '$(Get-SignedInAccountUpn)'",
+                "Read them like this:",
+                "  * Get-Mailbox errors, or ExchangeGuid is all zeros -> there is no Exchange Online",
+                "    mailbox: not licensed or still provisioning, a mail user / contact / group rather",
+                "    than a mailbox, or in a hybrid tenant still on-premises.",
+                "  * The mailbox is there but that returns nothing -> you have no FullAccess on it. Grant it:",
+                "      Add-MailboxPermission -Identity '$Address' -User '$(Get-SignedInAccountUpn)' -AccessRights FullAccess -InheritanceType All",
+                "    A grant on the other mailbox does not cover this one, and a new grant takes a few",
+                "    minutes to reach Graph. Wait, sign out, sign in again, then retry.",
+                "  * PrimarySmtpAddress or UserPrincipalName differs from what you typed -> you entered",
+                "    an alias. Re-run with the address Get-Mailbox reports."
+            )
+        }
         'NoMailbox' {
             return @(
-                "The address was accepted, but there is no Exchange Online mailbox behind it.",
-                "Check, in this order:",
-                "  1. Open https://outlook.office.com/mail/$Address/ - does the mailbox exist at all?",
-                "  2. Is an Exchange Online licence assigned and has provisioning finished? A mailbox that",
-                "     was licensed minutes ago answers with exactly this error until it has been created.",
-                "  3. Is this a mailbox? Mail-enabled users, mail contacts, distribution lists and",
-                "     Microsoft 365 groups have an address but no mailbox to copy.",
-                "  4. Hybrid tenant: is the mailbox still on-premises? Graph only reaches Exchange Online.",
-                "  5. Is the mailbox inactive, soft-deleted, or was the licence removed?",
+                "The account exists, but it has no mailbox: Exchange reports the mailbox itself as absent.",
+                "Check whether an Exchange Online licence is assigned and provisioning has finished - a",
+                "mailbox licensed minutes ago answers this way until it has been created - and whether this",
+                "is a mailbox at all: mail users, contacts, distribution lists and Microsoft 365 groups",
+                "have an address but nothing to copy.",
                 "Confirm with: Get-Mailbox -Identity '$Address' | Format-List Name,RecipientTypeDetails,ExchangeGuid"
+            )
+        }
+        'NotInExchangeOnline' {
+            return @(
+                "The mailbox is not served by Exchange Online, so Graph cannot reach it at all.",
+                "In a hybrid tenant this means the mailbox is still on-premises and has to be migrated",
+                "before it can be copied this way. It also appears for an unlicensed, inactive or",
+                "soft-deleted mailbox.",
+                "Confirm with: Get-Mailbox -Identity '$Address' | Format-List Name,RecipientTypeDetails,ExchangeGuid",
+                "On-premises, the same mailbox shows up under Get-RemoteMailbox / the on-premises Get-Mailbox."
             )
         }
         'UnknownUser' {
@@ -2067,7 +2122,7 @@ function Get-MailboxProblemAdvice {
             return @(
                 "The signed-in account is not allowed to open this mailbox.",
                 "Grant access with:",
-                "  Add-MailboxPermission -Identity '$Address' -User <your account> -AccessRights FullAccess -InheritanceType All",
+                "  Add-MailboxPermission -Identity '$Address' -User '$(Get-SignedInAccountUpn)' -AccessRights FullAccess -InheritanceType All",
                 "Permission changes can take several minutes to reach Graph. Wait, then sign in again and retry.",
                 "Also confirm the consent prompt granted Mail.ReadWrite.Shared / Calendars.ReadWrite.Shared."
             )
@@ -2092,28 +2147,171 @@ function Get-MailboxProblemAdvice {
 
 <#
 .SYNOPSIS
-    Confirms a mailbox exists and can be opened before the copy touches anything.
+    Asks Graph the follow-up questions that tell one mailbox failure from another.
 .DESCRIPTION
-    Reads the mailbox folder root, which is the same call every later stage
-    depends on and needs no permission beyond the mail scopes already consented.
+    A failed folder listing on its own cannot say why it failed, so each of these
+    is asked once, and what each one answers narrows it down:
+
+      msgfolderroot  the mailbox root, rather than the folders under it
+      inbox          a second well-known folder, in case one folder is the problem
+      calendars      the same mailbox store reached through the calendar API
+      directory      who Graph thinks the address belongs to, which exposes an
+                     alias pointing at a different account; needs a directory
+                     scope the tool does not ask for, so it is best-effort
+
+    Nothing here is retried: this runs after something already failed, and the
+    operator is waiting for an answer.
+#>
+function Get-MailboxProbeSet {
+    param([string]$Address)
+
+    $probes = @(
+        @{ Name = 'Mailbox root'; Block = { Get-MgUserMailFolder -UserId $Address -MailFolderId 'msgfolderroot' -ErrorAction Stop } },
+        @{ Name = 'Inbox'; Block = { Get-MgUserMailFolder -UserId $Address -MailFolderId 'inbox' -ErrorAction Stop } },
+        @{ Name = 'Calendar'; Block = { Get-MgUserCalendar -UserId $Address -Top 1 -ErrorAction Stop } },
+        @{ Name = 'Directory'; Block = { Get-MgUser -UserId $Address -Property 'id', 'displayName', 'userPrincipalName', 'mail', 'accountEnabled' -ErrorAction Stop } }
+    )
+
+    $results = New-Object System.Collections.ArrayList
+    foreach ($probe in $probes) {
+        $entry = @{ Name = $probe.Name; Ok = $false; Kind = 'Unknown'; Detail = ''; Value = $null }
+        try {
+            $value = Invoke-WithRetry -ScriptBlock $probe.Block -MaxRetries 0
+            if ($value) {
+                $entry.Ok    = $true
+                $entry.Kind  = 'Ok'
+                $entry.Value = @($value)[0]
+            }
+            else {
+                $entry.Detail = 'returned nothing'
+            }
+        }
+        catch {
+            $entry.Detail = $_.Exception.Message
+            $entry.Kind   = Get-GraphFailureKind -Message $entry.Detail
+        }
+        [void]$results.Add([PSCustomObject]$entry)
+    }
+    return $results
+}
+
+function Get-ProbeByName {
+    param($Probes, [string]$Name)
+    foreach ($probe in @($Probes)) {
+        if ($probe.Name -eq $Name) { return $probe }
+    }
+    return $null
+}
+
+<#
+.SYNOPSIS
+    Reports what each follow-up probe answered, so the log holds the evidence
+    rather than only a conclusion drawn from it.
+#>
+function Format-MailboxProbeLines {
+    param($Probes, [string]$Address, [string]$PrimaryDetail)
+
+    # Exchange usually gives every probe the same answer, and three copies of one
+    # long error is harder to read than one copy plus "same answer".
+    $seen = @{}
+    if ($PrimaryDetail) { $seen[$PrimaryDetail] = 'the folder listing above' }
+
+    $lines = New-Object System.Collections.ArrayList
+    foreach ($probe in @($Probes)) {
+        $label = "{0,-12}" -f $probe.Name
+        if ($probe.Name -eq 'Directory') {
+            if ($probe.Ok) {
+                $user = $probe.Value
+                $mail = if ($user.Mail) { $user.Mail } else { '(none)' }
+                [void]$lines.Add("  $label : $($user.DisplayName) - sign-in $($user.UserPrincipalName), mail $mail, enabled $($user.AccountEnabled)")
+            }
+            elseif ($probe.Kind -eq 'AccessDenied' -or $probe.Kind -eq 'NotAvailable') {
+                [void]$lines.Add("  $label : not checked - reading the directory needs a scope this sign-in does not have")
+            }
+            else {
+                [void]$lines.Add("  $label : $($probe.Detail)")
+            }
+        }
+        elseif ($probe.Ok) {
+            [void]$lines.Add("  $label : opened")
+        }
+        elseif ($seen.ContainsKey($probe.Detail)) {
+            [void]$lines.Add("  $label : same answer as $($seen[$probe.Detail])")
+        }
+        else {
+            $seen[$probe.Detail] = $probe.Name
+            [void]$lines.Add("  $label : $($probe.Detail)")
+        }
+    }
+    return $lines
+}
+
+<#
+.SYNOPSIS
+    Draws what can honestly be concluded from the probes, and nothing more.
+#>
+function Get-MailboxProbeNotes {
+    param($Probes, [string]$Address)
+
+    $notes = New-Object System.Collections.ArrayList
+
+    $store     = @(@($Probes) | Where-Object { $_.Name -ne 'Directory' })
+    $opened    = @($store | Where-Object { $_.Ok })
+    $directory = Get-ProbeByName -Probes $Probes -Name 'Directory'
+
+    if ($opened.Count -gt 0) {
+        [void]$notes.Add("Part of this mailbox did open ($(($opened | ForEach-Object { $_.Name }) -join ', ')), so the mailbox")
+        [void]$notes.Add("exists and the signed-in account can reach it. The folder listing the copy depends on is")
+        [void]$notes.Add("what failed, which is not something the copy can work around - retry, and if it persists")
+        [void]$notes.Add("quote the request-id from the error to Microsoft support.")
+    }
+
+    if ($directory -and $directory.Ok) {
+        $user = $directory.Value
+        if (-not $user.Mail) {
+            [void]$notes.Add("The account has no email address in the directory, which means no mailbox is attached to it.")
+        }
+        if ($user.UserPrincipalName -and ($user.UserPrincipalName -ine $Address)) {
+            [void]$notes.Add("'$Address' is not this account's sign-in name ($($user.UserPrincipalName)), so it is an alias.")
+            [void]$notes.Add("Re-run with the sign-in name: an alias can point at an account other than the one that")
+            [void]$notes.Add("holds the mailbox, which is common just after a rename.")
+        }
+        if ($user.AccountEnabled -eq $false) {
+            [void]$notes.Add("The account is disabled in the directory.")
+        }
+    }
+
+    return $notes
+}
+
+<#
+.SYNOPSIS
+    Confirms a mailbox can be opened before the copy touches anything.
+.DESCRIPTION
+    Lists the mailbox's top-level folders, which is the same call the copy itself
+    starts with, so a mailbox that passes here cannot fail for access reasons
+    later. It needs no permission beyond the mail scopes already consented.
     Returns a result object rather than throwing, so both mailboxes can be
-    reported in one pass.
+    reported in one pass, and asks the follow-up probes when it fails.
 #>
 function Test-MailboxAccess {
     param(
         [string]$Address,
-        [string]$Role = 'Mailbox'
+        [string]$Role = 'Mailbox',
+        [switch]$SkipProbes
     )
 
     $check = [PSCustomObject]@{
-        Role    = $Role
-        Address = $Address
-        Ok      = $false
-        Kind    = 'Unknown'
-        Problem = ''
-        Detail  = ''
-        Advice  = @()
-        RootId  = $null
+        Role       = $Role
+        Address    = $Address
+        Ok         = $false
+        Kind       = 'Unknown'
+        Problem    = ''
+        Detail     = ''
+        Advice     = @()
+        Probes     = @()
+        ProbeLines = @()
+        FolderId   = $null
     }
 
     $trimmed = "$Address".Trim()
@@ -2135,17 +2333,17 @@ function Test-MailboxAccess {
     }
 
     try {
-        $root = Invoke-WithRetry -ScriptBlock {
-            Get-MgUserMailFolder -UserId $trimmed -MailFolderId 'msgfolderroot' -ErrorAction Stop
+        $folders = Invoke-WithRetry -ScriptBlock {
+            Get-MgUserMailFolder -UserId $trimmed -Top 1 -ErrorAction Stop
         }
-        if ($root -and $root.Id) {
-            $check.Ok     = $true
-            $check.Kind   = 'Ok'
-            $check.RootId = $root.Id
+        if ($folders) {
+            $check.Ok       = $true
+            $check.Kind     = 'Ok'
+            $check.FolderId = @($folders)[0].Id
             return $check
         }
-        $check.Kind    = 'NoMailbox'
-        $check.Problem = "$Role mailbox '$trimmed' returned no folder root."
+        $check.Kind    = 'StoreNotOpened'
+        $check.Problem = "$Role mailbox '$trimmed' returned no folders at all."
     }
     catch {
         $check.Detail  = $_.Exception.Message
@@ -2153,7 +2351,21 @@ function Test-MailboxAccess {
         $check.Problem = "$Role mailbox '$trimmed' could not be opened."
     }
 
-    $check.Advice = Get-MailboxProblemAdvice -Kind $check.Kind -Address $trimmed -Role $Role
+    if (-not $SkipProbes) {
+        $check.Probes     = @(Get-MailboxProbeSet -Address $trimmed)
+        $check.ProbeLines = @(Format-MailboxProbeLines -Probes $check.Probes -Address $trimmed -PrimaryDetail $check.Detail)
+
+        # A probe that names the cause outright beats the listing's vague answer.
+        foreach ($probe in $check.Probes) {
+            if ($probe.Name -ne 'Directory' -and @('NotInExchangeOnline', 'NoMailbox', 'UnknownUser') -contains $probe.Kind) {
+                $check.Kind = $probe.Kind
+                break
+            }
+        }
+    }
+
+    $check.Advice = @(Get-MailboxProblemAdvice -Kind $check.Kind -Address $trimmed -Role $Role) +
+                    @(Get-MailboxProbeNotes -Probes $check.Probes -Address $trimmed)
     return $check
 }
 
@@ -2163,6 +2375,10 @@ function Write-MailboxAccessProblem {
     Write-CopyLog ''
     Write-CopyLog "ERROR: $($Check.Problem)"
     if ($Check.Detail) { Write-CopyLog "  Graph said: $($Check.Detail)" }
+    if (@($Check.ProbeLines).Count -gt 0) {
+        Write-CopyLog "  What else Graph answered for this mailbox:"
+        foreach ($line in @($Check.ProbeLines)) { Write-CopyLog $line }
+    }
     foreach ($line in @($Check.Advice)) { Write-CopyLog "  $line" }
 }
 
@@ -2183,7 +2399,7 @@ function Write-UnreadableMailboxResult {
         [string]$Address
     )
 
-    $kind = 'NoMailbox'
+    $kind = 'StoreNotOpened'
     if ($script:LastFolderScanError) {
         $kind = Get-GraphFailureKind -Message $script:LastFolderScanError
     }
@@ -2219,6 +2435,20 @@ function Get-SignedInAccountText {
     }
     catch { }
     return $null
+}
+
+<#
+.SYNOPSIS
+    The signed-in address on its own, so the commands in the advice can be pasted
+    as they are rather than edited first.
+#>
+function Get-SignedInAccountUpn {
+    try {
+        $ctx = Get-MgContext -ErrorAction Stop
+        if ($ctx -and $ctx.Account) { return "$($ctx.Account)" }
+    }
+    catch { }
+    return '<signed-in account>'
 }
 
 # ------------------------------------------------------------------------------
@@ -3090,7 +3320,7 @@ $fontButton  = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.Fo
 $fontStatus  = New-Object System.Drawing.Font('Consolas', 9)
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text            = "Microsoft 365 Mailbox Copy Tool v1.17 (Interactive Login)"
+$form.Text            = "Microsoft 365 Mailbox Copy Tool v1.18 (Interactive Login)"
 $form.Size            = New-Object System.Drawing.Size(780, 820)
 $form.MinimumSize     = New-Object System.Drawing.Size(600, 700)
 $form.StartPosition   = "CenterScreen"

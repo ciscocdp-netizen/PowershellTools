@@ -41,6 +41,7 @@ $ErrorActionPreference = 'Stop'
 
 Assert-ToolFunctionsPresent -ToolPath $ToolPath -Names @(
     'Test-MailboxAccess', 'Get-GraphFailureKind', 'Get-MailboxProblemAdvice',
+    'Get-MailboxProbeSet', 'Format-MailboxProbeLines', 'Get-MailboxProbeNotes',
     'Write-UnreadableMailboxResult', 'Get-AllMailFolders', 'Copy-Emails'
 )
 
@@ -114,8 +115,18 @@ New-PopulatedMailbox -UserId 'src@contoso.com' | Out-Null
 $check = Test-MailboxAccess -Address 'src@contoso.com' -Role 'Source'
 
 Assert-That 'the check passes' ([bool]$check.Ok) $check.Problem
-Assert-That 'the mailbox root is identified' ([bool]$check.RootId)
+Assert-That 'a folder came back' ([bool]$check.FolderId)
 Assert-That 'nothing is reported as a problem' ([string]::IsNullOrEmpty($check.Problem)) $check.Problem
+Assert-That 'no follow-up probes were needed' (@($check.Probes).Count -eq 0)
+
+# The gate must be the call the copy itself starts with, so a mailbox cannot pass
+# here and then fail on the copy's first request.
+Reset-World
+New-PopulatedMailbox -UserId 'src@contoso.com' | Out-Null
+$script:FailFolderListing['src@contoso.com'] = $script:RootNotFoundError
+
+$check = Test-MailboxAccess -Address 'src@contoso.com' -Role 'Source'
+Assert-That 'a mailbox whose folder listing fails does not pass the check' (-not $check.Ok)
 
 # ==============================================================================
 Start-Case 'A display name or bare alias is rejected without asking Graph'
@@ -135,22 +146,153 @@ $check = Test-MailboxAccess -Address 'Kirk Smith' -Role 'Target'
 Assert-That 'the advice asks for the primary SMTP address' ((Get-AdviceText -Check $check) -match 'primary SMTP address')
 
 # ==============================================================================
-Start-Case 'An address with no mailbox behind it is explained, not dumped'
+Start-Case 'A mailbox Exchange will not open does not claim the mailbox is missing'
 Reset-World
-$script:FailMailbox['kirk@contoso.com'] = $script:RootNotFoundError
+$script:FailMailbox['kellie.boyle@parkview.com'] = $script:RootNotFoundError
 
-$check = Test-MailboxAccess -Address 'kirk@contoso.com' -Role 'Target'
+$check = Test-MailboxAccess -Address 'kellie.boyle@parkview.com' -Role 'Target'
 $advice = Get-AdviceText -Check $check
 
 Assert-That 'the check fails' (-not $check.Ok)
-Assert-That 'it is classified as a missing mailbox' ($check.Kind -eq 'NoMailbox') "kind was $($check.Kind)"
+Assert-That 'it is not called a missing mailbox' ($check.Kind -eq 'StoreNotOpened') "kind was $($check.Kind)"
 Assert-That 'the problem names the mailbox and its role' `
-    (($check.Problem -match 'kirk@contoso\.com') -and ($check.Problem -match 'Target'))  $check.Problem
+    (($check.Problem -match 'kellie\.boyle@parkview\.com') -and ($check.Problem -match 'Target'))  $check.Problem
 Assert-That 'the raw Graph text is kept for the log' ($check.Detail -match 'Default folder Root not found')
-Assert-That 'the advice covers the licence' ($advice -match 'licence')
-Assert-That 'the advice covers a mailbox that is still on-premises' ($advice -match 'on-premises')
-Assert-That 'the advice covers mail users and groups that have no mailbox' ($advice -match 'Mail-enabled users')
-Assert-That 'the advice gives a command that settles it' ($advice -match 'Get-Mailbox -Identity')
+Assert-That 'the advice says the mailbox may simply be unopenable, not absent' `
+    ($advice -match 'may not open it')
+Assert-That 'the advice does not assert that no mailbox exists' `
+    (-not ($advice -match 'there is no Exchange Online mailbox behind'))
+Assert-That 'the advice gives the command that proves the mailbox exists' ($advice -match 'Get-Mailbox -Identity')
+Assert-That 'the advice gives the command that proves the access' ($advice -match 'Get-MailboxPermission -Identity')
+Assert-That 'the advice explains an all-zero ExchangeGuid' ($advice -match 'ExchangeGuid is all zeros')
+Assert-That 'the advice warns that a grant on the other mailbox does not count' `
+    ($advice -match 'does not cover this one')
+Assert-That 'the advice covers the address being an alias' ($advice -match 'an alias')
+
+# ==============================================================================
+Start-Case 'A mailbox outside Exchange Online is named as such'
+Reset-World
+New-PopulatedMailbox -UserId 'onprem@contoso.com' | Out-Null
+# The folder listing gives the vague answer, but a follow-up probe says outright
+# that the mailbox is not served by Exchange Online. The named cause must win.
+$notInExo = 'Status: 404 Code: MailboxNotEnabledForRESTAPI Message: REST API is not yet supported for this mailbox.'
+$script:FailFolderListing['onprem@contoso.com'] = $script:RootNotFoundError
+$script:FailMailbox['onprem@contoso.com']       = $notInExo
+$script:FailCalendar['onprem@contoso.com']      = $notInExo
+
+$check = Test-MailboxAccess -Address 'onprem@contoso.com' -Role 'Target'
+$advice = Get-AdviceText -Check $check
+
+Assert-That 'the listing error alone is the vague one' ($check.Detail -match 'Default folder Root not found')
+Assert-That 'the named cause from a probe overrides it' ($check.Kind -eq 'NotInExchangeOnline') "kind was $($check.Kind)"
+Assert-That 'the advice explains a hybrid mailbox' ($advice -match 'still on-premises')
+Assert-That 'the advice does not hand out the permission command' (-not ($advice -match 'Add-MailboxPermission'))
+
+# ==============================================================================
+Start-Case 'What the follow-up probes answered is reported, not just a conclusion'
+Reset-World
+$script:FailMailbox['kellie.boyle@parkview.com'] = $script:RootNotFoundError
+$script:FailCalendar['kellie.boyle@parkview.com'] = $script:RootNotFoundError
+$script:FailDirectoryLookup = 'Status: 403 (Forbidden) Code: Authorization_RequestDenied Message: Insufficient privileges to complete the operation.'
+
+$check = Test-MailboxAccess -Address 'kellie.boyle@parkview.com' -Role 'Target'
+$probeText = (@($check.ProbeLines) -join "`n")
+
+Assert-That 'every probe is reported' (@($check.ProbeLines).Count -eq 4) "got $(@($check.ProbeLines).Count)"
+Assert-That 'the mailbox root is reported' ($probeText -match 'Mailbox root')
+Assert-That 'the Inbox is reported' ($probeText -match 'Inbox')
+Assert-That 'the calendar is reported' ($probeText -match 'Calendar')
+Assert-That 'a directory read it may not do is reported as not checked' ($probeText -match 'Directory.*not checked')
+Assert-That 'a probe that repeats the same answer says so instead of repeating it' `
+    ($probeText -match 'same answer as the folder listing above') $probeText
+
+# The whole report has to reach the status log, not just the conclusion.
+$ui = New-TestUi
+Write-MailboxAccessProblem -Check $check
+Assert-That 'the log carries the probe answers' ($ui.StatusBox.Text -match 'What else Graph answered')
+Assert-That 'the log carries the advice' ($ui.StatusBox.Text -match 'Get-MailboxPermission -Identity')
+Assert-That 'the long Graph error is printed once, not once per probe' `
+    ((([regex]::Matches($ui.StatusBox.Text, 'Default folder Root not found')).Count) -eq 1) `
+    "appeared $((([regex]::Matches($ui.StatusBox.Text, 'Default folder Root not found')).Count)) times"
+
+# ==============================================================================
+Start-Case 'A mailbox that partly opens is not reported as unreachable'
+Reset-World
+New-PopulatedMailbox -UserId 'half@contoso.com' | Out-Null
+$script:FailFolderListing['half@contoso.com'] = $script:RootNotFoundError
+
+$check = Test-MailboxAccess -Address 'half@contoso.com' -Role 'Target'
+$advice = Get-AdviceText -Check $check
+
+Assert-That 'the copy is still blocked, because its own call failed' (-not $check.Ok)
+Assert-That 'the report says part of the mailbox opened' ($advice -match 'Part of this mailbox did open')
+Assert-That 'it names which parts opened' ($advice -match 'Mailbox root' -and $advice -match 'Inbox')
+
+# ==============================================================================
+Start-Case 'The directory answer names the account an address really belongs to'
+Reset-World
+$script:FailMailbox['kellie.boyle@parkview.com'] = $script:RootNotFoundError
+$script:Directory['kellie.boyle@parkview.com'] = @{
+    Id                = '00000000-0000-0000-0000-000000000001'
+    DisplayName       = 'Kellie Boyle'
+    UserPrincipalName = 'kellie.boyle2@parkview.com'
+    Mail              = 'Kellie.Boyle2@parkview.com'
+    AccountEnabled    = $true
+}
+
+$check = Test-MailboxAccess -Address 'kellie.boyle@parkview.com' -Role 'Target'
+$advice    = Get-AdviceText -Check $check
+$probeText = (@($check.ProbeLines) -join "`n")
+
+Assert-That 'the directory answer is reported' ($probeText -match 'Kellie Boyle - sign-in kellie\.boyle2@parkview\.com')
+Assert-That 'the mismatch is called out' ($advice -match 'is not this account''s sign-in name')
+Assert-That 'the alias is explained as a rename side effect' ($advice -match 'just after a rename')
+
+# An account with no mail address at all settles it the other way.
+Reset-World
+$script:FailMailbox['ghost@contoso.com'] = $script:RootNotFoundError
+$script:Directory['ghost@contoso.com'] = @{
+    Id                = '00000000-0000-0000-0000-000000000002'
+    DisplayName       = 'Ghost Account'
+    UserPrincipalName = 'ghost@contoso.com'
+    Mail              = $null
+    AccountEnabled    = $false
+}
+
+$check  = Test-MailboxAccess -Address 'ghost@contoso.com' -Role 'Target'
+$advice = Get-AdviceText -Check $check
+$probeText = (@($check.ProbeLines) -join "`n")
+
+Assert-That 'an account with no mail address is reported as such' ($advice -match 'no email address in the directory')
+Assert-That 'a disabled account is reported' ($advice -match 'account is disabled')
+Assert-That 'the empty mail attribute is shown as none' ($probeText -match 'mail \(none\)')
+
+# ==============================================================================
+Start-Case 'A directory lookup the SDK cannot make does not break the diagnosis'
+Reset-World
+$script:FailMailbox['kirk@contoso.com'] = $script:RootNotFoundError
+$script:FailDirectoryLookup = "The term 'Get-MgUser' is not recognized as a name of a cmdlet, function, script file, or executable program."
+
+$check = Test-MailboxAccess -Address 'kirk@contoso.com' -Role 'Target'
+
+Assert-That 'the check still reports the mailbox problem' ($check.Kind -eq 'StoreNotOpened') "kind was $($check.Kind)"
+Assert-That 'the missing cmdlet is reported as not checked' `
+    ((@($check.ProbeLines) -join "`n") -match 'Directory.*not checked')
+Assert-That 'the advice is still produced' ((Get-AdviceText -Check $check) -match 'Get-Mailbox -Identity')
+
+# ==============================================================================
+Start-Case 'Commands in the advice name the signed-in account'
+Reset-World
+$script:FailMailbox['kirk@contoso.com'] = $script:RootNotFoundError
+
+function Get-MgContext { return [pscustomobject]@{ Account = 'anthony.blake@parkview.com'; TenantId = '02b47b37' } }
+$advice = Get-AdviceText -Check (Test-MailboxAccess -Address 'kirk@contoso.com' -Role 'Target')
+Assert-That 'the permission commands are ready to paste' `
+    ($advice -match "-User 'anthony\.blake@parkview\.com'") $advice
+
+Remove-Item function:Get-MgContext
+$advice = Get-AdviceText -Check (Test-MailboxAccess -Address 'kirk@contoso.com' -Role 'Target')
+Assert-That 'without a session the commands still read sensibly' ($advice -match '<signed-in account>')
 
 # ==============================================================================
 Start-Case 'An address that is not in the tenant is told apart from one without a mailbox'
@@ -181,10 +323,12 @@ Assert-That 'the advice warns that the grant takes time to reach Graph' ($advice
 # ==============================================================================
 Start-Case 'Graph error text maps to the cause an operator can act on'
 $cases = @(
-    @{ Kind = 'NoMailbox';    Text = $script:RootNotFoundError },
-    @{ Kind = 'NoMailbox';    Text = 'Status: 404 Code: MailboxNotEnabledForRESTAPI Message: REST API is not yet supported for this mailbox.' },
-    @{ Kind = 'NoMailbox';    Text = 'The mailbox is either inactive, soft-deleted, or is hosted on-premise.' },
-    @{ Kind = 'NoMailbox';    Text = 'Status: 404 (NotFound) Code: ErrorItemNotFound Message: The specified object was not found in the store.' },
+    @{ Kind = 'StoreNotOpened';      Text = $script:RootNotFoundError },
+    @{ Kind = 'NotInExchangeOnline'; Text = 'Status: 404 Code: MailboxNotEnabledForRESTAPI Message: REST API is not yet supported for this mailbox.' },
+    @{ Kind = 'NotInExchangeOnline'; Text = 'The mailbox is either inactive, soft-deleted, or is hosted on-premise.' },
+    @{ Kind = 'StoreNotOpened';      Text = 'Status: 404 (NotFound) Code: ErrorItemNotFound Message: The specified object was not found in the store.' },
+    @{ Kind = 'NoMailbox';           Text = 'Status: 404 Code: ErrorNonExistentMailbox Message: The SMTP address has no mailbox associated with it.' },
+    @{ Kind = 'NotAvailable';        Text = "The term 'Get-MgUser' is not recognized as a name of a cmdlet." },
     @{ Kind = 'UnknownUser';  Text = 'Status: 404 Code: Request_ResourceNotFound' },
     @{ Kind = 'UnknownUser';  Text = 'Status: 404 Code: ErrorInvalidUser Message: The requested user is invalid.' },
     @{ Kind = 'AccessDenied'; Text = 'Status: 403 (Forbidden) Code: ErrorAccessDenied' },

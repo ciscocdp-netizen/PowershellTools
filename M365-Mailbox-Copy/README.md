@@ -125,35 +125,52 @@ failure detail.
 
 ## When a mailbox cannot be opened
 
-Before it creates anything, the tool opens the folder root of both mailboxes. If
-either cannot be opened the copy does not start, and the status log names the cause
-and the checks to run. The common one looks like this in Graph's own words:
+Before it creates anything, the tool lists the top-level folders of both mailboxes —
+the same call the copy itself starts with, so a mailbox that passes this check cannot
+fail the copy's first request. If either mailbox cannot be opened the copy does not
+start, and the status log reports what Graph answered and what to do about it.
+
+The common failure, in Graph's own words:
 
 ```
 The specified object was not found in the store., Default folder Root not found.
 Status: 404 (NotFound)  ErrorCode: ErrorItemNotFound
 ```
 
-That means the address was accepted but there is no Exchange Online mailbox behind
-it. In rough order of likelihood:
+**Exchange returns this both for a mailbox that is not there and for one the signed-in
+account may not open, and it does not say which.** Nothing in the error distinguishes
+them, and the mailbox opening in Outlook proves nothing either way: Outlook opens it as
+its owner, the copy opens it as you. Two commands settle it:
 
-1. **No mailbox yet.** An account licensed a few minutes ago answers with exactly
-   this error until provisioning finishes.
-2. **No Exchange Online licence**, or the licence was removed and the mailbox is now
-   inactive or soft-deleted.
-3. **Not a mailbox.** Mail-enabled users, mail contacts, distribution lists and
-   Microsoft 365 groups have an address but nothing to copy.
-4. **Hybrid**: the mailbox is still on-premises. Graph only reaches Exchange Online.
+```powershell
+Get-Mailbox -Identity <address> | Format-List Name,RecipientTypeDetails,ExchangeGuid,UserPrincipalName,PrimarySmtpAddress
+Get-MailboxPermission -Identity <address> -User <signed-in account>
+```
 
-`Get-Mailbox -Identity <address> | Format-List Name,RecipientTypeDetails,ExchangeGuid`
-settles which of these it is.
+- `Get-Mailbox` errors, or `ExchangeGuid` is all zeros → there is no Exchange Online
+  mailbox: unlicensed or still provisioning, a mail user / contact / distribution list /
+  group rather than a mailbox, or in a hybrid tenant still on-premises.
+- The mailbox is there but `Get-MailboxPermission` returns nothing → no FullAccess. A
+  grant on the *other* mailbox does not cover this one, and a new grant takes a few
+  minutes to reach Graph; wait, sign out, sign in again, then retry.
+- `PrimarySmtpAddress` or `UserPrincipalName` differs from what you typed → you entered
+  an alias, which can point at an account other than the one holding the mailbox. This
+  is common right after a rename. Re-run with the address `Get-Mailbox` reports.
 
-Two other cases are reported separately, because the fix is different: an address
-that does not exist in the signed-in tenant (check for a typo, and use the primary
-SMTP address rather than an alias), and a mailbox the signed-in account may not open
-(grant FullAccess and allow a few minutes for it to reach Graph). An entry that is
-not an email address at all — a display name such as `Kirk Smith`, or a bare alias —
-is rejected before any Graph call.
+To narrow it down before you reach for PowerShell, the tool asks Graph three more
+questions whenever a mailbox fails — the mailbox root, the Inbox, and the calendar —
+and reports what each answered, so the log carries the evidence rather than only a
+conclusion drawn from it. A cause Graph names outright, such as a mailbox that is not
+served by Exchange Online, overrides the listing's vague answer. It also looks the
+address up in the directory, which needs a scope the tool does not request, so that
+line usually reads "not checked"; where a sign-in does carry it, the lookup names the
+account the address really belongs to, exposing an alias, an account with no mail
+address, and a disabled account.
+
+An address that does not exist in the signed-in tenant is reported separately, because
+the fix is different (typo, or the wrong tenant). An entry that is not an email address
+at all — a display name such as `Kirk Smith`, or a bare alias — is rejected before any
+Graph call.
 
 ## Known limitations
 
@@ -181,7 +198,7 @@ never starts) and drive them against a fake mailbox store and a virtual clock.
 pwsh -File .\tests\Invoke-AllTests.ps1
 ```
 
-224 assertions across four suites.
+258 assertions across four suites.
 
 The **folder** suite covers empty folders, apostrophes in nested and top-level names,
 backslashes in names, a localized target mailbox, repeated names under different
@@ -211,9 +228,16 @@ listing that fails prints to the console, returns nothing, and used to be read a
 empty mailbox — a copy that reported success having copied nothing. The fake Graph
 reproduces that exactly (it only throws when the caller asks for `-ErrorAction
 Stop`), and the suite checks that a failed listing is caught and logged, that an
-empty scan aborts the copy instead of completing it, that nothing is written to
-either mailbox when a check fails, and that each Graph error text maps to the cause
-and the advice an operator can act on.
+empty scan aborts the copy instead of completing it, and that nothing is written to
+either mailbox when a check fails.
+
+The rest of the suite is about not overstating what an error means: that the
+not-found-in-the-store answer is never reported as a missing mailbox, that a cause
+Graph names outright overrides it, that the follow-up probes are reported rather than
+summarised away (and deduplicated when they all answer the same), that a mailbox
+which partly opens says so, that a directory answer naming a different account is
+called out as an alias, and that a directory lookup the sign-in may not make — or an
+SDK that has no `Get-MgUser` at all — does not break the diagnosis.
 
 All three suites exit non-zero on failure, so they work as a build check.
 
