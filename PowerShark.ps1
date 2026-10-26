@@ -14,7 +14,7 @@
     (SMB1/2/3, NFS, SRVSVC).
 
     Capture filter dropdown: All traffic, Active Directory, File shares, SMB, LDAP,
-    Kerberos, DNS, RPC, NFS, Domain collapse. Display filters work on the current view.
+    Kerberos, DNS, RPC, NFS, Domain collapse, RC4. Display filters work on the current view.
     Click the red PRE-COLLAPSE (or SMBv1) banner to list leftover packets on Findings.
 
     Designed for Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012 / 2012 R2,
@@ -33,6 +33,7 @@
       kerberos
       dns
       smb1
+      rc4
       tcp.port==389
       ip.addr==10.1.1.8
 
@@ -65,7 +66,7 @@
 
 .NOTES
     Author      : Anthony Blake
-    Version     : 1.3
+    Version     : 1.4
     Compatible  : Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012
                   (PowerShell 3.0), 2012 R2 (PowerShell 4.0), 5.1, and PowerShell 7+.
                   There is no Requires-Version directive. Do not use -shl/-shr
@@ -86,7 +87,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.3'
+$script:AppVersion = '1.4'
 $script:AppAuthor  = 'Anthony Blake'
 
 # Version is checked at runtime on purpose. Do not add "#Requires -Version".
@@ -251,6 +252,7 @@ function Get-PacketFindingReasons {
     if ($Packet.IsKpasswd) { [void]$list.Add('Kerberos password change (464) — password changes still go through this KDC.') }
     if ($Packet.IsGc) { [void]$list.Add('Global Catalog (3268/3269) — forest-wide lookups still hit this domain.') }
     if ($Packet.IsSmb1) { [void]$list.Add('SMBv1 — remaining NT LM 0.12 client; replace before the file server / DC is retired.') }
+    if ($Packet.IsRc4) { [void]$list.Add('RC4 (Kerberos etype 23 rc4-hmac, or TLS-RC4) — weak cipher. Move tickets to AES (etype 17/18) and disable RC4 on the KDC.') }
     return $list
 }
 
@@ -454,6 +456,7 @@ public class PowerSharkPacket {
     public bool IsKdc;
     public bool IsWinRm;
     public bool IsCert;
+    public bool IsRc4;
 }
 
 public class PowerSharkStats {
@@ -479,6 +482,7 @@ public class PowerSharkStats {
     public int DcLocator;
     public int Sysvol;
     public int Collapse;
+    public int Rc4;
 }
 
 public static class PowerSharkParser {
@@ -1068,6 +1072,7 @@ public static class PowerSharkParser {
         if (mode == 7) return p.IsRpc;
         if (mode == 8) return p.IsNfs;
         if (mode == 9) return p.IsCollapse;
+        if (mode == 10) return p.IsRc4;
         return true;
     }
 
@@ -1092,6 +1097,7 @@ public static class PowerSharkParser {
         else if (p.IsAd) p.Family = "AD";
         else if (p.IsFileShare) p.Family = "FileShare";
         else p.Family = "Other";
+        ScanRc4(p);
         MarkCollapseFindings(p);
         ApplyWellKnownProtocol(p);
     }
@@ -1180,12 +1186,12 @@ public static class PowerSharkParser {
             p.IsGpo = true;
         if (blob.IndexOf("\\DFS") >= 0 || blob.IndexOf("DFS$") >= 0 || blob.IndexOf("DFSN") >= 0)
             p.IsDfs = true;
-        if (p.IsSmb1 || p.IsNtlmV1 || p.IsSimpleBind || p.IsWins) p.IsLegacy = true;
+        if (p.IsSmb1 || p.IsNtlmV1 || p.IsSimpleBind || p.IsWins || p.IsRc4) p.IsLegacy = true;
         if (p.IsLegacy || p.IsSimpleBind || p.IsNtlm || p.IsDcLocator || p.IsSysvol ||
             p.IsNetlogonShare || p.IsReplication || p.IsKpasswd || p.IsGc ||
             p.IsMachine || p.IsGpo || p.IsNtp || p.IsAdws || p.IsCldap || p.IsLlmnr ||
             p.IsAnonymous || p.IsDfs || p.IsSamr || p.IsDnsUpdate || p.IsKdc ||
-            p.IsWinRm || p.IsCert)
+            p.IsWinRm || p.IsCert || p.IsRc4)
             p.IsCollapse = true;
     }
 
@@ -1423,6 +1429,142 @@ public static class PowerSharkParser {
             p.QueryName = realm;
             p.Info = p.Info + " " + realm;
         }
+        ScanRc4(p);
+    }
+
+    static bool EtypeIsRc4(int etype) {
+        return etype == 23 || etype == 24;
+    }
+
+    static string Rc4EtypeName(int etype) {
+        if (etype == 24) return "rc4-hmac-exp";
+        return "rc4-hmac";
+    }
+
+    static bool TlsSuiteIsRc4(int cs) {
+        return cs == 0x0004 || cs == 0x0005 || cs == 0x0024 || cs == 0x0025
+            || cs == 0x002A || cs == 0x002B || cs == 0x008A
+            || cs == 0xC002 || cs == 0xC007 || cs == 0xC00C || cs == 0xC011 || cs == 0xC016;
+    }
+
+    static void MarkRc4Packet(PowerSharkPacket p, int etype, bool used, int hi, int hiLen, string kind) {
+        p.IsRc4 = true;
+        string name = Rc4EtypeName(etype);
+        string how = used ? "used" : "offered";
+        if (kind != null && kind.Length > 0) {
+            p.Info = p.Info + " " + kind + " " + name + " (" + how + ")";
+        } else {
+            p.Info = p.Info + " RC4 " + name + " (" + how + ")";
+        }
+        if (hi >= 0 && hiLen > 0) {
+            p.HighlightOffset = hi;
+            p.HighlightLength = hiLen;
+        }
+    }
+
+    static bool MatchEncryptedRc4(byte[] r, int i, int end, ref int etype, ref int n) {
+        etype = 0;
+        n = 0;
+        if (i + 4 >= end || r[i] != 0xA0 || r[i + 2] != 0x02) return false;
+        int llen = r[i + 1];
+        if (llen == 3 && r[i + 3] == 0x01 && i + 4 < end) {
+            etype = r[i + 4];
+            n = 5;
+            return EtypeIsRc4(etype);
+        }
+        if (llen == 4 && i + 5 < end && r[i + 3] == 0x02 && r[i + 4] == 0x00) {
+            etype = r[i + 5];
+            n = 6;
+            return EtypeIsRc4(etype);
+        }
+        return false;
+    }
+
+    static void ScanRc4(PowerSharkPacket p) {
+        if (p == null || p.IsRc4) return;
+        byte[] r = p.Raw;
+        if (r == null || r.Length < 5) return;
+        int off = p.PayloadOffset;
+        if (off < 0) off = 0;
+        if (off >= r.Length) return;
+        int end = r.Length;
+        bool inKrb = p.IsKerberos;
+        int i;
+        for (i = off; i + 1 < end; i++) {
+            int tag = r[i];
+            int cls = tag & 0xC0;
+            int app = tag & 0x1F;
+            if (cls == 0x40 && app >= 10 && app <= 15) { inKrb = true; break; }
+        }
+        int etype = 0;
+        int n = 0;
+        for (i = off; i + 4 < end; i++) {
+            if (MatchEncryptedRc4(r, i, end, ref etype, ref n)) {
+                MarkRc4Packet(p, etype, true, i, n, "RC4");
+                return;
+            }
+        }
+        if (inKrb) {
+            for (i = off; i + 2 < end; i++) {
+                if (r[i] == 0x02 && r[i + 1] == 0x01 && EtypeIsRc4(r[i + 2])) {
+                    MarkRc4Packet(p, r[i + 2], false, i, 3, "RC4");
+                    return;
+                }
+                if (i + 3 < end && r[i] == 0x02 && r[i + 1] == 0x02 && r[i + 2] == 0 && EtypeIsRc4(r[i + 3])) {
+                    MarkRc4Packet(p, r[i + 3], false, i, 4, "RC4");
+                    return;
+                }
+            }
+        }
+        ScanTlsRc4(p, off, end);
+    }
+
+    static void ScanTlsRc4(PowerSharkPacket p, int off, int end) {
+        byte[] r = p.Raw;
+        if (r == null || off + 11 >= end) return;
+        if (r[off] != 0x16 || r[off + 1] != 0x03 || r[off + 2] > 3) return;
+        int recLen = (r[off + 3] << 8) | r[off + 4];
+        int recEnd = off + 5 + recLen;
+        if (recEnd > end) recEnd = end;
+        int hs = off + 5;
+        if (hs >= recEnd) return;
+        byte hsType = r[hs];
+        if (hsType == 2) {
+            int sidLenOff = hs + 1 + 3 + 2 + 32;
+            if (sidLenOff >= recEnd) return;
+            int sidLen = r[sidLenOff];
+            int csOff = sidLenOff + 1 + sidLen;
+            if (csOff + 1 >= recEnd) return;
+            int cs = (r[csOff] << 8) | r[csOff + 1];
+            if (TlsSuiteIsRc4(cs)) {
+                p.IsRc4 = true;
+                p.Info = p.Info + " TLS-RC4 0x" + cs.ToString("X4") + " (selected)";
+                p.HighlightOffset = csOff;
+                p.HighlightLength = 2;
+            }
+            return;
+        }
+        if (hsType != 1) return;
+        int helloSidOff = hs + 1 + 3 + 2 + 32;
+        if (helloSidOff >= recEnd) return;
+        int helloSidLen = r[helloSidOff];
+        int csLenOff = helloSidOff + 1 + helloSidLen;
+        if (csLenOff + 1 >= recEnd) return;
+        int csLen = (r[csLenOff] << 8) | r[csLenOff + 1];
+        int csAt = csLenOff + 2;
+        int csStop = csAt + csLen;
+        if (csStop > recEnd) csStop = recEnd;
+        int c;
+        for (c = csAt; c + 1 < csStop; c += 2) {
+            int cs = (r[c] << 8) | r[c + 1];
+            if (TlsSuiteIsRc4(cs)) {
+                p.IsRc4 = true;
+                p.Info = p.Info + " TLS-RC4 0x" + cs.ToString("X4") + " (offered)";
+                p.HighlightOffset = c;
+                p.HighlightLength = 2;
+                return;
+            }
+        }
     }
 
     static string ExtractPrintable(byte[] r, int off, int n) {
@@ -1610,6 +1752,9 @@ public static class PowerSharkParser {
         t = t.AddMilliseconds(8);
         list.Add(Wrap(BuildIpUdp(client, "10.10.50.11", 55126, 88, BuildKerberosAsReq()), t));
 
+        t = t.AddMilliseconds(6);
+        list.Add(Wrap(BuildIpUdp(client, "10.10.50.11", 55131, 88, BuildKerberosAsReqRc4()), t));
+
         t = t.AddMilliseconds(8);
         list.Add(Wrap(BuildIpTcp(client, server, 55127, 2049, 0x18, new byte[] { 0x80, 0x00, 0x00, 0x04, 0, 0, 0, 0 }), t));
 
@@ -1701,6 +1846,26 @@ public static class PowerSharkParser {
         pkt[0] = 0x6A;
         pkt[1] = (byte)body.Length;
         Array.Copy(body, 0, pkt, 2, body.Length);
+        return pkt;
+    }
+
+    static byte[] BuildKerberosAsReqRc4() {
+        byte[] realm = Encoding.ASCII.GetBytes("CONTOSO.LOCAL");
+        int innerLen = 5 + realm.Length + 3;
+        byte[] inner = new byte[innerLen];
+        inner[0] = 0xA0;
+        inner[1] = 0x03;
+        inner[2] = 0x02;
+        inner[3] = 0x01;
+        inner[4] = 23;
+        Array.Copy(realm, 0, inner, 5, realm.Length);
+        inner[5 + realm.Length] = 0x02;
+        inner[6 + realm.Length] = 0x01;
+        inner[7 + realm.Length] = 23;
+        byte[] pkt = new byte[2 + inner.Length];
+        pkt[0] = 0x6A;
+        pkt[1] = (byte)inner.Length;
+        Array.Copy(inner, 0, pkt, 2, inner.Length);
         return pkt;
     }
 
@@ -1871,6 +2036,7 @@ public class PowerSharkEngine {
     public int DcLocatorCount;
     public int SysvolCount;
     public int CollapseCount;
+    public int Rc4Count;
     public int Dropped;
     public long Bytes;
     public int RecvCount;
@@ -1922,6 +2088,7 @@ public class PowerSharkEngine {
         DcLocatorCount = 0;
         SysvolCount = 0;
         CollapseCount = 0;
+        Rc4Count = 0;
         Dropped = 0;
         Bytes = 0;
         RecvCount = 0;
@@ -2114,6 +2281,7 @@ public class PowerSharkEngine {
         s.DcLocator = DcLocatorCount;
         s.Sysvol = SysvolCount;
         s.Collapse = CollapseCount;
+        s.Rc4 = Rc4Count;
         s.Dropped = Dropped;
         lock (_gate) { s.Queue = _queue.Count; }
         s.Bytes = Bytes;
@@ -2198,6 +2366,7 @@ public class PowerSharkEngine {
             if (pkt.IsDcLocator) Interlocked.Increment(ref DcLocatorCount);
             if (pkt.IsSysvol || pkt.IsNetlogonShare) Interlocked.Increment(ref SysvolCount);
             if (pkt.IsCollapse) Interlocked.Increment(ref CollapseCount);
+            if (pkt.IsRc4) Interlocked.Increment(ref Rc4Count);
         }
     }
 }
@@ -2432,6 +2601,17 @@ function Invoke-SmbAnalyzerSelfTest {
     if (-not $ntp) { [void]$failures.Add('Demo NTP packet not flagged') }
     $kdc = $demo | Where-Object { $_.IsKdc } | Select-Object -First 1
     if (-not $kdc) { [void]$failures.Add('Demo Kerberos AS-REQ not flagged as KDC') }
+    $rc4 = $demo | Where-Object { $_.IsRc4 } | Select-Object -First 1
+    if (-not $rc4) { [void]$failures.Add('Demo Kerberos RC4 (etype 23) packet not flagged') }
+    elseif (-not [PowerSharkParser]::MatchesFilter($rc4, 10)) {
+        [void]$failures.Add('RC4 capture filter rejected an RC4 packet')
+    } else {
+        $rc4Why = Get-PacketFindingSummary $rc4
+        if ($rc4Why -notmatch 'RC4') { [void]$failures.Add("RC4 finding text missing: $rc4Why") }
+        if ($rc4.Info -notmatch 'rc4-hmac') { [void]$failures.Add("RC4 info missing rc4-hmac: $($rc4.Info)") }
+    }
+    $plainKrb = $demo | Where-Object { $_.IsKerberos -and -not $_.IsRc4 } | Select-Object -First 1
+    if (-not $plainKrb) { [void]$failures.Add('Demo should still include a non-RC4 Kerberos packet') }
     $col = $demo | Where-Object { $_.IsCollapse } | Select-Object -First 1
     if (-not $col) { [void]$failures.Add('No domain-collapse demo packets') }
     elseif (-not [PowerSharkParser]::MatchesFilter($col, 9)) {
@@ -2810,7 +2990,7 @@ function Get-PacketRowColor {
     if ($p.IsSmb1) { return $script:C.Smb1 }
     if ($p.Protocol -eq 'SMB3' -or $p.IsSmb3) { return $script:C.Smb3 }
     if ($p.IsSmb2 -or $p.Protocol -eq 'SMB2') { return $script:C.Smb2 }
-    if ($p.IsSimpleBind -or $p.IsNtlmV1) { return $script:C.Smb1Neg }
+    if ($p.IsSimpleBind -or $p.IsNtlmV1 -or $p.IsRc4) { return $script:C.Smb1Neg }
     if ($p.IsLdap) { return $script:C.Ldap }
     if ($p.IsKerberos) { return $script:C.Kerberos }
     if ($p.IsDns) { return $script:C.Dns }
@@ -2868,6 +3048,7 @@ function Test-FilterToken {
         '^(samr|lsa|lsarpc)$'    { return [bool]$pkt.IsSamr }
         '^(dnsupdate|dns-update|dynamic)$' { return [bool]$pkt.IsDnsUpdate }
         '^(kdc|ticket)$'         { return [bool]$pkt.IsKdc }
+        '^(rc4|rc4hmac|rc4-hmac|etype23|etype-?23|etype24)$' { return [bool]$pkt.IsRc4 }
         '^winrm$'                { return [bool]$pkt.IsWinRm }
         '^(cert|icert|enrollment)$' { return [bool]$pkt.IsCert }
         '^marked$'               { return [bool]$pkt.Marked }
@@ -3063,6 +3244,7 @@ function Update-Smb1Host {
                 IsLegacy    = $false
                 IsMachine   = $false
                 IsGpo       = $false
+                IsRc4       = $false
             }
         }
         $h = $script:Smb1Hosts[$ip]
@@ -3075,6 +3257,7 @@ function Update-Smb1Host {
         if ($pkt.IsLegacy) { $h.IsLegacy = $true }
         if ($pkt.IsMachine) { $h.IsMachine = $true }
         if ($pkt.IsGpo) { $h.IsGpo = $true }
+        if ($pkt.IsRc4) { $h.IsRc4 = $true }
         $protoName = [string]$pkt.Protocol
         if (-not (Test-BlankString $protoName)) {
             if ($h.Protocols.ContainsKey($protoName)) { $h.Protocols[$protoName]++ } else { $h.Protocols[$protoName] = 1 }
@@ -3232,7 +3415,9 @@ function Update-StatusBar {
             $script:BannerKind = 'collapse'
             $script:banner.Visible = $true
             $script:banner.BackColor = $script:C.AlertBg
-            $script:banner.Text = "  PRE-COLLAPSE  -  $($stats.Collapse) leftover(s)  SMBv1 $($stats.Smb1)  simple-bind $($stats.SimpleBind)  NTLM $($stats.Ntlm)  DC-locator $($stats.DcLocator)  SYSVOL $($stats.Sysvol)  -  click to list packets"
+            $rc4n = 0
+            try { $rc4n = [int]$stats.Rc4 } catch { }
+            $script:banner.Text = "  PRE-COLLAPSE  -  $($stats.Collapse) leftover(s)  SMBv1 $($stats.Smb1)  simple-bind $($stats.SimpleBind)  NTLM $($stats.Ntlm)  RC4 $rc4n  DC-locator $($stats.DcLocator)  SYSVOL $($stats.Sysvol)  -  click to list packets"
         } elseif ($stats.Ad -gt 0) {
             $script:BannerKind = 'ad'
             $script:banner.Visible = $true
@@ -3609,6 +3794,7 @@ function Get-CaptureFilterMode {
     if ($v -eq 'RPC') { return 7 }
     if ($v -eq 'NFS') { return 8 }
     if ($v -eq 'Domain collapse') { return 9 }
+    if ($v -eq 'RC4') { return 10 }
     return 0
 }
 
@@ -3741,7 +3927,7 @@ function Import-DemoCapture {
     Update-FindingsGrid -Force
     Write-AppLog "Loaded $($demo.Length) synthetic demo packets (SMB, LDAP, Kerberos, DNS, NFS)." 'INFO'
     [void][System.Windows.Forms.MessageBox]::Show(
-        "Loaded $($demo.Length) synthetic packets.`n`nPurple = LDAP, orange = Kerberos, teal = DNS, red = legacy SMB, blue = SMB2+.`nClick the red banner (SMBv1 / PRE-COLLAPSE) to list leftover packets on Findings, or try display filters: ad, collapse, machine, fileshare.",
+        "Loaded $($demo.Length) synthetic packets.`n`nPurple = LDAP, orange = Kerberos, teal = DNS, red = legacy SMB / RC4, blue = SMB2+.`nClick the red banner (SMBv1 / PRE-COLLAPSE) to list leftover packets on Findings, or try display filters: ad, collapse, rc4, machine, fileshare.",
         'Demo Capture Loaded',
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Information)
@@ -3800,6 +3986,9 @@ function New-PacketCsvRow {
     Add-Member -InputObject $row -MemberType NoteProperty -Name SmbVersion -Value ([string]$Packet.SmbVersion)
     Add-Member -InputObject $row -MemberType NoteProperty -Name SmbCommand -Value ([string]$Packet.SmbCommand)
     Add-Member -InputObject $row -MemberType NoteProperty -Name Info -Value ([string]$Packet.Info)
+    $rc4 = ''
+    try { if ($Packet.IsRc4) { $rc4 = 'Yes' } } catch { }
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Rc4 -Value $rc4
     return $row
 }
 
@@ -4077,6 +4266,9 @@ function Update-HostsGrid {
         $isCol = $false
         try { $isCol = [bool](Get-AppNote $h 'IsCollapse') } catch { }
         if ($view -eq 'Domain collapse' -and -not $isCol) { continue }
+        $isRc4Host = $false
+        try { $isRc4Host = [bool](Get-AppNote $h 'IsRc4') } catch { }
+        if ($view -eq 'RC4' -and -not $isRc4Host) { continue }
         $kind = 'Other'
         if ($isAd -and $isFs) { $kind = 'AD+File' }
         elseif ($isAd) { $kind = 'AD' }
@@ -4164,7 +4356,7 @@ function Update-StatsTab {
     $stats = $script:Engine.GetStats()
     $total = [Math]::Max(1, (Get-AppCount $script:AllPackets))
     $c1 = 0; $c2 = 0; $c3 = 0; $tcp = 0
-    $nMach = 0; $nGpo = 0; $nNtp = 0; $nKdc = 0; $nAnon = 0; $nLlmnr = 0; $nSamr = 0; $nAdws = 0
+    $nMach = 0; $nGpo = 0; $nNtp = 0; $nKdc = 0; $nAnon = 0; $nLlmnr = 0; $nSamr = 0; $nAdws = 0; $nRc4 = 0
     foreach ($p in (Get-AppEnumerable $script:AllPackets)) {
         if ($p.IsSmb1) { $c1++ }
         elseif ($p.IsSmb2 -or $p.Protocol -eq 'SMB2') { $c2++ }
@@ -4178,6 +4370,7 @@ function Update-StatsTab {
         if ($p.IsLlmnr) { $nLlmnr++ }
         if ($p.IsSamr) { $nSamr++ }
         if ($p.IsAdws) { $nAdws++ }
+        if ($p.IsRc4) { $nRc4++ }
     }
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine("PowerShark v$($script:AppVersion)  -  Statistics")
@@ -4198,8 +4391,8 @@ function Update-StatsTab {
     [void]$sb.AppendLine("")
     [void]$sb.AppendLine("Active Directory : $($stats.Ad)   LDAP $($stats.Ldap)  Kerberos $($stats.Kerberos)  DNS $($stats.Dns)  RPC $($stats.Rpc)")
     [void]$sb.AppendLine("File shares      : $($stats.FileShare)   NFS $($stats.Nfs)")
-    [void]$sb.AppendLine("Pre-collapse     : $($stats.Collapse)  legacy $($stats.Legacy)  simple-bind $($stats.SimpleBind)  NTLM $($stats.Ntlm)  DC-locator $($stats.DcLocator)  SYSVOL/NETLOGON $($stats.Sysvol)")
-    [void]$sb.AppendLine(("  machine accounts {0}  GPO {1}  KDC tickets {2}  NTP {3}  ADWS {4}  anon-bind {5}  LLMNR {6}  SAMR/LSA {7}" -f $nMach, $nGpo, $nKdc, $nNtp, $nAdws, $nAnon, $nLlmnr, $nSamr))
+    [void]$sb.AppendLine("Pre-collapse     : $($stats.Collapse)  legacy $($stats.Legacy)  simple-bind $($stats.SimpleBind)  NTLM $($stats.Ntlm)  RC4 $($stats.Rc4)  DC-locator $($stats.DcLocator)  SYSVOL/NETLOGON $($stats.Sysvol)")
+    [void]$sb.AppendLine(("  machine accounts {0}  GPO {1}  KDC tickets {2}  NTP {3}  ADWS {4}  anon-bind {5}  LLMNR {6}  SAMR/LSA {7}  RC4 {8}" -f $nMach, $nGpo, $nKdc, $nNtp, $nAdws, $nAnon, $nLlmnr, $nSamr, $nRc4))
     [void]$sb.AppendLine("Talkers          : $($script:Smb1Hosts.Count)")
     [void]$sb.AppendLine("SMBv1 commands")
     foreach ($e in (Get-AppEnumerable ($script:Smb1CommandHist.GetEnumerator() | Sort-Object Value -Descending))) {
@@ -4439,8 +4632,8 @@ HOW TO RUN
   2. Right-click powershell.exe or pwsh.exe -> Run as administrator.
   3. powershell.exe -ExecutionPolicy Bypass -STA -File .\PowerShark.ps1
   4. Pick the IPv4 address of the interface that faces clients / DCs.
-  5. Capture dropdown: All traffic (default), Active Directory, File shares, or Domain collapse.
-  6. Click Start. Use display filters (collapse, machine, gpo, dclocator, ad, ldap).
+  5. Capture dropdown: All traffic (default), Active Directory, File shares, Domain collapse, or RC4.
+  6. Click Start. Use display filters (collapse, rc4, machine, gpo, dclocator, ad, ldap).
   7. When the red PRE-COLLAPSE (or SMBv1) banner appears, click it. The Findings
      tab lists every leftover packet the alert is about. Double-click a row to
      jump to that frame on the Packets tab.
@@ -4461,7 +4654,7 @@ NO LIVE TRAFFIC?
   Watch Wire in the status bar after Start.
     Wire = 0  firewall / 32-bit SysWOW64 PowerShell. Use System32 powershell.exe.
     Wire > 0, Packets = 0  set Capture to All traffic.
-  File > Load demo capture injects synthetic AD + SMB + DNS + Kerberos + LDAP + NFS.
+  File > Load demo capture injects synthetic AD + SMB + DNS + Kerberos (including RC4) + LDAP + NFS.
   Saved PCAPs open in Wireshark (LINKTYPE 228 / IPv4).
 
 BEFORE A DOMAIN COLLAPSE
@@ -4475,6 +4668,7 @@ BEFORE A DOMAIN COLLAPSE
     simplebind     LDAP simple binds (passwords in cleartext on 389)
     anonymous      LDAP binds with an empty DN
     ntlm / ntlmv1  apps not using Kerberos (harder cutover)
+    rc4            Kerberos etype 23/24 (rc4-hmac) or TLS RC4 cipher suites
     dclocator      DNS SRV _ldap._tcp / _kerberos / _msdcs / _sites
     cldap          UDP 389 NetLogon LDAP ping (DC locator)
     dns:old.domain.tld     who still queries the old DNS name
@@ -4493,7 +4687,7 @@ BEFORE A DOMAIN COLLAPSE
     gc             Global Catalog 3268/3269
     kpasswd        Kerberos password-change (464)
     smb1           remaining NT LM 0.12 clients
-  Talkers tab -> Show: Domain collapse lists the IPs to chase.
+  Talkers tab -> Show: Domain collapse or RC4 lists the IPs to chase.
   Click the red PRE-COLLAPSE header to open Findings (leftover packets + why).
   Packet details show FINDING lines for each leftover.
 
@@ -4507,6 +4701,7 @@ DISPLAY FILTERS
   simplebind
   anonymous
   ntlm
+  rc4
   dclocator
   cldap
   ntp
@@ -4554,6 +4749,9 @@ HOW DETECTION WORKS
     FD 53 4D 42   = SMB 3 transform (encrypted)
   Negotiate requests list dialects. Session Setup is scanned for NTLMSSP Type 3
   (username / domain / workstation). Tree Connect and NT Create extract paths.
+  Kerberos (UDP/TCP 88 and GSS blobs) is scanned for encryption type 23
+  (rc4-hmac) and 24 (rc4-hmac-exp) in EncryptedData and etype lists. TLS
+  ClientHello/ServerHello is checked for RC4 cipher suites (0x0004/0x0005/…).
 
 LIMITATIONS vs REAL WIRESHARK
   - IPv4 only (raw sockets). No Ethernet header on live frames.
@@ -4696,7 +4894,7 @@ $lblTitle.AutoSize = $true
 $lblTitle.Location = New-Object System.Drawing.Point(16, 6)
 
 $lblSub = New-Object System.Windows.Forms.Label
-$lblSub.Text = 'Live IPv4    Active Directory    File shares    Domain collapse'
+$lblSub.Text = 'Live IPv4    Active Directory    File shares    Domain collapse    RC4'
 $lblSub.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 $lblSub.ForeColor = $script:C.Accent
 $lblSub.AutoSize = $true
@@ -4805,10 +5003,11 @@ $script:cmbCap.Margin = New-Object System.Windows.Forms.Padding(0, 6, 8, 4)
     'DNS',
     'RPC',
     'NFS',
-    'Domain collapse'
+    'Domain collapse',
+    'RC4'
 ))
 $script:cmbCap.SelectedIndex = 0
-$script:Tip.SetToolTip($script:cmbCap, 'Capture filter applied on the sniffer thread. All traffic is the default.')
+$script:Tip.SetToolTip($script:cmbCap, 'Capture filter applied on the sniffer thread. All traffic is the default. RC4 keeps Kerberos etype 23/24 and TLS-RC4.')
 $script:cmbCap.Add_SelectedIndexChanged({
     if ($script:Engine) { $script:Engine.FilterMode = Get-CaptureFilterMode }
 })
@@ -4946,6 +5145,7 @@ $script:cmbPreset.Margin = New-Object System.Windows.Forms.Padding(0, 4, 8, 4)
     'anonymous',
     'ntlm',
     'ntlmv1',
+    'rc4',
     'dclocator',
     'cldap',
     'sysvol',
@@ -4983,7 +5183,7 @@ $script:txtFilter.Font = New-Object System.Drawing.Font('Consolas', 10)
 $script:txtFilter.Dock = 'Fill'
 $script:txtFilter.Margin = New-Object System.Windows.Forms.Padding(0, 4, 8, 4)
 $script:txtFilter.MinimumSize = New-Object System.Drawing.Size(120, 0)
-$script:Tip.SetToolTip($script:txtFilter, "Examples: collapse   machine   gpo   dclocator   domain:contoso   simplebind   ntp   ad   ldap   Enter to apply")
+$script:Tip.SetToolTip($script:txtFilter, "Examples: collapse   rc4   machine   gpo   dclocator   domain:contoso   simplebind   ntp   ad   ldap   Enter to apply")
 $script:txtFilter.Add_KeyDown({
     param($s, $e)
     if ($e.KeyCode -eq 'Enter') { $e.SuppressKeyPress = $true; Update-PacketView }
@@ -5183,6 +5383,8 @@ $mFs = $ctx.Items.Add('Display filter: fileshare')
 $mFs.add_Click({ Set-DisplayFilter -Text 'fileshare' })
 $mSmb1 = $ctx.Items.Add('Display filter: smb1')
 $mSmb1.add_Click({ Set-DisplayFilter -Text 'smb1' })
+$mRc4 = $ctx.Items.Add('Display filter: rc4')
+$mRc4.add_Click({ Set-DisplayFilter -Text 'rc4' })
 $mCol = $ctx.Items.Add('Display filter: collapse')
 $mCol.add_Click({ Set-DisplayFilter -Text 'collapse' })
 $mFind = $ctx.Items.Add('Show banner findings')
@@ -5296,7 +5498,7 @@ $script:cmbHostView = New-Object System.Windows.Forms.ComboBox
 $script:cmbHostView.DropDownStyle = 'DropDownList'
 $script:cmbHostView.Width = 160
 $script:cmbHostView.Margin = New-Object System.Windows.Forms.Padding(0, 6, 8, 4)
-[void]$script:cmbHostView.Items.AddRange(@('All talkers', 'Active Directory', 'File shares', 'Domain collapse'))
+[void]$script:cmbHostView.Items.AddRange(@('All talkers', 'Active Directory', 'File shares', 'Domain collapse', 'RC4'))
 $script:cmbHostView.SelectedIndex = 0
 $script:cmbHostView.Add_SelectedIndexChanged({ Update-HostsGrid })
 
