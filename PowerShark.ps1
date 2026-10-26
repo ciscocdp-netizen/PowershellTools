@@ -14,7 +14,7 @@
     (SMB1/2/3, NFS, SRVSVC).
 
     Capture filter dropdown: All traffic, Active Directory, File shares, SMB, LDAP,
-    Kerberos, DNS, RPC, NFS, Domain collapse, RC4. Display filters work on the current view.
+    LDAPS, Kerberos, DNS, RPC, NFS, Domain collapse, RC4. Display filters work on the current view.
     Click the red PRE-COLLAPSE (or SMBv1) banner to list leftover packets on Findings.
 
     Designed for Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012 / 2012 R2,
@@ -34,6 +34,7 @@
       dns
       smb1
       rc4
+      ldaps
       tcp.port==389
       ip.addr==10.1.1.8
 
@@ -66,7 +67,7 @@
 
 .NOTES
     Author      : Anthony Blake
-    Version     : 1.4
+    Version     : 1.5
     Compatible  : Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012
                   (PowerShell 3.0), 2012 R2 (PowerShell 4.0), 5.1, and PowerShell 7+.
                   There is no Requires-Version directive. Do not use -shl/-shr
@@ -87,7 +88,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.4'
+$script:AppVersion = '1.5'
 $script:AppAuthor  = 'Anthony Blake'
 
 # Version is checked at runtime on purpose. Do not add "#Requires -Version".
@@ -473,6 +474,7 @@ public class PowerSharkStats {
     public int FileShare;
     public int Dns;
     public int Ldap;
+    public int Ldaps;
     public int Kerberos;
     public int Rpc;
     public int Nfs;
@@ -1073,6 +1075,7 @@ public static class PowerSharkParser {
         if (mode == 8) return p.IsNfs;
         if (mode == 9) return p.IsCollapse;
         if (mode == 10) return p.IsRc4;
+        if (mode == 11) return p.IsLdaps;
         return true;
     }
 
@@ -1300,6 +1303,11 @@ public static class PowerSharkParser {
         return v;
     }
 
+    static bool LooksLikeTls(byte[] r, int off, int end) {
+        if (r == null || off + 2 >= end || off + 2 >= r.Length) return false;
+        return r[off] == 0x16 && r[off + 1] == 0x03 && r[off + 2] <= 3;
+    }
+
     static void ParseLdap(PowerSharkPacket p) {
         byte[] r = p.Raw;
         int off = p.PayloadOffset;
@@ -1308,17 +1316,26 @@ public static class PowerSharkParser {
         p.IsLdap = true;
         bool ssl = PortIs(p.SrcPort, p.DstPort, 636) || PortIs(p.SrcPort, p.DstPort, 3269);
         bool gc = PortIs(p.SrcPort, p.DstPort, 3268) || PortIs(p.SrcPort, p.DstPort, 3269);
+        bool tls = LooksLikeTls(r, off, end);
+        if (ssl || tls) p.IsLdaps = true;
         if (p.IsUdp) {
             p.IsCldap = true;
             p.Protocol = "CLDAP";
+        } else if (p.IsLdaps) {
+            p.Protocol = gc ? "LDAPS-GC" : "LDAPS";
         } else {
-            p.Protocol = ssl ? "LDAPS" : (gc ? "LDAP-GC" : "LDAP");
+            p.Protocol = gc ? "LDAP-GC" : "LDAP";
         }
         p.HighlightOffset = off;
         p.HighlightLength = Math.Min(8, Math.Max(0, end - off));
+        if (tls) {
+            p.AppOp = "TLS";
+            p.Info = p.Protocol + " TLS handshake";
+            return;
+        }
         if (off >= end || r[off] != 0x30) {
-            p.AppOp = ssl ? "TLS" : "LDAP";
-            p.Info = p.Protocol + (ssl ? " (encrypted)" : "");
+            p.AppOp = p.IsLdaps ? "TLS" : "LDAP";
+            p.Info = p.Protocol + (p.IsLdaps ? " (encrypted)" : "");
             return;
         }
         int pos = off + 1;
@@ -1749,6 +1766,9 @@ public static class PowerSharkParser {
         t = t.AddMilliseconds(8);
         list.Add(Wrap(BuildIpTcp(client, "10.10.50.11", 55125, 389, 0x18, BuildLdapBind()), t));
 
+        t = t.AddMilliseconds(6);
+        list.Add(Wrap(BuildIpTcp(client, "10.10.50.11", 55133, 636, 0x18, BuildTlsClientHello()), t));
+
         t = t.AddMilliseconds(8);
         list.Add(Wrap(BuildIpUdp(client, "10.10.50.11", 55126, 88, BuildKerberosAsReq()), t));
 
@@ -1837,6 +1857,19 @@ public static class PowerSharkParser {
             0x02, 0x01, 0x03,
             0x04, 0x00,
             0x80, 0x00
+        };
+    }
+
+    static byte[] BuildTlsClientHello() {
+        return new byte[] {
+            0x16, 0x03, 0x01, 0x00, 0x2C,
+            0x01, 0x00, 0x00, 0x28,
+            0x03, 0x01,
+            0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+            0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+            0x00,
+            0x00, 0x02, 0x00, 0x2F,
+            0x01, 0x00
         };
     }
 
@@ -2027,6 +2060,7 @@ public class PowerSharkEngine {
     public int FileShareCount;
     public int DnsCount;
     public int LdapCount;
+    public int LdapsCount;
     public int KerberosCount;
     public int RpcCount;
     public int NfsCount;
@@ -2079,6 +2113,7 @@ public class PowerSharkEngine {
         FileShareCount = 0;
         DnsCount = 0;
         LdapCount = 0;
+        LdapsCount = 0;
         KerberosCount = 0;
         RpcCount = 0;
         NfsCount = 0;
@@ -2272,6 +2307,7 @@ public class PowerSharkEngine {
         s.FileShare = FileShareCount;
         s.Dns = DnsCount;
         s.Ldap = LdapCount;
+        s.Ldaps = LdapsCount;
         s.Kerberos = KerberosCount;
         s.Rpc = RpcCount;
         s.Nfs = NfsCount;
@@ -2357,6 +2393,7 @@ public class PowerSharkEngine {
             if (pkt.IsFileShare) Interlocked.Increment(ref FileShareCount);
             if (pkt.IsDns) Interlocked.Increment(ref DnsCount);
             if (pkt.IsLdap) Interlocked.Increment(ref LdapCount);
+            if (pkt.IsLdaps) Interlocked.Increment(ref LdapsCount);
             if (pkt.IsKerberos) Interlocked.Increment(ref KerberosCount);
             if (pkt.IsRpc) Interlocked.Increment(ref RpcCount);
             if (pkt.IsNfs) Interlocked.Increment(ref NfsCount);
@@ -2578,6 +2615,16 @@ function Invoke-SmbAnalyzerSelfTest {
     if (-not $dns) { [void]$failures.Add('Demo DNS packet missing') }
     $ldap = $demo | Where-Object { $_.IsLdap } | Select-Object -First 1
     if (-not $ldap) { [void]$failures.Add('Demo LDAP packet missing') }
+    $ldaps = $demo | Where-Object { $_.IsLdaps } | Select-Object -First 1
+    if (-not $ldaps) { [void]$failures.Add('Demo LDAPS packet missing') }
+    elseif (-not [PowerSharkParser]::MatchesFilter($ldaps, 11)) {
+        [void]$failures.Add('LDAPS capture filter rejected an LDAPS packet')
+    } elseif ((Get-PacketServiceName $ldaps) -ne 'LDAPS') {
+        [void]$failures.Add("Get-PacketServiceName LDAPS got $(Get-PacketServiceName $ldaps)")
+    } elseif ($ldaps.Protocol -ne 'LDAPS') {
+        [void]$failures.Add("LDAPS Protocol=$($ldaps.Protocol)")
+    }
+    if ($ldap -and $ldap.IsLdaps) { [void]$failures.Add('Cleartext LDAP bind should not be flagged as LDAPS') }
     $krb = $demo | Where-Object { $_.IsKerberos } | Select-Object -First 1
     if (-not $krb) { [void]$failures.Add('Demo Kerberos packet missing') }
     if (-not ($demo | Where-Object { $_.IsAd })) { [void]$failures.Add('No AD-classified demo packets') }
@@ -3015,7 +3062,7 @@ function Test-FilterToken {
         '^(ad|activedirectory)$' { return [bool]$pkt.IsAd }
         '^(fileshare|file.?share|fileserver)$' { return [bool]$pkt.IsFileShare }
         '^ldap$'                 { return [bool]$pkt.IsLdap }
-        '^ldaps$'                { return [bool]$pkt.IsLdaps }
+        '^(ldaps|ldap\.ssl|ldap-ssl|starttls)$' { return [bool]$pkt.IsLdaps }
         '^gc$'                   { return [bool]$pkt.IsGc }
         '^(kerberos|krb5|krb)$'  { return [bool]$pkt.IsKerberos }
         '^dns$'                  { return [bool]$pkt.IsDns }
@@ -3245,6 +3292,7 @@ function Update-Smb1Host {
                 IsMachine   = $false
                 IsGpo       = $false
                 IsRc4       = $false
+                IsLdaps     = $false
             }
         }
         $h = $script:Smb1Hosts[$ip]
@@ -3258,6 +3306,7 @@ function Update-Smb1Host {
         if ($pkt.IsMachine) { $h.IsMachine = $true }
         if ($pkt.IsGpo) { $h.IsGpo = $true }
         if ($pkt.IsRc4) { $h.IsRc4 = $true }
+        if ($pkt.IsLdaps) { $h.IsLdaps = $true }
         $protoName = [string]$pkt.Protocol
         if (-not (Test-BlankString $protoName)) {
             if ($h.Protocols.ContainsKey($protoName)) { $h.Protocols[$protoName]++ } else { $h.Protocols[$protoName] = 1 }
@@ -3422,7 +3471,7 @@ function Update-StatusBar {
             $script:BannerKind = 'ad'
             $script:banner.Visible = $true
             $script:banner.BackColor = $script:C.Blue
-            $script:banner.Text = "  Active Directory traffic  -  LDAP $($stats.Ldap)  Kerberos $($stats.Kerberos)  DNS $($stats.Dns)  RPC $($stats.Rpc)  DC-locator $($stats.DcLocator)  -  click to list packets"
+            $script:banner.Text = "  Active Directory traffic  -  LDAP $($stats.Ldap)  LDAPS $($stats.Ldaps)  Kerberos $($stats.Kerberos)  DNS $($stats.Dns)  RPC $($stats.Rpc)  DC-locator $($stats.DcLocator)  -  click to list packets"
         } else {
             $script:BannerKind = ''
             $script:banner.Visible = $false
@@ -3795,6 +3844,7 @@ function Get-CaptureFilterMode {
     if ($v -eq 'NFS') { return 8 }
     if ($v -eq 'Domain collapse') { return 9 }
     if ($v -eq 'RC4') { return 10 }
+    if ($v -eq 'LDAPS') { return 11 }
     return 0
 }
 
@@ -3927,7 +3977,7 @@ function Import-DemoCapture {
     Update-FindingsGrid -Force
     Write-AppLog "Loaded $($demo.Length) synthetic demo packets (SMB, LDAP, Kerberos, DNS, NFS)." 'INFO'
     [void][System.Windows.Forms.MessageBox]::Show(
-        "Loaded $($demo.Length) synthetic packets.`n`nPurple = LDAP, orange = Kerberos, teal = DNS, red = legacy SMB / RC4, blue = SMB2+.`nClick the red banner (SMBv1 / PRE-COLLAPSE) to list leftover packets on Findings, or try display filters: ad, collapse, rc4, machine, fileshare.",
+        "Loaded $($demo.Length) synthetic packets.`n`nPurple = LDAP, orange = Kerberos, teal = DNS, red = legacy SMB / RC4, blue = SMB2+.`nClick the red banner (SMBv1 / PRE-COLLAPSE) to list leftover packets on Findings, or try display filters: ad, collapse, rc4, ldaps, machine, fileshare.",
         'Demo Capture Loaded',
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Information)
@@ -3989,6 +4039,9 @@ function New-PacketCsvRow {
     $rc4 = ''
     try { if ($Packet.IsRc4) { $rc4 = 'Yes' } } catch { }
     Add-Member -InputObject $row -MemberType NoteProperty -Name Rc4 -Value $rc4
+    $ldaps = ''
+    try { if ($Packet.IsLdaps) { $ldaps = 'Yes' } } catch { }
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Ldaps -Value $ldaps
     return $row
 }
 
@@ -4269,6 +4322,9 @@ function Update-HostsGrid {
         $isRc4Host = $false
         try { $isRc4Host = [bool](Get-AppNote $h 'IsRc4') } catch { }
         if ($view -eq 'RC4' -and -not $isRc4Host) { continue }
+        $isLdapsHost = $false
+        try { $isLdapsHost = [bool](Get-AppNote $h 'IsLdaps') } catch { }
+        if ($view -eq 'LDAPS' -and -not $isLdapsHost) { continue }
         $kind = 'Other'
         if ($isAd -and $isFs) { $kind = 'AD+File' }
         elseif ($isAd) { $kind = 'AD' }
@@ -4389,7 +4445,7 @@ function Update-StatsTab {
     [void]$sb.AppendLine(("  SMB3   {0,8}  {1,6:N1}%" -f $c3, (100.0 * $c3 / $total)))
     [void]$sb.AppendLine(("  TCP    {0,8}  {1,6:N1}%" -f $tcp, (100.0 * $tcp / $total)))
     [void]$sb.AppendLine("")
-    [void]$sb.AppendLine("Active Directory : $($stats.Ad)   LDAP $($stats.Ldap)  Kerberos $($stats.Kerberos)  DNS $($stats.Dns)  RPC $($stats.Rpc)")
+    [void]$sb.AppendLine("Active Directory : $($stats.Ad)   LDAP $($stats.Ldap)  LDAPS $($stats.Ldaps)  Kerberos $($stats.Kerberos)  DNS $($stats.Dns)  RPC $($stats.Rpc)")
     [void]$sb.AppendLine("File shares      : $($stats.FileShare)   NFS $($stats.Nfs)")
     [void]$sb.AppendLine("Pre-collapse     : $($stats.Collapse)  legacy $($stats.Legacy)  simple-bind $($stats.SimpleBind)  NTLM $($stats.Ntlm)  RC4 $($stats.Rc4)  DC-locator $($stats.DcLocator)  SYSVOL/NETLOGON $($stats.Sysvol)")
     [void]$sb.AppendLine(("  machine accounts {0}  GPO {1}  KDC tickets {2}  NTP {3}  ADWS {4}  anon-bind {5}  LLMNR {6}  SAMR/LSA {7}  RC4 {8}" -f $nMach, $nGpo, $nKdc, $nNtp, $nAdws, $nAnon, $nLlmnr, $nSamr, $nRc4))
@@ -4632,8 +4688,8 @@ HOW TO RUN
   2. Right-click powershell.exe or pwsh.exe -> Run as administrator.
   3. powershell.exe -ExecutionPolicy Bypass -STA -File .\PowerShark.ps1
   4. Pick the IPv4 address of the interface that faces clients / DCs.
-  5. Capture dropdown: All traffic (default), Active Directory, File shares, Domain collapse, or RC4.
-  6. Click Start. Use display filters (collapse, rc4, machine, gpo, dclocator, ad, ldap).
+  5. Capture dropdown: All traffic (default), Active Directory, File shares, Domain collapse, RC4, or LDAPS.
+  6. Click Start. Use display filters (collapse, rc4, ldaps, machine, gpo, dclocator, ad, ldap).
   7. When the red PRE-COLLAPSE (or SMBv1) banner appears, click it. The Findings
      tab lists every leftover packet the alert is about. Double-click a row to
      jump to that frame on the Packets tab.
@@ -4669,6 +4725,7 @@ BEFORE A DOMAIN COLLAPSE
     anonymous      LDAP binds with an empty DN
     ntlm / ntlmv1  apps not using Kerberos (harder cutover)
     rc4            Kerberos etype 23/24 (rc4-hmac) or TLS RC4 cipher suites
+    ldaps          LDAP over TLS (TCP 636 / GC 3269), including STARTTLS
     dclocator      DNS SRV _ldap._tcp / _kerberos / _msdcs / _sites
     cldap          UDP 389 NetLogon LDAP ping (DC locator)
     dns:old.domain.tld     who still queries the old DNS name
@@ -4713,6 +4770,7 @@ DISPLAY FILTERS
   sysvol
   fileshare
   ldap
+  ldaps
   kerberos
   dns
   dns:_msdcs
@@ -4894,7 +4952,7 @@ $lblTitle.AutoSize = $true
 $lblTitle.Location = New-Object System.Drawing.Point(16, 6)
 
 $lblSub = New-Object System.Windows.Forms.Label
-$lblSub.Text = 'Live IPv4    Active Directory    File shares    Domain collapse    RC4'
+$lblSub.Text = 'Live IPv4    Active Directory    File shares    Domain collapse    RC4    LDAPS'
 $lblSub.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 $lblSub.ForeColor = $script:C.Accent
 $lblSub.AutoSize = $true
@@ -4999,6 +5057,7 @@ $script:cmbCap.Margin = New-Object System.Windows.Forms.Padding(0, 6, 8, 4)
     'File shares',
     'SMB',
     'LDAP',
+    'LDAPS',
     'Kerberos',
     'DNS',
     'RPC',
@@ -5007,7 +5066,7 @@ $script:cmbCap.Margin = New-Object System.Windows.Forms.Padding(0, 6, 8, 4)
     'RC4'
 ))
 $script:cmbCap.SelectedIndex = 0
-$script:Tip.SetToolTip($script:cmbCap, 'Capture filter applied on the sniffer thread. All traffic is the default. RC4 keeps Kerberos etype 23/24 and TLS-RC4.')
+$script:Tip.SetToolTip($script:cmbCap, 'Capture filter applied on the sniffer thread. All traffic is the default. LDAPS keeps TCP 636/3269 and LDAP STARTTLS. RC4 keeps Kerberos etype 23/24 and TLS-RC4.')
 $script:cmbCap.Add_SelectedIndexChanged({
     if ($script:Engine) { $script:Engine.FilterMode = Get-CaptureFilterMode }
 })
@@ -5160,6 +5219,7 @@ $script:cmbPreset.Margin = New-Object System.Windows.Forms.Padding(0, 4, 8, 4)
     'gc',
     'fileshare',
     'ldap',
+    'ldaps',
     'kerberos',
     'dns',
     'rpc',
@@ -5168,6 +5228,7 @@ $script:cmbPreset.Margin = New-Object System.Windows.Forms.Padding(0, 4, 8, 4)
     'smb1',
     'smb2 or smb3',
     'tcp.port==389',
+    'tcp.port==636',
     'tcp.port==88',
     'tcp.port==445',
     'marked'
@@ -5183,7 +5244,7 @@ $script:txtFilter.Font = New-Object System.Drawing.Font('Consolas', 10)
 $script:txtFilter.Dock = 'Fill'
 $script:txtFilter.Margin = New-Object System.Windows.Forms.Padding(0, 4, 8, 4)
 $script:txtFilter.MinimumSize = New-Object System.Drawing.Size(120, 0)
-$script:Tip.SetToolTip($script:txtFilter, "Examples: collapse   rc4   machine   gpo   dclocator   domain:contoso   simplebind   ntp   ad   ldap   Enter to apply")
+$script:Tip.SetToolTip($script:txtFilter, "Examples: collapse   rc4   ldaps   machine   gpo   dclocator   domain:contoso   simplebind   ntp   ad   ldap   Enter to apply")
 $script:txtFilter.Add_KeyDown({
     param($s, $e)
     if ($e.KeyCode -eq 'Enter') { $e.SuppressKeyPress = $true; Update-PacketView }
@@ -5385,6 +5446,8 @@ $mSmb1 = $ctx.Items.Add('Display filter: smb1')
 $mSmb1.add_Click({ Set-DisplayFilter -Text 'smb1' })
 $mRc4 = $ctx.Items.Add('Display filter: rc4')
 $mRc4.add_Click({ Set-DisplayFilter -Text 'rc4' })
+$mLdaps = $ctx.Items.Add('Display filter: ldaps')
+$mLdaps.add_Click({ Set-DisplayFilter -Text 'ldaps' })
 $mCol = $ctx.Items.Add('Display filter: collapse')
 $mCol.add_Click({ Set-DisplayFilter -Text 'collapse' })
 $mFind = $ctx.Items.Add('Show banner findings')
@@ -5498,7 +5561,7 @@ $script:cmbHostView = New-Object System.Windows.Forms.ComboBox
 $script:cmbHostView.DropDownStyle = 'DropDownList'
 $script:cmbHostView.Width = 160
 $script:cmbHostView.Margin = New-Object System.Windows.Forms.Padding(0, 6, 8, 4)
-[void]$script:cmbHostView.Items.AddRange(@('All talkers', 'Active Directory', 'File shares', 'Domain collapse', 'RC4'))
+[void]$script:cmbHostView.Items.AddRange(@('All talkers', 'Active Directory', 'File shares', 'Domain collapse', 'RC4', 'LDAPS'))
 $script:cmbHostView.SelectedIndex = 0
 $script:cmbHostView.Add_SelectedIndexChanged({ Update-HostsGrid })
 
