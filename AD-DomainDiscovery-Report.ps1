@@ -1397,6 +1397,30 @@ function New-Badge {
     '<span class="badge badge-{0}">{1}</span>' -f $Kind, (ConvertTo-HtmlEncoded $Text)
 }
 
+function ConvertTo-EmbeddedJson {
+    param($InputObject)
+    $json = $InputObject | ConvertTo-Json -Depth 8 -Compress
+    if ([string]::IsNullOrEmpty($json)) { return '{}' }
+    return ($json -replace '<', '\u003c')
+}
+
+function New-ChartItem {
+    param(
+        [string]$Title,
+        [string]$Subtitle = '',
+        [string]$Detail = '',
+        [string]$Tab = '',
+        [string]$Filter = ''
+    )
+    [ordered]@{
+        title    = $Title
+        subtitle = $Subtitle
+        detail   = $Detail
+        tab      = $Tab
+        filter   = $Filter
+    }
+}
+
 function New-DiscoveryReportHtml {
     param($Report)
 
@@ -1562,7 +1586,7 @@ function New-DiscoveryReportHtml {
         $searchBlob = ($searchParts.ToArray() -join ' ')
 
         [void]$dcCards.AppendLine(@"
-<article class="dc-card" data-status="$statusClass" data-search="$(ConvertTo-HtmlEncoded $searchBlob.ToLowerInvariant())">
+<article class="dc-card" data-status="$statusClass" data-name="$(ConvertTo-HtmlEncoded $dc.ComputerName)" data-search="$(ConvertTo-HtmlEncoded $searchBlob.ToLowerInvariant())">
     <header class="dc-head">
         <div>
             <h3>$(ConvertTo-HtmlEncoded $dc.ComputerName)</h3>
@@ -1682,7 +1706,7 @@ function New-DiscoveryReportHtml {
         }
         $rec = if ($g.Recursive) { 'recursive' } else { 'direct only' }
         [void]$privHtml.AppendLine(@"
-<div class="priv-card">
+<div class="priv-card" data-priv="$(ConvertTo-HtmlEncoded $g.Name)">
     <h3>$(ConvertTo-HtmlEncoded $g.Name) <span class="count">$($g.Count)</span></h3>
     <div class="muted">Enumeration: $rec</div>
     <ul>$memberList</ul>
@@ -1819,97 +1843,298 @@ function New-DiscoveryReportHtml {
         "Inventory truncated at $($Report.MaxInventoryObjects) objects — counts are lower bounds."
     } else { 'Inventory covers enabled/disabled, stale, and delegation flags up to the result cap.' }
 
+    $osPalette = @('#6366f1', '#06b6d4', '#8b5cf6', '#14b8a6', '#f43f5e', '#84cc16', '#f97316', '#64748b')
+    $chartFindings = [System.Collections.Generic.List[object]]::new()
+    foreach ($sev in @('Critical', 'Warning', 'Info', 'Good')) {
+        $set = @($findings | Where-Object { $_.Severity -eq $sev })
+        if ($set.Count -eq 0) { continue }
+        $color = switch ($sev) { 'Critical' { '#e11d48' } 'Warning' { '#f59e0b' } 'Info' { '#3b82f6' } default { '#10b981' } }
+        $items = @(
+            $set | ForEach-Object {
+                New-ChartItem -Title $_.Title -Subtitle $_.Area -Detail $_.Detail -Tab 'brief' -Filter ('finding:{0}' -f $sev.ToLowerInvariant())
+            }
+        )
+        [void]$chartFindings.Add([ordered]@{
+                key = $sev.ToLowerInvariant(); label = $sev; value = $set.Count; color = $color; items = $items
+            })
+    }
+
+    $chartDc = [System.Collections.Generic.List[object]]::new()
+    foreach ($st in @('Online', 'Error', 'Skipped')) {
+        $set = @($dcs | Where-Object { $_.Status -eq $st })
+        if ($set.Count -eq 0) { continue }
+        $color = switch ($st) { 'Online' { '#10b981' } 'Error' { '#e11d48' } default { '#f59e0b' } }
+        $items = @(
+            $set | ForEach-Object {
+                New-ChartItem -Title $_.ComputerName -Subtitle $_.Status -Detail ('{0} · {1} · {2}' -f $_.IPv4Address, $_.Site, $_.OperatingSystem) -Tab 'dcs' -Filter ('dc:{0}' -f $st.ToLowerInvariant())
+            }
+        )
+        [void]$chartDc.Add([ordered]@{
+                key = $st.ToLowerInvariant(); label = $st; value = $set.Count; color = $color; items = $items
+            })
+    }
+
+    $chartUsers = @()
+    $chartOs = @()
+    $chartComputers = @()
+    if ($inv -and -not $inv.Skipped) {
+        $healthyUsers = [math]::Max(0, [int]$inv.UserEnabled - [int]$inv.UserStale)
+        $userSlices = @(
+            @{ k = 'healthy'; l = 'Enabled (active)'; v = $healthyUsers; c = '#2563eb'; items = @((New-ChartItem -Title 'Enabled accounts still logging on' -Subtitle "$healthyUsers users" -Detail 'Enabled minus the stale-enabled count. Not a guarantee they are human or current.' -Tab 'identity' -Filter 'identity:users')) }
+            @{ k = 'stale'; l = 'Enabled + stale'; v = [int]$inv.UserStale; c = '#f59e0b'; items = @(@($inv.StaleUsers) | ForEach-Object { New-ChartItem -Title $_.Name -Subtitle 'Stale user' -Detail ('Last logon {0}' -f (Format-When $_.LastLogonDate)) -Tab 'identity' -Filter 'identity:stale-users' }) }
+            @{ k = 'disabled'; l = 'Disabled'; v = [int]$inv.UserDisabled; c = '#94a3b8'; items = @((New-ChartItem -Title 'Disabled user accounts' -Subtitle "$($inv.UserDisabled) accounts" -Detail 'Disabled is not the same as deleted. Confirm these are intentional.' -Tab 'identity' -Filter 'identity:users')) }
+        )
+        $chartUsers = @(
+            $userSlices | Where-Object { $_.v -gt 0 } | ForEach-Object {
+                $sliceItems = @($_.items)
+                if ($sliceItems.Count -eq 0) {
+                    $sliceItems = @((New-ChartItem -Title $_.l -Subtitle "$($_.v) accounts" -Tab 'identity' -Filter 'identity:users'))
+                }
+                [ordered]@{ key = $_.k; label = $_.l; value = $_.v; color = $_.c; items = $sliceItems }
+            }
+        )
+        $healthyPc = [math]::Max(0, [int]$inv.ComputerEnabled - [int]$inv.ComputerStale)
+        $chartComputers = @(
+            @{ k = 'healthy'; l = 'Enabled (active)'; v = $healthyPc; c = '#0ea5e9' },
+            @{ k = 'stale'; l = 'Enabled + stale'; v = [int]$inv.ComputerStale; c = '#f59e0b' },
+            @{ k = 'disabled'; l = 'Disabled'; v = [int]$inv.ComputerDisabled; c = '#94a3b8' }
+        ) | Where-Object { $_.v -gt 0 } | ForEach-Object {
+            [ordered]@{
+                key = $_.k; label = $_.l; value = $_.v; color = $_.c
+                items = @(
+                    if ($_.k -eq 'stale') {
+                        @($inv.StaleComputers) | ForEach-Object { New-ChartItem -Title $_.Name -Subtitle $_.OS -Detail ('Last logon {0}' -f (Format-When $_.LastLogonDate)) -Tab 'identity' -Filter 'identity:stale-computers' }
+                    } else {
+                        New-ChartItem -Title $_.l -Subtitle "$($_.v) computers" -Tab 'identity' -Filter 'identity:computers'
+                    }
+                )
+            }
+        }
+        $iColor = 0
+        $chartOs = @(
+            @($inv.ComputersByOS) | ForEach-Object {
+                $c = $osPalette[$iColor % $osPalette.Count]
+                $iColor++
+                $osName = $_.OperatingSystem
+                $samples = @($inv.StaleComputers | Where-Object { $_.OS -eq $osName } | ForEach-Object {
+                        New-ChartItem -Title $_.Name -Subtitle $_.OS -Detail ('Last logon {0}' -f (Format-When $_.LastLogonDate)) -Tab 'identity' -Filter 'identity:os'
+                    })
+                if ($samples.Count -eq 0) {
+                    $samples = @((New-ChartItem -Title $osName -Subtitle "$($_.Count) computers" -Detail 'Full inventory is in the Computers by operating system table.' -Tab 'identity' -Filter 'identity:os'))
+                }
+                [ordered]@{ key = $osName; label = $osName; value = [int]$_.Count; color = $c; items = $samples }
+            }
+        )
+    }
+
+    $chartPriv = @(
+        @($Report.PrivilegedGroups) | ForEach-Object {
+            $g = $_
+            $items = @(
+                @($g.Members) | ForEach-Object {
+                    New-ChartItem -Title $_.SamAccountName -Subtitle $_.Name -Detail $_.objectClass -Tab 'identity' -Filter ('priv:{0}' -f $g.Name)
+                }
+            )
+            if ($items.Count -eq 0) {
+                $items = @((New-ChartItem -Title $g.Name -Subtitle 'Empty group' -Detail 'Empty is the desired daily state for Schema/Enterprise Admins.' -Tab 'identity' -Filter ('priv:{0}' -f $g.Name)))
+            }
+            [ordered]@{ key = $g.Name; label = $g.Name; value = [int]$g.Count; color = '#6366f1'; items = $items }
+        }
+    )
+
+    $chartSites = @(
+        @($Report.Topology.Sites) | ForEach-Object {
+            $siteName = $_.Name
+            $here = @($dcs | Where-Object { $_.Site -eq $siteName })
+            $subs = @($Report.Topology.Subnets | Where-Object { $_.Site -eq $siteName })
+            $items = @(
+                $here | ForEach-Object { New-ChartItem -Title $_.ComputerName -Subtitle $_.Status -Detail ('{0} · {1}' -f $_.IPv4Address, $_.OperatingSystem) -Tab 'dcs' -Filter ('dcname:{0}' -f $_.ComputerName) }
+            )
+            if ($items.Count -eq 0) {
+                $items = @((New-ChartItem -Title $siteName -Subtitle 'No DC in this site' -Detail ('Subnets: {0}' -f (ConvertTo-TextList $subs.Name 'none')) -Tab 'sites' -Filter 'sites:empty'))
+            }
+            [ordered]@{ key = $siteName; label = $siteName; value = $here.Count; color = '#0ea5e9'; items = $items }
+        }
+    )
+
+    $chartRoles = @(
+        $allRoles.Values | Sort-Object { $_.InstalledOn.Count } -Descending | Select-Object -First 8 | ForEach-Object {
+            $display = $_.DisplayName
+            $installed = @($_.InstalledOn)
+            $items = @(
+                $installed | ForEach-Object { New-ChartItem -Title $_ -Subtitle $display -Detail 'Role is installed on this DC.' -Tab 'dcs' -Filter ('dcname:{0}' -f $_) }
+            )
+            [ordered]@{ key = $display; label = $display; value = $installed.Count; color = '#8b5cf6'; items = $items }
+        }
+    )
+
+    $fsmoByHolder = @{}
+    foreach ($roleName in $Report.FSMO.Keys) {
+        $holder = [string]$Report.FSMO[$roleName]
+        if (-not $holder) { continue }
+        $short = Get-ShortHostName $holder
+        if (-not $fsmoByHolder.ContainsKey($short)) {
+            $fsmoByHolder[$short] = [System.Collections.Generic.List[string]]::new()
+        }
+        [void]$fsmoByHolder[$short].Add($roleName)
+    }
+    $fi = 0
+    $chartFsmo = @(
+        $fsmoByHolder.GetEnumerator() | ForEach-Object {
+            $c = $osPalette[$fi % $osPalette.Count]
+            $fi++
+            $holderName = $_.Key
+            $items = @(
+                $_.Value | ForEach-Object { New-ChartItem -Title $_ -Subtitle $holderName -Detail 'Forest or domain FSMO held by this DC.' -Tab 'fsmo' -Filter ('fsmo:{0}' -f $holderName) }
+            )
+            [ordered]@{ key = $holderName; label = $holderName; value = $_.Value.Count; color = $c; items = $items }
+        }
+    )
+
+    $chartPayload = [ordered]@{
+        findings  = [ordered]@{ title = 'Findings'; type = 'donut'; hint = 'Click a slice to open those cards'; tab = 'brief'; slices = @($chartFindings) }
+        dcStatus  = [ordered]@{ title = 'Domain controllers'; type = 'donut'; hint = 'Click to filter DC cards'; tab = 'dcs'; slices = @($chartDc) }
+        users     = [ordered]@{ title = 'User accounts'; type = 'donut'; hint = 'Click a slice for the sample list'; tab = 'identity'; slices = @($chartUsers) }
+        computers = [ordered]@{ title = 'Computer accounts'; type = 'donut'; hint = 'Click a slice to inspect'; tab = 'identity'; slices = @($chartComputers) }
+        os        = [ordered]@{ title = 'Computers by OS'; type = 'donut'; hint = 'Click an OS to see samples'; tab = 'identity'; slices = @($chartOs) }
+        priv      = [ordered]@{ title = 'Privileged groups'; type = 'bar'; hint = 'Click a group to see members'; tab = 'identity'; slices = @($chartPriv) }
+        sites     = [ordered]@{ title = 'DCs per site'; type = 'bar'; hint = 'Click a site to see its DCs'; tab = 'sites'; slices = @($chartSites) }
+        roles     = [ordered]@{ title = 'Top installed roles'; type = 'bar'; hint = 'Click a role to see which DCs have it'; tab = 'roles'; slices = @($chartRoles) }
+        fsmo      = [ordered]@{ title = 'FSMO concentration'; type = 'donut'; hint = 'Click a holder to see its roles'; tab = 'fsmo'; slices = @($chartFsmo) }
+    }
+    $chartJson = (ConvertTo-EmbeddedJson $chartPayload).Replace('$', '\u0024')
+
     $css = @'
 :root {
-  --bg:#f4f1ea; --card:#fffdf8; --ink:#1e1b16; --muted:#5c564c;
-  --line:#e4ddd0; --accent:#1f4e79; --accent-2:#0b7a75; --warn:#9a5b13;
-  --crit:#8b1e1e; --good:#1f6b3a; --info:#1f4e79; --skip:#6b5e4a;
-  --fsmo:#5b2d8e; --shadow:0 10px 30px rgba(40,30,10,.08);
+  --bg:#f5f7fb; --card:#ffffff; --ink:#0f172a; --muted:#64748b;
+  --line:#e2e8f0; --accent:#4f46e5; --accent-2:#0891b2; --warn:#d97706;
+  --crit:#e11d48; --good:#059669; --info:#2563eb; --skip:#d97706;
+  --fsmo:#7c3aed; --shadow:0 1px 2px rgba(15,23,42,.06), 0 8px 24px rgba(15,23,42,.04);
+  --side:#0b1220; --side-ink:#e2e8f0; --side-muted:#94a3b8; --side-active:#818cf8;
+  --drawer:420px;
 }
 :root[data-theme="dark"] {
-  --bg:#161410; --card:#221e18; --ink:#f3ece1; --muted:#c2b8a8;
-  --line:#3a342b; --accent:#7eb6e6; --accent-2:#5fd0c7; --warn:#f0b060;
-  --crit:#f0a0a0; --good:#8ad0a4; --info:#9cc4ef; --skip:#c2b8a8;
-  --fsmo:#d2b4f0; --shadow:none;
+  --bg:#0b1220; --card:#121a2b; --ink:#e8eef8; --muted:#9aa8bd;
+  --line:#243049; --accent:#818cf8; --accent-2:#22d3ee; --warn:#fbbf24;
+  --crit:#fb7185; --good:#34d399; --info:#60a5fa; --skip:#fbbf24;
+  --fsmo:#c4b5fd; --shadow:none;
+  --side:#070b14; --side-ink:#e8eef8; --side-muted:#8b9bb3; --side-active:#a5b4fc;
 }
 * { box-sizing:border-box; margin:0; padding:0; }
-body { font-family:"Segoe UI",Calibri,system-ui,sans-serif; background:var(--bg); color:var(--ink); line-height:1.55; }
-.wrap { max-width:1600px; margin:0 auto; padding:24px; }
-header.hero {
-  background:linear-gradient(135deg,#16324f,#1f4e79 55%,#0b7a75);
-  color:#fff; padding:32px 28px; border-radius:16px; margin-bottom:20px;
+html,body { height:100%; }
+body { font-family:"Segoe UI",ui-sans-serif,system-ui,sans-serif; background:var(--bg); color:var(--ink); line-height:1.5; }
+.app { display:grid; grid-template-columns:248px 1fr; min-height:100vh; }
+.sidebar {
+  background:var(--side); color:var(--side-ink); padding:22px 16px; position:sticky; top:0; height:100vh;
+  display:flex; flex-direction:column; gap:18px;
 }
-header.hero h1 { font-size:2rem; font-weight:650; letter-spacing:-.02em; }
-header.hero p { opacity:.92; margin-top:6px; }
-.banner { background:#fff4ce; color:#5c4300; padding:10px 14px; border-radius:8px; margin:14px 0; }
-:root[data-theme="dark"] .banner { background:#4a3b12; color:#f6e7b2; }
-.stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin:20px 0; }
-.stat { background:var(--card); border-radius:12px; padding:16px; box-shadow:var(--shadow); }
-.stat .n { font-size:2rem; font-weight:700; color:var(--accent); }
-.stat.crit .n { color:var(--crit); } .stat.warn .n { color:var(--warn); }
-.stat.good .n { color:var(--good); } .stat.fsmo .n { color:var(--fsmo); }
-.stat .l { color:var(--muted); font-size:.8rem; text-transform:uppercase; letter-spacing:.04em; }
-.tabs { display:flex; flex-wrap:wrap; gap:6px; border-bottom:2px solid var(--line); margin:18px 0 16px; }
-.tab { background:none; border:none; color:var(--muted); padding:10px 14px; cursor:pointer; font:inherit; border-bottom:3px solid transparent; margin-bottom:-2px; }
-.tab.active { color:var(--accent); border-bottom-color:var(--accent); font-weight:650; }
+.brand { padding:4px 10px 12px; }
+.brand-kicker { font-size:.68rem; letter-spacing:.14em; text-transform:uppercase; color:var(--side-muted); }
+.brand h1 { font-size:1.15rem; font-weight:700; letter-spacing:-.03em; margin-top:4px; }
+.side-nav { display:flex; flex-direction:column; gap:4px; }
+.tab {
+  display:flex; align-items:center; gap:10px; width:100%; text-align:left;
+  background:transparent; border:none; color:var(--side-muted); padding:10px 12px; border-radius:10px;
+  cursor:pointer; font:inherit; font-size:.92rem;
+}
+.tab:hover { background:rgba(255,255,255,.06); color:var(--side-ink); }
+.tab.active { background:rgba(129,140,248,.16); color:var(--side-active); font-weight:650; }
+.tab .ico { width:18px; text-align:center; opacity:.85; }
+.side-foot { margin-top:auto; display:flex; flex-direction:column; gap:8px; }
+.theme-btn, .ghost-btn {
+  background:rgba(255,255,255,.06); color:var(--side-ink); border:1px solid rgba(255,255,255,.08);
+  padding:8px 10px; border-radius:10px; cursor:pointer; font:inherit;
+}
+.main { min-width:0; }
+.topbar {
+  padding:22px 28px 8px; display:flex; justify-content:space-between; align-items:flex-start; gap:16px;
+}
+.topbar h2 { font-size:1.55rem; letter-spacing:-.03em; }
+.topbar p { color:var(--muted); font-size:.92rem; }
+.content { padding:8px 28px 40px; }
+.banner { background:#fff7ed; color:#9a3412; padding:10px 14px; border-radius:12px; margin:8px 0 14px; border:1px solid #ffedd5; }
+:root[data-theme="dark"] .banner { background:#3b2410; color:#fed7aa; border-color:#7c4a1e; }
+.kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:12px; margin:8px 0 18px; }
+.kpi {
+  background:var(--card); border:1px solid var(--line); border-radius:16px; padding:14px 16px;
+  box-shadow:var(--shadow); cursor:pointer; text-align:left; font:inherit; color:inherit;
+  transition:transform .15s ease, border-color .15s ease;
+}
+.kpi:hover { transform:translateY(-2px); border-color:var(--accent); }
+.kpi .n { font-size:1.7rem; font-weight:750; letter-spacing:-.03em; color:var(--accent); }
+.kpi.crit .n { color:var(--crit); } .kpi.warn .n { color:var(--warn); }
+.kpi.good .n { color:var(--good); } .kpi.fsmo .n { color:var(--fsmo); }
+.kpi .l { color:var(--muted); font-size:.75rem; text-transform:uppercase; letter-spacing:.04em; margin-top:2px; }
 .panel { display:none; } .panel.active { display:block; }
-.card { background:var(--card); border-radius:12px; padding:20px; box-shadow:var(--shadow); margin-bottom:16px; }
-.learn { background:rgba(31,78,121,.07); border-left:4px solid var(--accent); padding:12px 14px; border-radius:8px; margin:12px 0 18px; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:18px 20px; box-shadow:var(--shadow); margin-bottom:16px; }
+.card h2, .card h3 { letter-spacing:-.02em; }
+.learn { background:rgba(79,70,229,.06); border:1px solid rgba(79,70,229,.12); padding:12px 14px; border-radius:12px; margin:0 0 16px; }
 .learn-title { font-weight:700; margin-bottom:4px; }
 .muted { color:var(--muted); }
 .grid-2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:12px; }
+.chart-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:14px; margin-bottom:18px; }
+.chart-card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:16px; box-shadow:var(--shadow); }
+.chart-card h3 { font-size:.95rem; margin-bottom:2px; }
+.chart-hint { color:var(--muted); font-size:.78rem; margin-bottom:8px; }
+.chart-box { min-height:210px; }
+.chart-box svg { width:100%; height:auto; display:block; }
+.chart-legend { display:flex; flex-wrap:wrap; gap:8px 12px; margin-top:10px; }
+.legend-item { display:flex; align-items:center; gap:6px; font-size:.8rem; cursor:pointer; color:var(--muted); }
+.legend-item:hover { color:var(--ink); }
+.swatch { width:10px; height:10px; border-radius:99px; display:inline-block; }
 .kv { display:flex; justify-content:space-between; gap:12px; padding:8px 0; border-bottom:1px solid var(--line); }
 .kv span:last-child { font-weight:600; text-align:right; }
-.finding { border-radius:12px; padding:16px 18px; margin-bottom:12px; background:var(--card); border-left:5px solid var(--info); box-shadow:var(--shadow); }
+.finding { border-radius:14px; padding:16px 18px; margin-bottom:12px; background:var(--card); border:1px solid var(--line); border-left:5px solid var(--info); }
 .finding.sev-critical { border-left-color:var(--crit); }
 .finding.sev-warning { border-left-color:var(--warn); }
 .finding.sev-good { border-left-color:var(--good); }
 .finding-head { display:flex; flex-wrap:wrap; gap:8px; align-items:baseline; margin-bottom:8px; }
-.finding-head h3 { font-size:1.05rem; }
-.finding-area { color:var(--muted); font-size:.8rem; text-transform:uppercase; letter-spacing:.04em; }
-.sev-pill { font-size:.7rem; font-weight:700; text-transform:uppercase; padding:2px 8px; border-radius:999px; background:var(--line); }
-.sev-pill.sev-critical { background:#fde7e9; color:#8b1e1e; }
-.sev-pill.sev-warning { background:#fff4ce; color:#9a5b13; }
-.sev-pill.sev-info { background:#deecf9; color:#1f4e79; }
-.sev-pill.sev-good { background:#dff6dd; color:#1f6b3a; }
+.finding-head h3 { font-size:1.02rem; }
+.finding-area { color:var(--muted); font-size:.78rem; text-transform:uppercase; letter-spacing:.04em; }
+.sev-pill { font-size:.68rem; font-weight:700; text-transform:uppercase; padding:2px 8px; border-radius:999px; background:var(--line); }
+.sev-pill.sev-critical { background:#ffe4e6; color:#9f1239; }
+.sev-pill.sev-warning { background:#ffedd5; color:#9a3412; }
+.sev-pill.sev-info { background:#dbeafe; color:#1e3a8a; }
+.sev-pill.sev-good { background:#d1fae5; color:#065f46; }
 .finding-why, .finding-next { margin-top:8px; }
 .fsmo-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:12px; }
-.fsmo-card { background:var(--card); border-radius:12px; padding:16px; box-shadow:var(--shadow); border-top:4px solid var(--fsmo); }
+.fsmo-card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:16px; border-top:4px solid var(--fsmo); }
 .fsmo-kicker { font-size:.72rem; letter-spacing:.08em; text-transform:uppercase; color:var(--fsmo); }
 .fsmo-holder { font-size:1.15rem; font-weight:700; margin:6px 0 10px; }
 .look { margin-top:8px; font-size:.9rem; }
-.dc-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(520px,1fr)); gap:16px; }
-.dc-card { background:var(--card); border-radius:12px; padding:16px 18px; box-shadow:var(--shadow); }
+.dc-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(500px,1fr)); gap:16px; }
+.dc-card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:16px 18px; box-shadow:var(--shadow); }
+.dc-card.pulse { outline:2px solid var(--accent); }
 .dc-head { display:flex; justify-content:space-between; gap:10px; align-items:flex-start; margin-bottom:10px; }
 .dc-host { color:var(--muted); font-size:.85rem; }
-.info-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:8px; background:rgba(0,0,0,.03); padding:10px; border-radius:8px; margin-bottom:10px; }
+.info-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:8px; background:rgba(15,23,42,.03); padding:10px; border-radius:10px; margin-bottom:10px; }
 .info-grid .lbl { display:block; font-size:.7rem; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
 .uptime { color:var(--good); font-weight:700; }
 .tags { display:flex; flex-wrap:wrap; gap:6px; }
 .tag { display:inline-block; padding:3px 8px; border-radius:6px; font-size:.8rem; background:var(--line); }
-.tag-role { background:#e1dfdd; }
-.tag-feature { background:#deecf9; color:#1f4e79; }
-.tag-fsmo { background:#f3e5f5; color:#5b2d8e; font-weight:650; }
-.svc-on { background:#dff6dd; color:#1f6b3a; }
-.svc-off { background:#fde7e9; color:#8b1e1e; }
+.tag-role { background:#e2e8f0; }
+.tag-feature { background:#dbeafe; color:#1d4ed8; }
+.tag-fsmo { background:#ede9fe; color:#6d28d9; font-weight:650; }
+.svc-on { background:#d1fae5; color:#065f46; }
+.svc-off { background:#ffe4e6; color:#9f1239; }
 .status-badge { padding:2px 8px; border-radius:999px; font-size:.72rem; font-weight:700; text-transform:uppercase; }
-.status-online { background:#dff6dd; color:#1f6b3a; }
-.status-error { background:#fde7e9; color:#8b1e1e; }
-.status-skipped { background:#fff4ce; color:#9a5b13; }
+.status-online { background:#d1fae5; color:#065f46; }
+.status-error { background:#ffe4e6; color:#9f1239; }
+.status-skipped { background:#ffedd5; color:#9a3412; }
 .badge { margin-left:4px; padding:2px 6px; border-radius:4px; font-size:.68rem; font-weight:700; }
-.badge-gc { background:#fff4ce; color:#835c00; }
-.badge-rodc { background:#deecf9; color:#1565c0; }
-.badge-fsmo { background:#f3e5f5; color:#5b2d8e; }
-.repl-row { padding:6px 8px; border-radius:6px; margin-bottom:4px; background:rgba(0,0,0,.03); font-size:.85rem; }
-.repl-bad { background:#fde7e9; }
+.badge-gc { background:#ffedd5; color:#9a3412; }
+.badge-rodc { background:#dbeafe; color:#1d4ed8; }
+.badge-fsmo { background:#ede9fe; color:#6d28d9; }
+.repl-row { padding:6px 8px; border-radius:8px; margin-bottom:4px; background:rgba(15,23,42,.03); font-size:.85rem; }
+.repl-bad { background:#ffe4e6; }
 .disk { display:flex; justify-content:space-between; font-size:.9rem; padding:3px 0; }
 .controls { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }
-.search { flex:1; min-width:220px; padding:8px 12px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); font:inherit; }
-.filter { padding:8px 12px; border:1px solid var(--line); background:var(--card); color:var(--ink); border-radius:8px; cursor:pointer; }
+.search { flex:1; min-width:220px; padding:9px 12px; border:1px solid var(--line); border-radius:10px; background:var(--card); color:var(--ink); font:inherit; }
+.filter { padding:8px 12px; border:1px solid var(--line); background:var(--card); color:var(--ink); border-radius:10px; cursor:pointer; }
 .filter.active { background:var(--accent); color:#fff; border-color:var(--accent); }
-table { width:100%; border-collapse:collapse; background:var(--card); border-radius:12px; overflow:hidden; box-shadow:var(--shadow); }
+table { width:100%; border-collapse:collapse; background:var(--card); border-radius:12px; overflow:hidden; }
 th,td { padding:10px 12px; text-align:left; border-bottom:1px solid var(--line); vertical-align:top; }
-th { font-size:.78rem; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); background:rgba(0,0,0,.03); }
+th { font-size:.75rem; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); background:rgba(15,23,42,.03); }
 .desc { color:var(--muted); font-size:.85rem; max-width:360px; }
 .table-wrap { overflow-x:auto; }
 .hidden { display:none !important; }
@@ -1918,18 +2143,43 @@ th { font-size:.78rem; text-transform:uppercase; letter-spacing:.04em; color:var
 .collapsible.open .chev { transform:rotate(90deg); display:inline-block; }
 .collapse-h { cursor:pointer; user-select:none; }
 .priv-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; }
-.priv-card { background:var(--card); border-radius:12px; padding:14px; box-shadow:var(--shadow); }
+.priv-card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; }
+.priv-card.pulse { outline:2px solid var(--accent); }
 .priv-card ul { margin:8px 0 0 18px; }
 .priv-card .count { float:right; color:var(--accent); }
 .error-msg { color:var(--crit); }
-.path { margin:8px 0 16px; padding:10px 12px; background:var(--card); border-radius:8px; }
+.path { margin:0 0 16px; padding:12px 14px; }
 .path ol { margin-left:20px; }
 footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem; }
-.theme-btn { float:right; background:rgba(255,255,255,.15); color:#fff; border:1px solid rgba(255,255,255,.3); padding:6px 10px; border-radius:8px; cursor:pointer; }
-@media (max-width:800px) { .dc-grid { grid-template-columns:1fr; } }
+.scrim { display:none; position:fixed; inset:0; background:rgba(15,23,42,.35); z-index:40; }
+.scrim.show { display:block; }
+.drawer {
+  position:fixed; top:0; right:0; width:var(--drawer); max-width:100%; height:100vh; background:var(--card);
+  border-left:1px solid var(--line); z-index:50; transform:translateX(110%); transition:transform .22s ease;
+  display:flex; flex-direction:column; box-shadow:var(--shadow);
+}
+.drawer.open { transform:translateX(0); }
+.drawer-head { display:flex; justify-content:space-between; gap:12px; padding:18px 18px 10px; border-bottom:1px solid var(--line); }
+.drawer-crumb { font-size:.75rem; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+.drawer-head h3 { font-size:1.1rem; }
+.drawer-close { border:none; background:var(--line); width:32px; height:32px; border-radius:8px; cursor:pointer; font-size:1.1rem; color:var(--ink); }
+.drawer-body { overflow:auto; padding:16px 18px 28px; }
+.drill-item { border:1px solid var(--line); border-radius:12px; padding:12px; margin-bottom:10px; cursor:pointer; }
+.drill-item:hover { border-color:var(--accent); }
+.drill-item h4 { font-size:.95rem; }
+.chart-slice { cursor:pointer; }
+.chart-slice:hover { opacity:.86; }
+@media (max-width:960px) {
+  .app { grid-template-columns:1fr; }
+  .sidebar { position:relative; height:auto; flex-direction:row; flex-wrap:wrap; }
+  .side-nav { flex-direction:row; flex-wrap:wrap; }
+  .side-foot { margin-top:0; }
+  .dc-grid { grid-template-columns:1fr; }
+}
 @media print {
-  .tabs,.controls,.theme-btn { display:none !important; }
+  .sidebar,.controls,.theme-btn,.drawer,.scrim,.kpis { display:none !important; }
   .panel { display:block !important; }
+  .app { display:block; }
   .dc-card,.finding,.card { break-inside:avoid; }
 }
 '@
@@ -1939,19 +2189,22 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
   const root = document.documentElement;
   const saved = localStorage.getItem("adbrief-theme");
   if (saved) root.setAttribute("data-theme", saved);
-  document.getElementById("themeBtn").addEventListener("click", function () {
+  const themeBtn = document.getElementById("themeBtn");
+  if (themeBtn) themeBtn.addEventListener("click", function () {
     const next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
     root.setAttribute("data-theme", next);
     localStorage.setItem("adbrief-theme", next);
   });
 
+  function showTab(id) {
+    document.querySelectorAll(".tab").forEach(function (t) { t.classList.toggle("active", t.getAttribute("data-tab") === id); });
+    document.querySelectorAll(".panel").forEach(function (p) { p.classList.toggle("active", p.id === id); });
+    const panel = document.getElementById(id);
+    if (panel) panel.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+  window.showTab = showTab;
   document.querySelectorAll(".tab").forEach(function (tab) {
-    tab.addEventListener("click", function () {
-      document.querySelectorAll(".tab").forEach(function (t) { t.classList.remove("active"); });
-      document.querySelectorAll(".panel").forEach(function (p) { p.classList.remove("active"); });
-      tab.classList.add("active");
-      document.getElementById(tab.getAttribute("data-tab")).classList.add("active");
-    });
+    tab.addEventListener("click", function () { showTab(tab.getAttribute("data-tab")); });
   });
 
   window.toggleCollapse = function (el) {
@@ -1961,14 +2214,17 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
   const search = document.getElementById("dcSearch");
   const cards = document.querySelectorAll(".dc-card");
   let statusFilter = "all";
+  let nameFilter = "";
   function applyDcFilter() {
-    const q = (search.value || "").toLowerCase();
+    const q = ((search && search.value) || "").toLowerCase();
     cards.forEach(function (card) {
       const hay = card.getAttribute("data-search") || "";
       const okText = !q || hay.indexOf(q) !== -1;
       const st = card.getAttribute("data-status");
+      const nm = (card.getAttribute("data-name") || "").toLowerCase();
       const okSt = statusFilter === "all" || st === statusFilter;
-      card.classList.toggle("hidden", !(okText && okSt));
+      const okName = !nameFilter || nm === nameFilter.toLowerCase();
+      card.classList.toggle("hidden", !(okText && okSt && okName));
     });
   }
   if (search) search.addEventListener("input", applyDcFilter);
@@ -1977,19 +2233,21 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
       document.querySelectorAll("[data-dc-filter]").forEach(function (b) { b.classList.remove("active"); });
       btn.classList.add("active");
       statusFilter = btn.getAttribute("data-dc-filter");
+      nameFilter = "";
       applyDcFilter();
     });
   });
 
-  document.querySelectorAll("[data-find-filter]").forEach(function (btn) {
-    btn.addEventListener("click", function () {
-      document.querySelectorAll("[data-find-filter]").forEach(function (b) { b.classList.remove("active"); });
-      btn.classList.add("active");
-      const sev = btn.getAttribute("data-find-filter");
-      document.querySelectorAll(".finding").forEach(function (f) {
-        f.classList.toggle("hidden", !(sev === "all" || f.getAttribute("data-sev") === sev));
-      });
+  function applyFindingFilter(sev) {
+    document.querySelectorAll("[data-find-filter]").forEach(function (b) {
+      b.classList.toggle("active", b.getAttribute("data-find-filter") === sev);
     });
+    document.querySelectorAll(".finding").forEach(function (f) {
+      f.classList.toggle("hidden", !(sev === "all" || f.getAttribute("data-sev") === sev));
+    });
+  }
+  document.querySelectorAll("[data-find-filter]").forEach(function (btn) {
+    btn.addEventListener("click", function () { applyFindingFilter(btn.getAttribute("data-find-filter")); });
   });
 
   function bindTableSearch(inputId, tableId) {
@@ -2009,23 +2267,192 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
   bindTableSearch("roleSearch", "roleTable");
   bindTableSearch("featSearch", "featTable");
   bindTableSearch("siteSearch", "siteTable");
-})();
-'@
 
-    $pathBox = @'
-<div class="path card">
-  <strong>Read this report in this order</strong>
-  <ol>
-    <li>Findings — inherited risk, in priority order.</li>
-    <li>Forest &amp; domain — what this directory <em>is</em>.</li>
-    <li>FSMO — who can do the operations nobody else can.</li>
-    <li>Sites &amp; replication — whether every DC has the same truth.</li>
-    <li>Domain controllers — capacity, roles, and service health.</li>
-    <li>Identity — who is powerful, how passwords work, what is stale.</li>
-    <li>GPOs &amp; OUs — how the estate is shaped and controlled.</li>
-    <li>Roles &amp; features — what each DC is actually installed to do.</li>
-  </ol>
-</div>
+  const drawer = document.getElementById("drawer");
+  const scrim = document.getElementById("scrim");
+  const drawerBody = document.getElementById("drawerBody");
+  const drawerTitle = document.getElementById("drawerTitle");
+  const drawerCrumb = document.getElementById("drawerCrumb");
+  function closeDrawer() {
+    if (drawer) drawer.classList.remove("open");
+    if (scrim) scrim.classList.remove("show");
+  }
+  window.closeDrawer = closeDrawer;
+  if (document.getElementById("drawerClose")) document.getElementById("drawerClose").addEventListener("click", closeDrawer);
+  if (scrim) scrim.addEventListener("click", closeDrawer);
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape") closeDrawer(); });
+
+  function applyFilter(filter) {
+    if (!filter) return;
+    const parts = String(filter).split(":");
+    const kind = parts[0];
+    const val = parts.slice(1).join(":");
+    if (kind === "finding") applyFindingFilter(val || "all");
+    if (kind === "dc") {
+      statusFilter = val || "all";
+      nameFilter = "";
+      document.querySelectorAll("[data-dc-filter]").forEach(function (b) {
+        b.classList.toggle("active", b.getAttribute("data-dc-filter") === statusFilter);
+      });
+      applyDcFilter();
+    }
+    if (kind === "dcname") {
+      statusFilter = "all";
+      nameFilter = val;
+      if (search) search.value = "";
+      applyDcFilter();
+      document.querySelectorAll(".dc-card").forEach(function (c) {
+        c.classList.toggle("pulse", (c.getAttribute("data-name") || "").toLowerCase() === val.toLowerCase());
+      });
+    }
+    if (kind === "priv") {
+      document.querySelectorAll(".priv-card").forEach(function (c) {
+        const on = (c.getAttribute("data-priv") || "") === val;
+        c.classList.toggle("pulse", on);
+        if (on) c.scrollIntoView({ behavior: "smooth", block: "center" });
+      });
+    }
+  }
+
+  function openDrill(chart, slice) {
+    if (!drawer || !slice) return;
+    drawerCrumb.textContent = (chart.title || "Chart") + " / " + (slice.label || "");
+    drawerTitle.textContent = (slice.label || "Details") + " · " + (slice.value || 0);
+    const items = slice.items || [];
+    if (!items.length) {
+      drawerBody.innerHTML = "<p class='muted'>No drill-down rows for this slice.</p>";
+    } else {
+      drawerBody.innerHTML = items.map(function (item) {
+        return "<article class='drill-item' data-tab='" + (item.tab || "") + "' data-filter='" + (item.filter || "") + "'>" +
+          "<h4>" + escapeHtml(item.title || "") + "</h4>" +
+          (item.subtitle ? "<div class='muted'>" + escapeHtml(item.subtitle) + "</div>" : "") +
+          (item.detail ? "<p>" + escapeHtml(item.detail) + "</p>" : "") +
+          "</article>";
+      }).join("");
+      drawerBody.querySelectorAll(".drill-item").forEach(function (el) {
+        el.addEventListener("click", function () {
+          const tab = el.getAttribute("data-tab");
+          const filter = el.getAttribute("data-filter");
+          if (tab) showTab(tab);
+          applyFilter(filter);
+        });
+      });
+    }
+    drawer.classList.add("open");
+    scrim.classList.add("show");
+    if (chart.tab) showTab(chart.tab);
+    if (slice.items && slice.items[0] && slice.items[0].filter) applyFilter(slice.items[0].filter);
+  }
+  window.openDrill = openDrill;
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (ch) {
+      return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch];
+    });
+  }
+
+  const ns = "http://www.w3.org/2000/svg";
+  function svgEl(name, attrs) {
+    const el = document.createElementNS(ns, name);
+    Object.keys(attrs || {}).forEach(function (k) { el.setAttribute(k, attrs[k]); });
+    return el;
+  }
+  function polar(cx, cy, r, a) { return [cx + r * Math.cos(a), cy + r * Math.sin(a)]; }
+
+  function renderDonut(host, chart) {
+    const slices = (chart.slices || []).filter(function (s) { return Number(s.value) > 0; });
+    const total = slices.reduce(function (n, s) { return n + Number(s.value); }, 0) || 1;
+    const svg = svgEl("svg", { viewBox: "0 0 220 180", role: "img" });
+    let angle = -Math.PI / 2;
+    const cx = 90, cy = 90, r = 70, r0 = 42;
+    slices.forEach(function (slice) {
+      const sweep = (Number(slice.value) / total) * Math.PI * 2;
+      const a2 = angle + sweep;
+      const large = sweep > Math.PI ? 1 : 0;
+      const p1 = polar(cx, cy, r, angle), p2 = polar(cx, cy, r, a2);
+      const i1 = polar(cx, cy, r0, a2), i2 = polar(cx, cy, r0, angle);
+      const d = "M " + p1[0] + " " + p1[1] + " A " + r + " " + r + " 0 " + large + " 1 " + p2[0] + " " + p2[1] +
+        " L " + i1[0] + " " + i1[1] + " A " + r0 + " " + r0 + " 0 " + large + " 0 " + i2[0] + " " + i2[1] + " Z";
+      const path = svgEl("path", { d: d, fill: slice.color || "#64748b", class: "chart-slice" });
+      path.addEventListener("click", function () { openDrill(chart, slice); });
+      path.appendChild(document.createElementNS(ns, "title")).textContent = slice.label + " · " + slice.value;
+      svg.appendChild(path);
+      angle = a2;
+    });
+    svg.appendChild(svgEl("text", { x: 90, y: 86, "text-anchor": "middle", fill: "currentColor", "font-size": "18", "font-weight": "700" })).textContent = String(total);
+    svg.appendChild(svgEl("text", { x: 90, y: 104, "text-anchor": "middle", fill: "currentColor", "font-size": "10", opacity: ".65" })).textContent = "total";
+    host.appendChild(svg);
+    renderLegend(host, chart, slices);
+  }
+
+  function renderBar(host, chart) {
+    const slices = chart.slices || [];
+    const max = Math.max.apply(null, slices.map(function (s) { return Number(s.value) || 0; }).concat([1]));
+    const rowH = 28;
+    const h = Math.max(140, 20 + slices.length * rowH);
+    const svg = svgEl("svg", { viewBox: "0 0 360 " + h, role: "img" });
+    slices.forEach(function (slice, i) {
+      const y = 8 + i * rowH;
+      const w = Math.max(4, (Number(slice.value) / max) * 200);
+      const label = svgEl("text", { x: 0, y: y + 14, fill: "currentColor", "font-size": "11" });
+      label.textContent = (slice.label || "").slice(0, 22);
+      svg.appendChild(label);
+      const rect = svgEl("rect", { x: 130, y: y + 2, width: String(w), height: "16", rx: "8", fill: slice.color || "#6366f1", class: "chart-slice" });
+      rect.addEventListener("click", function () { openDrill(chart, slice); });
+      svg.appendChild(rect);
+      svg.appendChild(svgEl("text", { x: 136 + w, y: y + 14, fill: "currentColor", "font-size": "11" })).textContent = String(slice.value);
+    });
+    host.appendChild(svg);
+  }
+
+  function renderLegend(host, chart, slices) {
+    const legend = document.createElement("div");
+    legend.className = "chart-legend";
+    slices.forEach(function (slice) {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "legend-item";
+      item.innerHTML = "<span class='swatch' style='background:" + (slice.color || "#64748b") + "'></span>" +
+        escapeHtml(slice.label) + " · " + slice.value;
+      item.addEventListener("click", function () { openDrill(chart, slice); });
+      legend.appendChild(item);
+    });
+    host.appendChild(legend);
+  }
+
+  function renderChart(host, chart) {
+    if (!host || !chart) {
+      if (host) host.innerHTML = "<p class='muted'>No data for this chart.</p>";
+      return;
+    }
+    host.innerHTML = "";
+    const slices = chart.slices || [];
+    if (!slices.length) {
+      host.innerHTML = "<p class='muted'>Nothing to chart in this collection.</p>";
+      return;
+    }
+    if (chart.type === "bar") renderBar(host, chart);
+    else renderDonut(host, chart);
+  }
+
+  let charts = {};
+  const raw = document.getElementById("chartData");
+  try { charts = raw ? JSON.parse(raw.textContent) : {}; } catch (e) { charts = {}; }
+
+  document.querySelectorAll("[data-chart]").forEach(function (el) {
+    renderChart(el, charts[el.getAttribute("data-chart")]);
+  });
+  document.querySelectorAll("[data-open-chart]").forEach(function (el) {
+    el.addEventListener("click", function () {
+      const name = el.getAttribute("data-open-chart");
+      const key = el.getAttribute("data-open-slice");
+      const chart = charts[name];
+      if (!chart) return;
+      const slice = (chart.slices || []).find(function (s) { return s.key === key; }) || chart.slices[0];
+      openDrill(chart, slice);
+    });
+  });
+})();
 '@
 
     $html = @"
@@ -2040,39 +2467,67 @@ $css
 </style>
 </head>
 <body>
-<div class="wrap">
-  <header class="hero">
-    <button class="theme-btn" id="themeBtn" type="button">Toggle theme</button>
-    <h1>Active Directory domain brief</h1>
-    <p>Forest <strong>$forestName</strong> · Domain <strong>$domainName</strong> · Generated $gen · $($Report.Mode)</p>
-  </header>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-kicker">Active Directory</div>
+      <h1>Domain brief</h1>
+    </div>
+    <nav class="side-nav">
+      <button class="tab active" data-tab="brief"><span class="ico">&#9632;</span> Dashboard</button>
+      <button class="tab" data-tab="forest"><span class="ico">&#9633;</span> Forest &amp; domain</button>
+      <button class="tab" data-tab="fsmo"><span class="ico">&#9670;</span> FSMO</button>
+      <button class="tab" data-tab="sites"><span class="ico">&#9646;</span> Sites &amp; replication</button>
+      <button class="tab" data-tab="dcs"><span class="ico">&#9638;</span> Domain controllers</button>
+      <button class="tab" data-tab="identity"><span class="ico">&#9650;</span> Identity</button>
+      <button class="tab" data-tab="gpo"><span class="ico">&#9660;</span> GPOs &amp; OUs</button>
+      <button class="tab" data-tab="roles"><span class="ico">&#9644;</span> Roles &amp; features</button>
+    </nav>
+    <div class="side-foot">
+      <button class="theme-btn" id="themeBtn" type="button">Toggle theme</button>
+      <div class="muted" style="font-size:.75rem;padding:0 4px">Click any chart slice or KPI to drill down.</div>
+    </div>
+  </aside>
+  <div class="main">
+    <header class="topbar">
+      <div>
+        <h2>$domainName</h2>
+        <p>Forest $forestName · Generated $gen · $($Report.Mode)</p>
+      </div>
+    </header>
+    <div class="content">
   $modeNote
-  $pathBox
-
-  <div class="stats">
-    <div class="stat"><div class="n">$(Get-SafeCount $dcs)</div><div class="l">Domain controllers</div></div>
-    <div class="stat good"><div class="n">$onlineDCs</div><div class="l">Online / queried</div></div>
-    <div class="stat crit"><div class="n">$errorDCs</div><div class="l">Unreachable</div></div>
-    <div class="stat warn"><div class="n">$skippedDCs</div><div class="l">Remote skipped</div></div>
-    <div class="stat fsmo"><div class="n">5</div><div class="l">FSMO roles</div></div>
-    <div class="stat crit"><div class="n">$crit</div><div class="l">Critical findings</div></div>
-    <div class="stat warn"><div class="n">$warn</div><div class="l">Warnings</div></div>
-    <div class="stat"><div class="n">$($allRoles.Count)</div><div class="l">Unique roles</div></div>
-  </div>
-
-  <nav class="tabs">
-    <button class="tab active" data-tab="brief">Start here</button>
-    <button class="tab" data-tab="forest">Forest &amp; domain</button>
-    <button class="tab" data-tab="fsmo">FSMO</button>
-    <button class="tab" data-tab="sites">Sites &amp; replication</button>
-    <button class="tab" data-tab="dcs">Domain controllers</button>
-    <button class="tab" data-tab="identity">Identity</button>
-    <button class="tab" data-tab="gpo">GPOs &amp; OUs</button>
-    <button class="tab" data-tab="roles">Roles &amp; features</button>
-  </nav>
 
   <section id="brief" class="panel active">
-    $(New-LearnBox 'This tab is your punch list' 'A new domain is too big to memorize. Read every Critical and Warning card, then skim Info. Each card tells you why it matters and what to do next — not just that something is true.')
+    $(New-LearnBox 'Start on the charts' 'This dashboard is the map of the domain you just inherited. Click a pie slice, bar, legend item, or KPI tile. A drawer lists the underlying objects; click a row to jump to that section.')
+    <div class="kpis">
+      <button class="kpi" type="button" data-open-chart="dcStatus"><div class="n">$(Get-SafeCount $dcs)</div><div class="l">Domain controllers</div></button>
+      <button class="kpi good" type="button" data-open-chart="dcStatus" data-open-slice="online"><div class="n">$onlineDCs</div><div class="l">Online / queried</div></button>
+      <button class="kpi crit" type="button" data-open-chart="dcStatus" data-open-slice="error"><div class="n">$errorDCs</div><div class="l">Unreachable</div></button>
+      <button class="kpi fsmo" type="button" data-open-chart="fsmo"><div class="n">5</div><div class="l">FSMO roles</div></button>
+      <button class="kpi crit" type="button" data-open-chart="findings" data-open-slice="critical"><div class="n">$crit</div><div class="l">Critical findings</div></button>
+      <button class="kpi warn" type="button" data-open-chart="findings" data-open-slice="warning"><div class="n">$warn</div><div class="l">Warnings</div></button>
+      <button class="kpi" type="button" data-open-chart="roles"><div class="n">$($allRoles.Count)</div><div class="l">Unique roles</div></button>
+      <button class="kpi" type="button" data-open-chart="users"><div class="n">$(if ($inv -and -not $inv.Skipped) { $inv.UserEnabled } else { '–' })</div><div class="l">Enabled users</div></button>
+    </div>
+    <div class="chart-grid">
+      <div class="chart-card"><h3>Findings by severity</h3><p class="chart-hint">Click a slice to open those findings</p><div class="chart-box" data-chart="findings"></div></div>
+      <div class="chart-card"><h3>Domain controller status</h3><p class="chart-hint">Click a slice to filter DC cards</p><div class="chart-box" data-chart="dcStatus"></div></div>
+      <div class="chart-card"><h3>User account mix</h3><p class="chart-hint">Active vs stale vs disabled</p><div class="chart-box" data-chart="users"></div></div>
+      <div class="chart-card"><h3>Computers by OS</h3><p class="chart-hint">Click an OS for sample machines</p><div class="chart-box" data-chart="os"></div></div>
+      <div class="chart-card"><h3>Privileged group size</h3><p class="chart-hint">Click a bar to list members</p><div class="chart-box" data-chart="priv"></div></div>
+      <div class="chart-card"><h3>DCs per site</h3><p class="chart-hint">Click a site to see its controllers</p><div class="chart-box" data-chart="sites"></div></div>
+    </div>
+    <div class="card path">
+      <strong>Then read the sections in this order</strong>
+      <ol>
+        <li>Findings below — inherited risk, in priority order.</li>
+        <li>Forest &amp; domain — what this directory is.</li>
+        <li>FSMO — who can do the operations nobody else can.</li>
+        <li>Sites &amp; replication — whether every DC has the same truth.</li>
+        <li>Identity — who is powerful and what is stale.</li>
+      </ol>
+    </div>
     <div class="controls">
       <button class="filter active" data-find-filter="all">All ($($findings.Count))</button>
       <button class="filter" data-find-filter="critical">Critical ($crit)</button>
@@ -2127,6 +2582,9 @@ $css
 
   <section id="fsmo" class="panel">
     $(New-LearnBox 'FSMO means "this write can only happen in one place"' 'Most AD writes replicate multimaster. Five operations do not. If you inherit a domain, memorize the holders and keep them on DCs you would actually answer a page for.')
+    <div class="chart-grid">
+      <div class="chart-card"><h3>FSMO concentration</h3><p class="chart-hint">Click a holder to list the roles on that DC</p><div class="chart-box" data-chart="fsmo"></div></div>
+    </div>
     <div class="fsmo-grid">
       $($fsmoCards.ToString())
     </div>
@@ -2134,6 +2592,9 @@ $css
 
   <section id="sites" class="panel">
     $(New-LearnBox 'Sites are how AD thinks about the network' 'A site should be a set of well-connected subnets. Clients in those subnets find a local DC. Site links (cost + interval) decide how often DCs across WAN links pull changes. Empty leftover sites and missing subnets are the usual mess.')
+    <div class="chart-grid">
+      <div class="chart-card"><h3>DCs per site</h3><p class="chart-hint">Click a bar to open the controllers in that site</p><div class="chart-box" data-chart="sites"></div></div>
+    </div>
     <div class="controls"><input class="search" id="siteSearch" placeholder="Filter sites..."></div>
     <div class="table-wrap"><table id="siteTable"><thead><tr><th>Site</th><th>Description</th><th>DCs</th><th>DC names</th><th>Subnets</th></tr></thead><tbody>$($siteRows.ToString())</tbody></table></div>
     <div class="card" style="margin-top:16px">
@@ -2152,6 +2613,10 @@ $css
 
   <section id="dcs" class="panel">
     $(New-LearnBox 'A DC is more than "online"' 'Uptime is not a virtue if patches are pending. Time source should chain to the PDC Emulator. Disks under 15% free are an outage waiting to happen. Inbound partners with consecutive failures mean this DC is drifting.')
+    <div class="chart-grid">
+      <div class="chart-card"><h3>Controller status</h3><p class="chart-hint">Click a slice to show only those DCs</p><div class="chart-box" data-chart="dcStatus"></div></div>
+      <div class="chart-card"><h3>Roles on these DCs</h3><p class="chart-hint">Click a role to see which DC has it</p><div class="chart-box" data-chart="roles"></div></div>
+    </div>
     <div class="controls">
       <input class="search" id="dcSearch" placeholder="Search name, IP, site, OS, FSMO, role, or feature...">
       <button class="filter active" data-dc-filter="all">All</button>
@@ -2176,6 +2641,12 @@ $css
 
   <section id="identity" class="panel">
     $(New-LearnBox 'Privilege is the real map of the domain' 'Domain Admins, Enterprise Admins, Schema Admins, DnsAdmins, and Backup Operators are tier-0. Count the humans, not just the groups. krbtgt age tells you how long a stolen KRBTGT hash would keep working.')
+    <div class="chart-grid">
+      <div class="chart-card"><h3>User account mix</h3><p class="chart-hint">Click for stale samples or the hygiene tables</p><div class="chart-box" data-chart="users"></div></div>
+      <div class="chart-card"><h3>Computer account mix</h3><p class="chart-hint">Click stale to see the sample list</p><div class="chart-box" data-chart="computers"></div></div>
+      <div class="chart-card"><h3>Computers by OS</h3><p class="chart-hint">Click an OS family</p><div class="chart-box" data-chart="os"></div></div>
+      <div class="chart-card"><h3>Privileged groups</h3><p class="chart-hint">Click a bar to list members</p><div class="chart-box" data-chart="priv"></div></div>
+    </div>
     <div class="grid-2">
       <div class="card">
         <h2>Default domain password policy</h2>
@@ -2239,6 +2710,9 @@ $css
 
   <section id="roles" class="panel">
     $(New-LearnBox 'Installed roles tell you what else these DCs are doing' 'A DC that is also DHCP, CA, or RDS is a concentration-of-risk problem. Compare roles across DCs — drift is how "only DC02 has the thing" incidents start.')
+    <div class="chart-grid">
+      <div class="chart-card"><h3>Top installed roles</h3><p class="chart-hint">Click a bar to see the DCs that have it</p><div class="chart-box" data-chart="roles"></div></div>
+    </div>
     <div class="card">
       <h2>Roles across the domain</h2>
       <div class="controls"><input class="search" id="roleSearch" placeholder="Filter roles..."></div>
@@ -2252,10 +2726,24 @@ $css
   </section>
 
   <footer>
-    <p>AD Domain Discovery Report v2.0 · Execution time $($Report.ExecTime) · Stale threshold $($Report.StaleDays) days</p>
+    <p>AD Domain Discovery Report v2.1 · Execution time $($Report.ExecTime) · Stale threshold $($Report.StaleDays) days</p>
     <p>Read-only discovery. This script does not change AD. Validate privileged-group counts before you act.</p>
   </footer>
+    </div>
+  </div>
 </div>
+<aside class="drawer" id="drawer" aria-label="Drill-down">
+  <div class="drawer-head">
+    <div>
+      <div class="drawer-crumb" id="drawerCrumb">Selection</div>
+      <h3 id="drawerTitle">Details</h3>
+    </div>
+    <button class="drawer-close" id="drawerClose" type="button" aria-label="Close">&times;</button>
+  </div>
+  <div class="drawer-body" id="drawerBody"></div>
+</aside>
+<div class="scrim" id="scrim"></div>
+<script type="application/json" id="chartData">$chartJson</script>
 <script>
 $js
 </script>
