@@ -18,7 +18,8 @@
     session (src:port -> dst:port) and the Kerberos account (user@REALM) when the
     cname is in the clear (AS-REQ / TGS-REQ / AS-REP / TGS-REP). Display filters
     work on the current view. Click the red PRE-COLLAPSE (or SMBv1) banner to list
-    leftover packets on Findings.
+    leftover packets on Findings. Resolve names (toolbar) does async reverse-DNS
+    so Source/Destination show hostname (ip) when a PTR exists.
 
     Designed for Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012 / 2012 R2,
     and PowerShell 7 on Windows. Live capture needs an elevated Administrator session.
@@ -40,6 +41,7 @@
       ldaps
       user:legacyapp
       account:legacyapp
+      hostname:dc01
       tcp.port==389
       ip.addr==10.1.1.8
 
@@ -72,7 +74,7 @@
 
 .NOTES
     Author      : Anthony Blake
-    Version     : 1.6
+    Version     : 1.7
     Compatible  : Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012
                   (PowerShell 3.0), 2012 R2 (PowerShell 4.0), 5.1, and PowerShell 7+.
                   There is no Requires-Version directive. Do not use -shl/-shr
@@ -93,8 +95,11 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.6'
+$script:AppVersion = '1.7'
 $script:AppAuthor  = 'Anthony Blake'
+$script:NameCache = $null
+$script:ResolveNames = $true
+$script:LastDnsVersion = -1
 
 # Version is checked at runtime on purpose. Do not add "#Requires -Version".
 # Server 2008 / 2008 R2 is PowerShell 2.0. Server 2012 R2 is 4.0.
@@ -253,6 +258,38 @@ function Get-PacketAccountText {
     if (-not (Test-BlankString $u)) { return $u }
     if ($Packet.IsRc4) { return '(account not in cleartext)' }
     return ''
+}
+
+function Format-ResolvedAddress {
+    param([string]$Ip, [string]$HostName, [bool]$ShowName = $true)
+    if (Test-BlankString $Ip) { return '' }
+    if (-not $ShowName) { return $Ip }
+    $n = [string]$HostName
+    if (Test-BlankString $n) { return $Ip }
+    if ($n -eq $Ip -or $n -eq '(no PTR)') { return $Ip }
+    return ('{0} ({1})' -f $n, $Ip)
+}
+
+function Get-CachedHostName {
+    param([string]$Ip)
+    if (Test-BlankString $Ip) { return '' }
+    if (-not $script:NameCache) { return '' }
+    try { return [string]$script:NameCache.Get($Ip) } catch { }
+    return ''
+}
+
+function Get-ResolvedAddressText {
+    param([string]$Ip)
+    $show = $true
+    try { if ($script:ResolveNames -eq $false) { $show = $false } } catch { }
+    return (Format-ResolvedAddress -Ip $Ip -HostName (Get-CachedHostName $Ip) -ShowName $show)
+}
+
+function Queue-AddressName {
+    param([string]$Ip)
+    if (-not $script:NameCache) { return }
+    if (Test-BlankString $Ip) { return }
+    try { $script:NameCache.Enqueue($Ip) } catch { }
 }
 
 function Get-PacketFindingReasons {
@@ -2695,6 +2732,160 @@ public class PowerSharkEngine {
         }
     }
 }
+
+public class PowerSharkNameCache {
+    readonly object _gate = new object();
+    Dictionary<string, string> _map = new Dictionary<string, string>();
+    Dictionary<string, bool> _queued = new Dictionary<string, bool>();
+    Queue<string> _q = new Queue<string>();
+    int _inflight;
+    int _version;
+    bool _enabled = true;
+    const int MaxInflight = 2;
+
+    public void SetEnabled(bool on) {
+        lock (_gate) { _enabled = on; }
+        if (on) Pump();
+    }
+
+    public bool IsEnabled {
+        get { lock (_gate) { return _enabled; } }
+    }
+
+    public int Version {
+        get { lock (_gate) { return _version; } }
+    }
+
+    public int CachedCount {
+        get { lock (_gate) { return _map.Count; } }
+    }
+
+    public int ResolvedCount {
+        get {
+            lock (_gate) {
+                int n = 0;
+                foreach (KeyValuePair<string, string> kv in _map) {
+                    if (kv.Value != null && kv.Value.Length > 0) n++;
+                }
+                return n;
+            }
+        }
+    }
+
+    public int PendingCount {
+        get { lock (_gate) { return _q.Count + _inflight; } }
+    }
+
+    static bool LooksLikeIpv4(string ip) {
+        if (ip == null) return false;
+        string[] p = ip.Split('.');
+        if (p.Length != 4) return false;
+        int i;
+        for (i = 0; i < 4; i++) {
+            if (p[i] == null || p[i].Length < 1 || p[i].Length > 3) return false;
+            int v = 0;
+            int j;
+            for (j = 0; j < p[i].Length; j++) {
+                char c = p[i][j];
+                if (c < '0' || c > '9') return false;
+                v = (v * 10) + (c - '0');
+            }
+            if (v > 255) return false;
+            if (i == 0 && (v == 0 || v >= 224)) return false;
+        }
+        return true;
+    }
+
+    static string CleanName(string name, string ip) {
+        if (name == null) return "";
+        name = name.Trim();
+        if (name.Length == 0) return "";
+        if (name.EndsWith(".")) name = name.Substring(0, name.Length - 1);
+        if (name.Length == 0 || name == ip) return "";
+        return name;
+    }
+
+    public void Enqueue(string ip) {
+        if (!LooksLikeIpv4(ip)) return;
+        lock (_gate) {
+            if (_map.ContainsKey(ip) || _queued.ContainsKey(ip)) return;
+            _queued[ip] = true;
+            _q.Enqueue(ip);
+        }
+        Pump();
+    }
+
+    public string Get(string ip) {
+        if (ip == null) return "";
+        lock (_gate) {
+            string n;
+            if (_map.TryGetValue(ip, out n) && n != null) return n;
+        }
+        return "";
+    }
+
+    public bool Has(string ip) {
+        if (ip == null) return false;
+        lock (_gate) { return _map.ContainsKey(ip); }
+    }
+
+    public void Seed(string ip, string name) {
+        if (!LooksLikeIpv4(ip)) return;
+        string clean = CleanName(name, ip);
+        lock (_gate) {
+            _map[ip] = clean;
+            if (!_queued.ContainsKey(ip)) _queued[ip] = true;
+            _version++;
+        }
+    }
+
+    public void Clear() {
+        lock (_gate) {
+            _map.Clear();
+            _q.Clear();
+            _queued.Clear();
+            _inflight = 0;
+            _version++;
+        }
+    }
+
+    void Pump() {
+        string ip = null;
+        lock (_gate) {
+            if (!_enabled) return;
+            if (_inflight >= MaxInflight) return;
+            if (_q.Count == 0) return;
+            ip = _q.Dequeue();
+            _inflight++;
+        }
+        try {
+            Dns.BeginGetHostEntry(ip, new AsyncCallback(OnDone), ip);
+        } catch {
+            Finish(ip, "");
+        }
+    }
+
+    void OnDone(IAsyncResult ar) {
+        string ip = ar != null ? (ar.AsyncState as string) : null;
+        string name = "";
+        try {
+            IPHostEntry e = Dns.EndGetHostEntry(ar);
+            if (e != null) name = e.HostName;
+        } catch { }
+        Finish(ip, name);
+    }
+
+    void Finish(string ip, string name) {
+        if (ip == null) ip = "";
+        string clean = CleanName(name, ip);
+        lock (_gate) {
+            if (ip.Length > 0) _map[ip] = clean;
+            if (_inflight > 0) _inflight--;
+            _version++;
+        }
+        Pump();
+    }
+}
 '@
     try {
         Add-Type -TypeDefinition $cs -Language CSharp -ErrorAction Stop
@@ -2706,6 +2897,13 @@ public class PowerSharkEngine {
         }
     }
 }
+
+if (-not $script:NameCache) {
+    $script:NameCache = New-Object PowerSharkNameCache
+    $script:NameCache.SetEnabled($true)
+}
+$script:ResolveNames = $true
+$script:LastDnsVersion = -1
 
 # PowerShell 2.0 cannot New-Object 'List[PowerSharkPacket]' (in-memory generic args).
 # Returning an empty collection without a leading comma unwraps to $null, and
@@ -3041,6 +3239,37 @@ function Invoke-SmbAnalyzerSelfTest {
         if (Test-Path -LiteralPath $csvTmp) { Remove-Item -LiteralPath $csvTmp -Force -ErrorAction SilentlyContinue }
     }
 
+    $nc = New-Object PowerSharkNameCache
+    $nc.Seed('10.10.50.11', 'dc01.contoso.local')
+    if ($nc.Get('10.10.50.11') -ne 'dc01.contoso.local') {
+        [void]$failures.Add("Name cache Seed/Get failed: '$($nc.Get('10.10.50.11'))'")
+    }
+    if (-not $nc.Has('10.10.50.11')) { [void]$failures.Add('Name cache Has missed a seeded IP') }
+    $nc.Seed('10.10.50.12', '10.10.50.12')
+    if ($nc.Get('10.10.50.12') -ne '') { [void]$failures.Add('Name cache should ignore a PTR that equals the IP') }
+    $nc.Enqueue('224.0.0.252')
+    if ($nc.Has('224.0.0.252')) { [void]$failures.Add('Name cache should skip multicast') }
+    $shown = Format-ResolvedAddress -Ip '10.10.50.11' -HostName 'dc01.contoso.local' -ShowName $true
+    if ($shown -notmatch 'dc01' -or $shown -notmatch '10\.10\.50\.11') {
+        [void]$failures.Add("Format-ResolvedAddress on: $shown")
+    }
+    $hidden = Format-ResolvedAddress -Ip '10.10.50.11' -HostName 'dc01.contoso.local' -ShowName $false
+    if ($hidden -ne '10.10.50.11') { [void]$failures.Add("Format-ResolvedAddress off: $hidden") }
+    if ((Format-ResolvedAddress -Ip '10.10.50.11' -HostName '' -ShowName $true) -ne '10.10.50.11') {
+        [void]$failures.Add('Format-ResolvedAddress empty hostname should keep the IP')
+    }
+    if ($script:NameCache) {
+        $script:NameCache.Seed('10.10.50.11', 'dc01.contoso.local')
+        $script:ResolveNames = $true
+        $shownLive = Get-ResolvedAddressText '10.10.50.11'
+        if ($shownLive -notmatch 'dc01') { [void]$failures.Add("Get-ResolvedAddressText: $shownLive") }
+        $script:ResolveNames = $false
+        if ((Get-ResolvedAddressText '10.10.50.11') -ne '10.10.50.11') {
+            [void]$failures.Add('Get-ResolvedAddressText should keep the raw IP when Resolve names is off')
+        }
+        $script:ResolveNames = $true
+    }
+
     if ($failures.Count -gt 0) {
         Write-Host "SELFTEST FAIL ($($failures.Count))" -ForegroundColor Red
         $failures | ForEach-Object { Write-Host " - $_" -ForegroundColor Red }
@@ -3096,6 +3325,9 @@ $script:lvPackets       = $null
 $script:txtFilter       = $null
 $script:chkSmb1Only     = $null
 $script:chkAutoScroll   = $null
+$script:chkResolve      = $null
+$script:lblDns          = $null
+$script:LastDnsVersion  = -1
 $script:cmbSaveFormat   = $null
 $script:cmbTimer        = $null
 $script:lblTimer        = $null
@@ -3430,6 +3662,14 @@ function Test-FilterToken {
     if ($tl -match '^(user|account|cname):(.+)$') {
         return ($pkt.UserName -and $pkt.UserName.ToLowerInvariant().Contains($Matches[2]))
     }
+    if ($tl -match '^(hostname|ptr|dnsname):(.+)$') {
+        $q = $Matches[2]
+        $srcN = Get-CachedHostName $pkt.Src
+        $dstN = Get-CachedHostName $pkt.Dst
+        if ($srcN -and $srcN.ToLowerInvariant().Contains($q)) { return $true }
+        if ($dstN -and $dstN.ToLowerInvariant().Contains($q)) { return $true }
+        return $false
+    }
     if ($tl -match '^file:(.+)$') {
         return ($pkt.FileName -and $pkt.FileName.ToLowerInvariant().Contains($Matches[1]))
     }
@@ -3459,6 +3699,10 @@ function Test-FilterToken {
     if ($pkt.Info -and $pkt.Info.ToLowerInvariant().Contains($tl)) { return $true }
     if ($pkt.SmbCommand -and $pkt.SmbCommand.ToLowerInvariant().Contains($tl)) { return $true }
     if ($pkt.UserName -and $pkt.UserName.ToLowerInvariant().Contains($tl)) { return $true }
+    $srcN = Get-CachedHostName $pkt.Src
+    $dstN = Get-CachedHostName $pkt.Dst
+    if ($srcN -and $srcN.ToLowerInvariant().Contains($tl)) { return $true }
+    if ($dstN -and $dstN.ToLowerInvariant().Contains($tl)) { return $true }
     return $false
 }
 
@@ -3615,6 +3859,9 @@ function Update-Smb1Host {
             if ($h.Commands.ContainsKey($cmd)) { $h.Commands[$cmd]++ } else { $h.Commands[$cmd] = 1 }
             if ($script:Smb1CommandHist.ContainsKey($cmd)) { $script:Smb1CommandHist[$cmd]++ } else { $script:Smb1CommandHist[$cmd] = 1 }
         }
+        if ($role -eq 'Client' -and $pkt.Workstation -and (Test-BlankString $h.HostName)) {
+            $h.HostName = [string]$pkt.Workstation
+        }
         if ($pkt.UserName -and -not $h.Users.Contains($pkt.UserName)) { [void]$h.Users.Add($pkt.UserName) }
         if ($pkt.SharePath -and -not $h.Shares.Contains($pkt.SharePath)) { [void]$h.Shares.Add($pkt.SharePath) }
         if ($pkt.FileName -and -not $h.Files.Contains($pkt.FileName)) { [void]$h.Files.Add($pkt.FileName) }
@@ -3632,6 +3879,8 @@ function Add-PacketsToUi {
         [void]$script:AllPackets.Add($pkt)
         if (Test-PacketFilter $pkt) { [void]$script:ViewPackets.Add($pkt) }
         Update-Smb1Host $pkt
+        Queue-AddressName $pkt.Src
+        Queue-AddressName $pkt.Dst
         $added++
     }
     return $added
@@ -3794,6 +4043,7 @@ function Update-CaptureUi {
         Update-StatusBar
         Update-SessionTimerLabel
         Check-SessionTimer
+        Update-NameResolutionUi
         if ($script:tabMain -and $script:tabMain.SelectedTab -eq $script:tabStats) { Update-StatsTab }
         if ($script:tabMain -and $script:tabMain.SelectedTab -eq $script:tabHosts) { Update-HostsGrid }
         if ($script:tabMain -and $script:tabFindings -and $script:tabMain.SelectedTab -eq $script:tabFindings) { Update-FindingsGrid }
@@ -3815,10 +4065,14 @@ function Show-PacketDetails {
     [void]$frame.Nodes.Add("Marked: $($p.Marked)")
     [void]$frame.Nodes.Add("Protocol column: $($p.Protocol)")
 
-    $ip = $frame.Nodes.Add(("Internet Protocol Version 4, Src: {0}, Dst: {1}" -f $p.Src, $p.Dst))
+    $ip = $frame.Nodes.Add(("Internet Protocol Version 4, Src: {0}, Dst: {1}" -f (Get-ResolvedAddressText $p.Src), (Get-ResolvedAddressText $p.Dst)))
     [void]$ip.Nodes.Add("Header length: $($p.IpHeaderLen)")
-    [void]$ip.Nodes.Add("Source: $($p.Src)")
-    [void]$ip.Nodes.Add("Destination: $($p.Dst)")
+    [void]$ip.Nodes.Add("Source: $(Get-ResolvedAddressText $p.Src)")
+    [void]$ip.Nodes.Add("Destination: $(Get-ResolvedAddressText $p.Dst)")
+    $srcName = Get-CachedHostName $p.Src
+    $dstName = Get-CachedHostName $p.Dst
+    if (-not (Test-BlankString $srcName)) { [void]$ip.Nodes.Add("Source hostname: $srcName") }
+    if (-not (Test-BlankString $dstName)) { [void]$ip.Nodes.Add("Destination hostname: $dstName") }
 
     $flags = @()
     if (($p.TcpFlags -band 0x02) -ne 0) { $flags += 'SYN' }
@@ -4028,9 +4282,9 @@ function Update-FindingsGrid {
             $idx = $script:dgvFindings.Rows.Add(
                 [string]$p.No,
                 $timeText,
-                [string]$p.Src,
+                (Get-ResolvedAddressText $p.Src),
                 [string]$p.SrcPort,
-                [string]$p.Dst,
+                (Get-ResolvedAddressText $p.Dst),
                 [string]$p.DstPort,
                 [string]$p.Protocol,
                 $acctText,
@@ -4278,6 +4532,7 @@ function Clear-Capture {
 }
 
 function Import-DemoCapture {
+    Seed-DemoHostNames
     $demo = [PowerSharkParser]::BuildDemoPackets()
     [void](Add-PacketsToUi -Packets $demo)
     Refresh-PacketListView
@@ -4287,7 +4542,7 @@ function Import-DemoCapture {
     Update-FindingsGrid -Force
     Write-AppLog "Loaded $($demo.Length) synthetic demo packets (SMB, LDAP, Kerberos, DNS, NFS)." 'INFO'
     [void][System.Windows.Forms.MessageBox]::Show(
-        "Loaded $($demo.Length) synthetic packets.`n`nPurple = LDAP, orange = Kerberos, teal = DNS, red = legacy SMB / RC4, blue = SMB2+.`nRC4 Kerberos rows include the session and account (legacyapp@CONTOSO.LOCAL). Click the red banner (SMBv1 / PRE-COLLAPSE) to list leftover packets on Findings, or try display filters: ad, collapse, rc4, user:legacyapp, ldaps, machine, fileshare.",
+        "Loaded $($demo.Length) synthetic packets.`n`nPurple = LDAP, orange = Kerberos, teal = DNS, red = legacy SMB / RC4, blue = SMB2+.`nRC4 Kerberos rows include the session and account (legacyapp@CONTOSO.LOCAL). Resolve names is on — demo IPs show as hostnames (xpclient01 / dc01). Click the red banner (SMBv1 / PRE-COLLAPSE) to list leftover packets on Findings, or try display filters: ad, collapse, rc4, user:legacyapp, hostname:dc01, ldaps, machine, fileshare.",
         'Demo Capture Loaded',
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Information)
@@ -4335,8 +4590,10 @@ function New-PacketCsvRow {
     Add-Member -InputObject $row -MemberType NoteProperty -Name Family -Value $svc
     Add-Member -InputObject $row -MemberType NoteProperty -Name Category -Value $cat
     Add-Member -InputObject $row -MemberType NoteProperty -Name Src -Value ([string]$Packet.Src)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name SrcHost -Value (Get-CachedHostName $Packet.Src)
     Add-Member -InputObject $row -MemberType NoteProperty -Name SrcPort -Value ([string]$Packet.SrcPort)
     Add-Member -InputObject $row -MemberType NoteProperty -Name Dst -Value ([string]$Packet.Dst)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name DstHost -Value (Get-CachedHostName $Packet.Dst)
     Add-Member -InputObject $row -MemberType NoteProperty -Name DstPort -Value ([string]$Packet.DstPort)
     Add-Member -InputObject $row -MemberType NoteProperty -Name Session -Value (Get-PacketSessionText $Packet)
     Add-Member -InputObject $row -MemberType NoteProperty -Name Length -Value ([string]$Packet.Length)
@@ -4596,7 +4853,7 @@ function Find-InPackets {
     for ($k = 1; $k -le $n; $k++) {
         $idx = if ($Forward) { ($start + $k) % $n } else { ($start - $k + $n) % $n }
         $p = $script:ViewPackets[$idx]
-        $hay = ('{0} {1} {2} {3} {4} {5} {6}' -f $p.Src, $p.Dst, $p.Info, $p.UserName, $p.FileName, $p.SharePath, $p.SmbCommand).ToLowerInvariant()
+        $hay = ('{0} {1} {2} {3} {4} {5} {6} {7} {8}' -f $p.Src, $p.Dst, $p.Info, $p.UserName, $p.FileName, $p.SharePath, $p.SmbCommand, (Get-CachedHostName $p.Src), (Get-CachedHostName $p.Dst)).ToLowerInvariant()
         if ($hay.Contains($ql)) {
             $script:FindIndex = $idx
             $script:lvPackets.SelectedIndices.Clear()
@@ -4659,18 +4916,103 @@ function Update-HostsGrid {
     }
 }
 
-function Resolve-HostNames {
+function Apply-CachedNamesToTalkers {
+    if (-not $script:NameCache) { return }
     foreach ($ip in (Get-AppEnumerable $script:Smb1Hosts.Keys)) {
-        try {
-            $entry = [System.Net.Dns]::GetHostEntry($ip)
-            $script:Smb1Hosts[$ip].HostName = $entry.HostName
-        } catch {
-            $script:Smb1Hosts[$ip].HostName = '(no PTR)'
+        $h = $script:Smb1Hosts[$ip]
+        if ($null -eq $h) { continue }
+        $n = ''
+        try { $n = [string]$script:NameCache.Get($ip) } catch { }
+        if (-not (Test-BlankString $n)) {
+            $cur = [string](Get-AppNote $h 'HostName')
+            if (Test-BlankString $cur -or $cur -eq '(no PTR)' -or $cur -eq $ip) {
+                $h.HostName = $n
+            }
+        } elseif ($script:NameCache.Has($ip)) {
+            $cur = [string](Get-AppNote $h 'HostName')
+            if (Test-BlankString $cur) { $h.HostName = '(no PTR)' }
         }
-        [System.Windows.Forms.Application]::DoEvents()
     }
+}
+
+function Queue-KnownAddressNames {
+    foreach ($p in (Get-AppEnumerable $script:AllPackets)) {
+        if ($null -eq $p) { continue }
+        Queue-AddressName $p.Src
+        Queue-AddressName $p.Dst
+    }
+    foreach ($ip in (Get-AppEnumerable $script:Smb1Hosts.Keys)) {
+        Queue-AddressName ([string]$ip)
+    }
+}
+
+function Set-NameResolutionEnabled {
+    param([bool]$On)
+    $script:ResolveNames = $On
+    if ($script:NameCache) {
+        try { $script:NameCache.SetEnabled($On) } catch { }
+    }
+    if ($On) { Queue-KnownAddressNames }
+    try { if ($script:lvPackets) { $script:lvPackets.Invalidate() } } catch { }
+    $p = $null
+    try { $p = Get-SelectedPacket } catch { }
+    if ($p) { Show-PacketDetails $p }
+    if ($script:tabMain -and $script:tabMain.SelectedTab -eq $script:tabHosts) { Update-HostsGrid }
+    if ($script:tabMain -and $script:tabFindings -and $script:tabMain.SelectedTab -eq $script:tabFindings) { Update-FindingsGrid -Force }
+}
+
+function Update-NameResolutionUi {
+    if (-not $script:NameCache) { return }
+    $ver = -1
+    try { $ver = [int]$script:NameCache.Version } catch { }
+    if ($ver -eq $script:LastDnsVersion) { return }
+    $script:LastDnsVersion = $ver
+    Apply-CachedNamesToTalkers
+    try { if ($script:lvPackets) { $script:lvPackets.Invalidate() } } catch { }
+    if ($script:lblDns) {
+        $n = 0
+        $pend = 0
+        try { $n = [int]$script:NameCache.ResolvedCount } catch { }
+        try { $pend = [int]$script:NameCache.PendingCount } catch { }
+        if ($script:ResolveNames -eq $false) {
+            $script:lblDns.Text = 'Names: off'
+        } elseif ($pend -gt 0) {
+            $script:lblDns.Text = ('Names: {0}  queued {1}' -f $n, $pend)
+        } else {
+            $script:lblDns.Text = ('Names: {0}' -f $n)
+        }
+    }
+    $p = $null
+    try { $p = Get-SelectedPacket } catch { }
+    if ($p -and $script:tvDetails) { Show-PacketDetails $p }
+    if ($script:tabMain -and $script:tabMain.SelectedTab -eq $script:tabHosts) { Update-HostsGrid }
+    if ($script:tabMain -and $script:tabFindings -and $script:tabMain.SelectedTab -eq $script:tabFindings) {
+        Update-FindingsGrid -Force
+    }
+}
+
+function Resolve-HostNames {
+    if ($script:chkResolve) {
+        try { $script:chkResolve.Checked = $true } catch { }
+    }
+    Set-NameResolutionEnabled $true
+    foreach ($ip in (Get-AppEnumerable $script:Smb1Hosts.Keys)) {
+        Queue-AddressName ([string]$ip)
+    }
+    Apply-CachedNamesToTalkers
     Update-HostsGrid
-    Write-AppLog 'Reverse DNS lookup complete for talkers.' 'INFO'
+    $pend = 0
+    try { if ($script:NameCache) { $pend = [int]$script:NameCache.PendingCount } } catch { }
+    Write-AppLog ("Queued reverse DNS for talkers (pending={0})." -f $pend) 'INFO'
+}
+
+function Seed-DemoHostNames {
+    if (-not $script:NameCache) { return }
+    $script:NameCache.Seed('10.10.50.88', 'xpclient01.contoso.local')
+    $script:NameCache.Seed('10.10.50.10', 'fileserver.contoso.local')
+    $script:NameCache.Seed('10.10.51.17', 'win10-17.contoso.local')
+    $script:NameCache.Seed('10.10.50.11', 'dc01.contoso.local')
+    $script:NameCache.Seed('192.168.88.19', 'oldxp.contoso.local')
 }
 
 function Export-HostsCsv {
@@ -5045,7 +5387,9 @@ HOW TO RUN
   3. powershell.exe -ExecutionPolicy Bypass -STA -File .\PowerShark.ps1
   4. Pick the IPv4 address of the interface that faces clients / DCs.
   5. Capture dropdown: All traffic (default), Active Directory, File shares, Domain collapse, RC4, or LDAPS.
-  6. Click Start. Use display filters (collapse, rc4, user:legacyapp, ldaps, machine, gpo, dclocator, ad, ldap).
+  6. Click Start. Use display filters (collapse, rc4, user:legacyapp, hostname:dc01, ldaps, machine, gpo, dclocator, ad, ldap).
+     Resolve names (toolbar) does background PTR lookups so Source/Destination
+     show hostname (ip) when DNS has a reverse record.
   7. When the red PRE-COLLAPSE (or SMBv1) banner appears, click it. The Findings
      tab lists every leftover packet the alert is about. Double-click a row to
      jump to that frame on the Packets tab.
@@ -5061,6 +5405,7 @@ SESSION TIMER AND SAVE ALL
   CSV Protocol and Family are the exact service (LDAP, Kerberos, SMB, DNS, RPC-SAMR).
   Category is the coarse AD / FileShare / Other bucket. Operation is Bind / AS-REQ / Query.
   CSV Session is src:port -> dst:port. UserName is the Kerberos or NTLM account.
+  CSV SrcHost / DstHost are reverse-DNS names when Resolve names has a PTR.
   Unattended:  .\PowerShark.ps1 -AutoCloseMinutes 60
 
 NO LIVE TRAFFIC?
@@ -5086,6 +5431,7 @@ BEFORE A DOMAIN COLLAPSE
                    list src:port -> dst:port with the Kerberos account (user@REALM)
                    when cname is in the clear. AP-REQ authenticators are encrypted.
     user:legacyapp / account:legacyapp   filter by Kerberos cname or NTLM user
+    hostname:dc01  / ptr:dc01            reverse-DNS name on src or dst
     ldaps          LDAP over TLS (TCP 636 / GC 3269), including STARTTLS
     dclocator      DNS SRV _ldap._tcp / _kerberos / _msdcs / _sites
     cldap          UDP 389 NetLogon LDAP ping (DC locator)
@@ -5122,6 +5468,7 @@ DISPLAY FILTERS
   rc4
   user:legacyapp
   account:legacyapp
+  hostname:dc01
   dclocator
   cldap
   ntp
@@ -5177,6 +5524,12 @@ HOW DETECTION WORKS
   session 4-tuple plus the account. AP-REQ authenticators stay encrypted, so
   those frames may show the session without an account. TLS
   ClientHello/ServerHello is checked for RC4 cipher suites (0x0004/0x0005/…).
+  Resolve names (toolbar, on by default) queues each IPv4 address for a
+  background reverse-DNS PTR lookup (System.Net.Dns.BeginGetHostEntry).
+  Results are cached. Source/Destination columns, Findings, Talkers, packet
+  details, and CSV SrcHost/DstHost show hostname (ip) when a PTR exists.
+  Multicast / 0.x / 224+ are skipped. NTLM workstation names fill Talkers
+  immediately; a later PTR replaces them with the FQDN. No PTR leaves the IP.
 
 LIMITATIONS vs REAL WIRESHARK
   - IPv4 only (raw sockets). No Ethernet header on live frames.
@@ -5453,13 +5806,30 @@ $script:chkAutoScroll.AutoSize = $true
 $script:chkAutoScroll.Checked = $true
 $script:chkAutoScroll.Margin = New-Object System.Windows.Forms.Padding(4, 8, 10, 4)
 
+$script:chkResolve = New-Object System.Windows.Forms.CheckBox
+$script:chkResolve.Text = 'Resolve names'
+$script:chkResolve.ForeColor = $script:C.White
+$script:chkResolve.AutoSize = $true
+$script:chkResolve.Checked = $true
+$script:chkResolve.Margin = New-Object System.Windows.Forms.Padding(4, 8, 8, 4)
+$script:Tip.SetToolTip($script:chkResolve, 'Reverse-DNS (PTR) for each IPv4 address. Lookups run in the background so capture stays live. Source/Destination show hostname (ip) when a name is found.')
+$script:chkResolve.Add_CheckedChanged({
+    Set-NameResolutionEnabled ([bool]$script:chkResolve.Checked)
+})
+
+$script:lblDns = New-Object System.Windows.Forms.Label
+$script:lblDns.Text = 'Names: 0'
+$script:lblDns.ForeColor = $script:C.Accent
+$script:lblDns.AutoSize = $true
+$script:lblDns.Margin = New-Object System.Windows.Forms.Padding(0, 10, 10, 4)
+
 $btnClear = New-FlatButton -Text 'Clear' -Width 78 -BackColor $script:C.Gray -Bold $false -OnClick { Clear-Capture } -TipText 'Clear packet list'
 $btnDemo = New-FlatButton -Text 'Demo' -Width 78 -BackColor $script:C.Teal -Bold $false -OnClick { Import-DemoCapture } -TipText 'Load synthetic AD, file-share, DNS, Kerberos, LDAP, NFS packets'
 $btnOpen = New-FlatButton -Text 'Open' -Width 78 -BackColor $script:C.Blue -Bold $false -OnClick { Open-PcapFile } -TipText 'Open a .pcap (Ctrl+O)'
 $btnSaveView = New-FlatButton -Text 'Save view' -Width 92 -BackColor $script:C.Dark -Bold $false -OnClick { Save-PcapFile } -TipText 'Save the filtered view as pcap/csv (Ctrl+S)'
 $script:btnSaveAll = New-FlatButton -Text 'Save all' -Width 88 -BackColor $script:C.Accent -OnClick { Show-SaveAllDialog } -TipText 'Save the entire capture buffer as PCAP or CSV (Ctrl+Shift+S). Dialog starts on the Desktop.'
 
-$tool.Controls.AddRange(@($lblIf, $script:cmbIface, $script:btnStart, $script:btnStop, $script:btnPause, $lblCap, $script:cmbCap, $script:chkSmbPayload, $script:chkAutoScroll, $btnClear, $btnDemo, $btnOpen, $btnSaveView, $script:btnSaveAll))
+$tool.Controls.AddRange(@($lblIf, $script:cmbIface, $script:btnStart, $script:btnStop, $script:btnPause, $lblCap, $script:cmbCap, $script:chkSmbPayload, $script:chkAutoScroll, $script:chkResolve, $script:lblDns, $btnClear, $btnDemo, $btnOpen, $btnSaveView, $script:btnSaveAll))
 
 # --- Session timer (keep open N minutes, then save all to Desktop and close) ---
 $sessionBar = New-FlowBar -MinHeight 44 -BackColor $script:C.Header2
@@ -5744,9 +6114,9 @@ $script:lvPackets.BackColor = $script:C.White
 Enable-DoubleBuffer $script:lvPackets
 [void]$script:lvPackets.Columns.Add('No', 60)
 [void]$script:lvPackets.Columns.Add('Time', 110)
-[void]$script:lvPackets.Columns.Add('Source', 120)
+[void]$script:lvPackets.Columns.Add('Source', 190)
 [void]$script:lvPackets.Columns.Add('Src Port', 70)
-[void]$script:lvPackets.Columns.Add('Destination', 120)
+[void]$script:lvPackets.Columns.Add('Destination', 190)
 [void]$script:lvPackets.Columns.Add('Dst Port', 70)
 [void]$script:lvPackets.Columns.Add('Protocol', 96)
 [void]$script:lvPackets.Columns.Add('Account', 150)
@@ -5773,9 +6143,9 @@ $script:lvPackets.Add_RetrieveVirtualItem({
         $timeText = ''
         try { $timeText = $p.Time.ToString('HH:mm:ss.fff') } catch { }
         [void]$item.SubItems.Add($timeText)
-        [void]$item.SubItems.Add(([string]$p.Src))
+        [void]$item.SubItems.Add((Get-ResolvedAddressText $p.Src))
         [void]$item.SubItems.Add(([string]$p.SrcPort))
-        [void]$item.SubItems.Add(([string]$p.Dst))
+        [void]$item.SubItems.Add((Get-ResolvedAddressText $p.Dst))
         [void]$item.SubItems.Add(([string]$p.DstPort))
         [void]$item.SubItems.Add(([string]$p.Protocol))
         $acctText = ''
@@ -5822,6 +6192,15 @@ $mLdaps = $ctx.Items.Add('Display filter: ldaps')
 $mLdaps.add_Click({ Set-DisplayFilter -Text 'ldaps' })
 $mAcct = $ctx.Items.Add('Display filter: this account')
 $mAcct.add_Click({ Use-FilterSelectedAccount })
+$mName = $ctx.Items.Add('Resolve names for this packet')
+$mName.add_Click({
+    $p = Get-SelectedPacket
+    if (-not $p) { return }
+    if ($script:chkResolve) { try { $script:chkResolve.Checked = $true } catch { } }
+    Set-NameResolutionEnabled $true
+    Queue-AddressName $p.Src
+    Queue-AddressName $p.Dst
+})
 $mCol = $ctx.Items.Add('Display filter: collapse')
 $mCol.add_Click({ Set-DisplayFilter -Text 'collapse' })
 $mFind = $ctx.Items.Add('Show banner findings')
@@ -5940,7 +6319,7 @@ $script:cmbHostView.Margin = New-Object System.Windows.Forms.Padding(0, 6, 8, 4)
 $script:cmbHostView.SelectedIndex = 0
 $script:cmbHostView.Add_SelectedIndexChanged({ Update-HostsGrid })
 
-$btnRes = New-FlatButton -Text 'Resolve DNS' -Width 120 -BackColor $script:C.Blue -OnClick { Resolve-HostNames } -TipText 'PTR lookup for each talker IP'
+$btnRes = New-FlatButton -Text 'Resolve DNS' -Width 120 -BackColor $script:C.Blue -OnClick { Resolve-HostNames } -TipText 'Queue reverse-DNS (PTR) for every talker IP. Same cache as Resolve names on the toolbar.'
 $btnExpH = New-FlatButton -Text 'Export CSV' -Width 120 -BackColor $script:C.Dark -OnClick { Export-HostsCsv }
 $btnFiltH = New-FlatButton -Text 'Filter selected IP' -Width 150 -BackColor $script:C.Teal -OnClick {
     if ($script:dgvHosts.SelectedRows.Count -gt 0) {
