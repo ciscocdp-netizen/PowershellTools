@@ -1968,26 +1968,26 @@ function New-DiscoveryReportHtml {
         }
     )
 
-    $fsmoByHolder = @{}
-    foreach ($roleName in $Report.FSMO.Keys) {
-        $holder = [string]$Report.FSMO[$roleName]
-        if (-not $holder) { continue }
-        $short = Get-ShortHostName $holder
-        if (-not $fsmoByHolder.ContainsKey($short)) {
-            $fsmoByHolder[$short] = [System.Collections.Generic.List[string]]::new()
-        }
-        [void]$fsmoByHolder[$short].Add($roleName)
+    $fsmoColors = @{
+        'Schema Master'         = '#6366f1'
+        'Domain Naming Master'  = '#06b6d4'
+        'PDC Emulator'          = '#8b5cf6'
+        'RID Master'            = '#14b8a6'
+        'Infrastructure Master' = '#f59e0b'
     }
-    $fi = 0
     $chartFsmo = @(
-        $fsmoByHolder.GetEnumerator() | ForEach-Object {
-            $c = $osPalette[$fi % $osPalette.Count]
-            $fi++
-            $holderName = $_.Key
-            $items = @(
-                $_.Value | ForEach-Object { New-ChartItem -Title $_ -Subtitle $holderName -Detail 'Forest or domain FSMO held by this DC.' -Tab 'fsmo' -Filter ('fsmo:{0}' -f $holderName) }
-            )
-            [ordered]@{ key = $holderName; label = $holderName; value = $_.Value.Count; color = $c; items = $items }
+        foreach ($roleName in $Report.FSMO.Keys) {
+            $holder = [string]$Report.FSMO[$roleName]
+            if (-not $holder) { continue }
+            $short = Get-ShortHostName $holder
+            $c = if ($fsmoColors.ContainsKey($roleName)) { $fsmoColors[$roleName] } else { '#64748b' }
+            [ordered]@{
+                key   = $roleName
+                label = $roleName
+                value = 1
+                color = $c
+                items = @((New-ChartItem -Title $roleName -Subtitle $holder -Detail 'This FSMO write can only happen on this DC.' -Tab 'fsmo' -Filter ('dcname:{0}' -f $short)))
+            }
         }
     )
 
@@ -2000,7 +2000,7 @@ function New-DiscoveryReportHtml {
         priv      = [ordered]@{ title = 'Privileged groups'; type = 'bar'; hint = 'Click a group to see members'; tab = 'identity'; slices = @($chartPriv) }
         sites     = [ordered]@{ title = 'DCs per site'; type = 'bar'; hint = 'Click a site to see its DCs'; tab = 'sites'; slices = @($chartSites) }
         roles     = [ordered]@{ title = 'Top installed roles'; type = 'bar'; hint = 'Click a role to see which DCs have it'; tab = 'roles'; slices = @($chartRoles) }
-        fsmo      = [ordered]@{ title = 'FSMO concentration'; type = 'donut'; hint = 'Click a holder to see its roles'; tab = 'fsmo'; slices = @($chartFsmo) }
+        fsmo      = [ordered]@{ title = 'FSMO role holders'; type = 'bar'; hint = 'Each bar is one role — click to see the holder'; tab = 'fsmo'; slices = @($chartFsmo) }
     }
     $chartJson = (ConvertTo-EmbeddedJson $chartPayload).Replace('$', '\u0024')
 
@@ -2517,6 +2517,7 @@ $css
       <div class="chart-card"><h3>Computers by OS</h3><p class="chart-hint">Click an OS for sample machines</p><div class="chart-box" data-chart="os"></div></div>
       <div class="chart-card"><h3>Privileged group size</h3><p class="chart-hint">Click a bar to list members</p><div class="chart-box" data-chart="priv"></div></div>
       <div class="chart-card"><h3>DCs per site</h3><p class="chart-hint">Click a site to see its controllers</p><div class="chart-box" data-chart="sites"></div></div>
+      <div class="chart-card"><h3>FSMO role holders</h3><p class="chart-hint">Each bar is one role — click for the holder</p><div class="chart-box" data-chart="fsmo"></div></div>
     </div>
     <div class="card path">
       <strong>Then read the sections in this order</strong>
@@ -2583,7 +2584,7 @@ $css
   <section id="fsmo" class="panel">
     $(New-LearnBox 'FSMO means "this write can only happen in one place"' 'Most AD writes replicate multimaster. Five operations do not. If you inherit a domain, memorize the holders and keep them on DCs you would actually answer a page for.')
     <div class="chart-grid">
-      <div class="chart-card"><h3>FSMO concentration</h3><p class="chart-hint">Click a holder to list the roles on that DC</p><div class="chart-box" data-chart="fsmo"></div></div>
+      <div class="chart-card"><h3>FSMO role holders</h3><p class="chart-hint">Each bar is one role — click to see the holder DC</p><div class="chart-box" data-chart="fsmo"></div></div>
     </div>
     <div class="fsmo-grid">
       $($fsmoCards.ToString())
