@@ -243,6 +243,17 @@ function Format-AgeDays {
     try { return [int]((Get-Date) - [datetime]$Value).TotalDays } catch { return $null }
 }
 
+function Format-AgeLabel {
+    param($Value)
+    $days = Format-AgeDays $Value
+    if ($null -eq $days) { return $null }
+    if ($days -lt 0) { return 'future' }
+    if ($days -ge 365) {
+        return '{0}y {1}d' -f ([int][math]::Floor($days / 365)), ($days % 365)
+    }
+    return '{0} days' -f $days
+}
+
 function New-ReportWarning {
     param([string]$Area, [string]$Message)
     [pscustomobject]@{
@@ -394,10 +405,35 @@ function Get-FSMORoleTable {
     return $roles
 }
 
+function Get-DcCreatedTime {
+    param($Dc, $Ad)
+    $created = $null
+    $identity = $null
+    if ($Dc.ComputerObjectDN) {
+        $identity = $Dc.ComputerObjectDN
+    } elseif ($Dc.Name) {
+        $identity = $Dc.Name
+    }
+    if ($identity) {
+        try {
+            $acct = Get-ADComputer -Identity $identity -Properties whenCreated @Ad
+            $created = $acct.whenCreated
+        } catch { }
+    }
+    if (-not $created -and $Dc.NTDSSettingsObjectDN) {
+        try {
+            $ntds = Get-ADObject -Identity $Dc.NTDSSettingsObjectDN -Properties whenCreated @Ad
+            $created = $ntds.whenCreated
+        } catch { }
+    }
+    return $created
+}
+
 function Get-AllDomainControllers {
     param($Ad)
     $raw = @(Get-ADDomainController -Filter * @Ad)
     $list = foreach ($dc in $raw) {
+        $created = Get-DcCreatedTime -Dc $dc -Ad $Ad
         [pscustomobject]@{
             Name                    = $dc.Name
             HostName                = $dc.HostName
@@ -413,6 +449,10 @@ function Get-AllDomainControllers {
             SslPort                 = $dc.SslPort
             Forest                  = [string]$dc.Forest
             Domain                  = [string]$dc.Domain
+            Created                 = $created
+            CreatedFormatted        = Format-When $created
+            CreatedAgeDays          = Format-AgeDays $created
+            CreatedAgeLabel         = Format-AgeLabel $created
         }
     }
     return @($list | Sort-Object Name)
@@ -658,6 +698,10 @@ function Get-DcRecord {
         FSMORoles             = @($held)
         LastBootTime          = $remote.LastBootTime
         LastBootTimeFormatted = $remote.LastBootTimeFormatted
+        Created               = $Dc.Created
+        CreatedFormatted      = if ($Dc.CreatedFormatted) { $Dc.CreatedFormatted } else { Format-When $Dc.Created }
+        CreatedAgeDays        = $Dc.CreatedAgeDays
+        CreatedAgeLabel       = if ($Dc.CreatedAgeLabel) { $Dc.CreatedAgeLabel } else { Format-AgeLabel $Dc.Created }
         Uptime                = $remote.Uptime
         MemoryGB              = $remote.MemoryGB
         Disks                 = @($remote.Disks)
@@ -1573,7 +1617,7 @@ function New-DiscoveryReportHtml {
         }
 
         $searchParts = [System.Collections.Generic.List[string]]::new()
-        foreach ($part in @($dc.ComputerName, $dc.HostName, $dc.IPv4Address, $dc.Site, $dc.OperatingSystem, $dc.Status)) {
+        foreach ($part in @($dc.ComputerName, $dc.HostName, $dc.IPv4Address, $dc.Site, $dc.OperatingSystem, $dc.Status, $dc.CreatedFormatted)) {
             if ($part) { [void]$searchParts.Add([string]$part) }
         }
         foreach ($part in @($dc.FSMORoles)) {
@@ -1602,6 +1646,7 @@ function New-DiscoveryReportHtml {
         <div><span class="lbl">Site</span><span>$(ConvertTo-HtmlEncoded $dc.Site)</span></div>
         <div><span class="lbl">OS</span><span>$(ConvertTo-HtmlEncoded $dc.OperatingSystem)</span></div>
         <div><span class="lbl">Version</span><span>$(ConvertTo-HtmlEncoded $dc.OperatingSystemVersion)</span></div>
+        <div><span class="lbl">When created</span><span>$(if ($dc.CreatedFormatted) { ConvertTo-HtmlEncoded $dc.CreatedFormatted } else { 'N/A' })$(if ($dc.CreatedAgeLabel) { ' <span class="muted">({0})</span>' -f (ConvertTo-HtmlEncoded $dc.CreatedAgeLabel) })</span></div>
         <div><span class="lbl">Last boot</span><span>$(ConvertTo-HtmlEncoded $dc.LastBootTimeFormatted)</span></div>
         <div><span class="lbl">Uptime</span><span class="uptime">$(ConvertTo-HtmlEncoded $dc.Uptime)</span></div>
         <div><span class="lbl">Memory</span><span>$(if ($dc.MemoryGB) { "$($dc.MemoryGB) GB" } else { 'N/A' })</span></div>
@@ -1635,6 +1680,7 @@ function New-DiscoveryReportHtml {
     <td>$(ConvertTo-HtmlEncoded $dc.IPv4Address)</td>
     <td>$(ConvertTo-HtmlEncoded $dc.Site)</td>
     <td>$(ConvertTo-HtmlEncoded $dc.OperatingSystem)</td>
+    <td>$(if ($dc.CreatedFormatted) { ConvertTo-HtmlEncoded $dc.CreatedFormatted } else { 'N/A' })</td>
     <td>$(ConvertTo-HtmlEncoded $dc.LastBootTimeFormatted)</td>
     <td>$(ConvertTo-HtmlEncoded $dc.Uptime)</td>
     <td>$(ConvertTo-HtmlEncoded $fsmoList)</td>
@@ -1866,7 +1912,7 @@ function New-DiscoveryReportHtml {
         $color = switch ($st) { 'Online' { '#10b981' } 'Error' { '#e11d48' } default { '#f59e0b' } }
         $items = @(
             $set | ForEach-Object {
-                New-ChartItem -Title $_.ComputerName -Subtitle $_.Status -Detail ('{0} · {1} · {2}' -f $_.IPv4Address, $_.Site, $_.OperatingSystem) -Tab 'dcs' -Filter ('dc:{0}' -f $st.ToLowerInvariant())
+                New-ChartItem -Title $_.ComputerName -Subtitle $_.Status -Detail ('{0} · {1} · {2} · created {3}' -f $_.IPv4Address, $_.Site, $_.OperatingSystem, $(if ($_.CreatedFormatted) { $_.CreatedFormatted } else { 'N/A' })) -Tab 'dcs' -Filter ('dc:{0}' -f $st.ToLowerInvariant())
             }
         )
         [void]$chartDc.Add([ordered]@{
@@ -1948,7 +1994,7 @@ function New-DiscoveryReportHtml {
             $here = @($dcs | Where-Object { $_.Site -eq $siteName })
             $subs = @($Report.Topology.Subnets | Where-Object { $_.Site -eq $siteName })
             $items = @(
-                $here | ForEach-Object { New-ChartItem -Title $_.ComputerName -Subtitle $_.Status -Detail ('{0} · {1}' -f $_.IPv4Address, $_.OperatingSystem) -Tab 'dcs' -Filter ('dcname:{0}' -f $_.ComputerName) }
+                $here | ForEach-Object { New-ChartItem -Title $_.ComputerName -Subtitle $_.Status -Detail ('{0} · {1} · created {2}' -f $_.IPv4Address, $_.OperatingSystem, $(if ($_.CreatedFormatted) { $_.CreatedFormatted } else { 'N/A' })) -Tab 'dcs' -Filter ('dcname:{0}' -f $_.ComputerName) }
             )
             if ($items.Count -eq 0) {
                 $items = @((New-ChartItem -Title $siteName -Subtitle 'No DC in this site' -Detail ('Subnets: {0}' -f (ConvertTo-TextList $subs.Name 'none')) -Tab 'sites' -Filter 'sites:empty'))
@@ -2633,7 +2679,7 @@ $css
       <div class="controls"><input class="search" id="cmpSearch" placeholder="Filter comparison rows..."></div>
       <div class="table-wrap">
         <table id="cmpTable">
-          <thead><tr><th>Server</th><th>Status</th><th>IP</th><th>Site</th><th>OS</th><th>Last boot</th><th>Uptime</th><th>FSMO</th><th>Inbound partners</th></tr></thead>
+          <thead><tr><th>Server</th><th>Status</th><th>IP</th><th>Site</th><th>OS</th><th>When created</th><th>Last boot</th><th>Uptime</th><th>FSMO</th><th>Inbound partners</th></tr></thead>
           <tbody>$($cmpRows.ToString())</tbody>
         </table>
       </div>
@@ -2817,6 +2863,7 @@ function New-OfflineDemoReport {
             Roles = $dc1Roles; Features = $dc1Feats
             FSMORoles = @('Schema Master', 'Domain Naming Master', 'PDC Emulator', 'RID Master', 'Infrastructure Master')
             LastBootTime = $now.AddDays(-42); LastBootTimeFormatted = Format-When $now.AddDays(-42); Uptime = '42d 3h 12m'
+            Created = $now.AddYears(-8); CreatedFormatted = Format-When $now.AddYears(-8); CreatedAgeDays = Format-AgeDays $now.AddYears(-8); CreatedAgeLabel = Format-AgeLabel $now.AddYears(-8)
             MemoryGB = 16
             Disks = @([pscustomobject]@{ DeviceID = 'C:'; SizeGB = 127; FreeGB = 14.2 }, [pscustomobject]@{ DeviceID = 'D:'; SizeGB = 80; FreeGB = 41 })
             TimeSource = 'time.windows.com'
@@ -2844,6 +2891,7 @@ function New-OfflineDemoReport {
             Roles = $dc2Roles; Features = @()
             FSMORoles = @()
             LastBootTime = $now.AddDays(-120); LastBootTimeFormatted = Format-When $now.AddDays(-120); Uptime = '120d 6h 1m'
+            Created = $now.AddYears(-5); CreatedFormatted = Format-When $now.AddYears(-5); CreatedAgeDays = Format-AgeDays $now.AddYears(-5); CreatedAgeLabel = Format-AgeLabel $now.AddYears(-5)
             MemoryGB = 12
             Disks = @([pscustomobject]@{ DeviceID = 'C:'; SizeGB = 100; FreeGB = 22 })
             TimeSource = 'NW-DC01.northwind.lab'
@@ -2868,6 +2916,7 @@ function New-OfflineDemoReport {
             IsGlobalCatalog = $true; IsReadOnly = $true; Status = 'Error'
             Roles = @(); Features = @(); FSMORoles = @()
             LastBootTime = $null; LastBootTimeFormatted = 'N/A'; Uptime = 'N/A'; MemoryGB = $null; Disks = @()
+            Created = $now.AddYears(-3); CreatedFormatted = Format-When $now.AddYears(-3); CreatedAgeDays = Format-AgeDays $now.AddYears(-3); CreatedAgeLabel = Format-AgeLabel $now.AddYears(-3)
             TimeSource = 'N/A'; Services = @(); LastHotfix = 'N/A'; PendingReboot = $null
             Error = 'WinRM cannot complete the operation. Verify the computer is up and WinRM is configured.'
             ReplicationError = $null
