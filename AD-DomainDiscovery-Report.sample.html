@@ -1,0 +1,926 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AD Domain Brief — northwind.lab</title>
+<style>
+:root {
+  --bg:#f4f1ea; --card:#fffdf8; --ink:#1e1b16; --muted:#5c564c;
+  --line:#e4ddd0; --accent:#1f4e79; --accent-2:#0b7a75; --warn:#9a5b13;
+  --crit:#8b1e1e; --good:#1f6b3a; --info:#1f4e79; --skip:#6b5e4a;
+  --fsmo:#5b2d8e; --shadow:0 10px 30px rgba(40,30,10,.08);
+}
+:root[data-theme="dark"] {
+  --bg:#161410; --card:#221e18; --ink:#f3ece1; --muted:#c2b8a8;
+  --line:#3a342b; --accent:#7eb6e6; --accent-2:#5fd0c7; --warn:#f0b060;
+  --crit:#f0a0a0; --good:#8ad0a4; --info:#9cc4ef; --skip:#c2b8a8;
+  --fsmo:#d2b4f0; --shadow:none;
+}
+* { box-sizing:border-box; margin:0; padding:0; }
+body { font-family:"Segoe UI",Calibri,system-ui,sans-serif; background:var(--bg); color:var(--ink); line-height:1.55; }
+.wrap { max-width:1600px; margin:0 auto; padding:24px; }
+header.hero {
+  background:linear-gradient(135deg,#16324f,#1f4e79 55%,#0b7a75);
+  color:#fff; padding:32px 28px; border-radius:16px; margin-bottom:20px;
+}
+header.hero h1 { font-size:2rem; font-weight:650; letter-spacing:-.02em; }
+header.hero p { opacity:.92; margin-top:6px; }
+.banner { background:#fff4ce; color:#5c4300; padding:10px 14px; border-radius:8px; margin:14px 0; }
+:root[data-theme="dark"] .banner { background:#4a3b12; color:#f6e7b2; }
+.stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin:20px 0; }
+.stat { background:var(--card); border-radius:12px; padding:16px; box-shadow:var(--shadow); }
+.stat .n { font-size:2rem; font-weight:700; color:var(--accent); }
+.stat.crit .n { color:var(--crit); } .stat.warn .n { color:var(--warn); }
+.stat.good .n { color:var(--good); } .stat.fsmo .n { color:var(--fsmo); }
+.stat .l { color:var(--muted); font-size:.8rem; text-transform:uppercase; letter-spacing:.04em; }
+.tabs { display:flex; flex-wrap:wrap; gap:6px; border-bottom:2px solid var(--line); margin:18px 0 16px; }
+.tab { background:none; border:none; color:var(--muted); padding:10px 14px; cursor:pointer; font:inherit; border-bottom:3px solid transparent; margin-bottom:-2px; }
+.tab.active { color:var(--accent); border-bottom-color:var(--accent); font-weight:650; }
+.panel { display:none; } .panel.active { display:block; }
+.card { background:var(--card); border-radius:12px; padding:20px; box-shadow:var(--shadow); margin-bottom:16px; }
+.learn { background:rgba(31,78,121,.07); border-left:4px solid var(--accent); padding:12px 14px; border-radius:8px; margin:12px 0 18px; }
+.learn-title { font-weight:700; margin-bottom:4px; }
+.muted { color:var(--muted); }
+.grid-2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:12px; }
+.kv { display:flex; justify-content:space-between; gap:12px; padding:8px 0; border-bottom:1px solid var(--line); }
+.kv span:last-child { font-weight:600; text-align:right; }
+.finding { border-radius:12px; padding:16px 18px; margin-bottom:12px; background:var(--card); border-left:5px solid var(--info); box-shadow:var(--shadow); }
+.finding.sev-critical { border-left-color:var(--crit); }
+.finding.sev-warning { border-left-color:var(--warn); }
+.finding.sev-good { border-left-color:var(--good); }
+.finding-head { display:flex; flex-wrap:wrap; gap:8px; align-items:baseline; margin-bottom:8px; }
+.finding-head h3 { font-size:1.05rem; }
+.finding-area { color:var(--muted); font-size:.8rem; text-transform:uppercase; letter-spacing:.04em; }
+.sev-pill { font-size:.7rem; font-weight:700; text-transform:uppercase; padding:2px 8px; border-radius:999px; background:var(--line); }
+.sev-pill.sev-critical { background:#fde7e9; color:#8b1e1e; }
+.sev-pill.sev-warning { background:#fff4ce; color:#9a5b13; }
+.sev-pill.sev-info { background:#deecf9; color:#1f4e79; }
+.sev-pill.sev-good { background:#dff6dd; color:#1f6b3a; }
+.finding-why, .finding-next { margin-top:8px; }
+.fsmo-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:12px; }
+.fsmo-card { background:var(--card); border-radius:12px; padding:16px; box-shadow:var(--shadow); border-top:4px solid var(--fsmo); }
+.fsmo-kicker { font-size:.72rem; letter-spacing:.08em; text-transform:uppercase; color:var(--fsmo); }
+.fsmo-holder { font-size:1.15rem; font-weight:700; margin:6px 0 10px; }
+.look { margin-top:8px; font-size:.9rem; }
+.dc-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(520px,1fr)); gap:16px; }
+.dc-card { background:var(--card); border-radius:12px; padding:16px 18px; box-shadow:var(--shadow); }
+.dc-head { display:flex; justify-content:space-between; gap:10px; align-items:flex-start; margin-bottom:10px; }
+.dc-host { color:var(--muted); font-size:.85rem; }
+.info-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:8px; background:rgba(0,0,0,.03); padding:10px; border-radius:8px; margin-bottom:10px; }
+.info-grid .lbl { display:block; font-size:.7rem; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+.uptime { color:var(--good); font-weight:700; }
+.tags { display:flex; flex-wrap:wrap; gap:6px; }
+.tag { display:inline-block; padding:3px 8px; border-radius:6px; font-size:.8rem; background:var(--line); }
+.tag-role { background:#e1dfdd; }
+.tag-feature { background:#deecf9; color:#1f4e79; }
+.tag-fsmo { background:#f3e5f5; color:#5b2d8e; font-weight:650; }
+.svc-on { background:#dff6dd; color:#1f6b3a; }
+.svc-off { background:#fde7e9; color:#8b1e1e; }
+.status-badge { padding:2px 8px; border-radius:999px; font-size:.72rem; font-weight:700; text-transform:uppercase; }
+.status-online { background:#dff6dd; color:#1f6b3a; }
+.status-error { background:#fde7e9; color:#8b1e1e; }
+.status-skipped { background:#fff4ce; color:#9a5b13; }
+.badge { margin-left:4px; padding:2px 6px; border-radius:4px; font-size:.68rem; font-weight:700; }
+.badge-gc { background:#fff4ce; color:#835c00; }
+.badge-rodc { background:#deecf9; color:#1565c0; }
+.badge-fsmo { background:#f3e5f5; color:#5b2d8e; }
+.repl-row { padding:6px 8px; border-radius:6px; margin-bottom:4px; background:rgba(0,0,0,.03); font-size:.85rem; }
+.repl-bad { background:#fde7e9; }
+.disk { display:flex; justify-content:space-between; font-size:.9rem; padding:3px 0; }
+.controls { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }
+.search { flex:1; min-width:220px; padding:8px 12px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); font:inherit; }
+.filter { padding:8px 12px; border:1px solid var(--line); background:var(--card); color:var(--ink); border-radius:8px; cursor:pointer; }
+.filter.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+table { width:100%; border-collapse:collapse; background:var(--card); border-radius:12px; overflow:hidden; box-shadow:var(--shadow); }
+th,td { padding:10px 12px; text-align:left; border-bottom:1px solid var(--line); vertical-align:top; }
+th { font-size:.78rem; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); background:rgba(0,0,0,.03); }
+.desc { color:var(--muted); font-size:.85rem; max-width:360px; }
+.table-wrap { overflow-x:auto; }
+.hidden { display:none !important; }
+.collapsible .collapse-c { display:none; padding-top:8px; }
+.collapsible.open .collapse-c { display:block; }
+.collapsible.open .chev { transform:rotate(90deg); display:inline-block; }
+.collapse-h { cursor:pointer; user-select:none; }
+.priv-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; }
+.priv-card { background:var(--card); border-radius:12px; padding:14px; box-shadow:var(--shadow); }
+.priv-card ul { margin:8px 0 0 18px; }
+.priv-card .count { float:right; color:var(--accent); }
+.error-msg { color:var(--crit); }
+.path { margin:8px 0 16px; padding:10px 12px; background:var(--card); border-radius:8px; }
+.path ol { margin-left:20px; }
+footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem; }
+.theme-btn { float:right; background:rgba(255,255,255,.15); color:#fff; border:1px solid rgba(255,255,255,.3); padding:6px 10px; border-radius:8px; cursor:pointer; }
+@media (max-width:800px) { .dc-grid { grid-template-columns:1fr; } }
+@media print {
+  .tabs,.controls,.theme-btn { display:none !important; }
+  .panel { display:block !important; }
+  .dc-card,.finding,.card { break-inside:avoid; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="hero">
+    <button class="theme-btn" id="themeBtn" type="button">Toggle theme</button>
+    <h1>Active Directory domain brief</h1>
+    <p>Forest <strong>northwind.lab</strong> · Domain <strong>northwind.lab</strong> · Generated 2026-10-27 03:06 · OfflineDemo</p>
+  </header>
+  <div class="banner">Offline demo data — fictional Northwind Lab forest. Run without -OfflineDemo on a domain-joined box to scan a real environment.</div>
+  <div class="path card">
+  <strong>Read this report in this order</strong>
+  <ol>
+    <li>Findings — inherited risk, in priority order.</li>
+    <li>Forest &amp; domain — what this directory <em>is</em>.</li>
+    <li>FSMO — who can do the operations nobody else can.</li>
+    <li>Sites &amp; replication — whether every DC has the same truth.</li>
+    <li>Domain controllers — capacity, roles, and service health.</li>
+    <li>Identity — who is powerful, how passwords work, what is stale.</li>
+    <li>GPOs &amp; OUs — how the estate is shaped and controlled.</li>
+    <li>Roles &amp; features — what each DC is actually installed to do.</li>
+  </ol>
+</div>
+
+  <div class="stats">
+    <div class="stat"><div class="n">3</div><div class="l">Domain controllers</div></div>
+    <div class="stat good"><div class="n">2</div><div class="l">Online / queried</div></div>
+    <div class="stat crit"><div class="n">1</div><div class="l">Unreachable</div></div>
+    <div class="stat warn"><div class="n">0</div><div class="l">Remote skipped</div></div>
+    <div class="stat fsmo"><div class="n">5</div><div class="l">FSMO roles</div></div>
+    <div class="stat crit"><div class="n">1</div><div class="l">Critical findings</div></div>
+    <div class="stat warn"><div class="n">10</div><div class="l">Warnings</div></div>
+    <div class="stat"><div class="n">4</div><div class="l">Unique roles</div></div>
+  </div>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="brief">Start here</button>
+    <button class="tab" data-tab="forest">Forest &amp; domain</button>
+    <button class="tab" data-tab="fsmo">FSMO</button>
+    <button class="tab" data-tab="sites">Sites &amp; replication</button>
+    <button class="tab" data-tab="dcs">Domain controllers</button>
+    <button class="tab" data-tab="identity">Identity</button>
+    <button class="tab" data-tab="gpo">GPOs &amp; OUs</button>
+    <button class="tab" data-tab="roles">Roles &amp; features</button>
+  </nav>
+
+  <section id="brief" class="panel active">
+    <div class="learn">
+    <div class="learn-title">This tab is your punch list</div>
+    <p>A new domain is too big to memorize. Read every Critical and Warning card, then skim Info. Each card tells you why it matters and what to do next — not just that something is true.</p>
+</div>
+    <div class="controls">
+      <button class="filter active" data-find-filter="all">All (21)</button>
+      <button class="filter" data-find-filter="critical">Critical (1)</button>
+      <button class="filter" data-find-filter="warning">Warning (10)</button>
+      <button class="filter" data-find-filter="info">Info (10)</button>
+      <button class="filter" data-find-filter="good">Good (0)</button>
+    </div>
+    <article class="finding sev-warning" data-sev="warning">
+    <div class="finding-head">
+        <span class="sev-pill sev-warning">Warning</span>
+        <span class="finding-area">Availability</span>
+        <h3>1 DC(s) could not be queried remotely</h3>
+    </div>
+    <p class="finding-detail">NW-RODC01: WinRM cannot complete the operation. Verify the computer is up and WinRM is configured.</p>
+    <div class="finding-why"><strong>Why it matters.</strong> WinRM, firewall, or credential problems hide roles, disks, and service health.</div>
+    <div class="finding-next"><strong>What to do next.</strong> Confirm WinRM (5985/5986) and that your account is local admin on those DCs. AD data in this report is still valid.</div>
+</article>
+<article class="finding sev-info" data-sev="info">
+    <div class="finding-head">
+        <span class="sev-pill sev-info">Info</span>
+        <span class="finding-area">FSMO</span>
+        <h3>All FSMO roles sit on one DC</h3>
+    </div>
+    <p class="finding-detail">Holder: NW-DC01.northwind.lab</p>
+    <div class="finding-why"><strong>Why it matters.</strong> Convenient, and common, but that one DC is now a special snowflake. Losing it means seizing roles.</div>
+    <div class="finding-next"><strong>What to do next.</strong> Keep roles on a pair of well-known hub DCs. Document who owns them and how you would seize.</div>
+</article>
+<article class="finding sev-warning" data-sev="warning">
+    <div class="finding-head">
+        <span class="sev-pill sev-warning">Warning</span>
+        <span class="finding-area">Forest</span>
+        <h3>AD Recycle Bin is not enabled</h3>
+    </div>
+    <p class="finding-detail">Deleted users, groups, and computers are not recoverable with full attributes after tombstone processing.</p>
+    <div class="finding-why"><strong>Why it matters.</strong> This is the first optional feature most new owners enable. It cannot be turned off once enabled.</div>
+    <div class="finding-next"><strong>What to do next.</strong> Enable-ADOptionalFeature &quot;Recycle Bin Feature&quot; after you confirm forest functional level is 2008 R2+.</div>
+</article>
+<article class="finding sev-critical" data-sev="critical">
+    <div class="finding-head">
+        <span class="sev-pill sev-critical">Critical</span>
+        <span class="finding-area">Replication</span>
+        <h3>1 replication failure record(s)</h3>
+    </div>
+    <p class="finding-detail">NW-DC01 -&gt; NW-RODC01: RPC server unavailable (1722)</p>
+    <div class="finding-why"><strong>Why it matters.</strong> If DCs disagree, passwords, group membership, and GPOs become location-dependent. That is how &quot;it works in this building&quot; starts.</div>
+    <div class="finding-next"><strong>What to do next.</strong> Start with repadmin /replsummary and the failing partner pair. Fix DNS and connectivity before you seize roles.</div>
+</article>
+<article class="finding sev-warning" data-sev="warning">
+    <div class="finding-head">
+        <span class="sev-pill sev-warning">Warning</span>
+        <span class="finding-area">Replication</span>
+        <h3>NW-DC01 has consecutive replication failures</h3>
+    </div>
+    <p class="finding-detail">NW-RODC01 (4 fails, last result 1722)</p>
+    <div class="finding-why"><strong>Why it matters.</strong> A partner that has not succeeded recently will diverge. Users, groups, and passwords will not match.</div>
+    <div class="finding-next"><strong>What to do next.</strong> On that DC run: Get-ADReplicationPartnerMetadata -Target localhost | Format-Table Partner, LastReplicationSuccess, ConsecutiveReplicationFailures</div>
+</article>
+<article class="finding sev-info" data-sev="info">
+    <div class="finding-head">
+        <span class="sev-pill sev-info">Info</span>
+        <span class="finding-area">Sites</span>
+        <h3>1 site(s) have no domain controller</h3>
+    </div>
+    <p class="finding-detail">Default-First-Site-Name</p>
+    <div class="finding-why"><strong>Why it matters.</strong> Empty sites are valid (client-only sites) if subnets still exist so clients locate a nearby DC.</div>
+    <div class="finding-next"><strong>What to do next.</strong> If a site has neither DCs nor subnets, it is leftover topology. Clean it up after you confirm nothing uses it.</div>
+</article>
+<article class="finding sev-info" data-sev="info">
+    <div class="finding-head">
+        <span class="sev-pill sev-info">Info</span>
+        <span class="finding-area">Trusts</span>
+        <h3>1 trust(s) are configured</h3>
+    </div>
+    <p class="finding-detail">fabrikam.lab (Forest, Bidirectional)</p>
+    <div class="finding-why"><strong>Why it matters.</strong> Trusts extend authentication. They are also the path attackers use to walk forests. Know every one.</div>
+    <div class="finding-next"><strong>What to do next.</strong> Document direction, transitivity, SID filtering, and who owns the other side. Test with nltest /sc_verify.</div>
+</article>
+<article class="finding sev-warning" data-sev="warning">
+    <div class="finding-head">
+        <span class="sev-pill sev-warning">Warning</span>
+        <span class="finding-area">Identity</span>
+        <h3>Default minimum password length is 8</h3>
+    </div>
+    <p class="finding-detail">Modern baselines start at 12–15, plus ban-list / Windows Hello / gMSA for services.</p>
+    <div class="finding-why"><strong>Why it matters.</strong> Length beats complexity theater. Fine-grained policies can raise length for admins first.</div>
+    <div class="finding-next"><strong>What to do next.</strong> Review Default Domain Policy and any FGPP before you tighten anything — you can lock out service accounts.</div>
+</article>
+<article class="finding sev-warning" data-sev="warning">
+    <div class="finding-head">
+        <span class="sev-pill sev-warning">Warning</span>
+        <span class="finding-area">Identity</span>
+        <h3>Account lockout threshold is 0 (never lock out)</h3>
+    </div>
+    <p class="finding-detail">Brute-force password guesses never lock the account.</p>
+    <div class="finding-why"><strong>Why it matters.</strong> A threshold of 0 is sometimes kept to avoid DoS lockouts. Know which it is.</div>
+    <div class="finding-next"><strong>What to do next.</strong> Prefer smart lockout (Azure) or a modest threshold plus a short observation window.</div>
+</article>
+<article class="finding sev-warning" data-sev="warning">
+    <div class="finding-head">
+        <span class="sev-pill sev-warning">Warning</span>
+        <span class="finding-area">Identity</span>
+        <h3>krbtgt password is 640 days old</h3>
+    </div>
+    <p class="finding-detail">krbtgt is the account that encrypts Kerberos TGTs. A stolen hash remains useful until this password is rotated twice.</p>
+    <div class="finding-why"><strong>Why it matters.</strong> Microsoft guidance is a two-stage reset (then wait for replication / ticket lifetime, then reset again).</div>
+    <div class="finding-next"><strong>What to do next.</strong> Use Microsoft KRBTGT reset guidance. Never treat this as a casual Set-ADAccountPassword.</div>
+</article>
+<article class="finding sev-warning" data-sev="warning">
+    <div class="finding-head">
+        <span class="sev-pill sev-warning">Warning</span>
+        <span class="finding-area">Identity</span>
+        <h3>Domain Admins has 6 members</h3>
+    </div>
+    <p class="finding-detail">Administrator, j.blake, s.patel, helpdesk.admin, vendor.temp, backup.svc</p>
+    <div class="finding-why"><strong>Why it matters.</strong> DA is the keys to the domain. Broad membership is the most common inherited-domain smell.</div>
+    <div class="finding-next"><strong>What to do next.</strong> Inventory each member, move day-to-day work to lesser groups, and keep DA for DC/domain work only.</div>
+</article>
+<article class="finding sev-warning" data-sev="warning">
+    <div class="finding-head">
+        <span class="sev-pill sev-warning">Warning</span>
+        <span class="finding-area">Identity</span>
+        <h3>Enterprise Admins has 2 member(s)</h3>
+    </div>
+    <p class="finding-detail">Administrator, j.blake</p>
+    <div class="finding-why"><strong>Why it matters.</strong> These forest-wide groups should be empty in daily operations. Membership is a break-glass event.</div>
+    <div class="finding-next"><strong>What to do next.</strong> Remove standing membership. Use PAM / privileged access workstations / just-in-time groups.</div>
+</article>
+<article class="finding sev-info" data-sev="info">
+    <div class="finding-head">
+        <span class="sev-pill sev-info">Info</span>
+        <span class="finding-area">Identity</span>
+        <h3>DnsAdmins is populated</h3>
+    </div>
+    <p class="finding-detail">netops, dhcp.svc</p>
+    <div class="finding-why"><strong>Why it matters.</strong> DnsAdmins can be abused for privilege escalation on DCs that run DNS (load a DLL as dns.exe).</div>
+    <div class="finding-next"><strong>What to do next.</strong> Treat DnsAdmins as tier-0. Confirm every member still needs it.</div>
+</article>
+<article class="finding sev-info" data-sev="info">
+    <div class="finding-head">
+        <span class="sev-pill sev-info">Info</span>
+        <span class="finding-area">Hygiene</span>
+        <h3>37 enabled user(s) have not logged on in 90+ days</h3>
+    </div>
+    <p class="finding-detail">Stale enabled accounts are extra passwords an attacker can try, plus license and audit noise.</p>
+    <div class="finding-why"><strong>Why it matters.</strong> Disable, not delete, until you confirm they are not service or seasonal accounts.</div>
+    <div class="finding-next"><strong>What to do next.</strong> Start with a disable + description stamp. Deletion comes after a sitting period.</div>
+</article>
+<article class="finding sev-info" data-sev="info">
+    <div class="finding-head">
+        <span class="sev-pill sev-info">Info</span>
+        <span class="finding-area">Hygiene</span>
+        <h3>22 enabled computer(s) look stale (90+ days)</h3>
+    </div>
+    <p class="finding-detail">Stale computer accounts still have passwords and SPNs. They clutter GPOs and inventories.</p>
+    <div class="finding-why"><strong>Why it matters.</strong> Disable first. Confirm they are not clustered VMs or rarely-booted appliances.</div>
+    <div class="finding-next"><strong>What to do next.</strong> Use LastLogonDate as a hint, not gospel — it is not replicated in real time.</div>
+</article>
+<article class="finding sev-warning" data-sev="warning">
+    <div class="finding-head">
+        <span class="sev-pill sev-warning">Warning</span>
+        <span class="finding-area">Delegation</span>
+        <h3>Unconstrained Kerberos delegation is in use</h3>
+    </div>
+    <p class="finding-detail">Computers: NW-APP01. Users: None.</p>
+    <div class="finding-why"><strong>Why it matters.</strong> Unconstrained delegation lets that host request tickets to any service as the inbound user. It is a tier-0 risk.</div>
+    <div class="finding-next"><strong>What to do next.</strong> Prefer constrained or resource-based constrained delegation. DCs have this by design — focus on member servers.</div>
+</article>
+<article class="finding sev-info" data-sev="info">
+    <div class="finding-head">
+        <span class="sev-pill sev-info">Info</span>
+        <span class="finding-area">Services</span>
+        <h3>Active Directory Certificate Services is present</h3>
+    </div>
+    <p class="finding-detail">NORTHWIND-CA (NW-DC02.northwind.lab)</p>
+    <div class="finding-why"><strong>Why it matters.</strong> AD CS is part of your tier-0 boundary. A compromised CA issues logon certificates forever until you catch it.</div>
+    <div class="finding-next"><strong>What to do next.</strong> Inventory templates, ESC1–ESC8 misissuance patterns, and who can enroll. Back up the CA and its keys.</div>
+</article>
+<article class="finding sev-info" data-sev="info">
+    <div class="finding-head">
+        <span class="sev-pill sev-info">Info</span>
+        <span class="finding-area">Services</span>
+        <h3>Entra ID Connect / Azure AD Connect artifacts found</h3>
+    </div>
+    <p class="finding-detail">MSOL_a1b2c3d4e5f6</p>
+    <div class="finding-why"><strong>Why it matters.</strong> The sync server and its MSOL/AAD_* account are tier-0. They can write back into AD.</div>
+    <div class="finding-next"><strong>What to do next.</strong> Find the actual sync server, confirm staging vs active, and protect that host like a DC.</div>
+</article>
+<article class="finding sev-info" data-sev="info">
+    <div class="finding-head">
+        <span class="sev-pill sev-info">Info</span>
+        <span class="finding-area">Services</span>
+        <h3>No LAPS schema attributes detected</h3>
+    </div>
+    <p class="finding-detail">Local admin passwords on workstations/servers may be shared or unmanaged.</p>
+    <div class="finding-why"><strong>Why it matters.</strong> Windows LAPS is built into current Windows and stores passwords in AD or Entra.</div>
+    <div class="finding-next"><strong>What to do next.</strong> Plan LAPS before you rotate built-in Administrator passwords across the fleet.</div>
+</article>
+<article class="finding sev-warning" data-sev="warning">
+    <div class="finding-head">
+        <span class="sev-pill sev-warning">Warning</span>
+        <span class="finding-area">Capacity</span>
+        <h3>NW-DC01 has a volume under 15% free</h3>
+    </div>
+    <p class="finding-detail">C: 14.2 GB free of 127 GB</p>
+    <div class="finding-why"><strong>Why it matters.</strong> NTDS and SYSVOL on a full volume halt the DC. You will notice via logon and replication failures.</div>
+    <div class="finding-next"><strong>What to do next.</strong> Move logs, purge old dumps, expand the VMDK. Never delete NTDS.dit by hand.</div>
+</article>
+<article class="finding sev-info" data-sev="info">
+    <div class="finding-head">
+        <span class="sev-pill sev-info">Info</span>
+        <span class="finding-area">Patching</span>
+        <h3>NW-DC01 has a pending reboot</h3>
+    </div>
+    <p class="finding-detail">Updates are staged but not fully applied.</p>
+    <div class="finding-why"><strong>Why it matters.</strong> Pending reboots hide whether a DC is actually patched and can block further CU installs.</div>
+    <div class="finding-next"><strong>What to do next.</strong> Schedule a controlled reboot. Do not reboot every DC at once.</div>
+</article>
+
+    <div class="card">
+      <h2>Collector warnings</h2>
+      <div class="table-wrap"><table><thead><tr><th>Area</th><th>Message</th></tr></thead><tbody><tr><td>Demo</td><td>This report is generated from built-in sample data. No directory was queried.</td></tr></tbody></table></div>
+    </div>
+  </section>
+
+  <section id="forest" class="panel">
+    <div class="learn">
+    <div class="learn-title">Identity first</div>
+    <p>Functional level is not the same as the OS on your DCs. The schema version tells you the newest AD binary that extended the forest. Recycle Bin, UPNs, and trusts tell you how this directory connects to the rest of the world.</p>
+</div>
+    <div class="grid-2">
+      <div class="card">
+        <h2>Forest</h2>
+        <div class="kv"><span>Name</span><span>northwind.lab</span></div>
+        <div class="kv"><span>Functional level</span><span>Windows Server 2016 (7)</span></div>
+        <div class="kv"><span>Root domain</span><span>northwind.lab</span></div>
+        <div class="kv"><span>Domains</span><span>northwind.lab</span></div>
+        <div class="kv"><span>Schema</span><span>Windows Server 2019 (objectVersion 88)</span></div>
+        <div class="kv"><span>Recycle Bin</span><span>Not enabled</span></div>
+        <div class="kv"><span>Tombstone lifetime</span><span>180 days</span></div>
+        <div class="kv"><span>Optional features</span><span>Recycle Bin Feature (disabled), Privileged Access Management Feature (disabled)</span></div>
+      </div>
+      <div class="card">
+        <h2>Domain</h2>
+        <div class="kv"><span>DNS name</span><span>northwind.lab</span></div>
+        <div class="kv"><span>NetBIOS</span><span>NORTHWIND</span></div>
+        <div class="kv"><span>SID</span><span>S-1-5-21-1000000000-2000000000-3000000000</span></div>
+        <div class="kv"><span>Functional level</span><span>Windows Server 2016 (7)</span></div>
+        <div class="kv"><span>Distinguished name</span><span>DC=northwind,DC=lab</span></div>
+        <div class="kv"><span>UPN suffixes</span><span>northwind.com</span></div>
+        <div class="kv"><span>Child domains</span><span>None</span></div>
+        <div class="kv"><span>Queried DC</span><span>NW-DC01.northwind.lab</span></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Directory-integrated services</h2>
+      <div class="learn">
+    <div class="learn-title">These objects live in the configuration partition</div>
+    <p>If you see a CA, Exchange, DHCP registration, or Entra Connect account, those products are part of this forest even if nobody mentioned them in the handover.</p>
+</div>
+      <div class="table-wrap"><table><thead><tr><th>Service</th><th>What we found</th></tr></thead><tbody><tr><td>AD CS (Enterprise CAs)</td><td>NORTHWIND-CA on NW-DC02.northwind.lab</td></tr>
+<tr><td>DHCP servers registered in AD</td><td>nw-dc01.northwind.lab</td></tr>
+<tr><td>Exchange org in configuration NC</td><td>Not found</td></tr>
+<tr><td>Entra / Azure AD Connect accounts</td><td>MSOL_a1b2c3d4e5f6</td></tr>
+<tr><td>Legacy LAPS schema (ms-Mcs-AdmPwd)</td><td>Not present</td></tr>
+<tr><td>Windows LAPS schema</td><td>Not present</td></tr></tbody></table></div>
+    </div>
+    <div class="card">
+      <h2>Trusts</h2>
+      <div class="learn">
+    <div class="learn-title">A trust is a security boundary you chose to thin</div>
+    <p>SID filtering should stay on for most external trusts. Forest-transitive trusts mean a compromise on the other side can become your problem.</p>
+</div>
+      <div class="table-wrap"><table><thead><tr><th>Name</th><th>Type</th><th>Direction</th><th>Forest transitive</th><th>SID filtering</th><th>Selective auth</th></tr></thead><tbody><tr><td>fabrikam.lab</td><td>Forest</td><td>Bidirectional</td><td>Yes</td><td>On</td><td>No</td></tr></tbody></table></div>
+    </div>
+  </section>
+
+  <section id="fsmo" class="panel">
+    <div class="learn">
+    <div class="learn-title">FSMO means &quot;this write can only happen in one place&quot;</div>
+    <p>Most AD writes replicate multimaster. Five operations do not. If you inherit a domain, memorize the holders and keep them on DCs you would actually answer a page for.</p>
+</div>
+    <div class="fsmo-grid">
+      <div class="fsmo-card">
+    <div class="fsmo-kicker">Forest FSMO</div>
+    <h3>Schema Master</h3>
+    <div class="fsmo-holder">NW-DC01.northwind.lab</div>
+    <p>The only DC that can write to the AD schema (new classes and attributes).</p>
+    <p class="muted">Schema updates are rare (Exchange, AD Connect, Windows functional-level raises) but they must succeed.</p>
+    <div class="look">Keep it on a healthy, well-connected hub DC. Treat schema extensions as change-controlled events.</div>
+</div>
+<div class="fsmo-card">
+    <div class="fsmo-kicker">Forest FSMO</div>
+    <h3>Domain Naming Master</h3>
+    <div class="fsmo-holder">NW-DC01.northwind.lab</div>
+    <p>The only DC that can add or remove domains and application partitions.</p>
+    <p class="muted">Idle most of the time. Required when creating domains, trusts that add partitions, or some DNS app partitions.</p>
+    <div class="look">Usually colocated with Schema Master. Confirm it is reachable from wherever you would run domain-create tools.</div>
+</div>
+<div class="fsmo-card">
+    <div class="fsmo-kicker">Domain FSMO</div>
+    <h3>PDC Emulator</h3>
+    <div class="fsmo-holder">NW-DC01.northwind.lab</div>
+    <p>Password changes and lockouts, time source for the domain, GPO editing target, backward-compat PDC.</p>
+    <p class="muted">This is the FSMO you will feel immediately if it is down: logons, lockouts, and time drift.</p>
+    <div class="look">Put it on your most reliable, lowest-latency DC. Clients and other DCs sync time from here (directly or indirectly).</div>
+</div>
+<div class="fsmo-card">
+    <div class="fsmo-kicker">Domain FSMO</div>
+    <h3>RID Master</h3>
+    <div class="fsmo-holder">NW-DC01.northwind.lab</div>
+    <p>Hands each DC pools of Relative IDs used to build new SIDs for users, computers, and groups.</p>
+    <p class="muted">If it is offline long enough that RID pools exhaust, that DC cannot create new security principals.</p>
+    <div class="look">Short outages are fine. Multi-day outages plus a hiring/build surge are not. Confirm every DC has a RID pool.</div>
+</div>
+<div class="fsmo-card">
+    <div class="fsmo-kicker">Domain FSMO</div>
+    <h3>Infrastructure Master</h3>
+    <div class="fsmo-holder">NW-DC01.northwind.lab</div>
+    <p>Updates cross-domain group-to-user references (phantoms) so memberships stay consistent.</p>
+    <p class="muted">In a single-domain forest this role is effectively idle. In multi-domain forests it matters.</p>
+    <div class="look">Do not place it on a GC unless every DC in the domain is a GC (the usual modern design).</div>
+</div>
+
+    </div>
+  </section>
+
+  <section id="sites" class="panel">
+    <div class="learn">
+    <div class="learn-title">Sites are how AD thinks about the network</div>
+    <p>A site should be a set of well-connected subnets. Clients in those subnets find a local DC. Site links (cost + interval) decide how often DCs across WAN links pull changes. Empty leftover sites and missing subnets are the usual mess.</p>
+</div>
+    <div class="controls"><input class="search" id="siteSearch" placeholder="Filter sites..."></div>
+    <div class="table-wrap"><table id="siteTable"><thead><tr><th>Site</th><th>Description</th><th>DCs</th><th>DC names</th><th>Subnets</th></tr></thead><tbody><tr>
+    <td><strong>HQ-Chicago</strong></td>
+    <td>Headquarters</td>
+    <td>1</td>
+    <td>NW-DC01</td>
+    <td>10.10.10.0/24, 10.10.20.0/24</td>
+</tr>
+<tr>
+    <td><strong>Plant-Austin</strong></td>
+    <td>Manufacturing</td>
+    <td>2</td>
+    <td>NW-DC02, NW-RODC01</td>
+    <td>10.20.20.0/24</td>
+</tr>
+<tr>
+    <td><strong>Default-First-Site-Name</strong></td>
+    <td>Leftover default site</td>
+    <td>0</td>
+    <td>None</td>
+    <td>None</td>
+</tr>
+</tbody></table></div>
+    <div class="card" style="margin-top:16px">
+      <h2>Subnets</h2>
+      <div class="table-wrap"><table><thead><tr><th>Prefix</th><th>Site</th><th>Description</th></tr></thead><tbody><tr><td>10.10.10.0/24</td><td>HQ-Chicago</td><td>DC + servers</td></tr>
+<tr><td>10.10.20.0/24</td><td>HQ-Chicago</td><td>Workstations</td></tr>
+<tr><td>10.20.20.0/24</td><td>Plant-Austin</td><td>Plant servers</td></tr></tbody></table></div>
+    </div>
+    <div class="card">
+      <h2>Site links</h2>
+      <div class="table-wrap"><table><thead><tr><th>Name</th><th>Cost</th><th>Interval (min)</th><th>Transport</th><th>Sites</th></tr></thead><tbody><tr><td>HQ-AUSTIN</td><td>100</td><td>15</td><td>IP</td><td>HQ-Chicago, Plant-Austin</td></tr></tbody></table></div>
+    </div>
+    <div class="card">
+      <h2>Replication failures (domain scope)</h2>
+      <div class="table-wrap"><table><thead><tr><th>Server</th><th>Partner</th><th>Type</th><th>First failure</th><th>Count</th><th>Last error</th></tr></thead><tbody><tr><td>NW-DC01</td><td>NW-RODC01</td><td>Connection</td><td>2026-10-27 00:06</td><td>4</td><td>RPC server unavailable (1722)</td></tr></tbody></table></div>
+    </div>
+  </section>
+
+  <section id="dcs" class="panel">
+    <div class="learn">
+    <div class="learn-title">A DC is more than &quot;online&quot;</div>
+    <p>Uptime is not a virtue if patches are pending. Time source should chain to the PDC Emulator. Disks under 15% free are an outage waiting to happen. Inbound partners with consecutive failures mean this DC is drifting.</p>
+</div>
+    <div class="controls">
+      <input class="search" id="dcSearch" placeholder="Search name, IP, site, OS, FSMO...">
+      <button class="filter active" data-dc-filter="all">All</button>
+      <button class="filter" data-dc-filter="online">Online</button>
+      <button class="filter" data-dc-filter="error">Errors</button>
+      <button class="filter" data-dc-filter="skipped">Skipped</button>
+    </div>
+    <div class="dc-grid">
+      <article class="dc-card" data-status="online" data-search="nw-dc01 nw-dc01.northwind.lab 10.10.10.11 hq-chicago windows server 2022 standard schema master domain naming master pdc emulator rid master infrastructure master online">
+    <header class="dc-head">
+        <div>
+            <h3>NW-DC01</h3>
+            <div class="dc-host">NW-DC01.northwind.lab</div>
+        </div>
+        <div class="dc-flags">
+            <span class="status-badge status-online">Online</span>
+            <span class="badge badge-gc">GC</span><span class="badge badge-fsmo">FSMO</span>
+        </div>
+    </header>
+    <div class="info-grid">
+        <div><span class="lbl">IP</span><span>10.10.10.11</span></div>
+        <div><span class="lbl">Site</span><span>HQ-Chicago</span></div>
+        <div><span class="lbl">OS</span><span>Windows Server 2022 Standard</span></div>
+        <div><span class="lbl">Version</span><span>10.0 (20348)</span></div>
+        <div><span class="lbl">Last boot</span><span>2026-09-15 03:06</span></div>
+        <div><span class="lbl">Uptime</span><span class="uptime">42d 3h 12m</span></div>
+        <div><span class="lbl">Memory</span><span>16 GB</span></div>
+        <div><span class="lbl">Time source</span><span>time.windows.com</span></div>
+        <div><span class="lbl">Last hotfix</span><span>KB5044281 (2026-09-10)</span></div>
+        <div><span class="lbl">Pending reboot</span><span>Yes</span></div>
+    </div>
+    <section><h4>FSMO roles held</h4><div class="tags"><span class="tag tag-fsmo">Schema Master</span><span class="tag tag-fsmo">Domain Naming Master</span><span class="tag tag-fsmo">PDC Emulator</span><span class="tag tag-fsmo">RID Master</span><span class="tag tag-fsmo">Infrastructure Master</span></div></section>
+    <section><h4>Replication partners (inbound)</h4><div class="repl"><div class="repl-row repl-ok"><strong>NW-DC02</strong> · last success 2026-10-27 02:48 · fails 0 · northwind, Configuration, Schema</div><div class="repl-row repl-bad"><strong>NW-RODC01</strong> · last success 2026-10-27 00:06 · fails 4 · northwind</div></div></section>
+    <section><h4>Disks</h4><div class="disk"><span>C:</span><span>14.2 / 127 GB free (11%)</span></div><div class="disk"><span>D:</span><span>41 / 80 GB free (51%)</span></div></section>
+    <section><h4>Key services</h4><div class="tags"><span class="tag svc-on">NTDS: Running</span><span class="tag svc-on">DNS: Running</span><span class="tag svc-on">KDC: Running</span><span class="tag svc-on">DFSR: Running</span><span class="tag svc-on">W32Time: Running</span><span class="tag svc-on">DHCPServer: Running</span></div></section>
+    <section class="collapsible">
+        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Roles (3)</h4>
+        <div class="collapse-c"><div class="tags"><span class="tag tag-role" title="Store directory data and manage communication between users and domains.">Active Directory Domain Services</span><span class="tag tag-role" title="Domain Name System server.">DNS Server</span><span class="tag tag-role" title="Dynamic Host Configuration Protocol server.">DHCP Server</span></div></div>
+    </section>
+    <section class="collapsible">
+        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Features (2)</h4>
+        <div class="collapse-c"><div class="tags"><span class="tag tag-feature" title="AD PowerShell">Active Directory module for Windows PowerShell</span><span class="tag tag-feature" title="GPO admin console">Group Policy Management</span></div></div>
+    </section>
+</article>
+<article class="dc-card" data-status="online" data-search="nw-dc02 nw-dc02.northwind.lab 10.20.20.11 plant-austin windows server 2019 standard  online">
+    <header class="dc-head">
+        <div>
+            <h3>NW-DC02</h3>
+            <div class="dc-host">NW-DC02.northwind.lab</div>
+        </div>
+        <div class="dc-flags">
+            <span class="status-badge status-online">Online</span>
+            <span class="badge badge-gc">GC</span>
+        </div>
+    </header>
+    <div class="info-grid">
+        <div><span class="lbl">IP</span><span>10.20.20.11</span></div>
+        <div><span class="lbl">Site</span><span>Plant-Austin</span></div>
+        <div><span class="lbl">OS</span><span>Windows Server 2019 Standard</span></div>
+        <div><span class="lbl">Version</span><span>10.0 (17763)</span></div>
+        <div><span class="lbl">Last boot</span><span>2026-06-29 03:06</span></div>
+        <div><span class="lbl">Uptime</span><span class="uptime">120d 6h 1m</span></div>
+        <div><span class="lbl">Memory</span><span>12 GB</span></div>
+        <div><span class="lbl">Time source</span><span>NW-DC01.northwind.lab</span></div>
+        <div><span class="lbl">Last hotfix</span><span>KB5035849 (2025-11-02)</span></div>
+        <div><span class="lbl">Pending reboot</span><span>No</span></div>
+    </div>
+    <section><h4>FSMO roles held</h4><div class="tags"><span class="muted">None</span></div></section>
+    <section><h4>Replication partners (inbound)</h4><div class="repl"><div class="repl-row repl-ok"><strong>NW-DC01</strong> · last success 2026-10-27 02:50 · fails 0 · northwind, Configuration, Schema</div></div></section>
+    <section><h4>Disks</h4><div class="disk"><span>C:</span><span>22 / 100 GB free (22%)</span></div></section>
+    <section><h4>Key services</h4><div class="tags"><span class="tag svc-on">NTDS: Running</span><span class="tag svc-on">DNS: Running</span><span class="tag svc-on">KDC: Running</span><span class="tag svc-on">DFSR: Running</span><span class="tag svc-on">CertSvc: Running</span></div></section>
+    <section class="collapsible">
+        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Roles (3)</h4>
+        <div class="collapse-c"><div class="tags"><span class="tag tag-role" title="Store directory data and manage communication between users and domains.">Active Directory Domain Services</span><span class="tag tag-role" title="Domain Name System server.">DNS Server</span><span class="tag tag-role" title="Enterprise CA.">Active Directory Certificate Services</span></div></div>
+    </section>
+    <section class="collapsible">
+        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Features (0)</h4>
+        <div class="collapse-c"><div class="tags"><span class="muted">None collected</span></div></div>
+    </section>
+</article>
+<article class="dc-card" data-status="error" data-search="nw-rodc01 nw-rodc01.northwind.lab 10.30.30.11 plant-austin windows server 2019 standard  error">
+    <header class="dc-head">
+        <div>
+            <h3>NW-RODC01</h3>
+            <div class="dc-host">NW-RODC01.northwind.lab</div>
+        </div>
+        <div class="dc-flags">
+            <span class="status-badge status-error">Error</span>
+            <span class="badge badge-gc">GC</span><span class="badge badge-rodc">RODC</span>
+        </div>
+    </header>
+    <div class="info-grid">
+        <div><span class="lbl">IP</span><span>10.30.30.11</span></div>
+        <div><span class="lbl">Site</span><span>Plant-Austin</span></div>
+        <div><span class="lbl">OS</span><span>Windows Server 2019 Standard</span></div>
+        <div><span class="lbl">Version</span><span>10.0 (17763)</span></div>
+        <div><span class="lbl">Last boot</span><span>N/A</span></div>
+        <div><span class="lbl">Uptime</span><span class="uptime">N/A</span></div>
+        <div><span class="lbl">Memory</span><span>N/A</span></div>
+        <div><span class="lbl">Time source</span><span>N/A</span></div>
+        <div><span class="lbl">Last hotfix</span><span>N/A</span></div>
+        <div><span class="lbl">Pending reboot</span><span>N/A</span></div>
+    </div>
+    <section><h4>FSMO roles held</h4><div class="tags"><span class="muted">None</span></div></section>
+    <section><h4>Replication partners (inbound)</h4><div class="repl"><span class="muted">None detected</span></div></section>
+    <section><h4>Disks</h4><span class="muted">N/A</span></section>
+    <section><h4>Key services</h4><div class="tags"><span class="muted">N/A</span></div></section>
+    <section class="collapsible">
+        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Roles (0)</h4>
+        <div class="collapse-c"><div class="tags"><span class="error-msg">WinRM cannot complete the operation. Verify the computer is up and WinRM is configured.</span></div></div>
+    </section>
+    <section class="collapsible">
+        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Features (0)</h4>
+        <div class="collapse-c"><div class="tags"><span class="muted">None collected</span></div></div>
+    </section>
+</article>
+
+    </div>
+    <div class="card" style="margin-top:18px">
+      <h2>Comparison table</h2>
+      <div class="controls"><input class="search" id="cmpSearch" placeholder="Filter comparison rows..."></div>
+      <div class="table-wrap">
+        <table id="cmpTable">
+          <thead><tr><th>Server</th><th>Status</th><th>IP</th><th>Site</th><th>OS</th><th>Last boot</th><th>Uptime</th><th>FSMO</th><th>Inbound partners</th></tr></thead>
+          <tbody><tr>
+    <td><strong>NW-DC01</strong></td>
+    <td><span class="status-badge status-online">Online</span></td>
+    <td>10.10.10.11</td>
+    <td>HQ-Chicago</td>
+    <td>Windows Server 2022 Standard</td>
+    <td>2026-09-15 03:06</td>
+    <td>42d 3h 12m</td>
+    <td>Schema Master, Domain Naming Master, PDC Emulator, RID Master, Infrastructure Master</td>
+    <td>NW-DC02, NW-RODC01</td>
+</tr>
+<tr>
+    <td><strong>NW-DC02</strong></td>
+    <td><span class="status-badge status-online">Online</span></td>
+    <td>10.20.20.11</td>
+    <td>Plant-Austin</td>
+    <td>Windows Server 2019 Standard</td>
+    <td>2026-06-29 03:06</td>
+    <td>120d 6h 1m</td>
+    <td>-</td>
+    <td>NW-DC01</td>
+</tr>
+<tr>
+    <td><strong>NW-RODC01</strong></td>
+    <td><span class="status-badge status-error">Error</span></td>
+    <td>10.30.30.11</td>
+    <td>Plant-Austin</td>
+    <td>Windows Server 2019 Standard</td>
+    <td>N/A</td>
+    <td>N/A</td>
+    <td>-</td>
+    <td>-</td>
+</tr>
+</tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section id="identity" class="panel">
+    <div class="learn">
+    <div class="learn-title">Privilege is the real map of the domain</div>
+    <p>Domain Admins, Enterprise Admins, Schema Admins, DnsAdmins, and Backup Operators are tier-0. Count the humans, not just the groups. krbtgt age tells you how long a stolen KRBTGT hash would keep working.</p>
+</div>
+    <div class="grid-2">
+      <div class="card">
+        <h2>Default domain password policy</h2>
+        <div class="table-wrap"><table><tbody><tr><td>Complexity</td><td>True</td></tr>
+<tr><td>Minimum length</td><td>8</td></tr>
+<tr><td>Minimum age (days)</td><td>1</td></tr>
+<tr><td>Maximum age (days)</td><td>90</td></tr>
+<tr><td>History</td><td>12</td></tr>
+<tr><td>Lockout threshold</td><td>0</td></tr>
+<tr><td>Lockout duration (min)</td><td>30</td></tr>
+<tr><td>Observation window (min)</td><td>30</td></tr>
+<tr><td>Reversible encryption</td><td>False</td></tr></tbody></table></div>
+      </div>
+      <div class="card">
+        <h2>KRBTGT &amp; hygiene snapshot</h2>
+        <div class="table-wrap"><table><tbody>
+          <tr><td>krbtgt last password set</td><td>2025-01-25 03:06 (640 days ago)</td></tr>
+          <tr><td>Enabled users</td><td>412</td></tr>
+          <tr><td>Disabled users</td><td>88</td></tr>
+          <tr><td>Stale enabled users (90+ days)</td><td>37</td></tr>
+          <tr><td>Never logged on (enabled)</td><td>14</td></tr>
+          <tr><td>Password never expires</td><td>11</td></tr>
+          <tr><td>adminCount &ge; 1</td><td>9</td></tr>
+          <tr><td>Enabled computers</td><td>260</td></tr>
+          <tr><td>Stale enabled computers</td><td>22</td></tr>
+          <tr><td>Security groups</td><td>148</td></tr>
+          <tr><td>Distribution groups</td><td>33</td></tr>
+        </tbody></table></div>
+        <p class="muted" style="margin-top:8px">Inventory covers enabled/disabled, stale, and delegation flags up to the result cap.</p>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Fine-grained password policies</h2>
+      <div class="table-wrap"><table><thead><tr><th>Name</th><th>Precedence</th><th>Min length</th><th>Max age (days)</th><th>Lockout</th></tr></thead><tbody><tr><td>Admins-FGPP</td><td>10</td><td>14</td><td>60</td><td>5</td></tr></tbody></table></div>
+    </div>
+    <div class="card">
+      <h2>Privileged groups</h2>
+      <div class="priv-grid"><div class="priv-card">
+    <h3>Domain Admins <span class="count">6</span></h3>
+    <div class="muted">Enumeration: recursive</div>
+    <ul><li><strong>Administrator</strong> <span class="muted">(Administrator, user)</span></li><li><strong>j.blake</strong> <span class="muted">(Jordan Blake, user)</span></li><li><strong>s.patel</strong> <span class="muted">(Sam Patel, user)</span></li><li><strong>helpdesk.admin</strong> <span class="muted">(Helpdesk Admin, user)</span></li><li><strong>vendor.temp</strong> <span class="muted">(Vendor Temp, user)</span></li><li><strong>backup.svc</strong> <span class="muted">(Backup Service, user)</span></li></ul>
+</div>
+<div class="priv-card">
+    <h3>Enterprise Admins <span class="count">2</span></h3>
+    <div class="muted">Enumeration: recursive</div>
+    <ul><li><strong>Administrator</strong> <span class="muted">(Administrator, user)</span></li><li><strong>j.blake</strong> <span class="muted">(Jordan Blake, user)</span></li></ul>
+</div>
+<div class="priv-card">
+    <h3>Schema Admins <span class="count">1</span></h3>
+    <div class="muted">Enumeration: recursive</div>
+    <ul><li><strong>Administrator</strong> <span class="muted">(Administrator, user)</span></li></ul>
+</div>
+<div class="priv-card">
+    <h3>DnsAdmins <span class="count">2</span></h3>
+    <div class="muted">Enumeration: recursive</div>
+    <ul><li><strong>netops</strong> <span class="muted">(Network Ops, user)</span></li><li><strong>dhcp.svc</strong> <span class="muted">(DHCP Service, user)</span></li></ul>
+</div>
+<div class="priv-card">
+    <h3>Protected Users <span class="count">0</span></h3>
+    <div class="muted">Enumeration: recursive</div>
+    <ul><li class="muted">Empty — good for Schema/Enterprise Admins in daily ops.</li></ul>
+</div>
+</div>
+    </div>
+    <div class="grid-2">
+      <div class="card">
+        <h2>Stale users (sample)</h2>
+        <div class="table-wrap"><table><thead><tr><th>Account</th><th>Last logon</th></tr></thead><tbody><tr><td>temp.contractor</td><td>2026-03-31 03:06</td></tr>
+<tr><td>old.finance</td><td>2025-09-22 03:06</td></tr></tbody></table></div>
+      </div>
+      <div class="card">
+        <h2>Stale computers (sample)</h2>
+        <div class="table-wrap"><table><thead><tr><th>Name</th><th>OS</th><th>Last logon</th></tr></thead><tbody><tr><td>AUS-WKS-014</td><td>Windows 10 Pro</td><td>2026-04-30 03:06</td></tr></tbody></table></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Computers by operating system</h2>
+      <div class="table-wrap"><table><thead><tr><th>Operating system</th><th>Count</th></tr></thead><tbody><tr><td>Windows 11 Pro</td><td>140</td></tr>
+<tr><td>Windows 10 Pro</td><td>70</td></tr>
+<tr><td>Windows Server 2022 Standard</td><td>18</td></tr>
+<tr><td>Windows Server 2016 Standard</td><td>12</td></tr>
+<tr><td>(none)</td><td>20</td></tr></tbody></table></div>
+    </div>
+  </section>
+
+  <section id="gpo" class="panel">
+    <div class="learn">
+    <div class="learn-title">GPOs are where &quot;the domain does X&quot; actually lives</div>
+    <p>Unlinked GPOs are leftover experiments. Unprotected OUs can be deleted by a tired click. Start from the OU tree, then read which GPOs hang off each OU. Default Domain Policy and Default Domain Controllers Policy deserve a careful read on day one.</p>
+</div>
+    <div class="card">
+      <h2>Group Policy objects (4)</h2>
+      <div class="controls"><input class="search" id="gpoSearch" placeholder="Filter GPOs..."></div>
+      <div class="table-wrap"><table id="gpoTable"><thead><tr><th>Name</th><th>Status</th><th>Created</th><th>Modified</th></tr></thead><tbody><tr><td>Default Domain Controllers Policy</td><td>AllSettingsEnabled</td><td>2018-10-27 03:06</td><td>2026-09-17 03:06</td></tr>
+<tr><td>Default Domain Policy</td><td>AllSettingsEnabled</td><td>2018-10-27 03:06</td><td>2026-10-15 03:06</td></tr>
+<tr><td>Map-Drives-Legacy</td><td>UserSettingsDisabled</td><td>2020-10-27 03:06</td><td>2024-10-27 03:06</td></tr>
+<tr><td>Workstation-Baseline</td><td>AllSettingsEnabled</td><td>2023-10-27 03:06</td><td>2026-10-22 03:06</td></tr></tbody></table></div>
+    </div>
+    <div class="card">
+      <h2>OU tree (5)</h2>
+      <div class="controls"><input class="search" id="ouSearch" placeholder="Filter OUs..."></div>
+      <div class="table-wrap"><table id="ouTable"><thead><tr><th>Canonical name</th><th>Description</th><th>Protected</th><th>Linked GPOs</th></tr></thead><tbody><tr><td>northwind.lab/HQ</td><td>Chicago HQ</td><td>Yes</td><td>1</td></tr>
+<tr><td>northwind.lab/HQ/Workstations</td><td>End-user PCs</td><td>Yes</td><td>1</td></tr>
+<tr><td>northwind.lab/HQ/Servers</td><td>Member servers</td><td>Yes</td><td>0</td></tr>
+<tr><td>northwind.lab/Austin</td><td>Plant</td><td>No</td><td>0</td></tr>
+<tr><td>northwind.lab/Service Accounts</td><td>gMSA + legacy SVC</td><td>Yes</td><td>1</td></tr></tbody></table></div>
+    </div>
+  </section>
+
+  <section id="roles" class="panel">
+    <div class="learn">
+    <div class="learn-title">Installed roles tell you what else these DCs are doing</div>
+    <p>A DC that is also DHCP, CA, or RDS is a concentration-of-risk problem. Compare roles across DCs — drift is how &quot;only DC02 has the thing&quot; incidents start.</p>
+</div>
+    <div class="card">
+      <h2>Roles across the domain</h2>
+      <div class="controls"><input class="search" id="roleSearch" placeholder="Filter roles..."></div>
+      <div class="table-wrap"><table id="roleTable"><thead><tr><th>Role</th><th>Installed on</th><th>Domain controllers</th><th>Description</th></tr></thead><tbody><tr><td><strong>Active Directory Certificate Services</strong><br><small class="muted">ADCS-Cert-Authority</small></td><td>1 / 2</td><td>NW-DC02</td><td class="desc">Enterprise CA.</td></tr>
+<tr><td><strong>Active Directory Domain Services</strong><br><small class="muted">AD-Domain-Services</small></td><td>2 / 2</td><td>NW-DC01, NW-DC02</td><td class="desc">Store directory data and manage communication between users and domains.</td></tr>
+<tr><td><strong>DHCP Server</strong><br><small class="muted">DHCP</small></td><td>1 / 2</td><td>NW-DC01</td><td class="desc">Dynamic Host Configuration Protocol server.</td></tr>
+<tr><td><strong>DNS Server</strong><br><small class="muted">DNS</small></td><td>2 / 2</td><td>NW-DC01, NW-DC02</td><td class="desc">Domain Name System server.</td></tr></tbody></table></div>
+    </div>
+    <div class="card">
+      <h2>Features across the domain</h2>
+      <div class="controls"><input class="search" id="featSearch" placeholder="Filter features..."></div>
+      <div class="table-wrap"><table id="featTable"><thead><tr><th>Feature</th><th>Type</th><th>Installed on</th><th>Domain controllers</th></tr></thead><tbody><tr><td><strong>Active Directory module for Windows PowerShell</strong><br><small class="muted">RSAT-AD-PowerShell</small></td><td>Feature</td><td>1 / 2</td><td>NW-DC01</td></tr>
+<tr><td><strong>Group Policy Management</strong><br><small class="muted">GPMC</small></td><td>Feature</td><td>1 / 2</td><td>NW-DC01</td></tr></tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>AD Domain Discovery Report v2.0 · Execution time 00:00.236 · Stale threshold 90 days</p>
+    <p>Read-only discovery. This script does not change AD. Validate privileged-group counts before you act.</p>
+  </footer>
+</div>
+<script>
+(function () {
+  const root = document.documentElement;
+  const saved = localStorage.getItem("adbrief-theme");
+  if (saved) root.setAttribute("data-theme", saved);
+  document.getElementById("themeBtn").addEventListener("click", function () {
+    const next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    localStorage.setItem("adbrief-theme", next);
+  });
+
+  document.querySelectorAll(".tab").forEach(function (tab) {
+    tab.addEventListener("click", function () {
+      document.querySelectorAll(".tab").forEach(function (t) { t.classList.remove("active"); });
+      document.querySelectorAll(".panel").forEach(function (p) { p.classList.remove("active"); });
+      tab.classList.add("active");
+      document.getElementById(tab.getAttribute("data-tab")).classList.add("active");
+    });
+  });
+
+  window.toggleCollapse = function (el) {
+    el.closest(".collapsible").classList.toggle("open");
+  };
+
+  const search = document.getElementById("dcSearch");
+  const cards = document.querySelectorAll(".dc-card");
+  let statusFilter = "all";
+  function applyDcFilter() {
+    const q = (search.value || "").toLowerCase();
+    cards.forEach(function (card) {
+      const okText = !q || (card.getAttribute("data-search") || "").indexOf(q) !== -1 || card.textContent.toLowerCase().indexOf(q) !== -1;
+      const st = card.getAttribute("data-status");
+      const okSt = statusFilter === "all" || st === statusFilter;
+      card.classList.toggle("hidden", !(okText && okSt));
+    });
+  }
+  if (search) search.addEventListener("input", applyDcFilter);
+  document.querySelectorAll("[data-dc-filter]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      document.querySelectorAll("[data-dc-filter]").forEach(function (b) { b.classList.remove("active"); });
+      btn.classList.add("active");
+      statusFilter = btn.getAttribute("data-dc-filter");
+      applyDcFilter();
+    });
+  });
+
+  document.querySelectorAll("[data-find-filter]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      document.querySelectorAll("[data-find-filter]").forEach(function (b) { b.classList.remove("active"); });
+      btn.classList.add("active");
+      const sev = btn.getAttribute("data-find-filter");
+      document.querySelectorAll(".finding").forEach(function (f) {
+        f.classList.toggle("hidden", !(sev === "all" || f.getAttribute("data-sev") === sev));
+      });
+    });
+  });
+
+  function bindTableSearch(inputId, tableId) {
+    const input = document.getElementById(inputId);
+    const table = document.getElementById(tableId);
+    if (!input || !table) return;
+    input.addEventListener("input", function () {
+      const q = input.value.toLowerCase();
+      table.querySelectorAll("tbody tr").forEach(function (row) {
+        row.classList.toggle("hidden", row.textContent.toLowerCase().indexOf(q) === -1);
+      });
+    });
+  }
+  bindTableSearch("cmpSearch", "cmpTable");
+  bindTableSearch("gpoSearch", "gpoTable");
+  bindTableSearch("ouSearch", "ouTable");
+  bindTableSearch("roleSearch", "roleTable");
+  bindTableSearch("featSearch", "featTable");
+  bindTableSearch("siteSearch", "siteTable");
+})();
+</script>
+</body>
+</html>
