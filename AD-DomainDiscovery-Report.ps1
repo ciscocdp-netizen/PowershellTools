@@ -13,8 +13,9 @@
       - Forest and domain identity, functional levels, schema, recycle bin, UPNs
       - FSMO role holders with plain-language explanations
       - Sites, subnets, site links, and empty-site / missing-subnet findings
-      - Every domain controller: health, FSMO, GC/RODC, roles/features, services
-      - Replication partners (inbound) with last success and consecutive failures
+      - Every domain controller: AD computer object (whenCreated, last logon, OS, SPNs), FSMO, GC/RODC
+      - Roles/features inferred from the directory (GC, DNS SPNs, AD CS, DHCP) — no WinRM to DCs
+      - Replication partners from nTDSConnection objects in the configuration partition (live last-success only with -IncludeRemoteQueries)
       - Trusts, password policy, fine-grained password policies, KRBTGT age
       - Privileged group membership (recursive where possible)
       - Stale users/computers, password-never-expires, unconstrained delegation
@@ -36,10 +37,10 @@
 
 .NOTES
     Author : Anthony Blake (enhanced)
-    Version: 2.0
+    Version: 2.2
     Run from a domain-joined Windows machine with the ActiveDirectory module (RSAT).
-    WinRM/admin rights on each DC are only required for roles, features, disks, and services.
-    Forest-wide AD reads work with a typical delegated admin account.
+    Default mode is Active Directory only (LDAP/ADWS). It does not WinRM into DCs.
+    Optional -IncludeRemoteQueries adds live OS health if you later get local admin/WinRM.
 
 .EXAMPLE
     .\AD-DomainDiscovery-Report.ps1
@@ -48,7 +49,11 @@
     .\AD-DomainDiscovery-Report.ps1 -Domain contoso.com -OutputPath C:\Reports\contoso.html
 
 .EXAMPLE
-    .\AD-DomainDiscovery-Report.ps1 -SkipRemoteQueries -StaleDays 60
+    .\AD-DomainDiscovery-Report.ps1 -StaleDays 60
+
+.EXAMPLE
+    .\AD-DomainDiscovery-Report.ps1 -IncludeRemoteQueries
+    Also queries each DC over WinRM for disks, services, and installed Windows features.
 
 .EXAMPLE
     .\AD-DomainDiscovery-Report.ps1 -OfflineDemo
@@ -63,6 +68,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential,
     [switch]$IncludeSubFeatures,
     [switch]$SkipRemoteQueries,
+    [switch]$IncludeRemoteQueries,
     [switch]$SkipOptionalInventory,
     [int]$StaleDays = 90,
     [int]$MaxInventoryObjects = 8000,
@@ -74,6 +80,9 @@ param(
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Continue'
+# AD-only unless the caller explicitly asks to WinRM into DCs.
+$script:QueryDcsRemotely = [bool]$IncludeRemoteQueries -and -not $SkipRemoteQueries
+$script:AllReplConnections = $null
 
 #region Knowledge
 
@@ -405,57 +414,147 @@ function Get-FSMORoleTable {
     return $roles
 }
 
-function Get-DcCreatedTime {
+function Get-DcComputerAccount {
     param($Dc, $Ad)
-    $created = $null
-    $identity = $null
-    if ($Dc.ComputerObjectDN) {
-        $identity = $Dc.ComputerObjectDN
-    } elseif ($Dc.Name) {
-        $identity = $Dc.Name
-    }
-    if ($identity) {
+    $ids = @($Dc.ComputerObjectDN, $Dc.Name)
+    if ($Dc.Name -and $Dc.Name -notlike '*$') { $ids += ($Dc.Name + '$') }
+    foreach ($id in ($ids | Where-Object { $_ } | Select-Object -Unique)) {
         try {
-            $acct = Get-ADComputer -Identity $identity -Properties whenCreated @Ad
-            $created = $acct.whenCreated
+            return Get-ADComputer -Identity $id -Properties whenCreated, whenChanged, LastLogonDate, PasswordLastSet, OperatingSystem, OperatingSystemVersion, IPv4Address, Enabled, Description, CanonicalName, DNSHostName, servicePrincipalName, PrimaryGroupID @Ad
         } catch { }
     }
-    if (-not $created -and $Dc.NTDSSettingsObjectDN) {
+    if ($Dc.NTDSSettingsObjectDN) {
         try {
-            $ntds = Get-ADObject -Identity $Dc.NTDSSettingsObjectDN -Properties whenCreated @Ad
-            $created = $ntds.whenCreated
+            return Get-ADObject -Identity $Dc.NTDSSettingsObjectDN -Properties whenCreated @Ad
         } catch { }
     }
-    return $created
+    return $null
+}
+
+function New-InferredComponent {
+    param(
+        [string]$Name,
+        [string]$DisplayName,
+        [string]$Description,
+        [string]$FeatureType = 'Role'
+    )
+    [pscustomobject]@{
+        Name        = $Name
+        DisplayName = $DisplayName
+        Description = $Description
+        FeatureType = $FeatureType
+        Inferred    = $true
+    }
+}
+
+function Get-InferredDcWorkload {
+    param($Dc, $Computer)
+    $roles = [System.Collections.Generic.List[object]]::new()
+    $features = [System.Collections.Generic.List[object]]::new()
+    $services = [System.Collections.Generic.List[object]]::new()
+    $spns = @()
+    if ($Computer -and $Computer.servicePrincipalName) {
+        $spns = @($Computer.servicePrincipalName)
+    }
+
+    [void]$roles.Add((New-InferredComponent 'AD-Domain-Services' 'Active Directory Domain Services' 'Inferred from the domain controller object in AD.'))
+    [void]$services.Add([pscustomobject]@{ Name = 'NTDS'; DisplayName = 'AD DS'; Status = 'Advertised in AD' })
+    [void]$services.Add([pscustomobject]@{ Name = 'KDC'; DisplayName = 'Kerberos KDC'; Status = 'Advertised in AD' })
+
+    if ($Dc.IsGlobalCatalog) {
+        [void]$roles.Add((New-InferredComponent 'GlobalCatalog' 'Global Catalog' 'Inferred from IsGlobalCatalog on the DC object.'))
+        [void]$services.Add([pscustomobject]@{ Name = 'GC'; DisplayName = 'Global Catalog'; Status = 'Advertised in AD' })
+    }
+    if ($Dc.IsReadOnly) {
+        [void]$roles.Add((New-InferredComponent 'RODC' 'Read-Only Domain Controller' 'Inferred from IsReadOnly on the DC object.'))
+    }
+    if ($spns | Where-Object { $_ -like 'DNS/*' }) {
+        [void]$roles.Add((New-InferredComponent 'DNS' 'DNS Server' 'Inferred from DNS/ service principal names on the computer account.'))
+        [void]$services.Add([pscustomobject]@{ Name = 'DNS'; DisplayName = 'DNS Server'; Status = 'Advertised in AD' })
+    }
+    if ($spns | Where-Object { $_ -like 'TERMSRV/*' }) {
+        [void]$features.Add((New-InferredComponent 'RDS-RD-Server' 'Remote Desktop Services' 'Inferred from TERMSRV/ SPNs.' 'Feature'))
+    }
+    if ($spns | Where-Object { $_ -like 'MSSQL*' }) {
+        [void]$features.Add((New-InferredComponent 'SQL-Server' 'SQL Server' 'Inferred from MSSQL SPNs. Unusual on a DC.' 'Feature'))
+    }
+
+    [pscustomobject]@{
+        Roles    = @($roles)
+        Features = @($features)
+        Services = @($services)
+        SPNs     = @($spns)
+    }
 }
 
 function Get-AllDomainControllers {
     param($Ad)
     $raw = @(Get-ADDomainController -Filter * @Ad)
     $list = foreach ($dc in $raw) {
-        $created = Get-DcCreatedTime -Dc $dc -Ad $Ad
+        $acct = Get-DcComputerAccount -Dc $dc -Ad $Ad
+        $created = $null
+        if ($acct -and $acct.whenCreated) { $created = $acct.whenCreated }
+        $workload = Get-InferredDcWorkload -Dc $dc -Computer $acct
+        $enabled = $true
+        if ($acct -and ($null -ne $acct.Enabled)) { $enabled = [bool]$acct.Enabled }
+        elseif ($null -ne $dc.Enabled) { $enabled = [bool]$dc.Enabled }
         [pscustomobject]@{
             Name                    = $dc.Name
             HostName                = $dc.HostName
-            IPv4Address             = $dc.IPv4Address
+            IPv4Address             = if ($dc.IPv4Address) { $dc.IPv4Address } elseif ($acct) { $acct.IPv4Address } else { $null }
             Site                    = $dc.Site
-            OperatingSystem         = $dc.OperatingSystem
-            OperatingSystemVersion  = $dc.OperatingSystemVersion
+            OperatingSystem         = if ($dc.OperatingSystem) { $dc.OperatingSystem } elseif ($acct) { $acct.OperatingSystem } else { $null }
+            OperatingSystemVersion  = if ($dc.OperatingSystemVersion) { $dc.OperatingSystemVersion } elseif ($acct) { $acct.OperatingSystemVersion } else { $null }
             IsGlobalCatalog         = [bool]$dc.IsGlobalCatalog
             IsReadOnly              = [bool]$dc.IsReadOnly
-            Enabled                 = [bool]$dc.Enabled
+            Enabled                 = $enabled
             OperationMasterRoles    = @($dc.OperationMasterRoles | ForEach-Object { [string]$_ })
             LdapPort                = $dc.LdapPort
             SslPort                 = $dc.SslPort
             Forest                  = [string]$dc.Forest
             Domain                  = [string]$dc.Domain
+            Description             = if ($acct) { [string]$acct.Description } else { '' }
+            CanonicalName           = if ($acct) { [string]$acct.CanonicalName } else { '' }
             Created                 = $created
             CreatedFormatted        = Format-When $created
             CreatedAgeDays          = Format-AgeDays $created
             CreatedAgeLabel         = Format-AgeLabel $created
+            WhenChanged             = if ($acct) { $acct.whenChanged } else { $null }
+            WhenChangedFormatted    = if ($acct) { Format-When $acct.whenChanged } else { 'N/A' }
+            LastLogonDate           = if ($acct) { $acct.LastLogonDate } else { $null }
+            LastLogonFormatted      = if ($acct -and $acct.LastLogonDate) { Format-When $acct.LastLogonDate } else { 'N/A' }
+            LastLogonAgeLabel       = if ($acct) { Format-AgeLabel $acct.LastLogonDate } else { $null }
+            PasswordLastSet         = if ($acct) { $acct.PasswordLastSet } else { $null }
+            PasswordLastSetFormatted = if ($acct -and $acct.PasswordLastSet) { Format-When $acct.PasswordLastSet } else { 'N/A' }
+            PasswordAgeDays         = if ($acct) { Format-AgeDays $acct.PasswordLastSet } else { $null }
+            PasswordAgeLabel        = if ($acct) { Format-AgeLabel $acct.PasswordLastSet } else { $null }
+            InferredRoles           = @($workload.Roles)
+            InferredFeatures        = @($workload.Features)
+            InferredServices        = @($workload.Services)
+            SPNs                    = @($workload.SPNs)
         }
     }
     return @($list | Sort-Object Name)
+}
+
+function Get-AllReplicationConnections {
+    param($Ad)
+    if ($null -ne $script:AllReplConnections) { return @($script:AllReplConnections) }
+    try {
+        $script:AllReplConnections = @(Get-ADReplicationConnection -Filter * @Ad | ForEach-Object {
+                [pscustomobject]@{
+                    Name          = $_.Name
+                    From          = Get-PartnerNameFromDn ([string]$_.ReplicateFromDirectoryServer)
+                    To            = Get-PartnerNameFromDn ([string]$_.DistinguishedName)
+                    AutoGenerated = [bool]$_.AutoGenerated
+                    Enabled       = if ($null -ne $_.Enabled) { [bool]$_.Enabled } else { $true }
+                }
+            })
+    } catch {
+        Write-ReportLog "Replication connection objects could not be read from AD: $($_.Exception.Message)" 'WARN'
+        $script:AllReplConnections = @()
+    }
+    return @($script:AllReplConnections)
 }
 
 function Get-DcReplicationDetails {
@@ -467,41 +566,49 @@ function Get-DcReplicationDetails {
         Error       = $null
     }
 
-    try {
-        $meta = @(Get-ADReplicationPartnerMetadata -Target $ComputerName -Partition * @Ad -ErrorAction Stop)
-        $grouped = $meta | Group-Object { Get-PartnerNameFromDn $_.Partner }
-        foreach ($g in $grouped) {
-            $worst = $g.Group | Sort-Object ConsecutiveReplicationFailures -Descending | Select-Object -First 1
-            $partitions = @($g.Group | ForEach-Object {
-                    if ($_.Partition) { ($_.Partition -split ',')[0] -replace '^CN=|^DC=', '' } else { 'Unknown' }
-                } | Select-Object -Unique)
+    $short = Get-ShortHostName $ComputerName
+    $conns = @(Get-AllReplicationConnections -Ad $Ad | Where-Object {
+            (Get-ShortHostName $_.To) -eq $short
+        })
+    foreach ($c in $conns) {
+        $result.Connections += $c
+        if ($c.From -and $c.From -notin @($result.Inbound | ForEach-Object { $_.Partner })) {
             $result.Inbound += [pscustomobject]@{
-                Partner          = $g.Name
-                LastSuccess      = $worst.LastReplicationSuccess
-                LastAttempt      = $worst.LastReplicationAttempt
-                LastResult       = [string]$worst.LastReplicationResult
-                ConsecutiveFails = [int]$worst.ConsecutiveReplicationFailures
-                Partitions       = $partitions
-                UsnFilter        = $worst.LastReplicationSuccess
+                Partner          = $c.From
+                LastSuccess      = $null
+                LastAttempt      = $null
+                LastResult       = 'Configured in AD'
+                ConsecutiveFails = 0
+                Partitions       = @('nTDSConnection')
+                UsnFilter        = $null
             }
         }
-    } catch {
-        $result.Error = $_.Exception.Message
     }
 
-    try {
-        $conns = @(Get-ADReplicationConnection -Server $ComputerName -Filter * @Ad -ErrorAction SilentlyContinue)
-        foreach ($c in $conns) {
-            $from = Get-PartnerNameFromDn ([string]$c.ReplicateFromDirectoryServer)
-            $result.Connections += [pscustomobject]@{
-                Name           = $c.Name
-                From           = $from
-                AutoGenerated  = [bool]$c.AutoGenerated
-                Enabled        = if ($null -ne $c.Enabled) { [bool]$c.Enabled } else { $true }
+    # Live last-success/failure is stored on the DC; skip unless we can use ADWS against it.
+    if ($script:QueryDcsRemotely) {
+        try {
+            $meta = @(Get-ADReplicationPartnerMetadata -Target $ComputerName -Partition * @Ad -ErrorAction Stop)
+            $grouped = $meta | Group-Object { Get-PartnerNameFromDn $_.Partner }
+            $result.Inbound = @()
+            foreach ($g in $grouped) {
+                $worst = $g.Group | Sort-Object ConsecutiveReplicationFailures -Descending | Select-Object -First 1
+                $partitions = @($g.Group | ForEach-Object {
+                        if ($_.Partition) { ($_.Partition -split ',')[0] -replace '^CN=|^DC=', '' } else { 'Unknown' }
+                    } | Select-Object -Unique)
+                $result.Inbound += [pscustomobject]@{
+                    Partner          = $g.Name
+                    LastSuccess      = $worst.LastReplicationSuccess
+                    LastAttempt      = $worst.LastReplicationAttempt
+                    LastResult       = [string]$worst.LastReplicationResult
+                    ConsecutiveFails = [int]$worst.ConsecutiveReplicationFailures
+                    Partitions       = $partitions
+                    UsnFilter        = $worst.LastReplicationSuccess
+                }
             }
+        } catch {
+            $result.Error = $_.Exception.Message
         }
-    } catch {
-        # Connection objects are nice-to-have.
     }
 
     return $result
@@ -529,9 +636,9 @@ function Get-RemoteDcDetails {
         Error               = $null
     }
 
-    if ($SkipRemoteQueries) {
-        $empty.Status = 'Skipped'
-        $empty.Error = 'Remote queries disabled (-SkipRemoteQueries).'
+    if (-not $script:QueryDcsRemotely) {
+        $empty.Status = 'Directory'
+        $empty.Error = $null
         return $empty
     }
 
@@ -673,15 +780,31 @@ function Get-DcRecord {
         if ($label -and $label -notin $held) { $held += $label }
     }
 
-    Write-ReportLog "Querying $($Dc.Name)..." 'INFO'
-    $remote = Get-RemoteDcDetails -ComputerName $Dc.HostName -SubFeatures $SubFeatures
-    if ($remote.Status -eq 'Error' -and $Dc.Name -ne $Dc.HostName) {
-        Write-ReportLog "Retrying $($Dc.Name) by short name..." 'WARN'
-        $retry = Get-RemoteDcDetails -ComputerName $Dc.Name -SubFeatures $SubFeatures
-        if ($retry.Status -eq 'Online') { $remote = $retry }
+    Write-ReportLog "Reading $($Dc.Name) from Active Directory..." 'INFO'
+    $remote = $null
+    if ($script:QueryDcsRemotely) {
+        $remote = Get-RemoteDcDetails -ComputerName $Dc.HostName -SubFeatures $SubFeatures
+        if ($remote.Status -eq 'Error' -and $Dc.Name -ne $Dc.HostName) {
+            Write-ReportLog "Retrying $($Dc.Name) by short name..." 'WARN'
+            $retry = Get-RemoteDcDetails -ComputerName $Dc.Name -SubFeatures $SubFeatures
+            if ($retry.Status -eq 'Online') { $remote = $retry }
+        }
     }
 
     $repl = Get-DcReplicationDetails -ComputerName $Dc.HostName -Ad $Ad
+    $status = if (-not $Dc.Enabled) { 'Disabled' }
+        elseif ($remote -and $remote.Status -eq 'Online') { 'Online' }
+        elseif ($remote -and $remote.Status -eq 'Error') { 'Error' }
+        else { 'Enabled' }
+
+    $roles = @($Dc.InferredRoles)
+    $features = @($Dc.InferredFeatures)
+    $services = @($Dc.InferredServices)
+    if ($remote -and $remote.Status -eq 'Online') {
+        if ((Get-SafeCount $remote.Roles) -gt 0) { $roles = @($remote.Roles) }
+        if ((Get-SafeCount $remote.Features) -gt 0) { $features = @($remote.Features) }
+        if ((Get-SafeCount $remote.Services) -gt 0) { $services = @($remote.Services) }
+    }
 
     [pscustomobject]@{
         ComputerName          = $Dc.Name
@@ -692,29 +815,61 @@ function Get-DcRecord {
         OperatingSystemVersion = $Dc.OperatingSystemVersion
         IsGlobalCatalog       = $Dc.IsGlobalCatalog
         IsReadOnly            = $Dc.IsReadOnly
-        Status                = $remote.Status
-        Roles                 = @($remote.Roles)
-        Features              = @($remote.Features)
+        Enabled               = $Dc.Enabled
+        Status                = $status
+        Roles                 = $roles
+        Features              = $features
         FSMORoles             = @($held)
-        LastBootTime          = $remote.LastBootTime
-        LastBootTimeFormatted = $remote.LastBootTimeFormatted
+        LastBootTime          = if ($remote) { $remote.LastBootTime } else { $null }
+        LastBootTimeFormatted = if ($remote -and $remote.LastBootTimeFormatted -ne 'N/A') { $remote.LastBootTimeFormatted } else { $Dc.LastLogonFormatted }
         Created               = $Dc.Created
         CreatedFormatted      = if ($Dc.CreatedFormatted) { $Dc.CreatedFormatted } else { Format-When $Dc.Created }
         CreatedAgeDays        = $Dc.CreatedAgeDays
         CreatedAgeLabel       = if ($Dc.CreatedAgeLabel) { $Dc.CreatedAgeLabel } else { Format-AgeLabel $Dc.Created }
-        Uptime                = $remote.Uptime
-        MemoryGB              = $remote.MemoryGB
-        Disks                 = @($remote.Disks)
-        TimeSource            = $remote.TimeSource
-        Services              = @($remote.Services)
-        LastHotfix            = $remote.LastHotfix
-        PendingReboot         = $remote.PendingReboot
+        WhenChangedFormatted  = $Dc.WhenChangedFormatted
+        LastLogonFormatted    = $Dc.LastLogonFormatted
+        LastLogonAgeLabel     = $Dc.LastLogonAgeLabel
+        PasswordLastSetFormatted = $Dc.PasswordLastSetFormatted
+        PasswordAgeDays       = $Dc.PasswordAgeDays
+        PasswordAgeLabel      = $Dc.PasswordAgeLabel
+        Description           = $Dc.Description
+        CanonicalName         = $Dc.CanonicalName
+        SPNs                  = @($Dc.SPNs)
+        Uptime                = if ($remote) { $remote.Uptime } else { 'N/A' }
+        MemoryGB              = if ($remote) { $remote.MemoryGB } else { $null }
+        Disks                 = if ($remote) { @($remote.Disks) } else { @() }
+        TimeSource            = if ($remote) { $remote.TimeSource } else { 'N/A' }
+        Services              = $services
+        LastHotfix            = if ($remote) { $remote.LastHotfix } else { 'N/A' }
+        PendingReboot         = if ($remote) { $remote.PendingReboot } else { $null }
         ReplicationPartners   = @{
             Inbound     = @($repl.Inbound)
             Connections = @($repl.Connections)
         }
         ReplicationError      = $repl.Error
-        Error                 = $remote.Error
+        Error                 = if ($remote) { $remote.Error } else { $null }
+        Source                = if ($remote -and $remote.Status -eq 'Online') { 'AD + WinRM' } else { 'Active Directory' }
+    }
+}
+
+function Add-DirectoryServiceRolesToDcs {
+    param($DcRecords, $Services)
+    foreach ($dc in @($DcRecords)) {
+        foreach ($ca in @($Services.CertificateAuthorities)) {
+            if ($ca.HostName -and ((Test-SameHost $ca.HostName $dc.HostName) -or (Test-SameHost $ca.HostName $dc.ComputerName))) {
+                if (-not (@($dc.Roles) | Where-Object { $_.Name -eq 'ADCS-Cert-Authority' })) {
+                    $dc.Roles = @($dc.Roles) + (New-InferredComponent 'ADCS-Cert-Authority' 'Active Directory Certificate Services' ("Inferred: enterprise CA '{0}' is registered on this host in AD." -f $ca.Name))
+                }
+            }
+        }
+        foreach ($dhcp in @($Services.DhcpServers)) {
+            if ($dhcp.Name -and ((Test-SameHost $dhcp.Name $dc.HostName) -or (Test-SameHost $dhcp.Name $dc.ComputerName))) {
+                if (-not (@($dc.Roles) | Where-Object { $_.Name -eq 'DHCP' })) {
+                    $dc.Roles = @($dc.Roles) + (New-InferredComponent 'DHCP' 'DHCP Server' 'Inferred: this host is registered in AD as a DHCP server.')
+                    $dc.Services = @($dc.Services) + [pscustomobject]@{ Name = 'DHCPServer'; DisplayName = 'DHCP Server'; Status = 'Advertised in AD' }
+                }
+            }
+        }
     }
 }
 
@@ -795,6 +950,9 @@ function Get-TrustInfo {
 
 function Get-ReplicationFailures {
     param($Ad, $DomainName)
+    if (-not $script:QueryDcsRemotely) {
+        return @()
+    }
     try {
         $target = if ($DomainName) { $DomainName } else { $script:TargetServer }
         return @(Get-ADReplicationFailure -Target $target -Scope Domain -ErrorAction Stop | ForEach-Object {
@@ -1187,8 +1345,9 @@ function Get-DiscoveryFindings {
     param($Report)
 
     $findings = [System.Collections.Generic.List[object]]::new()
-    $online = @($Report.DomainControllers | Where-Object { $_.Status -eq 'Online' })
+    $online = @($Report.DomainControllers | Where-Object { $_.Status -in @('Online', 'Enabled', 'Directory') })
     $errorDcs = @($Report.DomainControllers | Where-Object { $_.Status -eq 'Error' })
+    $disabledDcs = @($Report.DomainControllers | Where-Object { $_.Status -eq 'Disabled' })
     $dcs = @($Report.DomainControllers)
 
     if ((Get-SafeCount $dcs) -lt 2) {
@@ -1201,8 +1360,24 @@ function Get-DiscoveryFindings {
     if ((Get-SafeCount $errorDcs) -gt 0) {
         Add-Finding $findings Warning 'Availability' ("{0} DC(s) could not be queried remotely" -f $errorDcs.Count) `
             (($errorDcs | ForEach-Object { '{0}: {1}' -f $_.ComputerName, $_.Error }) -join '; ') `
-            'WinRM, firewall, or credential problems hide roles, disks, and service health.' `
-            'Confirm WinRM (5985/5986) and that your account is local admin on those DCs. AD data in this report is still valid.'
+            'WinRM was requested (-IncludeRemoteQueries) but those DCs did not answer. Directory data in this report is still valid.' `
+            'This report defaults to Active Directory only. Use -IncludeRemoteQueries only when you have local admin and WinRM.'
+    }
+
+    if ((Get-SafeCount $disabledDcs) -gt 0) {
+        Add-Finding $findings Critical 'Availability' ("{0} DC computer account(s) are disabled in AD" -f $disabledDcs.Count) `
+            (ConvertTo-TextList ($disabledDcs | ForEach-Object { $_.ComputerName })) `
+            'A disabled DC computer account cannot authenticate as a DC. Treat this as a metadata-cleanup or restore event until you know otherwise.' `
+            'Confirm in ADUC/dsa.msc. Do not re-enable blindly if the server is gone — that is lingering-object territory.'
+    }
+
+    foreach ($dc in $dcs) {
+        if ($dc.PasswordAgeDays -and [int]$dc.PasswordAgeDays -gt 60) {
+            Add-Finding $findings Info 'Availability' ("{0} machine password is {1} days old" -f $dc.ComputerName, $dc.PasswordAgeDays) `
+                ("Last set {0}" -f $dc.PasswordLastSetFormatted) `
+                'DC computer accounts normally rotate about every 30 days. A much older password can mean the DC has not been writing to AD.' `
+                'Confirm the server is actually replicating before you reset the machine account.'
+        }
     }
 
     $holders = @($Report.FSMO.Values | ForEach-Object { Get-ShortHostName $_ } | Select-Object -Unique)
@@ -1472,9 +1647,10 @@ function New-DiscoveryReportHtml {
     $domainName = ConvertTo-HtmlEncoded $Report.Identity.DomainName
     $forestName = ConvertTo-HtmlEncoded $Report.Identity.ForestName
     $dcs = @($Report.DomainControllers)
-    $onlineDCs = @($dcs | Where-Object { $_.Status -eq 'Online' }).Count
+    $onlineDCs = @($dcs | Where-Object { $_.Status -in @('Online', 'Enabled', 'Directory') }).Count
     $errorDCs = @($dcs | Where-Object { $_.Status -eq 'Error' }).Count
-    $skippedDCs = @($dcs | Where-Object { $_.Status -eq 'Skipped' }).Count
+    $disabledDCs = @($dcs | Where-Object { $_.Status -eq 'Disabled' }).Count
+    $skippedDCs = $disabledDCs
     $findings = @($Report.Findings)
     $crit = @($findings | Where-Object { $_.Severity -eq 'Critical' }).Count
     $warn = @($findings | Where-Object { $_.Severity -eq 'Warning' }).Count
@@ -1483,7 +1659,7 @@ function New-DiscoveryReportHtml {
 
     $allRoles = @{}
     $allFeatures = @{}
-    foreach ($dc in $dcs | Where-Object { $_.Status -eq 'Online' }) {
+    foreach ($dc in $dcs | Where-Object { $_.Status -ne 'Disabled' }) {
         foreach ($role in @($dc.Roles)) {
             $key = [string]$role.DisplayName
             if (-not $allRoles.ContainsKey($key)) {
@@ -1549,9 +1725,20 @@ function New-DiscoveryReportHtml {
     $cmpRows = New-Object System.Text.StringBuilder
     foreach ($dc in $dcs) {
         $statusClass = switch ($dc.Status) {
-            'Online'  { 'online' }
-            'Skipped' { 'skipped' }
-            default   { 'error' }
+            'Online'     { 'online' }
+            'Enabled'    { 'online' }
+            'Directory'  { 'online' }
+            'Disabled'   { 'error' }
+            'Skipped'    { 'skipped' }
+            default      { 'error' }
+        }
+        $statusFilterKey = switch ($dc.Status) {
+            'Online'     { 'enabled' }
+            'Enabled'    { 'enabled' }
+            'Directory'  { 'enabled' }
+            'Disabled'   { 'disabled' }
+            'Skipped'    { 'skipped' }
+            default      { 'error' }
         }
         $badges = ''
         if ($dc.IsGlobalCatalog) { $badges += (New-Badge 'GC' 'gc') }
@@ -1562,18 +1749,29 @@ function New-DiscoveryReportHtml {
             ($dc.FSMORoles | ForEach-Object { '<span class="tag tag-fsmo">{0}</span>' -f (ConvertTo-HtmlEncoded $_) }) -join ''
         } else { '<span class="muted">None</span>' }
 
-        $rolesHtml = if ($dc.Status -eq 'Error') {
+        $rolesHtml = if ($dc.Status -eq 'Error' -and $dc.Error) {
             '<span class="error-msg">{0}</span>' -f (ConvertTo-HtmlEncoded $dc.Error)
         } elseif ((Get-SafeCount $dc.Roles) -eq 0) {
-            '<span class="muted">None collected</span>'
+            '<span class="muted">None inferred from AD</span>'
         } else {
             ($dc.Roles | ForEach-Object {
                     '<span class="tag tag-role" title="{0}">{1}</span>' -f (ConvertTo-HtmlEncoded $_.Description), (ConvertTo-HtmlEncoded $_.DisplayName)
                 }) -join ''
         }
 
-        $featHtml = if ((Get-SafeCount $dc.Features) -eq 0) {
+        $spnHtml = if ((Get-SafeCount $dc.SPNs) -eq 0) {
             '<span class="muted">None collected</span>'
+        } else {
+            (@($dc.SPNs) | Select-Object -First 20 | ForEach-Object {
+                    '<span class="tag tag-feature">{0}</span>' -f (ConvertTo-HtmlEncoded $_)
+                }) -join ''
+        }
+        if ((Get-SafeCount $dc.SPNs) -gt 20) {
+            $spnHtml += ('<span class="tag">{0} more</span>' -f ((Get-SafeCount $dc.SPNs) - 20))
+        }
+
+        $featHtml = if ((Get-SafeCount $dc.Features) -eq 0) {
+            '<span class="muted">None inferred from AD</span>'
         } else {
             ($dc.Features | ForEach-Object {
                     '<span class="tag tag-feature" title="{0}">{1}</span>' -f (ConvertTo-HtmlEncoded $_.Description), (ConvertTo-HtmlEncoded $_.DisplayName)
@@ -1588,10 +1786,11 @@ function New-DiscoveryReportHtml {
             ($dc.ReplicationPartners.Inbound | ForEach-Object {
                     $failClass = if ($_.ConsecutiveFails -gt 0) { 'repl-bad' } else { 'repl-ok' }
                     $parts = ConvertTo-TextList $_.Partitions
-                    '<div class="repl-row {0}"><strong>{1}</strong> · last success {2} · fails {3} · {4}</div>' -f `
+                    $successText = if ($_.LastSuccess) { 'last success {0}' -f (Format-When $_.LastSuccess) } else { [string]$_.LastResult }
+                    '<div class="repl-row {0}"><strong>{1}</strong> · {2} · fails {3} · {4}</div>' -f `
                         $failClass,
                         (ConvertTo-HtmlEncoded $_.Partner),
-                        (ConvertTo-HtmlEncoded (Format-When $_.LastSuccess)),
+                        (ConvertTo-HtmlEncoded $successText),
                         [int]$_.ConsecutiveFails,
                         (ConvertTo-HtmlEncoded $parts)
                 }) -join ''
@@ -1611,13 +1810,13 @@ function New-DiscoveryReportHtml {
             '<span class="muted">N/A</span>'
         } else {
             ($dc.Services | ForEach-Object {
-                    $cls = if ($_.Status -eq 'Running') { 'svc-on' } else { 'svc-off' }
+                    $cls = if ($_.Status -eq 'Running' -or $_.Status -like 'Advertised*') { 'svc-on' } else { 'svc-off' }
                     '<span class="tag {0}">{1}: {2}</span>' -f $cls, (ConvertTo-HtmlEncoded $_.Name), (ConvertTo-HtmlEncoded $_.Status)
                 }) -join ''
         }
 
         $searchParts = [System.Collections.Generic.List[string]]::new()
-        foreach ($part in @($dc.ComputerName, $dc.HostName, $dc.IPv4Address, $dc.Site, $dc.OperatingSystem, $dc.Status, $dc.CreatedFormatted)) {
+        foreach ($part in @($dc.ComputerName, $dc.HostName, $dc.IPv4Address, $dc.Site, $dc.OperatingSystem, $dc.Status, $dc.CreatedFormatted, $dc.LastLogonFormatted, $dc.Description, $dc.CanonicalName)) {
             if ($part) { [void]$searchParts.Add([string]$part) }
         }
         foreach ($part in @($dc.FSMORoles)) {
@@ -1630,7 +1829,7 @@ function New-DiscoveryReportHtml {
         $searchBlob = ($searchParts.ToArray() -join ' ')
 
         [void]$dcCards.AppendLine(@"
-<article class="dc-card" data-status="$statusClass" data-name="$(ConvertTo-HtmlEncoded $dc.ComputerName)" data-search="$(ConvertTo-HtmlEncoded $searchBlob.ToLowerInvariant())">
+<article class="dc-card" data-status="$statusFilterKey" data-name="$(ConvertTo-HtmlEncoded $dc.ComputerName)" data-search="$(ConvertTo-HtmlEncoded $searchBlob.ToLowerInvariant())">
     <header class="dc-head">
         <div>
             <h3>$(ConvertTo-HtmlEncoded $dc.ComputerName)</h3>
@@ -1647,24 +1846,28 @@ function New-DiscoveryReportHtml {
         <div><span class="lbl">OS</span><span>$(ConvertTo-HtmlEncoded $dc.OperatingSystem)</span></div>
         <div><span class="lbl">Version</span><span>$(ConvertTo-HtmlEncoded $dc.OperatingSystemVersion)</span></div>
         <div><span class="lbl">When created</span><span>$(if ($dc.CreatedFormatted) { ConvertTo-HtmlEncoded $dc.CreatedFormatted } else { 'N/A' })$(if ($dc.CreatedAgeLabel) { ' <span class="muted">({0})</span>' -f (ConvertTo-HtmlEncoded $dc.CreatedAgeLabel) })</span></div>
-        <div><span class="lbl">Last boot</span><span>$(ConvertTo-HtmlEncoded $dc.LastBootTimeFormatted)</span></div>
-        <div><span class="lbl">Uptime</span><span class="uptime">$(ConvertTo-HtmlEncoded $dc.Uptime)</span></div>
-        <div><span class="lbl">Memory</span><span>$(if ($dc.MemoryGB) { "$($dc.MemoryGB) GB" } else { 'N/A' })</span></div>
-        <div><span class="lbl">Time source</span><span>$(ConvertTo-HtmlEncoded $dc.TimeSource)</span></div>
-        <div><span class="lbl">Last hotfix</span><span>$(ConvertTo-HtmlEncoded $dc.LastHotfix)</span></div>
-        <div><span class="lbl">Pending reboot</span><span>$(if ($null -eq $dc.PendingReboot) { 'N/A' } elseif ($dc.PendingReboot) { 'Yes' } else { 'No' })</span></div>
+        <div><span class="lbl">When changed</span><span>$(if ($dc.WhenChangedFormatted) { ConvertTo-HtmlEncoded $dc.WhenChangedFormatted } else { 'N/A' })</span></div>
+        <div><span class="lbl">Last logon (AD)</span><span>$(if ($dc.LastLogonFormatted) { ConvertTo-HtmlEncoded $dc.LastLogonFormatted } else { 'N/A' })$(if ($dc.LastLogonAgeLabel) { ' <span class="muted">({0})</span>' -f (ConvertTo-HtmlEncoded $dc.LastLogonAgeLabel) })</span></div>
+        <div><span class="lbl">Machine password</span><span>$(if ($dc.PasswordLastSetFormatted) { ConvertTo-HtmlEncoded $dc.PasswordLastSetFormatted } else { 'N/A' })$(if ($dc.PasswordAgeLabel) { ' <span class="muted">({0})</span>' -f (ConvertTo-HtmlEncoded $dc.PasswordAgeLabel) })</span></div>
+        <div><span class="lbl">OU</span><span>$(if ($dc.CanonicalName) { ConvertTo-HtmlEncoded $dc.CanonicalName } else { 'N/A' })</span></div>
+        <div><span class="lbl">Description</span><span>$(if ($dc.Description) { ConvertTo-HtmlEncoded $dc.Description } else { 'N/A' })</span></div>
+        <div><span class="lbl">Source</span><span>$(if ($dc.Source) { ConvertTo-HtmlEncoded $dc.Source } else { 'Active Directory' })</span></div>
     </div>
     <section><h4>FSMO roles held</h4><div class="tags">$fsmoHtml</div></section>
-    <section><h4>Replication partners (inbound)</h4><div class="repl">$replHtml</div></section>
-    <section><h4>Disks</h4>$diskHtml</section>
-    <section><h4>Key services</h4><div class="tags">$svcHtml</div></section>
+    <section><h4>Replication partners (from nTDSConnection objects)</h4><div class="repl">$replHtml</div></section>
+    $(if ((Get-SafeCount $dc.Disks) -gt 0) { "<section><h4>Disks</h4>$diskHtml</section>" } else { '' })
+    <section><h4>Directory-advertised services</h4><div class="tags">$svcHtml</div></section>
     <section class="collapsible">
-        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Roles ($(Get-SafeCount $dc.Roles))</h4>
+        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Roles inferred from AD ($(Get-SafeCount $dc.Roles))</h4>
         <div class="collapse-c"><div class="tags">$rolesHtml</div></div>
     </section>
     <section class="collapsible">
-        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Features ($(Get-SafeCount $dc.Features))</h4>
+        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Extra features inferred ($(Get-SafeCount $dc.Features))</h4>
         <div class="collapse-c"><div class="tags">$featHtml</div></div>
+    </section>
+    <section class="collapsible">
+        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Service principal names ($(Get-SafeCount $dc.SPNs))</h4>
+        <div class="collapse-c"><div class="tags">$spnHtml</div></div>
     </section>
 </article>
 "@)
@@ -1681,8 +1884,8 @@ function New-DiscoveryReportHtml {
     <td>$(ConvertTo-HtmlEncoded $dc.Site)</td>
     <td>$(ConvertTo-HtmlEncoded $dc.OperatingSystem)</td>
     <td>$(if ($dc.CreatedFormatted) { ConvertTo-HtmlEncoded $dc.CreatedFormatted } else { 'N/A' })</td>
-    <td>$(ConvertTo-HtmlEncoded $dc.LastBootTimeFormatted)</td>
-    <td>$(ConvertTo-HtmlEncoded $dc.Uptime)</td>
+    <td>$(if ($dc.LastLogonFormatted) { ConvertTo-HtmlEncoded $dc.LastLogonFormatted } else { 'N/A' })</td>
+    <td>$(if ($dc.PasswordLastSetFormatted) { ConvertTo-HtmlEncoded $dc.PasswordLastSetFormatted } else { 'N/A' })</td>
     <td>$(ConvertTo-HtmlEncoded $fsmoList)</td>
     <td>$(ConvertTo-HtmlEncoded $replList)</td>
 </tr>
@@ -1731,7 +1934,11 @@ function New-DiscoveryReportHtml {
     }
 
     $failRows = if ((Get-SafeCount $Report.ReplicationFailures) -eq 0) {
-        '<tr><td colspan="6" class="muted">No domain-scope replication failures returned. That is good — still read partner last-success times on each DC card.</td></tr>'
+        if ($Report.CollectionMode -eq 'AD + WinRM') {
+            '<tr><td colspan="6" class="muted">No domain-scope replication failures returned. That is good — still read partner last-success times on each DC card.</td></tr>'
+        } else {
+            '<tr><td colspan="6" class="muted">Live replication-failure counters live on each DC and were not queried. Inbound partners on DC cards come from nTDSConnection objects in the configuration partition.</td></tr>'
+        }
     } else {
         (@($Report.ReplicationFailures) | ForEach-Object {
                 '<tr><td>{0}</td><td>{1}</td><td>{2}</td><td>{3}</td><td>{4}</td><td>{5}</td></tr>' -f `
@@ -1834,7 +2041,7 @@ function New-DiscoveryReportHtml {
     }
 
     $roleRows = if ($allRoles.Count -eq 0) {
-        '<tr><td colspan="4" class="muted">No installed roles collected. Use a privileged WinRM session or omit -SkipRemoteQueries.</td></tr>'
+        '<tr><td colspan="4" class="muted">No roles were inferred from AD (GC/RODC flags, DNS SPNs, AD CS, or DHCP registration).</td></tr>'
     } else {
         ($allRoles.Values | Sort-Object DisplayName | ForEach-Object {
                 '<tr><td><strong>{0}</strong><br><small class="muted">{1}</small></td><td>{2} / {3}</td><td>{4}</td><td class="desc">{5}</td></tr>' -f `
@@ -1846,7 +2053,7 @@ function New-DiscoveryReportHtml {
     }
 
     $featureRows = if ($allFeatures.Count -eq 0) {
-        '<tr><td colspan="4" class="muted">No installed features collected.</td></tr>'
+        '<tr><td colspan="4" class="muted">No extra features were inferred from SPNs (RDS, SQL, and similar).</td></tr>'
     } else {
         ($allFeatures.Values | Sort-Object DisplayName | ForEach-Object {
                 '<tr><td><strong>{0}</strong><br><small class="muted">{1}</small></td><td>{2}</td><td>{3} / {4}</td><td>{5}</td></tr>' -f `
@@ -1875,8 +2082,12 @@ function New-DiscoveryReportHtml {
     }
 
     $modeNote = if ($Report.Mode -eq 'OfflineDemo') {
-        '<div class="banner">Offline demo data — fictional Northwind Lab forest. Run without -OfflineDemo on a domain-joined box to scan a real environment.</div>'
-    } else { '' }
+        '<div class="banner">Offline demo data — fictional Northwind Lab forest. All DC facts here are modeled as Active Directory attributes (no WinRM). Run without -OfflineDemo on a domain-joined box to scan a real environment.</div>'
+    } elseif ($Report.CollectionMode -eq 'AD + WinRM') {
+        '<div class="banner">Collection mode: Active Directory plus WinRM to each DC. Live disks, services, and installed Windows features are mixed with directory attributes.</div>'
+    } else {
+        '<div class="banner">Collection mode: Active Directory only (LDAP/ADWS). This report does not connect to DCs over WinRM. Roles are inferred from GC/RODC flags, SPNs, and configuration-partition registrations (AD CS, DHCP). Last logon is lastLogonTimestamp — not boot time.</div>'
+    }
 
     $krb = $Report.Krbtgt
     $krbHtml = if ($krb) {
@@ -1906,17 +2117,22 @@ function New-DiscoveryReportHtml {
     }
 
     $chartDc = [System.Collections.Generic.List[object]]::new()
-    foreach ($st in @('Online', 'Error', 'Skipped')) {
-        $set = @($dcs | Where-Object { $_.Status -eq $st })
+    $dcChartGroups = @(
+        @{ Key = 'enabled'; Label = 'Enabled in AD'; Statuses = @('Enabled', 'Directory', 'Online'); Color = '#10b981' }
+        @{ Key = 'disabled'; Label = 'Disabled'; Statuses = @('Disabled'); Color = '#e11d48' }
+        @{ Key = 'error'; Label = 'WinRM error'; Statuses = @('Error'); Color = '#e11d48' }
+        @{ Key = 'skipped'; Label = 'Skipped'; Statuses = @('Skipped'); Color = '#f59e0b' }
+    )
+    foreach ($group in $dcChartGroups) {
+        $set = @($dcs | Where-Object { $_.Status -in $group.Statuses })
         if ($set.Count -eq 0) { continue }
-        $color = switch ($st) { 'Online' { '#10b981' } 'Error' { '#e11d48' } default { '#f59e0b' } }
         $items = @(
             $set | ForEach-Object {
-                New-ChartItem -Title $_.ComputerName -Subtitle $_.Status -Detail ('{0} · {1} · {2} · created {3}' -f $_.IPv4Address, $_.Site, $_.OperatingSystem, $(if ($_.CreatedFormatted) { $_.CreatedFormatted } else { 'N/A' })) -Tab 'dcs' -Filter ('dc:{0}' -f $st.ToLowerInvariant())
+                New-ChartItem -Title $_.ComputerName -Subtitle $_.Status -Detail ('{0} · {1} · {2} · created {3}' -f $_.IPv4Address, $_.Site, $_.OperatingSystem, $(if ($_.CreatedFormatted) { $_.CreatedFormatted } else { 'N/A' })) -Tab 'dcs' -Filter ('dc:{0}' -f $group.Key)
             }
         )
         [void]$chartDc.Add([ordered]@{
-                key = $st.ToLowerInvariant(); label = $st; value = $set.Count; color = $color; items = $items
+                key = $group.Key; label = $group.Label; value = $set.Count; color = $group.Color; items = $items
             })
     }
 
@@ -2008,7 +2224,7 @@ function New-DiscoveryReportHtml {
             $display = $_.DisplayName
             $installed = @($_.InstalledOn)
             $items = @(
-                $installed | ForEach-Object { New-ChartItem -Title $_ -Subtitle $display -Detail 'Role is installed on this DC.' -Tab 'dcs' -Filter ('dcname:{0}' -f $_) }
+                $installed | ForEach-Object { New-ChartItem -Title $_ -Subtitle $display -Detail 'Role is advertised on this DC in Active Directory.' -Tab 'dcs' -Filter ('dcname:{0}' -f $_) }
             )
             [ordered]@{ key = $display; label = $display; value = $installed.Count; color = '#8b5cf6'; items = $items }
         }
@@ -2538,7 +2754,7 @@ $css
     <header class="topbar">
       <div>
         <h2>$domainName</h2>
-        <p>Forest $forestName · Generated $gen · $($Report.Mode)</p>
+        <p>Forest $forestName · Generated $gen · $($Report.Mode)$(if ($Report.CollectionMode) { ' · {0}' -f $Report.CollectionMode })</p>
       </div>
     </header>
     <div class="content">
@@ -2548,8 +2764,8 @@ $css
     $(New-LearnBox 'Start on the charts' 'This dashboard is the map of the domain you just inherited. Click a pie slice, bar, legend item, or KPI tile. A drawer lists the underlying objects; click a row to jump to that section.')
     <div class="kpis">
       <button class="kpi" type="button" data-open-chart="dcStatus"><div class="n">$(Get-SafeCount $dcs)</div><div class="l">Domain controllers</div></button>
-      <button class="kpi good" type="button" data-open-chart="dcStatus" data-open-slice="online"><div class="n">$onlineDCs</div><div class="l">Online / queried</div></button>
-      <button class="kpi crit" type="button" data-open-chart="dcStatus" data-open-slice="error"><div class="n">$errorDCs</div><div class="l">Unreachable</div></button>
+      <button class="kpi good" type="button" data-open-chart="dcStatus" data-open-slice="enabled"><div class="n">$onlineDCs</div><div class="l">Enabled in AD</div></button>
+      <button class="kpi crit" type="button" data-open-chart="dcStatus" data-open-slice="disabled"><div class="n">$disabledDCs</div><div class="l">Disabled accounts</div></button>
       <button class="kpi fsmo" type="button" data-open-chart="fsmo"><div class="n">5</div><div class="l">FSMO roles</div></button>
       <button class="kpi crit" type="button" data-open-chart="findings" data-open-slice="critical"><div class="n">$crit</div><div class="l">Critical findings</div></button>
       <button class="kpi warn" type="button" data-open-chart="findings" data-open-slice="warning"><div class="n">$warn</div><div class="l">Warnings</div></button>
@@ -2653,13 +2869,13 @@ $css
       <div class="table-wrap"><table><thead><tr><th>Name</th><th>Cost</th><th>Interval (min)</th><th>Transport</th><th>Sites</th></tr></thead><tbody>$linkRows</tbody></table></div>
     </div>
     <div class="card">
-      <h2>Replication failures (domain scope)</h2>
+      <h2>Replication failures</h2>
       <div class="table-wrap"><table><thead><tr><th>Server</th><th>Partner</th><th>Type</th><th>First failure</th><th>Count</th><th>Last error</th></tr></thead><tbody>$failRows</tbody></table></div>
     </div>
   </section>
 
   <section id="dcs" class="panel">
-    $(New-LearnBox 'A DC is more than "online"' 'Uptime is not a virtue if patches are pending. Time source should chain to the PDC Emulator. Disks under 15% free are an outage waiting to happen. Inbound partners with consecutive failures mean this DC is drifting.')
+    $(New-LearnBox 'Read the computer object, not the OS' 'whenCreated is how old this DC is. lastLogonTimestamp is last contact with a DC that replicated the stamp — not boot time. pwdLastSet should rotate about every 30 days. SPNs and nTDSConnection objects tell you what the directory thinks this DC does, without logging on to it.')
     <div class="chart-grid">
       <div class="chart-card"><h3>Controller status</h3><p class="chart-hint">Click a slice to show only those DCs</p><div class="chart-box" data-chart="dcStatus"></div></div>
       <div class="chart-card"><h3>Roles on these DCs</h3><p class="chart-hint">Click a role to see which DC has it</p><div class="chart-box" data-chart="roles"></div></div>
@@ -2667,9 +2883,9 @@ $css
     <div class="controls">
       <input class="search" id="dcSearch" placeholder="Search name, IP, site, OS, FSMO, role, or feature...">
       <button class="filter active" data-dc-filter="all">All</button>
-      <button class="filter" data-dc-filter="online">Online</button>
+      <button class="filter" data-dc-filter="enabled">Enabled</button>
+      <button class="filter" data-dc-filter="disabled">Disabled</button>
       <button class="filter" data-dc-filter="error">Errors</button>
-      <button class="filter" data-dc-filter="skipped">Skipped</button>
     </div>
     <div class="dc-grid">
       $($dcCards.ToString())
@@ -2679,7 +2895,7 @@ $css
       <div class="controls"><input class="search" id="cmpSearch" placeholder="Filter comparison rows..."></div>
       <div class="table-wrap">
         <table id="cmpTable">
-          <thead><tr><th>Server</th><th>Status</th><th>IP</th><th>Site</th><th>OS</th><th>When created</th><th>Last boot</th><th>Uptime</th><th>FSMO</th><th>Inbound partners</th></tr></thead>
+          <thead><tr><th>Server</th><th>Status</th><th>IP</th><th>Site</th><th>OS</th><th>When created</th><th>Last logon (AD)</th><th>Machine password</th><th>FSMO</th><th>Inbound partners</th></tr></thead>
           <tbody>$($cmpRows.ToString())</tbody>
         </table>
       </div>
@@ -2756,7 +2972,7 @@ $css
   </section>
 
   <section id="roles" class="panel">
-    $(New-LearnBox 'Installed roles tell you what else these DCs are doing' 'A DC that is also DHCP, CA, or RDS is a concentration-of-risk problem. Compare roles across DCs — drift is how "only DC02 has the thing" incidents start.')
+    $(New-LearnBox 'Roles here are inferred from Active Directory' 'GC and RODC flags, DNS SPNs, and AD CS / DHCP objects in the configuration partition. This is not Get-WindowsFeature. A DC that is also DHCP or CA is still a concentration-of-risk problem — confirm on the host when you can.')
     <div class="chart-grid">
       <div class="chart-card"><h3>Top installed roles</h3><p class="chart-hint">Click a bar to see the DCs that have it</p><div class="chart-box" data-chart="roles"></div></div>
     </div>
@@ -2773,7 +2989,7 @@ $css
   </section>
 
   <footer>
-    <p>AD Domain Discovery Report v2.1 · Execution time $($Report.ExecTime) · Stale threshold $($Report.StaleDays) days</p>
+    <p>AD Domain Discovery Report v2.2 · $(if ($Report.CollectionMode) { $Report.CollectionMode } else { $Report.Mode }) · Execution time $($Report.ExecTime) · Stale threshold $($Report.StaleDays) days</p>
     <p>Read-only discovery. This script does not change AD. Validate privileged-group counts before you act.</p>
   </footer>
     </div>
@@ -2841,45 +3057,54 @@ function New-OfflineDemoReport {
     $fsmo = Get-FSMORoleTable -ForestInfo $identity
 
     $dc1Roles = @(
-        [pscustomobject]@{ Name = 'AD-Domain-Services'; DisplayName = 'Active Directory Domain Services'; Description = 'Store directory data and manage communication between users and domains.'; FeatureType = 'Role' }
-        [pscustomobject]@{ Name = 'DNS'; DisplayName = 'DNS Server'; Description = 'Domain Name System server.'; FeatureType = 'Role' }
-        [pscustomobject]@{ Name = 'DHCP'; DisplayName = 'DHCP Server'; Description = 'Dynamic Host Configuration Protocol server.'; FeatureType = 'Role' }
+        (New-InferredComponent 'AD-Domain-Services' 'Active Directory Domain Services' 'Inferred from the domain controller object in AD.')
+        (New-InferredComponent 'GlobalCatalog' 'Global Catalog' 'Inferred from IsGlobalCatalog on the DC object.')
+        (New-InferredComponent 'DNS' 'DNS Server' 'Inferred from DNS/ service principal names on the computer account.')
+        (New-InferredComponent 'DHCP' 'DHCP Server' 'Inferred: this host is registered in AD as a DHCP server.')
     )
     $dc1Feats = @(
-        [pscustomobject]@{ Name = 'RSAT-AD-PowerShell'; DisplayName = 'Active Directory module for Windows PowerShell'; Description = 'AD PowerShell'; FeatureType = 'Feature' }
-        [pscustomobject]@{ Name = 'GPMC'; DisplayName = 'Group Policy Management'; Description = 'GPO admin console'; FeatureType = 'Feature' }
+        (New-InferredComponent 'RDS-RD-Server' 'Remote Desktop Services' 'Inferred from TERMSRV/ SPNs.' 'Feature')
     )
     $dc2Roles = @(
-        [pscustomobject]@{ Name = 'AD-Domain-Services'; DisplayName = 'Active Directory Domain Services'; Description = 'Store directory data and manage communication between users and domains.'; FeatureType = 'Role' }
-        [pscustomobject]@{ Name = 'DNS'; DisplayName = 'DNS Server'; Description = 'Domain Name System server.'; FeatureType = 'Role' }
-        [pscustomobject]@{ Name = 'ADCS-Cert-Authority'; DisplayName = 'Active Directory Certificate Services'; Description = 'Enterprise CA.'; FeatureType = 'Role' }
+        (New-InferredComponent 'AD-Domain-Services' 'Active Directory Domain Services' 'Inferred from the domain controller object in AD.')
+        (New-InferredComponent 'GlobalCatalog' 'Global Catalog' 'Inferred from IsGlobalCatalog on the DC object.')
+        (New-InferredComponent 'DNS' 'DNS Server' 'Inferred from DNS/ service principal names on the computer account.')
+        (New-InferredComponent 'ADCS-Cert-Authority' 'Active Directory Certificate Services' "Inferred: enterprise CA 'NW-CA' is registered on this host in AD.")
+    )
+    $rodcRoles = @(
+        (New-InferredComponent 'AD-Domain-Services' 'Active Directory Domain Services' 'Inferred from the domain controller object in AD.')
+        (New-InferredComponent 'GlobalCatalog' 'Global Catalog' 'Inferred from IsGlobalCatalog on the DC object.')
+        (New-InferredComponent 'RODC' 'Read-Only Domain Controller' 'Inferred from IsReadOnly on the DC object.')
+        (New-InferredComponent 'DNS' 'DNS Server' 'Inferred from DNS/ service principal names on the computer account.')
     )
 
     $dcs = @(
         [pscustomobject]@{
             ComputerName = 'NW-DC01'; HostName = 'NW-DC01.northwind.lab'; IPv4Address = '10.10.10.11'; Site = 'HQ-Chicago'
             OperatingSystem = 'Windows Server 2022 Standard'; OperatingSystemVersion = '10.0 (20348)'
-            IsGlobalCatalog = $true; IsReadOnly = $false; Status = 'Online'
+            IsGlobalCatalog = $true; IsReadOnly = $false; Enabled = $true; Status = 'Enabled'
             Roles = $dc1Roles; Features = $dc1Feats
             FSMORoles = @('Schema Master', 'Domain Naming Master', 'PDC Emulator', 'RID Master', 'Infrastructure Master')
-            LastBootTime = $now.AddDays(-42); LastBootTimeFormatted = Format-When $now.AddDays(-42); Uptime = '42d 3h 12m'
             Created = $now.AddYears(-8); CreatedFormatted = Format-When $now.AddYears(-8); CreatedAgeDays = Format-AgeDays $now.AddYears(-8); CreatedAgeLabel = Format-AgeLabel $now.AddYears(-8)
-            MemoryGB = 16
-            Disks = @([pscustomobject]@{ DeviceID = 'C:'; SizeGB = 127; FreeGB = 14.2 }, [pscustomobject]@{ DeviceID = 'D:'; SizeGB = 80; FreeGB = 41 })
-            TimeSource = 'time.windows.com'
+            WhenChangedFormatted = Format-When $now.AddHours(-6)
+            LastLogonFormatted = Format-When $now.AddHours(-2); LastLogonAgeLabel = Format-AgeLabel $now.AddHours(-2)
+            PasswordLastSetFormatted = Format-When $now.AddDays(-18); PasswordAgeDays = 18; PasswordAgeLabel = Format-AgeLabel $now.AddDays(-18)
+            Description = 'Hub DC and FSMO holder'
+            CanonicalName = 'northwind.lab/Domain Controllers/NW-DC01'
+            SPNs = @('HOST/NW-DC01', 'HOST/NW-DC01.northwind.lab', 'LDAP/NW-DC01.northwind.lab', 'DNS/NW-DC01.northwind.lab', 'GC/NW-DC01.northwind.lab/northwind.lab', 'TERMSRV/NW-DC01.northwind.lab')
+            Disks = @(); PendingReboot = $null; Error = $null; ReplicationError = $null
+            Source = 'Active Directory'
             Services = @(
-                [pscustomobject]@{ Name = 'NTDS'; Status = 'Running' }
-                [pscustomobject]@{ Name = 'DNS'; Status = 'Running' }
-                [pscustomobject]@{ Name = 'KDC'; Status = 'Running' }
-                [pscustomobject]@{ Name = 'DFSR'; Status = 'Running' }
-                [pscustomobject]@{ Name = 'W32Time'; Status = 'Running' }
-                [pscustomobject]@{ Name = 'DHCPServer'; Status = 'Running' }
+                [pscustomobject]@{ Name = 'NTDS'; DisplayName = 'AD DS'; Status = 'Advertised in AD' }
+                [pscustomobject]@{ Name = 'KDC'; DisplayName = 'Kerberos KDC'; Status = 'Advertised in AD' }
+                [pscustomobject]@{ Name = 'GC'; DisplayName = 'Global Catalog'; Status = 'Advertised in AD' }
+                [pscustomobject]@{ Name = 'DNS'; DisplayName = 'DNS Server'; Status = 'Advertised in AD' }
+                [pscustomobject]@{ Name = 'DHCPServer'; DisplayName = 'DHCP Server'; Status = 'Advertised in AD' }
             )
-            LastHotfix = 'KB5044281 (2026-09-10)'; PendingReboot = $true; Error = $null; ReplicationError = $null
             ReplicationPartners = @{
                 Inbound = @(
-                    [pscustomobject]@{ Partner = 'NW-DC02'; LastSuccess = $now.AddMinutes(-18); ConsecutiveFails = 0; LastResult = '0'; Partitions = @('northwind', 'Configuration', 'Schema') }
-                    [pscustomobject]@{ Partner = 'NW-RODC01'; LastSuccess = $now.AddHours(-3); ConsecutiveFails = 4; LastResult = '1722'; Partitions = @('northwind') }
+                    [pscustomobject]@{ Partner = 'NW-DC02'; LastSuccess = $null; ConsecutiveFails = 0; LastResult = 'Configured in AD'; Partitions = @('nTDSConnection') }
+                    [pscustomobject]@{ Partner = 'NW-RODC01'; LastSuccess = $null; ConsecutiveFails = 0; LastResult = 'Configured in AD'; Partitions = @('nTDSConnection') }
                 )
                 Connections = @()
             }
@@ -2887,25 +3112,28 @@ function New-OfflineDemoReport {
         [pscustomobject]@{
             ComputerName = 'NW-DC02'; HostName = 'NW-DC02.northwind.lab'; IPv4Address = '10.20.20.11'; Site = 'Plant-Austin'
             OperatingSystem = 'Windows Server 2019 Standard'; OperatingSystemVersion = '10.0 (17763)'
-            IsGlobalCatalog = $true; IsReadOnly = $false; Status = 'Online'
+            IsGlobalCatalog = $true; IsReadOnly = $false; Enabled = $true; Status = 'Enabled'
             Roles = $dc2Roles; Features = @()
             FSMORoles = @()
-            LastBootTime = $now.AddDays(-120); LastBootTimeFormatted = Format-When $now.AddDays(-120); Uptime = '120d 6h 1m'
             Created = $now.AddYears(-5); CreatedFormatted = Format-When $now.AddYears(-5); CreatedAgeDays = Format-AgeDays $now.AddYears(-5); CreatedAgeLabel = Format-AgeLabel $now.AddYears(-5)
-            MemoryGB = 12
-            Disks = @([pscustomobject]@{ DeviceID = 'C:'; SizeGB = 100; FreeGB = 22 })
-            TimeSource = 'NW-DC01.northwind.lab'
+            WhenChangedFormatted = Format-When $now.AddHours(-8)
+            LastLogonFormatted = Format-When $now.AddHours(-4); LastLogonAgeLabel = Format-AgeLabel $now.AddHours(-4)
+            PasswordLastSetFormatted = Format-When $now.AddDays(-25); PasswordAgeDays = 25; PasswordAgeLabel = Format-AgeLabel $now.AddDays(-25)
+            Description = 'Austin plant DC / enterprise CA'
+            CanonicalName = 'northwind.lab/Domain Controllers/NW-DC02'
+            SPNs = @('HOST/NW-DC02', 'HOST/NW-DC02.northwind.lab', 'LDAP/NW-DC02.northwind.lab', 'DNS/NW-DC02.northwind.lab', 'GC/NW-DC02.northwind.lab/northwind.lab')
+            Disks = @(); PendingReboot = $null; Error = $null; ReplicationError = $null
+            Source = 'Active Directory'
             Services = @(
-                [pscustomobject]@{ Name = 'NTDS'; Status = 'Running' }
-                [pscustomobject]@{ Name = 'DNS'; Status = 'Running' }
-                [pscustomobject]@{ Name = 'KDC'; Status = 'Running' }
-                [pscustomobject]@{ Name = 'DFSR'; Status = 'Running' }
-                [pscustomobject]@{ Name = 'CertSvc'; Status = 'Running' }
+                [pscustomobject]@{ Name = 'NTDS'; DisplayName = 'AD DS'; Status = 'Advertised in AD' }
+                [pscustomobject]@{ Name = 'KDC'; DisplayName = 'Kerberos KDC'; Status = 'Advertised in AD' }
+                [pscustomobject]@{ Name = 'GC'; DisplayName = 'Global Catalog'; Status = 'Advertised in AD' }
+                [pscustomobject]@{ Name = 'DNS'; DisplayName = 'DNS Server'; Status = 'Advertised in AD' }
+                [pscustomobject]@{ Name = 'CertSvc'; DisplayName = 'AD CS'; Status = 'Advertised in AD' }
             )
-            LastHotfix = 'KB5035849 (2025-11-02)'; PendingReboot = $false; Error = $null; ReplicationError = $null
             ReplicationPartners = @{
                 Inbound = @(
-                    [pscustomobject]@{ Partner = 'NW-DC01'; LastSuccess = $now.AddMinutes(-16); ConsecutiveFails = 0; LastResult = '0'; Partitions = @('northwind', 'Configuration', 'Schema') }
+                    [pscustomobject]@{ Partner = 'NW-DC01'; LastSuccess = $null; ConsecutiveFails = 0; LastResult = 'Configured in AD'; Partitions = @('nTDSConnection') }
                 )
                 Connections = @()
             }
@@ -2913,15 +3141,28 @@ function New-OfflineDemoReport {
         [pscustomobject]@{
             ComputerName = 'NW-RODC01'; HostName = 'NW-RODC01.northwind.lab'; IPv4Address = '10.30.30.11'; Site = 'Plant-Austin'
             OperatingSystem = 'Windows Server 2019 Standard'; OperatingSystemVersion = '10.0 (17763)'
-            IsGlobalCatalog = $true; IsReadOnly = $true; Status = 'Error'
-            Roles = @(); Features = @(); FSMORoles = @()
-            LastBootTime = $null; LastBootTimeFormatted = 'N/A'; Uptime = 'N/A'; MemoryGB = $null; Disks = @()
+            IsGlobalCatalog = $true; IsReadOnly = $true; Enabled = $true; Status = 'Enabled'
+            Roles = $rodcRoles; Features = @(); FSMORoles = @()
             Created = $now.AddYears(-3); CreatedFormatted = Format-When $now.AddYears(-3); CreatedAgeDays = Format-AgeDays $now.AddYears(-3); CreatedAgeLabel = Format-AgeLabel $now.AddYears(-3)
-            TimeSource = 'N/A'; Services = @(); LastHotfix = 'N/A'; PendingReboot = $null
-            Error = 'WinRM cannot complete the operation. Verify the computer is up and WinRM is configured.'
-            ReplicationError = $null
+            WhenChangedFormatted = Format-When $now.AddDays(-2)
+            LastLogonFormatted = Format-When $now.AddDays(-2); LastLogonAgeLabel = Format-AgeLabel $now.AddDays(-2)
+            PasswordLastSetFormatted = Format-When $now.AddDays(-95); PasswordAgeDays = 95; PasswordAgeLabel = Format-AgeLabel $now.AddDays(-95)
+            Description = 'Read-only DC for the plant floor'
+            CanonicalName = 'northwind.lab/Domain Controllers/NW-RODC01'
+            SPNs = @('HOST/NW-RODC01', 'HOST/NW-RODC01.northwind.lab', 'LDAP/NW-RODC01.northwind.lab', 'DNS/NW-RODC01.northwind.lab', 'GC/NW-RODC01.northwind.lab/northwind.lab', 'RestrictedKrbHost/NW-RODC01')
+            Disks = @(); PendingReboot = $null; Error = $null; ReplicationError = $null
+            Source = 'Active Directory'
+            Services = @(
+                [pscustomobject]@{ Name = 'NTDS'; DisplayName = 'AD DS'; Status = 'Advertised in AD' }
+                [pscustomobject]@{ Name = 'KDC'; DisplayName = 'Kerberos KDC'; Status = 'Advertised in AD' }
+                [pscustomobject]@{ Name = 'GC'; DisplayName = 'Global Catalog'; Status = 'Advertised in AD' }
+                [pscustomobject]@{ Name = 'DNS'; DisplayName = 'DNS Server'; Status = 'Advertised in AD' }
+            )
             ReplicationPartners = @{
-                Inbound = @()
+                Inbound = @(
+                    [pscustomobject]@{ Partner = 'NW-DC01'; LastSuccess = $null; ConsecutiveFails = 0; LastResult = 'Configured in AD'; Partitions = @('nTDSConnection') }
+                    [pscustomobject]@{ Partner = 'NW-DC02'; LastSuccess = $null; ConsecutiveFails = 0; LastResult = 'Configured in AD'; Partitions = @('nTDSConnection') }
+                )
                 Connections = @()
             }
         }
@@ -2982,6 +3223,7 @@ function New-OfflineDemoReport {
         GeneratedAt          = $now
         ExecTime             = '00:00.000'
         Mode                 = 'OfflineDemo'
+        CollectionMode       = 'Active Directory'
         StaleDays            = 90
         MaxInventoryObjects  = 8000
         Identity             = $identity
@@ -2994,12 +3236,7 @@ function New-OfflineDemoReport {
             }
         )
         DomainControllers    = $dcs
-        ReplicationFailures  = @(
-            [pscustomobject]@{
-                Server = 'NW-DC01'; Partner = 'NW-RODC01'; FailureType = 'Connection'; FirstFailureTime = $now.AddHours(-3)
-                FailureCount = 4; LastErrorDesc = 'RPC server unavailable (1722)'
-            }
-        )
+        ReplicationFailures  = @()
         PasswordPolicy       = [pscustomobject]@{
             Default = [pscustomobject]@{
                 ComplexityEnabled = $true; MinPasswordLength = 8; MinPasswordAgeDays = 1; MaxPasswordAgeDays = 90
@@ -3063,7 +3300,7 @@ function New-OfflineDemoReport {
         }
         Findings             = @()
         Warnings             = @(
-            [pscustomobject]@{ Area = 'Demo'; Message = 'This report is generated from built-in sample data. No directory was queried.' }
+            [pscustomobject]@{ Area = 'Demo'; Message = 'This report is generated from built-in sample data modeled as Active Directory attributes. No directory was queried and no DC was contacted over WinRM.' }
         )
     }
 
@@ -3131,6 +3368,12 @@ function Invoke-LiveDiscovery {
     Write-ReportLog ("Forest {0} / domain {1}" -f $identity.ForestName, $identity.DomainName) 'SUCCESS'
 
     $fsmo = Get-FSMORoleTable -ForestInfo $identity
+    if ($script:QueryDcsRemotely) {
+        Write-ReportLog 'IncludeRemoteQueries is on — will WinRM into each DC for OS health.' 'WARN'
+    } else {
+        Write-ReportLog 'AD-only mode: DCs are not contacted over WinRM. Roles and partners come from the directory.' 'INFO'
+    }
+
     Write-ReportLog 'Retrieving domain controllers...' 'STEP'
     $dcList = Get-AllDomainControllers -Ad $Ad
     if ((Get-SafeCount $dcList) -eq 0) {
@@ -3138,7 +3381,7 @@ function Invoke-LiveDiscovery {
     }
     Write-ReportLog ("Found {0} domain controller(s)" -f $dcList.Count) 'SUCCESS'
 
-    Write-ReportLog 'Querying each DC (replication, roles, health)...' 'STEP'
+    Write-ReportLog 'Building each DC record from Active Directory...' 'STEP'
     $dcRecords = @()
     foreach ($dc in $dcList) {
         try {
@@ -3164,11 +3407,13 @@ function Invoke-LiveDiscovery {
     Write-ReportLog 'Collecting GPOs, OUs, and directory services...' 'STEP'
     $gpoOu = Get-GpoAndOuInfo -Ad $Ad -DomainDN $identity.DomainDN -DomainName $identity.DomainName
     $services = Get-DirectoryServicesInfo -Ad $Ad -ConfigNC $identity.ConfigurationNC -SchemaNC $identity.SchemaNC -DomainDN $identity.DomainDN
+    Add-DirectoryServiceRolesToDcs -DcRecords $dcRecords -Services $services
 
     $report = [pscustomobject]@{
         GeneratedAt         = Get-Date
         ExecTime            = ''
         Mode                = 'Live'
+        CollectionMode      = if ($script:QueryDcsRemotely) { 'AD + WinRM' } else { 'Active Directory' }
         StaleDays           = $StaleDays
         MaxInventoryObjects = $MaxInventoryObjects
         Identity            = $identity
@@ -3194,8 +3439,13 @@ $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 Write-Host ''
 Write-Host '==============================================' -ForegroundColor Green
-Write-Host '  AD Domain Discovery Report v2.1' -ForegroundColor Green
+Write-Host '  AD Domain Discovery Report v2.2' -ForegroundColor Green
 Write-Host '==============================================' -ForegroundColor Green
+if ($script:QueryDcsRemotely) {
+    Write-Host '  Collection: Active Directory + WinRM to each DC' -ForegroundColor Yellow
+} else {
+    Write-Host '  Collection: Active Directory only (no WinRM to DCs)' -ForegroundColor Cyan
+}
 Write-Host ''
 
 $script:Credential = $Credential

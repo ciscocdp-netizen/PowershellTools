@@ -210,11 +210,11 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
     <header class="topbar">
       <div>
         <h2>northwind.lab</h2>
-        <p>Forest northwind.lab · Generated 2026-10-27 13:09 · OfflineDemo</p>
+        <p>Forest northwind.lab · Generated 2026-10-27 13:17 · OfflineDemo · Active Directory</p>
       </div>
     </header>
     <div class="content">
-  <div class="banner">Offline demo data — fictional Northwind Lab forest. Run without -OfflineDemo on a domain-joined box to scan a real environment.</div>
+  <div class="banner">Offline demo data — fictional Northwind Lab forest. All DC facts here are modeled as Active Directory attributes (no WinRM). Run without -OfflineDemo on a domain-joined box to scan a real environment.</div>
 
   <section id="brief" class="panel active">
     <div class="learn">
@@ -223,12 +223,12 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
 </div>
     <div class="kpis">
       <button class="kpi" type="button" data-open-chart="dcStatus"><div class="n">3</div><div class="l">Domain controllers</div></button>
-      <button class="kpi good" type="button" data-open-chart="dcStatus" data-open-slice="online"><div class="n">2</div><div class="l">Online / queried</div></button>
-      <button class="kpi crit" type="button" data-open-chart="dcStatus" data-open-slice="error"><div class="n">1</div><div class="l">Unreachable</div></button>
+      <button class="kpi good" type="button" data-open-chart="dcStatus" data-open-slice="enabled"><div class="n">3</div><div class="l">Enabled in AD</div></button>
+      <button class="kpi crit" type="button" data-open-chart="dcStatus" data-open-slice="disabled"><div class="n">0</div><div class="l">Disabled accounts</div></button>
       <button class="kpi fsmo" type="button" data-open-chart="fsmo"><div class="n">5</div><div class="l">FSMO roles</div></button>
-      <button class="kpi crit" type="button" data-open-chart="findings" data-open-slice="critical"><div class="n">1</div><div class="l">Critical findings</div></button>
-      <button class="kpi warn" type="button" data-open-chart="findings" data-open-slice="warning"><div class="n">10</div><div class="l">Warnings</div></button>
-      <button class="kpi" type="button" data-open-chart="roles"><div class="n">4</div><div class="l">Unique roles</div></button>
+      <button class="kpi crit" type="button" data-open-chart="findings" data-open-slice="critical"><div class="n">0</div><div class="l">Critical findings</div></button>
+      <button class="kpi warn" type="button" data-open-chart="findings" data-open-slice="warning"><div class="n">7</div><div class="l">Warnings</div></button>
+      <button class="kpi" type="button" data-open-chart="roles"><div class="n">6</div><div class="l">Unique roles</div></button>
       <button class="kpi" type="button" data-open-chart="users"><div class="n">412</div><div class="l">Enabled users</div></button>
     </div>
     <div class="chart-grid">
@@ -251,21 +251,21 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
       </ol>
     </div>
     <div class="controls">
-      <button class="filter active" data-find-filter="all">All (21)</button>
-      <button class="filter" data-find-filter="critical">Critical (1)</button>
-      <button class="filter" data-find-filter="warning">Warning (10)</button>
+      <button class="filter active" data-find-filter="all">All (17)</button>
+      <button class="filter" data-find-filter="critical">Critical (0)</button>
+      <button class="filter" data-find-filter="warning">Warning (7)</button>
       <button class="filter" data-find-filter="info">Info (10)</button>
       <button class="filter" data-find-filter="good">Good (0)</button>
     </div>
-    <article class="finding sev-warning" data-sev="warning">
+    <article class="finding sev-info" data-sev="info">
     <div class="finding-head">
-        <span class="sev-pill sev-warning">Warning</span>
+        <span class="sev-pill sev-info">Info</span>
         <span class="finding-area">Availability</span>
-        <h3>1 DC(s) could not be queried remotely</h3>
+        <h3>NW-RODC01 machine password is 95 days old</h3>
     </div>
-    <p class="finding-detail">NW-RODC01: WinRM cannot complete the operation. Verify the computer is up and WinRM is configured.</p>
-    <div class="finding-why"><strong>Why it matters.</strong> WinRM, firewall, or credential problems hide roles, disks, and service health.</div>
-    <div class="finding-next"><strong>What to do next.</strong> Confirm WinRM (5985/5986) and that your account is local admin on those DCs. AD data in this report is still valid.</div>
+    <p class="finding-detail">Last set 2026-07-24 13:17</p>
+    <div class="finding-why"><strong>Why it matters.</strong> DC computer accounts normally rotate about every 30 days. A much older password can mean the DC has not been writing to AD.</div>
+    <div class="finding-next"><strong>What to do next.</strong> Confirm the server is actually replicating before you reset the machine account.</div>
 </article>
 <article class="finding sev-info" data-sev="info">
     <div class="finding-head">
@@ -286,26 +286,6 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
     <p class="finding-detail">Deleted users, groups, and computers are not recoverable with full attributes after tombstone processing.</p>
     <div class="finding-why"><strong>Why it matters.</strong> This is the first optional feature most new owners enable. It cannot be turned off once enabled.</div>
     <div class="finding-next"><strong>What to do next.</strong> Enable-ADOptionalFeature &quot;Recycle Bin Feature&quot; after you confirm forest functional level is 2008 R2+.</div>
-</article>
-<article class="finding sev-critical" data-sev="critical">
-    <div class="finding-head">
-        <span class="sev-pill sev-critical">Critical</span>
-        <span class="finding-area">Replication</span>
-        <h3>1 replication failure record(s)</h3>
-    </div>
-    <p class="finding-detail">NW-DC01 -&gt; NW-RODC01: RPC server unavailable (1722)</p>
-    <div class="finding-why"><strong>Why it matters.</strong> If DCs disagree, passwords, group membership, and GPOs become location-dependent. That is how &quot;it works in this building&quot; starts.</div>
-    <div class="finding-next"><strong>What to do next.</strong> Start with repadmin /replsummary and the failing partner pair. Fix DNS and connectivity before you seize roles.</div>
-</article>
-<article class="finding sev-warning" data-sev="warning">
-    <div class="finding-head">
-        <span class="sev-pill sev-warning">Warning</span>
-        <span class="finding-area">Replication</span>
-        <h3>NW-DC01 has consecutive replication failures</h3>
-    </div>
-    <p class="finding-detail">NW-RODC01 (4 fails, last result 1722)</p>
-    <div class="finding-why"><strong>Why it matters.</strong> A partner that has not succeeded recently will diverge. Users, groups, and passwords will not match.</div>
-    <div class="finding-next"><strong>What to do next.</strong> On that DC run: Get-ADReplicationPartnerMetadata -Target localhost | Format-Table Partner, LastReplicationSuccess, ConsecutiveReplicationFailures</div>
 </article>
 <article class="finding sev-info" data-sev="info">
     <div class="finding-head">
@@ -447,30 +427,10 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
     <div class="finding-why"><strong>Why it matters.</strong> Windows LAPS is built into current Windows and stores passwords in AD or Entra.</div>
     <div class="finding-next"><strong>What to do next.</strong> Plan LAPS before you rotate built-in Administrator passwords across the fleet.</div>
 </article>
-<article class="finding sev-warning" data-sev="warning">
-    <div class="finding-head">
-        <span class="sev-pill sev-warning">Warning</span>
-        <span class="finding-area">Capacity</span>
-        <h3>NW-DC01 has a volume under 15% free</h3>
-    </div>
-    <p class="finding-detail">C: 14.2 GB free of 127 GB</p>
-    <div class="finding-why"><strong>Why it matters.</strong> NTDS and SYSVOL on a full volume halt the DC. You will notice via logon and replication failures.</div>
-    <div class="finding-next"><strong>What to do next.</strong> Move logs, purge old dumps, expand the VMDK. Never delete NTDS.dit by hand.</div>
-</article>
-<article class="finding sev-info" data-sev="info">
-    <div class="finding-head">
-        <span class="sev-pill sev-info">Info</span>
-        <span class="finding-area">Patching</span>
-        <h3>NW-DC01 has a pending reboot</h3>
-    </div>
-    <p class="finding-detail">Updates are staged but not fully applied.</p>
-    <div class="finding-why"><strong>Why it matters.</strong> Pending reboots hide whether a DC is actually patched and can block further CU installs.</div>
-    <div class="finding-next"><strong>What to do next.</strong> Schedule a controlled reboot. Do not reboot every DC at once.</div>
-</article>
 
     <div class="card">
       <h2>Collector warnings</h2>
-      <div class="table-wrap"><table><thead><tr><th>Area</th><th>Message</th></tr></thead><tbody><tr><td>Demo</td><td>This report is generated from built-in sample data. No directory was queried.</td></tr></tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>Area</th><th>Message</th></tr></thead><tbody><tr><td>Demo</td><td>This report is generated from built-in sample data modeled as Active Directory attributes. No directory was queried and no DC was contacted over WinRM.</td></tr></tbody></table></div>
     </div>
   </section>
 
@@ -621,15 +581,15 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
       <div class="table-wrap"><table><thead><tr><th>Name</th><th>Cost</th><th>Interval (min)</th><th>Transport</th><th>Sites</th></tr></thead><tbody><tr><td>HQ-AUSTIN</td><td>100</td><td>15</td><td>IP</td><td>HQ-Chicago, Plant-Austin</td></tr></tbody></table></div>
     </div>
     <div class="card">
-      <h2>Replication failures (domain scope)</h2>
-      <div class="table-wrap"><table><thead><tr><th>Server</th><th>Partner</th><th>Type</th><th>First failure</th><th>Count</th><th>Last error</th></tr></thead><tbody><tr><td>NW-DC01</td><td>NW-RODC01</td><td>Connection</td><td>2026-10-27 10:09</td><td>4</td><td>RPC server unavailable (1722)</td></tr></tbody></table></div>
+      <h2>Replication failures</h2>
+      <div class="table-wrap"><table><thead><tr><th>Server</th><th>Partner</th><th>Type</th><th>First failure</th><th>Count</th><th>Last error</th></tr></thead><tbody><tr><td colspan="6" class="muted">Live replication-failure counters live on each DC and were not queried. Inbound partners on DC cards come from nTDSConnection objects in the configuration partition.</td></tr></tbody></table></div>
     </div>
   </section>
 
   <section id="dcs" class="panel">
     <div class="learn">
-    <div class="learn-title">A DC is more than &quot;online&quot;</div>
-    <p>Uptime is not a virtue if patches are pending. Time source should chain to the PDC Emulator. Disks under 15% free are an outage waiting to happen. Inbound partners with consecutive failures mean this DC is drifting.</p>
+    <div class="learn-title">Read the computer object, not the OS</div>
+    <p>whenCreated is how old this DC is. lastLogonTimestamp is last contact with a DC that replicated the stamp — not boot time. pwdLastSet should rotate about every 30 days. SPNs and nTDSConnection objects tell you what the directory thinks this DC does, without logging on to it.</p>
 </div>
     <div class="chart-grid">
       <div class="chart-card"><h3>Controller status</h3><p class="chart-hint">Click a slice to show only those DCs</p><div class="chart-box" data-chart="dcStatus"></div></div>
@@ -638,19 +598,19 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
     <div class="controls">
       <input class="search" id="dcSearch" placeholder="Search name, IP, site, OS, FSMO, role, or feature...">
       <button class="filter active" data-dc-filter="all">All</button>
-      <button class="filter" data-dc-filter="online">Online</button>
+      <button class="filter" data-dc-filter="enabled">Enabled</button>
+      <button class="filter" data-dc-filter="disabled">Disabled</button>
       <button class="filter" data-dc-filter="error">Errors</button>
-      <button class="filter" data-dc-filter="skipped">Skipped</button>
     </div>
     <div class="dc-grid">
-      <article class="dc-card" data-status="online" data-name="NW-DC01" data-search="nw-dc01 nw-dc01.northwind.lab 10.10.10.11 hq-chicago windows server 2022 standard online 2018-10-27 13:09 schema master domain naming master pdc emulator rid master infrastructure master active directory domain services ad-domain-services dns server dns dhcp server dhcp active directory module for windows powershell rsat-ad-powershell group policy management gpmc">
+      <article class="dc-card" data-status="enabled" data-name="NW-DC01" data-search="nw-dc01 nw-dc01.northwind.lab 10.10.10.11 hq-chicago windows server 2022 standard enabled 2018-10-27 13:17 2026-10-27 11:17 hub dc and fsmo holder northwind.lab/domain controllers/nw-dc01 schema master domain naming master pdc emulator rid master infrastructure master active directory domain services ad-domain-services global catalog globalcatalog dns server dns dhcp server dhcp remote desktop services rds-rd-server">
     <header class="dc-head">
         <div>
             <h3>NW-DC01</h3>
             <div class="dc-host">NW-DC01.northwind.lab</div>
         </div>
         <div class="dc-flags">
-            <span class="status-badge status-online">Online</span>
+            <span class="status-badge status-online">Enabled</span>
             <span class="badge badge-gc">GC</span><span class="badge badge-fsmo">FSMO</span>
         </div>
     </header>
@@ -659,35 +619,39 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
         <div><span class="lbl">Site</span><span>HQ-Chicago</span></div>
         <div><span class="lbl">OS</span><span>Windows Server 2022 Standard</span></div>
         <div><span class="lbl">Version</span><span>10.0 (20348)</span></div>
-        <div><span class="lbl">When created</span><span>2018-10-27 13:09 <span class="muted">(8y 2d)</span></span></div>
-        <div><span class="lbl">Last boot</span><span>2026-09-15 13:09</span></div>
-        <div><span class="lbl">Uptime</span><span class="uptime">42d 3h 12m</span></div>
-        <div><span class="lbl">Memory</span><span>16 GB</span></div>
-        <div><span class="lbl">Time source</span><span>time.windows.com</span></div>
-        <div><span class="lbl">Last hotfix</span><span>KB5044281 (2026-09-10)</span></div>
-        <div><span class="lbl">Pending reboot</span><span>Yes</span></div>
+        <div><span class="lbl">When created</span><span>2018-10-27 13:17 <span class="muted">(8y 2d)</span></span></div>
+        <div><span class="lbl">When changed</span><span>2026-10-27 07:17</span></div>
+        <div><span class="lbl">Last logon (AD)</span><span>2026-10-27 11:17 <span class="muted">(0 days)</span></span></div>
+        <div><span class="lbl">Machine password</span><span>2026-10-09 13:17 <span class="muted">(18 days)</span></span></div>
+        <div><span class="lbl">OU</span><span>northwind.lab/Domain Controllers/NW-DC01</span></div>
+        <div><span class="lbl">Description</span><span>Hub DC and FSMO holder</span></div>
+        <div><span class="lbl">Source</span><span>Active Directory</span></div>
     </div>
     <section><h4>FSMO roles held</h4><div class="tags"><span class="tag tag-fsmo">Schema Master</span><span class="tag tag-fsmo">Domain Naming Master</span><span class="tag tag-fsmo">PDC Emulator</span><span class="tag tag-fsmo">RID Master</span><span class="tag tag-fsmo">Infrastructure Master</span></div></section>
-    <section><h4>Replication partners (inbound)</h4><div class="repl"><div class="repl-row repl-ok"><strong>NW-DC02</strong> · last success 2026-10-27 12:51 · fails 0 · northwind, Configuration, Schema</div><div class="repl-row repl-bad"><strong>NW-RODC01</strong> · last success 2026-10-27 10:09 · fails 4 · northwind</div></div></section>
-    <section><h4>Disks</h4><div class="disk"><span>C:</span><span>14.2 / 127 GB free (11%)</span></div><div class="disk"><span>D:</span><span>41 / 80 GB free (51%)</span></div></section>
-    <section><h4>Key services</h4><div class="tags"><span class="tag svc-on">NTDS: Running</span><span class="tag svc-on">DNS: Running</span><span class="tag svc-on">KDC: Running</span><span class="tag svc-on">DFSR: Running</span><span class="tag svc-on">W32Time: Running</span><span class="tag svc-on">DHCPServer: Running</span></div></section>
+    <section><h4>Replication partners (from nTDSConnection objects)</h4><div class="repl"><div class="repl-row repl-ok"><strong>NW-DC02</strong> · Configured in AD · fails 0 · nTDSConnection</div><div class="repl-row repl-ok"><strong>NW-RODC01</strong> · Configured in AD · fails 0 · nTDSConnection</div></div></section>
+    
+    <section><h4>Directory-advertised services</h4><div class="tags"><span class="tag svc-on">NTDS: Advertised in AD</span><span class="tag svc-on">KDC: Advertised in AD</span><span class="tag svc-on">GC: Advertised in AD</span><span class="tag svc-on">DNS: Advertised in AD</span><span class="tag svc-on">DHCPServer: Advertised in AD</span></div></section>
     <section class="collapsible">
-        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Roles (3)</h4>
-        <div class="collapse-c"><div class="tags"><span class="tag tag-role" title="Store directory data and manage communication between users and domains.">Active Directory Domain Services</span><span class="tag tag-role" title="Domain Name System server.">DNS Server</span><span class="tag tag-role" title="Dynamic Host Configuration Protocol server.">DHCP Server</span></div></div>
+        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Roles inferred from AD (4)</h4>
+        <div class="collapse-c"><div class="tags"><span class="tag tag-role" title="Inferred from the domain controller object in AD.">Active Directory Domain Services</span><span class="tag tag-role" title="Inferred from IsGlobalCatalog on the DC object.">Global Catalog</span><span class="tag tag-role" title="Inferred from DNS/ service principal names on the computer account.">DNS Server</span><span class="tag tag-role" title="Inferred: this host is registered in AD as a DHCP server.">DHCP Server</span></div></div>
     </section>
     <section class="collapsible">
-        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Features (2)</h4>
-        <div class="collapse-c"><div class="tags"><span class="tag tag-feature" title="AD PowerShell">Active Directory module for Windows PowerShell</span><span class="tag tag-feature" title="GPO admin console">Group Policy Management</span></div></div>
+        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Extra features inferred (1)</h4>
+        <div class="collapse-c"><div class="tags"><span class="tag tag-feature" title="Inferred from TERMSRV/ SPNs.">Remote Desktop Services</span></div></div>
+    </section>
+    <section class="collapsible">
+        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Service principal names (6)</h4>
+        <div class="collapse-c"><div class="tags"><span class="tag tag-feature">HOST/NW-DC01</span><span class="tag tag-feature">HOST/NW-DC01.northwind.lab</span><span class="tag tag-feature">LDAP/NW-DC01.northwind.lab</span><span class="tag tag-feature">DNS/NW-DC01.northwind.lab</span><span class="tag tag-feature">GC/NW-DC01.northwind.lab/northwind.lab</span><span class="tag tag-feature">TERMSRV/NW-DC01.northwind.lab</span></div></div>
     </section>
 </article>
-<article class="dc-card" data-status="online" data-name="NW-DC02" data-search="nw-dc02 nw-dc02.northwind.lab 10.20.20.11 plant-austin windows server 2019 standard online 2021-10-27 13:09 active directory domain services ad-domain-services dns server dns active directory certificate services adcs-cert-authority">
+<article class="dc-card" data-status="enabled" data-name="NW-DC02" data-search="nw-dc02 nw-dc02.northwind.lab 10.20.20.11 plant-austin windows server 2019 standard enabled 2021-10-27 13:17 2026-10-27 09:17 austin plant dc / enterprise ca northwind.lab/domain controllers/nw-dc02 active directory domain services ad-domain-services global catalog globalcatalog dns server dns active directory certificate services adcs-cert-authority">
     <header class="dc-head">
         <div>
             <h3>NW-DC02</h3>
             <div class="dc-host">NW-DC02.northwind.lab</div>
         </div>
         <div class="dc-flags">
-            <span class="status-badge status-online">Online</span>
+            <span class="status-badge status-online">Enabled</span>
             <span class="badge badge-gc">GC</span>
         </div>
     </header>
@@ -696,35 +660,39 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
         <div><span class="lbl">Site</span><span>Plant-Austin</span></div>
         <div><span class="lbl">OS</span><span>Windows Server 2019 Standard</span></div>
         <div><span class="lbl">Version</span><span>10.0 (17763)</span></div>
-        <div><span class="lbl">When created</span><span>2021-10-27 13:09 <span class="muted">(5y 1d)</span></span></div>
-        <div><span class="lbl">Last boot</span><span>2026-06-29 13:09</span></div>
-        <div><span class="lbl">Uptime</span><span class="uptime">120d 6h 1m</span></div>
-        <div><span class="lbl">Memory</span><span>12 GB</span></div>
-        <div><span class="lbl">Time source</span><span>NW-DC01.northwind.lab</span></div>
-        <div><span class="lbl">Last hotfix</span><span>KB5035849 (2025-11-02)</span></div>
-        <div><span class="lbl">Pending reboot</span><span>No</span></div>
+        <div><span class="lbl">When created</span><span>2021-10-27 13:17 <span class="muted">(5y 1d)</span></span></div>
+        <div><span class="lbl">When changed</span><span>2026-10-27 05:17</span></div>
+        <div><span class="lbl">Last logon (AD)</span><span>2026-10-27 09:17 <span class="muted">(0 days)</span></span></div>
+        <div><span class="lbl">Machine password</span><span>2026-10-02 13:17 <span class="muted">(25 days)</span></span></div>
+        <div><span class="lbl">OU</span><span>northwind.lab/Domain Controllers/NW-DC02</span></div>
+        <div><span class="lbl">Description</span><span>Austin plant DC / enterprise CA</span></div>
+        <div><span class="lbl">Source</span><span>Active Directory</span></div>
     </div>
     <section><h4>FSMO roles held</h4><div class="tags"><span class="muted">None</span></div></section>
-    <section><h4>Replication partners (inbound)</h4><div class="repl"><div class="repl-row repl-ok"><strong>NW-DC01</strong> · last success 2026-10-27 12:53 · fails 0 · northwind, Configuration, Schema</div></div></section>
-    <section><h4>Disks</h4><div class="disk"><span>C:</span><span>22 / 100 GB free (22%)</span></div></section>
-    <section><h4>Key services</h4><div class="tags"><span class="tag svc-on">NTDS: Running</span><span class="tag svc-on">DNS: Running</span><span class="tag svc-on">KDC: Running</span><span class="tag svc-on">DFSR: Running</span><span class="tag svc-on">CertSvc: Running</span></div></section>
+    <section><h4>Replication partners (from nTDSConnection objects)</h4><div class="repl"><div class="repl-row repl-ok"><strong>NW-DC01</strong> · Configured in AD · fails 0 · nTDSConnection</div></div></section>
+    
+    <section><h4>Directory-advertised services</h4><div class="tags"><span class="tag svc-on">NTDS: Advertised in AD</span><span class="tag svc-on">KDC: Advertised in AD</span><span class="tag svc-on">GC: Advertised in AD</span><span class="tag svc-on">DNS: Advertised in AD</span><span class="tag svc-on">CertSvc: Advertised in AD</span></div></section>
     <section class="collapsible">
-        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Roles (3)</h4>
-        <div class="collapse-c"><div class="tags"><span class="tag tag-role" title="Store directory data and manage communication between users and domains.">Active Directory Domain Services</span><span class="tag tag-role" title="Domain Name System server.">DNS Server</span><span class="tag tag-role" title="Enterprise CA.">Active Directory Certificate Services</span></div></div>
+        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Roles inferred from AD (4)</h4>
+        <div class="collapse-c"><div class="tags"><span class="tag tag-role" title="Inferred from the domain controller object in AD.">Active Directory Domain Services</span><span class="tag tag-role" title="Inferred from IsGlobalCatalog on the DC object.">Global Catalog</span><span class="tag tag-role" title="Inferred from DNS/ service principal names on the computer account.">DNS Server</span><span class="tag tag-role" title="Inferred: enterprise CA &#39;NW-CA&#39; is registered on this host in AD.">Active Directory Certificate Services</span></div></div>
     </section>
     <section class="collapsible">
-        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Features (0)</h4>
-        <div class="collapse-c"><div class="tags"><span class="muted">None collected</span></div></div>
+        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Extra features inferred (0)</h4>
+        <div class="collapse-c"><div class="tags"><span class="muted">None inferred from AD</span></div></div>
+    </section>
+    <section class="collapsible">
+        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Service principal names (5)</h4>
+        <div class="collapse-c"><div class="tags"><span class="tag tag-feature">HOST/NW-DC02</span><span class="tag tag-feature">HOST/NW-DC02.northwind.lab</span><span class="tag tag-feature">LDAP/NW-DC02.northwind.lab</span><span class="tag tag-feature">DNS/NW-DC02.northwind.lab</span><span class="tag tag-feature">GC/NW-DC02.northwind.lab/northwind.lab</span></div></div>
     </section>
 </article>
-<article class="dc-card" data-status="error" data-name="NW-RODC01" data-search="nw-rodc01 nw-rodc01.northwind.lab 10.30.30.11 plant-austin windows server 2019 standard error 2023-10-27 13:09">
+<article class="dc-card" data-status="enabled" data-name="NW-RODC01" data-search="nw-rodc01 nw-rodc01.northwind.lab 10.30.30.11 plant-austin windows server 2019 standard enabled 2023-10-27 13:17 2026-10-25 13:17 read-only dc for the plant floor northwind.lab/domain controllers/nw-rodc01 active directory domain services ad-domain-services global catalog globalcatalog read-only domain controller rodc dns server dns">
     <header class="dc-head">
         <div>
             <h3>NW-RODC01</h3>
             <div class="dc-host">NW-RODC01.northwind.lab</div>
         </div>
         <div class="dc-flags">
-            <span class="status-badge status-error">Error</span>
+            <span class="status-badge status-online">Enabled</span>
             <span class="badge badge-gc">GC</span><span class="badge badge-rodc">RODC</span>
         </div>
     </header>
@@ -733,25 +701,29 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
         <div><span class="lbl">Site</span><span>Plant-Austin</span></div>
         <div><span class="lbl">OS</span><span>Windows Server 2019 Standard</span></div>
         <div><span class="lbl">Version</span><span>10.0 (17763)</span></div>
-        <div><span class="lbl">When created</span><span>2023-10-27 13:09 <span class="muted">(3y 1d)</span></span></div>
-        <div><span class="lbl">Last boot</span><span>N/A</span></div>
-        <div><span class="lbl">Uptime</span><span class="uptime">N/A</span></div>
-        <div><span class="lbl">Memory</span><span>N/A</span></div>
-        <div><span class="lbl">Time source</span><span>N/A</span></div>
-        <div><span class="lbl">Last hotfix</span><span>N/A</span></div>
-        <div><span class="lbl">Pending reboot</span><span>N/A</span></div>
+        <div><span class="lbl">When created</span><span>2023-10-27 13:17 <span class="muted">(3y 1d)</span></span></div>
+        <div><span class="lbl">When changed</span><span>2026-10-25 13:17</span></div>
+        <div><span class="lbl">Last logon (AD)</span><span>2026-10-25 13:17 <span class="muted">(2 days)</span></span></div>
+        <div><span class="lbl">Machine password</span><span>2026-07-24 13:17 <span class="muted">(95 days)</span></span></div>
+        <div><span class="lbl">OU</span><span>northwind.lab/Domain Controllers/NW-RODC01</span></div>
+        <div><span class="lbl">Description</span><span>Read-only DC for the plant floor</span></div>
+        <div><span class="lbl">Source</span><span>Active Directory</span></div>
     </div>
     <section><h4>FSMO roles held</h4><div class="tags"><span class="muted">None</span></div></section>
-    <section><h4>Replication partners (inbound)</h4><div class="repl"><span class="muted">None detected</span></div></section>
-    <section><h4>Disks</h4><span class="muted">N/A</span></section>
-    <section><h4>Key services</h4><div class="tags"><span class="muted">N/A</span></div></section>
+    <section><h4>Replication partners (from nTDSConnection objects)</h4><div class="repl"><div class="repl-row repl-ok"><strong>NW-DC01</strong> · Configured in AD · fails 0 · nTDSConnection</div><div class="repl-row repl-ok"><strong>NW-DC02</strong> · Configured in AD · fails 0 · nTDSConnection</div></div></section>
+    
+    <section><h4>Directory-advertised services</h4><div class="tags"><span class="tag svc-on">NTDS: Advertised in AD</span><span class="tag svc-on">KDC: Advertised in AD</span><span class="tag svc-on">GC: Advertised in AD</span><span class="tag svc-on">DNS: Advertised in AD</span></div></section>
     <section class="collapsible">
-        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Roles (0)</h4>
-        <div class="collapse-c"><div class="tags"><span class="error-msg">WinRM cannot complete the operation. Verify the computer is up and WinRM is configured.</span></div></div>
+        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Roles inferred from AD (4)</h4>
+        <div class="collapse-c"><div class="tags"><span class="tag tag-role" title="Inferred from the domain controller object in AD.">Active Directory Domain Services</span><span class="tag tag-role" title="Inferred from IsGlobalCatalog on the DC object.">Global Catalog</span><span class="tag tag-role" title="Inferred from IsReadOnly on the DC object.">Read-Only Domain Controller</span><span class="tag tag-role" title="Inferred from DNS/ service principal names on the computer account.">DNS Server</span></div></div>
     </section>
     <section class="collapsible">
-        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Features (0)</h4>
-        <div class="collapse-c"><div class="tags"><span class="muted">None collected</span></div></div>
+        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Extra features inferred (0)</h4>
+        <div class="collapse-c"><div class="tags"><span class="muted">None inferred from AD</span></div></div>
+    </section>
+    <section class="collapsible">
+        <h4 class="collapse-h" onclick="toggleCollapse(this)"><span class="chev">&#9654;</span> Service principal names (6)</h4>
+        <div class="collapse-c"><div class="tags"><span class="tag tag-feature">HOST/NW-RODC01</span><span class="tag tag-feature">HOST/NW-RODC01.northwind.lab</span><span class="tag tag-feature">LDAP/NW-RODC01.northwind.lab</span><span class="tag tag-feature">DNS/NW-RODC01.northwind.lab</span><span class="tag tag-feature">GC/NW-RODC01.northwind.lab/northwind.lab</span><span class="tag tag-feature">RestrictedKrbHost/NW-RODC01</span></div></div>
     </section>
 </article>
 
@@ -761,42 +733,42 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
       <div class="controls"><input class="search" id="cmpSearch" placeholder="Filter comparison rows..."></div>
       <div class="table-wrap">
         <table id="cmpTable">
-          <thead><tr><th>Server</th><th>Status</th><th>IP</th><th>Site</th><th>OS</th><th>When created</th><th>Last boot</th><th>Uptime</th><th>FSMO</th><th>Inbound partners</th></tr></thead>
+          <thead><tr><th>Server</th><th>Status</th><th>IP</th><th>Site</th><th>OS</th><th>When created</th><th>Last logon (AD)</th><th>Machine password</th><th>FSMO</th><th>Inbound partners</th></tr></thead>
           <tbody><tr>
     <td><strong>NW-DC01</strong></td>
-    <td><span class="status-badge status-online">Online</span></td>
+    <td><span class="status-badge status-online">Enabled</span></td>
     <td>10.10.10.11</td>
     <td>HQ-Chicago</td>
     <td>Windows Server 2022 Standard</td>
-    <td>2018-10-27 13:09</td>
-    <td>2026-09-15 13:09</td>
-    <td>42d 3h 12m</td>
+    <td>2018-10-27 13:17</td>
+    <td>2026-10-27 11:17</td>
+    <td>2026-10-09 13:17</td>
     <td>Schema Master, Domain Naming Master, PDC Emulator, RID Master, Infrastructure Master</td>
     <td>NW-DC02, NW-RODC01</td>
 </tr>
 <tr>
     <td><strong>NW-DC02</strong></td>
-    <td><span class="status-badge status-online">Online</span></td>
+    <td><span class="status-badge status-online">Enabled</span></td>
     <td>10.20.20.11</td>
     <td>Plant-Austin</td>
     <td>Windows Server 2019 Standard</td>
-    <td>2021-10-27 13:09</td>
-    <td>2026-06-29 13:09</td>
-    <td>120d 6h 1m</td>
+    <td>2021-10-27 13:17</td>
+    <td>2026-10-27 09:17</td>
+    <td>2026-10-02 13:17</td>
     <td>-</td>
     <td>NW-DC01</td>
 </tr>
 <tr>
     <td><strong>NW-RODC01</strong></td>
-    <td><span class="status-badge status-error">Error</span></td>
+    <td><span class="status-badge status-online">Enabled</span></td>
     <td>10.30.30.11</td>
     <td>Plant-Austin</td>
     <td>Windows Server 2019 Standard</td>
-    <td>2023-10-27 13:09</td>
-    <td>N/A</td>
-    <td>N/A</td>
+    <td>2023-10-27 13:17</td>
+    <td>2026-10-25 13:17</td>
+    <td>2026-07-24 13:17</td>
     <td>-</td>
-    <td>-</td>
+    <td>NW-DC01, NW-DC02</td>
 </tr>
 </tbody>
         </table>
@@ -831,7 +803,7 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
       <div class="card">
         <h2>KRBTGT &amp; hygiene snapshot</h2>
         <div class="table-wrap"><table><tbody>
-          <tr><td>krbtgt last password set</td><td>2025-01-25 13:09 (640 days ago)</td></tr>
+          <tr><td>krbtgt last password set</td><td>2025-01-25 13:17 (640 days ago)</td></tr>
           <tr><td>Enabled users</td><td>412</td></tr>
           <tr><td>Disabled users</td><td>88</td></tr>
           <tr><td>Stale enabled users (90+ days)</td><td>37</td></tr>
@@ -882,12 +854,12 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
     <div class="grid-2">
       <div class="card">
         <h2>Stale users (sample)</h2>
-        <div class="table-wrap"><table><thead><tr><th>Account</th><th>Last logon</th></tr></thead><tbody><tr><td>temp.contractor</td><td>2026-03-31 13:09</td></tr>
-<tr><td>old.finance</td><td>2025-09-22 13:09</td></tr></tbody></table></div>
+        <div class="table-wrap"><table><thead><tr><th>Account</th><th>Last logon</th></tr></thead><tbody><tr><td>temp.contractor</td><td>2026-03-31 13:17</td></tr>
+<tr><td>old.finance</td><td>2025-09-22 13:17</td></tr></tbody></table></div>
       </div>
       <div class="card">
         <h2>Stale computers (sample)</h2>
-        <div class="table-wrap"><table><thead><tr><th>Name</th><th>OS</th><th>Last logon</th></tr></thead><tbody><tr><td>AUS-WKS-014</td><td>Windows 10 Pro</td><td>2026-04-30 13:09</td></tr></tbody></table></div>
+        <div class="table-wrap"><table><thead><tr><th>Name</th><th>OS</th><th>Last logon</th></tr></thead><tbody><tr><td>AUS-WKS-014</td><td>Windows 10 Pro</td><td>2026-04-30 13:17</td></tr></tbody></table></div>
       </div>
     </div>
     <div class="card">
@@ -908,10 +880,10 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
     <div class="card">
       <h2>Group Policy objects (4)</h2>
       <div class="controls"><input class="search" id="gpoSearch" placeholder="Filter GPOs..."></div>
-      <div class="table-wrap"><table id="gpoTable"><thead><tr><th>Name</th><th>Status</th><th>Created</th><th>Modified</th></tr></thead><tbody><tr><td>Default Domain Controllers Policy</td><td>AllSettingsEnabled</td><td>2018-10-27 13:09</td><td>2026-09-17 13:09</td></tr>
-<tr><td>Default Domain Policy</td><td>AllSettingsEnabled</td><td>2018-10-27 13:09</td><td>2026-10-15 13:09</td></tr>
-<tr><td>Map-Drives-Legacy</td><td>UserSettingsDisabled</td><td>2020-10-27 13:09</td><td>2024-10-27 13:09</td></tr>
-<tr><td>Workstation-Baseline</td><td>AllSettingsEnabled</td><td>2023-10-27 13:09</td><td>2026-10-22 13:09</td></tr></tbody></table></div>
+      <div class="table-wrap"><table id="gpoTable"><thead><tr><th>Name</th><th>Status</th><th>Created</th><th>Modified</th></tr></thead><tbody><tr><td>Default Domain Controllers Policy</td><td>AllSettingsEnabled</td><td>2018-10-27 13:17</td><td>2026-09-17 13:17</td></tr>
+<tr><td>Default Domain Policy</td><td>AllSettingsEnabled</td><td>2018-10-27 13:17</td><td>2026-10-15 13:17</td></tr>
+<tr><td>Map-Drives-Legacy</td><td>UserSettingsDisabled</td><td>2020-10-27 13:17</td><td>2024-10-27 13:17</td></tr>
+<tr><td>Workstation-Baseline</td><td>AllSettingsEnabled</td><td>2023-10-27 13:17</td><td>2026-10-22 13:17</td></tr></tbody></table></div>
     </div>
     <div class="card">
       <h2>OU tree (5)</h2>
@@ -926,8 +898,8 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
 
   <section id="roles" class="panel">
     <div class="learn">
-    <div class="learn-title">Installed roles tell you what else these DCs are doing</div>
-    <p>A DC that is also DHCP, CA, or RDS is a concentration-of-risk problem. Compare roles across DCs — drift is how &quot;only DC02 has the thing&quot; incidents start.</p>
+    <div class="learn-title">Roles here are inferred from Active Directory</div>
+    <p>GC and RODC flags, DNS SPNs, and AD CS / DHCP objects in the configuration partition. This is not Get-WindowsFeature. A DC that is also DHCP or CA is still a concentration-of-risk problem — confirm on the host when you can.</p>
 </div>
     <div class="chart-grid">
       <div class="chart-card"><h3>Top installed roles</h3><p class="chart-hint">Click a bar to see the DCs that have it</p><div class="chart-box" data-chart="roles"></div></div>
@@ -935,21 +907,22 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
     <div class="card">
       <h2>Roles across the domain</h2>
       <div class="controls"><input class="search" id="roleSearch" placeholder="Filter roles..."></div>
-      <div class="table-wrap"><table id="roleTable"><thead><tr><th>Role</th><th>Installed on</th><th>Domain controllers</th><th>Description</th></tr></thead><tbody><tr><td><strong>Active Directory Certificate Services</strong><br><small class="muted">ADCS-Cert-Authority</small></td><td>1 / 2</td><td>NW-DC02</td><td class="desc">Enterprise CA.</td></tr>
-<tr><td><strong>Active Directory Domain Services</strong><br><small class="muted">AD-Domain-Services</small></td><td>2 / 2</td><td>NW-DC01, NW-DC02</td><td class="desc">Store directory data and manage communication between users and domains.</td></tr>
-<tr><td><strong>DHCP Server</strong><br><small class="muted">DHCP</small></td><td>1 / 2</td><td>NW-DC01</td><td class="desc">Dynamic Host Configuration Protocol server.</td></tr>
-<tr><td><strong>DNS Server</strong><br><small class="muted">DNS</small></td><td>2 / 2</td><td>NW-DC01, NW-DC02</td><td class="desc">Domain Name System server.</td></tr></tbody></table></div>
+      <div class="table-wrap"><table id="roleTable"><thead><tr><th>Role</th><th>Installed on</th><th>Domain controllers</th><th>Description</th></tr></thead><tbody><tr><td><strong>Active Directory Certificate Services</strong><br><small class="muted">ADCS-Cert-Authority</small></td><td>1 / 3</td><td>NW-DC02</td><td class="desc">Inferred: enterprise CA &#39;NW-CA&#39; is registered on this host in AD.</td></tr>
+<tr><td><strong>Active Directory Domain Services</strong><br><small class="muted">AD-Domain-Services</small></td><td>3 / 3</td><td>NW-DC01, NW-DC02, NW-RODC01</td><td class="desc">Inferred from the domain controller object in AD.</td></tr>
+<tr><td><strong>DHCP Server</strong><br><small class="muted">DHCP</small></td><td>1 / 3</td><td>NW-DC01</td><td class="desc">Inferred: this host is registered in AD as a DHCP server.</td></tr>
+<tr><td><strong>DNS Server</strong><br><small class="muted">DNS</small></td><td>3 / 3</td><td>NW-DC01, NW-DC02, NW-RODC01</td><td class="desc">Inferred from DNS/ service principal names on the computer account.</td></tr>
+<tr><td><strong>Global Catalog</strong><br><small class="muted">GlobalCatalog</small></td><td>3 / 3</td><td>NW-DC01, NW-DC02, NW-RODC01</td><td class="desc">Inferred from IsGlobalCatalog on the DC object.</td></tr>
+<tr><td><strong>Read-Only Domain Controller</strong><br><small class="muted">RODC</small></td><td>1 / 3</td><td>NW-RODC01</td><td class="desc">Inferred from IsReadOnly on the DC object.</td></tr></tbody></table></div>
     </div>
     <div class="card">
       <h2>Features across the domain</h2>
       <div class="controls"><input class="search" id="featSearch" placeholder="Filter features..."></div>
-      <div class="table-wrap"><table id="featTable"><thead><tr><th>Feature</th><th>Type</th><th>Installed on</th><th>Domain controllers</th></tr></thead><tbody><tr><td><strong>Active Directory module for Windows PowerShell</strong><br><small class="muted">RSAT-AD-PowerShell</small></td><td>Feature</td><td>1 / 2</td><td>NW-DC01</td></tr>
-<tr><td><strong>Group Policy Management</strong><br><small class="muted">GPMC</small></td><td>Feature</td><td>1 / 2</td><td>NW-DC01</td></tr></tbody></table></div>
+      <div class="table-wrap"><table id="featTable"><thead><tr><th>Feature</th><th>Type</th><th>Installed on</th><th>Domain controllers</th></tr></thead><tbody><tr><td><strong>Remote Desktop Services</strong><br><small class="muted">RDS-RD-Server</small></td><td>Feature</td><td>1 / 3</td><td>NW-DC01</td></tr></tbody></table></div>
     </div>
   </section>
 
   <footer>
-    <p>AD Domain Discovery Report v2.1 · Execution time 00:00.262 · Stale threshold 90 days</p>
+    <p>AD Domain Discovery Report v2.2 · Active Directory · Execution time 00:00.325 · Stale threshold 90 days</p>
     <p>Read-only discovery. This script does not change AD. Validate privileged-group counts before you act.</p>
   </footer>
     </div>
@@ -966,7 +939,7 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
   <div class="drawer-body" id="drawerBody"></div>
 </aside>
 <div class="scrim" id="scrim"></div>
-<script type="application/json" id="chartData">{"findings":{"title":"Findings","type":"donut","hint":"Click a slice to open those cards","tab":"brief","slices":[{"key":"critical","label":"Critical","value":1,"color":"#e11d48","items":[{"title":"1 replication failure record(s)","subtitle":"Replication","detail":"NW-DC01 -> NW-RODC01: RPC server unavailable (1722)","tab":"brief","filter":"finding:critical"}]},{"key":"warning","label":"Warning","value":10,"color":"#f59e0b","items":[{"title":"1 DC(s) could not be queried remotely","subtitle":"Availability","detail":"NW-RODC01: WinRM cannot complete the operation. Verify the computer is up and WinRM is configured.","tab":"brief","filter":"finding:warning"},{"title":"AD Recycle Bin is not enabled","subtitle":"Forest","detail":"Deleted users, groups, and computers are not recoverable with full attributes after tombstone processing.","tab":"brief","filter":"finding:warning"},{"title":"NW-DC01 has consecutive replication failures","subtitle":"Replication","detail":"NW-RODC01 (4 fails, last result 1722)","tab":"brief","filter":"finding:warning"},{"title":"Default minimum password length is 8","subtitle":"Identity","detail":"Modern baselines start at 12–15, plus ban-list / Windows Hello / gMSA for services.","tab":"brief","filter":"finding:warning"},{"title":"Account lockout threshold is 0 (never lock out)","subtitle":"Identity","detail":"Brute-force password guesses never lock the account.","tab":"brief","filter":"finding:warning"},{"title":"krbtgt password is 640 days old","subtitle":"Identity","detail":"krbtgt is the account that encrypts Kerberos TGTs. A stolen hash remains useful until this password is rotated twice.","tab":"brief","filter":"finding:warning"},{"title":"Domain Admins has 6 members","subtitle":"Identity","detail":"Administrator, j.blake, s.patel, helpdesk.admin, vendor.temp, backup.svc","tab":"brief","filter":"finding:warning"},{"title":"Enterprise Admins has 2 member(s)","subtitle":"Identity","detail":"Administrator, j.blake","tab":"brief","filter":"finding:warning"},{"title":"Unconstrained Kerberos delegation is in use","subtitle":"Delegation","detail":"Computers: NW-APP01. Users: None.","tab":"brief","filter":"finding:warning"},{"title":"NW-DC01 has a volume under 15% free","subtitle":"Capacity","detail":"C: 14.2 GB free of 127 GB","tab":"brief","filter":"finding:warning"}]},{"key":"info","label":"Info","value":10,"color":"#3b82f6","items":[{"title":"All FSMO roles sit on one DC","subtitle":"FSMO","detail":"Holder: NW-DC01.northwind.lab","tab":"brief","filter":"finding:info"},{"title":"1 site(s) have no domain controller","subtitle":"Sites","detail":"Default-First-Site-Name","tab":"brief","filter":"finding:info"},{"title":"1 trust(s) are configured","subtitle":"Trusts","detail":"fabrikam.lab (Forest, Bidirectional)","tab":"brief","filter":"finding:info"},{"title":"DnsAdmins is populated","subtitle":"Identity","detail":"netops, dhcp.svc","tab":"brief","filter":"finding:info"},{"title":"37 enabled user(s) have not logged on in 90+ days","subtitle":"Hygiene","detail":"Stale enabled accounts are extra passwords an attacker can try, plus license and audit noise.","tab":"brief","filter":"finding:info"},{"title":"22 enabled computer(s) look stale (90+ days)","subtitle":"Hygiene","detail":"Stale computer accounts still have passwords and SPNs. They clutter GPOs and inventories.","tab":"brief","filter":"finding:info"},{"title":"Active Directory Certificate Services is present","subtitle":"Services","detail":"NORTHWIND-CA (NW-DC02.northwind.lab)","tab":"brief","filter":"finding:info"},{"title":"Entra ID Connect / Azure AD Connect artifacts found","subtitle":"Services","detail":"MSOL_a1b2c3d4e5f6","tab":"brief","filter":"finding:info"},{"title":"No LAPS schema attributes detected","subtitle":"Services","detail":"Local admin passwords on workstations/servers may be shared or unmanaged.","tab":"brief","filter":"finding:info"},{"title":"NW-DC01 has a pending reboot","subtitle":"Patching","detail":"Updates are staged but not fully applied.","tab":"brief","filter":"finding:info"}]}]},"dcStatus":{"title":"Domain controllers","type":"donut","hint":"Click to filter DC cards","tab":"dcs","slices":[{"key":"online","label":"Online","value":2,"color":"#10b981","items":[{"title":"NW-DC01","subtitle":"Online","detail":"10.10.10.11 · HQ-Chicago · Windows Server 2022 Standard · created 2018-10-27 13:09","tab":"dcs","filter":"dc:online"},{"title":"NW-DC02","subtitle":"Online","detail":"10.20.20.11 · Plant-Austin · Windows Server 2019 Standard · created 2021-10-27 13:09","tab":"dcs","filter":"dc:online"}]},{"key":"error","label":"Error","value":1,"color":"#e11d48","items":[{"title":"NW-RODC01","subtitle":"Error","detail":"10.30.30.11 · Plant-Austin · Windows Server 2019 Standard · created 2023-10-27 13:09","tab":"dcs","filter":"dc:error"}]}]},"users":{"title":"User accounts","type":"donut","hint":"Click a slice for the sample list","tab":"identity","slices":[{"key":"healthy","label":"Enabled (active)","value":375,"color":"#2563eb","items":[{"title":"Enabled accounts still logging on","subtitle":"375 users","detail":"Enabled minus the stale-enabled count. Not a guarantee they are human or current.","tab":"identity","filter":"identity:users"}]},{"key":"stale","label":"Enabled + stale","value":37,"color":"#f59e0b","items":[{"title":"temp.contractor","subtitle":"Stale user","detail":"Last logon 2026-03-31 13:09","tab":"identity","filter":"identity:stale-users"},{"title":"old.finance","subtitle":"Stale user","detail":"Last logon 2025-09-22 13:09","tab":"identity","filter":"identity:stale-users"}]},{"key":"disabled","label":"Disabled","value":88,"color":"#94a3b8","items":[{"title":"Disabled user accounts","subtitle":"88 accounts","detail":"Disabled is not the same as deleted. Confirm these are intentional.","tab":"identity","filter":"identity:users"}]}]},"computers":{"title":"Computer accounts","type":"donut","hint":"Click a slice to inspect","tab":"identity","slices":[{"key":"healthy","label":"Enabled (active)","value":238,"color":"#0ea5e9","items":[{"title":"Enabled (active)","subtitle":"238 computers","detail":"","tab":"identity","filter":"identity:computers"}]},{"key":"stale","label":"Enabled + stale","value":22,"color":"#f59e0b","items":[{"title":"AUS-WKS-014","subtitle":"Windows 10 Pro","detail":"Last logon 2026-04-30 13:09","tab":"identity","filter":"identity:stale-computers"}]},{"key":"disabled","label":"Disabled","value":41,"color":"#94a3b8","items":[{"title":"Disabled","subtitle":"41 computers","detail":"","tab":"identity","filter":"identity:computers"}]}]},"os":{"title":"Computers by OS","type":"donut","hint":"Click an OS to see samples","tab":"identity","slices":[{"key":"Windows 11 Pro","label":"Windows 11 Pro","value":140,"color":"#6366f1","items":[{"title":"Windows 11 Pro","subtitle":"140 computers","detail":"Full inventory is in the Computers by operating system table.","tab":"identity","filter":"identity:os"}]},{"key":"Windows 10 Pro","label":"Windows 10 Pro","value":70,"color":"#06b6d4","items":[{"title":"AUS-WKS-014","subtitle":"Windows 10 Pro","detail":"Last logon 2026-04-30 13:09","tab":"identity","filter":"identity:os"}]},{"key":"Windows Server 2022 Standard","label":"Windows Server 2022 Standard","value":18,"color":"#8b5cf6","items":[{"title":"Windows Server 2022 Standard","subtitle":"18 computers","detail":"Full inventory is in the Computers by operating system table.","tab":"identity","filter":"identity:os"}]},{"key":"Windows Server 2016 Standard","label":"Windows Server 2016 Standard","value":12,"color":"#14b8a6","items":[{"title":"Windows Server 2016 Standard","subtitle":"12 computers","detail":"Full inventory is in the Computers by operating system table.","tab":"identity","filter":"identity:os"}]},{"key":"(none)","label":"(none)","value":20,"color":"#f43f5e","items":[{"title":"(none)","subtitle":"20 computers","detail":"Full inventory is in the Computers by operating system table.","tab":"identity","filter":"identity:os"}]}]},"priv":{"title":"Privileged groups","type":"bar","hint":"Click a group to see members","tab":"identity","slices":[{"key":"Domain Admins","label":"Domain Admins","value":6,"color":"#6366f1","items":[{"title":"Administrator","subtitle":"Administrator","detail":"user","tab":"identity","filter":"priv:Domain Admins"},{"title":"j.blake","subtitle":"Jordan Blake","detail":"user","tab":"identity","filter":"priv:Domain Admins"},{"title":"s.patel","subtitle":"Sam Patel","detail":"user","tab":"identity","filter":"priv:Domain Admins"},{"title":"helpdesk.admin","subtitle":"Helpdesk Admin","detail":"user","tab":"identity","filter":"priv:Domain Admins"},{"title":"vendor.temp","subtitle":"Vendor Temp","detail":"user","tab":"identity","filter":"priv:Domain Admins"},{"title":"backup.svc","subtitle":"Backup Service","detail":"user","tab":"identity","filter":"priv:Domain Admins"}]},{"key":"Enterprise Admins","label":"Enterprise Admins","value":2,"color":"#6366f1","items":[{"title":"Administrator","subtitle":"Administrator","detail":"user","tab":"identity","filter":"priv:Enterprise Admins"},{"title":"j.blake","subtitle":"Jordan Blake","detail":"user","tab":"identity","filter":"priv:Enterprise Admins"}]},{"key":"Schema Admins","label":"Schema Admins","value":1,"color":"#6366f1","items":[{"title":"Administrator","subtitle":"Administrator","detail":"user","tab":"identity","filter":"priv:Schema Admins"}]},{"key":"DnsAdmins","label":"DnsAdmins","value":2,"color":"#6366f1","items":[{"title":"netops","subtitle":"Network Ops","detail":"user","tab":"identity","filter":"priv:DnsAdmins"},{"title":"dhcp.svc","subtitle":"DHCP Service","detail":"user","tab":"identity","filter":"priv:DnsAdmins"}]},{"key":"Protected Users","label":"Protected Users","value":0,"color":"#6366f1","items":[{"title":"Protected Users","subtitle":"Empty group","detail":"Empty is the desired daily state for Schema/Enterprise Admins.","tab":"identity","filter":"priv:Protected Users"}]}]},"sites":{"title":"DCs per site","type":"bar","hint":"Click a site to see its DCs","tab":"sites","slices":[{"key":"HQ-Chicago","label":"HQ-Chicago","value":1,"color":"#0ea5e9","items":[{"title":"NW-DC01","subtitle":"Online","detail":"10.10.10.11 · Windows Server 2022 Standard · created 2018-10-27 13:09","tab":"dcs","filter":"dcname:NW-DC01"}]},{"key":"Plant-Austin","label":"Plant-Austin","value":2,"color":"#0ea5e9","items":[{"title":"NW-DC02","subtitle":"Online","detail":"10.20.20.11 · Windows Server 2019 Standard · created 2021-10-27 13:09","tab":"dcs","filter":"dcname:NW-DC02"},{"title":"NW-RODC01","subtitle":"Error","detail":"10.30.30.11 · Windows Server 2019 Standard · created 2023-10-27 13:09","tab":"dcs","filter":"dcname:NW-RODC01"}]},{"key":"Default-First-Site-Name","label":"Default-First-Site-Name","value":0,"color":"#0ea5e9","items":[{"title":"Default-First-Site-Name","subtitle":"No DC in this site","detail":"Subnets: none","tab":"sites","filter":"sites:empty"}]}]},"roles":{"title":"Top installed roles","type":"bar","hint":"Click a role to see which DCs have it","tab":"roles","slices":[{"key":"DNS Server","label":"DNS Server","value":2,"color":"#8b5cf6","items":[{"title":"NW-DC01","subtitle":"DNS Server","detail":"Role is installed on this DC.","tab":"dcs","filter":"dcname:NW-DC01"},{"title":"NW-DC02","subtitle":"DNS Server","detail":"Role is installed on this DC.","tab":"dcs","filter":"dcname:NW-DC02"}]},{"key":"Active Directory Domain Services","label":"Active Directory Domain Services","value":2,"color":"#8b5cf6","items":[{"title":"NW-DC01","subtitle":"Active Directory Domain Services","detail":"Role is installed on this DC.","tab":"dcs","filter":"dcname:NW-DC01"},{"title":"NW-DC02","subtitle":"Active Directory Domain Services","detail":"Role is installed on this DC.","tab":"dcs","filter":"dcname:NW-DC02"}]},{"key":"DHCP Server","label":"DHCP Server","value":1,"color":"#8b5cf6","items":[{"title":"NW-DC01","subtitle":"DHCP Server","detail":"Role is installed on this DC.","tab":"dcs","filter":"dcname:NW-DC01"}]},{"key":"Active Directory Certificate Services","label":"Active Directory Certificate Services","value":1,"color":"#8b5cf6","items":[{"title":"NW-DC02","subtitle":"Active Directory Certificate Services","detail":"Role is installed on this DC.","tab":"dcs","filter":"dcname:NW-DC02"}]}]},"fsmo":{"title":"FSMO role holders","type":"bar","hint":"Each bar is one role — click to see the holder","tab":"fsmo","slices":[{"key":"Schema Master","label":"Schema Master","value":1,"color":"#6366f1","items":[{"title":"Schema Master","subtitle":"NW-DC01.northwind.lab","detail":"This FSMO write can only happen on this DC.","tab":"fsmo","filter":"dcname:NW-DC01"}]},{"key":"Domain Naming Master","label":"Domain Naming Master","value":1,"color":"#06b6d4","items":[{"title":"Domain Naming Master","subtitle":"NW-DC01.northwind.lab","detail":"This FSMO write can only happen on this DC.","tab":"fsmo","filter":"dcname:NW-DC01"}]},{"key":"PDC Emulator","label":"PDC Emulator","value":1,"color":"#8b5cf6","items":[{"title":"PDC Emulator","subtitle":"NW-DC01.northwind.lab","detail":"This FSMO write can only happen on this DC.","tab":"fsmo","filter":"dcname:NW-DC01"}]},{"key":"RID Master","label":"RID Master","value":1,"color":"#14b8a6","items":[{"title":"RID Master","subtitle":"NW-DC01.northwind.lab","detail":"This FSMO write can only happen on this DC.","tab":"fsmo","filter":"dcname:NW-DC01"}]},{"key":"Infrastructure Master","label":"Infrastructure Master","value":1,"color":"#f59e0b","items":[{"title":"Infrastructure Master","subtitle":"NW-DC01.northwind.lab","detail":"This FSMO write can only happen on this DC.","tab":"fsmo","filter":"dcname:NW-DC01"}]}]}}</script>
+<script type="application/json" id="chartData">{"findings":{"title":"Findings","type":"donut","hint":"Click a slice to open those cards","tab":"brief","slices":[{"key":"warning","label":"Warning","value":7,"color":"#f59e0b","items":[{"title":"AD Recycle Bin is not enabled","subtitle":"Forest","detail":"Deleted users, groups, and computers are not recoverable with full attributes after tombstone processing.","tab":"brief","filter":"finding:warning"},{"title":"Default minimum password length is 8","subtitle":"Identity","detail":"Modern baselines start at 12–15, plus ban-list / Windows Hello / gMSA for services.","tab":"brief","filter":"finding:warning"},{"title":"Account lockout threshold is 0 (never lock out)","subtitle":"Identity","detail":"Brute-force password guesses never lock the account.","tab":"brief","filter":"finding:warning"},{"title":"krbtgt password is 640 days old","subtitle":"Identity","detail":"krbtgt is the account that encrypts Kerberos TGTs. A stolen hash remains useful until this password is rotated twice.","tab":"brief","filter":"finding:warning"},{"title":"Domain Admins has 6 members","subtitle":"Identity","detail":"Administrator, j.blake, s.patel, helpdesk.admin, vendor.temp, backup.svc","tab":"brief","filter":"finding:warning"},{"title":"Enterprise Admins has 2 member(s)","subtitle":"Identity","detail":"Administrator, j.blake","tab":"brief","filter":"finding:warning"},{"title":"Unconstrained Kerberos delegation is in use","subtitle":"Delegation","detail":"Computers: NW-APP01. Users: None.","tab":"brief","filter":"finding:warning"}]},{"key":"info","label":"Info","value":10,"color":"#3b82f6","items":[{"title":"NW-RODC01 machine password is 95 days old","subtitle":"Availability","detail":"Last set 2026-07-24 13:17","tab":"brief","filter":"finding:info"},{"title":"All FSMO roles sit on one DC","subtitle":"FSMO","detail":"Holder: NW-DC01.northwind.lab","tab":"brief","filter":"finding:info"},{"title":"1 site(s) have no domain controller","subtitle":"Sites","detail":"Default-First-Site-Name","tab":"brief","filter":"finding:info"},{"title":"1 trust(s) are configured","subtitle":"Trusts","detail":"fabrikam.lab (Forest, Bidirectional)","tab":"brief","filter":"finding:info"},{"title":"DnsAdmins is populated","subtitle":"Identity","detail":"netops, dhcp.svc","tab":"brief","filter":"finding:info"},{"title":"37 enabled user(s) have not logged on in 90+ days","subtitle":"Hygiene","detail":"Stale enabled accounts are extra passwords an attacker can try, plus license and audit noise.","tab":"brief","filter":"finding:info"},{"title":"22 enabled computer(s) look stale (90+ days)","subtitle":"Hygiene","detail":"Stale computer accounts still have passwords and SPNs. They clutter GPOs and inventories.","tab":"brief","filter":"finding:info"},{"title":"Active Directory Certificate Services is present","subtitle":"Services","detail":"NORTHWIND-CA (NW-DC02.northwind.lab)","tab":"brief","filter":"finding:info"},{"title":"Entra ID Connect / Azure AD Connect artifacts found","subtitle":"Services","detail":"MSOL_a1b2c3d4e5f6","tab":"brief","filter":"finding:info"},{"title":"No LAPS schema attributes detected","subtitle":"Services","detail":"Local admin passwords on workstations/servers may be shared or unmanaged.","tab":"brief","filter":"finding:info"}]}]},"dcStatus":{"title":"Domain controllers","type":"donut","hint":"Click to filter DC cards","tab":"dcs","slices":[{"key":"enabled","label":"Enabled in AD","value":3,"color":"#10b981","items":[{"title":"NW-DC01","subtitle":"Enabled","detail":"10.10.10.11 · HQ-Chicago · Windows Server 2022 Standard · created 2018-10-27 13:17","tab":"dcs","filter":"dc:enabled"},{"title":"NW-DC02","subtitle":"Enabled","detail":"10.20.20.11 · Plant-Austin · Windows Server 2019 Standard · created 2021-10-27 13:17","tab":"dcs","filter":"dc:enabled"},{"title":"NW-RODC01","subtitle":"Enabled","detail":"10.30.30.11 · Plant-Austin · Windows Server 2019 Standard · created 2023-10-27 13:17","tab":"dcs","filter":"dc:enabled"}]}]},"users":{"title":"User accounts","type":"donut","hint":"Click a slice for the sample list","tab":"identity","slices":[{"key":"healthy","label":"Enabled (active)","value":375,"color":"#2563eb","items":[{"title":"Enabled accounts still logging on","subtitle":"375 users","detail":"Enabled minus the stale-enabled count. Not a guarantee they are human or current.","tab":"identity","filter":"identity:users"}]},{"key":"stale","label":"Enabled + stale","value":37,"color":"#f59e0b","items":[{"title":"temp.contractor","subtitle":"Stale user","detail":"Last logon 2026-03-31 13:17","tab":"identity","filter":"identity:stale-users"},{"title":"old.finance","subtitle":"Stale user","detail":"Last logon 2025-09-22 13:17","tab":"identity","filter":"identity:stale-users"}]},{"key":"disabled","label":"Disabled","value":88,"color":"#94a3b8","items":[{"title":"Disabled user accounts","subtitle":"88 accounts","detail":"Disabled is not the same as deleted. Confirm these are intentional.","tab":"identity","filter":"identity:users"}]}]},"computers":{"title":"Computer accounts","type":"donut","hint":"Click a slice to inspect","tab":"identity","slices":[{"key":"healthy","label":"Enabled (active)","value":238,"color":"#0ea5e9","items":[{"title":"Enabled (active)","subtitle":"238 computers","detail":"","tab":"identity","filter":"identity:computers"}]},{"key":"stale","label":"Enabled + stale","value":22,"color":"#f59e0b","items":[{"title":"AUS-WKS-014","subtitle":"Windows 10 Pro","detail":"Last logon 2026-04-30 13:17","tab":"identity","filter":"identity:stale-computers"}]},{"key":"disabled","label":"Disabled","value":41,"color":"#94a3b8","items":[{"title":"Disabled","subtitle":"41 computers","detail":"","tab":"identity","filter":"identity:computers"}]}]},"os":{"title":"Computers by OS","type":"donut","hint":"Click an OS to see samples","tab":"identity","slices":[{"key":"Windows 11 Pro","label":"Windows 11 Pro","value":140,"color":"#6366f1","items":[{"title":"Windows 11 Pro","subtitle":"140 computers","detail":"Full inventory is in the Computers by operating system table.","tab":"identity","filter":"identity:os"}]},{"key":"Windows 10 Pro","label":"Windows 10 Pro","value":70,"color":"#06b6d4","items":[{"title":"AUS-WKS-014","subtitle":"Windows 10 Pro","detail":"Last logon 2026-04-30 13:17","tab":"identity","filter":"identity:os"}]},{"key":"Windows Server 2022 Standard","label":"Windows Server 2022 Standard","value":18,"color":"#8b5cf6","items":[{"title":"Windows Server 2022 Standard","subtitle":"18 computers","detail":"Full inventory is in the Computers by operating system table.","tab":"identity","filter":"identity:os"}]},{"key":"Windows Server 2016 Standard","label":"Windows Server 2016 Standard","value":12,"color":"#14b8a6","items":[{"title":"Windows Server 2016 Standard","subtitle":"12 computers","detail":"Full inventory is in the Computers by operating system table.","tab":"identity","filter":"identity:os"}]},{"key":"(none)","label":"(none)","value":20,"color":"#f43f5e","items":[{"title":"(none)","subtitle":"20 computers","detail":"Full inventory is in the Computers by operating system table.","tab":"identity","filter":"identity:os"}]}]},"priv":{"title":"Privileged groups","type":"bar","hint":"Click a group to see members","tab":"identity","slices":[{"key":"Domain Admins","label":"Domain Admins","value":6,"color":"#6366f1","items":[{"title":"Administrator","subtitle":"Administrator","detail":"user","tab":"identity","filter":"priv:Domain Admins"},{"title":"j.blake","subtitle":"Jordan Blake","detail":"user","tab":"identity","filter":"priv:Domain Admins"},{"title":"s.patel","subtitle":"Sam Patel","detail":"user","tab":"identity","filter":"priv:Domain Admins"},{"title":"helpdesk.admin","subtitle":"Helpdesk Admin","detail":"user","tab":"identity","filter":"priv:Domain Admins"},{"title":"vendor.temp","subtitle":"Vendor Temp","detail":"user","tab":"identity","filter":"priv:Domain Admins"},{"title":"backup.svc","subtitle":"Backup Service","detail":"user","tab":"identity","filter":"priv:Domain Admins"}]},{"key":"Enterprise Admins","label":"Enterprise Admins","value":2,"color":"#6366f1","items":[{"title":"Administrator","subtitle":"Administrator","detail":"user","tab":"identity","filter":"priv:Enterprise Admins"},{"title":"j.blake","subtitle":"Jordan Blake","detail":"user","tab":"identity","filter":"priv:Enterprise Admins"}]},{"key":"Schema Admins","label":"Schema Admins","value":1,"color":"#6366f1","items":[{"title":"Administrator","subtitle":"Administrator","detail":"user","tab":"identity","filter":"priv:Schema Admins"}]},{"key":"DnsAdmins","label":"DnsAdmins","value":2,"color":"#6366f1","items":[{"title":"netops","subtitle":"Network Ops","detail":"user","tab":"identity","filter":"priv:DnsAdmins"},{"title":"dhcp.svc","subtitle":"DHCP Service","detail":"user","tab":"identity","filter":"priv:DnsAdmins"}]},{"key":"Protected Users","label":"Protected Users","value":0,"color":"#6366f1","items":[{"title":"Protected Users","subtitle":"Empty group","detail":"Empty is the desired daily state for Schema/Enterprise Admins.","tab":"identity","filter":"priv:Protected Users"}]}]},"sites":{"title":"DCs per site","type":"bar","hint":"Click a site to see its DCs","tab":"sites","slices":[{"key":"HQ-Chicago","label":"HQ-Chicago","value":1,"color":"#0ea5e9","items":[{"title":"NW-DC01","subtitle":"Enabled","detail":"10.10.10.11 · Windows Server 2022 Standard · created 2018-10-27 13:17","tab":"dcs","filter":"dcname:NW-DC01"}]},{"key":"Plant-Austin","label":"Plant-Austin","value":2,"color":"#0ea5e9","items":[{"title":"NW-DC02","subtitle":"Enabled","detail":"10.20.20.11 · Windows Server 2019 Standard · created 2021-10-27 13:17","tab":"dcs","filter":"dcname:NW-DC02"},{"title":"NW-RODC01","subtitle":"Enabled","detail":"10.30.30.11 · Windows Server 2019 Standard · created 2023-10-27 13:17","tab":"dcs","filter":"dcname:NW-RODC01"}]},{"key":"Default-First-Site-Name","label":"Default-First-Site-Name","value":0,"color":"#0ea5e9","items":[{"title":"Default-First-Site-Name","subtitle":"No DC in this site","detail":"Subnets: none","tab":"sites","filter":"sites:empty"}]}]},"roles":{"title":"Top installed roles","type":"bar","hint":"Click a role to see which DCs have it","tab":"roles","slices":[{"key":"Active Directory Domain Services","label":"Active Directory Domain Services","value":3,"color":"#8b5cf6","items":[{"title":"NW-DC01","subtitle":"Active Directory Domain Services","detail":"Role is advertised on this DC in Active Directory.","tab":"dcs","filter":"dcname:NW-DC01"},{"title":"NW-DC02","subtitle":"Active Directory Domain Services","detail":"Role is advertised on this DC in Active Directory.","tab":"dcs","filter":"dcname:NW-DC02"},{"title":"NW-RODC01","subtitle":"Active Directory Domain Services","detail":"Role is advertised on this DC in Active Directory.","tab":"dcs","filter":"dcname:NW-RODC01"}]},{"key":"DNS Server","label":"DNS Server","value":3,"color":"#8b5cf6","items":[{"title":"NW-DC01","subtitle":"DNS Server","detail":"Role is advertised on this DC in Active Directory.","tab":"dcs","filter":"dcname:NW-DC01"},{"title":"NW-DC02","subtitle":"DNS Server","detail":"Role is advertised on this DC in Active Directory.","tab":"dcs","filter":"dcname:NW-DC02"},{"title":"NW-RODC01","subtitle":"DNS Server","detail":"Role is advertised on this DC in Active Directory.","tab":"dcs","filter":"dcname:NW-RODC01"}]},{"key":"Global Catalog","label":"Global Catalog","value":3,"color":"#8b5cf6","items":[{"title":"NW-DC01","subtitle":"Global Catalog","detail":"Role is advertised on this DC in Active Directory.","tab":"dcs","filter":"dcname:NW-DC01"},{"title":"NW-DC02","subtitle":"Global Catalog","detail":"Role is advertised on this DC in Active Directory.","tab":"dcs","filter":"dcname:NW-DC02"},{"title":"NW-RODC01","subtitle":"Global Catalog","detail":"Role is advertised on this DC in Active Directory.","tab":"dcs","filter":"dcname:NW-RODC01"}]},{"key":"Active Directory Certificate Services","label":"Active Directory Certificate Services","value":1,"color":"#8b5cf6","items":[{"title":"NW-DC02","subtitle":"Active Directory Certificate Services","detail":"Role is advertised on this DC in Active Directory.","tab":"dcs","filter":"dcname:NW-DC02"}]},{"key":"Read-Only Domain Controller","label":"Read-Only Domain Controller","value":1,"color":"#8b5cf6","items":[{"title":"NW-RODC01","subtitle":"Read-Only Domain Controller","detail":"Role is advertised on this DC in Active Directory.","tab":"dcs","filter":"dcname:NW-RODC01"}]},{"key":"DHCP Server","label":"DHCP Server","value":1,"color":"#8b5cf6","items":[{"title":"NW-DC01","subtitle":"DHCP Server","detail":"Role is advertised on this DC in Active Directory.","tab":"dcs","filter":"dcname:NW-DC01"}]}]},"fsmo":{"title":"FSMO role holders","type":"bar","hint":"Each bar is one role — click to see the holder","tab":"fsmo","slices":[{"key":"Schema Master","label":"Schema Master","value":1,"color":"#6366f1","items":[{"title":"Schema Master","subtitle":"NW-DC01.northwind.lab","detail":"This FSMO write can only happen on this DC.","tab":"fsmo","filter":"dcname:NW-DC01"}]},{"key":"Domain Naming Master","label":"Domain Naming Master","value":1,"color":"#06b6d4","items":[{"title":"Domain Naming Master","subtitle":"NW-DC01.northwind.lab","detail":"This FSMO write can only happen on this DC.","tab":"fsmo","filter":"dcname:NW-DC01"}]},{"key":"PDC Emulator","label":"PDC Emulator","value":1,"color":"#8b5cf6","items":[{"title":"PDC Emulator","subtitle":"NW-DC01.northwind.lab","detail":"This FSMO write can only happen on this DC.","tab":"fsmo","filter":"dcname:NW-DC01"}]},{"key":"RID Master","label":"RID Master","value":1,"color":"#14b8a6","items":[{"title":"RID Master","subtitle":"NW-DC01.northwind.lab","detail":"This FSMO write can only happen on this DC.","tab":"fsmo","filter":"dcname:NW-DC01"}]},{"key":"Infrastructure Master","label":"Infrastructure Master","value":1,"color":"#f59e0b","items":[{"title":"Infrastructure Master","subtitle":"NW-DC01.northwind.lab","detail":"This FSMO write can only happen on this DC.","tab":"fsmo","filter":"dcname:NW-DC01"}]}]}}</script>
 <script>
 (function () {
   const root = document.documentElement;
