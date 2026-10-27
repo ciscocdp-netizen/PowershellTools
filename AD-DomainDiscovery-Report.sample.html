@@ -124,7 +124,7 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
   <header class="hero">
     <button class="theme-btn" id="themeBtn" type="button">Toggle theme</button>
     <h1>Active Directory domain brief</h1>
-    <p>Forest <strong>northwind.lab</strong> · Domain <strong>northwind.lab</strong> · Generated 2026-10-27 03:06 · OfflineDemo</p>
+    <p>Forest <strong>northwind.lab</strong> · Domain <strong>northwind.lab</strong> · Generated 2026-10-27 03:21 · OfflineDemo</p>
   </header>
   <div class="banner">Offline demo data — fictional Northwind Lab forest. Run without -OfflineDemo on a domain-joined box to scan a real environment.</div>
   <div class="path card">
@@ -534,7 +534,7 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
     </div>
     <div class="card">
       <h2>Replication failures (domain scope)</h2>
-      <div class="table-wrap"><table><thead><tr><th>Server</th><th>Partner</th><th>Type</th><th>First failure</th><th>Count</th><th>Last error</th></tr></thead><tbody><tr><td>NW-DC01</td><td>NW-RODC01</td><td>Connection</td><td>2026-10-27 00:06</td><td>4</td><td>RPC server unavailable (1722)</td></tr></tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>Server</th><th>Partner</th><th>Type</th><th>First failure</th><th>Count</th><th>Last error</th></tr></thead><tbody><tr><td>NW-DC01</td><td>NW-RODC01</td><td>Connection</td><td>2026-10-27 00:21</td><td>4</td><td>RPC server unavailable (1722)</td></tr></tbody></table></div>
     </div>
   </section>
 
@@ -544,14 +544,14 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
     <p>Uptime is not a virtue if patches are pending. Time source should chain to the PDC Emulator. Disks under 15% free are an outage waiting to happen. Inbound partners with consecutive failures mean this DC is drifting.</p>
 </div>
     <div class="controls">
-      <input class="search" id="dcSearch" placeholder="Search name, IP, site, OS, FSMO...">
+      <input class="search" id="dcSearch" placeholder="Search name, IP, site, OS, FSMO, role, or feature...">
       <button class="filter active" data-dc-filter="all">All</button>
       <button class="filter" data-dc-filter="online">Online</button>
       <button class="filter" data-dc-filter="error">Errors</button>
       <button class="filter" data-dc-filter="skipped">Skipped</button>
     </div>
     <div class="dc-grid">
-      <article class="dc-card" data-status="online" data-search="nw-dc01 nw-dc01.northwind.lab 10.10.10.11 hq-chicago windows server 2022 standard schema master domain naming master pdc emulator rid master infrastructure master online">
+      <article class="dc-card" data-status="online" data-search="nw-dc01 nw-dc01.northwind.lab 10.10.10.11 hq-chicago windows server 2022 standard online schema master domain naming master pdc emulator rid master infrastructure master active directory domain services ad-domain-services dns server dns dhcp server dhcp active directory module for windows powershell rsat-ad-powershell group policy management gpmc">
     <header class="dc-head">
         <div>
             <h3>NW-DC01</h3>
@@ -567,7 +567,7 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
         <div><span class="lbl">Site</span><span>HQ-Chicago</span></div>
         <div><span class="lbl">OS</span><span>Windows Server 2022 Standard</span></div>
         <div><span class="lbl">Version</span><span>10.0 (20348)</span></div>
-        <div><span class="lbl">Last boot</span><span>2026-09-15 03:06</span></div>
+        <div><span class="lbl">Last boot</span><span>2026-09-15 03:21</span></div>
         <div><span class="lbl">Uptime</span><span class="uptime">42d 3h 12m</span></div>
         <div><span class="lbl">Memory</span><span>16 GB</span></div>
         <div><span class="lbl">Time source</span><span>time.windows.com</span></div>
@@ -575,7 +575,7 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
         <div><span class="lbl">Pending reboot</span><span>Yes</span></div>
     </div>
     <section><h4>FSMO roles held</h4><div class="tags"><span class="tag tag-fsmo">Schema Master</span><span class="tag tag-fsmo">Domain Naming Master</span><span class="tag tag-fsmo">PDC Emulator</span><span class="tag tag-fsmo">RID Master</span><span class="tag tag-fsmo">Infrastructure Master</span></div></section>
-    <section><h4>Replication partners (inbound)</h4><div class="repl"><div class="repl-row repl-ok"><strong>NW-DC02</strong> · last success 2026-10-27 02:48 · fails 0 · northwind, Configuration, Schema</div><div class="repl-row repl-bad"><strong>NW-RODC01</strong> · last success 2026-10-27 00:06 · fails 4 · northwind</div></div></section>
+    <section><h4>Replication partners (inbound)</h4><div class="repl"><div class="repl-row repl-ok"><strong>NW-DC02</strong> · last success 2026-10-27 03:03 · fails 0 · northwind, Configuration, Schema</div><div class="repl-row repl-bad"><strong>NW-RODC01</strong> · last success 2026-10-27 00:21 · fails 4 · northwind</div></div></section>
     <section><h4>Disks</h4><div class="disk"><span>C:</span><span>14.2 / 127 GB free (11%)</span></div><div class="disk"><span>D:</span><span>41 / 80 GB free (51%)</span></div></section>
     <section><h4>Key services</h4><div class="tags"><span class="tag svc-on">NTDS: Running</span><span class="tag svc-on">DNS: Running</span><span class="tag svc-on">KDC: Running</span><span class="tag svc-on">DFSR: Running</span><span class="tag svc-on">W32Time: Running</span><span class="tag svc-on">DHCPServer: Running</span></div></section>
     <section class="collapsible">
@@ -587,7 +587,7 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
         <div class="collapse-c"><div class="tags"><span class="tag tag-feature" title="AD PowerShell">Active Directory module for Windows PowerShell</span><span class="tag tag-feature" title="GPO admin console">Group Policy Management</span></div></div>
     </section>
 </article>
-<article class="dc-card" data-status="online" data-search="nw-dc02 nw-dc02.northwind.lab 10.20.20.11 plant-austin windows server 2019 standard  online">
+<article class="dc-card" data-status="online" data-search="nw-dc02 nw-dc02.northwind.lab 10.20.20.11 plant-austin windows server 2019 standard online active directory domain services ad-domain-services dns server dns active directory certificate services adcs-cert-authority">
     <header class="dc-head">
         <div>
             <h3>NW-DC02</h3>
@@ -603,7 +603,7 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
         <div><span class="lbl">Site</span><span>Plant-Austin</span></div>
         <div><span class="lbl">OS</span><span>Windows Server 2019 Standard</span></div>
         <div><span class="lbl">Version</span><span>10.0 (17763)</span></div>
-        <div><span class="lbl">Last boot</span><span>2026-06-29 03:06</span></div>
+        <div><span class="lbl">Last boot</span><span>2026-06-29 03:21</span></div>
         <div><span class="lbl">Uptime</span><span class="uptime">120d 6h 1m</span></div>
         <div><span class="lbl">Memory</span><span>12 GB</span></div>
         <div><span class="lbl">Time source</span><span>NW-DC01.northwind.lab</span></div>
@@ -611,7 +611,7 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
         <div><span class="lbl">Pending reboot</span><span>No</span></div>
     </div>
     <section><h4>FSMO roles held</h4><div class="tags"><span class="muted">None</span></div></section>
-    <section><h4>Replication partners (inbound)</h4><div class="repl"><div class="repl-row repl-ok"><strong>NW-DC01</strong> · last success 2026-10-27 02:50 · fails 0 · northwind, Configuration, Schema</div></div></section>
+    <section><h4>Replication partners (inbound)</h4><div class="repl"><div class="repl-row repl-ok"><strong>NW-DC01</strong> · last success 2026-10-27 03:05 · fails 0 · northwind, Configuration, Schema</div></div></section>
     <section><h4>Disks</h4><div class="disk"><span>C:</span><span>22 / 100 GB free (22%)</span></div></section>
     <section><h4>Key services</h4><div class="tags"><span class="tag svc-on">NTDS: Running</span><span class="tag svc-on">DNS: Running</span><span class="tag svc-on">KDC: Running</span><span class="tag svc-on">DFSR: Running</span><span class="tag svc-on">CertSvc: Running</span></div></section>
     <section class="collapsible">
@@ -623,7 +623,7 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
         <div class="collapse-c"><div class="tags"><span class="muted">None collected</span></div></div>
     </section>
 </article>
-<article class="dc-card" data-status="error" data-search="nw-rodc01 nw-rodc01.northwind.lab 10.30.30.11 plant-austin windows server 2019 standard  error">
+<article class="dc-card" data-status="error" data-search="nw-rodc01 nw-rodc01.northwind.lab 10.30.30.11 plant-austin windows server 2019 standard error">
     <header class="dc-head">
         <div>
             <h3>NW-RODC01</h3>
@@ -673,7 +673,7 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
     <td>10.10.10.11</td>
     <td>HQ-Chicago</td>
     <td>Windows Server 2022 Standard</td>
-    <td>2026-09-15 03:06</td>
+    <td>2026-09-15 03:21</td>
     <td>42d 3h 12m</td>
     <td>Schema Master, Domain Naming Master, PDC Emulator, RID Master, Infrastructure Master</td>
     <td>NW-DC02, NW-RODC01</td>
@@ -684,7 +684,7 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
     <td>10.20.20.11</td>
     <td>Plant-Austin</td>
     <td>Windows Server 2019 Standard</td>
-    <td>2026-06-29 03:06</td>
+    <td>2026-06-29 03:21</td>
     <td>120d 6h 1m</td>
     <td>-</td>
     <td>NW-DC01</td>
@@ -727,7 +727,7 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
       <div class="card">
         <h2>KRBTGT &amp; hygiene snapshot</h2>
         <div class="table-wrap"><table><tbody>
-          <tr><td>krbtgt last password set</td><td>2025-01-25 03:06 (640 days ago)</td></tr>
+          <tr><td>krbtgt last password set</td><td>2025-01-25 03:21 (640 days ago)</td></tr>
           <tr><td>Enabled users</td><td>412</td></tr>
           <tr><td>Disabled users</td><td>88</td></tr>
           <tr><td>Stale enabled users (90+ days)</td><td>37</td></tr>
@@ -778,12 +778,12 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
     <div class="grid-2">
       <div class="card">
         <h2>Stale users (sample)</h2>
-        <div class="table-wrap"><table><thead><tr><th>Account</th><th>Last logon</th></tr></thead><tbody><tr><td>temp.contractor</td><td>2026-03-31 03:06</td></tr>
-<tr><td>old.finance</td><td>2025-09-22 03:06</td></tr></tbody></table></div>
+        <div class="table-wrap"><table><thead><tr><th>Account</th><th>Last logon</th></tr></thead><tbody><tr><td>temp.contractor</td><td>2026-03-31 03:21</td></tr>
+<tr><td>old.finance</td><td>2025-09-22 03:21</td></tr></tbody></table></div>
       </div>
       <div class="card">
         <h2>Stale computers (sample)</h2>
-        <div class="table-wrap"><table><thead><tr><th>Name</th><th>OS</th><th>Last logon</th></tr></thead><tbody><tr><td>AUS-WKS-014</td><td>Windows 10 Pro</td><td>2026-04-30 03:06</td></tr></tbody></table></div>
+        <div class="table-wrap"><table><thead><tr><th>Name</th><th>OS</th><th>Last logon</th></tr></thead><tbody><tr><td>AUS-WKS-014</td><td>Windows 10 Pro</td><td>2026-04-30 03:21</td></tr></tbody></table></div>
       </div>
     </div>
     <div class="card">
@@ -804,10 +804,10 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
     <div class="card">
       <h2>Group Policy objects (4)</h2>
       <div class="controls"><input class="search" id="gpoSearch" placeholder="Filter GPOs..."></div>
-      <div class="table-wrap"><table id="gpoTable"><thead><tr><th>Name</th><th>Status</th><th>Created</th><th>Modified</th></tr></thead><tbody><tr><td>Default Domain Controllers Policy</td><td>AllSettingsEnabled</td><td>2018-10-27 03:06</td><td>2026-09-17 03:06</td></tr>
-<tr><td>Default Domain Policy</td><td>AllSettingsEnabled</td><td>2018-10-27 03:06</td><td>2026-10-15 03:06</td></tr>
-<tr><td>Map-Drives-Legacy</td><td>UserSettingsDisabled</td><td>2020-10-27 03:06</td><td>2024-10-27 03:06</td></tr>
-<tr><td>Workstation-Baseline</td><td>AllSettingsEnabled</td><td>2023-10-27 03:06</td><td>2026-10-22 03:06</td></tr></tbody></table></div>
+      <div class="table-wrap"><table id="gpoTable"><thead><tr><th>Name</th><th>Status</th><th>Created</th><th>Modified</th></tr></thead><tbody><tr><td>Default Domain Controllers Policy</td><td>AllSettingsEnabled</td><td>2018-10-27 03:21</td><td>2026-09-17 03:21</td></tr>
+<tr><td>Default Domain Policy</td><td>AllSettingsEnabled</td><td>2018-10-27 03:21</td><td>2026-10-15 03:21</td></tr>
+<tr><td>Map-Drives-Legacy</td><td>UserSettingsDisabled</td><td>2020-10-27 03:21</td><td>2024-10-27 03:21</td></tr>
+<tr><td>Workstation-Baseline</td><td>AllSettingsEnabled</td><td>2023-10-27 03:21</td><td>2026-10-22 03:21</td></tr></tbody></table></div>
     </div>
     <div class="card">
       <h2>OU tree (5)</h2>
@@ -842,7 +842,7 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
   </section>
 
   <footer>
-    <p>AD Domain Discovery Report v2.0 · Execution time 00:00.236 · Stale threshold 90 days</p>
+    <p>AD Domain Discovery Report v2.0 · Execution time 00:00.232 · Stale threshold 90 days</p>
     <p>Read-only discovery. This script does not change AD. Validate privileged-group counts before you act.</p>
   </footer>
 </div>
@@ -876,7 +876,8 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
   function applyDcFilter() {
     const q = (search.value || "").toLowerCase();
     cards.forEach(function (card) {
-      const okText = !q || (card.getAttribute("data-search") || "").indexOf(q) !== -1 || card.textContent.toLowerCase().indexOf(q) !== -1;
+      const hay = card.getAttribute("data-search") || "";
+      const okText = !q || hay.indexOf(q) !== -1;
       const st = card.getAttribute("data-status");
       const okSt = statusFilter === "all" || st === statusFilter;
       card.classList.toggle("hidden", !(okText && okSt));

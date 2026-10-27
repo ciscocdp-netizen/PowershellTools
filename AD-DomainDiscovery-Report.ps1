@@ -1548,10 +1548,18 @@ function New-DiscoveryReportHtml {
                 }) -join ''
         }
 
-        $searchBlob = @(
-            $dc.ComputerName, $dc.HostName, $dc.IPv4Address, $dc.Site, $dc.OperatingSystem,
-            ($dc.FSMORoles -join ' '), $dc.Status
-        ) -join ' '
+        $searchParts = [System.Collections.Generic.List[string]]::new()
+        foreach ($part in @($dc.ComputerName, $dc.HostName, $dc.IPv4Address, $dc.Site, $dc.OperatingSystem, $dc.Status)) {
+            if ($part) { [void]$searchParts.Add([string]$part) }
+        }
+        foreach ($part in @($dc.FSMORoles)) {
+            if ($part) { [void]$searchParts.Add([string]$part) }
+        }
+        foreach ($item in @($dc.Roles) + @($dc.Features)) {
+            if ($item.DisplayName) { [void]$searchParts.Add([string]$item.DisplayName) }
+            if ($item.Name) { [void]$searchParts.Add([string]$item.Name) }
+        }
+        $searchBlob = ($searchParts.ToArray() -join ' ')
 
         [void]$dcCards.AppendLine(@"
 <article class="dc-card" data-status="$statusClass" data-search="$(ConvertTo-HtmlEncoded $searchBlob.ToLowerInvariant())">
@@ -1956,7 +1964,8 @@ footer { text-align:center; color:var(--muted); padding:24px 0; font-size:.85rem
   function applyDcFilter() {
     const q = (search.value || "").toLowerCase();
     cards.forEach(function (card) {
-      const okText = !q || (card.getAttribute("data-search") || "").indexOf(q) !== -1 || card.textContent.toLowerCase().indexOf(q) !== -1;
+      const hay = card.getAttribute("data-search") || "";
+      const okText = !q || hay.indexOf(q) !== -1;
       const st = card.getAttribute("data-status");
       const okSt = statusFilter === "all" || st === statusFilter;
       card.classList.toggle("hidden", !(okText && okSt));
@@ -2144,7 +2153,7 @@ $css
   <section id="dcs" class="panel">
     $(New-LearnBox 'A DC is more than "online"' 'Uptime is not a virtue if patches are pending. Time source should chain to the PDC Emulator. Disks under 15% free are an outage waiting to happen. Inbound partners with consecutive failures mean this DC is drifting.')
     <div class="controls">
-      <input class="search" id="dcSearch" placeholder="Search name, IP, site, OS, FSMO...">
+      <input class="search" id="dcSearch" placeholder="Search name, IP, site, OS, FSMO, role, or feature...">
       <button class="filter active" data-dc-filter="all">All</button>
       <button class="filter" data-dc-filter="online">Online</button>
       <button class="filter" data-dc-filter="error">Errors</button>
