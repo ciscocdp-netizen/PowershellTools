@@ -1,0 +1,5 @@
+"ScriptName","ScriptPath","ScriptKey","UserCount","PercentOfUsers","Users"
+"logon.bat","scripts\logon.bat","scripts\logon.bat","4","50","alice; bob; carol; obrien"
+"login.cmd","login.cmd","login.cmd","2","25","dave; erin"
+"dept.vbs","\\fs01\netlogon\dept.vbs","\\fs01\netlogon\dept.vbs","1","12.5","frank"
+"old.bat","scripts\old.bat","scripts\old.bat","1","12.5","gina"
