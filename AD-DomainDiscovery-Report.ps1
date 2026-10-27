@@ -3144,7 +3144,7 @@ $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 Write-Host ''
 Write-Host '==============================================' -ForegroundColor Green
-Write-Host '  AD Domain Discovery Report v2.0' -ForegroundColor Green
+Write-Host '  AD Domain Discovery Report v2.1' -ForegroundColor Green
 Write-Host '==============================================' -ForegroundColor Green
 Write-Host ''
 
