@@ -74,7 +74,7 @@
 
 .NOTES
     Author      : Anthony Blake
-    Version     : 1.7
+    Version     : 1.8
     Compatible  : Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012
                   (PowerShell 3.0), 2012 R2 (PowerShell 4.0), 5.1, and PowerShell 7+.
                   There is no Requires-Version directive. Do not use -shl/-shr
@@ -95,11 +95,13 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.7'
+$script:AppVersion = '1.8'
 $script:AppAuthor  = 'Anthony Blake'
 $script:NameCache = $null
 $script:ResolveNames = $true
 $script:LastDnsVersion = -1
+$script:PacketListColumns = 10
+$script:PacketListUpdating = $false
 
 # Version is checked at runtime on purpose. Do not add "#Requires -Version".
 # Server 2008 / 2008 R2 is PowerShell 2.0. Server 2012 R2 is 4.0.
@@ -279,10 +281,18 @@ function Get-CachedHostName {
 }
 
 function Get-ResolvedAddressText {
-    param([string]$Ip)
-    $show = $true
-    try { if ($script:ResolveNames -eq $false) { $show = $false } } catch { }
-    return (Format-ResolvedAddress -Ip $Ip -HostName (Get-CachedHostName $Ip) -ShowName $show)
+    param($Ip)
+    try {
+        $ipText = [string]$Ip
+        if (Test-BlankString $ipText) { return '' }
+        $show = $true
+        try { if ($script:ResolveNames -eq $false) { $show = $false } } catch { }
+        $n = ''
+        try { $n = Get-CachedHostName $ipText } catch { }
+        return (Format-ResolvedAddress -Ip $ipText -HostName $n -ShowName $show)
+    } catch {
+        try { return [string]$Ip } catch { return '' }
+    }
 }
 
 function Queue-AddressName {
@@ -3215,6 +3225,9 @@ function Invoke-SmbAnalyzerSelfTest {
     if ($saveName -notmatch 'PowerShark-.*\.pcap$') { [void]$failures.Add("Get-CaptureSavePath name: $saveName") }
     if ((Get-SaveFormat 'CSV') -ne 'csv') { [void]$failures.Add('Get-SaveFormat CSV') }
     if ($script:AppAuthor -ne 'Anthony Blake') { [void]$failures.Add("AppAuthor=$($script:AppAuthor)") }
+    if ($script:AppVersion -ne '1.8') { [void]$failures.Add("AppVersion=$($script:AppVersion)") }
+    if ((Get-ResolvedAddressText $null) -ne '') { [void]$failures.Add('Get-ResolvedAddressText null should be blank') }
+    if ((Get-ResolvedAddressText '') -ne '') { [void]$failures.Add('Get-ResolvedAddressText empty should be blank') }
     if ((Get-SaveFormat 'pcap') -ne 'pcap') { [void]$failures.Add('Get-SaveFormat pcap') }
     if ((Get-SaveFormat -Path 'C:\tmp\out.csv') -ne 'csv') { [void]$failures.Add('Get-SaveFormat path csv') }
     $csvName = Get-CaptureSavePath -Directory $desk -Format 'csv'
@@ -3328,6 +3341,8 @@ $script:chkAutoScroll   = $null
 $script:chkResolve      = $null
 $script:lblDns          = $null
 $script:LastDnsVersion  = -1
+$script:PacketListColumns = 10
+$script:PacketListUpdating = $false
 $script:cmbSaveFormat   = $null
 $script:cmbTimer        = $null
 $script:lblTimer        = $null
@@ -3728,6 +3743,9 @@ function Set-PacketListVirtualSize {
     param([int]$Size)
     if (-not $script:lvPackets) { return }
     if ($Size -lt 0) { $Size = 0 }
+    $viewCount = 0
+    try { $viewCount = Get-AppCount $script:ViewPackets } catch { $viewCount = 0 }
+    if ($Size -gt $viewCount) { $Size = $viewCount }
     $old = 0
     try { $old = [int]$script:lvPackets.VirtualListSize } catch { $old = 0 }
     $selBad = $false
@@ -3738,11 +3756,21 @@ function Set-PacketListVirtualSize {
         }
     } catch { $selBad = $true }
     if ($Size -eq $old -and -not $selBad) { return }
+    if ($selBad -or $Size -lt $old) {
+        try { $script:lvPackets.SelectedIndices.Clear() } catch { }
+        try { $script:lvPackets.FocusedItem = $null } catch { }
+        # Jump to the top before shrinking so the current scroll offset is not
+        # past the new VirtualListSize (WinForms then asks for a missing row).
+        if ($old -gt 0) {
+            try { $script:lvPackets.EnsureVisible(0) } catch { }
+        }
+    }
     try { $script:lvPackets.BeginUpdate() } catch { }
     try {
-        if ($selBad -or $Size -lt $old) {
-            try { $script:lvPackets.SelectedIndices.Clear() } catch { }
-            try { $script:lvPackets.FocusedItem = $null } catch { }
+        # Shrink to 0 first so WinForms does not ask for a row past the new size
+        # (that throws "ListView virtualization requires a valid ListViewItem").
+        if ($Size -lt $old) {
+            try { $script:lvPackets.VirtualListSize = 0 } catch { }
         }
         try { $script:lvPackets.VirtualListSize = $Size } catch { }
     } finally {
@@ -3752,22 +3780,21 @@ function Set-PacketListVirtualSize {
 
 function Update-PacketView {
     $script:FilterText = if ($script:txtFilter) { $script:txtFilter.Text } else { '' }
-    if ($script:lvPackets) {
-        try { $script:lvPackets.BeginUpdate() } catch { }
-    }
+    $script:PacketListUpdating = $true
     try {
-        $script:ViewPackets.Clear()
+        # Drop VirtualListSize before clearing ViewPackets. Clearing first
+        # leaves the list asking for row 55744 while the array is empty, which
+        # is the "ListView virtualization requires a valid ListViewItem" dialog.
         Set-PacketListVirtualSize 0
+        $script:ViewPackets.Clear()
         foreach ($p in (Get-AppEnumerable $script:AllPackets)) {
             if (Test-PacketFilter $p) { [void]$script:ViewPackets.Add($p) }
         }
-        Set-PacketListVirtualSize (Get-AppCount $script:ViewPackets)
-        try { if ($script:lvPackets) { $script:lvPackets.Invalidate() } } catch { }
     } finally {
-        if ($script:lvPackets) {
-            try { $script:lvPackets.EndUpdate() } catch { }
-        }
+        $script:PacketListUpdating = $false
     }
+    Set-PacketListVirtualSize (Get-AppCount $script:ViewPackets)
+    try { if ($script:lvPackets) { $script:lvPackets.Invalidate() } } catch { }
     Update-FilterBoxColor
     Update-StatusBar
 }
@@ -3783,11 +3810,37 @@ function Update-FilterBoxColor {
 }
 
 function Limit-PacketBuffer {
-    if ((Get-AppCount $script:AllPackets) -le $script:MaxPackets) { return }
-    $trim = [Math]::Max(500, [int]($script:MaxPackets * 0.15))
-    $script:AllPackets.RemoveRange(0, $trim)
-    Update-PacketView
-    Write-AppLog "Packet buffer trimmed by $trim frames (cap=$($script:MaxPackets))." 'WARN'
+    $cap = 25000
+    try { $cap = [int]$script:MaxPackets } catch { }
+    if ($cap -lt 100) { $cap = 100 }
+    $count = Get-AppCount $script:AllPackets
+    if ($count -le $cap) { return }
+    $trim = $count - $cap
+    if ($trim -lt 500) { $trim = 500 }
+    if ($trim -gt $count) { $trim = $count }
+    $ok = $false
+    try {
+        $script:AllPackets.RemoveRange(0, $trim)
+        $ok = $true
+    } catch {
+        try {
+            $keep = New-Object System.Collections.ArrayList
+            $start = $count - $cap
+            if ($start -lt 0) { $start = 0 }
+            $i = 0
+            foreach ($p in (Get-AppEnumerable $script:AllPackets)) {
+                if ($i -ge $start -and $null -ne $p) { [void]$keep.Add($p) }
+                $i++
+            }
+            $script:AllPackets = $keep
+            $ok = $true
+            $trim = $start
+        } catch { }
+    }
+    try { Update-PacketView } catch { }
+    if ($ok) {
+        Write-AppLog "Packet buffer trimmed by $trim frames (cap=$cap, now=$(Get-AppCount $script:AllPackets))." 'WARN'
+    }
 }
 
 function Test-AppServerPort {
@@ -3889,29 +3942,145 @@ function Add-PacketsToUi {
 function Get-PacketListColumnCount {
     $n = 10
     try {
+        if ($script:PacketListColumns -gt 0) { $n = [int]$script:PacketListColumns }
+    } catch { }
+    try {
         if ($script:lvPackets) { $n = [int]$script:lvPackets.Columns.Count }
     } catch { }
-    if ($n -lt 1) { $n = 9 }
+    if ($n -lt 1) { $n = 10 }
+    $script:PacketListColumns = $n
     return $n
 }
 
 function New-BlankPacketListItem {
-    $item = New-Object System.Windows.Forms.ListViewItem('')
-    $need = Get-PacketListColumnCount
-    while ($item.SubItems.Count -lt $need) {
-        [void]$item.SubItems.Add('')
-    }
+    $item = $null
+    try { $item = New-Object System.Windows.Forms.ListViewItem('') } catch { }
+    if ($null -eq $item) { return $null }
+    $need = 10
+    try { $need = Get-PacketListColumnCount } catch { $need = 10 }
+    try {
+        while ($item.SubItems.Count -lt $need) {
+            [void]$item.SubItems.Add('')
+        }
+    } catch { }
     return $item
 }
 
 function Complete-PacketListItem {
     param($Item)
     if ($null -eq $Item) { return (New-BlankPacketListItem) }
-    $need = Get-PacketListColumnCount
-    while ($Item.SubItems.Count -lt $need) {
-        [void]$Item.SubItems.Add('')
-    }
+    $need = 10
+    try { $need = Get-PacketListColumnCount } catch { $need = 10 }
+    try {
+        while ($Item.SubItems.Count -lt $need) {
+            [void]$Item.SubItems.Add('')
+        }
+    } catch { }
     return $Item
+}
+
+function Set-RetrieveVirtualItem {
+    param($EventArgs, $Item)
+    if ($null -eq $EventArgs) { return }
+    if ($null -eq $Item) {
+        try { $Item = New-BlankPacketListItem } catch { }
+    }
+    if ($null -eq $Item) {
+        try { $Item = New-Object System.Windows.Forms.ListViewItem('') } catch { return }
+    }
+    $targets = New-Object System.Collections.ArrayList
+    [void]$targets.Add($EventArgs)
+    try {
+        $base = $EventArgs.psobject.BaseObject
+        if ($null -ne $base -and [object]::ReferenceEquals($base, $EventArgs) -eq $false) {
+            [void]$targets.Add($base)
+        }
+    } catch { }
+    foreach ($t in $targets) {
+        if ($null -eq $t) { continue }
+        try { $t.Item = $Item } catch { }
+        try {
+            $prop = $t.GetType().GetProperty('Item')
+            if ($prop) {
+                try { $prop.SetValue($t, $Item, $null) } catch { }
+                try {
+                    $set = $prop.GetSetMethod()
+                    if ($set) { [void]$set.Invoke($t, @($Item)) }
+                } catch { }
+            }
+        } catch { }
+    }
+}
+
+function Invoke-PacketListRetrieveVirtualItem {
+    param($EventArgs)
+    $eap = $null
+    try { $eap = $ErrorActionPreference } catch { }
+    try {
+        try { $ErrorActionPreference = 'Continue' } catch { }
+        $evt = $EventArgs
+        $blank = $null
+        try { $blank = New-BlankPacketListItem } catch { }
+        if ($null -eq $blank) {
+            try { $blank = New-Object System.Windows.Forms.ListViewItem('') } catch { }
+        }
+        Set-RetrieveVirtualItem $evt $blank
+        try {
+            if ($null -eq $evt) { return }
+            if ($script:PacketListUpdating) { return }
+            $idx = -1
+            try { $idx = [int]$evt.ItemIndex } catch { return }
+            $count = Get-AppCount $script:ViewPackets
+            if ($idx -lt 0 -or $idx -ge $count) { return }
+            $p = $null
+            try { $p = $script:ViewPackets[$idx] } catch { return }
+            if ($null -eq $p) { return }
+            $noText = ''
+            try { $noText = [string]$p.No } catch { $noText = '' }
+            $item = New-Object System.Windows.Forms.ListViewItem($noText)
+            $timeText = ''
+            try { $timeText = $p.Time.ToString('HH:mm:ss.fff') } catch { $timeText = '' }
+            if ($null -eq $timeText) { $timeText = '' }
+            [void]$item.SubItems.Add($timeText)
+            $srcText = ''
+            try { $srcText = [string](Get-ResolvedAddressText $p.Src) } catch { try { $srcText = [string]$p.Src } catch { $srcText = '' } }
+            if ($null -eq $srcText) { $srcText = '' }
+            [void]$item.SubItems.Add($srcText)
+            $spText = ''
+            try { $spText = [string]$p.SrcPort } catch { }
+            [void]$item.SubItems.Add($spText)
+            $dstText = ''
+            try { $dstText = [string](Get-ResolvedAddressText $p.Dst) } catch { try { $dstText = [string]$p.Dst } catch { $dstText = '' } }
+            if ($null -eq $dstText) { $dstText = '' }
+            [void]$item.SubItems.Add($dstText)
+            $dpText = ''
+            try { $dpText = [string]$p.DstPort } catch { }
+            [void]$item.SubItems.Add($dpText)
+            $protoText = ''
+            try { $protoText = [string]$p.Protocol } catch { }
+            [void]$item.SubItems.Add($protoText)
+            $acctText = ''
+            try { $acctText = [string]$p.UserName } catch { }
+            if ($null -eq $acctText) { $acctText = '' }
+            [void]$item.SubItems.Add($acctText)
+            $lenText = ''
+            try { $lenText = [string]$p.Length } catch { }
+            [void]$item.SubItems.Add($lenText)
+            $infoText = ''
+            try { $infoText = [string]$p.Info } catch { }
+            if ($null -eq $infoText) { $infoText = '' }
+            [void]$item.SubItems.Add($infoText)
+            try { $item.BackColor = Get-PacketRowColor $p } catch { }
+            try { if ($p.IsSmb1) { $item.ForeColor = $script:C.Smb1Ink } } catch { }
+            Set-RetrieveVirtualItem $evt (Complete-PacketListItem $item)
+        } catch {
+            Set-RetrieveVirtualItem $evt $blank
+        }
+    } finally {
+        if ($null -ne $eap) {
+            try { $ErrorActionPreference = $eap } catch { }
+        }
+    }
 }
 
 function Refresh-PacketListView {
@@ -3920,8 +4089,14 @@ function Refresh-PacketListView {
     $n = Get-AppCount $script:ViewPackets
     if ($n -lt 0) { $n = 0 }
     Set-PacketListVirtualSize $n
-    if ($ScrollEnd -and $script:chkAutoScroll -and $script:chkAutoScroll.Checked -and $n -gt 0) {
-        try { $script:lvPackets.EnsureVisible($n - 1) } catch { }
+    $size = 0
+    try { $size = [int]$script:lvPackets.VirtualListSize } catch { $size = $n }
+    if ($ScrollEnd -and $script:chkAutoScroll -and $script:chkAutoScroll.Checked -and $n -gt 0 -and $size -gt 0) {
+        $vis = $n - 1
+        if ($vis -ge $size) { $vis = $size - 1 }
+        if ($vis -ge 0) {
+            try { $script:lvPackets.EnsureVisible($vis) } catch { }
+        }
     } else {
         try { $script:lvPackets.Invalidate() } catch { }
     }
@@ -3930,8 +4105,6 @@ function Refresh-PacketListView {
 function Update-StatusBar {
     $stats = $null
     if ($script:Engine) { $stats = $script:Engine.GetStats() }
-    $smb1View = 0
-    foreach ($p in (Get-AppEnumerable $script:ViewPackets)) { if ($p.IsSmb1) { $smb1View++ } }
     $elapsed = ''
     if ($script:CaptureStarted) {
         $ts = (Get-Date) - $script:CaptureStarted
@@ -4034,11 +4207,11 @@ function Update-CaptureUi {
     try {
         if ($script:Engine -and $script:Engine.Running) {
             $batch = $script:Engine.Drain(120)
-            if ($batch.Length -gt 0) {
+            if ($batch -and $batch.Length -gt 0) {
                 [void](Add-PacketsToUi -Packets $batch)
                 Refresh-PacketListView -ScrollEnd
-                if ((Get-AppCount $script:AllPackets) -gt $script:MaxPackets) { Limit-PacketBuffer }
             }
+            if ((Get-AppCount $script:AllPackets) -gt $script:MaxPackets) { Limit-PacketBuffer }
         }
         Update-StatusBar
         Update-SessionTimerLabel
@@ -4493,13 +4666,12 @@ function Clear-Capture {
         $r = [System.Windows.Forms.MessageBox]::Show('Clear the packet list while still capturing?', 'Clear', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
         if ($r -ne [System.Windows.Forms.DialogResult]::Yes) { return }
     }
-    if ($script:lvPackets) {
-        try { $script:lvPackets.BeginUpdate() } catch { }
-    }
+    $script:PacketListUpdating = $true
     try {
         if ($script:lvPackets) {
             try { $script:lvPackets.SelectedIndices.Clear() } catch { }
         }
+        Set-PacketListVirtualSize 0
         $script:FindIndex = -1
         $script:AllPackets.Clear()
         $script:ViewPackets.Clear()
@@ -4514,9 +4686,7 @@ function Clear-Capture {
         Set-PacketListVirtualSize 0
         try { if ($script:lvPackets) { $script:lvPackets.Invalidate() } } catch { }
     } finally {
-        if ($script:lvPackets) {
-            try { $script:lvPackets.EndUpdate() } catch { }
-        }
+        $script:PacketListUpdating = $false
     }
     try { $script:tvDetails.Nodes.Clear() } catch { }
     try { $script:hexBox.Clear() } catch { }
@@ -4563,6 +4733,7 @@ function Import-PcapPath {
         [System.Windows.Forms.Application]::DoEvents()
         $pkts = [PowerSharkParser]::ReadPcap($Path)
         [void](Add-PacketsToUi -Packets $pkts)
+        try { Limit-PacketBuffer } catch { }
         Refresh-PacketListView
         Update-HostsGrid
         Update-StatsTab
@@ -4982,13 +5153,6 @@ function Update-NameResolutionUi {
             $script:lblDns.Text = ('Names: {0}' -f $n)
         }
     }
-    $p = $null
-    try { $p = Get-SelectedPacket } catch { }
-    if ($p -and $script:tvDetails) { Show-PacketDetails $p }
-    if ($script:tabMain -and $script:tabMain.SelectedTab -eq $script:tabHosts) { Update-HostsGrid }
-    if ($script:tabMain -and $script:tabFindings -and $script:tabMain.SelectedTab -eq $script:tabFindings) {
-        Update-FindingsGrid -Force
-    }
 }
 
 function Resolve-HostNames {
@@ -5328,6 +5492,7 @@ function Sort-PacketView {
     if ($script:SortColumn -eq $Column) { $script:SortAscending = -not $script:SortAscending } else { $script:SortAscending = $true }
     $script:SortColumn = $Column
     $props = @('No', 'Time', 'Src', 'SrcPort', 'Dst', 'DstPort', 'Protocol', 'UserName', 'Length', 'Info')
+    if ($Column -lt 0 -or $Column -ge $props.Length) { return }
     $name = $props[$Column]
     $arr = @(ConvertTo-PowerSharkPacketArray $script:ViewPackets)
     if ($script:SortAscending) {
@@ -5335,9 +5500,14 @@ function Sort-PacketView {
     } else {
         $arr = @($arr | Sort-Object -Property $name -Descending)
     }
-    $script:ViewPackets.Clear()
-    foreach ($p in $arr) { [void]$script:ViewPackets.Add($p) }
-    $script:lvPackets.Invalidate()
+    # Swap the list in one assignment so RetrieveVirtualItem never sees Count=0
+    # while VirtualListSize is still the old length.
+    $keep = New-Object System.Collections.ArrayList
+    foreach ($p in $arr) {
+        if ($null -ne $p) { [void]$keep.Add($p) }
+    }
+    $script:ViewPackets = $keep
+    try { if ($script:lvPackets) { $script:lvPackets.Invalidate() } } catch { }
 }
 
 function Show-GotoPacket {
@@ -5535,6 +5705,7 @@ LIMITATIONS vs REAL WIRESHARK
   - IPv4 only (raw sockets). No Ethernet header on live frames.
   - Captures traffic to/from THIS host, not a SPAN/mirror port.
   - No full TCP reassembly; a mid-segment SMB PDU may be missed.
+  - Live buffer is capped at 25000 packets so the packet list stays stable.
   - Requires Administrator for live capture.
   - Does not exploit, scan, or authenticate to remote hosts.
   - Server 2008 needs PowerShell 2.0 and .NET Framework 3.5 (for Add-Type).
@@ -6122,51 +6293,17 @@ Enable-DoubleBuffer $script:lvPackets
 [void]$script:lvPackets.Columns.Add('Account', 150)
 [void]$script:lvPackets.Columns.Add('Length', 70)
 [void]$script:lvPackets.Columns.Add('Info', 520)
+$script:PacketListColumns = 10
+try { $script:PacketListColumns = [int]$script:lvPackets.Columns.Count } catch { }
 
 $script:lvPackets.Add_RetrieveVirtualItem({
-    param($s, $e)
-    try {
-        $idx = $e.ItemIndex
-        $count = Get-AppCount $script:ViewPackets
-        if ($idx -lt 0 -or $idx -ge $count) {
-            $e.Item = New-BlankPacketListItem
-            return
-        }
-        $p = $script:ViewPackets[$idx]
-        if ($null -eq $p) {
-            $e.Item = New-BlankPacketListItem
-            return
-        }
-        $noText = ''
-        try { $noText = [string]$p.No } catch { $noText = '' }
-        $item = New-Object System.Windows.Forms.ListViewItem($noText)
-        $timeText = ''
-        try { $timeText = $p.Time.ToString('HH:mm:ss.fff') } catch { }
-        [void]$item.SubItems.Add($timeText)
-        [void]$item.SubItems.Add((Get-ResolvedAddressText $p.Src))
-        [void]$item.SubItems.Add(([string]$p.SrcPort))
-        [void]$item.SubItems.Add((Get-ResolvedAddressText $p.Dst))
-        [void]$item.SubItems.Add(([string]$p.DstPort))
-        [void]$item.SubItems.Add(([string]$p.Protocol))
-        $acctText = ''
-        try { $acctText = [string]$p.UserName } catch { }
-        if ($null -eq $acctText) { $acctText = '' }
-        [void]$item.SubItems.Add($acctText)
-        [void]$item.SubItems.Add(([string]$p.Length))
-        $infoText = ''
-        try { $infoText = [string]$p.Info } catch { }
-        if ($null -eq $infoText) { $infoText = '' }
-        [void]$item.SubItems.Add($infoText)
-        try { $item.BackColor = Get-PacketRowColor $p } catch { }
-        try { if ($p.IsSmb1) { $item.ForeColor = $script:C.Smb1Ink } } catch { }
-        $e.Item = Complete-PacketListItem $item
-    } catch {
-        $e.Item = New-BlankPacketListItem
-    }
+    try { Invoke-PacketListRetrieveVirtualItem $args[1] } catch { }
 })
 $script:lvPackets.Add_SelectedIndexChanged({
-    $p = Get-SelectedPacket
-    if ($p) { Show-PacketDetails $p }
+    try {
+        $p = Get-SelectedPacket
+        if ($p) { Show-PacketDetails $p }
+    } catch { }
 })
 $script:lvPackets.Add_ColumnClick({ param($s, $e) Sort-PacketView -Column $e.Column })
 $script:lvPackets.Add_DoubleClick({ Use-FollowStream })
@@ -6577,6 +6714,34 @@ if ($OpenPcap -and (Test-Path -LiteralPath $OpenPcap)) {
     Import-PcapPath -Path $OpenPcap
 }
 
+try {
+    [System.Windows.Forms.Application]::SetUnhandledExceptionMode(
+        [System.Windows.Forms.UnhandledExceptionMode]::CatchException)
+} catch { }
+try {
+    [System.Windows.Forms.Application]::add_ThreadException({
+        $ex = $null
+        try { $ex = $args[1].Exception } catch { }
+        try {
+            if ($null -eq $ex) { $ex = $args[1].psobject.BaseObject.Exception }
+        } catch { }
+        $msg = ''
+        try { $msg = [string]$ex.Message } catch { }
+        if ($msg -match 'RetrieveVirtualItem|virtualization|VirtualListSize') {
+            try { Write-AppLog ("ListView recovered: {0}" -f $msg) 'WARN' } catch { }
+            $script:PacketListUpdating = $true
+            try {
+                try { $script:lvPackets.SelectedIndices.Clear() } catch { }
+                try { $script:lvPackets.VirtualListSize = 0 } catch { }
+            } finally {
+                $script:PacketListUpdating = $false
+            }
+            try { Set-PacketListVirtualSize (Get-AppCount $script:ViewPackets) } catch { }
+            return
+        }
+        try { Write-AppLog ("UI exception: {0}" -f $msg) 'ERROR' } catch { }
+    })
+} catch { }
 try {
     [void]$form.ShowDialog()
 } catch {
