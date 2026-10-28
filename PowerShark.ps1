@@ -15,11 +15,13 @@
 
     Capture filter dropdown: All traffic, Active Directory, File shares, SMB, LDAP,
     LDAPS, Kerberos, DNS, RPC, NFS, Domain collapse, RC4. RC4 rows show the TCP/UDP
-    session (src:port -> dst:port) and the Kerberos account (user@REALM) when the
-    cname is in the clear (AS-REQ / TGS-REQ / AS-REP / TGS-REP). Display filters
-    work on the current view. Click the red PRE-COLLAPSE (or SMBv1) banner to list
-    leftover packets on Findings. Resolve names (toolbar) does async reverse-DNS
-    so Source/Destination show hostname (ip) when a PTR exists.
+    session (src:port -> dst:port), the Kerberos account (user@REALM) when the
+    cname is in the clear (AS-REQ / TGS-REQ / AS-REP / TGS-REP), the service
+    (sname), and a Why line (TGT/logon, service ticket, TLS-RC4). CSV export adds
+    Account, Service, Cipher, Rc4Use, Why, and Finding. Display filters work on
+    the current view. Click the red PRE-COLLAPSE (or SMBv1) banner to list leftover
+    packets on Findings. Resolve names (toolbar) does async reverse-DNS so
+    Source/Destination show hostname (ip) when a PTR exists.
 
     Designed for Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012 / 2012 R2,
     and PowerShell 7 on Windows. Live capture needs an elevated Administrator session.
@@ -74,7 +76,7 @@
 
 .NOTES
     Author      : Anthony Blake
-    Version     : 1.10
+    Version     : 1.11
     Compatible  : Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012
                   (PowerShell 3.0), 2012 R2 (PowerShell 4.0), 5.1, and PowerShell 7+.
                   There is no Requires-Version directive. Do not use -shl/-shr
@@ -95,7 +97,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.10'
+$script:AppVersion = '1.11'
 $script:AppAuthor  = 'Anthony Blake'
 $script:NameCache = $null
 $script:ResolveNames = $true
@@ -263,6 +265,111 @@ function Get-PacketAccountText {
     return ''
 }
 
+function Get-PacketServiceText {
+    param($Packet)
+    if ($null -eq $Packet) { return '' }
+    $q = ''
+    try { $q = [string]$Packet.QueryName } catch { }
+    if (-not (Test-BlankString $q)) { return $q }
+    return ''
+}
+
+function Get-PacketCipherText {
+    param($Packet)
+    if ($null -eq $Packet) { return '' }
+    $info = ''
+    try { $info = [string]$Packet.Info } catch { }
+    if ($Packet.IsRc4) {
+        if ($info -match 'TLS-RC4') { return 'TLS-RC4' }
+        if ($info -match 'rc4-hmac-exp') { return 'rc4-hmac-exp' }
+        if ($info -match 'rc4-hmac') { return 'rc4-hmac' }
+        return 'RC4'
+    }
+    return ''
+}
+
+function Get-PacketRc4UseText {
+    param($Packet)
+    if ($null -eq $Packet -or -not $Packet.IsRc4) { return '' }
+    $info = ''
+    try { $info = [string]$Packet.Info } catch { }
+    if ($info -match '\(used\)|\(selected\)|selected') { return 'used' }
+    if ($info -match '\(offered\)|offered') { return 'offered' }
+    return ''
+}
+
+function Get-PacketWhyText {
+    param($Packet)
+    if ($null -eq $Packet) { return '' }
+    $op = ''
+    try { $op = [string]$Packet.AppOp } catch { }
+    $acct = Get-PacketAccountText $Packet
+    $svc = Get-PacketServiceText $Packet
+    $sess = Get-PacketSessionText $Packet
+    $how = Get-PacketRc4UseText $Packet
+    $cipher = Get-PacketCipherText $Packet
+    if ($Packet.IsRc4 -and ($cipher -eq 'TLS-RC4' -or $op -eq 'TLS' -or ($Packet.IsLdaps -and $Packet.IsRc4))) {
+        $side = 'offered or selected'
+        if ($how -eq 'used') { $side = 'selected' }
+        elseif ($how -eq 'offered') { $side = 'offered' }
+        return ('TLS handshake {0} RC4 on {1}. Legacy LDAPS/HTTPS client; disable RC4 cipher suites on this host and the server.' -f $side, $sess)
+    }
+    if ($Packet.IsRc4 -and $op -eq 'AS-REQ') {
+        $who = $acct
+        if (Test-BlankString $who) { $who = 'a client' }
+        $tgt = $svc
+        if (Test-BlankString $tgt) { $tgt = 'krbtgt' }
+        return ('{0} on {1} is asking this KDC for a TGT ({2}) with {3}. That is a logon or first ticket after boot from a host that still has RC4 enabled.' -f $who, $sess, $tgt, $(if ($cipher) { $cipher } else { 'RC4' }))
+    }
+    if ($Packet.IsRc4 -and $op -eq 'AS-REP') {
+        $who = $acct
+        if (Test-BlankString $who) { $who = 'the client' }
+        return ('This KDC issued an RC4 TGT to {0} on {1}. The account still authenticates to this domain with a weak etype.' -f $who, $sess)
+    }
+    if ($Packet.IsRc4 -and $op -eq 'TGS-REQ') {
+        $who = $acct
+        if (Test-BlankString $who) { $who = 'a client' }
+        $want = $svc
+        if (Test-BlankString $want) { $want = 'a service' }
+        return ('{0} on {1} is asking this KDC for an RC4 service ticket to {2}. That names the app or host still using this domain.' -f $who, $sess, $want)
+    }
+    if ($Packet.IsRc4 -and $op -eq 'TGS-REP') {
+        $want = $svc
+        if (Test-BlankString $want) { $want = 'a service' }
+        return ('This KDC issued an RC4 service ticket for {0} on {1}. The client will present it to that service next.' -f $want, $sess)
+    }
+    if ($Packet.IsRc4 -and $op -eq 'AP-REQ') {
+        return ('A client is presenting a Kerberos ticket on {0}. The authenticator is encrypted, so the account is often missing. Pair with the AS/TGS rows on the same session.' -f $sess)
+    }
+    if ($Packet.IsRc4 -and $op -eq 'AP-REP') {
+        return ('A service accepted a Kerberos ticket on {0} (AP-REP). The server side of the RC4 session.' -f $sess)
+    }
+    if ($Packet.IsRc4) {
+        $bits = New-Object System.Collections.ArrayList
+        if (-not (Test-BlankString $acct)) { [void]$bits.Add(('account {0}' -f $acct)) }
+        if (-not (Test-BlankString $svc)) { [void]$bits.Add(('service {0}' -f $svc)) }
+        if (-not (Test-BlankString $cipher)) { [void]$bits.Add($cipher) }
+        if (-not (Test-BlankString $how)) { [void]$bits.Add($how) }
+        $extra = ''
+        if ((Get-AppCount $bits) -gt 0) { $extra = ' (' + (Join-AppStrings -Values $bits -Separator ', ') + ')' }
+        return ('RC4 on {0}{1}. Weak cipher; move tickets to AES (etype 17/18) and disable RC4 on the KDC.' -f $sess, $extra)
+    }
+    if ($Packet.IsKdc -and $op -eq 'AS-REQ') {
+        $who = $acct
+        if (Test-BlankString $who) { $who = 'a client' }
+        return ('{0} is requesting a TGT from this KDC — still a domain member or service.' -f $who)
+    }
+    if ($Packet.IsKdc -and $op -eq 'TGS-REQ') {
+        $want = $svc
+        if (Test-BlankString $want) { $want = 'a service' }
+        return ('A client is requesting a service ticket to {0} from this KDC.' -f $want)
+    }
+    $find = Get-PacketFindingSummary $Packet
+    if (-not (Test-BlankString $find)) { return $find }
+    if (-not (Test-BlankString $op)) { return $op }
+    return ''
+}
+
 function Format-ResolvedAddress {
     param([string]$Ip, [string]$HostName, [bool]$ShowName = $true)
     if (Test-BlankString $Ip) { return '' }
@@ -331,14 +438,14 @@ function Get-PacketFindingReasons {
     if ($Packet.IsGc) { [void]$list.Add('Global Catalog (3268/3269) — forest-wide lookups still hit this domain.') }
     if ($Packet.IsSmb1) { [void]$list.Add('SMBv1 — remaining NT LM 0.12 client; replace before the file server / DC is retired.') }
     if ($Packet.IsRc4) {
-        $sess = Get-PacketSessionText $Packet
-        $acct = Get-PacketAccountText $Packet
-        $svc = ''
-        try { $svc = [string]$Packet.QueryName } catch { }
-        $line = 'RC4 (Kerberos etype 23 rc4-hmac, or TLS-RC4) — session {0}  account {1}' -f $sess, $acct
-        if (-not (Test-BlankString $svc)) { $line = $line + ('  service {0}' -f $svc) }
-        $line = $line + '. Weak cipher. Move tickets to AES (etype 17/18) and disable RC4 on the KDC.'
-        [void]$list.Add($line)
+        $why = Get-PacketWhyText $Packet
+        if (Test-BlankString $why) {
+            $why = 'RC4 (Kerberos etype 23 rc4-hmac, or TLS-RC4). Weak cipher.'
+        }
+        if ($why -notmatch 'AES') {
+            $why = $why + ' Move tickets to AES (etype 17/18) and disable RC4 on the KDC.'
+        }
+        [void]$list.Add($why)
     }
     return $list
 }
@@ -3283,6 +3390,16 @@ function Invoke-SmbAnalyzerSelfTest {
         if ($rc4Why -notmatch '55131') { [void]$failures.Add("RC4 finding missing session: $rc4Why") }
         $acctText = Get-PacketAccountText $rc4
         if ($acctText -notmatch 'legacyapp') { [void]$failures.Add("Get-PacketAccountText missed RC4 cname: $acctText") }
+        $whyText = Get-PacketWhyText $rc4
+        if ($whyText -notmatch 'TGT' -and $whyText -notmatch 'logon') {
+            [void]$failures.Add("Get-PacketWhyText RC4 AS-REQ: $whyText")
+        }
+        if ((Get-PacketServiceText $rc4) -notmatch 'krbtgt') {
+            [void]$failures.Add("Get-PacketServiceText: $(Get-PacketServiceText $rc4)")
+        }
+        if ((Get-PacketCipherText $rc4) -notmatch 'rc4') {
+            [void]$failures.Add("Get-PacketCipherText: $(Get-PacketCipherText $rc4)")
+        }
     }
     $plainKrb = $demo | Where-Object { $_.IsKerberos -and -not $_.IsRc4 } | Select-Object -First 1
     if (-not $plainKrb) { [void]$failures.Add('Demo should still include a non-RC4 Kerberos packet') }
@@ -3345,7 +3462,7 @@ function Invoke-SmbAnalyzerSelfTest {
     if ($saveName -notmatch 'PowerShark-.*\.pcap$') { [void]$failures.Add("Get-CaptureSavePath name: $saveName") }
     if ((Get-SaveFormat 'CSV') -ne 'csv') { [void]$failures.Add('Get-SaveFormat CSV') }
     if ($script:AppAuthor -ne 'Anthony Blake') { [void]$failures.Add("AppAuthor=$($script:AppAuthor)") }
-    if ($script:AppVersion -ne '1.10') { [void]$failures.Add("AppVersion=$($script:AppVersion)") }
+    if ($script:AppVersion -ne '1.11') { [void]$failures.Add("AppVersion=$($script:AppVersion)") }
     if ((Get-ResolvedAddressText $null) -ne '') { [void]$failures.Add('Get-ResolvedAddressText null should be blank') }
     if ((Get-ResolvedAddressText '') -ne '') { [void]$failures.Add('Get-ResolvedAddressText empty should be blank') }
     if ((Get-SaveFormat 'pcap') -ne 'pcap') { [void]$failures.Add('Get-SaveFormat pcap') }
@@ -4501,12 +4618,16 @@ function Show-PacketDetails {
         if ($p.UserName) { [void]$app.Nodes.Add("Account: $($p.UserName)") }
         if ($p.QueryName) { [void]$app.Nodes.Add("Name / DN: $($p.QueryName)") }
         [void]$app.Nodes.Add("Session: $(Get-PacketSessionText $p)")
+        $whyApp = Get-PacketWhyText $p
+        if (-not (Test-BlankString $whyApp)) { [void]$app.Nodes.Add("Why: $whyApp") }
         [void]$app.Nodes.Add("Summary: $($p.Info)")
     }
     if ($p.IsRc4 -and -not ($p.IsLdap -or $p.IsKerberos -or $p.IsDns -or $p.IsRpc -or $p.IsNfs -or $p.IsNtp -or $p.IsAdws -or $p.IsLlmnr -or $p.IsWinRm -or $p.HasSmb)) {
         $rc4n = $frame.Nodes.Add('RC4')
         [void]$rc4n.Nodes.Add("Account: $(Get-PacketAccountText $p)")
         [void]$rc4n.Nodes.Add("Session: $(Get-PacketSessionText $p)")
+        $whyRc4 = Get-PacketWhyText $p
+        if (-not (Test-BlankString $whyRc4)) { [void]$rc4n.Nodes.Add("Why: $whyRc4") }
         [void]$rc4n.Nodes.Add("Summary: $($p.Info)")
     }
     if ($p.IsCollapse) {
@@ -4997,6 +5118,12 @@ function New-PacketCsvRow {
     Add-Member -InputObject $row -MemberType NoteProperty -Name SmbVersion -Value ([string]$Packet.SmbVersion)
     Add-Member -InputObject $row -MemberType NoteProperty -Name SmbCommand -Value ([string]$Packet.SmbCommand)
     Add-Member -InputObject $row -MemberType NoteProperty -Name Info -Value ([string]$Packet.Info)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Account -Value (Get-PacketAccountText $Packet)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Service -Value (Get-PacketServiceText $Packet)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Cipher -Value (Get-PacketCipherText $Packet)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Rc4Use -Value (Get-PacketRc4UseText $Packet)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Why -Value (Get-PacketWhyText $Packet)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Finding -Value (Get-PacketFindingSummary $Packet)
     $rc4 = ''
     try { if ($Packet.IsRc4) { $rc4 = 'Yes' } } catch { }
     Add-Member -InputObject $row -MemberType NoteProperty -Name Rc4 -Value $rc4
@@ -5521,7 +5648,8 @@ function Update-StatsTab {
             $o = New-Object PSObject
             Add-Member -InputObject $o -MemberType NoteProperty -Name Session -Value $sess
             Add-Member -InputObject $o -MemberType NoteProperty -Name Account -Value $acct
-            Add-Member -InputObject $o -MemberType NoteProperty -Name Service -Value ([string]$p.QueryName)
+            Add-Member -InputObject $o -MemberType NoteProperty -Name Service -Value (Get-PacketServiceText $p)
+            Add-Member -InputObject $o -MemberType NoteProperty -Name Why -Value (Get-PacketWhyText $p)
             Add-Member -InputObject $o -MemberType NoteProperty -Name Packets -Value 0
             $rc4Map[$key] = $o
         }
@@ -5539,7 +5667,9 @@ function Update-StatsTab {
         if ($pktN -eq 1) { $pktWord = 'pkt' }
         $svcBit = ''
         if (-not (Test-BlankString $svc)) { $svcBit = "  service $svc" }
+        $whyBit = [string](Get-AppNote $e 'Why')
         [void]$sb.AppendLine(('  {0}  {1}  {2} {3}{4}' -f (Get-AppNote $e 'Session'), (Get-AppNote $e 'Account'), $pktN, $pktWord, $svcBit))
+        if (-not (Test-BlankString $whyBit)) { [void]$sb.AppendLine(('      why: {0}' -f $whyBit)) }
         $rc4SessN++
     }
     if ($rc4SessN -eq 0) { [void]$sb.AppendLine('  (none)') }
@@ -5806,8 +5936,13 @@ SESSION TIMER AND SAVE ALL
   Save view / Ctrl+S writes only the filtered packet list (pcap or CSV).
   CSV Protocol and Family are the exact service (LDAP, Kerberos, SMB, DNS, RPC-SAMR).
   Category is the coarse AD / FileShare / Other bucket. Operation is Bind / AS-REQ / Query.
-  CSV Session is src:port -> dst:port. UserName is the Kerberos or NTLM account.
+  CSV Session is src:port -> dst:port. UserName / Account is the Kerberos or NTLM account.
+  CSV Service is the Kerberos sname (krbtgt/REALM or HTTP/host) or DNS/LDAP name.
+  CSV Why explains the exchange (AS-REQ logon/TGT, TGS service ticket, TLS-RC4, …).
+  CSV Finding is the collapse/legacy advice. Cipher / Rc4Use are rc4-hmac used|offered.
   CSV SrcHost / DstHost are reverse-DNS names when Resolve names has a PTR.
+  For RC4: filter rc4, Save view as CSV, then sort Why / Account / Service.
+  Save as PCAP and open in Wireshark for the full Kerberos ASN.1 decode.
   Unattended:  .\PowerShark.ps1 -AutoCloseMinutes 60
 
 NO LIVE TRAFFIC?
@@ -5829,9 +5964,10 @@ BEFORE A DOMAIN COLLAPSE
     anonymous      LDAP binds with an empty DN
     ntlm / ntlmv1  apps not using Kerberos (harder cutover)
     rc4            Kerberos etype 23/24 (rc4-hmac) or TLS RC4 cipher suites
-                   Packets/Findings Account column + Statistics "RC4 sessions"
+                   Packets/Findings Account + Why + Statistics "RC4 sessions"
                    list src:port -> dst:port with the Kerberos account (user@REALM)
-                   when cname is in the clear. AP-REQ authenticators are encrypted.
+                   when cname is in the clear. Why says TGT/logon vs service ticket
+                   vs TLS. AP-REQ authenticators are encrypted.
     user:legacyapp / account:legacyapp   filter by Kerberos cname or NTLM user
     hostname:dc01  / ptr:dc01            reverse-DNS name on src or dst
     ldaps          LDAP over TLS (TCP 636 / GC 3269), including STARTTLS
@@ -5923,9 +6059,13 @@ HOW DETECTION WORKS
   (rc4-hmac) and 24 (rc4-hmac-exp) in EncryptedData and etype lists. AS-REQ,
   TGS-REQ, AS-REP, and TGS-REP also yield the client principal (cname@realm)
   and service (sname) from the cleartext KDC body, so RC4 rows show the
-  session 4-tuple plus the account. AP-REQ authenticators stay encrypted, so
-  those frames may show the session without an account. TLS
-  ClientHello/ServerHello is checked for RC4 cipher suites (0x0004/0x0005/…).
+  session 4-tuple plus the account. Why (Packets details, Findings, Statistics,
+  and CSV) maps the opcode: AS-REQ is a TGT/logon from a host that still has
+  RC4, TGS-REQ names the leftover app (HTTP/host, cifs/fileserver), AP-REQ
+  presents the ticket (account often missing), TLS-RC4 is legacy LDAPS/HTTPS.
+  AP-REQ authenticators stay encrypted, so those frames may show the session
+  without an account. TLS ClientHello/ServerHello is checked for RC4 cipher
+  suites (0x0004/0x0005/…).
   Resolve names (toolbar, on by default) queues each IPv4 address for a
   background reverse-DNS PTR lookup (System.Net.Dns.BeginGetHostEntry).
   Results are cached. Source/Destination columns, Findings, Talkers, packet
