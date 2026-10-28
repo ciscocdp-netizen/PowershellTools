@@ -74,7 +74,7 @@
 
 .NOTES
     Author      : Anthony Blake
-    Version     : 1.9
+    Version     : 1.10
     Compatible  : Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012
                   (PowerShell 3.0), 2012 R2 (PowerShell 4.0), 5.1, and PowerShell 7+.
                   There is no Requires-Version directive. Do not use -shl/-shr
@@ -95,7 +95,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.9'
+$script:AppVersion = '1.10'
 $script:AppAuthor  = 'Anthony Blake'
 $script:NameCache = $null
 $script:ResolveNames = $true
@@ -1988,29 +1988,56 @@ public static class PowerSharkParser {
         return "";
     }
 
-    // Server 2008 SIO_RCVALL often delivers Ethernet (or VLAN) frames, not raw IPv4.
-    public static byte[] UnwrapToIp(byte[] frame) {
-        if (frame == null || frame.Length < 20) return null;
-        if (IsIpv4Header(frame, 0)) return frame;
-        if (frame.Length >= 34) {
+    public static bool TryGetIpv4(byte[] frame, int frameLen, out int ipOff, out int ipLen) {
+        ipOff = 0;
+        ipLen = 0;
+        if (frame == null || frameLen < 20) return false;
+        if (frameLen > frame.Length) frameLen = frame.Length;
+        if (IsIpv4Header(frame, 0)) {
+            ipOff = 0;
+            ipLen = frameLen;
+            return true;
+        }
+        if (frameLen >= 34) {
             int typeOff = 12;
             int etype = (frame[12] << 8) | frame[13];
-            if (etype == 0x8100 && frame.Length >= 38) {
+            if (etype == 0x8100 && frameLen >= 38) {
                 typeOff = 16;
                 etype = (frame[16] << 8) | frame[17];
             }
             if (etype == 0x0800) {
-                int ipOff = typeOff + 2;
-                if (IsIpv4Header(frame, ipOff)) return SliceBytes(frame, ipOff);
+                int off = typeOff + 2;
+                if (IsIpv4Header(frame, off)) {
+                    ipOff = off;
+                    ipLen = frameLen - off;
+                    return ipLen >= 20;
+                }
             }
         }
-        if (frame.Length >= 36 && IsIpv4Header(frame, 16)) return SliceBytes(frame, 16);
-        int max = frame.Length - 20;
-        if (max > 80) max = 80;
-        for (int off = 1; off <= max; off++) {
-            if (IsIpv4Header(frame, off)) return SliceBytes(frame, off);
+        if (frameLen >= 36 && IsIpv4Header(frame, 16)) {
+            ipOff = 16;
+            ipLen = frameLen - 16;
+            return ipLen >= 20;
         }
-        return null;
+        int max = frameLen - 20;
+        if (max > 80) max = 80;
+        int i;
+        for (i = 1; i <= max; i++) {
+            if (IsIpv4Header(frame, i)) {
+                ipOff = i;
+                ipLen = frameLen - i;
+                return ipLen >= 20;
+            }
+        }
+        return false;
+    }
+
+    // Server 2008 SIO_RCVALL often delivers Ethernet (or VLAN) frames, not raw IPv4.
+    public static byte[] UnwrapToIp(byte[] frame) {
+        int off, len;
+        if (frame == null || !TryGetIpv4(frame, frame.Length, out off, out len)) return null;
+        if (off == 0 && len == frame.Length) return frame;
+        return SliceBytes(frame, off, len);
     }
 
     static bool IsIpv4Header(byte[] f, int off) {
@@ -2025,8 +2052,12 @@ public static class PowerSharkParser {
     }
 
     static byte[] SliceBytes(byte[] src, int off) {
-        int n = src.Length - off;
-        if (n < 20) return null;
+        if (src == null) return null;
+        return SliceBytes(src, off, src.Length - off);
+    }
+
+    static byte[] SliceBytes(byte[] src, int off, int n) {
+        if (src == null || off < 0 || n < 20 || off + n > src.Length) return null;
         byte[] d = new byte[n];
         Buffer.BlockCopy(src, off, d, 0, n);
         return d;
@@ -2439,7 +2470,7 @@ public class PowerSharkEngine {
     public volatile string Error = "";
     public volatile string LastSetup = "";
     public volatile string FirstFrameHex = "";
-    public int MaxQueue = 25000;
+    public int MaxQueue = 20000;
     Socket _sock;
     Thread _thread;
     object _sockGate = new object();
@@ -2719,14 +2750,15 @@ public class PowerSharkEngine {
                 Interlocked.Increment(ref Dropped);
                 continue;
             }
-            byte[] raw = new byte[n];
-            Buffer.BlockCopy(buf, 0, raw, 0, n);
             try {
-                byte[] ip = PowerSharkParser.UnwrapToIp(raw);
-                if (ip == null) {
+                int ipOff = 0;
+                int ipLen = 0;
+                if (!PowerSharkParser.TryGetIpv4(buf, n, out ipOff, out ipLen)) {
                     Interlocked.Increment(ref ParseFail);
                     continue;
                 }
+                byte[] ip = new byte[ipLen];
+                Buffer.BlockCopy(buf, ipOff, ip, 0, ipLen);
                 PowerSharkPacket pkt = PowerSharkParser.ParseIpPacket(ip, DateTime.Now);
                 if (pkt == null) {
                     Interlocked.Increment(ref ParseFail);
@@ -3143,6 +3175,13 @@ function Invoke-SmbAnalyzerSelfTest {
     if (-not $p -or $p.Src -ne '10.1.1.8' -or $p.DstPort -ne 445) {
         [void]$failures.Add("IP/TCP parse failed for crafted frame")
     }
+    $ipOff = 0
+    $ipLen = 0
+    if (-not [PowerSharkParser]::TryGetIpv4($crafted, $crafted.Length, [ref]$ipOff, [ref]$ipLen)) {
+        [void]$failures.Add('TryGetIpv4 failed on crafted IPv4 frame')
+    } elseif ($ipOff -ne 0 -or $ipLen -ne $crafted.Length) {
+        [void]$failures.Add("TryGetIpv4 off=$ipOff len=$ipLen")
+    }
 
     $eth = New-Object byte[] ($crafted.Length + 14)
     $eth[12] = 0x08
@@ -3306,7 +3345,7 @@ function Invoke-SmbAnalyzerSelfTest {
     if ($saveName -notmatch 'PowerShark-.*\.pcap$') { [void]$failures.Add("Get-CaptureSavePath name: $saveName") }
     if ((Get-SaveFormat 'CSV') -ne 'csv') { [void]$failures.Add('Get-SaveFormat CSV') }
     if ($script:AppAuthor -ne 'Anthony Blake') { [void]$failures.Add("AppAuthor=$($script:AppAuthor)") }
-    if ($script:AppVersion -ne '1.9') { [void]$failures.Add("AppVersion=$($script:AppVersion)") }
+    if ($script:AppVersion -ne '1.10') { [void]$failures.Add("AppVersion=$($script:AppVersion)") }
     if ((Get-ResolvedAddressText $null) -ne '') { [void]$failures.Add('Get-ResolvedAddressText null should be blank') }
     if ((Get-ResolvedAddressText '') -ne '') { [void]$failures.Add('Get-ResolvedAddressText empty should be blank') }
     if ((Get-SaveFormat 'pcap') -ne 'pcap') { [void]$failures.Add('Get-SaveFormat pcap') }
@@ -3397,7 +3436,18 @@ if ($null -eq $script:ViewPackets) { $script:ViewPackets = New-Object System.Col
 $script:Smb1Hosts       = @{}
 $script:Smb1CommandHist = @{}
 $script:NextNo          = 1
-$script:MaxPackets      = 25000
+$script:MaxPackets      = 12000
+try {
+    if ([IntPtr]::Size -ge 8) { $script:MaxPackets = 20000 }
+    else { $script:MaxPackets = 8000 }
+} catch { $script:MaxPackets = 8000 }
+try { $script:Engine.MaxQueue = [int]$script:MaxPackets } catch { }
+$script:MemLimitMb      = 700
+try { if ([IntPtr]::Size -ge 8) { $script:MemLimitMb = 1500 } } catch { }
+$script:LastDetailNo    = -1
+$script:LastScrollTick  = 0
+$script:LastHeavyUiTick = 0
+$script:HexBoldFont     = $null
 $script:IsAdmin         = $false
 $script:CaptureStarted  = $null
 $script:LastRecipeRotate = $null
@@ -3511,10 +3561,46 @@ function Write-AppLog {
     param([string]$Message, [string]$Level = 'INFO')
     $line = '[{0}] [{1}] {2}' -f (Get-Timestamp), $Level, $Message
     if ($script:txtLog) {
-        $script:txtLog.AppendText($line + [Environment]::NewLine)
-        $script:txtLog.SelectionStart = $script:txtLog.Text.Length
-        $script:txtLog.ScrollToCaret()
+        try {
+            $script:txtLog.AppendText($line + [Environment]::NewLine)
+            if ($script:txtLog.TextLength -gt 100000) {
+                $keep = $script:txtLog.Text
+                if ($keep.Length -gt 40000) {
+                    $script:txtLog.Text = $keep.Substring($keep.Length - 40000)
+                }
+                try { $script:txtLog.ClearUndo() } catch { }
+            }
+            $script:txtLog.SelectionStart = $script:txtLog.Text.Length
+            $script:txtLog.ScrollToCaret()
+        } catch { }
     }
+}
+
+function Get-WorkingSetMb {
+    try {
+        $ws = [System.Diagnostics.Process]::GetCurrentProcess().WorkingSet
+        return [int]($ws / 1048576)
+    } catch { return 0 }
+}
+
+function Limit-WorkingSet {
+    $limit = 700
+    try { $limit = [int]$script:MemLimitMb } catch { }
+    if ($limit -lt 200) { $limit = 200 }
+    $mb = Get-WorkingSetMb
+    if ($mb -lt $limit) { return }
+    $count = Get-AppCount $script:AllPackets
+    $newCap = [int]($count / 2)
+    if ($newCap -lt 1500) { $newCap = 1500 }
+    if ($newCap -ge $count -and $count -le 1500) {
+        try { [GC]::Collect() } catch { }
+        return
+    }
+    try { $script:MaxPackets = $newCap } catch { }
+    try { if ($script:Engine) { $script:Engine.MaxQueue = $newCap } } catch { }
+    try { Limit-PacketBuffer } catch { }
+    try { [GC]::Collect() } catch { }
+    Write-AppLog ("Working set {0} MB (limit {1}); buffer now {2}" -f $mb, $limit, (Get-AppCount $script:AllPackets)) 'WARN'
 }
 
 function Test-IsAdministrator { [bool]$script:IsAdmin }
@@ -4175,14 +4261,29 @@ function Refresh-PacketListView {
     if (-not $script:lvPackets) { return }
     $n = Get-AppCount $script:ViewPackets
     if ($n -lt 0) { $n = 0 }
-    Set-PacketListVirtualSize $n
+    $script:PacketListUpdating = $true
+    try {
+        Set-PacketListVirtualSize $n
+    } finally {
+        $script:PacketListUpdating = $false
+    }
     $size = 0
     try { $size = [int]$script:lvPackets.VirtualListSize } catch { $size = $n }
     if ($ScrollEnd -and $script:chkAutoScroll -and $script:chkAutoScroll.Checked -and $n -gt 0 -and $size -gt 0) {
-        $vis = $n - 1
-        if ($vis -ge $size) { $vis = $size - 1 }
-        if ($vis -ge 0) {
-            try { $script:lvPackets.EnsureVisible($vis) } catch { }
+        $now = 0
+        try { $now = [Environment]::TickCount } catch { }
+        $due = $true
+        try {
+            $delta = $now - [int]$script:LastScrollTick
+            if ($delta -ge 0 -and $delta -lt 400) { $due = $false }
+        } catch { }
+        if ($due) {
+            $vis = $n - 1
+            if ($vis -ge $size) { $vis = $size - 1 }
+            if ($vis -ge 0) {
+                try { $script:lvPackets.EnsureVisible($vis) } catch { }
+            }
+            $script:LastScrollTick = $now
         }
     } else {
         try { $script:lvPackets.Invalidate() } catch { }
@@ -4293,20 +4394,31 @@ function Update-CaptureUi {
     $script:UiBusy = $true
     try {
         if ($script:Engine -and $script:Engine.Running) {
-            $batch = $script:Engine.Drain(120)
+            $batch = $script:Engine.Drain(80)
             if ($batch -and $batch.Length -gt 0) {
                 [void](Add-PacketsToUi -Packets $batch)
                 Refresh-PacketListView -ScrollEnd
             }
             if ((Get-AppCount $script:AllPackets) -gt $script:MaxPackets) { Limit-PacketBuffer }
+            try { Limit-WorkingSet } catch { }
         }
         Update-StatusBar
         Update-SessionTimerLabel
         Check-SessionTimer
         Update-NameResolutionUi
-        if ($script:tabMain -and $script:tabMain.SelectedTab -eq $script:tabStats) { Update-StatsTab }
-        if ($script:tabMain -and $script:tabMain.SelectedTab -eq $script:tabHosts) { Update-HostsGrid }
-        if ($script:tabMain -and $script:tabFindings -and $script:tabMain.SelectedTab -eq $script:tabFindings) { Update-FindingsGrid }
+        $heavy = $false
+        $tick = 0
+        try { $tick = [Environment]::TickCount } catch { }
+        try {
+            $delta = $tick - [int]$script:LastHeavyUiTick
+            if ($delta -lt 0 -or $delta -ge 1500) { $heavy = $true }
+        } catch { $heavy = $true }
+        if ($heavy) {
+            $script:LastHeavyUiTick = $tick
+            if ($script:tabMain -and $script:tabMain.SelectedTab -eq $script:tabStats) { Update-StatsTab }
+            if ($script:tabMain -and $script:tabMain.SelectedTab -eq $script:tabHosts) { Update-HostsGrid }
+            if ($script:tabMain -and $script:tabFindings -and $script:tabMain.SelectedTab -eq $script:tabFindings) { Update-FindingsGrid }
+        }
     } catch {
         Write-AppLog "UI update error: $($_.Exception.Message)" 'ERROR'
     } finally {
@@ -4316,9 +4428,15 @@ function Update-CaptureUi {
 
 function Show-PacketDetails {
     param([PowerSharkPacket]$p)
+    $no = -1
+    try { if ($p) { $no = [int]$p.No } } catch { $no = -1 }
+    if ($no -ge 0 -and $no -eq $script:LastDetailNo) { return }
+    if ($null -eq $p -and $script:LastDetailNo -lt 0) { return }
+    $script:LastDetailNo = $no
     $script:tvDetails.BeginUpdate()
     $script:tvDetails.Nodes.Clear()
-    $script:hexBox.Clear()
+    try { $script:hexBox.Clear() } catch { }
+    try { $script:hexBox.ClearUndo() } catch { }
     if (-not $p) { $script:tvDetails.EndUpdate(); return }
 
     $frame = $script:tvDetails.Nodes.Add(("Frame {0}: {1} bytes  {2}" -f $p.No, $p.Length, $p.Time.ToString('yyyy-MM-dd HH:mm:ss.fff')))
@@ -4412,58 +4530,71 @@ function Show-PacketDetails {
 function Set-HexDump {
     param([PowerSharkPacket]$Packet)
     $box = $script:hexBox
-    $box.Clear()
+    if (-not $box) { return }
+    try { $box.Clear() } catch { }
+    try { $box.ClearUndo() } catch { }
     if (-not $Packet -or -not $Packet.Raw) { return }
     $bytes = $Packet.Raw
+    $total = $bytes.Length
+    $shown = $total
+    if ($shown -gt 2048) { $shown = 2048 }
     $hi = $Packet.SmbOffset
     $hiLen = if ($Packet.IsSmb1) { 4 } elseif ($Packet.HasSmb) { 4 } else { 0 }
     if ($Packet.HighlightOffset -ge 0 -and $Packet.HighlightLength -gt 0) {
         $hi = $Packet.HighlightOffset
         $hiLen = $Packet.HighlightLength
     }
+    if ($hiLen -gt 32) { $hiLen = 32 }
 
-    $sb = New-Object System.Text.StringBuilder
-    $highlightRanges = New-AppList ([object])
-    for ($i = 0; $i -lt $bytes.Length; $i += 16) {
+    $sb = New-Object System.Text.StringBuilder ($shown * 5)
+    $highlightRanges = New-Object System.Collections.ArrayList
+    for ($i = 0; $i -lt $shown; $i += 16) {
         [void]$sb.AppendFormat('{0:X4}  ', $i)
-        $chunk = New-Object System.Text.StringBuilder
-        $ascii = New-Object System.Text.StringBuilder
-        $n = [Math]::Min(16, $bytes.Length - $i)
+        $n = 16
+        if (($shown - $i) -lt 16) { $n = ($shown - $i) }
         for ($j = 0; $j -lt 16; $j++) {
-            if ($j -eq 8) { [void]$chunk.Append(' ') }
+            if ($j -eq 8) { [void]$sb.Append(' ') }
             if ($j -lt $n) {
                 $b = $bytes[$i + $j]
                 $abs = $i + $j
-                $hexStr = '{0:X2} ' -f $b
                 if ($hiLen -gt 0 -and $abs -ge $hi -and $abs -lt ($hi + $hiLen)) {
-                    $rangeStart = $sb.Length + $chunk.Length
-                    [void]$highlightRanges.Add((New-AppObject -Property @{ Start = $rangeStart; Length = 3 }))
+                    [void]$highlightRanges.Add((New-AppObject -Property @{ Start = $sb.Length; Length = 3 }))
                 }
-                [void]$chunk.Append($hexStr)
-                $ch = if ($b -ge 32 -and $b -le 126) { [char]$b } else { '.' }
-                [void]$ascii.Append($ch)
+                [void]$sb.AppendFormat('{0:X2} ', $b)
             } else {
-                [void]$chunk.Append('   ')
-                [void]$ascii.Append(' ')
+                [void]$sb.Append('   ')
             }
         }
-        [void]$sb.Append($chunk.ToString())
         [void]$sb.Append(' | ')
-        [void]$sb.AppendLine($ascii.ToString())
-    }
-    $box.Text = $sb.ToString()
-    $box.SelectAll()
-    $box.SelectionColor = $script:C.HexText
-    $box.DeselectAll()
-    foreach ($r in (Get-AppEnumerable $highlightRanges)) {
-        if ($r.Start -ge 0 -and ($r.Start + $r.Length) -le $box.TextLength) {
-            $box.Select($r.Start, $r.Length)
-            $box.SelectionColor = $script:C.Red
-            $box.SelectionFont = New-Object System.Drawing.Font('Consolas', 9, [System.Drawing.FontStyle]::Bold)
+        for ($j = 0; $j -lt $n; $j++) {
+            $b = $bytes[$i + $j]
+            if ($b -ge 32 -and $b -le 126) { [void]$sb.Append([char]$b) } else { [void]$sb.Append('.') }
         }
+        [void]$sb.AppendLine()
     }
-    $box.DeselectAll()
-    $box.SelectionStart = 0
+    if ($total -gt $shown) {
+        [void]$sb.AppendLine(('... {0} more bytes not shown (hex dump capped at {1})' -f ($total - $shown), $shown))
+    }
+    try {
+        $box.Text = $sb.ToString()
+        $box.SelectAll()
+        $box.SelectionColor = $script:C.HexText
+        $box.DeselectAll()
+        if (-not $script:HexBoldFont) {
+            try { $script:HexBoldFont = New-Object System.Drawing.Font('Consolas', 9, [System.Drawing.FontStyle]::Bold) } catch { }
+        }
+        foreach ($r in $highlightRanges) {
+            if ($null -eq $r) { continue }
+            if ($r.Start -ge 0 -and ($r.Start + $r.Length) -le $box.TextLength) {
+                $box.Select($r.Start, $r.Length)
+                $box.SelectionColor = $script:C.Red
+                if ($script:HexBoldFont) { $box.SelectionFont = $script:HexBoldFont }
+            }
+        }
+        $box.DeselectAll()
+        $box.SelectionStart = 0
+        try { $box.ClearUndo() } catch { }
+    } catch { }
 }
 
 function Get-SelectedPacket {
@@ -4709,6 +4840,7 @@ function Start-Capture {
             Enable-RawCaptureFirewall
         }
     } catch { }
+    try { $script:Engine.MaxQueue = [int]$script:MaxPackets } catch { }
     $ok = $script:Engine.Start($ip)
     if (-not $ok) {
         [void][System.Windows.Forms.MessageBox]::Show(
@@ -5132,7 +5264,15 @@ function Update-HostsGrid {
     $sel = $null
     if ($script:dgvHosts.SelectedRows.Count -gt 0) { $sel = $script:dgvHosts.SelectedRows[0].Cells['IP'].Value }
     $script:dgvHosts.Rows.Clear()
-    foreach ($ip in (Get-AppEnumerable ($script:Smb1Hosts.Keys | Sort-Object))) {
+    $hostKeys = @($script:Smb1Hosts.Keys)
+    $hostN = Get-AppCount $hostKeys
+    if ($hostN -gt 1500) {
+        $hostKeys = $hostKeys[0..1499]
+    } elseif ($hostN -gt 1) {
+        try { $hostKeys = @($hostKeys | Sort-Object) } catch { }
+    }
+    $hostRows = 0
+    foreach ($ip in (Get-AppEnumerable $hostKeys)) {
         $h = $script:Smb1Hosts[$ip]
         if ($null -eq $h) { continue }
         $cmdMap = Get-AppNote $h 'Commands'
@@ -5174,6 +5314,8 @@ function Update-HostsGrid {
         elseif ($isFs) { $script:dgvHosts.Rows[$idx].DefaultCellStyle.BackColor = $script:C.Smb2 }
         else { $script:dgvHosts.Rows[$idx].DefaultCellStyle.BackColor = $script:C.Tcp }
         if ($sel -and ((Get-AppNote $h 'IP') -eq $sel)) { $script:dgvHosts.Rows[$idx].Selected = $true }
+        $hostRows++
+        if ($hostRows -ge 1500) { break }
     }
 }
 
@@ -5795,7 +5937,9 @@ LIMITATIONS vs REAL WIRESHARK
   - IPv4 only (raw sockets). No Ethernet header on live frames.
   - Captures traffic to/from THIS host, not a SPAN/mirror port.
   - No full TCP reassembly; a mid-segment SMB PDU may be missed.
-  - Live buffer is capped at 25000 packets so the packet list stays stable.
+  - Live buffer is capped (8000 frames on 32-bit PowerShell, 20000 on 64-bit)
+    and shrinks further if working set is high.
+  - Hex dump shows the first 2048 bytes; the log tab keeps the last ~40 KB.
   - Parse errors on the sniffer thread are counted as Bad, not process crashes.
   - Requires Administrator for live capture.
   - Does not exploit, scan, or authenticate to remote hosts.
@@ -6391,6 +6535,7 @@ $script:lvPackets.Add_RetrieveVirtualItem({
     try { Invoke-PacketListRetrieveVirtualItem $args[1] } catch { }
 })
 $script:lvPackets.Add_SelectedIndexChanged({
+    if ($script:PacketListUpdating) { return }
     try {
         $p = Get-SelectedPacket
         if ($p) { Show-PacketDetails $p }
@@ -6475,6 +6620,8 @@ $script:hexBox.ReadOnly = $true
 $script:hexBox.WordWrap = $false
 $script:hexBox.BackColor = $script:C.HexBg
 $script:hexBox.DetectUrls = $false
+$script:hexBox.HideSelection = $true
+try { $script:hexBox.MaxLength = 200000 } catch { }
 $splitV.Panel2.Controls.Add($script:hexBox)
 $splitH.Panel2.Controls.Add($splitV)
 $script:tabCapture.Controls.Add($splitH)
@@ -6839,6 +6986,12 @@ try {
                 try { Write-AppLog ("ListView recovered: {0}" -f $msg) 'WARN' } catch { }
                 # Do not change VirtualListSize here: that re-enters retrieve and
                 # stack-overflows the UI thread (window vanishes with no dialog).
+                return
+            }
+            if ($msg -match 'OutOfMemory|out of memory') {
+                try { Write-AppLog 'Out of memory — trimming the capture buffer.' 'ERROR' } catch { }
+                try { Limit-WorkingSet } catch { }
+                try { [GC]::Collect() } catch { }
                 return
             }
             try { Write-AppLog ("UI exception: {0}" -f $msg) 'ERROR' } catch { }
