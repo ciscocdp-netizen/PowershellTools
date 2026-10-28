@@ -3223,6 +3223,60 @@ function ConvertTo-PowerSharkPacketArray {
     return [PowerSharkPacket[]]$tmp
 }
 
+function New-PacketCsvRow {
+    param($Packet)
+    $svc = Get-PacketServiceName $Packet
+    $op = ''
+    try { $op = [string]$Packet.AppOp } catch { }
+    $cat = [string]$Packet.Family
+    if (Test-BlankString $cat) { $cat = 'Other' }
+    $row = New-Object PSObject
+    Add-Member -InputObject $row -MemberType NoteProperty -Name No -Value ([string]$Packet.No)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Time -Value (ConvertTo-AppTimeText $Packet.Time)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Protocol -Value $svc
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Operation -Value $op
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Family -Value $svc
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Category -Value $cat
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Src -Value ([string]$Packet.Src)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name SrcHost -Value (Get-CachedHostName $Packet.Src)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name SrcPort -Value ([string]$Packet.SrcPort)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Dst -Value ([string]$Packet.Dst)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name DstHost -Value (Get-CachedHostName $Packet.Dst)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name DstPort -Value ([string]$Packet.DstPort)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Session -Value (Get-PacketSessionText $Packet)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Length -Value ([string]$Packet.Length)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name UserName -Value ([string]$Packet.UserName)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name SharePath -Value ([string]$Packet.SharePath)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name FileName -Value ([string]$Packet.FileName)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name QueryName -Value ([string]$Packet.QueryName)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name SmbVersion -Value ([string]$Packet.SmbVersion)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name SmbCommand -Value ([string]$Packet.SmbCommand)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Info -Value ([string]$Packet.Info)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Account -Value (Get-PacketAccountText $Packet)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Service -Value (Get-PacketServiceText $Packet)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Cipher -Value (Get-PacketCipherText $Packet)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Rc4Use -Value (Get-PacketRc4UseText $Packet)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Why -Value (Get-PacketWhyText $Packet)
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Finding -Value (Get-PacketFindingSummary $Packet)
+    $rc4 = ''
+    try { if ($Packet.IsRc4) { $rc4 = 'Yes' } } catch { }
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Rc4 -Value $rc4
+    $ldaps = ''
+    try { if ($Packet.IsLdaps) { $ldaps = 'Yes' } } catch { }
+    Add-Member -InputObject $row -MemberType NoteProperty -Name Ldaps -Value $ldaps
+    return $row
+}
+
+function New-PacketCsvRows {
+    param($Packets)
+    $csvRows = New-Object System.Collections.ArrayList
+    foreach ($p in (Get-AppEnumerable $Packets)) {
+        if ($null -eq $p) { continue }
+        [void]$csvRows.Add((New-PacketCsvRow $p))
+    }
+    return ,$csvRows
+}
+
 # ============================================================
 # SELF-TEST (no GUI)
 # ============================================================
@@ -3399,6 +3453,30 @@ function Invoke-SmbAnalyzerSelfTest {
         }
         if ((Get-PacketCipherText $rc4) -notmatch 'rc4') {
             [void]$failures.Add("Get-PacketCipherText: $(Get-PacketCipherText $rc4)")
+        }
+        $csvRow = New-PacketCsvRow $rc4
+        if ($csvRow.Account -notmatch 'legacyapp') { [void]$failures.Add("CSV Account: $($csvRow.Account)") }
+        if ($csvRow.Service -notmatch 'krbtgt') { [void]$failures.Add("CSV Service: $($csvRow.Service)") }
+        if ($csvRow.Cipher -notmatch 'rc4') { [void]$failures.Add("CSV Cipher: $($csvRow.Cipher)") }
+        if ($csvRow.Why -notmatch 'TGT' -and $csvRow.Why -notmatch 'logon') {
+            [void]$failures.Add("CSV Why: $($csvRow.Why)")
+        }
+        if ($csvRow.Finding -notmatch 'RC4') { [void]$failures.Add("CSV Finding: $($csvRow.Finding)") }
+        if ($csvRow.Rc4 -ne 'Yes') { [void]$failures.Add("CSV Rc4 flag: $($csvRow.Rc4)") }
+        if ($csvRow.Session -notmatch '55131') { [void]$failures.Add("CSV Session: $($csvRow.Session)") }
+        $whyCsv = Join-Path ([System.IO.Path]::GetTempPath()) ("powershark-why-{0}.csv" -f [guid]::NewGuid().ToString('N'))
+        try {
+            $csvRow | Export-Csv -Path $whyCsv -NoTypeInformation -ErrorAction Stop
+            $hdr = [System.IO.File]::ReadAllLines($whyCsv)[0]
+            foreach ($col in @('Why','Account','Service','Cipher','Rc4Use','Finding','Session')) {
+                if ($hdr -notmatch $col) { [void]$failures.Add("CSV header missing $col : $hdr") }
+            }
+            $body = [System.IO.File]::ReadAllLines($whyCsv)[1]
+            if ($body -notmatch 'legacyapp') { [void]$failures.Add("CSV body missing account: $body") }
+        } catch {
+            [void]$failures.Add("CSV Why export: $($_.Exception.Message)")
+        } finally {
+            if (Test-Path -LiteralPath $whyCsv) { Remove-Item -LiteralPath $whyCsv -Force -ErrorAction SilentlyContinue }
         }
     }
     $plainKrb = $demo | Where-Object { $_.IsKerberos -and -not $_.IsRc4 } | Select-Object -First 1
@@ -5087,60 +5165,6 @@ function Import-PcapPath {
         Write-AppLog "PCAP open failed: $($_.Exception.Message)" 'ERROR'
         [void][System.Windows.Forms.MessageBox]::Show("Failed to open PCAP:`n$($_.Exception.Message)", 'Open Failed', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
     }
-}
-
-function New-PacketCsvRow {
-    param($Packet)
-    $svc = Get-PacketServiceName $Packet
-    $op = ''
-    try { $op = [string]$Packet.AppOp } catch { }
-    $cat = [string]$Packet.Family
-    if (Test-BlankString $cat) { $cat = 'Other' }
-    $row = New-Object PSObject
-    Add-Member -InputObject $row -MemberType NoteProperty -Name No -Value ([string]$Packet.No)
-    Add-Member -InputObject $row -MemberType NoteProperty -Name Time -Value (ConvertTo-AppTimeText $Packet.Time)
-    Add-Member -InputObject $row -MemberType NoteProperty -Name Protocol -Value $svc
-    Add-Member -InputObject $row -MemberType NoteProperty -Name Operation -Value $op
-    Add-Member -InputObject $row -MemberType NoteProperty -Name Family -Value $svc
-    Add-Member -InputObject $row -MemberType NoteProperty -Name Category -Value $cat
-    Add-Member -InputObject $row -MemberType NoteProperty -Name Src -Value ([string]$Packet.Src)
-    Add-Member -InputObject $row -MemberType NoteProperty -Name SrcHost -Value (Get-CachedHostName $Packet.Src)
-    Add-Member -InputObject $row -MemberType NoteProperty -Name SrcPort -Value ([string]$Packet.SrcPort)
-    Add-Member -InputObject $row -MemberType NoteProperty -Name Dst -Value ([string]$Packet.Dst)
-    Add-Member -InputObject $row -MemberType NoteProperty -Name DstHost -Value (Get-CachedHostName $Packet.Dst)
-    Add-Member -InputObject $row -MemberType NoteProperty -Name DstPort -Value ([string]$Packet.DstPort)
-    Add-Member -InputObject $row -MemberType NoteProperty -Name Session -Value (Get-PacketSessionText $Packet)
-    Add-Member -InputObject $row -MemberType NoteProperty -Name Length -Value ([string]$Packet.Length)
-    Add-Member -InputObject $row -MemberType NoteProperty -Name UserName -Value ([string]$Packet.UserName)
-    Add-Member -InputObject $row -MemberType NoteProperty -Name SharePath -Value ([string]$Packet.SharePath)
-    Add-Member -InputObject $row -MemberType NoteProperty -Name FileName -Value ([string]$Packet.FileName)
-    Add-Member -InputObject $row -MemberType NoteProperty -Name QueryName -Value ([string]$Packet.QueryName)
-    Add-Member -InputObject $row -MemberType NoteProperty -Name SmbVersion -Value ([string]$Packet.SmbVersion)
-    Add-Member -InputObject $row -MemberType NoteProperty -Name SmbCommand -Value ([string]$Packet.SmbCommand)
-    Add-Member -InputObject $row -MemberType NoteProperty -Name Info -Value ([string]$Packet.Info)
-    Add-Member -InputObject $row -MemberType NoteProperty -Name Account -Value (Get-PacketAccountText $Packet)
-    Add-Member -InputObject $row -MemberType NoteProperty -Name Service -Value (Get-PacketServiceText $Packet)
-    Add-Member -InputObject $row -MemberType NoteProperty -Name Cipher -Value (Get-PacketCipherText $Packet)
-    Add-Member -InputObject $row -MemberType NoteProperty -Name Rc4Use -Value (Get-PacketRc4UseText $Packet)
-    Add-Member -InputObject $row -MemberType NoteProperty -Name Why -Value (Get-PacketWhyText $Packet)
-    Add-Member -InputObject $row -MemberType NoteProperty -Name Finding -Value (Get-PacketFindingSummary $Packet)
-    $rc4 = ''
-    try { if ($Packet.IsRc4) { $rc4 = 'Yes' } } catch { }
-    Add-Member -InputObject $row -MemberType NoteProperty -Name Rc4 -Value $rc4
-    $ldaps = ''
-    try { if ($Packet.IsLdaps) { $ldaps = 'Yes' } } catch { }
-    Add-Member -InputObject $row -MemberType NoteProperty -Name Ldaps -Value $ldaps
-    return $row
-}
-
-function New-PacketCsvRows {
-    param($Packets)
-    $csvRows = New-Object System.Collections.ArrayList
-    foreach ($p in (Get-AppEnumerable $Packets)) {
-        if ($null -eq $p) { continue }
-        [void]$csvRows.Add((New-PacketCsvRow $p))
-    }
-    return ,$csvRows
 }
 
 function Get-UiSaveFormat {
