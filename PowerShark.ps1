@@ -74,7 +74,7 @@
 
 .NOTES
     Author      : Anthony Blake
-    Version     : 1.8
+    Version     : 1.9
     Compatible  : Windows Server 2008 / 2008 R2 (PowerShell 2.0), Server 2012
                   (PowerShell 3.0), 2012 R2 (PowerShell 4.0), 5.1, and PowerShell 7+.
                   There is no Requires-Version directive. Do not use -shl/-shr
@@ -95,13 +95,14 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.8'
+$script:AppVersion = '1.9'
 $script:AppAuthor  = 'Anthony Blake'
 $script:NameCache = $null
 $script:ResolveNames = $true
 $script:LastDnsVersion = -1
 $script:PacketListColumns = 10
 $script:PacketListUpdating = $false
+$script:ListViewRecovering = $false
 
 # Version is checked at runtime on purpose. Do not add "#Requires -Version".
 # Server 2008 / 2008 R2 is PowerShell 2.0. Server 2012 R2 is 4.0.
@@ -598,25 +599,25 @@ public static class PowerSharkParser {
                 p.PayloadOffset = ihl + 8;
                 p.PayloadLength = raw.Length - p.PayloadOffset;
                 if (p.PayloadLength < 0) p.PayloadLength = 0;
-                ParseAppLayer(p);
+                try { ParseAppLayer(p); } catch { }
                 if (p.Info == null || p.Info.Length == 0)
                     p.Info = "UDP " + p.SrcPort + " -> " + p.DstPort;
             } else {
                 p.Info = "Truncated UDP header";
             }
-            ClassifyFamily(p);
+            try { ClassifyFamily(p); } catch { }
             return p;
         }
         if (proto != 6) {
             p.Protocol = "IP";
             p.Info = "IP protocol " + proto;
-            ClassifyFamily(p);
+            try { ClassifyFamily(p); } catch { }
             return p;
         }
         if (raw.Length < ihl + 20) {
             p.Protocol = "TCP";
             p.Info = "Truncated TCP header";
-            ClassifyFamily(p);
+            try { ClassifyFamily(p); } catch { }
             return p;
         }
 
@@ -633,15 +634,17 @@ public static class PowerSharkParser {
         p.PayloadLength = raw.Length - p.PayloadOffset;
         if (p.PayloadLength < 0) p.PayloadLength = 0;
 
-        ParseSmb(p);
-        if (!p.HasSmb) {
-            ParseAppLayer(p);
-            if (p.Protocol == "TCP" || p.Protocol == null || p.Protocol.Length == 0) {
-                p.Protocol = "TCP";
-                if (p.Info == null || p.Info.Length == 0) p.Info = FormatTcpInfo(p);
+        try {
+            ParseSmb(p);
+            if (!p.HasSmb) {
+                ParseAppLayer(p);
+                if (p.Protocol == "TCP" || p.Protocol == null || p.Protocol.Length == 0) {
+                    p.Protocol = "TCP";
+                    if (p.Info == null || p.Info.Length == 0) p.Info = FormatTcpInfo(p);
+                }
             }
-        }
-        ClassifyFamily(p);
+        } catch { }
+        try { ClassifyFamily(p); } catch { }
         return p;
     }
 
@@ -1397,14 +1400,18 @@ public static class PowerSharkParser {
         tag = 0;
         contentPos = 0;
         contentLen = 0;
-        if (pos >= end || pos >= r.Length) return false;
+        if (r == null || pos < 0 || pos >= end || pos >= r.Length) return false;
         tag = r[pos++];
         if ((tag & 0x1F) == 0x1F) {
-            while (pos < end && (r[pos] & 0x80) != 0) pos++;
-            if (pos < end) pos++;
+            int guard = 0;
+            while (pos < end && pos < r.Length && (r[pos] & 0x80) != 0 && guard < 8) {
+                pos++;
+                guard++;
+            }
+            if (pos < end && pos < r.Length) pos++;
         }
         contentLen = ReadBerLen(r, ref pos, end);
-        if (contentLen < 0 || pos + contentLen > end) return false;
+        if (contentLen < 0 || pos < 0 || pos + contentLen > end || pos + contentLen > r.Length) return false;
         contentPos = pos;
         pos += contentLen;
         return true;
@@ -1434,50 +1441,65 @@ public static class PowerSharkParser {
     }
 
     static string ReadKerberosStringAt(byte[] r, int pos, int end) {
-        if (r == null || pos < 0 || pos >= end) return "";
+        return ReadKerberosStringAt(r, pos, end, 0);
+    }
+
+    static string ReadKerberosStringAt(byte[] r, int pos, int end, int depth) {
+        if (depth > 12 || r == null || pos < 0 || pos >= end || pos >= r.Length) return "";
         int tag = r[pos];
         if (tag == 0x1B || tag == 0x16 || tag == 0x13 || tag == 0x04 || tag == 0x1A) {
             int p = pos + 1;
             int len = ReadBerLen(r, ref p, end);
-            if (len < 1 || p + len > end) return "";
+            if (len < 1 || p < 0 || p + len > end || p + len > r.Length) return "";
             string s = Encoding.ASCII.GetString(r, p, len);
             return LooksLikeKrName(s) ? s : "";
         }
-        if (tag == 0x30) return ReadPrincipalName(r, pos, end);
+        if (tag == 0x30) return ReadPrincipalName(r, pos, end, depth + 1);
         if ((tag & 0x20) != 0) {
             int p = pos + 1;
             int len = ReadBerLen(r, ref p, end);
-            if (len < 1 || p + len > end) return "";
-            return ReadKerberosStringAt(r, p, p + len);
+            if (len < 1 || p < 0 || p + len > end || p + len > r.Length) return "";
+            return ReadKerberosStringAt(r, p, p + len, depth + 1);
         }
         return "";
     }
 
     static string ReadPrincipalName(byte[] r, int pos, int end) {
-        if (r == null || pos < 0 || pos >= end) return "";
-        if (r[pos] != 0x30) return ReadKerberosStringAt(r, pos, end);
+        return ReadPrincipalName(r, pos, end, 0);
+    }
+
+    static string ReadPrincipalName(byte[] r, int pos, int end, int depth) {
+        if (depth > 12 || r == null || pos < 0 || pos >= end || pos >= r.Length) return "";
+        if (r[pos] != 0x30) return ReadKerberosStringAt(r, pos, end, depth + 1);
         int p = pos + 1;
         int slen = ReadBerLen(r, ref p, end);
         if (slen < 0) return "";
         int seqEnd = p + slen;
         if (seqEnd > end) seqEnd = end;
+        if (seqEnd > r.Length) seqEnd = r.Length;
         int strPos = FindDirectContext(r, p, seqEnd, 1);
         int walk = (strPos >= 0) ? strPos : p;
         int walkEnd = seqEnd;
-        if (walk < walkEnd && r[walk] == 0x30) {
+        if (walk >= 0 && walk < walkEnd && walk < r.Length && r[walk] == 0x30) {
             walk++;
             int inner = ReadBerLen(r, ref walk, walkEnd);
-            if (inner >= 0) walkEnd = walk + inner;
+            if (inner >= 0) {
+                walkEnd = walk + inner;
+                if (walkEnd > seqEnd) walkEnd = seqEnd;
+            }
         }
         string[] parts = new string[6];
         int n = 0;
         int tag, cp, cl;
         while (n < 6 && NextBerTlv(r, ref walk, walkEnd, out tag, out cp, out cl)) {
             if (tag == 0x1B || tag == 0x16 || tag == 0x13 || tag == 0x04 || tag == 0x1A) {
+                if (cp < 0 || cl < 0 || cp + cl > r.Length) continue;
                 string s = Encoding.ASCII.GetString(r, cp, cl);
                 if (LooksLikeKrName(s)) parts[n++] = s;
             } else if (tag == 0x30 || (tag & 0x20) != 0) {
-                string inner = ReadPrincipalName(r, cp - 0, (cp + cl) > end ? end : (cp + cl));
+                int innerEnd = cp + cl;
+                if (innerEnd > end) innerEnd = end;
+                string inner = ReadPrincipalName(r, cp, innerEnd, depth + 1);
                 if (inner != null && inner.Length > 0 && n == 0) return inner;
             }
         }
@@ -1571,6 +1593,8 @@ public static class PowerSharkParser {
 
     static void ExtractKerberosNames(PowerSharkPacket p, byte[] r, int off, int end) {
         if (p == null || r == null || off < 0) return;
+        if (end > r.Length) end = r.Length;
+        if (off >= end) return;
         int i;
         for (i = off; i < end; i++) {
             int tag = r[i];
@@ -1720,7 +1744,7 @@ public static class PowerSharkParser {
         else if (PortIs(p.SrcPort, p.DstPort, 464)) op = "Kpasswd";
         p.AppOp = op;
         if (app == 10 || app == 11 || app == 12 || app == 13) p.IsKdc = true;
-        ExtractKerberosNames(p, r, off, end);
+        try { ExtractKerberosNames(p, r, off, end); } catch { }
         if (p.QueryName == null || p.QueryName.Length == 0) {
             string realm = ExtractPrintable(r, off, Math.Min(end - off, 80));
             if (realm != null && realm.Length >= 3) p.QueryName = realm;
@@ -1728,7 +1752,7 @@ public static class PowerSharkParser {
         p.Info = "Kerberos " + op;
         if (p.UserName != null && p.UserName.Length > 0) p.Info = p.Info + " " + p.UserName;
         if (p.QueryName != null && p.QueryName.Length > 0) p.Info = p.Info + " " + p.QueryName;
-        ScanRc4(p);
+        try { ScanRc4(p); } catch { }
     }
 
     static void FillKerberosAccount(PowerSharkPacket p, byte[] r, int off, int end) {
@@ -1756,6 +1780,7 @@ public static class PowerSharkParser {
 
     static void MarkRc4Packet(PowerSharkPacket p, int etype, bool used, int hi, int hiLen, string kind) {
         p.IsRc4 = true;
+        if (p.Info == null) p.Info = "";
         string name = Rc4EtypeName(etype);
         string how = used ? "used" : "offered";
         if (kind != null && kind.Length > 0) {
@@ -1789,6 +1814,7 @@ public static class PowerSharkParser {
 
     static void ScanRc4(PowerSharkPacket p) {
         if (p == null || p.IsRc4) return;
+        if (p.Info == null) p.Info = "";
         byte[] r = p.Raw;
         if (r == null || r.Length < 5) return;
         int off = p.PayloadOffset;
@@ -2695,50 +2721,54 @@ public class PowerSharkEngine {
             }
             byte[] raw = new byte[n];
             Buffer.BlockCopy(buf, 0, raw, 0, n);
-            byte[] ip = PowerSharkParser.UnwrapToIp(raw);
-            if (ip == null) {
-                Interlocked.Increment(ref ParseFail);
-                continue;
-            }
-            PowerSharkPacket pkt = PowerSharkParser.ParseIpPacket(ip, DateTime.Now);
-            if (pkt == null) {
-                Interlocked.Increment(ref ParseFail);
-                continue;
-            }
-            if (!PowerSharkParser.MatchesFilter(pkt, FilterMode)) continue;
-            if (SmbPayloadOnly && !pkt.HasSmb) continue;
-            bool dropped = false;
-            lock (_gate) {
-                if (_queue.Count >= MaxQueue) {
-                    dropped = true;
-                } else {
-                    _queue.Enqueue(pkt);
+            try {
+                byte[] ip = PowerSharkParser.UnwrapToIp(raw);
+                if (ip == null) {
+                    Interlocked.Increment(ref ParseFail);
+                    continue;
                 }
+                PowerSharkPacket pkt = PowerSharkParser.ParseIpPacket(ip, DateTime.Now);
+                if (pkt == null) {
+                    Interlocked.Increment(ref ParseFail);
+                    continue;
+                }
+                if (!PowerSharkParser.MatchesFilter(pkt, FilterMode)) continue;
+                if (SmbPayloadOnly && !pkt.HasSmb) continue;
+                bool dropped = false;
+                lock (_gate) {
+                    if (_queue.Count >= MaxQueue) {
+                        dropped = true;
+                    } else {
+                        _queue.Enqueue(pkt);
+                    }
+                }
+                if (dropped) {
+                    Interlocked.Increment(ref Dropped);
+                    continue;
+                }
+                Interlocked.Increment(ref Captured);
+                Interlocked.Add(ref Bytes, n);
+                if (pkt.IsSmb1) Interlocked.Increment(ref Smb1Count);
+                if (pkt.IsSmb2) Interlocked.Increment(ref Smb2Count);
+                if (pkt.IsSmb3) Interlocked.Increment(ref Smb3Count);
+                if (pkt.IsAd) Interlocked.Increment(ref AdCount);
+                if (pkt.IsFileShare) Interlocked.Increment(ref FileShareCount);
+                if (pkt.IsDns) Interlocked.Increment(ref DnsCount);
+                if (pkt.IsLdap) Interlocked.Increment(ref LdapCount);
+                if (pkt.IsLdaps) Interlocked.Increment(ref LdapsCount);
+                if (pkt.IsKerberos) Interlocked.Increment(ref KerberosCount);
+                if (pkt.IsRpc) Interlocked.Increment(ref RpcCount);
+                if (pkt.IsNfs) Interlocked.Increment(ref NfsCount);
+                if (pkt.IsLegacy) Interlocked.Increment(ref LegacyCount);
+                if (pkt.IsSimpleBind) Interlocked.Increment(ref SimpleBindCount);
+                if (pkt.IsNtlm) Interlocked.Increment(ref NtlmCount);
+                if (pkt.IsDcLocator) Interlocked.Increment(ref DcLocatorCount);
+                if (pkt.IsSysvol || pkt.IsNetlogonShare) Interlocked.Increment(ref SysvolCount);
+                if (pkt.IsCollapse) Interlocked.Increment(ref CollapseCount);
+                if (pkt.IsRc4) Interlocked.Increment(ref Rc4Count);
+            } catch {
+                Interlocked.Increment(ref ParseFail);
             }
-            if (dropped) {
-                Interlocked.Increment(ref Dropped);
-                continue;
-            }
-            Interlocked.Increment(ref Captured);
-            Interlocked.Add(ref Bytes, n);
-            if (pkt.IsSmb1) Interlocked.Increment(ref Smb1Count);
-            if (pkt.IsSmb2) Interlocked.Increment(ref Smb2Count);
-            if (pkt.IsSmb3) Interlocked.Increment(ref Smb3Count);
-            if (pkt.IsAd) Interlocked.Increment(ref AdCount);
-            if (pkt.IsFileShare) Interlocked.Increment(ref FileShareCount);
-            if (pkt.IsDns) Interlocked.Increment(ref DnsCount);
-            if (pkt.IsLdap) Interlocked.Increment(ref LdapCount);
-            if (pkt.IsLdaps) Interlocked.Increment(ref LdapsCount);
-            if (pkt.IsKerberos) Interlocked.Increment(ref KerberosCount);
-            if (pkt.IsRpc) Interlocked.Increment(ref RpcCount);
-            if (pkt.IsNfs) Interlocked.Increment(ref NfsCount);
-            if (pkt.IsLegacy) Interlocked.Increment(ref LegacyCount);
-            if (pkt.IsSimpleBind) Interlocked.Increment(ref SimpleBindCount);
-            if (pkt.IsNtlm) Interlocked.Increment(ref NtlmCount);
-            if (pkt.IsDcLocator) Interlocked.Increment(ref DcLocatorCount);
-            if (pkt.IsSysvol || pkt.IsNetlogonShare) Interlocked.Increment(ref SysvolCount);
-            if (pkt.IsCollapse) Interlocked.Increment(ref CollapseCount);
-            if (pkt.IsRc4) Interlocked.Increment(ref Rc4Count);
         }
     }
 }
@@ -2750,12 +2780,14 @@ public class PowerSharkNameCache {
     Queue<string> _q = new Queue<string>();
     int _inflight;
     int _version;
+    int _pumping;
     bool _enabled = true;
     const int MaxInflight = 2;
+    const int MaxDnsQueue = 256;
 
     public void SetEnabled(bool on) {
         lock (_gate) { _enabled = on; }
-        if (on) Pump();
+        if (on) RequestPump();
     }
 
     public bool IsEnabled {
@@ -2819,10 +2851,11 @@ public class PowerSharkNameCache {
         if (!LooksLikeIpv4(ip)) return;
         lock (_gate) {
             if (_map.ContainsKey(ip) || _queued.ContainsKey(ip)) return;
+            if (_q.Count >= MaxDnsQueue) return;
             _queued[ip] = true;
             _q.Enqueue(ip);
         }
-        Pump();
+        RequestPump();
     }
 
     public string Get(string ip) {
@@ -2859,26 +2892,51 @@ public class PowerSharkNameCache {
         }
     }
 
-    void Pump() {
-        string ip = null;
-        lock (_gate) {
-            if (!_enabled) return;
-            if (_inflight >= MaxInflight) return;
-            if (_q.Count == 0) return;
-            ip = _q.Dequeue();
-            _inflight++;
-        }
+    void RequestPump() {
         try {
-            Dns.BeginGetHostEntry(ip, new AsyncCallback(OnDone), ip);
+            ThreadPool.QueueUserWorkItem(new WaitCallback(PumpWork));
         } catch {
-            Finish(ip, "");
+            Pump();
+        }
+    }
+
+    void PumpWork(object state) {
+        Pump();
+    }
+
+    void Pump() {
+        if (Interlocked.CompareExchange(ref _pumping, 1, 0) != 0) return;
+        try {
+            while (true) {
+                string ip = null;
+                lock (_gate) {
+                    if (!_enabled) return;
+                    if (_inflight >= MaxInflight) return;
+                    if (_q.Count == 0) return;
+                    ip = _q.Dequeue();
+                    _inflight++;
+                }
+                try {
+                    Dns.BeginGetHostEntry(ip, new AsyncCallback(OnDone), ip);
+                } catch {
+                    lock (_gate) {
+                        if (ip != null && ip.Length > 0) _map[ip] = "";
+                        if (_inflight > 0) _inflight--;
+                        _version++;
+                    }
+                }
+            }
+        } catch {
+        } finally {
+            Interlocked.Exchange(ref _pumping, 0);
         }
     }
 
     void OnDone(IAsyncResult ar) {
-        string ip = ar != null ? (ar.AsyncState as string) : null;
+        string ip = null;
         string name = "";
         try {
+            ip = ar != null ? (ar.AsyncState as string) : null;
             IPHostEntry e = Dns.EndGetHostEntry(ar);
             if (e != null) name = e.HostName;
         } catch { }
@@ -3107,6 +3165,29 @@ function Invoke-SmbAnalyzerSelfTest {
         [void]$failures.Add("UDP parse failed for probe-style frame")
     }
 
+    $junk = New-Object byte[] 200
+    $junk[0] = 0x45
+    $junk[9] = 6
+    $junk[12] = 10; $junk[13] = 1; $junk[14] = 1; $junk[15] = 8
+    $junk[16] = 10; $junk[17] = 1; $junk[18] = 1; $junk[19] = 1
+    $junk[22] = 0; $junk[23] = 88
+    $junk[32] = 0x50
+    $nest = 40
+    while (($nest + 1) -lt 200) {
+        $junk[$nest] = 0x30
+        $left = 200 - ($nest + 2)
+        if ($left -gt 80) { $left = 80 }
+        if ($left -lt 0) { $left = 0 }
+        $junk[$nest + 1] = [byte]$left
+        $nest = $nest + 2
+    }
+    try {
+        $pj = [PowerSharkParser]::ParseIpPacket($junk, [datetime]::UtcNow)
+        if ($null -eq $pj) { [void]$failures.Add('Nested BER Kerberos-like frame returned null') }
+    } catch {
+        [void]$failures.Add("Nested BER parse threw: $($_.Exception.Message)")
+    }
+
     $dns = $demo | Where-Object { $_.IsDns } | Select-Object -First 1
     if (-not $dns) { [void]$failures.Add('Demo DNS packet missing') }
     $ldap = $demo | Where-Object { $_.IsLdap } | Select-Object -First 1
@@ -3225,7 +3306,7 @@ function Invoke-SmbAnalyzerSelfTest {
     if ($saveName -notmatch 'PowerShark-.*\.pcap$') { [void]$failures.Add("Get-CaptureSavePath name: $saveName") }
     if ((Get-SaveFormat 'CSV') -ne 'csv') { [void]$failures.Add('Get-SaveFormat CSV') }
     if ($script:AppAuthor -ne 'Anthony Blake') { [void]$failures.Add("AppAuthor=$($script:AppAuthor)") }
-    if ($script:AppVersion -ne '1.8') { [void]$failures.Add("AppVersion=$($script:AppVersion)") }
+    if ($script:AppVersion -ne '1.9') { [void]$failures.Add("AppVersion=$($script:AppVersion)") }
     if ((Get-ResolvedAddressText $null) -ne '') { [void]$failures.Add('Get-ResolvedAddressText null should be blank') }
     if ((Get-ResolvedAddressText '') -ne '') { [void]$failures.Add('Get-ResolvedAddressText empty should be blank') }
     if ((Get-SaveFormat 'pcap') -ne 'pcap') { [void]$failures.Add('Get-SaveFormat pcap') }
@@ -3343,6 +3424,7 @@ $script:lblDns          = $null
 $script:LastDnsVersion  = -1
 $script:PacketListColumns = 10
 $script:PacketListUpdating = $false
+$script:ListViewRecovering = $false
 $script:cmbSaveFormat   = $null
 $script:cmbTimer        = $null
 $script:lblTimer        = $null
@@ -3759,11 +3841,6 @@ function Set-PacketListVirtualSize {
     if ($selBad -or $Size -lt $old) {
         try { $script:lvPackets.SelectedIndices.Clear() } catch { }
         try { $script:lvPackets.FocusedItem = $null } catch { }
-        # Jump to the top before shrinking so the current scroll offset is not
-        # past the new VirtualListSize (WinForms then asks for a missing row).
-        if ($old -gt 0) {
-            try { $script:lvPackets.EnsureVisible(0) } catch { }
-        }
     }
     try { $script:lvPackets.BeginUpdate() } catch { }
     try {
@@ -3787,8 +3864,18 @@ function Update-PacketView {
         # is the "ListView virtualization requires a valid ListViewItem" dialog.
         Set-PacketListVirtualSize 0
         $script:ViewPackets.Clear()
-        foreach ($p in (Get-AppEnumerable $script:AllPackets)) {
-            if (Test-PacketFilter $p) { [void]$script:ViewPackets.Add($p) }
+        $nAll = 0
+        try { $nAll = Get-AppCount $script:AllPackets } catch { $nAll = 0 }
+        $i = 0
+        while ($i -lt $nAll) {
+            $p = $null
+            try { $p = $script:AllPackets[$i] } catch { }
+            if ($null -ne $p) {
+                try {
+                    if (Test-PacketFilter $p) { [void]$script:ViewPackets.Add($p) }
+                } catch { }
+            }
+            $i++
         }
     } finally {
         $script:PacketListUpdating = $false
@@ -4469,12 +4556,15 @@ function Update-FindingsGrid {
                 try { $script:dgvFindings.Rows[$idx].Selected = $true } catch { }
             }
             $n++
+            if ($n -ge 2000) { break }
         }
         if ($script:lblFindingsCount) {
             $label = 'pre-collapse leftover packet(s)'
             if ($kind -eq 'smb1') { $label = 'SMBv1 packet(s)' }
             elseif ($kind -eq 'ad') { $label = 'Active Directory packet(s)' }
-            $script:lblFindingsCount.Text = ('{0} {1}  —  double-click a row to open it on Packets' -f $n, $label)
+            $shown = '{0} {1}  —  double-click a row to open it on Packets' -f $n, $label
+            if ($n -ge 2000) { $shown = $shown + ' (first 2000)' }
+            $script:lblFindingsCount.Text = $shown
         }
     } catch {
         Write-AppLog ("Findings list error: {0}" -f $_.Exception.Message) 'ERROR'
@@ -5706,6 +5796,7 @@ LIMITATIONS vs REAL WIRESHARK
   - Captures traffic to/from THIS host, not a SPAN/mirror port.
   - No full TCP reassembly; a mid-segment SMB PDU may be missed.
   - Live buffer is capped at 25000 packets so the packet list stays stable.
+  - Parse errors on the sniffer thread are counted as Bad, not process crashes.
   - Requires Administrator for live capture.
   - Does not exploit, scan, or authenticate to remote hosts.
   - Server 2008 needs PowerShell 2.0 and .NET Framework 3.5 (for Add-Type).
@@ -6683,7 +6774,7 @@ $form.Add_Resize({
 })
 
 $uiTimer = New-Object System.Windows.Forms.Timer
-$uiTimer.Interval = 120
+$uiTimer.Interval = 200
 $uiTimer.Add_Tick({ Update-CaptureUi })
 $uiTimer.Start()
 
@@ -6719,27 +6810,41 @@ try {
         [System.Windows.Forms.UnhandledExceptionMode]::CatchException)
 } catch { }
 try {
-    [System.Windows.Forms.Application]::add_ThreadException({
-        $ex = $null
-        try { $ex = $args[1].Exception } catch { }
-        try {
-            if ($null -eq $ex) { $ex = $args[1].psobject.BaseObject.Exception }
-        } catch { }
+    [AppDomain]::CurrentDomain.add_UnhandledException({
+        $obj = $null
+        try { $obj = $args[1].ExceptionObject } catch { }
         $msg = ''
-        try { $msg = [string]$ex.Message } catch { }
-        if ($msg -match 'RetrieveVirtualItem|virtualization|VirtualListSize') {
-            try { Write-AppLog ("ListView recovered: {0}" -f $msg) 'WARN' } catch { }
-            $script:PacketListUpdating = $true
+        try { $msg = [string]$obj } catch { }
+        try { Write-AppLog ("Unhandled: {0}" -f $msg) 'ERROR' } catch { }
+        try {
+            $log = Join-Path ([System.IO.Path]::GetTempPath()) 'PowerShark-crash.log'
+            $line = '{0} {1}{2}' -f (Get-Date).ToString('o'), $msg, [Environment]::NewLine
+            [System.IO.File]::AppendAllText($log, $line)
+        } catch { }
+    })
+} catch { }
+try {
+    [System.Windows.Forms.Application]::add_ThreadException({
+        if ($script:ListViewRecovering) { return }
+        $script:ListViewRecovering = $true
+        try {
+            $ex = $null
+            try { $ex = $args[1].Exception } catch { }
             try {
-                try { $script:lvPackets.SelectedIndices.Clear() } catch { }
-                try { $script:lvPackets.VirtualListSize = 0 } catch { }
-            } finally {
-                $script:PacketListUpdating = $false
+                if ($null -eq $ex) { $ex = $args[1].psobject.BaseObject.Exception }
+            } catch { }
+            $msg = ''
+            try { $msg = [string]$ex.Message } catch { }
+            if ($msg -match 'RetrieveVirtualItem|virtualization|VirtualListSize') {
+                try { Write-AppLog ("ListView recovered: {0}" -f $msg) 'WARN' } catch { }
+                # Do not change VirtualListSize here: that re-enters retrieve and
+                # stack-overflows the UI thread (window vanishes with no dialog).
+                return
             }
-            try { Set-PacketListVirtualSize (Get-AppCount $script:ViewPackets) } catch { }
-            return
+            try { Write-AppLog ("UI exception: {0}" -f $msg) 'ERROR' } catch { }
+        } finally {
+            $script:ListViewRecovering = $false
         }
-        try { Write-AppLog ("UI exception: {0}" -f $msg) 'ERROR' } catch { }
     })
 } catch { }
 try {
