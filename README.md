@@ -4,7 +4,7 @@ Windows PowerShell admin tools (WinForms) for Server 2008 and later.
 
 ## PowerShark
 
-`PowerShark.ps1` is a Wireshark-style live capture GUI for **all IPv4** on the local server, with capture and display filters for **Active Directory** (LDAP, Kerberos, DNS, RPC, SYSVOL/SMB), **file server / file share** traffic (SMB1/2/3, NFS), and **domain collapse** leftovers (machine accounts, GPO, simple bind, DC locator, NTP, NTLM, WINS). No Npcap or Wireshark install is required. Same Server 2008 / PowerShell 2.0 bar as the SMBv1 analyzer.
+`PowerShark.ps1` is a Wireshark-style live capture GUI for **all IPv4** on the local server, with capture and display filters for **Active Directory** (LDAP, **LDAPS**, Kerberos, DNS, RPC, SYSVOL/SMB), **file server / file share** traffic (SMB1/2/3, NFS), **RC4** (Kerberos etype 23 rc4-hmac and TLS-RC4, with the **session 4-tuple** and **Kerberos account** `user@REALM` when cname is in the clear), and **domain collapse** leftovers (machine accounts, GPO, simple bind, DC locator, NTP, NTLM, WINS). No Npcap or Wireshark install is required. Same Server 2008 / PowerShell 2.0 bar as the SMBv1 analyzer.
 
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -STA -File .\PowerShark.ps1
@@ -12,7 +12,9 @@ pwsh.exe -ExecutionPolicy Bypass -File .\PowerShark.ps1
 powershell.exe -ExecutionPolicy Bypass -File .\PowerShark.ps1 -SelfTest
 ```
 
-On Start, **Capture** defaults to **All traffic**. Switch it to **Active Directory**, **File shares**, or **Domain collapse** to keep only those families on the sniffer thread. Before decommissioning a domain, use **Domain collapse** plus display filters such as `collapse`, `machine`, `kdc`, `gpo`, `simplebind`, `dclocator`, `ntp`, `domain:contoso`. Talkers tab can show All / AD / File shares / Domain collapse. Console must print `PowerShark v1.1`.
+On Start, **Capture** defaults to **All traffic**. Switch it to **Active Directory**, **File shares**, **Domain collapse**, **RC4**, or **LDAPS** to keep only those families on the sniffer thread. Before decommissioning a domain, use **Domain collapse** plus display filters such as `collapse`, `rc4`, `ldaps`, `user:legacyapp`, `hostname:dc01`, `machine`, `kdc`, `gpo`, `simplebind`, `dclocator`, `ntp`, `domain:contoso`. Talkers tab can show All / AD / File shares / Domain collapse / RC4 / LDAPS. Click the red **PRE-COLLAPSE** (or **SMBv1 DETECTED**) banner to open the **Findings** tab with every leftover packet the alert is about; double-click a row to jump to it on **Packets**. RC4 packets list the TCP/UDP session, the account (`legacyapp@CONTOSO.LOCAL`), the service (sname), and a **Why** line (AS-REQ TGT/logon, TGS service ticket, TLS-RC4) on Packets, Findings, Statistics, and CSV. Save view/all as **CSV** for Account / Service / Why / Finding / Cipher columns; save **PCAP** and open it in Wireshark for the full ASN.1 decode. **Resolve names** (toolbar, on by default) does background reverse-DNS so Source/Destination show `hostname (ip)` when a PTR exists; Talkers **Resolve DNS** uses the same cache. Long captures keep a capped frame buffer and the packet list always returns a row. Console must print `PowerShark v1.11`.
+
+The window uses a Windows 8-style Metro chrome (charcoal hub header, teal accent, tile buttons). **CLOSE AFTER** keeps the app open for a chosen time, then writes the entire capture to the Desktop and exits. **SAVE AS** chooses **PCAP** (Wireshark) or **CSV** (packet summary). CSV **Protocol** and **Family** name the exact service (LDAP, Kerberos, SMBv1, DNS, RPC-SAMR, …); **Category** is the coarse AD / FileShare / Other bucket; **Operation** is Bind, AS-REQ, Query, and so on. **Save all** (or Ctrl+Shift+S) dumps the full buffer on demand and lets you pick the format in the dialog. **Save view** (Ctrl+S) writes only the filtered list as pcap or CSV. Unattended: `.\PowerShark.ps1 -AutoCloseMinutes 60 -AutoSaveFormat csv`.
 
 ## SMBv1 Traffic Analyzer
 
