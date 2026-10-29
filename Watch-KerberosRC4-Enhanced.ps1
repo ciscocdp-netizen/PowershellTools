@@ -9,6 +9,12 @@
   separately from merely advertised RC4, enriches hostnames and (optionally) AD identities,
   and writes CSV plus a self-contained searchable HTML report.
 
+  Running the script with no targeting arguments opens a WinForms UI: pick DCs or EVTX
+  files, toggle options, Start/Stop collection (including live monitoring), search and
+  filter findings, and open the HTML/CSV reports. Pass -DomainControllers / -DiscoverDCs /
+  -EvtxPath for the original non-interactive CLI. Use -Gui to open the UI with those
+  values pre-filled.
+
   Does NOT modify AD, auditing settings, tickets, or encryption policies.
 
   Actual RC4 uses etype 0x17 (23, RC4-HMAC) or 0x18 (24, RC4-HMAC-EXP).
@@ -26,6 +32,16 @@
 
 .EXAMPLE
   .\Watch-KerberosRC4-Enhanced.ps1 -EvtxPath C:\Temp\Security.evtx -Mode Historical
+
+.EXAMPLE
+  .\Watch-KerberosRC4-Enhanced.ps1
+
+  Opens the interactive WinForms UI (default when no DC / EVTX arguments are given).
+
+.EXAMPLE
+  .\Watch-KerberosRC4-Enhanced.ps1 -Gui -DomainControllers DC01,DC02 -HoursBack 24
+
+  Opens the UI with DC01 and DC02 already selected.
 
 .EXAMPLE
   .\Watch-KerberosRC4-Enhanced.ps1 -SelfTest
@@ -74,10 +90,20 @@ param(
     [ValidateRange(10,1000000)][int]$MaxHistoryEventsPerDC = 100000,
     [ValidateRange(100,100000)][int]$LivePageSize = 20000,
     [ValidateRange(250,15000)][int]$DnsTimeoutMs = 750,
+    [switch]$Gui,
+    [switch]$NonInteractive,
+    [switch]$SkipMain,
     [switch]$SelfTest
 )
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+$script:QuietHost = $false
+$script:UiSync = $null
+$script:CsvPath = ''
+$script:HtmlPath = ''
+$script:CancelRequested = $false
+$script:DnsTimeoutMs = 750
+$script:Ui = $null
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -387,20 +413,31 @@ function Save-Finding {
     param($Row)
     if ($null -eq $Row) { return }
     [void]$script:Records.Add($Row)
-    $line = ($script:ReportColumns | ForEach-Object {
-        $prop = $Row.PSObject.Properties[$_]
-        $val = if ($null -ne $prop) { $prop.Value } else { '' }
-        ConvertTo-CsvField $val
-    }) -join ','
-    [System.IO.File]::AppendAllText($script:CsvPath, $line + [Environment]::NewLine, $script:Utf8NoBom)
+    if (-not [string]::IsNullOrWhiteSpace($script:CsvPath)) {
+        $line = ($script:ReportColumns | ForEach-Object {
+            $prop = $Row.PSObject.Properties[$_]
+            $val = if ($null -ne $prop) { $prop.Value } else { '' }
+            ConvertTo-CsvField $val
+        }) -join ','
+        [System.IO.File]::AppendAllText($script:CsvPath, $line + [Environment]::NewLine, $script:Utf8NoBom)
+    }
 
-    $color = 'Cyan'
-    if ($Row.Category -like 'RC4 Ticket*') { $color = 'Red' }
-    elseif ($Row.Category -like 'RC4 Session*') { $color = 'Yellow' }
-    Write-Host ('[{0}] {1} {2} | {3} {4} | Account={5} | Client={6} {7} | Service={8} | Ticket={9} | Session={10}' -f `
-        $Row.WhenLocal, $Row.DomainController, $Row.Category, $Row.RequestType, $Row.EventId, `
-        $Row.Account, $Row.ClientIP, $Row.ClientHostname, $Row.ServiceName, $Row.TicketEtype, $Row.SessionEtype) `
-        -ForegroundColor $color
+    if (-not $script:QuietHost) {
+        $color = 'Cyan'
+        if ($Row.Category -like 'RC4 Ticket*') { $color = 'Red' }
+        elseif ($Row.Category -like 'RC4 Session*') { $color = 'Yellow' }
+        Write-Host ('[{0}] {1} {2} | {3} {4} | Account={5} | Client={6} {7} | Service={8} | Ticket={9} | Session={10}' -f `
+            $Row.WhenLocal, $Row.DomainController, $Row.Category, $Row.RequestType, $Row.EventId, `
+            $Row.Account, $Row.ClientIP, $Row.ClientHostname, $Row.ServiceName, $Row.TicketEtype, $Row.SessionEtype) `
+            -ForegroundColor $color
+    }
+
+    if ($null -ne $script:UiSync) {
+        [void]$script:UiSync.Queue.Add($Row)
+        $script:UiSync.FindingCount = $script:Records.Count
+        $script:UiSync.CsvPath = $script:CsvPath
+        $script:UiSync.HtmlPath = $script:HtmlPath
+    }
 }
 
 function Write-HtmlReport {
@@ -444,6 +481,334 @@ function Write-HtmlReport {
             Write-Warning "Unable to refresh HTML report (file may be open): $($_.Exception.Message)"
         }
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-ReportColumnList {
+    return @(
+        'WhenLocal','DomainController','EventId','RequestType','Category','Account','AccountDomain',
+        'ClientIP','ClientHostname','ServiceName','ServiceSPNIfLogged','TicketEtype','TicketCipher',
+        'SessionEtype','SessionCipher','AdvertisedEtypes','Status','AccountADObject','ServiceADObject',
+        'AccountSupportedEtypes','ServiceSupportedEtypes','DCSupportedEtypes','AccountAvailableKeys',
+        'ServiceAvailableKeys','DCAvailableKeys','WhenUtc','ClientPort','RecordId'
+    )
+}
+
+function Get-GridColumnList {
+    return @(
+        'WhenLocal','Category','Account','AccountDomain','ClientIP','ClientHostname',
+        'ServiceName','TicketCipher','SessionCipher','DomainController','RequestType',
+        'EventId','Status','AdvertisedEtypes'
+    )
+}
+
+function Test-ShouldStartInteractiveUi {
+    param(
+        [switch]$SelfTestPresent,
+        [switch]$SkipMainPresent,
+        [switch]$GuiPresent,
+        [switch]$NonInteractivePresent,
+        [string[]]$DomainControllerList,
+        [switch]$DiscoverDCsPresent,
+        [string[]]$EvtxPathList
+    )
+    if ($SelfTestPresent -or $SkipMainPresent -or $NonInteractivePresent) { return $false }
+    if ($GuiPresent) { return $true }
+    $hasDc = $false
+    if ($DomainControllerList) {
+        $hasDc = (@($DomainControllerList | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 0)
+    }
+    $hasEvtx = $false
+    if ($EvtxPathList) {
+        $hasEvtx = (@($EvtxPathList | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 0)
+    }
+    return -not ($hasDc -or [bool]$DiscoverDCsPresent -or $hasEvtx)
+}
+
+function ConvertTo-LikeLiteral {
+    param([string]$Value)
+    if ($null -eq $Value) { return '' }
+    return $Value.Replace("'","''").Replace('[','[[]').Replace('%','[%]').Replace('*','[*]')
+}
+
+function ConvertTo-DataViewFilter {
+    param(
+        [string]$Query,
+        [string]$CategoryFilter = 'All'
+    )
+    $parts = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace($CategoryFilter) -and $CategoryFilter -ne 'All') {
+        $cat = ConvertTo-LikeLiteral $CategoryFilter
+        if ($CategoryFilter -eq 'RC4 Ticket') {
+            [void]$parts.Add("Category LIKE '%RC4 Ticket%'")
+        } elseif ($CategoryFilter -eq 'RC4 Session') {
+            [void]$parts.Add("Category LIKE '%Session%'")
+        } else {
+            [void]$parts.Add("Category = '$cat'")
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Query)) {
+        $like = "'%" + (ConvertTo-LikeLiteral $Query.Trim()) + "%'"
+        $or = @()
+        foreach ($col in (Get-GridColumnList)) {
+            $or += "$col LIKE $like"
+        }
+        [void]$parts.Add('(' + ($or -join ' OR ') + ')')
+    }
+    if ($parts.Count -lt 1) { return '' }
+    return ($parts -join ' AND ')
+}
+
+function Get-CategoryHighlightArgb {
+    param([string]$Category)
+    if ($Category -like 'RC4 Ticket*') { return [int[]](255, 228, 225) }
+    if ($Category -like 'RC4 Session*') { return [int[]](255, 249, 196) }
+    if ($Category -eq 'RC4 Offered Only') { return [int[]](220, 245, 255) }
+    if ($Category -like 'Failed*') { return [int[]](232, 232, 232) }
+    return [int[]](255, 255, 255)
+}
+
+function Test-IsStaApartment {
+    return ([System.Threading.Thread]::CurrentThread.GetApartmentState().ToString() -eq 'STA')
+}
+
+function Test-IsCollectorCancelRequested {
+    if ($script:CancelRequested) { return $true }
+    if ($null -ne $script:UiSync) {
+        try { return [bool]$script:UiSync.Cancel } catch { return $false }
+    }
+    return $false
+}
+
+function Write-CollectorStatus {
+    param(
+        [string]$Message,
+        [string]$Level = 'INFO'
+    )
+    if (-not $script:QuietHost) {
+        $color = 'Gray'
+        switch ($Level) {
+            'WARN' { $color = 'Yellow' }
+            'ERROR' { $color = 'Red' }
+            'SUCCESS' { $color = 'Green' }
+        }
+        Write-Host $Message -ForegroundColor $color
+    }
+    if ($null -ne $script:UiSync) {
+        $script:UiSync.Status = $Message
+        if ($null -ne $script:UiSync.Log) {
+            [void]$script:UiSync.Log.Add(('[{0}] [{1}] {2}' -f (Get-Date -Format 'HH:mm:ss'), $Level, $Message))
+        }
+    }
+}
+
+function Initialize-CollectorSession {
+    param(
+        [string]$OutputFolderPath,
+        [bool]$ResolveHostnamesFlag,
+        [bool]$EnrichADFlag,
+        [bool]$IncludeOfferedFlag,
+        [bool]$IncludeFailuresFlag,
+        [int]$DnsTimeout,
+        $CredentialObject,
+        [bool]$Quiet = $false,
+        [string]$ExistingCsvPath = '',
+        [string]$ExistingHtmlPath = ''
+    )
+    $script:DoResolveHostnames = $ResolveHostnamesFlag
+    $script:DoEnrichAD = $EnrichADFlag
+    $script:DoIncludeOffered = $IncludeOfferedFlag
+    $script:DoIncludeFailures = $IncludeFailuresFlag
+    $script:Credential = $CredentialObject
+    $script:DnsTimeoutMs = $DnsTimeout
+    $script:QuietHost = $Quiet
+    $script:CancelRequested = $false
+    $script:Utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    $script:DnsCache = @{}
+    $script:AdCache = @{}
+    $script:Records = New-Object 'System.Collections.Generic.List[object]'
+    $script:ReportColumns = Get-ReportColumnList
+    if ($script:DoEnrichAD) {
+        if (-not (Import-ActiveDirectoryModule -Reason 'AD enrichment')) { $script:DoEnrichAD = $false }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExistingCsvPath)) {
+        $script:CsvPath = $ExistingCsvPath
+        $script:HtmlPath = $ExistingHtmlPath
+        if (-not (Test-Path -LiteralPath $script:CsvPath)) { Initialize-CsvFile }
+        return
+    }
+    New-Item -Path $OutputFolderPath -ItemType Directory -Force | Out-Null
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $script:CsvPath = Join-Path $OutputFolderPath "KerberosRC4_$stamp.csv"
+    $script:HtmlPath = Join-Path $OutputFolderPath "KerberosRC4_$stamp.html"
+    Initialize-CsvFile
+}
+
+function Get-CollectorTargetList {
+    param(
+        [string[]]$DomainControllerList,
+        [string[]]$EvtxPathList,
+        [switch]$Discover,
+        [switch]$IncludeRODC
+    )
+    $controllers = @()
+    $evtxFiles = @()
+    if ($EvtxPathList) {
+        foreach ($p in $EvtxPathList) {
+            if ([string]::IsNullOrWhiteSpace($p)) { continue }
+            if (-not (Test-Path -LiteralPath $p)) { throw "EVTX file not found: $p" }
+            $evtxFiles += (Resolve-Path -LiteralPath $p).Path
+        }
+    }
+    if ($Discover) {
+        [void](Import-ActiveDirectoryModule -Reason 'required')
+        $dcSplat = @{ Filter = '*'; ErrorAction = 'Stop' }
+        if ($script:Credential) { $dcSplat['Credential'] = $script:Credential }
+        $found = @(Get-ADDomainController @dcSplat)
+        if (-not $IncludeRODC) {
+            $found = @($found | Where-Object { -not $_.IsReadOnly })
+        }
+        $controllers = @($found | Select-Object -ExpandProperty HostName)
+        if ($controllers.Count -lt 1) {
+            throw 'DC discovery returned no domain controllers. Specify domain controllers or include RODCs.'
+        }
+    }
+    if ($DomainControllerList) {
+        $controllers = @($controllers + @($DomainControllerList | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }))
+    }
+    $controllers = @($controllers | Select-Object -Unique)
+    $targets = @()
+    foreach ($dc in $controllers) {
+        $targets += [pscustomobject]@{ Kind = 'dc'; Name = $dc; Path = ''; Key = $dc }
+    }
+    foreach ($file in $evtxFiles) {
+        $targets += [pscustomobject]@{ Kind = 'evtx'; Name = [System.IO.Path]::GetFileName($file); Path = $file; Key = $file }
+    }
+    return $targets
+}
+
+function Invoke-KerberosCollection {
+    param(
+        [object[]]$Targets,
+        [ValidateSet('Historical','Live','Both')][string]$Mode = 'Both',
+        [int]$HoursBack = 24,
+        [int]$PollSeconds = 5,
+        [int]$MaxHistoryEventsPerDC = 100000,
+        [int]$LivePageSize = 20000
+    )
+    if ($null -eq $Targets -or $Targets.Count -lt 1) {
+        throw 'Specify at least one domain controller or EVTX file.'
+    }
+    $controllers = @($Targets | Where-Object { $_.Kind -eq 'dc' } | ForEach-Object { $_.Name })
+    $evtxFiles = @($Targets | Where-Object { $_.Kind -eq 'evtx' } | ForEach-Object { $_.Path })
+    $lastId = @{}
+    $lastScan = @{}
+    foreach ($target in $Targets) {
+        $lastId[$target.Key] = [int64]0
+        $lastScan[$target.Key] = Get-Date
+    }
+
+    $targetNames = @($Targets | ForEach-Object { if ($_.Kind -eq 'evtx') { $_.Path } else { $_.Name } })
+    Write-CollectorStatus "Monitoring $($targetNames -join ', ') | Mode=$Mode | CSV=$script:CsvPath" 'SUCCESS'
+    if ($null -ne $script:UiSync) {
+        $script:UiSync.CsvPath = $script:CsvPath
+        $script:UiSync.HtmlPath = $script:HtmlPath
+    }
+
+    $runHistorical = ($Mode -eq 'Historical' -or $Mode -eq 'Both' -or $evtxFiles.Count -gt 0)
+    $runLive = ($Mode -eq 'Live' -or $Mode -eq 'Both') -and ($controllers.Count -gt 0)
+    if ($evtxFiles.Count -gt 0 -and $controllers.Count -lt 1) { $runLive = $false }
+    if ($evtxFiles.Count -gt 0 -and $Mode -eq 'Live') {
+        Write-CollectorStatus 'EVTX files are static. Live polling is skipped for EVTX; running a one-shot historical scan.' 'WARN'
+    }
+
+    if ($runHistorical) {
+        $since = (Get-Date).AddHours(-$HoursBack)
+        foreach ($target in $Targets) {
+            if (Test-IsCollectorCancelRequested) { break }
+            Write-CollectorStatus "Historical query $($target.Name) since $since"
+            if ($target.Kind -eq 'evtx') {
+                $events = Read-KerberosEvents -Path $target.Path -Since $since -Max $MaxHistoryEventsPerDC
+            } else {
+                $events = Read-KerberosEvents -ComputerName $target.Name -Since $since -Max $MaxHistoryEventsPerDC
+            }
+            if ($events.Count -ge $MaxHistoryEventsPerDC) {
+                Write-CollectorStatus "Hit MaxHistoryEventsPerDC ($MaxHistoryEventsPerDC) on $($target.Name). Older matching events in the window were not read." 'WARN'
+            }
+            $n = 0
+            foreach ($ev in ($events | Sort-Object RecordId)) {
+                if (Test-IsCollectorCancelRequested) { break }
+                if ([int64]$ev.RecordId -gt $lastId[$target.Key]) { $lastId[$target.Key] = [int64]$ev.RecordId }
+                $row = Convert-KerberosEvent $ev $target.Name
+                if ($null -ne $row) { Save-Finding $row }
+                $n++
+                if (($n % 200) -eq 0) {
+                    Write-CollectorStatus "Parsed $n events from $($target.Name)..."
+                }
+            }
+        }
+        try { Write-HtmlReport } catch {
+            Write-CollectorStatus "HTML refresh failed: $($_.Exception.Message)" 'WARN'
+        }
+    } elseif ($runLive) {
+        foreach ($dc in $controllers) {
+            $lastId[$dc] = Get-NewestSecurityRecordId $dc
+            $lastScan[$dc] = Get-Date
+        }
+    }
+
+    Write-CollectorStatus "HTML report: $script:HtmlPath" 'SUCCESS'
+    if (-not $runLive -or (Test-IsCollectorCancelRequested)) {
+        Write-CollectorStatus "Completed: $($script:Records.Count) findings." 'SUCCESS'
+        return
+    }
+
+    Write-CollectorStatus 'Live monitoring. Stop from the UI or press Ctrl+C in the console.' 'SUCCESS'
+    try {
+        while (-not (Test-IsCollectorCancelRequested)) {
+            $waitMs = [Math]::Max(500, $PollSeconds * 1000)
+            $slept = 0
+            while ($slept -lt $waitMs -and -not (Test-IsCollectorCancelRequested)) {
+                $slice = [Math]::Min(500, $waitMs - $slept)
+                Start-Sleep -Milliseconds $slice
+                $slept += $slice
+            }
+            if (Test-IsCollectorCancelRequested) { break }
+            foreach ($dc in $controllers) {
+                if (Test-IsCollectorCancelRequested) { break }
+                try {
+                    if (Test-SecurityLogWrapped -ComputerName $dc -Cursor $lastId[$dc]) {
+                        Write-CollectorStatus "Security log on $dc was cleared or wrapped. Resetting RecordId cursor." 'WARN'
+                        $lastId[$dc] = [int64]0
+                    }
+                    $since = $lastScan[$dc].AddSeconds(-30)
+                    $useRecordIdOnly = ($lastId[$dc] -gt 0)
+                    $caughtUp = $false
+                    while (-not $caughtUp -and -not (Test-IsCollectorCancelRequested)) {
+                        $page = Read-KerberosEvents -ComputerName $dc -Since $since -Max $LivePageSize -AfterRecordId $lastId[$dc] -Oldest -RecordIdOnly:$useRecordIdOnly
+                        if ($page.Count -lt 1) { $caughtUp = $true; break }
+                        foreach ($ev in $page) {
+                            $rid = [int64]$ev.RecordId
+                            if ($rid -le $lastId[$dc]) { continue }
+                            $lastId[$dc] = $rid
+                            $row = Convert-KerberosEvent $ev $dc
+                            if ($null -ne $row) { Save-Finding $row }
+                        }
+                        if ($page.Count -lt $LivePageSize) { $caughtUp = $true }
+                        $useRecordIdOnly = ($lastId[$dc] -gt 0)
+                    }
+                    $lastScan[$dc] = Get-Date
+                } catch {
+                    Write-CollectorStatus "Live poll failed for ${dc}: $($_.Exception.Message)" 'WARN'
+                }
+            }
+            try { Write-HtmlReport } catch {
+                Write-CollectorStatus "HTML refresh failed: $($_.Exception.Message)" 'WARN'
+            }
+        }
+    } finally {
+        try { Write-HtmlReport } catch { }
+        Write-CollectorStatus "Stopped. Findings: $($script:Records.Count). CSV=$script:CsvPath" 'SUCCESS'
     }
 }
 
@@ -566,8 +931,805 @@ function Import-ActiveDirectoryModule {
 }
 
 # ---------------------------------------------------------------------------
+# Interactive WinForms UI
+# ---------------------------------------------------------------------------
+
+function Read-UiTextInput {
+    param([string]$Title, [string]$Prompt, [string]$Default = '')
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = $Title
+    $dlg.Size = New-Object System.Drawing.Size(460, 160)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+    $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = $Prompt
+    $lbl.Location = New-Object System.Drawing.Point(12, 12)
+    $lbl.AutoSize = $true
+    $txt = New-Object System.Windows.Forms.TextBox
+    $txt.Text = $Default
+    $txt.Location = New-Object System.Drawing.Point(12, 40)
+    $txt.Width = 418
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = 'OK'
+    $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $ok.Location = New-Object System.Drawing.Point(250, 78)
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = 'Cancel'
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $cancel.Location = New-Object System.Drawing.Point(340, 78)
+    $dlg.Controls.AddRange(@($lbl, $txt, $ok, $cancel))
+    $dlg.AcceptButton = $ok
+    $dlg.CancelButton = $cancel
+    $result = $dlg.ShowDialog()
+    $value = $txt.Text
+    $dlg.Dispose()
+    if ($result -eq 'OK') { return $value }
+    return ''
+}
+
+function New-UiButton {
+    param([string]$Text, [int]$Width = 118, [int]$Height = 28)
+    $button = New-Object System.Windows.Forms.Button
+    $button.Text = $Text
+    $button.Width = $Width
+    $button.Height = $Height
+    $button.FlatStyle = [System.Windows.Forms.FlatStyle]::System
+    $button.UseVisualStyleBackColor = $true
+    return $button
+}
+
+function Add-UiLogLine {
+    param([string]$Text)
+    if ($null -eq $script:Ui -or $null -eq $script:Ui.LogBox) { return }
+    $box = $script:Ui.LogBox
+    if ($box.IsDisposed) { return }
+    if ($box.Text.Length -gt 120000) { $box.Text = $box.Text.Substring($box.Text.Length - 80000) }
+    $box.AppendText($Text.TrimEnd() + [Environment]::NewLine)
+}
+
+function Update-UiFilter {
+    if ($null -eq $script:Ui) { return }
+    $query = ''
+    $category = 'All'
+    if ($script:Ui.SearchBox) { $query = $script:Ui.SearchBox.Text }
+    if ($script:Ui.FilterBox -and $null -ne $script:Ui.FilterBox.SelectedItem) {
+        $category = [string]$script:Ui.FilterBox.SelectedItem
+    }
+    $script:Ui.Table.DefaultView.RowFilter = ConvertTo-DataViewFilter -Query $query -CategoryFilter $category
+    Update-UiCountLabels
+}
+
+function Update-UiCountLabels {
+    if ($null -eq $script:Ui) { return }
+    $ticket = $script:Ui.TicketCount
+    $session = $script:Ui.SessionCount
+    $offered = $script:Ui.OfferedCount
+    $total = $script:Ui.Table.Rows.Count
+    $shown = $script:Ui.Table.DefaultView.Count
+    $script:Ui.CountLabel.Text = "Records $total  |  Shown $shown  |  RC4 tickets $ticket  |  RC4 sessions $session  |  Offered $offered"
+}
+
+function Add-FindingToUi {
+    param($Row)
+    if ($null -eq $script:Ui) { return }
+    $dataRow = $script:Ui.Table.NewRow()
+    foreach ($col in (Get-GridColumnList)) {
+        $prop = $Row.PSObject.Properties[$col]
+        $dataRow[$col] = if ($null -ne $prop) { [string]$prop.Value } else { '' }
+    }
+    $script:Ui.Table.Rows.Add($dataRow)
+    if ($Row.Category -like '*Ticket*') { $script:Ui.TicketCount++ }
+    if ($Row.Category -like '*Session*') { $script:Ui.SessionCount++ }
+    if ($Row.Category -eq 'RC4 Offered Only') { $script:Ui.OfferedCount++ }
+}
+
+function Drain-UiCollectorQueue {
+    if ($null -eq $script:UiSync) { return }
+    $batch = @()
+    $lockObj = $script:UiSync.Queue.SyncRoot
+    [System.Threading.Monitor]::Enter($lockObj)
+    try {
+        if ($script:UiSync.Queue.Count -gt 0) {
+            $batch = @($script:UiSync.Queue.ToArray())
+            $script:UiSync.Queue.Clear()
+        }
+    } finally {
+        [System.Threading.Monitor]::Exit($lockObj)
+    }
+    foreach ($row in $batch) { Add-FindingToUi $row }
+    if ($batch.Count -gt 0) { Update-UiFilter }
+
+    $logLock = $script:UiSync.Log.SyncRoot
+    $logLines = @()
+    [System.Threading.Monitor]::Enter($logLock)
+    try {
+        if ($script:UiSync.Log.Count -gt 0) {
+            $logLines = @($script:UiSync.Log.ToArray())
+            $script:UiSync.Log.Clear()
+        }
+    } finally {
+        [System.Threading.Monitor]::Exit($logLock)
+    }
+    foreach ($line in $logLines) { Add-UiLogLine $line }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:UiSync.Status)) {
+        $script:Ui.StatusLabel.Text = [string]$script:UiSync.Status
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:UiSync.CsvPath)) {
+        $script:Ui.CsvPath = [string]$script:UiSync.CsvPath
+        $script:Ui.HtmlPath = [string]$script:UiSync.HtmlPath
+    }
+}
+
+function Set-UiRunningState {
+    param([bool]$Running)
+    $script:Ui.Running = $Running
+    $script:Ui.StartButton.Enabled = -not $Running
+    $script:Ui.StopButton.Enabled = $Running
+    $script:Ui.TargetList.Enabled = -not $Running
+    $script:Ui.DiscoverButton.Enabled = -not $Running
+    $script:Ui.AddDcButton.Enabled = -not $Running
+    $script:Ui.AddEvtxButton.Enabled = -not $Running
+    $script:Ui.RemoveButton.Enabled = -not $Running
+    $script:Ui.ModeBox.Enabled = -not $Running
+}
+
+function Add-UiTarget {
+    param([string]$Kind, [string]$Name, [string]$Path = '')
+    if ($null -eq $script:Ui) { return }
+    $key = if ($Kind -eq 'evtx') { $Path } else { $Name }
+    if ([string]::IsNullOrWhiteSpace($key)) { return }
+    foreach ($existing in $script:Ui.Targets) {
+        if ($existing.Key -eq $key) { return }
+    }
+    $display = if ($Kind -eq 'evtx') { "EVTX  $Name" } else { $Name }
+    $item = [pscustomobject]@{ Kind = $Kind; Name = $Name; Path = $Path; Key = $key; Display = $display }
+    [void]$script:Ui.Targets.Add($item)
+    [void]$script:Ui.TargetList.Items.Add($display, $true)
+}
+
+function Get-UiCheckedTargets {
+    $result = @()
+    if ($null -eq $script:Ui) { return $result }
+    for ($i = 0; $i -lt $script:Ui.TargetList.Items.Count; $i++) {
+        if (-not $script:Ui.TargetList.GetItemChecked($i)) { continue }
+        $result += $script:Ui.Targets[$i]
+    }
+    return $result
+}
+
+function Show-FindingDetail {
+    param($GridRow)
+    if ($null -eq $GridRow) { return }
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($col in (Get-GridColumnList)) {
+        [void]$lines.Add(('{0,-22} {1}' -f ($col + ':'), [string]$GridRow.Cells[$col].Value))
+    }
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Finding detail'
+    $dlg.Size = New-Object System.Drawing.Size(720, 520)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.MinimizeBox = $false
+    $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $box = New-Object System.Windows.Forms.TextBox
+    $box.Multiline = $true
+    $box.ReadOnly = $true
+    $box.ScrollBars = 'Both'
+    $box.WordWrap = $false
+    $box.Dock = 'Fill'
+    $box.Font = New-Object System.Drawing.Font('Consolas', 9)
+    $box.Text = ($lines -join [Environment]::NewLine)
+    $dlg.Controls.Add($box)
+    [void]$dlg.ShowDialog($script:Ui.Form)
+    $dlg.Dispose()
+}
+
+function Stop-UiCollector {
+    if ($null -ne $script:UiSync) { $script:UiSync.Cancel = $true }
+    $script:CancelRequested = $true
+    if ($null -ne $script:Ui -and $null -ne $script:Ui.CollectorPS) {
+        try { $script:Ui.CollectorPS.BeginStop($null, $null) | Out-Null } catch { }
+    }
+    if ($null -ne $script:Ui) { $script:Ui.StatusLabel.Text = 'Stop requested...' }
+}
+
+function Complete-UiCollector {
+    Drain-UiCollectorQueue
+    Set-UiRunningState $false
+    if ($null -ne $script:Ui.CollectorPS) {
+        try {
+            if ($null -ne $script:Ui.CollectorHandle) {
+                $script:Ui.CollectorPS.EndInvoke($script:Ui.CollectorHandle) | Out-Null
+            }
+        } catch {
+            Add-UiLogLine ('[ERROR] ' + $_.Exception.Message)
+            $script:Ui.StatusLabel.Text = $_.Exception.Message
+        }
+        try { $script:Ui.CollectorPS.Runspace.Dispose() } catch { }
+        try { $script:Ui.CollectorPS.Dispose() } catch { }
+        $script:Ui.CollectorPS = $null
+        $script:Ui.CollectorHandle = $null
+    }
+    if ($null -ne $script:UiSync -and -not [string]::IsNullOrWhiteSpace([string]$script:UiSync.Error)) {
+        $script:Ui.StatusLabel.Text = [string]$script:UiSync.Error
+    } elseif ($script:Ui.StatusLabel.Text -like 'Stop requested*') {
+        $script:Ui.StatusLabel.Text = 'Stopped.'
+    }
+    $script:Ui.Timer.Stop()
+}
+
+function Start-UiCollector {
+    $targets = @(Get-UiCheckedTargets)
+    if ($targets.Count -lt 1) {
+        [System.Windows.Forms.MessageBox]::Show(
+            'Check at least one domain controller or EVTX file.',
+            'No targets',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
+        return
+    }
+
+    $hours = 24
+    $poll = 5
+    [void][int]::TryParse($script:Ui.HoursBox.Text, [ref]$hours)
+    [void][int]::TryParse($script:Ui.PollBox.Text, [ref]$poll)
+    if ($hours -lt 1) { $hours = 1 }
+    if ($hours -gt 720) { $hours = 720 }
+    if ($poll -lt 2) { $poll = 2 }
+    if ($poll -gt 3600) { $poll = 3600 }
+
+    $mode = [string]$script:Ui.ModeBox.SelectedItem
+    if ([string]::IsNullOrWhiteSpace($mode)) { $mode = 'Both' }
+    $outputFolder = $script:Ui.OutputBox.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($outputFolder)) {
+        $outputFolder = Join-Path (Get-Location).Path 'RC4-Reports'
+        $script:Ui.OutputBox.Text = $outputFolder
+    }
+
+    $script:Ui.Table.Rows.Clear()
+    $script:Ui.TicketCount = 0
+    $script:Ui.SessionCount = 0
+    $script:Ui.OfferedCount = 0
+    Update-UiCountLabels
+
+    $sync = [hashtable]::Synchronized(@{
+        Cancel       = $false
+        Status       = 'Starting...'
+        Queue        = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+        Log          = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+        FindingCount = 0
+        CsvPath      = ''
+        HtmlPath     = ''
+        Error        = ''
+        Done         = $false
+    })
+    $script:UiSync = $sync
+    $script:CancelRequested = $false
+
+    $settings = @{
+        ScriptPath            = $PSCommandPath
+        OutputFolder          = $outputFolder
+        ResolveHostnames      = [bool]$script:Ui.ChkDns.Checked
+        EnrichAD              = [bool]$script:Ui.ChkAd.Checked
+        IncludeOffered        = [bool]$script:Ui.ChkOffered.Checked
+        IncludeFailures       = [bool]$script:Ui.ChkFailures.Checked
+        DnsTimeoutMs          = $script:DnsTimeoutMs
+        Mode                  = $mode
+        HoursBack             = $hours
+        PollSeconds           = $poll
+        MaxHistoryEventsPerDC = $MaxHistoryEventsPerDC
+        LivePageSize          = $LivePageSize
+        Targets               = @($targets | ForEach-Object {
+            [pscustomobject]@{ Kind = $_.Kind; Name = $_.Name; Path = $_.Path; Key = $_.Key }
+        })
+    }
+    if ($script:Ui.Credential) { $settings['Credential'] = $script:Ui.Credential }
+
+    $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+    $runspace.ApartmentState = 'MTA'
+    $runspace.ThreadOptions = 'ReuseThread'
+    $runspace.Open()
+    $ps = [PowerShell]::Create()
+    $ps.Runspace = $runspace
+    $null = $ps.AddScript({
+        param($Sync, $Settings)
+        $script:UiSync = $Sync
+        try {
+            . $Settings.ScriptPath -SkipMain
+            $script:UiSync = $Sync
+            $cred = $null
+            if ($Settings.ContainsKey('Credential')) { $cred = $Settings.Credential }
+            Initialize-CollectorSession -OutputFolderPath $Settings.OutputFolder `
+                -ResolveHostnamesFlag $Settings.ResolveHostnames `
+                -EnrichADFlag $Settings.EnrichAD `
+                -IncludeOfferedFlag $Settings.IncludeOffered `
+                -IncludeFailuresFlag $Settings.IncludeFailures `
+                -DnsTimeout $Settings.DnsTimeoutMs `
+                -CredentialObject $cred `
+                -Quiet $true
+            $Sync.CsvPath = $script:CsvPath
+            $Sync.HtmlPath = $script:HtmlPath
+            Invoke-KerberosCollection -Targets $Settings.Targets -Mode $Settings.Mode `
+                -HoursBack $Settings.HoursBack -PollSeconds $Settings.PollSeconds `
+                -MaxHistoryEventsPerDC $Settings.MaxHistoryEventsPerDC -LivePageSize $Settings.LivePageSize
+        } catch {
+            $Sync.Error = $_.Exception.Message
+            $Sync.Status = $_.Exception.Message
+            if ($null -ne $Sync.Log) { [void]$Sync.Log.Add(('[{0}] [ERROR] {1}' -f (Get-Date -Format 'HH:mm:ss'), $_.Exception.Message)) }
+        } finally {
+            $Sync.Done = $true
+        }
+    }).AddArgument($sync).AddArgument($settings)
+
+    $script:Ui.CollectorPS = $ps
+    $script:Ui.CollectorHandle = $ps.BeginInvoke()
+    Set-UiRunningState $true
+    $script:Ui.StatusLabel.Text = 'Starting collector...'
+    Add-UiLogLine '[INFO] Collector started.'
+    $script:Ui.Timer.Start()
+}
+
+function Show-KerberosRc4Gui {
+    param(
+        [string[]]$PreselectedDCs,
+        [string[]]$PreselectedEvtx,
+        [string]$InitialMode = 'Both',
+        [int]$InitialHours = 24,
+        [int]$InitialPoll = 5,
+        [string]$InitialOutput = '',
+        [bool]$InitialOffered = $false,
+        [bool]$InitialFailures = $false,
+        [bool]$InitialDns = $false,
+        [bool]$InitialAd = $false
+    )
+
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+    } catch {
+        throw "Interactive UI requires System.Windows.Forms (Windows PowerShell / Windows). $($_.Exception.Message)"
+    }
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'Kerberos RC4 Investigator'
+    $form.Size = New-Object System.Drawing.Size(1280, 820)
+    $form.StartPosition = 'CenterScreen'
+    $form.MinimumSize = New-Object System.Drawing.Size(1000, 640)
+    $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $form.BackColor = [System.Drawing.Color]::FromArgb(245, 247, 250)
+
+    $header = New-Object System.Windows.Forms.Panel
+    $header.Dock = 'Top'
+    $header.Height = 58
+    $header.BackColor = [System.Drawing.Color]::FromArgb(23, 35, 56)
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = 'Kerberos RC4 Investigator'
+    $title.ForeColor = [System.Drawing.Color]::White
+    $title.Font = New-Object System.Drawing.Font('Segoe UI', 14, [System.Drawing.FontStyle]::Bold)
+    $title.AutoSize = $true
+    $title.Location = New-Object System.Drawing.Point(16, 8)
+    $subtitle = New-Object System.Windows.Forms.Label
+    $subtitle.Text = 'Read-only 4768 / 4769 collector   |   actual RC4 tickets vs advertised RC4   |   F5 start   Esc stop'
+    $subtitle.ForeColor = [System.Drawing.Color]::FromArgb(180, 196, 214)
+    $subtitle.AutoSize = $true
+    $subtitle.Location = New-Object System.Drawing.Point(18, 34)
+    $header.Controls.AddRange(@($title, $subtitle))
+
+    $footer = New-Object System.Windows.Forms.Panel
+    $footer.Dock = 'Bottom'
+    $footer.Height = 150
+    $status = New-Object System.Windows.Forms.Label
+    $status.Text = 'Ready. Add domain controllers or an EVTX file, then Start.'
+    $status.Dock = 'Top'
+    $status.Height = 24
+    $status.Padding = New-Object System.Windows.Forms.Padding(8, 4, 8, 0)
+    $counts = New-Object System.Windows.Forms.Label
+    $counts.Text = 'Records 0  |  Shown 0  |  RC4 tickets 0  |  RC4 sessions 0  |  Offered 0'
+    $counts.Dock = 'Top'
+    $counts.Height = 22
+    $counts.Padding = New-Object System.Windows.Forms.Padding(8, 0, 8, 0)
+    $logBox = New-Object System.Windows.Forms.TextBox
+    $logBox.Multiline = $true
+    $logBox.ReadOnly = $true
+    $logBox.ScrollBars = 'Vertical'
+    $logBox.Dock = 'Fill'
+    $logBox.Font = New-Object System.Drawing.Font('Consolas', 8.5)
+    $logBox.BackColor = [System.Drawing.Color]::FromArgb(248, 250, 252)
+    $footer.Controls.Add($logBox)
+    $footer.Controls.Add($counts)
+    $footer.Controls.Add($status)
+
+    $left = New-Object System.Windows.Forms.Panel
+    $left.Dock = 'Left'
+    $left.Width = 360
+    $left.Padding = New-Object System.Windows.Forms.Padding(12, 10, 12, 10)
+
+    $y = 8
+    $lblTargets = New-Object System.Windows.Forms.Label
+    $lblTargets.Text = 'Targets'
+    $lblTargets.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $lblTargets.Location = New-Object System.Drawing.Point(12, $y)
+    $lblTargets.AutoSize = $true
+    $y += 22
+    $targetList = New-Object System.Windows.Forms.CheckedListBox
+    $targetList.Location = New-Object System.Drawing.Point(12, $y)
+    $targetList.Size = New-Object System.Drawing.Size(332, 150)
+    $targetList.CheckOnClick = $true
+    $y += 158
+    $btnDiscover = New-UiButton 'Discover DCs' 100
+    $btnDiscover.Location = New-Object System.Drawing.Point(12, $y)
+    $btnAddDc = New-UiButton 'Add DC' 72 28
+    $btnAddDc.Location = New-Object System.Drawing.Point(116, $y)
+    $btnAddEvtx = New-UiButton 'Add EVTX' 76 28
+    $btnAddEvtx.Location = New-Object System.Drawing.Point(192, $y)
+    $btnRemove = New-UiButton 'Remove' 72 28
+    $btnRemove.Location = New-Object System.Drawing.Point(272, $y)
+    $y += 40
+
+    $lblMode = New-Object System.Windows.Forms.Label
+    $lblMode.Text = 'Mode'
+    $lblMode.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $lblMode.Location = New-Object System.Drawing.Point(12, $y)
+    $lblMode.AutoSize = $true
+    $y += 22
+    $modeBox = New-Object System.Windows.Forms.ComboBox
+    $modeBox.DropDownStyle = 'DropDownList'
+    $modeBox.Location = New-Object System.Drawing.Point(12, $y)
+    $modeBox.Width = 160
+    [void]$modeBox.Items.AddRange(@('Historical','Live','Both'))
+    $modeBox.SelectedItem = $InitialMode
+    $lblHours = New-Object System.Windows.Forms.Label
+    $lblHours.Text = 'Hours'
+    $lblHours.Location = New-Object System.Drawing.Point(182, ($y - 18))
+    $lblHours.AutoSize = $true
+    $hoursBox = New-Object System.Windows.Forms.TextBox
+    $hoursBox.Text = [string]$InitialHours
+    $hoursBox.Location = New-Object System.Drawing.Point(182, $y)
+    $hoursBox.Width = 50
+    $lblPoll = New-Object System.Windows.Forms.Label
+    $lblPoll.Text = 'Poll sec'
+    $lblPoll.Location = New-Object System.Drawing.Point(244, ($y - 18))
+    $lblPoll.AutoSize = $true
+    $pollBox = New-Object System.Windows.Forms.TextBox
+    $pollBox.Text = [string]$InitialPoll
+    $pollBox.Location = New-Object System.Drawing.Point(244, $y)
+    $pollBox.Width = 50
+    $y += 36
+
+    $chkOffered = New-Object System.Windows.Forms.CheckBox
+    $chkOffered.Text = 'Include offered RC4 (not proof of use)'
+    $chkOffered.Location = New-Object System.Drawing.Point(12, $y)
+    $chkOffered.AutoSize = $true
+    $chkOffered.Checked = $InitialOffered
+    $y += 24
+    $chkFailures = New-Object System.Windows.Forms.CheckBox
+    $chkFailures.Text = 'Include failed tickets that mention RC4'
+    $chkFailures.Location = New-Object System.Drawing.Point(12, $y)
+    $chkFailures.AutoSize = $true
+    $chkFailures.Checked = $InitialFailures
+    $y += 24
+    $chkDns = New-Object System.Windows.Forms.CheckBox
+    $chkDns.Text = 'Resolve client hostnames'
+    $chkDns.Location = New-Object System.Drawing.Point(12, $y)
+    $chkDns.AutoSize = $true
+    $chkDns.Checked = $InitialDns
+    $y += 24
+    $chkAd = New-Object System.Windows.Forms.CheckBox
+    $chkAd.Text = 'Enrich accounts in Active Directory'
+    $chkAd.Location = New-Object System.Drawing.Point(12, $y)
+    $chkAd.AutoSize = $true
+    $chkAd.Checked = $InitialAd
+    $y += 24
+    $chkRodc = New-Object System.Windows.Forms.CheckBox
+    $chkRodc.Text = 'Include RODCs when discovering'
+    $chkRodc.Location = New-Object System.Drawing.Point(12, $y)
+    $chkRodc.AutoSize = $true
+    $y += 32
+
+    $lblOut = New-Object System.Windows.Forms.Label
+    $lblOut.Text = 'Output folder'
+    $lblOut.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $lblOut.Location = New-Object System.Drawing.Point(12, $y)
+    $lblOut.AutoSize = $true
+    $y += 20
+    $outputBox = New-Object System.Windows.Forms.TextBox
+    $outputBox.Location = New-Object System.Drawing.Point(12, $y)
+    $outputBox.Width = 248
+    if ([string]::IsNullOrWhiteSpace($InitialOutput)) {
+        $outputBox.Text = Join-Path (Get-Location).Path 'RC4-Reports'
+    } else {
+        $outputBox.Text = $InitialOutput
+    }
+    $btnBrowse = New-UiButton 'Browse' 76 24
+    $btnBrowse.Location = New-Object System.Drawing.Point(266, $y)
+    $y += 40
+
+    $btnStart = New-UiButton 'Start' 100 34
+    $btnStart.Location = New-Object System.Drawing.Point(12, $y)
+    $btnStop = New-UiButton 'Stop' 90 34
+    $btnStop.Location = New-Object System.Drawing.Point(118, $y)
+    $btnStop.Enabled = $false
+    $btnCred = New-UiButton 'Credential...' 118 34
+    $btnCred.Location = New-Object System.Drawing.Point(214, $y)
+    $y += 44
+    $btnHtml = New-UiButton 'Open HTML' 108 28
+    $btnHtml.Location = New-Object System.Drawing.Point(12, $y)
+    $btnCsv = New-UiButton 'Open CSV' 100 28
+    $btnCsv.Location = New-Object System.Drawing.Point(124, $y)
+    $btnFolder = New-UiButton 'Open folder' 108 28
+    $btnFolder.Location = New-Object System.Drawing.Point(228, $y)
+
+    $left.Controls.AddRange(@(
+        $lblTargets, $targetList, $btnDiscover, $btnAddDc, $btnAddEvtx, $btnRemove,
+        $lblMode, $modeBox, $lblHours, $hoursBox, $lblPoll, $pollBox,
+        $chkOffered, $chkFailures, $chkDns, $chkAd, $chkRodc,
+        $lblOut, $outputBox, $btnBrowse, $btnStart, $btnStop, $btnCred,
+        $btnHtml, $btnCsv, $btnFolder
+    ))
+
+    $right = New-Object System.Windows.Forms.Panel
+    $right.Dock = 'Fill'
+    $searchRow = New-Object System.Windows.Forms.Panel
+    $searchRow.Dock = 'Top'
+    $searchRow.Height = 42
+    $lblSearch = New-Object System.Windows.Forms.Label
+    $lblSearch.Text = 'Search'
+    $lblSearch.Location = New-Object System.Drawing.Point(8, 12)
+    $lblSearch.AutoSize = $true
+    $searchBox = New-Object System.Windows.Forms.TextBox
+    $searchBox.Location = New-Object System.Drawing.Point(64, 8)
+    $searchBox.Width = 360
+    $filterBox = New-Object System.Windows.Forms.ComboBox
+    $filterBox.DropDownStyle = 'DropDownList'
+    $filterBox.Location = New-Object System.Drawing.Point(434, 8)
+    $filterBox.Width = 180
+    [void]$filterBox.Items.AddRange(@('All','RC4 Ticket','RC4 Session','RC4 Offered Only','Failed / RC4 Observed'))
+    $filterBox.SelectedIndex = 0
+    $hint = New-Object System.Windows.Forms.Label
+    $hint.Text = 'Double-click a row for details'
+    $hint.AutoSize = $true
+    $hint.Location = New-Object System.Drawing.Point(628, 12)
+    $hint.ForeColor = [System.Drawing.Color]::FromArgb(92, 102, 119)
+    $searchRow.Controls.AddRange(@($lblSearch, $searchBox, $filterBox, $hint))
+
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $grid.Dock = 'Fill'
+    $grid.ReadOnly = $true
+    $grid.AllowUserToAddRows = $false
+    $grid.AllowUserToDeleteRows = $false
+    $grid.SelectionMode = 'FullRowSelect'
+    $grid.MultiSelect = $false
+    $grid.AutoSizeColumnsMode = 'DisplayedCells'
+    $grid.RowHeadersVisible = $false
+    $grid.BackgroundColor = [System.Drawing.Color]::White
+    $grid.BorderStyle = 'None'
+
+    $table = New-Object System.Data.DataTable 'Findings'
+    foreach ($col in (Get-GridColumnList)) { [void]$table.Columns.Add($col, [string]) }
+    $grid.DataSource = $table
+
+    $right.Controls.Add($grid)
+    $right.Controls.Add($searchRow)
+
+    $form.Controls.Add($right)
+    $form.Controls.Add($left)
+    $form.Controls.Add($footer)
+    $form.Controls.Add($header)
+
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 400
+
+    $script:Ui = @{
+        Form            = $form
+        TargetList      = $targetList
+        Targets         = New-Object 'System.Collections.Generic.List[object]'
+        DiscoverButton  = $btnDiscover
+        AddDcButton     = $btnAddDc
+        AddEvtxButton   = $btnAddEvtx
+        RemoveButton    = $btnRemove
+        ModeBox         = $modeBox
+        HoursBox        = $hoursBox
+        PollBox         = $pollBox
+        ChkOffered      = $chkOffered
+        ChkFailures     = $chkFailures
+        ChkDns          = $chkDns
+        ChkAd           = $chkAd
+        ChkRodc         = $chkRodc
+        OutputBox       = $outputBox
+        StartButton     = $btnStart
+        StopButton      = $btnStop
+        SearchBox       = $searchBox
+        FilterBox       = $filterBox
+        Grid            = $grid
+        Table           = $table
+        LogBox          = $logBox
+        StatusLabel     = $status
+        CountLabel      = $counts
+        Timer           = $timer
+        Running         = $false
+        TicketCount     = 0
+        SessionCount    = 0
+        OfferedCount    = 0
+        CollectorPS     = $null
+        CollectorHandle = $null
+        Credential      = $Credential
+        CsvPath         = ''
+        HtmlPath        = ''
+    }
+
+    $grid.add_CellFormatting({
+        param($sender, $e)
+        if ($e.RowIndex -lt 0) { return }
+        try {
+            $cat = [string]$grid.Rows[$e.RowIndex].Cells['Category'].Value
+            $rgb = Get-CategoryHighlightArgb $cat
+            $e.CellStyle.BackColor = [System.Drawing.Color]::FromArgb($rgb[0], $rgb[1], $rgb[2])
+        } catch { }
+    })
+    $grid.add_CellDoubleClick({
+        param($sender, $e)
+        if ($e.RowIndex -lt 0) { return }
+        Show-FindingDetail $grid.Rows[$e.RowIndex]
+    })
+    $searchBox.add_TextChanged({ Update-UiFilter })
+    $filterBox.add_SelectedIndexChanged({ Update-UiFilter })
+
+    $btnDiscover.add_Click({
+        try {
+            $form.UseWaitCursor = $true
+            [System.Windows.Forms.Application]::DoEvents()
+            $script:Credential = $script:Ui.Credential
+            $found = Get-CollectorTargetList -Discover -IncludeRODC:$script:Ui.ChkRodc.Checked
+            foreach ($t in $found) { Add-UiTarget -Kind $t.Kind -Name $t.Name -Path $t.Path }
+            Add-UiLogLine ("[INFO] Discovered {0} domain controller(s)." -f @($found).Count)
+        } catch {
+            [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'DC discovery failed', 'OK', 'Error') | Out-Null
+            Add-UiLogLine ('[ERROR] ' + $_.Exception.Message)
+        } finally {
+            $form.UseWaitCursor = $false
+        }
+    })
+    $btnAddDc.add_Click({
+        $entered = Read-UiTextInput -Title 'Add domain controller' -Prompt 'Hostname or FQDN:' -Default $env:COMPUTERNAME
+        if (-not [string]::IsNullOrWhiteSpace($entered)) { Add-UiTarget -Kind 'dc' -Name $entered.Trim() }
+    })
+    $btnAddEvtx.add_Click({
+        $dlg = New-Object System.Windows.Forms.OpenFileDialog
+        $dlg.Filter = 'Event logs (*.evtx)|*.evtx|All files (*.*)|*.*'
+        $dlg.Multiselect = $true
+        $dlg.Title = 'Select exported Security EVTX files'
+        if ($dlg.ShowDialog() -eq 'OK') {
+            foreach ($file in $dlg.FileNames) {
+                Add-UiTarget -Kind 'evtx' -Name ([System.IO.Path]::GetFileName($file)) -Path $file
+            }
+        }
+    })
+    $btnRemove.add_Click({
+        $idx = $targetList.SelectedIndex
+        if ($idx -lt 0) { return }
+        $script:Ui.Targets.RemoveAt($idx)
+        $targetList.Items.RemoveAt($idx)
+    })
+    $btnBrowse.add_Click({
+        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dlg.Description = 'Folder for CSV and HTML reports'
+        if ($dlg.ShowDialog() -eq 'OK') { $outputBox.Text = $dlg.SelectedPath }
+    })
+    $btnCred.add_Click({
+        try {
+            $script:Ui.Credential = Get-Credential -Message 'Credential for remote event logs / AD'
+            Add-UiLogLine '[INFO] Alternate credential stored for this session.'
+        } catch {
+            Add-UiLogLine '[WARN] Credential prompt cancelled.'
+        }
+    })
+    $btnStart.add_Click({ Start-UiCollector })
+    $btnStop.add_Click({ Stop-UiCollector })
+    $btnHtml.add_Click({
+        if ($script:Ui.HtmlPath -and (Test-Path -LiteralPath $script:Ui.HtmlPath)) {
+            Start-Process $script:Ui.HtmlPath
+        } else {
+            [System.Windows.Forms.MessageBox]::Show('No HTML report yet. Run a collection first.', 'Open HTML', 'OK', 'Information') | Out-Null
+        }
+    })
+    $btnCsv.add_Click({
+        if ($script:Ui.CsvPath -and (Test-Path -LiteralPath $script:Ui.CsvPath)) {
+            Start-Process $script:Ui.CsvPath
+        } else {
+            [System.Windows.Forms.MessageBox]::Show('No CSV yet. Run a collection first.', 'Open CSV', 'OK', 'Information') | Out-Null
+        }
+    })
+    $btnFolder.add_Click({
+        $path = $outputBox.Text.Trim()
+        if (-not (Test-Path -LiteralPath $path)) { New-Item -Path $path -ItemType Directory -Force | Out-Null }
+        Start-Process $path
+    })
+    $timer.add_Tick({
+        try {
+            Drain-UiCollectorQueue
+            if ($null -ne $script:UiSync -and [bool]$script:UiSync.Done) {
+                Complete-UiCollector
+            }
+        } catch {
+            Add-UiLogLine ('[ERROR] ' + $_.Exception.Message)
+        }
+    })
+    $form.add_FormClosing({
+        param($sender, $e)
+        if ($script:Ui.Running) {
+            Stop-UiCollector
+            Start-Sleep -Milliseconds 200
+            Complete-UiCollector
+        }
+    })
+    $form.add_KeyDown({
+        param($sender, $e)
+        if ($e.KeyCode -eq 'F5') { Start-UiCollector }
+        elseif ($e.KeyCode -eq 'Escape') { Stop-UiCollector }
+    })
+    $form.KeyPreview = $true
+
+    if ($PreselectedDCs) {
+        foreach ($dc in $PreselectedDCs) { Add-UiTarget -Kind 'dc' -Name $dc }
+    }
+    if ($PreselectedEvtx) {
+        foreach ($p in $PreselectedEvtx) {
+            if (Test-Path -LiteralPath $p) {
+                Add-UiTarget -Kind 'evtx' -Name ([System.IO.Path]::GetFileName($p)) -Path ((Resolve-Path -LiteralPath $p).Path)
+            }
+        }
+    }
+    if ($script:Ui.Targets.Count -lt 1) {
+        Add-UiLogLine 'Add a DC (Discover, Add DC, or Add EVTX) then click Start. Collection is read-only.'
+    } else {
+        Add-UiLogLine 'Targets loaded. Review options and click Start.'
+    }
+
+    [void]$form.ShowDialog()
+    try { $timer.Stop(); $timer.Dispose() } catch { }
+    try { $form.Dispose() } catch { }
+}
+
+function Start-InteractiveUi {
+    if (-not (Test-IsStaApartment)) {
+        $procPath = (Get-Process -Id $PID).Path
+        $argList = New-Object System.Collections.Generic.List[string]
+        $exeName = [IO.Path]::GetFileNameWithoutExtension($procPath)
+        if ($exeName -eq 'powershell') { [void]$argList.Add('-STA') }
+        [void]$argList.Add('-NoProfile')
+        [void]$argList.Add('-ExecutionPolicy'); [void]$argList.Add('Bypass')
+        [void]$argList.Add('-File'); [void]$argList.Add($PSCommandPath)
+        [void]$argList.Add('-Gui')
+        if ($DomainControllers) { [void]$argList.Add('-DomainControllers'); foreach ($d in $DomainControllers) { [void]$argList.Add($d) } }
+        if ($EvtxPath) { [void]$argList.Add('-EvtxPath'); foreach ($p in $EvtxPath) { [void]$argList.Add($p) } }
+        [void]$argList.Add('-Mode'); [void]$argList.Add($Mode)
+        [void]$argList.Add('-HoursBack'); [void]$argList.Add([string]$HoursBack)
+        [void]$argList.Add('-PollSeconds'); [void]$argList.Add([string]$PollSeconds)
+        if ($IncludeOffered) { [void]$argList.Add('-IncludeOffered') }
+        if ($IncludeFailures) { [void]$argList.Add('-IncludeFailures') }
+        if ($ResolveHostnames) { [void]$argList.Add('-ResolveHostnames') }
+        if ($EnrichAD) { [void]$argList.Add('-EnrichAD') }
+        if ($OutputFolder) { [void]$argList.Add('-OutputFolder'); [void]$argList.Add($OutputFolder) }
+        Write-Host 'Relaunching in STA apartment for the interactive UI...' -ForegroundColor Gray
+        Start-Process -FilePath $procPath -ArgumentList $argList.ToArray()
+        return
+    }
+    Show-KerberosRc4Gui -PreselectedDCs $DomainControllers -PreselectedEvtx $EvtxPath `
+        -InitialMode $Mode -InitialHours $HoursBack -InitialPoll $PollSeconds `
+        -InitialOutput $OutputFolder -InitialOffered ([bool]$IncludeOffered) `
+        -InitialFailures ([bool]$IncludeFailures) -InitialDns ([bool]$ResolveHostnames) `
+        -InitialAd ([bool]$EnrichAD)
+}
+
+# ---------------------------------------------------------------------------
 # Self-test (no DC / event log required)
 # ---------------------------------------------------------------------------
+
 
 function New-MockKerberosEvent {
     param(
@@ -798,6 +1960,46 @@ function Invoke-KerberosRc4SelfTest {
     Assert-True -Condition ($liveXPath -match 'EventRecordID>12345' -and $liveXPath -notmatch 'TimeCreated') `
         -Name 'Live catch-up query uses EventRecordID and omits TimeCreated to avoid clock-skew gaps'
 
+    Assert-True -Condition (Test-ShouldStartInteractiveUi) `
+        -Name 'No targeting arguments start the interactive UI'
+    Assert-True -Condition (Test-ShouldStartInteractiveUi -GuiPresent) `
+        -Name '-Gui starts the interactive UI even when other switches are absent'
+    Assert-True -Condition (-not (Test-ShouldStartInteractiveUi -DomainControllerList @('DC01'))) `
+        -Name 'Passing -DomainControllers keeps the non-interactive CLI path'
+    Assert-True -Condition (-not (Test-ShouldStartInteractiveUi -SelfTestPresent)) `
+        -Name '-SelfTest does not open the UI'
+    Assert-True -Condition (-not (Test-ShouldStartInteractiveUi -SkipMainPresent -GuiPresent)) `
+        -Name '-SkipMain suppresses the UI so a collector runspace can load functions'
+    Assert-True -Condition (-not (Test-ShouldStartInteractiveUi -NonInteractivePresent)) `
+        -Name '-NonInteractive forces the CLI/error path instead of the UI'
+    Assert-True -Condition ((ConvertTo-DataViewFilter -Query '' -CategoryFilter 'All') -eq '') `
+        -Name 'Empty search and All category produce no DataView filter'
+    $ticketFilter = ConvertTo-DataViewFilter -Query '' -CategoryFilter 'RC4 Ticket'
+    Assert-True -Condition ($ticketFilter -eq "Category LIKE '%RC4 Ticket%'") `
+        -Name 'Ticket category filter matches RC4 Ticket and RC4 Ticket + Session'
+    $searchFilter = ConvertTo-DataViewFilter -Query "O'Brien" -CategoryFilter 'All'
+    Assert-True -Condition ($searchFilter -match "O''Brien" -and $searchFilter -match 'Account LIKE') `
+        -Name 'Search filter ORs across grid columns and escapes quotes'
+    $rgbTicket = Get-CategoryHighlightArgb 'RC4 Ticket + Session'
+    Assert-True -Condition ($rgbTicket[0] -eq 255 -and $rgbTicket[1] -eq 228) `
+        -Name 'RC4 ticket rows use the red highlight'
+    $rgbAes = Get-CategoryHighlightArgb 'Other'
+    Assert-True -Condition ($rgbAes[0] -eq 255 -and $rgbAes[2] -eq 255) `
+        -Name 'Unknown categories stay white'
+    $sta = Test-IsStaApartment
+    Assert-True -Condition ($sta -eq $true -or $sta -eq $false) `
+        -Name 'STA apartment probe returns a boolean without throwing'
+
+    $listRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('RC4Tgt_' + [guid]::NewGuid().ToString('N'))
+    New-Item -Path $listRoot -ItemType Directory -Force | Out-Null
+    $fakeEvtx = Join-Path $listRoot 'Security.evtx'
+    Set-Content -LiteralPath $fakeEvtx -Value 'fake'
+    $targetList = @(Get-CollectorTargetList -DomainControllerList @('DC01','DC01','DC02') -EvtxPathList @($fakeEvtx))
+    Assert-True -Condition ($targetList.Count -eq 3) -Name 'Target list de-duplicates DCs and includes EVTX files'
+    Assert-True -Condition ((@($targetList | Where-Object { $_.Kind -eq 'evtx' }).Count) -eq 1) `
+        -Name 'EVTX entries are tagged separately from domain controllers'
+    Remove-Item -LiteralPath $listRoot -Recurse -Force -ErrorAction SilentlyContinue
+
     Write-Host ''
     Write-Host ('  {0} passed, {1} failed' -f $script:SelfTestPassed, $script:SelfTestFailed) `
         -ForegroundColor $(if ($script:SelfTestFailed) { 'Red' } else { 'Green' })
@@ -813,160 +2015,35 @@ if ($SelfTest) {
     if ($ok) { exit 0 } else { exit 1 }
 }
 
-$script:DoResolveHostnames = [bool]$ResolveHostnames
-$script:DoEnrichAD = [bool]$EnrichAD
-$script:DoIncludeOffered = [bool]$IncludeOffered
-$script:DoIncludeFailures = [bool]$IncludeFailures
-$script:Credential = $Credential
+if ($SkipMain) { return }
+
 $script:DnsTimeoutMs = $DnsTimeoutMs
-$script:Utf8NoBom = New-Object System.Text.UTF8Encoding $false
-$script:DnsCache = @{}
-$script:AdCache = @{}
-$script:Records = New-Object 'System.Collections.Generic.List[object]'
-$script:ReportColumns = @(
-    'WhenLocal','DomainController','EventId','RequestType','Category','Account','AccountDomain',
-    'ClientIP','ClientHostname','ServiceName','ServiceSPNIfLogged','TicketEtype','TicketCipher',
-    'SessionEtype','SessionCipher','AdvertisedEtypes','Status','AccountADObject','ServiceADObject',
-    'AccountSupportedEtypes','ServiceSupportedEtypes','DCSupportedEtypes','AccountAvailableKeys',
-    'ServiceAvailableKeys','DCAvailableKeys','WhenUtc','ClientPort','RecordId'
-)
+$script:Credential = $Credential
 
-$evtxFiles = @()
-if ($EvtxPath) {
-    foreach ($p in $EvtxPath) {
-        if (-not (Test-Path -LiteralPath $p)) { throw "EVTX file not found: $p" }
-        $evtxFiles += (Resolve-Path -LiteralPath $p).Path
-    }
-}
+$startGui = Test-ShouldStartInteractiveUi -SelfTestPresent:$false -SkipMainPresent:$false `
+    -GuiPresent:$Gui -NonInteractivePresent:$NonInteractive `
+    -DomainControllerList $DomainControllers -DiscoverDCsPresent:$DiscoverDCs `
+    -EvtxPathList $EvtxPath
 
-if ($DiscoverDCs) {
-    [void](Import-ActiveDirectoryModule -Reason 'required')
-    $dcSplat = @{ Filter = '*'; ErrorAction = 'Stop' }
-    if ($Credential) { $dcSplat['Credential'] = $Credential }
-    $found = @(Get-ADDomainController @dcSplat)
-    if (-not $IncludeRODCs) {
-        $found = @($found | Where-Object { -not $_.IsReadOnly })
-    }
-    $DomainControllers = @($found | Select-Object -ExpandProperty HostName)
-    if ($DomainControllers.Count -lt 1) {
-        throw 'DC discovery returned no domain controllers. Specify -DomainControllers or add -IncludeRODCs.'
-    }
-}
-
-if ($script:DoEnrichAD) {
-    if (-not (Import-ActiveDirectoryModule -Reason 'AD enrichment')) { $script:DoEnrichAD = $false }
-}
-
-$controllers = @()
-if ($DomainControllers) {
-    $controllers = @($DomainControllers | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
-}
-
-if ($evtxFiles.Count -lt 1 -and $controllers.Count -lt 1) {
-    throw 'Specify -DomainControllers DC01,DC02, -DiscoverDCs, or -EvtxPath.'
-}
-
-if ($evtxFiles.Count -gt 0 -and $Mode -eq 'Live') {
-    Write-Warning 'EVTX files are static. Live polling is skipped for -EvtxPath; running a one-shot historical scan.'
-}
-
-New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
-$stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$script:CsvPath = Join-Path $OutputFolder "KerberosRC4_$stamp.csv"
-$script:HtmlPath = Join-Path $OutputFolder "KerberosRC4_$stamp.html"
-Initialize-CsvFile
-
-$lastId = @{}
-$lastScan = @{}
-$targets = @()
-foreach ($dc in $controllers) {
-    $targets += [pscustomobject]@{ Kind = 'dc'; Name = $dc; Path = '' }
-    $lastId[$dc] = [int64]0
-    $lastScan[$dc] = Get-Date
-}
-foreach ($file in $evtxFiles) {
-    $targets += [pscustomobject]@{ Kind = 'evtx'; Name = [System.IO.Path]::GetFileName($file); Path = $file }
-    $lastId[$file] = [int64]0
-    $lastScan[$file] = Get-Date
-}
-
-$targetNames = @($targets | ForEach-Object { if ($_.Kind -eq 'evtx') { $_.Path } else { $_.Name } })
-Write-Host "Monitoring $($targetNames -join ', ') | Mode=$Mode | CSV=$script:CsvPath" -ForegroundColor Green
-
-$runHistorical = ($Mode -eq 'Historical' -or $Mode -eq 'Both' -or $evtxFiles.Count -gt 0)
-$runLive = ($Mode -eq 'Live' -or $Mode -eq 'Both') -and ($controllers.Count -gt 0) -and ($evtxFiles.Count -lt 1 -or $Mode -ne 'Historical')
-if ($evtxFiles.Count -gt 0 -and $controllers.Count -lt 1) { $runLive = $false }
-
-if ($runHistorical) {
-    $since = (Get-Date).AddHours(-$HoursBack)
-    foreach ($target in $targets) {
-        Write-Host "Historical query $($target.Name) since $since" -ForegroundColor Gray
-        if ($target.Kind -eq 'evtx') {
-            $events = Read-KerberosEvents -Path $target.Path -Since $since -Max $MaxHistoryEventsPerDC
-        } else {
-            $events = Read-KerberosEvents -ComputerName $target.Name -Since $since -Max $MaxHistoryEventsPerDC
-        }
-        if ($events.Count -ge $MaxHistoryEventsPerDC) {
-            Write-Warning "Hit -MaxHistoryEventsPerDC ($MaxHistoryEventsPerDC) on $($target.Name). Older matching events in the window were not read (Get-WinEvent returns the newest N). Increase the limit if needed."
-        }
-        foreach ($ev in ($events | Sort-Object RecordId)) {
-            $key = if ($target.Kind -eq 'evtx') { $target.Path } else { $target.Name }
-            if ([int64]$ev.RecordId -gt $lastId[$key]) { $lastId[$key] = [int64]$ev.RecordId }
-            $row = Convert-KerberosEvent $ev $target.Name
-            if ($null -ne $row) { Save-Finding $row }
-        }
-    }
-} elseif ($runLive) {
-    foreach ($dc in $controllers) {
-        $lastId[$dc] = Get-NewestSecurityRecordId $dc
-        $lastScan[$dc] = Get-Date
-    }
-}
-
-Write-HtmlReport
-Write-Host "HTML report: $script:HtmlPath" -ForegroundColor Green
-
-if (-not $runLive) {
-    Write-Host "Completed: $($script:Records.Count) findings."
+if ($startGui) {
+    Start-InteractiveUi
     return
 }
 
-Write-Host 'Live monitoring. Press Ctrl+C to stop. HTML refreshes after each polling cycle.' -ForegroundColor Green
-try {
-    while ($true) {
-        Start-Sleep -Seconds $PollSeconds
-        foreach ($dc in $controllers) {
-            try {
-                if (Test-SecurityLogWrapped -ComputerName $dc -Cursor $lastId[$dc]) {
-                    Write-Warning "Security log on $dc was cleared or wrapped. Resetting RecordId cursor."
-                    $lastId[$dc] = [int64]0
-                }
-                $since = $lastScan[$dc].AddSeconds(-30)
-                $useRecordIdOnly = ($lastId[$dc] -gt 0)
-                $caughtUp = $false
-                while (-not $caughtUp) {
-                    $page = Read-KerberosEvents -ComputerName $dc -Since $since -Max $LivePageSize -AfterRecordId $lastId[$dc] -Oldest -RecordIdOnly:$useRecordIdOnly
-                    if ($page.Count -lt 1) { $caughtUp = $true; break }
-                    foreach ($ev in $page) {
-                        $rid = [int64]$ev.RecordId
-                        if ($rid -le $lastId[$dc]) { continue }
-                        $lastId[$dc] = $rid
-                        $row = Convert-KerberosEvent $ev $dc
-                        if ($null -ne $row) { Save-Finding $row }
-                    }
-                    if ($page.Count -lt $LivePageSize) { $caughtUp = $true }
-                    $useRecordIdOnly = ($lastId[$dc] -gt 0)
-                }
-                $lastScan[$dc] = Get-Date
-            } catch {
-                Write-Warning "Live poll failed for ${dc}: $($_.Exception.Message)"
-            }
-        }
-        try { Write-HtmlReport } catch {
-            Write-Warning "HTML refresh failed: $($_.Exception.Message)"
-        }
-    }
-} finally {
-    try { Write-HtmlReport } catch { }
-    Write-Host "Stopped. Findings: $($script:Records.Count). CSV=$script:CsvPath" -ForegroundColor Green
+Initialize-CollectorSession -OutputFolderPath $OutputFolder `
+    -ResolveHostnamesFlag ([bool]$ResolveHostnames) `
+    -EnrichADFlag ([bool]$EnrichAD) `
+    -IncludeOfferedFlag ([bool]$IncludeOffered) `
+    -IncludeFailuresFlag ([bool]$IncludeFailures) `
+    -DnsTimeout $DnsTimeoutMs `
+    -CredentialObject $Credential `
+    -Quiet $false
+
+$targets = @(Get-CollectorTargetList -DomainControllerList $DomainControllers -EvtxPathList $EvtxPath -Discover:$DiscoverDCs -IncludeRODC:$IncludeRODCs)
+if ($targets.Count -lt 1) {
+    throw 'Specify -DomainControllers DC01,DC02, -DiscoverDCs, or -EvtxPath. Or run without arguments for the interactive UI.'
 }
+
+Invoke-KerberosCollection -Targets $targets -Mode $Mode -HoursBack $HoursBack -PollSeconds $PollSeconds `
+    -MaxHistoryEventsPerDC $MaxHistoryEventsPerDC -LivePageSize $LivePageSize
+
