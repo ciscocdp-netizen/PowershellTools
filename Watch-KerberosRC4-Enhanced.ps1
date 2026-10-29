@@ -107,10 +107,9 @@
     looked hung on a busy DC. It now pages newest-first (default 1,000) with a log line
     after each page and checks Stop between pages.
   - Historical parse walked every 4768/4769 (mostly AES) and ran ToXml/XmlDocument on
-    each. EventData is parsed with a compiled regex. The collector pages 4768/4769 by
-    EventID and time only — an EventData RC4 etype XPath over RPC returned a tiny
-    subset (for example 14 RC4-session rows) no matter how large Hours was, and it
-    stayed on even when Include AES was checked. RC4 vs AES is decided after parse.
+    each. EventData is read from EventLogRecord.Properties (classic 4768/4769 layout)
+    and ToXml is only a fallback. AES confirmation rows skip DNS/AD. CSV is buffered
+    per page. The collector pages 4768/4769 by EventID and time only.
 #>
 [CmdletBinding()]
 param(
@@ -130,7 +129,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential,
     [string]$OutputFolder = (Join-Path (Get-Location).Path 'RC4-Reports'),
     [ValidateRange(10,1000000)][int]$MaxHistoryEventsPerDC = 100000,
-    [ValidateRange(50,20000)][int]$HistoryPageSize = 1000,
+    [ValidateRange(50,20000)][int]$HistoryPageSize = 2000,
     [ValidateRange(100,100000)][int]$LivePageSize = 20000,
     [ValidateRange(250,15000)][int]$DnsTimeoutMs = 750,
     [switch]$SkipAuditCheck,
@@ -151,6 +150,7 @@ $script:ReportedAccessDenied = @{}
 $script:LoggedRc4Filter = $false
 $script:TicketEtypeTally = @{}
 $script:EventDataRegex = $null
+$script:CsvBuffer = $null
 $script:DnsTimeoutMs = 750
 $script:DoIncludeFailures = $false
 $script:DoIncludeAes = $false
@@ -208,11 +208,28 @@ function Get-EtypeCode {
     $value = $Etype.Trim()
     if ($value -eq '-' -or $value -eq 'N/A') { return $null }
 
+    switch ($value) {
+        '0x17' { return 0x17 }
+        '0x12' { return 0x12 }
+        '0x11' { return 0x11 }
+        '0x18' { return 0x18 }
+        '0x13' { return 0x13 }
+        '0x14' { return 0x14 }
+        '23'   { return 23 }
+        '24'   { return 24 }
+        '18'   { return 18 }
+        '17'   { return 17 }
+        '0x00000017' { return 0x17 }
+        '0x00000018' { return 0x18 }
+        '0x00000012' { return 0x12 }
+        '0x00000011' { return 0x11 }
+    }
+
     if ($value -match '^(?i)0x([0-9a-f]+)$') {
         try { return [Convert]::ToInt32($Matches[1], 16) } catch { return $null }
     }
 
-    $parsed = 0
+    [int]$parsed = 0
     if ([int]::TryParse($value, [ref]$parsed)) { return $parsed }
 
     # Names from ClientAdvertizedEncryptionTypes / ticket fields. Check EXP first.
@@ -400,6 +417,86 @@ function ConvertTo-EventArray {
     return ,([object[]]@($Value))
 }
 
+function Get-KerberosPropertyNames {
+    param([int]$EventId)
+    if ($EventId -eq 4768) {
+        return @(
+            'TargetUserName','TargetDomainName','TargetSid','ServiceName','ServiceSid',
+            'TicketOptions','Status','TicketEncryptionType','PreAuthType','IpAddress','IpPort',
+            'CertIssuerName','CertSerialNumber','CertThumbprint',
+            'SessionKeyEncryptionType','PreAuthEncryptionType',
+            'AccountSupportedEncryptionTypes','AccountAvailableKeys',
+            'ServiceSupportedEncryptionTypes','ServiceAvailableKeys',
+            'DCSupportedEncryptionTypes','DCAvailableKeys',
+            'ClientAdvertizedEncryptionTypes'
+        )
+    }
+    if ($EventId -eq 4769) {
+        return @(
+            'TargetUserName','TargetDomainName','ServiceName','ServiceSid','TicketOptions',
+            'TicketEncryptionType','IpAddress','IpPort','Status','LogonGuid','TransmittedServices',
+            'SessionKeyEncryptionType',
+            'AccountSupportedEncryptionTypes','AccountAvailableKeys',
+            'ServiceSupportedEncryptionTypes','ServiceAvailableKeys',
+            'DCSupportedEncryptionTypes','DCAvailableKeys',
+            'ClientAdvertizedEncryptionTypes'
+        )
+    }
+    return @()
+}
+
+function Get-EventPropertyValue {
+    param($Properties, [int]$Index)
+    if ($null -eq $Properties -or $Index -lt 0) { return '' }
+    try {
+        if ($Index -ge [int]$Properties.Count) { return '' }
+        return [string]$Properties[$Index].Value
+    } catch {
+        return ''
+    }
+}
+
+function Get-EventFieldsFromProperties {
+    param($Event)
+    if ($null -eq $Event) { return $null }
+    $props = $null
+    try { $props = $Event.Properties } catch { return $null }
+    if ($null -eq $props) { return $null }
+    $count = 0
+    try { $count = [int]$props.Count } catch { return $null }
+    if ($count -lt 1) { return $null }
+
+    $eventId = 0
+    try { $eventId = [int]$Event.Id } catch { return $null }
+    $names = Get-KerberosPropertyNames $eventId
+    if ($names.Count -lt 1) { return $null }
+
+    $ticketIndex = if ($eventId -eq 4769) { 5 } elseif ($eventId -eq 4768) { 7 } else { -1 }
+    if ($ticketIndex -ge $count) { return $null }
+
+    $result = @{}
+    $limit = $count
+    if ($limit -gt $names.Count) { $limit = $names.Count }
+    for ($i = 0; $i -lt $limit; $i++) {
+        $result[$names[$i]] = Get-EventPropertyValue $props $i
+    }
+    if (-not $result.ContainsKey('TicketEncryptionType') -or [string]::IsNullOrWhiteSpace([string]$result['TicketEncryptionType'])) {
+        return $null
+    }
+    if ($count -gt $names.Count) {
+        for ($i = $names.Count; $i -lt $count; $i++) {
+            $extra = Get-EventPropertyValue $props $i
+            if ([string]::IsNullOrWhiteSpace($extra)) { continue }
+            if ((Test-IsRC4Etype $extra) -and -not $result.ContainsKey('SessionKeyEncryptionType')) {
+                $result['SessionKeyEncryptionType'] = $extra
+            } elseif ($extra -match '(?i)RC4|AES256|AES128' -and -not $result.ContainsKey('ClientAdvertizedEncryptionTypes')) {
+                $result['ClientAdvertizedEncryptionTypes'] = $extra
+            }
+        }
+    }
+    return $result
+}
+
 function Get-EventXmlText {
     param($Event)
     if ($null -eq $Event) { return '' }
@@ -408,10 +505,14 @@ function Get-EventXmlText {
     if ($null -ne $xmlProp -and -not [string]::IsNullOrWhiteSpace([string]$xmlProp.Value)) {
         return [string]$xmlProp.Value
     }
-    return [string]$Event.ToXml()
+    try {
+        return [string]$Event.ToXml()
+    } catch {
+        return ''
+    }
 }
 
-function Get-EventFields {
+function Get-EventFieldsFromXml {
     param($Event)
     $result = @{}
     $xmlText = Get-EventXmlText $Event
@@ -446,6 +547,20 @@ function Get-EventFields {
     return $result
 }
 
+function Get-EventFields {
+    param($Event)
+    $xmlProp = $null
+    try { $xmlProp = $Event.PSObject.Properties['XmlText'] } catch { }
+    if ($null -ne $xmlProp -and -not [string]::IsNullOrWhiteSpace([string]$xmlProp.Value)) {
+        return (Get-EventFieldsFromXml $Event)
+    }
+    $fromProps = Get-EventFieldsFromProperties $Event
+    if ($null -ne $fromProps -and $fromProps.Count -gt 0) {
+        return $fromProps
+    }
+    return (Get-EventFieldsFromXml $Event)
+}
+
 function Test-EventMayBeInteresting {
     param($Event)
     if ($script:DoIncludeAes) { return $true }
@@ -463,18 +578,17 @@ function Test-EventMayBeInteresting {
     $ticketIndex = -1
     $portIndex = -1
     if ($eventId -eq 4769) { $ticketIndex = 5; $portIndex = 7 }
-    elseif ($eventId -eq 4768) { $ticketIndex = 6; $portIndex = 9 }
+    elseif ($eventId -eq 4768) { $ticketIndex = 7; $portIndex = 10 }
 
     if ($ticketIndex -ge 0 -and $ticketIndex -lt $count) {
-        if (Test-IsRC4Etype ([string]$props[$ticketIndex].Value)) { return $true }
+        if (Test-IsRC4Etype (Get-EventPropertyValue $props $ticketIndex)) { return $true }
     }
 
     for ($i = 0; $i -lt $count; $i++) {
         if ($i -eq $portIndex) { continue }
-        $value = ''
-        try { $value = [string]$props[$i].Value } catch { continue }
+        $value = Get-EventPropertyValue $props $i
         if ([string]::IsNullOrWhiteSpace($value)) { continue }
-        if ($value -match '^(?i)0x0*(17|18)$') { return $true }
+        if (Test-IsRC4Etype $value) { return $true }
         if ($script:DoIncludeOffered -and $value -match '(?i)RC4') { return $true }
     }
     return $false
@@ -624,13 +738,20 @@ function Convert-KerberosEvent {
     $row.Category = $category
     $row.Account = $account
     $row.AccountDomain = $domain
-    $row.AccountADObject = (Find-ADIdentity $account)
     $row.ClientIP = $ip
     $row.ClientPort = (Get-NamedField $data @('IpPort','ClientPort'))
-    $row.ClientHostname = (Resolve-ClientHostname $ip)
     $row.ServiceName = $service
     $row.ServiceSPNIfLogged = $spn
-    $row.ServiceADObject = (Find-ADIdentity $service)
+    $needEnrich = ($category -like 'RC4*') -or ($category -like 'Failed*')
+    if ($needEnrich) {
+        $row.ClientHostname = (Resolve-ClientHostname $ip)
+        $row.AccountADObject = (Find-ADIdentity $account)
+        $row.ServiceADObject = (Find-ADIdentity $service)
+    } else {
+        $row.ClientHostname = ''
+        $row.AccountADObject = ''
+        $row.ServiceADObject = ''
+    }
     $row.TicketEtype = $ticket
     $row.TicketCipher = (Get-EncryptionName $ticket)
     $row.SessionEtype = $session
@@ -649,6 +770,17 @@ function Convert-KerberosEvent {
 function Initialize-CsvFile {
     $header = ($script:ReportColumns | ForEach-Object { ConvertTo-CsvField $_ }) -join ','
     [System.IO.File]::WriteAllText($script:CsvPath, $header + [Environment]::NewLine, $script:Utf8NoBom)
+    $script:CsvBuffer = New-Object System.Text.StringBuilder
+}
+
+function Flush-CsvBuffer {
+    if ($null -eq $script:CsvBuffer -or $script:CsvBuffer.Length -lt 1) { return }
+    if ([string]::IsNullOrWhiteSpace($script:CsvPath)) {
+        [void]$script:CsvBuffer.Clear()
+        return
+    }
+    [System.IO.File]::AppendAllText($script:CsvPath, $script:CsvBuffer.ToString(), $script:Utf8NoBom)
+    [void]$script:CsvBuffer.Clear()
 }
 
 function Save-Finding {
@@ -656,12 +788,15 @@ function Save-Finding {
     if ($null -eq $Row) { return }
     [void]$script:Records.Add($Row)
     if (-not [string]::IsNullOrWhiteSpace($script:CsvPath)) {
+        if ($null -eq $script:CsvBuffer) { $script:CsvBuffer = New-Object System.Text.StringBuilder }
         $line = ($script:ReportColumns | ForEach-Object {
             $prop = $Row.PSObject.Properties[$_]
             $val = if ($null -ne $prop) { $prop.Value } else { '' }
             ConvertTo-CsvField $val
         }) -join ','
-        [System.IO.File]::AppendAllText($script:CsvPath, $line + [Environment]::NewLine, $script:Utf8NoBom)
+        [void]$script:CsvBuffer.Append($line)
+        [void]$script:CsvBuffer.Append([Environment]::NewLine)
+        if ($script:CsvBuffer.Length -ge 65536) { Flush-CsvBuffer }
     }
 
     if (-not $script:QuietHost) {
@@ -683,6 +818,7 @@ function Save-Finding {
 }
 
 function Write-HtmlReport {
+    Flush-CsvBuffer
     $total = $script:Records.Count
     $ticketCount = 0
     $sessionCount = 0
@@ -910,6 +1046,7 @@ function Initialize-CollectorSession {
     $script:LoggedRc4Filter = $false
     $script:TicketEtypeTally = @{}
     $script:EventDataRegex = $null
+    $script:CsvBuffer = New-Object System.Text.StringBuilder
     $script:Utf8NoBom = New-Object System.Text.UTF8Encoding $false
     $script:DnsCache = @{}
     $script:AdCache = @{}
@@ -1302,9 +1439,9 @@ function Invoke-KerberosCollection {
                 }
             }
             Write-CollectorStatus "Options: Hours=$HoursBack IncludeAes=$($script:DoIncludeAes) IncludeOffered=$($script:DoIncludeOffered) IncludeFailures=$($script:DoIncludeFailures). Querying every 4768/4769 since $since (EventID + time only)."
-            Write-CollectorStatus "Paging newest matching events first (page size $HistoryPageSize). The log updates after each page; Stop is checked between pages."
+            Write-CollectorStatus "Paging newest matching events first (page size $HistoryPageSize). EventData is read from event Properties (ToXml only if needed). The log updates after each page; Stop is checked between pages."
             if ($script:DoIncludeAes) {
-                Write-CollectorStatus 'Include AES is on: AES tickets are listed as well as RC4. This is noisier and can take longer on a busy DC.'
+                Write-CollectorStatus 'Include AES is on: AES tickets are listed as well as RC4. AES rows skip DNS/AD; uncheck Include AES for the fastest RC4-only grid.'
             } else {
                 Write-CollectorStatus 'Include AES is off: every 4768/4769 in the window is still read, but AES tickets are counted and skipped. Check Include AES tickets to list them.'
             }
@@ -1343,12 +1480,10 @@ function Invoke-KerberosCollection {
                         $skipped++
                     }
                 }
+                Flush-CsvBuffer
                 $beforeId = $minId
                 $totalRead += $pageCount
                 Write-CollectorStatus "Page $pageNum from $($target.Name): $pageCount event(s), $saved finding(s), $skipped AES/other skipped. Total read $totalRead."
-                if (($pageNum % 5) -eq 0) {
-                    try { Write-HtmlReport } catch { }
-                }
                 if ($pageCount -lt $take) { break }
             }
 
@@ -1428,6 +1563,7 @@ function Invoke-KerberosCollection {
                         if ($pageCount -lt $LivePageSize) { $caughtUp = $true }
                         $useRecordIdOnly = ($lastId[$dc] -gt 0)
                     }
+                    Flush-CsvBuffer
                     $lastScan[$dc] = Get-Date
                 } catch {
                     Write-CollectorStatus "Live poll failed for ${dc}: $($_.Exception.Message)" 'WARN'
@@ -2766,6 +2902,43 @@ function New-MockKerberosEvent {
     }
 }
 
+function New-MockPropertyEvent {
+    param(
+        [int]$Id = 4769,
+        [string]$Ticket = '0x12',
+        [string]$Session = '0x12',
+        [string]$Status = '0x0',
+        [string]$Account = 'jsmith@CONTOSO.LOCAL',
+        [string]$Domain = 'CONTOSO.LOCAL',
+        [string]$Service = 'HOST/dc01.contoso.local',
+        [string]$Ip = '::ffff:10.10.10.25'
+    )
+    $values = @()
+    if ($Id -eq 4768) {
+        $values = @(
+            $Account, $Domain, 'S-1-5-21-1-2-3-1001', $Service, 'S-1-5-21-1-2-3-502',
+            '0x40810010', $Status, $Ticket, '15', $Ip, '54321',
+            '-', '-', '-', $Session
+        )
+    } else {
+        $values = @(
+            $Account, $Domain, $Service, 'S-1-5-21-1-2-3-502', '0x40810010',
+            $Ticket, $Ip, '54321', $Status, '{00000000-0000-0000-0000-000000000000}', '-',
+            $Session
+        )
+    }
+    $props = New-Object System.Collections.ArrayList
+    foreach ($value in $values) {
+        [void]$props.Add([pscustomobject]@{ Value = $value })
+    }
+    return [pscustomobject]@{
+        Id          = $Id
+        RecordId    = 9
+        TimeCreated = [datetime]'2026-10-28T12:00:00'
+        Properties  = $props
+    }
+}
+
 function Invoke-KerberosRc4SelfTest {
     $script:SelfTestPassed = 0
     $script:SelfTestFailed = 0
@@ -2777,6 +2950,7 @@ function Invoke-KerberosRc4SelfTest {
     $script:LoggedRc4Filter = $false
     $script:TicketEtypeTally = @{}
     $script:EventDataRegex = $null
+    $script:CsvBuffer = New-Object System.Text.StringBuilder
     $script:Credential = $null
     $script:DnsTimeoutMs = 750
     $script:DnsCache = @{}
@@ -2883,6 +3057,22 @@ function Invoke-KerberosRc4SelfTest {
     Assert-True -Condition ($null -eq $aesOnly) -Name 'AES ticket + AES session is ignored by default'
     Assert-True -Condition ((Get-TicketEtypeTallyText) -match 'AES256-SHA96=1') `
         -Name 'Skipped AES tickets are counted in the etype tally so 0 findings still shows what was read'
+
+    $script:TicketEtypeTally = @{}
+    $propAes = New-MockPropertyEvent -Ticket '0x12' -Session '0x12'
+    $propAesFields = Get-EventFields $propAes
+    Assert-True -Condition ($propAesFields['TicketEncryptionType'] -eq '0x12' -and $propAesFields['SessionKeyEncryptionType'] -eq '0x12') `
+        -Name 'EventLogRecord.Properties maps 4769 TicketEncryptionType at index 5 without ToXml'
+    Assert-True -Condition ($null -eq (Convert-KerberosEvent $propAes 'DC01')) `
+        -Name 'AES 4769 from Properties is skipped without IncludeAes'
+    $propRc4 = Convert-KerberosEvent (New-MockPropertyEvent -Ticket '0x17' -Session '0x12') 'DC01'
+    Assert-True -Condition ($null -ne $propRc4 -and $propRc4.Category -eq 'RC4 Ticket' -and $propRc4.TicketCipher -eq 'RC4-HMAC') `
+        -Name 'RC4 4769 from Properties classifies as RC4 Ticket'
+    $propAs = Convert-KerberosEvent (New-MockPropertyEvent -Id 4768 -Ticket '0x17' -Session '0x12') 'DC01'
+    Assert-True -Condition ($null -ne $propAs -and $propAs.RequestType -eq 'AS' -and $propAs.Category -eq 'RC4 Ticket') `
+        -Name 'RC4 4768 from Properties uses TicketEncryptionType at index 7'
+    Assert-True -Condition (-not (Test-EventMayBeInteresting $propAes)) `
+        -Name 'AES Properties events are not interesting when IncludeAes is off'
     $script:DoIncludeAes = $true
     $aesKept = Convert-KerberosEvent (New-MockKerberosEvent -Ticket '0x12' -Session '0x12') 'DC01'
     Assert-True -Condition ($null -ne $aesKept -and $aesKept.Category -eq 'AES Ticket') `
