@@ -31,6 +31,11 @@
   .\Watch-KerberosRC4-Enhanced.ps1 -DomainControllers DC01,DC02 -Mode Historical -HoursBack 48 -OutputFolder C:\Temp\RC4
 
 .EXAMPLE
+  .\Watch-KerberosRC4-Enhanced.ps1 -DomainControllers DC01 -Mode Live -LiveMinutes 30 -OutputFolder C:\Temp\RC4
+
+  Watch live for 30 minutes, then stop and leave CSV/HTML in C:\Temp\RC4. 0 minutes (the default) runs until Ctrl+C or Stop.
+
+.EXAMPLE
   .\Watch-KerberosRC4-Enhanced.ps1 -EvtxPath C:\Temp\Security.evtx -Mode Historical
 
 .EXAMPLE
@@ -81,6 +86,7 @@ param(
     [ValidateSet('Historical','Live','Both')][string]$Mode = 'Both',
     [ValidateRange(1,720)][int]$HoursBack = 24,
     [ValidateRange(2,3600)][int]$PollSeconds = 5,
+    [ValidateRange(0,10080)][int]$LiveMinutes = 0,
     [switch]$IncludeOffered,
     [switch]$IncludeFailures,
     [switch]$ResolveHostnames,
@@ -572,6 +578,43 @@ function Test-IsStaApartment {
     return ([System.Threading.Thread]::CurrentThread.GetApartmentState().ToString() -eq 'STA')
 }
 
+function Get-LiveWatchDeadline {
+    param(
+        [int]$LiveMinutes,
+        [datetime]$From = (Get-Date)
+    )
+    if ($LiveMinutes -le 0) { return $null }
+    return $From.AddMinutes($LiveMinutes)
+}
+
+function Test-IsLiveWatchExpired {
+    param(
+        $Deadline,
+        [datetime]$Now = (Get-Date)
+    )
+    if ($null -eq $Deadline) { return $false }
+    return ($Now -ge [datetime]$Deadline)
+}
+
+function Get-LiveWatchStatusText {
+    param(
+        $Deadline,
+        [int]$FindingCount = 0,
+        [int]$LiveMinutes = 0,
+        [datetime]$Now = (Get-Date)
+    )
+    if ($null -eq $Deadline) {
+        return "Live monitoring until stopped | findings $FindingCount"
+    }
+    $remaining = [datetime]$Deadline - $Now
+    if ($remaining.TotalSeconds -le 0) {
+        return "Live watch of $LiveMinutes minute(s) finished | findings $FindingCount"
+    }
+    $mins = [int][Math]::Floor($remaining.TotalMinutes)
+    $secs = [int][Math]::Floor($remaining.TotalSeconds % 60)
+    return ('Live watch {0}m {1:D2}s remaining | findings {2}' -f $mins, $secs, $FindingCount)
+}
+
 function Test-IsCollectorCancelRequested {
     if ($script:CancelRequested) { return $true }
     if ($null -ne $script:UiSync) {
@@ -693,6 +736,7 @@ function Invoke-KerberosCollection {
         [ValidateSet('Historical','Live','Both')][string]$Mode = 'Both',
         [int]$HoursBack = 24,
         [int]$PollSeconds = 5,
+        [int]$LiveMinutes = 0,
         [int]$MaxHistoryEventsPerDC = 100000,
         [int]$LivePageSize = 20000
     )
@@ -763,17 +807,23 @@ function Invoke-KerberosCollection {
         return
     }
 
-    Write-CollectorStatus 'Live monitoring. Stop from the UI or press Ctrl+C in the console.' 'SUCCESS'
+    $liveDeadline = Get-LiveWatchDeadline -LiveMinutes $LiveMinutes
+    if ($LiveMinutes -gt 0) {
+        Write-CollectorStatus "Live monitoring for $LiveMinutes minute(s), then reports save to $(Split-Path -Parent $script:CsvPath). Stop early from the UI or with Ctrl+C." 'SUCCESS'
+    } else {
+        Write-CollectorStatus 'Live monitoring until stopped. Reports save continuously; Stop / Ctrl+C writes a final HTML snapshot.' 'SUCCESS'
+    }
     try {
-        while (-not (Test-IsCollectorCancelRequested)) {
+        while (-not (Test-IsCollectorCancelRequested) -and -not (Test-IsLiveWatchExpired $liveDeadline)) {
+            Write-CollectorStatus (Get-LiveWatchStatusText -Deadline $liveDeadline -FindingCount $script:Records.Count -LiveMinutes $LiveMinutes)
             $waitMs = [Math]::Max(500, $PollSeconds * 1000)
             $slept = 0
-            while ($slept -lt $waitMs -and -not (Test-IsCollectorCancelRequested)) {
+            while ($slept -lt $waitMs -and -not (Test-IsCollectorCancelRequested) -and -not (Test-IsLiveWatchExpired $liveDeadline)) {
                 $slice = [Math]::Min(500, $waitMs - $slept)
                 Start-Sleep -Milliseconds $slice
                 $slept += $slice
             }
-            if (Test-IsCollectorCancelRequested) { break }
+            if (Test-IsCollectorCancelRequested -or (Test-IsLiveWatchExpired $liveDeadline)) { break }
             foreach ($dc in $controllers) {
                 if (Test-IsCollectorCancelRequested) { break }
                 try {
@@ -808,7 +858,11 @@ function Invoke-KerberosCollection {
         }
     } finally {
         try { Write-HtmlReport } catch { }
-        Write-CollectorStatus "Stopped. Findings: $($script:Records.Count). CSV=$script:CsvPath" 'SUCCESS'
+        if (Test-IsLiveWatchExpired $liveDeadline) {
+            Write-CollectorStatus "Live watch of $LiveMinutes minute(s) finished. Saved $($script:Records.Count) finding(s) to $script:CsvPath and $script:HtmlPath" 'SUCCESS'
+        } else {
+            Write-CollectorStatus "Stopped. Findings: $($script:Records.Count). CSV=$script:CsvPath" 'SUCCESS'
+        }
     }
 }
 
@@ -1175,12 +1229,16 @@ function Start-UiCollector {
 
     $hours = 24
     $poll = 5
+    $liveMins = 0
     [void][int]::TryParse($script:Ui.HoursBox.Text, [ref]$hours)
     [void][int]::TryParse($script:Ui.PollBox.Text, [ref]$poll)
+    [void][int]::TryParse($script:Ui.LiveBox.Text, [ref]$liveMins)
     if ($hours -lt 1) { $hours = 1 }
     if ($hours -gt 720) { $hours = 720 }
     if ($poll -lt 2) { $poll = 2 }
     if ($poll -gt 3600) { $poll = 3600 }
+    if ($liveMins -lt 0) { $liveMins = 0 }
+    if ($liveMins -gt 10080) { $liveMins = 10080 }
 
     $mode = [string]$script:Ui.ModeBox.SelectedItem
     if ([string]::IsNullOrWhiteSpace($mode)) { $mode = 'Both' }
@@ -1221,6 +1279,7 @@ function Start-UiCollector {
         Mode                  = $mode
         HoursBack             = $hours
         PollSeconds           = $poll
+        LiveMinutes           = $liveMins
         MaxHistoryEventsPerDC = $MaxHistoryEventsPerDC
         LivePageSize          = $LivePageSize
         Targets               = @($targets | ForEach-Object {
@@ -1255,6 +1314,7 @@ function Start-UiCollector {
             $Sync.HtmlPath = $script:HtmlPath
             Invoke-KerberosCollection -Targets $Settings.Targets -Mode $Settings.Mode `
                 -HoursBack $Settings.HoursBack -PollSeconds $Settings.PollSeconds `
+                -LiveMinutes $Settings.LiveMinutes `
                 -MaxHistoryEventsPerDC $Settings.MaxHistoryEventsPerDC -LivePageSize $Settings.LivePageSize
         } catch {
             $Sync.Error = $_.Exception.Message
@@ -1280,6 +1340,7 @@ function Show-KerberosRc4Gui {
         [string]$InitialMode = 'Both',
         [int]$InitialHours = 24,
         [int]$InitialPoll = 5,
+        [int]$InitialLiveMinutes = 0,
         [string]$InitialOutput = '',
         [bool]$InitialOffered = $false,
         [bool]$InitialFailures = $false,
@@ -1358,9 +1419,9 @@ function Show-KerberosRc4Gui {
     $y += 22
     $targetList = New-Object System.Windows.Forms.CheckedListBox
     $targetList.Location = New-Object System.Drawing.Point(12, $y)
-    $targetList.Size = New-Object System.Drawing.Size(332, 150)
+    $targetList.Size = New-Object System.Drawing.Size(332, 128)
     $targetList.CheckOnClick = $true
-    $y += 158
+    $y += 136
     $btnDiscover = New-UiButton 'Discover DCs' 100
     $btnDiscover.Location = New-Object System.Drawing.Point(12, $y)
     $btnAddDc = New-UiButton 'Add DC' 72 28
@@ -1399,7 +1460,22 @@ function Show-KerberosRc4Gui {
     $pollBox.Text = [string]$InitialPoll
     $pollBox.Location = New-Object System.Drawing.Point(244, $y)
     $pollBox.Width = 50
-    $y += 36
+    $y += 32
+    $lblLive = New-Object System.Windows.Forms.Label
+    $lblLive.Text = 'Live minutes (0 = until Stop)'
+    $lblLive.Location = New-Object System.Drawing.Point(12, $y)
+    $lblLive.AutoSize = $true
+    $y += 18
+    $liveBox = New-Object System.Windows.Forms.TextBox
+    $liveBox.Text = [string]$InitialLiveMinutes
+    $liveBox.Location = New-Object System.Drawing.Point(12, $y)
+    $liveBox.Width = 50
+    $lblLiveHint = New-Object System.Windows.Forms.Label
+    $lblLiveHint.Text = 'Then save CSV/HTML to the output folder'
+    $lblLiveHint.ForeColor = [System.Drawing.Color]::FromArgb(92, 102, 119)
+    $lblLiveHint.Location = New-Object System.Drawing.Point(70, ($y + 3))
+    $lblLiveHint.AutoSize = $true
+    $y += 32
 
     $chkOffered = New-Object System.Windows.Forms.CheckBox
     $chkOffered.Text = 'Include offered RC4 (not proof of use)'
@@ -1467,6 +1543,7 @@ function Show-KerberosRc4Gui {
     $left.Controls.AddRange(@(
         $lblTargets, $targetList, $btnDiscover, $btnAddDc, $btnAddEvtx, $btnRemove,
         $lblMode, $modeBox, $lblHours, $hoursBox, $lblPoll, $pollBox,
+        $lblLive, $liveBox, $lblLiveHint,
         $chkOffered, $chkFailures, $chkDns, $chkAd, $chkRodc,
         $lblOut, $outputBox, $btnBrowse, $btnStart, $btnStop, $btnCred,
         $btnHtml, $btnCsv, $btnFolder
@@ -1535,6 +1612,7 @@ function Show-KerberosRc4Gui {
         ModeBox         = $modeBox
         HoursBox        = $hoursBox
         PollBox         = $pollBox
+        LiveBox         = $liveBox
         ChkOffered      = $chkOffered
         ChkFailures     = $chkFailures
         ChkDns          = $chkDns
@@ -1710,6 +1788,7 @@ function Start-InteractiveUi {
         [void]$argList.Add('-Mode'); [void]$argList.Add($Mode)
         [void]$argList.Add('-HoursBack'); [void]$argList.Add([string]$HoursBack)
         [void]$argList.Add('-PollSeconds'); [void]$argList.Add([string]$PollSeconds)
+        [void]$argList.Add('-LiveMinutes'); [void]$argList.Add([string]$LiveMinutes)
         if ($IncludeOffered) { [void]$argList.Add('-IncludeOffered') }
         if ($IncludeFailures) { [void]$argList.Add('-IncludeFailures') }
         if ($ResolveHostnames) { [void]$argList.Add('-ResolveHostnames') }
@@ -1721,6 +1800,7 @@ function Start-InteractiveUi {
     }
     Show-KerberosRc4Gui -PreselectedDCs $DomainControllers -PreselectedEvtx $EvtxPath `
         -InitialMode $Mode -InitialHours $HoursBack -InitialPoll $PollSeconds `
+        -InitialLiveMinutes $LiveMinutes `
         -InitialOutput $OutputFolder -InitialOffered ([bool]$IncludeOffered) `
         -InitialFailures ([bool]$IncludeFailures) -InitialDns ([bool]$ResolveHostnames) `
         -InitialAd ([bool]$EnrichAD)
@@ -2000,6 +2080,22 @@ function Invoke-KerberosRc4SelfTest {
         -Name 'EVTX entries are tagged separately from domain controllers'
     Remove-Item -LiteralPath $listRoot -Recurse -Force -ErrorAction SilentlyContinue
 
+    $from = [datetime]'2026-10-28T12:00:00'
+    Assert-True -Condition ($null -eq (Get-LiveWatchDeadline -LiveMinutes 0 -From $from)) `
+        -Name 'LiveMinutes 0 means no deadline (run until stopped)'
+    $deadline = Get-LiveWatchDeadline -LiveMinutes 30 -From $from
+    Assert-True -Condition ($deadline -eq $from.AddMinutes(30)) `
+        -Name 'LiveMinutes 30 sets a deadline 30 minutes after start'
+    Assert-True -Condition (-not (Test-IsLiveWatchExpired -Deadline $deadline -Now $from.AddMinutes(29))) `
+        -Name 'Watch is not expired before the deadline'
+    Assert-True -Condition (Test-IsLiveWatchExpired -Deadline $deadline -Now $from.AddMinutes(30)) `
+        -Name 'Watch expires at the deadline'
+    Assert-True -Condition (-not (Test-IsLiveWatchExpired -Deadline $null -Now $from)) `
+        -Name 'A null deadline never expires'
+    $statusText = Get-LiveWatchStatusText -Deadline $deadline -FindingCount 4 -LiveMinutes 30 -Now $from.AddMinutes(10)
+    Assert-True -Condition ($statusText -match '20m 00s remaining' -and $statusText -match 'findings 4') `
+        -Name 'Status text shows remaining live-watch time and finding count'
+
     Write-Host ''
     Write-Host ('  {0} passed, {1} failed' -f $script:SelfTestPassed, $script:SelfTestFailed) `
         -ForegroundColor $(if ($script:SelfTestFailed) { 'Red' } else { 'Green' })
@@ -2045,5 +2141,6 @@ if ($targets.Count -lt 1) {
 }
 
 Invoke-KerberosCollection -Targets $targets -Mode $Mode -HoursBack $HoursBack -PollSeconds $PollSeconds `
+    -LiveMinutes $LiveMinutes `
     -MaxHistoryEventsPerDC $MaxHistoryEventsPerDC -LivePageSize $LivePageSize
 
