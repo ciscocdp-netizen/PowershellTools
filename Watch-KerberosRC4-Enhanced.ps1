@@ -99,6 +99,9 @@
     miss — then claimed Kerberos auditing was off. Id is now Object[], empty hashtable
     results always fall through to XPath and per-ID queries, and the probe distinguishes
     a readable Security log with no 4768/4769 from an access-denied or wrapped window.
+  - Historical collection issued one Get-WinEvent for up to 100,000 events, so the GUI
+    looked hung on a busy DC. It now pages newest-first (default 1,000) with a log line
+    after each page and checks Stop between pages.
 #>
 [CmdletBinding()]
 param(
@@ -118,6 +121,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential,
     [string]$OutputFolder = (Join-Path (Get-Location).Path 'RC4-Reports'),
     [ValidateRange(10,1000000)][int]$MaxHistoryEventsPerDC = 100000,
+    [ValidateRange(50,20000)][int]$HistoryPageSize = 1000,
     [ValidateRange(100,100000)][int]$LivePageSize = 20000,
     [ValidateRange(250,15000)][int]$DnsTimeoutMs = 750,
     [switch]$SkipAuditCheck,
@@ -1143,6 +1147,7 @@ function Invoke-KerberosCollection {
         [int]$PollSeconds = 5,
         [int]$LiveMinutes = 0,
         [int]$MaxHistoryEventsPerDC = 100000,
+        [int]$HistoryPageSize = 1000,
         [int]$LivePageSize = 20000,
         [switch]$SkipAuditCheck,
         [switch]$RequireAuditing
@@ -1179,6 +1184,7 @@ function Invoke-KerberosCollection {
 
     if ($runHistorical) {
         $since = (Get-Date).AddHours(-$HoursBack)
+        if ($HistoryPageSize -lt 50) { $HistoryPageSize = 50 }
         foreach ($target in $Targets) {
             if (Test-IsCollectorCancelRequested) { break }
             Write-CollectorStatus "Historical query $($target.Name) since $since"
@@ -1189,38 +1195,57 @@ function Invoke-KerberosCollection {
                     Write-CollectorStatus "Reading the Security log on $($target.Name) over Event Log RPC (not this computer)."
                 }
             }
-            if ($target.Kind -eq 'evtx') {
-                $events = ConvertTo-EventArray (Read-KerberosEvents -Path $target.Path -Since $since -Max $MaxHistoryEventsPerDC)
-            } else {
-                $events = ConvertTo-EventArray (Read-KerberosEvents -ComputerName $target.Name -Since $since -Max $MaxHistoryEventsPerDC)
-            }
-            $eventCount = Get-CollectionCount $events
-            Write-CollectorStatus "Read $eventCount Kerberos 4768/4769 event(s) from $($target.Name)."
-            if ($eventCount -ge $MaxHistoryEventsPerDC) {
-                Write-CollectorStatus "Hit MaxHistoryEventsPerDC ($MaxHistoryEventsPerDC) on $($target.Name). Older matching events in the window were not read." 'WARN'
-            }
-            $n = 0
+            Write-CollectorStatus "Paging newest 4768/4769 events first (page size $HistoryPageSize). The log updates after each page; Stop is checked between pages."
+
+            $beforeId = [int64]-1
+            $pageNum = 0
+            $totalRead = 0
             $saved = 0
             $skipped = 0
-            foreach ($ev in ($events | Sort-Object RecordId)) {
-                if (Test-IsCollectorCancelRequested) { break }
-                if ([int64]$ev.RecordId -gt $lastId[$target.Key]) { $lastId[$target.Key] = [int64]$ev.RecordId }
-                $row = Convert-KerberosEvent $ev $target.Name
-                if ($null -ne $row) {
-                    Save-Finding $row
-                    $saved++
+            while ($totalRead -lt $MaxHistoryEventsPerDC -and -not (Test-IsCollectorCancelRequested)) {
+                $pageNum++
+                $take = $HistoryPageSize
+                $remaining = $MaxHistoryEventsPerDC - $totalRead
+                if ($take -gt $remaining) { $take = $remaining }
+                Write-CollectorStatus "Fetching page $pageNum (up to $take events) from $($target.Name)..."
+                if ($target.Kind -eq 'evtx') {
+                    $page = ConvertTo-EventArray (Read-KerberosEvents -Path $target.Path -Since $since -Max $take -BeforeRecordId $beforeId)
                 } else {
-                    $skipped++
+                    $page = ConvertTo-EventArray (Read-KerberosEvents -ComputerName $target.Name -Since $since -Max $take -BeforeRecordId $beforeId)
                 }
-                $n++
-                if (($n % 200) -eq 0) {
-                    Write-CollectorStatus "Parsed $n events from $($target.Name)..."
+                $pageCount = Get-CollectionCount $page
+                if ($pageCount -lt 1) { break }
+
+                $minId = [int64]::MaxValue
+                foreach ($ev in $page) {
+                    if (Test-IsCollectorCancelRequested) { break }
+                    $rid = [int64]$ev.RecordId
+                    if ($rid -lt $minId) { $minId = $rid }
+                    if ($rid -gt $lastId[$target.Key]) { $lastId[$target.Key] = $rid }
+                    $row = Convert-KerberosEvent $ev $target.Name
+                    if ($null -ne $row) {
+                        Save-Finding $row
+                        $saved++
+                    } else {
+                        $skipped++
+                    }
                 }
+                $beforeId = $minId
+                $totalRead += $pageCount
+                Write-CollectorStatus "Page $pageNum from $($target.Name): $pageCount event(s), $saved finding(s), $skipped AES/other skipped. Total read $totalRead."
+                if (($pageNum % 5) -eq 0) {
+                    try { Write-HtmlReport } catch { }
+                }
+                if ($pageCount -lt $take) { break }
             }
-            if ($eventCount -lt 1) {
+
+            if ($totalRead -ge $MaxHistoryEventsPerDC) {
+                Write-CollectorStatus "Hit MaxHistoryEventsPerDC ($MaxHistoryEventsPerDC) on $($target.Name). Older matching events in the window were not read." 'WARN'
+            }
+            if ($totalRead -lt 1) {
                 Write-CollectorStatus (Get-HistoricalEmptyHint -ComputerName $target.Name -Path $target.Path -Since $since) 'WARN'
             } else {
-                Write-CollectorStatus "Parsed $n event(s) from $($target.Name): $saved finding(s) saved, $skipped AES/other skipped."
+                Write-CollectorStatus "Finished $($target.Name): $totalRead Kerberos event(s) read, $saved finding(s) saved, $skipped AES/other skipped."
                 if ($saved -lt 1) {
                     Write-CollectorStatus "No RC4 tickets in this window. That is expected when the DC issues AES. Check Include AES tickets (or Include offered RC4) to list the events that were read." 'WARN'
                 }
@@ -1306,12 +1331,16 @@ function New-KerberosFilterXPath {
     param(
         [datetime]$Since,
         [int64]$AfterRecordId = -1,
+        [int64]$BeforeRecordId = -1,
         [switch]$RecordIdOnly,
         [switch]$NoTimeFilter
     )
     $conditions = '(EventID=4768 or EventID=4769)'
     if ($AfterRecordId -ge 0) {
         $conditions += " and EventRecordID>$AfterRecordId"
+    }
+    if ($BeforeRecordId -gt 0) {
+        $conditions += " and EventRecordID<$BeforeRecordId"
     }
     if (-not $RecordIdOnly -and -not $NoTimeFilter) {
         $utc = $Since.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
@@ -1439,50 +1468,18 @@ function Read-KerberosEvents {
         [datetime]$Since,
         [int]$Max,
         [int64]$AfterRecordId = -1,
+        [int64]$BeforeRecordId = -1,
         [switch]$Oldest,
         [switch]$RecordIdOnly
     )
-    $xpath = New-KerberosFilterXPath -Since $Since -AfterRecordId $AfterRecordId -RecordIdOnly:$RecordIdOnly
-    $useRecordId = ($AfterRecordId -ge 0 -or $RecordIdOnly)
+    $xpath = New-KerberosFilterXPath -Since $Since -AfterRecordId $AfterRecordId -BeforeRecordId $BeforeRecordId -RecordIdOnly:$RecordIdOnly
     try {
-        if ($useRecordId) {
-            $splat = Get-WinEventSplat -ComputerName $ComputerName -Path $Path -FilterXPath $xpath -MaxEvents $Max -Oldest:$Oldest
-            $ridHit = Invoke-KerberosWinEventAttempt -Splat $splat -Label 'XPath/RecordId'
-            return ,(ConvertTo-EventArray $ridHit.Events)
+        $splat = Get-WinEventSplat -ComputerName $ComputerName -Path $Path -FilterXPath $xpath -MaxEvents $Max -Oldest:$Oldest
+        $hit = Invoke-KerberosWinEventAttempt -Splat $splat -Label 'XPath'
+        if ($hit.Failed) {
+            Write-CollectorStatus "XPath query failed ($($hit.Message))" 'WARN'
         }
-
-        $hashSplat = Get-WinEventSplat -ComputerName $ComputerName -Path $Path `
-            -FilterHashtable (New-KerberosFilterHashtable -Since $Since -Path $Path) `
-            -MaxEvents $Max -Oldest:$Oldest
-        $hashHit = Invoke-KerberosWinEventAttempt -Splat $hashSplat -Label 'FilterHashtable'
-        if ($hashHit.Count -gt 0) { return ,(ConvertTo-EventArray $hashHit.Events) }
-        if ($hashHit.Failed) {
-            Write-CollectorStatus "FilterHashtable query failed ($($hashHit.Message)); trying XPath." 'WARN'
-        }
-
-        $xpathSplat = Get-WinEventSplat -ComputerName $ComputerName -Path $Path -FilterXPath $xpath -MaxEvents $Max -Oldest:$Oldest
-        $xpathHit = Invoke-KerberosWinEventAttempt -Splat $xpathSplat -Label 'XPath'
-        if ($xpathHit.Count -gt 0) {
-            Write-CollectorStatus "FilterHashtable found 0 events; XPath found $($xpathHit.Count) 4768/4769 event(s)."
-            return ,(ConvertTo-EventArray $xpathHit.Events)
-        }
-        if ($xpathHit.Failed) {
-            Write-CollectorStatus "XPath query failed ($($xpathHit.Message)); trying per-event-ID queries." 'WARN'
-        }
-
-        $merged = New-Object 'System.Collections.Generic.List[object]'
-        foreach ($id in @(4768, 4769)) {
-            $one = New-KerberosFilterHashtable -Since $Since -Path $Path
-            $one['Id'] = $id
-            $oneSplat = Get-WinEventSplat -ComputerName $ComputerName -Path $Path -FilterHashtable $one -MaxEvents $Max -Oldest:$Oldest
-            $oneHit = Invoke-KerberosWinEventAttempt -Splat $oneSplat -Label "FilterHashtable Id=$id"
-            foreach ($ev in (ConvertTo-EventArray $oneHit.Events)) { [void]$merged.Add($ev) }
-        }
-        if ($merged.Count -gt 0) {
-            Write-CollectorStatus "Per-event-ID queries found $($merged.Count) 4768/4769 event(s)."
-            return ,$merged.ToArray()
-        }
-        return ,([object[]]@())
+        return ,(ConvertTo-EventArray $hit.Events)
     } catch {
         if (Test-IsNoMatchingEventsError $_) { return ,([object[]]@()) }
         $target = if ($Path) { $Path } else { $ComputerName }
@@ -1970,6 +1967,7 @@ function Start-UiCollector {
         PollSeconds           = $poll
         LiveMinutes           = $liveMins
         MaxHistoryEventsPerDC = $MaxHistoryEventsPerDC
+        HistoryPageSize       = $HistoryPageSize
         LivePageSize          = $LivePageSize
         SkipAuditCheck        = $true
         RequireAuditing       = $false
@@ -2007,7 +2005,7 @@ function Start-UiCollector {
             Invoke-KerberosCollection -Targets $Settings.Targets -Mode $Settings.Mode `
                 -HoursBack $Settings.HoursBack -PollSeconds $Settings.PollSeconds `
                 -LiveMinutes $Settings.LiveMinutes `
-                -MaxHistoryEventsPerDC $Settings.MaxHistoryEventsPerDC -LivePageSize $Settings.LivePageSize `
+                -MaxHistoryEventsPerDC $Settings.MaxHistoryEventsPerDC -HistoryPageSize $Settings.HistoryPageSize -LivePageSize $Settings.LivePageSize `
                 -SkipAuditCheck:$Settings.SkipAuditCheck -RequireAuditing:$Settings.RequireAuditing
         } catch {
             $Sync.Error = $_.Exception.Message
@@ -2549,6 +2547,7 @@ function Start-InteractiveUi {
         [void]$argList.Add('-HoursBack'); [void]$argList.Add([string]$HoursBack)
         [void]$argList.Add('-PollSeconds'); [void]$argList.Add([string]$PollSeconds)
         [void]$argList.Add('-LiveMinutes'); [void]$argList.Add([string]$LiveMinutes)
+        [void]$argList.Add('-HistoryPageSize'); [void]$argList.Add([string]$HistoryPageSize)
         if ($IncludeOffered) { [void]$argList.Add('-IncludeOffered') }
         if ($IncludeAes) { [void]$argList.Add('-IncludeAes') }
         if ($IncludeFailures) { [void]$argList.Add('-IncludeFailures') }
@@ -2812,6 +2811,9 @@ function Invoke-KerberosRc4SelfTest {
     $liveXPath = ([xml]$qLive).QueryList.Query.Select.InnerText
     Assert-True -Condition ($liveXPath -match 'EventRecordID>12345' -and $liveXPath -notmatch 'TimeCreated') `
         -Name 'Live catch-up query uses EventRecordID and omits TimeCreated to avoid clock-skew gaps'
+    $xpathBefore = New-KerberosFilterXPath -Since ([datetime]'2026-10-28T00:00:00Z') -BeforeRecordId 99999
+    Assert-True -Condition ($xpathBefore -match 'EventRecordID<99999' -and $xpathBefore -match 'TimeCreated') `
+        -Name 'Historical pages walk backward with EventRecordID less than the previous page'
     $hash = New-KerberosFilterHashtable -Since ([datetime]'2026-10-28T00:00:00')
     $hashIds = @($hash.Id)
     Assert-True -Condition ($hash.LogName -eq 'Security' -and ($hashIds -contains 4768) -and ($hashIds -contains 4769) -and $hash.ContainsKey('StartTime')) `
@@ -3009,6 +3011,6 @@ if ($targets.Count -lt 1) {
 
 Invoke-KerberosCollection -Targets $targets -Mode $Mode -HoursBack $HoursBack -PollSeconds $PollSeconds `
     -LiveMinutes $LiveMinutes `
-    -MaxHistoryEventsPerDC $MaxHistoryEventsPerDC -LivePageSize $LivePageSize `
+    -MaxHistoryEventsPerDC $MaxHistoryEventsPerDC -HistoryPageSize $HistoryPageSize -LivePageSize $LivePageSize `
     -SkipAuditCheck:$SkipAuditCheck -RequireAuditing:$RequireAuditing
 
