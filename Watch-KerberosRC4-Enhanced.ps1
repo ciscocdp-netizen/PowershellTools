@@ -102,6 +102,10 @@
   - Historical collection issued one Get-WinEvent for up to 100,000 events, so the GUI
     looked hung on a busy DC. It now pages newest-first (default 1,000) with a log line
     after each page and checks Stop between pages.
+  - Historical parse walked every 4768/4769 (mostly AES) and ran ToXml/XmlDocument on
+    each. RC4-only runs now filter TicketEncryptionType/SessionKeyEncryptionType in the
+    XPath query, skip ToXml unless Properties look like RC4, and parse EventData with a
+    compiled regex instead of an XmlDocument.
 #>
 [CmdletBinding()]
 param(
@@ -139,6 +143,8 @@ $script:CsvPath = ''
 $script:HtmlPath = ''
 $script:CancelRequested = $false
 $script:ReportedAccessDenied = @{}
+$script:LoggedRc4Filter = $false
+$script:EventDataRegex = $null
 $script:DnsTimeoutMs = 750
 $script:DoIncludeFailures = $false
 $script:DoIncludeAes = $false
@@ -383,6 +389,18 @@ function Get-EventFields {
     $xmlText = Get-EventXmlText $Event
     if ([string]::IsNullOrWhiteSpace($xmlText)) { return $result }
 
+    if ($null -eq $script:EventDataRegex) {
+        $regexOpts = [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::Compiled
+        $script:EventDataRegex = New-Object System.Text.RegularExpressions.Regex -ArgumentList @('<Data Name="([^"]+)">([^<]*)</Data>', $regexOpts)
+    }
+    $matchList = $script:EventDataRegex.Matches($xmlText)
+    if ($matchList.Count -gt 0) {
+        foreach ($m in $matchList) {
+            $result[$m.Groups[1].Value] = $m.Groups[2].Value
+        }
+        return $result
+    }
+
     $doc = New-Object System.Xml.XmlDocument
     $doc.XmlResolver = $null
     try { $doc.LoadXml($xmlText) } catch { return $result }
@@ -398,6 +416,40 @@ function Get-EventFields {
         $result[$name] = [string]$node.InnerText
     }
     return $result
+}
+
+function Test-EventMayBeInteresting {
+    param($Event)
+    if ($script:DoIncludeAes) { return $true }
+    if ($null -eq $Event) { return $false }
+
+    $props = $null
+    try { $props = $Event.Properties } catch { return $true }
+    if ($null -eq $props) { return $true }
+    $count = 0
+    try { $count = [int]$props.Count } catch { return $true }
+    if ($count -lt 1) { return $true }
+
+    $eventId = 0
+    try { $eventId = [int]$Event.Id } catch { }
+    $ticketIndex = -1
+    $portIndex = -1
+    if ($eventId -eq 4769) { $ticketIndex = 5; $portIndex = 7 }
+    elseif ($eventId -eq 4768) { $ticketIndex = 6; $portIndex = 9 }
+
+    if ($ticketIndex -ge 0 -and $ticketIndex -lt $count) {
+        if (Test-IsRC4Etype ([string]$props[$ticketIndex].Value)) { return $true }
+    }
+
+    for ($i = 0; $i -lt $count; $i++) {
+        if ($i -eq $portIndex) { continue }
+        $value = ''
+        try { $value = [string]$props[$i].Value } catch { continue }
+        if ([string]::IsNullOrWhiteSpace($value)) { continue }
+        if ($value -match '^(?i)0x0*(17|18)$') { return $true }
+        if ($script:DoIncludeOffered -and $value -match '(?i)RC4') { return $true }
+    }
+    return $false
 }
 
 function Resolve-ClientHostname {
@@ -472,7 +524,10 @@ function New-EmptyFinding {
 
 function Convert-KerberosEvent {
     param($Event, [string]$SourceName)
-    try { $data = Get-EventFields $Event } catch {
+    try {
+        if (-not (Test-EventMayBeInteresting $Event)) { return $null }
+        $data = Get-EventFields $Event
+    } catch {
         Write-Warning "Unable to parse event on ${SourceName}: $($_.Exception.Message)"
         return $null
     }
@@ -804,6 +859,8 @@ function Initialize-CollectorSession {
     $script:QuietHost = $Quiet
     $script:CancelRequested = $false
     $script:ReportedAccessDenied = @{}
+    $script:LoggedRc4Filter = $false
+    $script:EventDataRegex = $null
     $script:Utf8NoBom = New-Object System.Text.UTF8Encoding $false
     $script:DnsCache = @{}
     $script:AdCache = @{}
@@ -1195,7 +1252,11 @@ function Invoke-KerberosCollection {
                     Write-CollectorStatus "Reading the Security log on $($target.Name) over Event Log RPC (not this computer)."
                 }
             }
-            Write-CollectorStatus "Paging newest 4768/4769 events first (page size $HistoryPageSize). The log updates after each page; Stop is checked between pages."
+            $queryRc4Only = (-not $script:DoIncludeAes -and -not $script:DoIncludeOffered)
+            Write-CollectorStatus "Paging newest matching events first (page size $HistoryPageSize). The log updates after each page; Stop is checked between pages."
+            if ($queryRc4Only) {
+                Write-CollectorStatus 'RC4-only mode: AES tickets are filtered in the query (much faster). Enable Include AES tickets only if you need them listed.'
+            }
 
             $beforeId = [int64]-1
             $pageNum = 0
@@ -1209,9 +1270,9 @@ function Invoke-KerberosCollection {
                 if ($take -gt $remaining) { $take = $remaining }
                 Write-CollectorStatus "Fetching page $pageNum (up to $take events) from $($target.Name)..."
                 if ($target.Kind -eq 'evtx') {
-                    $page = ConvertTo-EventArray (Read-KerberosEvents -Path $target.Path -Since $since -Max $take -BeforeRecordId $beforeId)
+                    $page = ConvertTo-EventArray (Read-KerberosEvents -Path $target.Path -Since $since -Max $take -BeforeRecordId $beforeId -Rc4Only:$queryRc4Only)
                 } else {
-                    $page = ConvertTo-EventArray (Read-KerberosEvents -ComputerName $target.Name -Since $since -Max $take -BeforeRecordId $beforeId)
+                    $page = ConvertTo-EventArray (Read-KerberosEvents -ComputerName $target.Name -Since $since -Max $take -BeforeRecordId $beforeId -Rc4Only:$queryRc4Only)
                 }
                 $pageCount = Get-CollectionCount $page
                 if ($pageCount -lt 1) { break }
@@ -1295,7 +1356,7 @@ function Invoke-KerberosCollection {
                     $useRecordIdOnly = ($lastId[$dc] -gt 0)
                     $caughtUp = $false
                     while (-not $caughtUp -and -not (Test-IsCollectorCancelRequested)) {
-                        $page = ConvertTo-EventArray (Read-KerberosEvents -ComputerName $dc -Since $since -Max $LivePageSize -AfterRecordId $lastId[$dc] -Oldest -RecordIdOnly:$useRecordIdOnly)
+                        $page = ConvertTo-EventArray (Read-KerberosEvents -ComputerName $dc -Since $since -Max $LivePageSize -AfterRecordId $lastId[$dc] -Oldest -RecordIdOnly:$useRecordIdOnly -Rc4Only:(-not $script:DoIncludeAes -and -not $script:DoIncludeOffered))
                         $pageCount = Get-CollectionCount $page
                         if ($pageCount -lt 1) { $caughtUp = $true; break }
                         foreach ($ev in $page) {
@@ -1327,13 +1388,25 @@ function Invoke-KerberosCollection {
     }
 }
 
+function Get-Rc4EventDataPredicate {
+    $values = @('0x17','0x18','0x00000017','0x00000018','23','24')
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($field in @('TicketEncryptionType','SessionKeyEncryptionType')) {
+        foreach ($value in $values) {
+            [void]$parts.Add("Data[@Name='$field']='$value'")
+        }
+    }
+    return '(' + ($parts -join ' or ') + ')'
+}
+
 function New-KerberosFilterXPath {
     param(
         [datetime]$Since,
         [int64]$AfterRecordId = -1,
         [int64]$BeforeRecordId = -1,
         [switch]$RecordIdOnly,
-        [switch]$NoTimeFilter
+        [switch]$NoTimeFilter,
+        [switch]$Rc4Only
     )
     $conditions = '(EventID=4768 or EventID=4769)'
     if ($AfterRecordId -ge 0) {
@@ -1346,7 +1419,11 @@ function New-KerberosFilterXPath {
         $utc = $Since.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
         $conditions += " and TimeCreated[@SystemTime>='$utc']"
     }
-    return "*[System[$conditions]]"
+    $path = "*[System[$conditions]]"
+    if ($Rc4Only) {
+        $path = "*[System[$conditions] and EventData[$(Get-Rc4EventDataPredicate)]]"
+    }
+    return $path
 }
 
 function New-KerberosQueryXml {
@@ -1470,12 +1547,23 @@ function Read-KerberosEvents {
         [int64]$AfterRecordId = -1,
         [int64]$BeforeRecordId = -1,
         [switch]$Oldest,
-        [switch]$RecordIdOnly
+        [switch]$RecordIdOnly,
+        [switch]$Rc4Only
     )
-    $xpath = New-KerberosFilterXPath -Since $Since -AfterRecordId $AfterRecordId -BeforeRecordId $BeforeRecordId -RecordIdOnly:$RecordIdOnly
+    $xpath = New-KerberosFilterXPath -Since $Since -AfterRecordId $AfterRecordId -BeforeRecordId $BeforeRecordId -RecordIdOnly:$RecordIdOnly -Rc4Only:$Rc4Only
     try {
+        if ($Rc4Only -and -not $script:LoggedRc4Filter) {
+            $script:LoggedRc4Filter = $true
+            Write-CollectorStatus 'Using an EventData RC4 etype filter so AES tickets are skipped by the log engine. Uncheck Include AES / Include offered RC4 for this fast path.'
+        }
         $splat = Get-WinEventSplat -ComputerName $ComputerName -Path $Path -FilterXPath $xpath -MaxEvents $Max -Oldest:$Oldest
         $hit = Invoke-KerberosWinEventAttempt -Splat $splat -Label 'XPath'
+        if ($hit.Failed -and $Rc4Only) {
+            Write-CollectorStatus "RC4 EventData filter was not accepted ($($hit.Message)); reading all 4768/4769 and skipping AES in memory." 'WARN'
+            $xpath = New-KerberosFilterXPath -Since $Since -AfterRecordId $AfterRecordId -BeforeRecordId $BeforeRecordId -RecordIdOnly:$RecordIdOnly
+            $splat = Get-WinEventSplat -ComputerName $ComputerName -Path $Path -FilterXPath $xpath -MaxEvents $Max -Oldest:$Oldest
+            $hit = Invoke-KerberosWinEventAttempt -Splat $splat -Label 'XPath'
+        }
         if ($hit.Failed) {
             Write-CollectorStatus "XPath query failed ($($hit.Message))" 'WARN'
         }
@@ -2629,6 +2717,8 @@ function Invoke-KerberosRc4SelfTest {
     $script:DoIncludeOffered = $false
     $script:DoIncludeAes = $false
     $script:DoIncludeFailures = $false
+    $script:LoggedRc4Filter = $false
+    $script:EventDataRegex = $null
     $script:Credential = $null
     $script:DnsTimeoutMs = 750
     $script:DnsCache = @{}
@@ -2814,6 +2904,18 @@ function Invoke-KerberosRc4SelfTest {
     $xpathBefore = New-KerberosFilterXPath -Since ([datetime]'2026-10-28T00:00:00Z') -BeforeRecordId 99999
     Assert-True -Condition ($xpathBefore -match 'EventRecordID<99999' -and $xpathBefore -match 'TimeCreated') `
         -Name 'Historical pages walk backward with EventRecordID less than the previous page'
+    $xpathRc4 = New-KerberosFilterXPath -Since ([datetime]'2026-10-28T00:00:00Z') -Rc4Only
+    Assert-True -Condition ($xpathRc4 -match 'TicketEncryptionType' -and $xpathRc4 -match '0x17' -and $xpathRc4 -match 'SessionKeyEncryptionType' -and $xpathRc4 -match 'EventData') `
+        -Name 'RC4-only XPath filters TicketEncryptionType/SessionKeyEncryptionType in EventData'
+    $script:DoIncludeAes = $false
+    $script:DoIncludeOffered = $false
+    $plainMock = New-MockKerberosEvent -Ticket '0x12' -Session '0x12'
+    Assert-True -Condition (Test-EventMayBeInteresting $plainMock) `
+        -Name 'Events without a Properties collection still go through full field parsing'
+    $script:DoIncludeAes = $true
+    Assert-True -Condition (Test-EventMayBeInteresting $plainMock) `
+        -Name 'IncludeAes keeps every Kerberos event eligible for full parsing'
+    $script:DoIncludeAes = $false
     $hash = New-KerberosFilterHashtable -Since ([datetime]'2026-10-28T00:00:00')
     $hashIds = @($hash.Id)
     Assert-True -Condition ($hash.LogName -eq 'Security' -and ($hashIds -contains 4768) -and ($hashIds -contains 4769) -and $hash.ContainsKey('StartTime')) `
