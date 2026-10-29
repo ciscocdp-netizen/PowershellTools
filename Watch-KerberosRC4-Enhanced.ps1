@@ -22,8 +22,11 @@
 
   Actual RC4 uses etype 0x17 (23, RC4-HMAC) or 0x18 (24, RC4-HMAC-EXP).
   "RC4 Offered Only" is NOT evidence of RC4 ticket issuance. Almost every modern Windows
-  client still advertises RC4 even when the issued ticket is AES. Use -IncludeAes (or the
-  UI checkbox) to list AES tickets so you can confirm historical 4768/4769 events were read.
+  client still advertises RC4 even when the issued ticket is AES. A completed scan with
+  0 findings means no RC4 tickets/sessions were issued in the window — typical on AES-only
+  DCs. Use -IncludeAes (or the UI checkbox) to list AES tickets so you can confirm
+  historical 4768/4769 events were read. The log prints a ticket-etype histogram when
+  events were read but none were RC4.
 
 .EXAMPLE
   .\Watch-KerberosRC4-Enhanced.ps1 -DomainControllers LAP-MSASDC03.mclaren.org -Mode Both -HoursBack 24
@@ -144,6 +147,7 @@ $script:HtmlPath = ''
 $script:CancelRequested = $false
 $script:ReportedAccessDenied = @{}
 $script:LoggedRc4Filter = $false
+$script:TicketEtypeTally = @{}
 $script:EventDataRegex = $null
 $script:DnsTimeoutMs = 750
 $script:DoIncludeFailures = $false
@@ -522,10 +526,29 @@ function New-EmptyFinding {
     return [pscustomobject]$row
 }
 
+function Add-TicketEtypeTally {
+    param([string]$Etype)
+    if ($null -eq $script:TicketEtypeTally) { $script:TicketEtypeTally = @{} }
+    $name = Get-EncryptionName $Etype
+    if ($script:TicketEtypeTally.ContainsKey($name)) {
+        $script:TicketEtypeTally[$name] = [int]$script:TicketEtypeTally[$name] + 1
+    } else {
+        $script:TicketEtypeTally[$name] = 1
+    }
+}
+
+function Get-TicketEtypeTallyText {
+    if ($null -eq $script:TicketEtypeTally -or $script:TicketEtypeTally.Count -lt 1) { return '' }
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($entry in ($script:TicketEtypeTally.GetEnumerator() | Sort-Object Name)) {
+        [void]$parts.Add(('{0}={1}' -f $entry.Name, $entry.Value))
+    }
+    return ($parts -join ', ')
+}
+
 function Convert-KerberosEvent {
     param($Event, [string]$SourceName)
     try {
-        if (-not (Test-EventMayBeInteresting $Event)) { return $null }
         $data = Get-EventFields $Event
     } catch {
         Write-Warning "Unable to parse event on ${SourceName}: $($_.Exception.Message)"
@@ -533,6 +556,7 @@ function Convert-KerberosEvent {
     }
 
     $ticket  = Get-NamedField $data @('TicketEncryptionType')
+    Add-TicketEtypeTally $ticket
     $session = Get-NamedField $data @('SessionKeyEncryptionType','SessionEncryptionType')
     $offered = Get-NamedField $data @('ClientAdvertizedEncryptionTypes','ClientAdvertisedEncryptionTypes','AdvertizedEtypes','AdvertisedEtypes')
     $status  = Get-NamedField $data @('Status')
@@ -860,6 +884,7 @@ function Initialize-CollectorSession {
     $script:CancelRequested = $false
     $script:ReportedAccessDenied = @{}
     $script:LoggedRc4Filter = $false
+    $script:TicketEtypeTally = @{}
     $script:EventDataRegex = $null
     $script:Utf8NoBom = New-Object System.Text.UTF8Encoding $false
     $script:DnsCache = @{}
@@ -1263,6 +1288,7 @@ function Invoke-KerberosCollection {
             $totalRead = 0
             $saved = 0
             $skipped = 0
+            $script:TicketEtypeTally = @{}
             while ($totalRead -lt $MaxHistoryEventsPerDC -and -not (Test-IsCollectorCancelRequested)) {
                 $pageNum++
                 $take = $HistoryPageSize
@@ -1303,12 +1329,17 @@ function Invoke-KerberosCollection {
             if ($totalRead -ge $MaxHistoryEventsPerDC) {
                 Write-CollectorStatus "Hit MaxHistoryEventsPerDC ($MaxHistoryEventsPerDC) on $($target.Name). Older matching events in the window were not read." 'WARN'
             }
+            $tallyText = Get-TicketEtypeTallyText
             if ($totalRead -lt 1) {
-                Write-CollectorStatus (Get-HistoricalEmptyHint -ComputerName $target.Name -Path $target.Path -Since $since) 'WARN'
+                Write-CollectorStatus (Get-HistoricalEmptyHint -ComputerName $target.Name -Path $target.Path -Since $since -Rc4OnlyQuery:$queryRc4Only) 'WARN'
             } else {
+                if (-not [string]::IsNullOrWhiteSpace($tallyText)) {
+                    Write-CollectorStatus "Ticket etypes parsed on $($target.Name): $tallyText"
+                }
                 Write-CollectorStatus "Finished $($target.Name): $totalRead Kerberos event(s) read, $saved finding(s) saved, $skipped AES/other skipped."
                 if ($saved -lt 1) {
-                    Write-CollectorStatus "No RC4 tickets in this window. That is expected when the DC issues AES. Check Include AES tickets (or Include offered RC4) to list the events that were read." 'WARN'
+                    $etypeNote = if ([string]::IsNullOrWhiteSpace($tallyText)) { '' } else { " Ticket etypes were $tallyText." }
+                    Write-CollectorStatus "No RC4 tickets in this window.$etypeNote That is expected when the DC issues AES. Include AES tickets only if you want those rows listed." 'WARN'
                 }
             }
         }
@@ -1389,11 +1420,14 @@ function Invoke-KerberosCollection {
 }
 
 function Get-Rc4EventDataPredicate {
-    $values = @('0x17','0x18','0x00000017','0x00000018','23','24')
+    # Hex only. Decimal 23/24 collides with IpPort and other EventData fields because
+    # Event Log XPath Data[@Name='X']='Y' is not always same-node. AES tickets were
+    # coming through the "RC4" filter, then skipped as AES, which looked like 0 findings.
+    $hex = @('0x17','0x18','0x00000017','0x00000018')
     $parts = New-Object System.Collections.Generic.List[string]
     foreach ($field in @('TicketEncryptionType','SessionKeyEncryptionType')) {
-        foreach ($value in $values) {
-            [void]$parts.Add("Data[@Name='$field']='$value'")
+        foreach ($value in $hex) {
+            [void]$parts.Add("EventData[Data[@Name='$field']='$value']")
         }
     }
     return '(' + ($parts -join ' or ') + ')'
@@ -1421,7 +1455,7 @@ function New-KerberosFilterXPath {
     }
     $path = "*[System[$conditions]]"
     if ($Rc4Only) {
-        $path = "*[System[$conditions] and EventData[$(Get-Rc4EventDataPredicate)]]"
+        $path = "*[System[$conditions] and $(Get-Rc4EventDataPredicate)]"
     }
     return $path
 }
@@ -1585,7 +1619,8 @@ function Get-HistoricalEmptyHint {
     param(
         [string]$ComputerName,
         [string]$Path,
-        [datetime]$Since
+        [datetime]$Since,
+        [switch]$Rc4OnlyQuery
     )
     $target = if ($Path) { $Path } else { $ComputerName }
     $newestSecurity = $null
@@ -1630,6 +1665,9 @@ function Get-HistoricalEmptyHint {
 
     if ($null -ne $newestKerb) {
         $when = $newestKerb.TimeCreated
+        if ($Rc4OnlyQuery) {
+            return "No RC4 tickets (etype 0x17/0x18) in the window since $($Since.ToString('yyyy-MM-dd HH:mm:ss')) on $target. Newest 4768/4769 is $($when.ToString('yyyy-MM-dd HH:mm:ss')) (event $($newestKerb.Id)) and is not RC4. That is expected when the DC issues AES. Include AES tickets only if you want those rows listed."
+        }
         return "No 4768/4769 events in the window since $($Since.ToString('yyyy-MM-dd HH:mm:ss')) on $target. Newest Kerberos ticket event in the log is $($when.ToString('yyyy-MM-dd HH:mm:ss')) (event $($newestKerb.Id)). Increase Hours, or the Security log may have wrapped."
     }
 
@@ -2718,6 +2756,7 @@ function Invoke-KerberosRc4SelfTest {
     $script:DoIncludeAes = $false
     $script:DoIncludeFailures = $false
     $script:LoggedRc4Filter = $false
+    $script:TicketEtypeTally = @{}
     $script:EventDataRegex = $null
     $script:Credential = $null
     $script:DnsTimeoutMs = 750
@@ -2820,8 +2859,11 @@ function Invoke-KerberosRc4SelfTest {
         -Name 'AES ticket + RC4 session classifies as RC4 Session'
     Assert-True -Condition ($sessionOnly.RequestType -eq 'AS') -Name 'Event 4768 is RequestType AS'
 
+    $script:TicketEtypeTally = @{}
     $aesOnly = Convert-KerberosEvent (New-MockKerberosEvent -Ticket '0x12' -Session '0x12') 'DC01'
     Assert-True -Condition ($null -eq $aesOnly) -Name 'AES ticket + AES session is ignored by default'
+    Assert-True -Condition ((Get-TicketEtypeTallyText) -match 'AES256-SHA96=1') `
+        -Name 'Skipped AES tickets are counted in the etype tally so 0 findings still shows what was read'
     $script:DoIncludeAes = $true
     $aesKept = Convert-KerberosEvent (New-MockKerberosEvent -Ticket '0x12' -Session '0x12') 'DC01'
     Assert-True -Condition ($null -ne $aesKept -and $aesKept.Category -eq 'AES Ticket') `
@@ -2907,6 +2949,8 @@ function Invoke-KerberosRc4SelfTest {
     $xpathRc4 = New-KerberosFilterXPath -Since ([datetime]'2026-10-28T00:00:00Z') -Rc4Only
     Assert-True -Condition ($xpathRc4 -match 'TicketEncryptionType' -and $xpathRc4 -match '0x17' -and $xpathRc4 -match 'SessionKeyEncryptionType' -and $xpathRc4 -match 'EventData') `
         -Name 'RC4-only XPath filters TicketEncryptionType/SessionKeyEncryptionType in EventData'
+    Assert-True -Condition ($xpathRc4 -match "EventData\[Data\[@Name='TicketEncryptionType'\]='0x17'\]" -and $xpathRc4 -notmatch "='23'" -and $xpathRc4 -notmatch "='24'") `
+        -Name 'RC4-only XPath uses hex 0x17/0x18 only (decimal 23/24 would match IpPort and leak AES tickets)'
     $script:DoIncludeAes = $false
     $script:DoIncludeOffered = $false
     $plainMock = New-MockKerberosEvent -Ticket '0x12' -Session '0x12'
