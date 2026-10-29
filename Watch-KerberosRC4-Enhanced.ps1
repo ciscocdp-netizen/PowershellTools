@@ -22,11 +22,12 @@
 
   Actual RC4 uses etype 0x17 (23, RC4-HMAC) or 0x18 (24, RC4-HMAC-EXP).
   "RC4 Offered Only" is NOT evidence of RC4 ticket issuance. Almost every modern Windows
-  client still advertises RC4 even when the issued ticket is AES. A completed scan with
-  0 findings means no RC4 tickets/sessions were issued in the window — typical on AES-only
-  DCs. Use -IncludeAes (or the UI checkbox) to list AES tickets so you can confirm
-  historical 4768/4769 events were read. The log prints a ticket-etype histogram when
-  events were read but none were RC4.
+  client still advertises RC4 even when the issued ticket is AES. Historical reads
+  pull every 4768/4769 in the Hours window (paged), then keep RC4 ticket/session rows.
+  Use -IncludeAes (or Include AES tickets) to list AES tickets too — that is how you
+  confirm the Security log is being read. The log prints Hours, IncludeAes, and a
+  ticket-etype histogram. A tiny RC4-only result (for example 14 session rows) with
+  Include AES off is not the full Kerberos volume on the DC.
 
 .EXAMPLE
   .\Watch-KerberosRC4-Enhanced.ps1 -DomainControllers LAP-MSASDC03.mclaren.org -Mode Both -HoursBack 24
@@ -106,9 +107,10 @@
     looked hung on a busy DC. It now pages newest-first (default 1,000) with a log line
     after each page and checks Stop between pages.
   - Historical parse walked every 4768/4769 (mostly AES) and ran ToXml/XmlDocument on
-    each. RC4-only runs now filter TicketEncryptionType/SessionKeyEncryptionType in the
-    XPath query, skip ToXml unless Properties look like RC4, and parse EventData with a
-    compiled regex instead of an XmlDocument.
+    each. EventData is parsed with a compiled regex. The collector pages 4768/4769 by
+    EventID and time only — an EventData RC4 etype XPath over RPC returned a tiny
+    subset (for example 14 RC4-session rows) no matter how large Hours was, and it
+    stayed on even when Include AES was checked. RC4 vs AES is decided after parse.
 #>
 [CmdletBinding()]
 param(
@@ -165,6 +167,28 @@ function ConvertTo-HtmlEncoded([object]$Value) {
 function ConvertTo-CsvField([object]$Value) {
     $text = [string]$Value
     return '"' + $text.Replace('"','""') + '"'
+}
+
+function ConvertTo-IntOrDefault {
+    param(
+        [string]$Text,
+        [int]$Default,
+        [int]$Min,
+        [int]$Max
+    )
+    [int]$parsed = $Default
+    if (-not [string]::IsNullOrWhiteSpace($Text)) {
+        [void][int]::TryParse($Text.Trim(), [ref]$parsed)
+    }
+    if ($parsed -lt $Min) { $parsed = $Min }
+    if ($parsed -gt $Max) { $parsed = $Max }
+    return $parsed
+}
+
+function Test-UiCheckboxChecked {
+    param($Box)
+    if ($null -eq $Box) { return $false }
+    try { return [bool]$Box.Checked } catch { return $false }
 }
 
 function Get-NamedField {
@@ -1277,10 +1301,12 @@ function Invoke-KerberosCollection {
                     Write-CollectorStatus "Reading the Security log on $($target.Name) over Event Log RPC (not this computer)."
                 }
             }
-            $queryRc4Only = (-not $script:DoIncludeAes -and -not $script:DoIncludeOffered)
+            Write-CollectorStatus "Options: Hours=$HoursBack IncludeAes=$($script:DoIncludeAes) IncludeOffered=$($script:DoIncludeOffered) IncludeFailures=$($script:DoIncludeFailures). Querying every 4768/4769 since $since (EventID + time only)."
             Write-CollectorStatus "Paging newest matching events first (page size $HistoryPageSize). The log updates after each page; Stop is checked between pages."
-            if ($queryRc4Only) {
-                Write-CollectorStatus 'RC4-only mode: AES tickets are filtered in the query (much faster). Enable Include AES tickets only if you need them listed.'
+            if ($script:DoIncludeAes) {
+                Write-CollectorStatus 'Include AES is on: AES tickets are listed as well as RC4. This is noisier and can take longer on a busy DC.'
+            } else {
+                Write-CollectorStatus 'Include AES is off: every 4768/4769 in the window is still read, but AES tickets are counted and skipped. Check Include AES tickets to list them.'
             }
 
             $beforeId = [int64]-1
@@ -1296,9 +1322,9 @@ function Invoke-KerberosCollection {
                 if ($take -gt $remaining) { $take = $remaining }
                 Write-CollectorStatus "Fetching page $pageNum (up to $take events) from $($target.Name)..."
                 if ($target.Kind -eq 'evtx') {
-                    $page = ConvertTo-EventArray (Read-KerberosEvents -Path $target.Path -Since $since -Max $take -BeforeRecordId $beforeId -Rc4Only:$queryRc4Only)
+                    $page = ConvertTo-EventArray (Read-KerberosEvents -Path $target.Path -Since $since -Max $take -BeforeRecordId $beforeId)
                 } else {
-                    $page = ConvertTo-EventArray (Read-KerberosEvents -ComputerName $target.Name -Since $since -Max $take -BeforeRecordId $beforeId -Rc4Only:$queryRc4Only)
+                    $page = ConvertTo-EventArray (Read-KerberosEvents -ComputerName $target.Name -Since $since -Max $take -BeforeRecordId $beforeId)
                 }
                 $pageCount = Get-CollectionCount $page
                 if ($pageCount -lt 1) { break }
@@ -1331,7 +1357,7 @@ function Invoke-KerberosCollection {
             }
             $tallyText = Get-TicketEtypeTallyText
             if ($totalRead -lt 1) {
-                Write-CollectorStatus (Get-HistoricalEmptyHint -ComputerName $target.Name -Path $target.Path -Since $since -Rc4OnlyQuery:$queryRc4Only) 'WARN'
+                Write-CollectorStatus (Get-HistoricalEmptyHint -ComputerName $target.Name -Path $target.Path -Since $since) 'WARN'
             } else {
                 if (-not [string]::IsNullOrWhiteSpace($tallyText)) {
                     Write-CollectorStatus "Ticket etypes parsed on $($target.Name): $tallyText"
@@ -1340,6 +1366,8 @@ function Invoke-KerberosCollection {
                 if ($saved -lt 1) {
                     $etypeNote = if ([string]::IsNullOrWhiteSpace($tallyText)) { '' } else { " Ticket etypes were $tallyText." }
                     Write-CollectorStatus "No RC4 tickets in this window.$etypeNote That is expected when the DC issues AES. Include AES tickets only if you want those rows listed." 'WARN'
+                } elseif ($skipped -gt 0 -and -not $script:DoIncludeAes) {
+                    Write-CollectorStatus "Listed RC4 ticket/session rows only. $skipped AES/other event(s) were read and skipped. Check Include AES tickets to list every 4768/4769 in this window." 'WARN'
                 }
             }
         }
@@ -1387,7 +1415,7 @@ function Invoke-KerberosCollection {
                     $useRecordIdOnly = ($lastId[$dc] -gt 0)
                     $caughtUp = $false
                     while (-not $caughtUp -and -not (Test-IsCollectorCancelRequested)) {
-                        $page = ConvertTo-EventArray (Read-KerberosEvents -ComputerName $dc -Since $since -Max $LivePageSize -AfterRecordId $lastId[$dc] -Oldest -RecordIdOnly:$useRecordIdOnly -Rc4Only:(-not $script:DoIncludeAes -and -not $script:DoIncludeOffered))
+                        $page = ConvertTo-EventArray (Read-KerberosEvents -ComputerName $dc -Since $since -Max $LivePageSize -AfterRecordId $lastId[$dc] -Oldest -RecordIdOnly:$useRecordIdOnly)
                         $pageCount = Get-CollectionCount $page
                         if ($pageCount -lt 1) { $caughtUp = $true; break }
                         foreach ($ev in $page) {
@@ -2038,18 +2066,9 @@ function Start-UiCollector {
     try {
     if (-not (Confirm-UiKerberosAuditing)) { return }
 
-    $hours = 24
-    $poll = 5
-    $liveMins = 0
-    [void][int]::TryParse($script:Ui.HoursBox.Text, [ref]$hours)
-    [void][int]::TryParse($script:Ui.PollBox.Text, [ref]$poll)
-    [void][int]::TryParse($script:Ui.LiveBox.Text, [ref]$liveMins)
-    if ($hours -lt 1) { $hours = 1 }
-    if ($hours -gt 720) { $hours = 720 }
-    if ($poll -lt 2) { $poll = 2 }
-    if ($poll -gt 3600) { $poll = 3600 }
-    if ($liveMins -lt 0) { $liveMins = 0 }
-    if ($liveMins -gt 10080) { $liveMins = 10080 }
+    $hours = ConvertTo-IntOrDefault -Text $script:Ui.HoursBox.Text -Default 24 -Min 1 -Max 720
+    $poll = ConvertTo-IntOrDefault -Text $script:Ui.PollBox.Text -Default 5 -Min 2 -Max 3600
+    $liveMins = ConvertTo-IntOrDefault -Text $script:Ui.LiveBox.Text -Default 0 -Min 0 -Max 10080
 
     $mode = [string]$script:Ui.ModeBox.SelectedItem
     if ([string]::IsNullOrWhiteSpace($mode)) { $mode = 'Both' }
@@ -2082,11 +2101,11 @@ function Start-UiCollector {
     $settings = @{
         ScriptPath            = $PSCommandPath
         OutputFolder          = $outputFolder
-        ResolveHostnames      = [bool]$script:Ui.ChkDns.Checked
-        EnrichAD              = [bool]$script:Ui.ChkAd.Checked
-        IncludeOffered        = [bool]$script:Ui.ChkOffered.Checked
-        IncludeAes            = [bool]($script:Ui.ChkAes -and $script:Ui.ChkAes.Checked)
-        IncludeFailures       = [bool]$script:Ui.ChkFailures.Checked
+        WantDns               = [int](Test-UiCheckboxChecked $script:Ui.ChkDns)
+        WantAd                = [int](Test-UiCheckboxChecked $script:Ui.ChkAd)
+        WantOffered           = [int](Test-UiCheckboxChecked $script:Ui.ChkOffered)
+        WantAes               = [int](Test-UiCheckboxChecked $script:Ui.ChkAes)
+        WantFailures          = [int](Test-UiCheckboxChecked $script:Ui.ChkFailures)
         DnsTimeoutMs          = $script:DnsTimeoutMs
         Mode                  = $mode
         HoursBack             = $hours
@@ -2113,26 +2132,26 @@ function Start-UiCollector {
         param($Sync, $Settings)
         $script:UiSync = $Sync
         try {
-            . $Settings.ScriptPath -SkipMain
+            . $Settings['ScriptPath'] -SkipMain
             $script:UiSync = $Sync
             $cred = $null
-            if ($Settings.ContainsKey('Credential')) { $cred = $Settings.Credential }
-            Initialize-CollectorSession -OutputFolderPath $Settings.OutputFolder `
-                -ResolveHostnamesFlag $Settings.ResolveHostnames `
-                -EnrichADFlag $Settings.EnrichAD `
-                -IncludeOfferedFlag $Settings.IncludeOffered `
-                -IncludeAesFlag $Settings.IncludeAes `
-                -IncludeFailuresFlag $Settings.IncludeFailures `
-                -DnsTimeout $Settings.DnsTimeoutMs `
+            if ($Settings.ContainsKey('Credential')) { $cred = $Settings['Credential'] }
+            Initialize-CollectorSession -OutputFolderPath $Settings['OutputFolder'] `
+                -ResolveHostnamesFlag ([bool]$Settings['WantDns']) `
+                -EnrichADFlag ([bool]$Settings['WantAd']) `
+                -IncludeOfferedFlag ([bool]$Settings['WantOffered']) `
+                -IncludeAesFlag ([bool]$Settings['WantAes']) `
+                -IncludeFailuresFlag ([bool]$Settings['WantFailures']) `
+                -DnsTimeout $Settings['DnsTimeoutMs'] `
                 -CredentialObject $cred `
                 -Quiet $true
             $Sync.CsvPath = $script:CsvPath
             $Sync.HtmlPath = $script:HtmlPath
-            Invoke-KerberosCollection -Targets $Settings.Targets -Mode $Settings.Mode `
-                -HoursBack $Settings.HoursBack -PollSeconds $Settings.PollSeconds `
-                -LiveMinutes $Settings.LiveMinutes `
-                -MaxHistoryEventsPerDC $Settings.MaxHistoryEventsPerDC -HistoryPageSize $Settings.HistoryPageSize -LivePageSize $Settings.LivePageSize `
-                -SkipAuditCheck:$Settings.SkipAuditCheck -RequireAuditing:$Settings.RequireAuditing
+            Invoke-KerberosCollection -Targets $Settings['Targets'] -Mode $Settings['Mode'] `
+                -HoursBack ([int]$Settings['HoursBack']) -PollSeconds ([int]$Settings['PollSeconds']) `
+                -LiveMinutes ([int]$Settings['LiveMinutes']) `
+                -MaxHistoryEventsPerDC ([int]$Settings['MaxHistoryEventsPerDC']) -HistoryPageSize ([int]$Settings['HistoryPageSize']) -LivePageSize ([int]$Settings['LivePageSize']) `
+                -SkipAuditCheck:([bool]$Settings['SkipAuditCheck']) -RequireAuditing:([bool]$Settings['RequireAuditing'])
         } catch {
             $Sync.Error = $_.Exception.Message
             $Sync.Status = $_.Exception.Message
@@ -2147,7 +2166,7 @@ function Start-UiCollector {
     Set-UiRunningState $true
     $script:Ui.StatusLabel.Text = 'Starting collector...'
     Add-UiLogLine ('---- {0} ----' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
-    Add-UiLogLine '[INFO] Collector started.'
+    Add-UiLogLine ('[INFO] Collector started. Mode={0} Hours={1} IncludeAes={2} IncludeOffered={3} IncludeFailures={4}' -f $mode, $hours, $settings['WantAes'], $settings['WantOffered'], $settings['WantFailures'])
     $script:Ui.Timer.Start()
     } catch {
         $msg = $_.Exception.Message
@@ -2936,9 +2955,23 @@ function Invoke-KerberosRc4SelfTest {
     $timeXPath = ([xml]$qTime).QueryList.Query.Select.InnerText
     Assert-True -Condition ($timeXPath -match 'EventID=4768' -and $timeXPath -match 'TimeCreated' -and $timeXPath -match "SystemTime>='2026-10-28T00:00:00.000Z'") `
         -Name 'Historical query XML includes event IDs and a quoted UTC TimeCreated filter'
+    Assert-True -Condition ((ConvertTo-IntOrDefault -Text '16' -Default 24 -Min 1 -Max 720) -eq 16) `
+        -Name 'Hours text 16 parses to 16'
+    Assert-True -Condition ((ConvertTo-IntOrDefault -Text '' -Default 24 -Min 1 -Max 720) -eq 24) `
+        -Name 'Blank Hours text keeps the default'
+    Assert-True -Condition ((ConvertTo-IntOrDefault -Text '9999' -Default 24 -Min 1 -Max 720) -eq 720) `
+        -Name 'Hours above the max is clamped'
+    $HoursBack = 24
+    $IncludeAes = [System.Management.Automation.SwitchParameter]::new($false)
+    $flagBag = @{ WantAes = 1; HoursBack = 48; IncludeAes = $true }
+    Assert-True -Condition (([bool]$flagBag['WantAes'] -eq $true) -and ([int]$flagBag['HoursBack'] -eq 48)) `
+        -Name 'GUI collector flags are read by indexer so script params HoursBack/IncludeAes cannot shadow them'
+
     $xpathTime = New-KerberosFilterXPath -Since ([datetime]'2026-10-28T00:00:00Z')
     Assert-True -Condition ($xpathTime -match 'EventID=4768' -and $xpathTime -match "SystemTime>='2026-10-28T00:00:00.000Z'" -and $xpathTime -notmatch '&gt;') `
         -Name 'FilterXPath uses a real greater-than for TimeCreated (not an XML entity)'
+    Assert-True -Condition ($xpathTime -notmatch 'TicketEncryptionType') `
+        -Name 'Default historical XPath is every 4768/4769 (no EventData RC4 etype filter)'
     $qLive = New-KerberosQueryXml -Since ([datetime]'2026-10-28T00:00:00Z') -AfterRecordId 12345 -RecordIdOnly
     $liveXPath = ([xml]$qLive).QueryList.Query.Select.InnerText
     Assert-True -Condition ($liveXPath -match 'EventRecordID>12345' -and $liveXPath -notmatch 'TimeCreated') `
