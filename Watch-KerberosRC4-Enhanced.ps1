@@ -72,6 +72,12 @@
   Event 4769 ServiceName is frequently a service account name, not the full SPN.
   Session-key and advertised-etype fields exist only on the updated 4768/4769 schema
   (Windows Server 2019+ and Server 2016 with the January 2025 cumulative update).
+  On that schema (23+ EventData properties) session-key etype is property index 20
+  (4769) or 22 (4768), matching Microsoft's Watch-KerbEncryptionUsage.
+
+  Live mode subscribes with EventLogWatcher (push, same idea as Watch-KerbEncryptionUsage)
+  for 4768/4769 as they are written. If the watcher cannot attach (some remote DCs),
+  it falls back to Get-WinEvent polling. This tool never changes audit policy.
 
   Bugs fixed versus the original collector:
   - Windows PowerShell 5.1 XmlElement.Name is the tag "Data", not the Name attribute.
@@ -417,6 +423,42 @@ function ConvertTo-EventArray {
     return ,([object[]]@($Value))
 }
 
+function Get-KerberosLayoutIndices {
+    param([int]$EventId, [int]$PropertyCount)
+    # Watch-KerbEncryptionUsage (Microsoft) requires 23+ properties and reads
+    # SessionKeyEncryptionType at 4769[20] / 4768[22]. Older events have fewer fields.
+    $newSchema = ($PropertyCount -ge 23)
+    if ($EventId -eq 4769) {
+        $session = 11
+        if ($newSchema) { $session = 20 }
+        return @{
+            Ticket  = 5
+            Session = $session
+            Status  = 8
+            Ip      = 6
+            Port    = 7
+            Account = 0
+            Domain  = 1
+            Service = 2
+        }
+    }
+    if ($EventId -eq 4768) {
+        $session = 14
+        if ($newSchema) { $session = 22 }
+        return @{
+            Ticket  = 7
+            Session = $session
+            Status  = 6
+            Ip      = 9
+            Port    = 10
+            Account = 0
+            Domain  = 1
+            Service = 3
+        }
+    }
+    return $null
+}
+
 function Get-KerberosPropertyNames {
     param([int]$EventId)
     if ($EventId -eq 4768) {
@@ -471,8 +513,9 @@ function Get-EventFieldsFromProperties {
     $names = Get-KerberosPropertyNames $eventId
     if ($names.Count -lt 1) { return $null }
 
-    $ticketIndex = if ($eventId -eq 4769) { 5 } elseif ($eventId -eq 4768) { 7 } else { -1 }
-    if ($ticketIndex -ge $count) { return $null }
+    $layout = Get-KerberosLayoutIndices -EventId $eventId -PropertyCount $count
+    if ($null -eq $layout) { return $null }
+    if ([int]$layout['Ticket'] -ge $count) { return $null }
 
     $result = @{}
     $limit = $count
@@ -480,19 +523,16 @@ function Get-EventFieldsFromProperties {
     for ($i = 0; $i -lt $limit; $i++) {
         $result[$names[$i]] = Get-EventPropertyValue $props $i
     }
-    if (-not $result.ContainsKey('TicketEncryptionType') -or [string]::IsNullOrWhiteSpace([string]$result['TicketEncryptionType'])) {
+    $result['TargetUserName'] = Get-EventPropertyValue $props ([int]$layout['Account'])
+    $result['TargetDomainName'] = Get-EventPropertyValue $props ([int]$layout['Domain'])
+    $result['ServiceName'] = Get-EventPropertyValue $props ([int]$layout['Service'])
+    $result['TicketEncryptionType'] = Get-EventPropertyValue $props ([int]$layout['Ticket'])
+    $result['SessionKeyEncryptionType'] = Get-EventPropertyValue $props ([int]$layout['Session'])
+    $result['Status'] = Get-EventPropertyValue $props ([int]$layout['Status'])
+    $result['IpAddress'] = Get-EventPropertyValue $props ([int]$layout['Ip'])
+    $result['IpPort'] = Get-EventPropertyValue $props ([int]$layout['Port'])
+    if ([string]::IsNullOrWhiteSpace([string]$result['TicketEncryptionType'])) {
         return $null
-    }
-    if ($count -gt $names.Count) {
-        for ($i = $names.Count; $i -lt $count; $i++) {
-            $extra = Get-EventPropertyValue $props $i
-            if ([string]::IsNullOrWhiteSpace($extra)) { continue }
-            if ((Test-IsRC4Etype $extra) -and -not $result.ContainsKey('SessionKeyEncryptionType')) {
-                $result['SessionKeyEncryptionType'] = $extra
-            } elseif ($extra -match '(?i)RC4|AES256|AES128' -and -not $result.ContainsKey('ClientAdvertizedEncryptionTypes')) {
-                $result['ClientAdvertizedEncryptionTypes'] = $extra
-            }
-        }
     }
     return $result
 }
@@ -575,10 +615,14 @@ function Test-EventMayBeInteresting {
 
     $eventId = 0
     try { $eventId = [int]$Event.Id } catch { }
+    $layout = Get-KerberosLayoutIndices -EventId $eventId -PropertyCount $count
     $ticketIndex = -1
     $portIndex = -1
-    if ($eventId -eq 4769) { $ticketIndex = 5; $portIndex = 7 }
-    elseif ($eventId -eq 4768) { $ticketIndex = 7; $portIndex = 10 }
+    if ($null -ne $layout) {
+        $ticketIndex = [int]$layout['Ticket']
+        $portIndex = [int]$layout['Port']
+        if (Test-IsRC4Etype (Get-EventPropertyValue $props ([int]$layout['Session']))) { return $true }
+    }
 
     if ($ticketIndex -ge 0 -and $ticketIndex -lt $count) {
         if (Test-IsRC4Etype (Get-EventPropertyValue $props $ticketIndex)) { return $true }
@@ -1528,52 +1572,85 @@ function Invoke-KerberosCollection {
     } else {
         Write-CollectorStatus 'Live monitoring until stopped. Reports save continuously; Stop / Ctrl+C writes a final HTML snapshot.' 'SUCCESS'
     }
+
+    $liveSubs = @{}
+    $pollDcs = New-Object System.Collections.Generic.List[string]
+    foreach ($dc in $controllers) {
+        try {
+            $sub = New-KerberosLiveWatcher -ComputerName $dc
+            $liveSubs[$dc] = $sub
+            Write-CollectorStatus "Live EventLogWatcher subscribed on $dc (4768/4769 as they are written; RC4 ticket or session, same idea as Watch-KerbEncryptionUsage)." 'SUCCESS'
+        } catch {
+            Write-CollectorStatus "EventLogWatcher could not attach on $dc ($($_.Exception.Message)). Falling back to Get-WinEvent polling every $PollSeconds second(s)." 'WARN'
+            [void]$pollDcs.Add($dc)
+        }
+    }
+
+    $lastHtml = Get-Date
+    $lastPoll = [datetime]'2000-01-01'
     try {
         while (-not (Test-IsCollectorCancelRequested) -and -not (Test-IsLiveWatchExpired $liveDeadline)) {
             Write-CollectorStatus (Get-LiveWatchStatusText -Deadline $liveDeadline -FindingCount $script:Records.Count -LiveMinutes $LiveMinutes)
-            $waitMs = [Math]::Max(500, $PollSeconds * 1000)
-            $slept = 0
-            while ($slept -lt $waitMs -and -not (Test-IsCollectorCancelRequested) -and -not (Test-IsLiveWatchExpired $liveDeadline)) {
-                $slice = [Math]::Min(500, $waitMs - $slept)
-                Start-Sleep -Milliseconds $slice
-                $slept += $slice
-            }
-            if (Test-IsCollectorCancelRequested -or (Test-IsLiveWatchExpired $liveDeadline)) { break }
-            foreach ($dc in $controllers) {
+            $drained = 0
+            foreach ($dc in @($liveSubs.Keys)) {
                 if (Test-IsCollectorCancelRequested) { break }
-                try {
-                    if (Test-SecurityLogWrapped -ComputerName $dc -Cursor $lastId[$dc]) {
-                        Write-CollectorStatus "Security log on $dc was cleared or wrapped. Resetting RecordId cursor." 'WARN'
-                        $lastId[$dc] = [int64]0
-                    }
-                    $since = $lastScan[$dc].AddSeconds(-30)
-                    $useRecordIdOnly = ($lastId[$dc] -gt 0)
-                    $caughtUp = $false
-                    while (-not $caughtUp -and -not (Test-IsCollectorCancelRequested)) {
-                        $page = ConvertTo-EventArray (Read-KerberosEvents -ComputerName $dc -Since $since -Max $LivePageSize -AfterRecordId $lastId[$dc] -Oldest -RecordIdOnly:$useRecordIdOnly)
-                        $pageCount = Get-CollectionCount $page
-                        if ($pageCount -lt 1) { $caughtUp = $true; break }
-                        foreach ($ev in $page) {
-                            $rid = [int64]$ev.RecordId
-                            if ($rid -le $lastId[$dc]) { continue }
-                            $lastId[$dc] = $rid
-                            $row = Convert-KerberosEvent $ev $dc
-                            if ($null -ne $row) { Save-Finding $row }
+                $drained += [int](Read-KerberosLiveQueue -Queue $liveSubs[$dc].Queue -ComputerName $dc)
+            }
+            if ($drained -gt 0) { Flush-CsvBuffer }
+
+            $now = Get-Date
+            $needPoll = ($pollDcs.Count -gt 0) -and (($now - $lastPoll).TotalSeconds -ge [Math]::Max(2, $PollSeconds))
+            if ($needPoll) {
+                $lastPoll = $now
+                foreach ($dc in $pollDcs) {
+                    if (Test-IsCollectorCancelRequested) { break }
+                    try {
+                        if (Test-SecurityLogWrapped -ComputerName $dc -Cursor $lastId[$dc]) {
+                            Write-CollectorStatus "Security log on $dc was cleared or wrapped. Resetting RecordId cursor." 'WARN'
+                            $lastId[$dc] = [int64]0
                         }
-                        if ($pageCount -lt $LivePageSize) { $caughtUp = $true }
+                        $since = $lastScan[$dc].AddSeconds(-30)
                         $useRecordIdOnly = ($lastId[$dc] -gt 0)
+                        $caughtUp = $false
+                        while (-not $caughtUp -and -not (Test-IsCollectorCancelRequested)) {
+                            $page = ConvertTo-EventArray (Read-KerberosEvents -ComputerName $dc -Since $since -Max $LivePageSize -AfterRecordId $lastId[$dc] -Oldest -RecordIdOnly:$useRecordIdOnly)
+                            $pageCount = Get-CollectionCount $page
+                            if ($pageCount -lt 1) { $caughtUp = $true; break }
+                            foreach ($ev in $page) {
+                                $rid = [int64]$ev.RecordId
+                                if ($rid -le $lastId[$dc]) { continue }
+                                $lastId[$dc] = $rid
+                                $row = Convert-KerberosEvent $ev $dc
+                                if ($null -ne $row) { Save-Finding $row }
+                            }
+                            if ($pageCount -lt $LivePageSize) { $caughtUp = $true }
+                            $useRecordIdOnly = ($lastId[$dc] -gt 0)
+                        }
+                        Flush-CsvBuffer
+                        $lastScan[$dc] = Get-Date
+                    } catch {
+                        Write-CollectorStatus "Live poll failed for ${dc}: $($_.Exception.Message)" 'WARN'
                     }
-                    Flush-CsvBuffer
-                    $lastScan[$dc] = Get-Date
-                } catch {
-                    Write-CollectorStatus "Live poll failed for ${dc}: $($_.Exception.Message)" 'WARN'
                 }
             }
-            try { Write-HtmlReport } catch {
-                Write-CollectorStatus "HTML refresh failed: $($_.Exception.Message)" 'WARN'
+
+            if (($now - $lastHtml).TotalSeconds -ge 5) {
+                try { Write-HtmlReport } catch {
+                    Write-CollectorStatus "HTML refresh failed: $($_.Exception.Message)" 'WARN'
+                }
+                $lastHtml = Get-Date
+            }
+
+            $slept = 0
+            while ($slept -lt 250 -and -not (Test-IsCollectorCancelRequested) -and -not (Test-IsLiveWatchExpired $liveDeadline)) {
+                Start-Sleep -Milliseconds 50
+                $slept += 50
             }
         }
     } finally {
+        foreach ($dc in @($liveSubs.Keys)) {
+            Stop-KerberosLiveWatcher $liveSubs[$dc]
+        }
         try { Write-HtmlReport } catch { }
         if (Test-IsLiveWatchExpired $liveDeadline) {
             Write-CollectorStatus "Live watch of $LiveMinutes minute(s) finished. Saved $($script:Records.Count) finding(s) to $script:CsvPath and $script:HtmlPath" 'SUCCESS'
@@ -1777,6 +1854,84 @@ function Read-KerberosEvents {
         }
         return ,([object[]]@())
     }
+}
+
+function Get-KerberosLiveXPath {
+    return '*[System[(EventID=4768 or EventID=4769)]]'
+}
+
+function New-KerberosLiveWatcher {
+    param([string]$ComputerName)
+    $xpath = Get-KerberosLiveXPath
+    $query = New-Object System.Diagnostics.Eventing.Reader.EventLogQuery(
+        'Security',
+        [System.Diagnostics.Eventing.Reader.PathType]::LogName,
+        $xpath
+    )
+    $session = $null
+    if (-not [string]::IsNullOrWhiteSpace($ComputerName) -and -not (Test-IsLocalComputerName $ComputerName)) {
+        if ($script:Credential) {
+            $net = $script:Credential.GetNetworkCredential()
+            $domain = $net.Domain
+            if ([string]::IsNullOrWhiteSpace($domain)) { $domain = $ComputerName }
+            $session = New-Object System.Diagnostics.Eventing.Reader.EventLogSession(
+                $ComputerName,
+                $domain,
+                $net.UserName,
+                $net.Password,
+                [System.Diagnostics.Eventing.Reader.SessionAuthentication]::Default
+            )
+        } else {
+            $session = New-Object System.Diagnostics.Eventing.Reader.EventLogSession($ComputerName)
+        }
+        $query.Session = $session
+    }
+    $queue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+    $watcher = New-Object System.Diagnostics.Eventing.Reader.EventLogWatcher $query
+    $handler = [System.Diagnostics.Eventing.Reader.EventRecordWrittenEventHandler] {
+        param($sender, $eventArgs)
+        if ($null -ne $eventArgs -and $null -ne $eventArgs.EventRecord) {
+            [void]$queue.Enqueue($eventArgs.EventRecord)
+        }
+    }
+    $watcher.add_EventRecordWritten($handler)
+    $watcher.Enabled = $true
+    return [pscustomobject]@{
+        ComputerName = $ComputerName
+        Watcher      = $watcher
+        Session      = $session
+        Queue        = $queue
+        Handler      = $handler
+    }
+}
+
+function Stop-KerberosLiveWatcher {
+    param($Subscription)
+    if ($null -eq $Subscription) { return }
+    try { $Subscription.Watcher.Enabled = $false } catch { }
+    try {
+        if ($null -ne $Subscription.Handler) {
+            $Subscription.Watcher.remove_EventRecordWritten($Subscription.Handler)
+        }
+    } catch { }
+    try { $Subscription.Watcher.Dispose() } catch { }
+    try {
+        if ($null -ne $Subscription.Session) { $Subscription.Session.Dispose() }
+    } catch { }
+}
+
+function Read-KerberosLiveQueue {
+    param($Queue, [string]$ComputerName, [int]$MaxDrain = 500)
+    if ($null -eq $Queue) { return 0 }
+    $n = 0
+    $record = $null
+    while ($n -lt $MaxDrain -and $Queue.TryDequeue([ref]$record)) {
+        $n++
+        if ($null -eq $record) { continue }
+        $row = Convert-KerberosEvent $record $ComputerName
+        if ($null -ne $row) { Save-Finding $row }
+    }
+    return $n
 }
 
 function Get-HistoricalEmptyHint {
@@ -2911,25 +3066,39 @@ function New-MockPropertyEvent {
         [string]$Account = 'jsmith@CONTOSO.LOCAL',
         [string]$Domain = 'CONTOSO.LOCAL',
         [string]$Service = 'HOST/dc01.contoso.local',
-        [string]$Ip = '::ffff:10.10.10.25'
+        [string]$Ip = '::ffff:10.10.10.25',
+        [switch]$NewMetadata
     )
+    $classicSession = $Session
+    if ($NewMetadata) { $classicSession = '0x12' }
     $values = @()
     if ($Id -eq 4768) {
         $values = @(
             $Account, $Domain, 'S-1-5-21-1-2-3-1001', $Service, 'S-1-5-21-1-2-3-502',
             '0x40810010', $Status, $Ticket, '15', $Ip, '54321',
-            '-', '-', '-', $Session
+            '-', '-', '-', $classicSession
         )
     } else {
         $values = @(
             $Account, $Domain, $Service, 'S-1-5-21-1-2-3-502', '0x40810010',
             $Ticket, $Ip, '54321', $Status, '{00000000-0000-0000-0000-000000000000}', '-',
-            $Session
+            $classicSession
         )
     }
     $props = New-Object System.Collections.ArrayList
     foreach ($value in $values) {
         [void]$props.Add([pscustomobject]@{ Value = $value })
+    }
+    if ($NewMetadata) {
+        $sessionIndex = 20
+        if ($Id -eq 4768) { $sessionIndex = 22 }
+        while ($props.Count -lt 23) {
+            [void]$props.Add([pscustomobject]@{ Value = '' })
+        }
+        while ($props.Count -le $sessionIndex) {
+            [void]$props.Add([pscustomobject]@{ Value = '' })
+        }
+        $props[$sessionIndex] = [pscustomobject]@{ Value = $Session }
     }
     return [pscustomobject]@{
         Id          = $Id
@@ -3073,6 +3242,20 @@ function Invoke-KerberosRc4SelfTest {
         -Name 'RC4 4768 from Properties uses TicketEncryptionType at index 7'
     Assert-True -Condition (-not (Test-EventMayBeInteresting $propAes)) `
         -Name 'AES Properties events are not interesting when IncludeAes is off'
+    $newLayout = Get-KerberosLayoutIndices -EventId 4769 -PropertyCount 23
+    $oldLayout = Get-KerberosLayoutIndices -EventId 4769 -PropertyCount 12
+    Assert-True -Condition (([int]$newLayout['Session'] -eq 20) -and ([int]$newLayout['Ticket'] -eq 5)) `
+        -Name 'New 4769 metadata (23+ properties) reads SessionKeyEncryptionType at index 20 like Watch-KerbEncryptionUsage'
+    Assert-True -Condition (([int]$oldLayout['Session'] -eq 11) -and ([int]$oldLayout['Ticket'] -eq 5)) `
+        -Name 'Classic 4769 layout keeps TicketEncryptionType at index 5'
+    $asLayout = Get-KerberosLayoutIndices -EventId 4768 -PropertyCount 23
+    Assert-True -Condition (([int]$asLayout['Session'] -eq 22) -and ([int]$asLayout['Ticket'] -eq 7)) `
+        -Name 'New 4768 metadata reads SessionKeyEncryptionType at index 22 like Watch-KerbEncryptionUsage'
+    $msRc4Session = Convert-KerberosEvent (New-MockPropertyEvent -Ticket '0x12' -Session '0x17' -NewMetadata) 'DC01'
+    Assert-True -Condition ($null -ne $msRc4Session -and $msRc4Session.Category -eq 'RC4 Session' -and $msRc4Session.SessionCipher -eq 'RC4-HMAC') `
+        -Name 'AES ticket + RC4 session at 4769 index 20 classifies as RC4 Session'
+    Assert-True -Condition ((Get-KerberosLiveXPath) -eq '*[System[(EventID=4768 or EventID=4769)]]') `
+        -Name 'Live EventLogWatcher XPath matches Watch-KerbEncryptionUsage (all 4768/4769)'
     $script:DoIncludeAes = $true
     $aesKept = Convert-KerberosEvent (New-MockKerberosEvent -Ticket '0x12' -Session '0x12') 'DC01'
     Assert-True -Condition ($null -ne $aesKept -and $aesKept.Category -eq 'AES Ticket') `
