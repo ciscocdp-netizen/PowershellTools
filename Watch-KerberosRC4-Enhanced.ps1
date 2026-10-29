@@ -15,7 +15,10 @@
   -EvtxPath for the original non-interactive CLI. Use -Gui to open the UI with those
   values pre-filled.
 
-  Does NOT modify AD, auditing settings, tickets, or encryption policies.
+  Before reading logs, the collector checks whether Kerberos auditing is enabled on each
+  DC (Audit Kerberos Authentication Service for 4768, Audit Kerberos Service Ticket
+  Operations for 4769). That check is read-only. Use -RequireAuditing to abort when a DC
+  is not logging those events, or -SkipAuditCheck to bypass the preflight.
 
   Actual RC4 uses etype 0x17 (23, RC4-HMAC) or 0x18 (24, RC4-HMAC-EXP).
   "RC4 Offered Only" is NOT evidence of RC4 ticket issuance. Almost every modern Windows
@@ -34,6 +37,11 @@
   .\Watch-KerberosRC4-Enhanced.ps1 -DomainControllers DC01 -Mode Live -LiveMinutes 30 -OutputFolder C:\Temp\RC4
 
   Watch live for 30 minutes, then stop and leave CSV/HTML in C:\Temp\RC4. 0 minutes (the default) runs until Ctrl+C or Stop.
+
+.EXAMPLE
+  .\Watch-KerberosRC4-Enhanced.ps1 -DomainControllers DC01 -Mode Both -RequireAuditing
+
+  Abort instead of watching if 4768/4769 auditing is not enabled on DC01.
 
 .EXAMPLE
   .\Watch-KerberosRC4-Enhanced.ps1 -EvtxPath C:\Temp\Security.evtx -Mode Historical
@@ -96,6 +104,8 @@ param(
     [ValidateRange(10,1000000)][int]$MaxHistoryEventsPerDC = 100000,
     [ValidateRange(100,100000)][int]$LivePageSize = 20000,
     [ValidateRange(250,15000)][int]$DnsTimeoutMs = 750,
+    [switch]$SkipAuditCheck,
+    [switch]$RequireAuditing,
     [switch]$Gui,
     [switch]$NonInteractive,
     [switch]$SkipMain,
@@ -109,6 +119,7 @@ $script:CsvPath = ''
 $script:HtmlPath = ''
 $script:CancelRequested = $false
 $script:DnsTimeoutMs = 750
+$script:DoIncludeFailures = $false
 $script:Ui = $null
 
 # ---------------------------------------------------------------------------
@@ -730,6 +741,271 @@ function Get-CollectorTargetList {
     return $targets
 }
 
+function Get-KerberosAuditGuidMap {
+    return [ordered]@{
+        'Kerberos Authentication Service'   = [guid]'0cce9242-69ae-11d9-bed3-505054503030'
+        'Kerberos Service Ticket Operations' = [guid]'0cce9240-69ae-11d9-bed3-505054503030'
+    }
+}
+
+function ConvertTo-AuditFlagPair {
+    param(
+        [string]$Inclusion,
+        $SettingValue
+    )
+    $success = $false
+    $failure = $false
+    $n = 0
+    if ($null -ne $SettingValue -and [int]::TryParse([string]$SettingValue, [ref]$n) -and $n -ge 0 -and $n -le 3) {
+        if ($n -band 1) { $success = $true }
+        if ($n -band 2) { $failure = $true }
+        return @{ Success = $success; Failure = $failure; Value = $n }
+    }
+    $text = [string]$Inclusion
+    if ($text -match '(?i)success') { $success = $true }
+    if ($text -match '(?i)failure') { $failure = $true }
+    $value = 0
+    if ($success) { $value = $value -bor 1 }
+    if ($failure) { $value = $value -bor 2 }
+    return @{ Success = $success; Failure = $failure; Value = $value }
+}
+
+function ConvertFrom-AuditPolRaw {
+    param(
+        [string[]]$Lines,
+        [guid]$Guid
+    )
+    if ($null -eq $Lines) { return $null }
+    $bare = $Guid.ToString('D')
+    foreach ($line in $Lines) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        if ($line -match '(?i)^Machine Name,') { continue }
+        if ($line -notmatch [regex]::Escape($bare)) { continue }
+        $fields = $line.Split(',')
+        $guidIndex = -1
+        for ($i = 0; $i -lt $fields.Length; $i++) {
+            if ($fields[$i] -match [regex]::Escape($bare)) { $guidIndex = $i; break }
+        }
+        if ($guidIndex -lt 0) { continue }
+        $inclusion = ''
+        $settingValue = $null
+        if ($fields.Length -gt ($guidIndex + 1)) { $inclusion = $fields[$guidIndex + 1].Trim() }
+        for ($j = $fields.Length - 1; $j -gt $guidIndex; $j--) {
+            $parsed = 0
+            $cell = $fields[$j].Trim()
+            if ($cell -match '^\d+$' -and [int]::TryParse($cell, [ref]$parsed) -and $parsed -ge 0 -and $parsed -le 3) {
+                $settingValue = $parsed
+                break
+            }
+        }
+        $flags = ConvertTo-AuditFlagPair -Inclusion $inclusion -SettingValue $settingValue
+        $flags['Inclusion'] = $inclusion
+        $flags['Found'] = $true
+        return $flags
+    }
+    return $null
+}
+
+function Get-AuditPolSettingLabel {
+    param($Flags)
+    if ($null -eq $Flags) { return 'Unknown' }
+    if ($Flags.Success -and $Flags.Failure) { return 'Success and Failure' }
+    if ($Flags.Success) { return 'Success' }
+    if ($Flags.Failure) { return 'Failure' }
+    return 'No Auditing'
+}
+
+function Invoke-AuditPolRaw {
+    param(
+        [string]$ComputerName,
+        [guid[]]$Guids
+    )
+    $guidArgs = ($Guids | ForEach-Object { $_.ToString('B') }) -join ','
+    $scriptBlock = {
+        param($SubcategoryArg)
+        $exe = Join-Path $env:SystemRoot 'System32\auditpol.exe'
+        if (-not (Test-Path -LiteralPath $exe)) { return @() }
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $output = & $exe @('/get', "/subcategory:$SubcategoryArg", '/r') 2>&1 | ForEach-Object { [string]$_ }
+            if (-not $output -or ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne $null)) {
+                $output = & $exe @('/get', "/subcategory:$SubcategoryArg") 2>&1 | ForEach-Object { [string]$_ }
+            }
+            return @($output)
+        } finally {
+            $ErrorActionPreference = $prev
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ComputerName) -or (Test-IsLocalComputerName $ComputerName)) {
+        return @(& $scriptBlock $guidArgs)
+    }
+
+    try {
+        $option = New-PSSessionOption -OpenTimeout 8000 -OperationTimeout 20000
+        $sessSplat = @{
+            ComputerName  = $ComputerName
+            SessionOption = $option
+            ErrorAction   = 'Stop'
+        }
+        if ($script:Credential) { $sessSplat['Credential'] = $script:Credential }
+        $session = New-PSSession @sessSplat
+        try {
+            return @(Invoke-Command -Session $session -ScriptBlock $scriptBlock -ArgumentList $guidArgs -ErrorAction Stop)
+        } finally {
+            Remove-PSSession -Session $session -ErrorAction SilentlyContinue
+        }
+    } catch {
+        return $null
+    }
+}
+
+function Test-SecurityEventIdPresent {
+    param(
+        [string]$ComputerName,
+        [int]$EventId
+    )
+    try {
+        $splat = @{
+            FilterHashtable = @{ LogName = 'Security'; Id = $EventId }
+            MaxEvents       = 1
+            ErrorAction     = 'Stop'
+        }
+        if ($script:Credential) { $splat['Credential'] = $script:Credential }
+        if (-not [string]::IsNullOrWhiteSpace($ComputerName) -and -not (Test-IsLocalComputerName $ComputerName)) {
+            $splat['ComputerName'] = $ComputerName
+        }
+        $events = @(Get-WinEvent @splat)
+        return ($events.Count -gt 0)
+    } catch {
+        if (Test-IsNoMatchingEventsError $_) { return $false }
+        throw
+    }
+}
+
+function Get-KerberosAuditStatus {
+    param(
+        [string]$ComputerName,
+        [switch]$NeedFailures
+    )
+    $name = $ComputerName
+    if ([string]::IsNullOrWhiteSpace($name)) { $name = '.' }
+    $asGuid = [guid]'0cce9242-69ae-11d9-bed3-505054503030'
+    $tgsGuid = [guid]'0cce9240-69ae-11d9-bed3-505054503030'
+    $asFlags = $null
+    $tgsFlags = $null
+    $source = 'unavailable'
+    $errorText = ''
+    $event4768 = $null
+    $event4769 = $null
+
+    try {
+        $raw = Invoke-AuditPolRaw -ComputerName $name -Guids @($asGuid, $tgsGuid)
+        if ($null -ne $raw) {
+            $asFlags = ConvertFrom-AuditPolRaw -Lines $raw -Guid $asGuid
+            $tgsFlags = ConvertFrom-AuditPolRaw -Lines $raw -Guid $tgsGuid
+            if ($asFlags -or $tgsFlags) { $source = 'auditpol' }
+        }
+    } catch {
+        $errorText = $_.Exception.Message
+    }
+
+    if ($source -ne 'auditpol') {
+        try {
+            $event4768 = Test-SecurityEventIdPresent -ComputerName $name -EventId 4768
+            $event4769 = Test-SecurityEventIdPresent -ComputerName $name -EventId 4769
+            $source = 'events'
+        } catch {
+            if ([string]::IsNullOrWhiteSpace($errorText)) { $errorText = $_.Exception.Message }
+            $source = 'unavailable'
+        }
+    }
+
+    $asSuccess = $false
+    $asFailure = $false
+    $tgsSuccess = $false
+    $tgsFailure = $false
+    if ($asFlags) { $asSuccess = [bool]$asFlags.Success; $asFailure = [bool]$asFlags.Failure }
+    if ($tgsFlags) { $tgsSuccess = [bool]$tgsFlags.Success; $tgsFailure = [bool]$tgsFlags.Failure }
+    if ($source -eq 'events') {
+        $asSuccess = [bool]$event4768
+        $tgsSuccess = [bool]$event4769
+    }
+
+    $fullyReady = ($asSuccess -and $tgsSuccess)
+    if ($NeedFailures) { $fullyReady = $fullyReady -and $asFailure -and $tgsFailure }
+    $partialReady = ($asSuccess -or $tgsSuccess -or [bool]$event4768 -or [bool]$event4769)
+
+    $asLabel = if ($asFlags) { Get-AuditPolSettingLabel $asFlags } elseif ($source -eq 'events') { if ($event4768) { 'Events present' } else { 'No 4768 events found' } } else { 'Unknown' }
+    $tgsLabel = if ($tgsFlags) { Get-AuditPolSettingLabel $tgsFlags } elseif ($source -eq 'events') { if ($event4769) { 'Events present' } else { 'No 4769 events found' } } else { 'Unknown' }
+
+    $summary = if ($fullyReady) {
+        "Kerberos auditing is ON on $name (4768=$asLabel, 4769=$tgsLabel) [$source]"
+    } elseif ($partialReady) {
+        "Kerberos auditing is PARTIAL on $name (4768=$asLabel, 4769=$tgsLabel) [$source]"
+    } elseif ($source -eq 'unavailable') {
+        "Could not determine Kerberos auditing on ${name}: $errorText"
+    } else {
+        "Kerberos auditing appears OFF on $name (4768=$asLabel, 4769=$tgsLabel) [$source]"
+    }
+
+    return [pscustomobject]@{
+        Computer     = $name
+        Source       = $source
+        AsSuccess    = $asSuccess
+        AsFailure    = $asFailure
+        TgsSuccess   = $tgsSuccess
+        TgsFailure   = $tgsFailure
+        Event4768Seen = $event4768
+        Event4769Seen = $event4769
+        FullyReady   = $fullyReady
+        PartialReady = $partialReady
+        AsLabel      = $asLabel
+        TgsLabel     = $tgsLabel
+        Summary      = $summary
+        Error        = $errorText
+    }
+}
+
+function Invoke-KerberosAuditPreflight {
+    param(
+        [object[]]$Targets,
+        [switch]$NeedFailures,
+        [switch]$RequireAuditing,
+        [switch]$SkipAuditCheck
+    )
+    if ($SkipAuditCheck) { return $true }
+    $dcs = @($Targets | Where-Object { $_.Kind -eq 'dc' })
+    if ($dcs.Count -lt 1) { return $true }
+
+    $blocked = New-Object System.Collections.Generic.List[string]
+    $partial = New-Object System.Collections.Generic.List[string]
+    foreach ($dc in $dcs) {
+        if (Test-IsCollectorCancelRequested) { return $false }
+        Write-CollectorStatus "Checking Kerberos auditing on $($dc.Name)..."
+        $status = Get-KerberosAuditStatus -ComputerName $dc.Name -NeedFailures:$NeedFailures
+        if ($status.FullyReady) {
+            Write-CollectorStatus $status.Summary 'SUCCESS'
+        } elseif ($status.PartialReady) {
+            Write-CollectorStatus $status.Summary 'WARN'
+            [void]$partial.Add($status.Summary)
+        } else {
+            Write-CollectorStatus $status.Summary 'WARN'
+            [void]$blocked.Add($status.Summary)
+        }
+    }
+
+    if ($blocked.Count -lt 1 -and $partial.Count -lt 1) { return $true }
+
+    $detail = @($blocked + $partial) -join [Environment]::NewLine
+    if ($RequireAuditing) {
+        throw "Kerberos auditing is not fully enabled. Refusing to watch logs.`nEnable 'Audit Kerberos Authentication Service' and 'Audit Kerberos Service Ticket Operations' (Success) on the DCs, or omit -RequireAuditing.`n$detail"
+    }
+    Write-CollectorStatus 'Continuing even though Kerberos auditing may be incomplete. Use -RequireAuditing to abort. Enable the Account Logon Kerberos subcategories if you expected events.' 'WARN'
+    return $true
+}
+
 function Invoke-KerberosCollection {
     param(
         [object[]]$Targets,
@@ -738,7 +1014,9 @@ function Invoke-KerberosCollection {
         [int]$PollSeconds = 5,
         [int]$LiveMinutes = 0,
         [int]$MaxHistoryEventsPerDC = 100000,
-        [int]$LivePageSize = 20000
+        [int]$LivePageSize = 20000,
+        [switch]$SkipAuditCheck,
+        [switch]$RequireAuditing
     )
     if ($null -eq $Targets -or $Targets.Count -lt 1) {
         throw 'Specify at least one domain controller or EVTX file.'
@@ -750,6 +1028,10 @@ function Invoke-KerberosCollection {
     foreach ($target in $Targets) {
         $lastId[$target.Key] = [int64]0
         $lastScan[$target.Key] = Get-Date
+    }
+
+    if (-not (Invoke-KerberosAuditPreflight -Targets $Targets -NeedFailures:$script:DoIncludeFailures -RequireAuditing:$RequireAuditing -SkipAuditCheck:$SkipAuditCheck)) {
+        return
     }
 
     $targetNames = @($Targets | ForEach-Object { if ($_.Kind -eq 'evtx') { $_.Path } else { $_.Name } })
@@ -1215,6 +1497,48 @@ function Complete-UiCollector {
     $script:Ui.Timer.Stop()
 }
 
+function Get-UiKerberosAuditStatuses {
+    $dcs = @(Get-UiCheckedTargets | Where-Object { $_.Kind -eq 'dc' })
+    $statuses = @()
+    if ($dcs.Count -lt 1) { return $statuses }
+    $script:Credential = $script:Ui.Credential
+    $needFail = $false
+    if ($script:Ui.ChkFailures) { $needFail = [bool]$script:Ui.ChkFailures.Checked }
+    if ($script:Ui.Form) { $script:Ui.Form.UseWaitCursor = $true }
+    try {
+        foreach ($t in $dcs) {
+            Add-UiLogLine "[INFO] Checking Kerberos auditing on $($t.Name)..."
+            try { [System.Windows.Forms.Application]::DoEvents() } catch { }
+            $status = Get-KerberosAuditStatus -ComputerName $t.Name -NeedFailures:$needFail
+            $level = if ($status.FullyReady) { 'INFO' } else { 'WARN' }
+            Add-UiLogLine "[$level] $($status.Summary)"
+            $statuses += $status
+        }
+    } finally {
+        if ($script:Ui.Form) { $script:Ui.Form.UseWaitCursor = $false }
+    }
+    return $statuses
+}
+
+function Confirm-UiKerberosAuditing {
+    $dcs = @(Get-UiCheckedTargets | Where-Object { $_.Kind -eq 'dc' })
+    if ($dcs.Count -lt 1) { return $true }
+    $statuses = @(Get-UiKerberosAuditStatuses)
+    $notFully = @($statuses | Where-Object { -not $_.FullyReady })
+    if ($notFully.Count -lt 1) { return $true }
+    $msg = (($notFully | ForEach-Object { $_.Summary }) -join [Environment]::NewLine)
+    $msg += [Environment]::NewLine + [Environment]::NewLine + "Enable Account Logon > Kerberos Authentication Service (event 4768) and Kerberos Service Ticket Operations (event 4769) with Success. This tool does not change audit policy."
+    $require = $false
+    if ($script:Ui.ChkRequireAudit) { $require = [bool]$script:Ui.ChkRequireAudit.Checked }
+    if ($require) {
+        [System.Windows.Forms.MessageBox]::Show($msg, 'Kerberos auditing not enabled', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        return $false
+    }
+    $msg += [Environment]::NewLine + [Environment]::NewLine + 'Continue watching logs anyway?'
+    $result = [System.Windows.Forms.MessageBox]::Show($msg, 'Kerberos auditing check', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning)
+    return ($result -eq [System.Windows.Forms.DialogResult]::Yes)
+}
+
 function Start-UiCollector {
     $targets = @(Get-UiCheckedTargets)
     if ($targets.Count -lt 1) {
@@ -1226,6 +1550,8 @@ function Start-UiCollector {
         ) | Out-Null
         return
     }
+
+    if (-not (Confirm-UiKerberosAuditing)) { return }
 
     $hours = 24
     $poll = 5
@@ -1282,6 +1608,8 @@ function Start-UiCollector {
         LiveMinutes           = $liveMins
         MaxHistoryEventsPerDC = $MaxHistoryEventsPerDC
         LivePageSize          = $LivePageSize
+        SkipAuditCheck        = $true
+        RequireAuditing       = $false
         Targets               = @($targets | ForEach-Object {
             [pscustomobject]@{ Kind = $_.Kind; Name = $_.Name; Path = $_.Path; Key = $_.Key }
         })
@@ -1315,7 +1643,8 @@ function Start-UiCollector {
             Invoke-KerberosCollection -Targets $Settings.Targets -Mode $Settings.Mode `
                 -HoursBack $Settings.HoursBack -PollSeconds $Settings.PollSeconds `
                 -LiveMinutes $Settings.LiveMinutes `
-                -MaxHistoryEventsPerDC $Settings.MaxHistoryEventsPerDC -LivePageSize $Settings.LivePageSize
+                -MaxHistoryEventsPerDC $Settings.MaxHistoryEventsPerDC -LivePageSize $Settings.LivePageSize `
+                -SkipAuditCheck:$Settings.SkipAuditCheck -RequireAuditing:$Settings.RequireAuditing
         } catch {
             $Sync.Error = $_.Exception.Message
             $Sync.Status = $_.Exception.Message
@@ -1345,7 +1674,8 @@ function Show-KerberosRc4Gui {
         [bool]$InitialOffered = $false,
         [bool]$InitialFailures = $false,
         [bool]$InitialDns = $false,
-        [bool]$InitialAd = $false
+        [bool]$InitialAd = $false,
+        [bool]$InitialRequireAuditing = $false
     )
 
     try {
@@ -1505,6 +1835,12 @@ function Show-KerberosRc4Gui {
     $chkRodc.Text = 'Include RODCs when discovering'
     $chkRodc.Location = New-Object System.Drawing.Point(12, $y)
     $chkRodc.AutoSize = $true
+    $y += 24
+    $chkRequireAudit = New-Object System.Windows.Forms.CheckBox
+    $chkRequireAudit.Text = 'Abort if Kerberos auditing is off'
+    $chkRequireAudit.Location = New-Object System.Drawing.Point(12, $y)
+    $chkRequireAudit.AutoSize = $true
+    $chkRequireAudit.Checked = $InitialRequireAuditing
     $y += 32
 
     $lblOut = New-Object System.Windows.Forms.Label
@@ -1539,14 +1875,17 @@ function Show-KerberosRc4Gui {
     $btnCsv.Location = New-Object System.Drawing.Point(124, $y)
     $btnFolder = New-UiButton 'Open folder' 108 28
     $btnFolder.Location = New-Object System.Drawing.Point(228, $y)
+    $y += 34
+    $btnAudit = New-UiButton 'Check auditing' 332 28
+    $btnAudit.Location = New-Object System.Drawing.Point(12, $y)
 
     $left.Controls.AddRange(@(
         $lblTargets, $targetList, $btnDiscover, $btnAddDc, $btnAddEvtx, $btnRemove,
         $lblMode, $modeBox, $lblHours, $hoursBox, $lblPoll, $pollBox,
         $lblLive, $liveBox, $lblLiveHint,
-        $chkOffered, $chkFailures, $chkDns, $chkAd, $chkRodc,
+        $chkOffered, $chkFailures, $chkDns, $chkAd, $chkRodc, $chkRequireAudit,
         $lblOut, $outputBox, $btnBrowse, $btnStart, $btnStop, $btnCred,
-        $btnHtml, $btnCsv, $btnFolder
+        $btnHtml, $btnCsv, $btnFolder, $btnAudit
     ))
 
     $right = New-Object System.Windows.Forms.Panel
@@ -1618,6 +1957,7 @@ function Show-KerberosRc4Gui {
         ChkDns          = $chkDns
         ChkAd           = $chkAd
         ChkRodc         = $chkRodc
+        ChkRequireAudit = $chkRequireAudit
         OutputBox       = $outputBox
         StartButton     = $btnStart
         StopButton      = $btnStop
@@ -1722,6 +2062,21 @@ function Show-KerberosRc4Gui {
             [System.Windows.Forms.MessageBox]::Show('No CSV yet. Run a collection first.', 'Open CSV', 'OK', 'Information') | Out-Null
         }
     })
+    $btnAudit.add_Click({
+        $dcs = @(Get-UiCheckedTargets | Where-Object { $_.Kind -eq 'dc' })
+        if ($dcs.Count -lt 1) {
+            [System.Windows.Forms.MessageBox]::Show('Check at least one domain controller first.', 'Check auditing', 'OK', 'Information') | Out-Null
+            return
+        }
+        $statuses = @(Get-UiKerberosAuditStatuses)
+        $notFully = @($statuses | Where-Object { -not $_.FullyReady })
+        if ($notFully.Count -lt 1) {
+            [System.Windows.Forms.MessageBox]::Show('Kerberos 4768/4769 auditing looks enabled on the selected DCs.', 'Check auditing', 'OK', 'Information') | Out-Null
+        } else {
+            $msg = (($notFully | ForEach-Object { $_.Summary }) -join [Environment]::NewLine)
+            [System.Windows.Forms.MessageBox]::Show($msg, 'Kerberos auditing check', 'OK', 'Warning') | Out-Null
+        }
+    })
     $btnFolder.add_Click({
         $path = $outputBox.Text.Trim()
         if (-not (Test-Path -LiteralPath $path)) { New-Item -Path $path -ItemType Directory -Force | Out-Null }
@@ -1793,6 +2148,8 @@ function Start-InteractiveUi {
         if ($IncludeFailures) { [void]$argList.Add('-IncludeFailures') }
         if ($ResolveHostnames) { [void]$argList.Add('-ResolveHostnames') }
         if ($EnrichAD) { [void]$argList.Add('-EnrichAD') }
+        if ($SkipAuditCheck) { [void]$argList.Add('-SkipAuditCheck') }
+        if ($RequireAuditing) { [void]$argList.Add('-RequireAuditing') }
         if ($OutputFolder) { [void]$argList.Add('-OutputFolder'); [void]$argList.Add($OutputFolder) }
         Write-Host 'Relaunching in STA apartment for the interactive UI...' -ForegroundColor Gray
         Start-Process -FilePath $procPath -ArgumentList $argList.ToArray()
@@ -1803,7 +2160,7 @@ function Start-InteractiveUi {
         -InitialLiveMinutes $LiveMinutes `
         -InitialOutput $OutputFolder -InitialOffered ([bool]$IncludeOffered) `
         -InitialFailures ([bool]$IncludeFailures) -InitialDns ([bool]$ResolveHostnames) `
-        -InitialAd ([bool]$EnrichAD)
+        -InitialAd ([bool]$EnrichAD) -InitialRequireAuditing ([bool]$RequireAuditing)
 }
 
 # ---------------------------------------------------------------------------
@@ -2096,6 +2453,37 @@ function Invoke-KerberosRc4SelfTest {
     Assert-True -Condition ($statusText -match '20m 00s remaining' -and $statusText -match 'findings 4') `
         -Name 'Status text shows remaining live-watch time and finding count'
 
+    $asGuid = [guid]'0cce9242-69ae-11d9-bed3-505054503030'
+    $tgsGuid = [guid]'0cce9240-69ae-11d9-bed3-505054503030'
+    $guidMap = Get-KerberosAuditGuidMap
+    Assert-True -Condition ($guidMap['Kerberos Authentication Service'] -eq $asGuid) `
+        -Name '4768 maps to Kerberos Authentication Service GUID 0cce9242'
+    Assert-True -Condition ($guidMap['Kerberos Service Ticket Operations'] -eq $tgsGuid) `
+        -Name '4769 maps to Kerberos Service Ticket Operations GUID 0cce9240'
+    $both = ConvertTo-AuditFlagPair -Inclusion 'Success and Failure' -SettingValue 3
+    Assert-True -Condition ($both.Success -and $both.Failure) -Name 'Setting value 3 is Success and Failure'
+    $succ = ConvertTo-AuditFlagPair -Inclusion 'Success' -SettingValue 1
+    Assert-True -Condition ($succ.Success -and -not $succ.Failure) -Name 'Setting value 1 is Success only'
+    $none = ConvertTo-AuditFlagPair -Inclusion 'No Auditing' -SettingValue 0
+    Assert-True -Condition (-not $none.Success -and -not $none.Failure) -Name 'Setting value 0 is No Auditing'
+    $rawLines = @(
+        'Machine Name,Policy Target,Subcategory,Subcategory GUID,Inclusion Setting,Exclusion Setting,Setting Value',
+        'DC01,System,Kerberos Authentication Service,{0CCE9242-69AE-11D9-BED3-505054503030},Success and Failure,,3',
+        'DC01,System,Kerberos Service Ticket Operations,{0CCE9240-69AE-11D9-BED3-505054503030},No Auditing,,0'
+    )
+    $parsedAs = ConvertFrom-AuditPolRaw -Lines $rawLines -Guid $asGuid
+    $parsedTgs = ConvertFrom-AuditPolRaw -Lines $rawLines -Guid $tgsGuid
+    Assert-True -Condition ($parsedAs.Success -and $parsedAs.Failure) `
+        -Name 'auditpol /r parser reads Success and Failure for the AS subcategory'
+    Assert-True -Condition (-not $parsedTgs.Success -and -not $parsedTgs.Failure) `
+        -Name 'auditpol /r parser reads No Auditing for the TGS subcategory'
+    Assert-True -Condition ($null -eq (ConvertFrom-AuditPolRaw -Lines $rawLines -Guid ([guid]'0cce9243-69ae-11d9-bed3-505054503030'))) `
+        -Name 'Parser ignores unrelated audit subcategories such as NPS'
+    Assert-True -Condition ((Get-AuditPolSettingLabel $none) -eq 'No Auditing') `
+        -Name 'No-auditing flags render as No Auditing'
+    $skipOk = Invoke-KerberosAuditPreflight -Targets @([pscustomobject]@{ Kind = 'evtx'; Name = 'x.evtx' }) -SkipAuditCheck
+    Assert-True -Condition ($skipOk -eq $true) -Name 'EVTX-only / -SkipAuditCheck preflight does not block collection'
+
     Write-Host ''
     Write-Host ('  {0} passed, {1} failed' -f $script:SelfTestPassed, $script:SelfTestFailed) `
         -ForegroundColor $(if ($script:SelfTestFailed) { 'Red' } else { 'Green' })
@@ -2142,5 +2530,6 @@ if ($targets.Count -lt 1) {
 
 Invoke-KerberosCollection -Targets $targets -Mode $Mode -HoursBack $HoursBack -PollSeconds $PollSeconds `
     -LiveMinutes $LiveMinutes `
-    -MaxHistoryEventsPerDC $MaxHistoryEventsPerDC -LivePageSize $LivePageSize
+    -MaxHistoryEventsPerDC $MaxHistoryEventsPerDC -LivePageSize $LivePageSize `
+    -SkipAuditCheck:$SkipAuditCheck -RequireAuditing:$RequireAuditing
 
