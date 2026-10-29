@@ -84,6 +84,11 @@
   - Live loop had no per-DC catch; one locked CSV or parse error stopped monitoring.
   - HTML replace used Move-Item, which fails when a browser has the report open.
   - AD lookup did not split HOST/service SPNs, so service enrichment usually missed.
+  - StrictMode 2.0 crashed on .Count after an empty Get-WinEvent result unwrapped to $null.
+    Empty and single-event results are comma-wrapped and counted with Get-CollectionCount.
+  - Access-denied Security-log / WinRM failures used Write-Warning, so the GUI only showed
+    "Attempted to perform an unauthorized operation." Collector and audit-check paths now
+    log Event Log Readers / WinRM guidance once per target.
 #>
 [CmdletBinding()]
 param(
@@ -118,6 +123,7 @@ $script:UiSync = $null
 $script:CsvPath = ''
 $script:HtmlPath = ''
 $script:CancelRequested = $false
+$script:ReportedAccessDenied = @{}
 $script:DnsTimeoutMs = 750
 $script:DoIncludeFailures = $false
 $script:Ui = $null
@@ -247,6 +253,80 @@ function Test-IsNoMatchingEventsError {
         $message -match 'No events were found' -or
         $message -match 'No matching events found'
     )
+}
+
+function Test-IsAccessDeniedError {
+    param($ErrorRecord)
+    if ($null -eq $ErrorRecord) { return $false }
+    $ex = $null
+    $message = ''
+    $fqid = ''
+    try { $ex = $ErrorRecord.Exception } catch { }
+    try { $fqid = [string]$ErrorRecord.FullyQualifiedErrorId } catch { }
+    if ($null -ne $ex) {
+        if ($ex -is [System.UnauthorizedAccessException]) { return $true }
+        try {
+            if ($ex.InnerException -is [System.UnauthorizedAccessException]) { return $true }
+        } catch { }
+        try { $message = [string]$ex.Message } catch { }
+    }
+    if ([string]::IsNullOrWhiteSpace($message)) {
+        try { $message = [string]$ErrorRecord } catch { }
+    }
+    return (
+        $fqid -match 'UnauthorizedAccess' -or
+        $message -match '(?i)unauthorized operation' -or
+        $message -match '(?i)access is denied' -or
+        $message -match '(?i)access denied' -or
+        $message -match '(?i)not authorized'
+    )
+}
+
+function Get-AccessDeniedGuidance {
+    param(
+        [string]$Target,
+        [string]$Message,
+        [string]$Action = 'read the Security log'
+    )
+    $suffix = ''
+    if (-not [string]::IsNullOrWhiteSpace($Message)) { $suffix = " $Message" }
+    return "Access denied while trying to $Action on ${Target}. Use an account in Event Log Readers (or Domain Admins). Security-log reads use Event Log RPC; remote auditpol uses WinRM.$suffix"
+}
+
+function Write-AccessDeniedOnce {
+    param(
+        [string]$Target,
+        [string]$Message
+    )
+    if ($null -eq $script:ReportedAccessDenied) { $script:ReportedAccessDenied = @{} }
+    $key = [string]$Target
+    if ([string]::IsNullOrWhiteSpace($key)) { $key = '.' }
+    if ($script:ReportedAccessDenied.ContainsKey($key)) { return }
+    $script:ReportedAccessDenied[$key] = $true
+    Write-CollectorStatus $Message 'ERROR'
+}
+
+function Get-CollectionCount {
+    param($Value)
+    if ($null -eq $Value) { return 0 }
+    if ($Value -is [string]) { return 1 }
+    if ($Value -is [System.Collections.ICollection]) { return [int]$Value.Count }
+    return 1
+}
+
+function ConvertTo-EventArray {
+    param($Value)
+    if ($null -eq $Value) { return ,([object[]]@()) }
+    if ($Value -is [object[]]) { return ,$Value }
+    if ($Value -is [System.Array]) { return ,([object[]]$Value) }
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        $list = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($item in $Value) {
+            if ($null -ne $item) { [void]$list.Add($item) }
+        }
+        return ,$list.ToArray()
+    }
+    return ,([object[]]@($Value))
 }
 
 function Get-EventXmlText {
@@ -677,6 +757,7 @@ function Initialize-CollectorSession {
     $script:DnsTimeoutMs = $DnsTimeout
     $script:QuietHost = $Quiet
     $script:CancelRequested = $false
+    $script:ReportedAccessDenied = @{}
     $script:Utf8NoBom = New-Object System.Text.UTF8Encoding $false
     $script:DnsCache = @{}
     $script:AdCache = @{}
@@ -842,6 +923,7 @@ function Invoke-AuditPolRaw {
         return @(& $scriptBlock $guidArgs)
     }
 
+    $session = $null
     try {
         $option = New-PSSessionOption -OpenTimeout 8000 -OperationTimeout 20000
         $sessSplat = @{
@@ -851,13 +933,11 @@ function Invoke-AuditPolRaw {
         }
         if ($script:Credential) { $sessSplat['Credential'] = $script:Credential }
         $session = New-PSSession @sessSplat
-        try {
-            return @(Invoke-Command -Session $session -ScriptBlock $scriptBlock -ArgumentList $guidArgs -ErrorAction Stop)
-        } finally {
+        return @(Invoke-Command -Session $session -ScriptBlock $scriptBlock -ArgumentList $guidArgs -ErrorAction Stop)
+    } finally {
+        if ($null -ne $session) {
             Remove-PSSession -Session $session -ErrorAction SilentlyContinue
         }
-    } catch {
-        return $null
     }
 }
 
@@ -876,8 +956,8 @@ function Test-SecurityEventIdPresent {
         if (-not [string]::IsNullOrWhiteSpace($ComputerName) -and -not (Test-IsLocalComputerName $ComputerName)) {
             $splat['ComputerName'] = $ComputerName
         }
-        $events = @(Get-WinEvent @splat)
-        return ($events.Count -gt 0)
+        $events = ConvertTo-EventArray (Get-WinEvent @splat)
+        return ((Get-CollectionCount $events) -gt 0)
     } catch {
         if (Test-IsNoMatchingEventsError $_) { return $false }
         throw
@@ -909,6 +989,9 @@ function Get-KerberosAuditStatus {
         }
     } catch {
         $errorText = $_.Exception.Message
+        if (Test-IsAccessDeniedError $_) {
+            $errorText = Get-AccessDeniedGuidance -Target $name -Message $_.Exception.Message -Action 'query audit policy'
+        }
     }
 
     if ($source -ne 'auditpol') {
@@ -917,7 +1000,11 @@ function Get-KerberosAuditStatus {
             $event4769 = Test-SecurityEventIdPresent -ComputerName $name -EventId 4769
             $source = 'events'
         } catch {
-            if ([string]::IsNullOrWhiteSpace($errorText)) { $errorText = $_.Exception.Message }
+            if (Test-IsAccessDeniedError $_) {
+                $errorText = Get-AccessDeniedGuidance -Target $name -Message $_.Exception.Message -Action 'read Security events 4768/4769'
+            } elseif ([string]::IsNullOrWhiteSpace($errorText)) {
+                $errorText = $_.Exception.Message
+            }
             $source = 'unavailable'
         }
     }
@@ -1018,7 +1105,7 @@ function Invoke-KerberosCollection {
         [switch]$SkipAuditCheck,
         [switch]$RequireAuditing
     )
-    if ($null -eq $Targets -or $Targets.Count -lt 1) {
+    if ((Get-CollectionCount $Targets) -lt 1) {
         throw 'Specify at least one domain controller or EVTX file.'
     }
     $controllers = @($Targets | Where-Object { $_.Kind -eq 'dc' } | ForEach-Object { $_.Name })
@@ -1054,11 +1141,13 @@ function Invoke-KerberosCollection {
             if (Test-IsCollectorCancelRequested) { break }
             Write-CollectorStatus "Historical query $($target.Name) since $since"
             if ($target.Kind -eq 'evtx') {
-                $events = Read-KerberosEvents -Path $target.Path -Since $since -Max $MaxHistoryEventsPerDC
+                $events = ConvertTo-EventArray (Read-KerberosEvents -Path $target.Path -Since $since -Max $MaxHistoryEventsPerDC)
             } else {
-                $events = Read-KerberosEvents -ComputerName $target.Name -Since $since -Max $MaxHistoryEventsPerDC
+                $events = ConvertTo-EventArray (Read-KerberosEvents -ComputerName $target.Name -Since $since -Max $MaxHistoryEventsPerDC)
             }
-            if ($events.Count -ge $MaxHistoryEventsPerDC) {
+            $eventCount = Get-CollectionCount $events
+            Write-CollectorStatus "Read $eventCount Kerberos event(s) from $($target.Name)."
+            if ($eventCount -ge $MaxHistoryEventsPerDC) {
                 Write-CollectorStatus "Hit MaxHistoryEventsPerDC ($MaxHistoryEventsPerDC) on $($target.Name). Older matching events in the window were not read." 'WARN'
             }
             $n = 0
@@ -1117,8 +1206,9 @@ function Invoke-KerberosCollection {
                     $useRecordIdOnly = ($lastId[$dc] -gt 0)
                     $caughtUp = $false
                     while (-not $caughtUp -and -not (Test-IsCollectorCancelRequested)) {
-                        $page = Read-KerberosEvents -ComputerName $dc -Since $since -Max $LivePageSize -AfterRecordId $lastId[$dc] -Oldest -RecordIdOnly:$useRecordIdOnly
-                        if ($page.Count -lt 1) { $caughtUp = $true; break }
+                        $page = ConvertTo-EventArray (Read-KerberosEvents -ComputerName $dc -Since $since -Max $LivePageSize -AfterRecordId $lastId[$dc] -Oldest -RecordIdOnly:$useRecordIdOnly)
+                        $pageCount = Get-CollectionCount $page
+                        if ($pageCount -lt 1) { $caughtUp = $true; break }
                         foreach ($ev in $page) {
                             $rid = [int64]$ev.RecordId
                             if ($rid -le $lastId[$dc]) { continue }
@@ -1126,7 +1216,7 @@ function Invoke-KerberosCollection {
                             $row = Convert-KerberosEvent $ev $dc
                             if ($null -ne $row) { Save-Finding $row }
                         }
-                        if ($page.Count -lt $LivePageSize) { $caughtUp = $true }
+                        if ($pageCount -lt $LivePageSize) { $caughtUp = $true }
                         $useRecordIdOnly = ($lastId[$dc] -gt 0)
                     }
                     $lastScan[$dc] = Get-Date
@@ -1216,31 +1306,48 @@ function Read-KerberosEvents {
         [switch]$Oldest,
         [switch]$RecordIdOnly
     )
+    $list = New-Object 'System.Collections.Generic.List[object]'
     try {
         if ($Path) {
             $xpath = "*[System[(EventID=4768 or EventID=4769) and TimeCreated[@SystemTime>='$($Since.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ'))']]]"
             $splat = Get-WinEventSplat -Path $Path -FilterXPath $xpath -MaxEvents $Max -Oldest:$Oldest
-            return @(Get-WinEvent @splat)
+            $raw = @(Get-WinEvent @splat)
+        } else {
+            $query = New-KerberosQueryXml -Since $Since -AfterRecordId $AfterRecordId -RecordIdOnly:$RecordIdOnly
+            $splat = Get-WinEventSplat -ComputerName $ComputerName -FilterXml ([xml]$query) -MaxEvents $Max -Oldest:$Oldest
+            $raw = @(Get-WinEvent @splat)
         }
-        $query = New-KerberosQueryXml -Since $Since -AfterRecordId $AfterRecordId -RecordIdOnly:$RecordIdOnly
-        $splat = Get-WinEventSplat -ComputerName $ComputerName -FilterXml ([xml]$query) -MaxEvents $Max -Oldest:$Oldest
-        return @(Get-WinEvent @splat)
+        foreach ($item in $raw) {
+            if ($null -ne $item) { [void]$list.Add($item) }
+        }
     } catch {
-        if (Test-IsNoMatchingEventsError $_) { return @() }
+        if (Test-IsNoMatchingEventsError $_) { return ,([object[]]@()) }
         $target = if ($Path) { $Path } else { $ComputerName }
-        Write-Warning "Cannot read Security events from ${target}: $($_.Exception.Message)"
-        return @()
+        $msg = $_.Exception.Message
+        if (Test-IsAccessDeniedError $_) {
+            Write-AccessDeniedOnce -Target $target -Message (Get-AccessDeniedGuidance -Target $target -Message $msg -Action 'read the Security log')
+        } else {
+            Write-CollectorStatus "Cannot read Security events from ${target}: $msg" 'WARN'
+        }
+        return ,([object[]]@())
     }
+    return ,$list.ToArray()
 }
 
 function Get-NewestSecurityRecordId {
     param([string]$ComputerName)
     try {
         $splat = Get-WinEventSplat -ComputerName $ComputerName -MaxEvents 1
-        $newest = @(Get-WinEvent @splat)
-        if ($newest.Count -gt 0) { return [int64]$newest[0].RecordId }
+        $newest = ConvertTo-EventArray (Get-WinEvent @splat)
+        if ((Get-CollectionCount $newest) -gt 0) { return [int64]$newest[0].RecordId }
     } catch {
-        Write-Warning "Unable to read newest Security record on ${ComputerName}: $($_.Exception.Message)"
+        if (Test-IsNoMatchingEventsError $_) { return [int64]0 }
+        $msg = $_.Exception.Message
+        if (Test-IsAccessDeniedError $_) {
+            Write-AccessDeniedOnce -Target $ComputerName -Message (Get-AccessDeniedGuidance -Target $ComputerName -Message $msg -Action 'read the newest Security record')
+        } else {
+            Write-CollectorStatus "Unable to read newest Security record on ${ComputerName}: $msg" 'WARN'
+        }
     }
     return [int64]0
 }
@@ -1509,10 +1616,26 @@ function Get-UiKerberosAuditStatuses {
         foreach ($t in $dcs) {
             Add-UiLogLine "[INFO] Checking Kerberos auditing on $($t.Name)..."
             try { [System.Windows.Forms.Application]::DoEvents() } catch { }
-            $status = Get-KerberosAuditStatus -ComputerName $t.Name -NeedFailures:$needFail
-            $level = if ($status.FullyReady) { 'INFO' } else { 'WARN' }
-            Add-UiLogLine "[$level] $($status.Summary)"
-            $statuses += $status
+            try {
+                $status = Get-KerberosAuditStatus -ComputerName $t.Name -NeedFailures:$needFail
+                $level = if ($status.FullyReady) { 'INFO' } else { 'WARN' }
+                Add-UiLogLine "[$level] $($status.Summary)"
+                $statuses += $status
+            } catch {
+                $msg = $_.Exception.Message
+                if (Test-IsAccessDeniedError $_) {
+                    $msg = Get-AccessDeniedGuidance -Target $t.Name -Message $_.Exception.Message -Action 'check Kerberos auditing'
+                }
+                Add-UiLogLine "[ERROR] $msg"
+                $statuses += [pscustomobject]@{
+                    Computer     = $t.Name
+                    Source       = 'unavailable'
+                    FullyReady   = $false
+                    PartialReady = $false
+                    Summary      = $msg
+                    Error        = $msg
+                }
+            }
         }
     } finally {
         if ($script:Ui.Form) { $script:Ui.Form.UseWaitCursor = $false }
@@ -1521,27 +1644,44 @@ function Get-UiKerberosAuditStatuses {
 }
 
 function Confirm-UiKerberosAuditing {
-    $dcs = @(Get-UiCheckedTargets | Where-Object { $_.Kind -eq 'dc' })
-    if ($dcs.Count -lt 1) { return $true }
-    $statuses = @(Get-UiKerberosAuditStatuses)
-    $notFully = @($statuses | Where-Object { -not $_.FullyReady })
-    if ($notFully.Count -lt 1) { return $true }
-    $msg = (($notFully | ForEach-Object { $_.Summary }) -join [Environment]::NewLine)
-    $msg += [Environment]::NewLine + [Environment]::NewLine + "Enable Account Logon > Kerberos Authentication Service (event 4768) and Kerberos Service Ticket Operations (event 4769) with Success. This tool does not change audit policy."
-    $require = $false
-    if ($script:Ui.ChkRequireAudit) { $require = [bool]$script:Ui.ChkRequireAudit.Checked }
-    if ($require) {
-        [System.Windows.Forms.MessageBox]::Show($msg, 'Kerberos auditing not enabled', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
-        return $false
+    try {
+        $dcs = @(Get-UiCheckedTargets | Where-Object { $_.Kind -eq 'dc' })
+        if ($dcs.Count -lt 1) { return $true }
+        $statuses = @(Get-UiKerberosAuditStatuses)
+        $notFully = @($statuses | Where-Object { -not $_.FullyReady })
+        if ($notFully.Count -lt 1) { return $true }
+        $msg = (($notFully | ForEach-Object { $_.Summary }) -join [Environment]::NewLine)
+        $msg += [Environment]::NewLine + [Environment]::NewLine + "Enable Account Logon > Kerberos Authentication Service (event 4768) and Kerberos Service Ticket Operations (event 4769) with Success. This tool does not change audit policy."
+        $require = $false
+        if ($script:Ui.ChkRequireAudit) { $require = [bool]$script:Ui.ChkRequireAudit.Checked }
+        if ($require) {
+            [System.Windows.Forms.MessageBox]::Show($msg, 'Kerberos auditing not enabled', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+            return $false
+        }
+        $msg += [Environment]::NewLine + [Environment]::NewLine + 'Continue watching logs anyway?'
+        $result = [System.Windows.Forms.MessageBox]::Show($msg, 'Kerberos auditing check', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning)
+        return ($result -eq [System.Windows.Forms.DialogResult]::Yes)
+    } catch {
+        $msg = $_.Exception.Message
+        if (Test-IsAccessDeniedError $_) {
+            $msg = Get-AccessDeniedGuidance -Target 'selected DC(s)' -Message $_.Exception.Message -Action 'check Kerberos auditing'
+        }
+        Add-UiLogLine "[ERROR] $msg"
+        $require = $false
+        if ($script:Ui.ChkRequireAudit) { $require = [bool]$script:Ui.ChkRequireAudit.Checked }
+        if ($require) {
+            [System.Windows.Forms.MessageBox]::Show($msg, 'Kerberos auditing check failed', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+            return $false
+        }
+        $msg += [Environment]::NewLine + [Environment]::NewLine + 'Continue watching logs anyway?'
+        $result = [System.Windows.Forms.MessageBox]::Show($msg, 'Kerberos auditing check failed', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning)
+        return ($result -eq [System.Windows.Forms.DialogResult]::Yes)
     }
-    $msg += [Environment]::NewLine + [Environment]::NewLine + 'Continue watching logs anyway?'
-    $result = [System.Windows.Forms.MessageBox]::Show($msg, 'Kerberos auditing check', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning)
-    return ($result -eq [System.Windows.Forms.DialogResult]::Yes)
 }
 
 function Start-UiCollector {
     $targets = @(Get-UiCheckedTargets)
-    if ($targets.Count -lt 1) {
+    if ((Get-CollectionCount $targets) -lt 1) {
         [System.Windows.Forms.MessageBox]::Show(
             'Check at least one domain controller or EVTX file.',
             'No targets',
@@ -1551,6 +1691,7 @@ function Start-UiCollector {
         return
     }
 
+    try {
     if (-not (Confirm-UiKerberosAuditing)) { return }
 
     $hours = 24
@@ -1658,8 +1799,20 @@ function Start-UiCollector {
     $script:Ui.CollectorHandle = $ps.BeginInvoke()
     Set-UiRunningState $true
     $script:Ui.StatusLabel.Text = 'Starting collector...'
+    Add-UiLogLine ('---- {0} ----' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
     Add-UiLogLine '[INFO] Collector started.'
     $script:Ui.Timer.Start()
+    } catch {
+        $msg = $_.Exception.Message
+        if (Test-IsAccessDeniedError $_) {
+            $msg = Get-AccessDeniedGuidance -Target 'selected target(s)' -Message $_.Exception.Message -Action 'start collection'
+        }
+        Add-UiLogLine "[ERROR] $msg"
+        if ($script:Ui -and $script:Ui.StatusLabel) { $script:Ui.StatusLabel.Text = $msg }
+        try {
+            [System.Windows.Forms.MessageBox]::Show($msg, 'Start failed', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        } catch { }
+    }
 }
 
 function Show-KerberosRc4Gui {
@@ -2046,7 +2199,19 @@ function Show-KerberosRc4Gui {
             Add-UiLogLine '[WARN] Credential prompt cancelled.'
         }
     })
-    $btnStart.add_Click({ Start-UiCollector })
+    $btnStart.add_Click({
+        try {
+            Start-UiCollector
+        } catch {
+            $msg = $_.Exception.Message
+            if (Test-IsAccessDeniedError $_) {
+                $msg = Get-AccessDeniedGuidance -Target 'selected target(s)' -Message $_.Exception.Message -Action 'start collection'
+            }
+            Add-UiLogLine "[ERROR] $msg"
+            if ($script:Ui.StatusLabel) { $script:Ui.StatusLabel.Text = $msg }
+            [System.Windows.Forms.MessageBox]::Show($msg, 'Start failed', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        }
+    })
     $btnStop.add_Click({ Stop-UiCollector })
     $btnHtml.add_Click({
         if ($script:Ui.HtmlPath -and (Test-Path -LiteralPath $script:Ui.HtmlPath)) {
@@ -2063,18 +2228,27 @@ function Show-KerberosRc4Gui {
         }
     })
     $btnAudit.add_Click({
-        $dcs = @(Get-UiCheckedTargets | Where-Object { $_.Kind -eq 'dc' })
-        if ($dcs.Count -lt 1) {
-            [System.Windows.Forms.MessageBox]::Show('Check at least one domain controller first.', 'Check auditing', 'OK', 'Information') | Out-Null
-            return
-        }
-        $statuses = @(Get-UiKerberosAuditStatuses)
-        $notFully = @($statuses | Where-Object { -not $_.FullyReady })
-        if ($notFully.Count -lt 1) {
-            [System.Windows.Forms.MessageBox]::Show('Kerberos 4768/4769 auditing looks enabled on the selected DCs.', 'Check auditing', 'OK', 'Information') | Out-Null
-        } else {
-            $msg = (($notFully | ForEach-Object { $_.Summary }) -join [Environment]::NewLine)
-            [System.Windows.Forms.MessageBox]::Show($msg, 'Kerberos auditing check', 'OK', 'Warning') | Out-Null
+        try {
+            $dcs = @(Get-UiCheckedTargets | Where-Object { $_.Kind -eq 'dc' })
+            if ((Get-CollectionCount $dcs) -lt 1) {
+                [System.Windows.Forms.MessageBox]::Show('Check at least one domain controller first.', 'Check auditing', 'OK', 'Information') | Out-Null
+                return
+            }
+            $statuses = @(Get-UiKerberosAuditStatuses)
+            $notFully = @($statuses | Where-Object { -not $_.FullyReady })
+            if ((Get-CollectionCount $notFully) -lt 1) {
+                [System.Windows.Forms.MessageBox]::Show('Kerberos 4768/4769 auditing looks enabled on the selected DCs.', 'Check auditing', 'OK', 'Information') | Out-Null
+            } else {
+                $msg = (($notFully | ForEach-Object { $_.Summary }) -join [Environment]::NewLine)
+                [System.Windows.Forms.MessageBox]::Show($msg, 'Kerberos auditing check', 'OK', 'Warning') | Out-Null
+            }
+        } catch {
+            $msg = $_.Exception.Message
+            if (Test-IsAccessDeniedError $_) {
+                $msg = Get-AccessDeniedGuidance -Target 'selected DC(s)' -Message $_.Exception.Message -Action 'check Kerberos auditing'
+            }
+            Add-UiLogLine "[ERROR] $msg"
+            [System.Windows.Forms.MessageBox]::Show($msg, 'Kerberos auditing check failed', 'OK', 'Error') | Out-Null
         }
     })
     $btnFolder.add_Click({
@@ -2483,6 +2657,49 @@ function Invoke-KerberosRc4SelfTest {
         -Name 'No-auditing flags render as No Auditing'
     $skipOk = Invoke-KerberosAuditPreflight -Targets @([pscustomobject]@{ Kind = 'evtx'; Name = 'x.evtx' }) -SkipAuditCheck
     Assert-True -Condition ($skipOk -eq $true) -Name 'EVTX-only / -SkipAuditCheck preflight does not block collection'
+
+    Assert-True -Condition ((Get-CollectionCount $null) -eq 0) `
+        -Name 'Get-CollectionCount treats $null as 0 (empty Get-WinEvent unwrap)'
+    Assert-True -Condition ((Get-CollectionCount @()) -eq 0) `
+        -Name 'Get-CollectionCount of an empty array is 0'
+    Assert-True -Condition ((Get-CollectionCount 'abc') -eq 1) `
+        -Name 'Get-CollectionCount does not enumerate strings as characters'
+    Assert-True -Condition ((Get-CollectionCount 42) -eq 1) `
+        -Name 'Get-CollectionCount of a scalar is 1'
+    Assert-True -Condition ((Get-CollectionCount @(1, 2, 3)) -eq 3) `
+        -Name 'Get-CollectionCount of a three-item array is 3'
+    function script:Invoke-EmptyArrayReturn { return @() }
+    $unwrappedEmpty = script:Invoke-EmptyArrayReturn
+    Assert-True -Condition ($null -eq $unwrappedEmpty) `
+        -Name 'Bare return @() unwraps to $null in PowerShell'
+    Assert-True -Condition ((Get-CollectionCount $unwrappedEmpty) -eq 0) `
+        -Name 'Get-CollectionCount of an unwrapped empty return is 0'
+    function script:Invoke-SingleItemReturn { return ,@(Get-Date) }
+    Assert-True -Condition ((Get-CollectionCount (script:Invoke-SingleItemReturn)) -eq 1) `
+        -Name 'Get-CollectionCount of a comma-wrapped single item is 1'
+    Assert-True -Condition ((Get-CollectionCount (ConvertTo-EventArray $null)) -eq 0) `
+        -Name 'ConvertTo-EventArray of $null counts as 0'
+    Assert-True -Condition ((Get-CollectionCount (ConvertTo-EventArray 'only-one')) -eq 1) `
+        -Name 'ConvertTo-EventArray wraps a scalar as one event'
+    Assert-True -Condition ((Get-CollectionCount (ConvertTo-EventArray @(1, 2))) -eq 2) `
+        -Name 'ConvertTo-EventArray preserves a two-item array'
+    $deniedCaught = $false
+    try {
+        throw (New-Object System.UnauthorizedAccessException 'Attempted to perform an unauthorized operation.')
+    } catch {
+        $deniedCaught = Test-IsAccessDeniedError $_
+    }
+    Assert-True -Condition $deniedCaught `
+        -Name 'UnauthorizedAccessException is treated as access denied'
+    $otherErr = [pscustomobject]@{
+        FullyQualifiedErrorId = 'NoMatchingEventsFound,Microsoft.PowerShell.Commands.GetWinEventCommand'
+        Exception = [pscustomobject]@{ Message = 'No events were found that match the specified selection criteria.' }
+    }
+    Assert-True -Condition (-not (Test-IsAccessDeniedError $otherErr)) `
+        -Name 'Empty event-log results are not classified as access denied'
+    $hint = Get-AccessDeniedGuidance -Target 'DC01' -Message 'Attempted to perform an unauthorized operation.' -Action 'read the Security log'
+    Assert-True -Condition ($hint -match 'Event Log Readers' -and $hint -match 'DC01' -and $hint -match 'WinRM') `
+        -Name 'Access-denied guidance names Event Log Readers and WinRM'
 
     Write-Host ''
     Write-Host ('  {0} passed, {1} failed' -f $script:SelfTestPassed, $script:SelfTestFailed) `
