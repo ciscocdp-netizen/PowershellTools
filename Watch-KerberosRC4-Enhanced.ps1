@@ -94,6 +94,11 @@
     zero events on Windows PowerShell 5.1. Historical reads now use FilterHashtable
     (StartTime + event IDs) with an XPath fallback, and the log reports events-read vs
     RC4-saved vs AES-skipped so a modern AES-only DC is not mistaken for a query miss.
+  - FilterHashtable Id as a typed int[] matches nothing on 5.1 and "No events were found"
+    was treated as final, so XPath never ran and the empty-window probe repeated the same
+    miss — then claimed Kerberos auditing was off. Id is now Object[], empty hashtable
+    results always fall through to XPath and per-ID queries, and the probe distinguishes
+    a readable Security log with no 4768/4769 from an access-denied or wrapped window.
 #>
 [CmdletBinding()]
 param(
@@ -1177,6 +1182,13 @@ function Invoke-KerberosCollection {
         foreach ($target in $Targets) {
             if (Test-IsCollectorCancelRequested) { break }
             Write-CollectorStatus "Historical query $($target.Name) since $since"
+            if ($target.Kind -eq 'dc') {
+                if (Test-IsLocalComputerName $target.Name) {
+                    Write-CollectorStatus "Reading the local Security log ($($env:COMPUTERNAME)) for $($target.Name)."
+                } else {
+                    Write-CollectorStatus "Reading the Security log on $($target.Name) over Event Log RPC (not this computer)."
+                }
+            }
             if ($target.Kind -eq 'evtx') {
                 $events = ConvertTo-EventArray (Read-KerberosEvents -Path $target.Path -Since $since -Max $MaxHistoryEventsPerDC)
             } else {
@@ -1294,14 +1306,15 @@ function New-KerberosFilterXPath {
     param(
         [datetime]$Since,
         [int64]$AfterRecordId = -1,
-        [switch]$RecordIdOnly
+        [switch]$RecordIdOnly,
+        [switch]$NoTimeFilter
     )
-    $utc = $Since.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
     $conditions = '(EventID=4768 or EventID=4769)'
     if ($AfterRecordId -ge 0) {
         $conditions += " and EventRecordID>$AfterRecordId"
     }
-    if (-not $RecordIdOnly) {
+    if (-not $RecordIdOnly -and -not $NoTimeFilter) {
+        $utc = $Since.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
         $conditions += " and TimeCreated[@SystemTime>='$utc']"
     }
     return "*[System[$conditions]]"
@@ -1329,10 +1342,8 @@ function New-KerberosFilterHashtable {
         [string]$Path,
         [switch]$NoTimeFilter
     )
-    $ids = New-Object 'int[]' 2
-    $ids[0] = 4768
-    $ids[1] = 4769
-    $hash = @{ Id = $ids }
+    # Object[] (not int[]) — Get-WinEvent FilterHashtable on 5.1 ignores a typed int[] and returns no matches.
+    $hash = @{ Id = @(4768, 4769) }
     if (-not $NoTimeFilter) { $hash['StartTime'] = $Since }
     if (-not [string]::IsNullOrWhiteSpace($Path)) {
         $hash['Path'] = $Path
@@ -1395,6 +1406,32 @@ function ConvertFrom-WinEventResult {
     return ,$list.ToArray()
 }
 
+function Invoke-KerberosWinEventAttempt {
+    param(
+        [hashtable]$Splat,
+        [string]$Label
+    )
+    $result = [pscustomobject]@{
+        Label   = $Label
+        Events  = [object[]]@()
+        Count   = 0
+        Failed  = $false
+        Message = ''
+    }
+    try {
+        $raw = ConvertTo-EventArray (Get-WinEvent @Splat)
+        $result.Events = $raw
+        $result.Count = Get-CollectionCount $raw
+    } catch {
+        if (Test-IsAccessDeniedError $_) { throw }
+        if (-not (Test-IsNoMatchingEventsError $_)) {
+            $result.Failed = $true
+            $result.Message = $_.Exception.Message
+        }
+    }
+    return $result
+}
+
 function Read-KerberosEvents {
     param(
         [string]$ComputerName,
@@ -1410,20 +1447,42 @@ function Read-KerberosEvents {
     try {
         if ($useRecordId) {
             $splat = Get-WinEventSplat -ComputerName $ComputerName -Path $Path -FilterXPath $xpath -MaxEvents $Max -Oldest:$Oldest
-            return ,(ConvertFrom-WinEventResult (Get-WinEvent @splat))
+            $ridHit = Invoke-KerberosWinEventAttempt -Splat $splat -Label 'XPath/RecordId'
+            return ,(ConvertTo-EventArray $ridHit.Events)
         }
 
-        $hash = New-KerberosFilterHashtable -Since $Since -Path $Path
-        try {
-            $splat = Get-WinEventSplat -ComputerName $ComputerName -Path $Path -FilterHashtable $hash -MaxEvents $Max -Oldest:$Oldest
-            return ,(ConvertFrom-WinEventResult (Get-WinEvent @splat))
-        } catch {
-            if (Test-IsNoMatchingEventsError $_) { throw }
-            if (Test-IsAccessDeniedError $_) { throw }
-            Write-CollectorStatus "FilterHashtable query failed ($($_.Exception.Message)); retrying with XPath." 'WARN'
-            $splat = Get-WinEventSplat -ComputerName $ComputerName -Path $Path -FilterXPath $xpath -MaxEvents $Max -Oldest:$Oldest
-            return ,(ConvertFrom-WinEventResult (Get-WinEvent @splat))
+        $hashSplat = Get-WinEventSplat -ComputerName $ComputerName -Path $Path `
+            -FilterHashtable (New-KerberosFilterHashtable -Since $Since -Path $Path) `
+            -MaxEvents $Max -Oldest:$Oldest
+        $hashHit = Invoke-KerberosWinEventAttempt -Splat $hashSplat -Label 'FilterHashtable'
+        if ($hashHit.Count -gt 0) { return ,(ConvertTo-EventArray $hashHit.Events) }
+        if ($hashHit.Failed) {
+            Write-CollectorStatus "FilterHashtable query failed ($($hashHit.Message)); trying XPath." 'WARN'
         }
+
+        $xpathSplat = Get-WinEventSplat -ComputerName $ComputerName -Path $Path -FilterXPath $xpath -MaxEvents $Max -Oldest:$Oldest
+        $xpathHit = Invoke-KerberosWinEventAttempt -Splat $xpathSplat -Label 'XPath'
+        if ($xpathHit.Count -gt 0) {
+            Write-CollectorStatus "FilterHashtable found 0 events; XPath found $($xpathHit.Count) 4768/4769 event(s)."
+            return ,(ConvertTo-EventArray $xpathHit.Events)
+        }
+        if ($xpathHit.Failed) {
+            Write-CollectorStatus "XPath query failed ($($xpathHit.Message)); trying per-event-ID queries." 'WARN'
+        }
+
+        $merged = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($id in @(4768, 4769)) {
+            $one = New-KerberosFilterHashtable -Since $Since -Path $Path
+            $one['Id'] = $id
+            $oneSplat = Get-WinEventSplat -ComputerName $ComputerName -Path $Path -FilterHashtable $one -MaxEvents $Max -Oldest:$Oldest
+            $oneHit = Invoke-KerberosWinEventAttempt -Splat $oneSplat -Label "FilterHashtable Id=$id"
+            foreach ($ev in (ConvertTo-EventArray $oneHit.Events)) { [void]$merged.Add($ev) }
+        }
+        if ($merged.Count -gt 0) {
+            Write-CollectorStatus "Per-event-ID queries found $($merged.Count) 4768/4769 event(s)."
+            return ,$merged.ToArray()
+        }
+        return ,([object[]]@())
     } catch {
         if (Test-IsNoMatchingEventsError $_) { return ,([object[]]@()) }
         $target = if ($Path) { $Path } else { $ComputerName }
@@ -1444,23 +1503,56 @@ function Get-HistoricalEmptyHint {
         [datetime]$Since
     )
     $target = if ($Path) { $Path } else { $ComputerName }
+    $newestSecurity = $null
+    $newestKerb = $null
+
     try {
-        $hash = New-KerberosFilterHashtable -Since $Since -Path $Path -NoTimeFilter
-        $splat = Get-WinEventSplat -ComputerName $ComputerName -Path $Path -FilterHashtable $hash -MaxEvents 1
-        $any = ConvertTo-EventArray (Get-WinEvent @splat)
-        if ((Get-CollectionCount $any) -gt 0) {
-            $when = $any[0].TimeCreated
-            return "No 4768/4769 events in the window since $($Since.ToString('yyyy-MM-dd HH:mm:ss')) on $target. Newest Kerberos ticket event in the log is $($when.ToString('yyyy-MM-dd HH:mm:ss')). Increase Hours, or the Security log may have wrapped."
+        $securitySplat = Get-WinEventSplat -ComputerName $ComputerName -Path $Path -MaxEvents 1
+        $securityHit = Invoke-KerberosWinEventAttempt -Splat $securitySplat -Label 'Security newest'
+        if ($securityHit.Count -gt 0) { $newestSecurity = $securityHit.Events[0] }
+        elseif ($securityHit.Failed) {
+            return "Could not read the Security log on ${target}: $($securityHit.Message)"
         }
+    } catch {
+        if (Test-IsAccessDeniedError $_) {
+            return (Get-AccessDeniedGuidance -Target $target -Message $_.Exception.Message -Action 'read the Security log')
+        }
+        return "Could not read the Security log on ${target}: $($_.Exception.Message)"
+    }
+
+    $xpathAny = New-KerberosFilterXPath -Since $Since -NoTimeFilter
+    try {
+        $probeSplat = Get-WinEventSplat -ComputerName $ComputerName -Path $Path -FilterXPath $xpathAny -MaxEvents 1
+        $probeHit = Invoke-KerberosWinEventAttempt -Splat $probeSplat -Label 'XPath untimed'
+        if ($probeHit.Count -gt 0) { $newestKerb = $probeHit.Events[0] }
     } catch {
         if (Test-IsAccessDeniedError $_) {
             return (Get-AccessDeniedGuidance -Target $target -Message $_.Exception.Message -Action 'probe for 4768/4769 events')
         }
-        if (-not (Test-IsNoMatchingEventsError $_)) {
-            return "Could not probe for 4768/4769 on ${target}: $($_.Exception.Message)"
+    }
+
+    if ($null -eq $newestKerb) {
+        foreach ($id in @(4768, 4769)) {
+            try {
+                $one = @{ Id = $id }
+                if (-not [string]::IsNullOrWhiteSpace($Path)) { $one['Path'] = $Path } else { $one['LogName'] = 'Security' }
+                $oneSplat = Get-WinEventSplat -ComputerName $ComputerName -Path $Path -FilterHashtable $one -MaxEvents 1
+                $oneHit = Invoke-KerberosWinEventAttempt -Splat $oneSplat -Label "Id=$id untimed"
+                if ($oneHit.Count -gt 0) { $newestKerb = $oneHit.Events[0]; break }
+            } catch { }
         }
     }
-    return "No 4768/4769 events are in the Security log on $target. Enable Account Logon > Kerberos Authentication Service (4768) and Kerberos Service Ticket Operations (4769) with Success. This tool does not change audit policy."
+
+    if ($null -ne $newestKerb) {
+        $when = $newestKerb.TimeCreated
+        return "No 4768/4769 events in the window since $($Since.ToString('yyyy-MM-dd HH:mm:ss')) on $target. Newest Kerberos ticket event in the log is $($when.ToString('yyyy-MM-dd HH:mm:ss')) (event $($newestKerb.Id)). Increase Hours, or the Security log may have wrapped."
+    }
+
+    $suffix = ''
+    if ($null -ne $newestSecurity) {
+        $suffix = " The Security log is readable (newest event Id=$($newestSecurity.Id) at $($newestSecurity.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'))), so this is not an access-denied miss. Advanced Audit Policy can show Success while this DC is still not writing 4768/4769 — run ``auditpol /get /category:*`` on the DC and gpupdate if the Kerberos subcategories are No Auditing."
+    }
+    return "No 4768/4769 events are in the Security log on $target. Enable Account Logon > Kerberos Authentication Service (4768) and Kerberos Service Ticket Operations (4769) with Success. This tool does not change audit policy.$suffix"
 }
 
 function Get-NewestSecurityRecordId {
@@ -2721,8 +2813,14 @@ function Invoke-KerberosRc4SelfTest {
     Assert-True -Condition ($liveXPath -match 'EventRecordID>12345' -and $liveXPath -notmatch 'TimeCreated') `
         -Name 'Live catch-up query uses EventRecordID and omits TimeCreated to avoid clock-skew gaps'
     $hash = New-KerberosFilterHashtable -Since ([datetime]'2026-10-28T00:00:00')
-    Assert-True -Condition ($hash.LogName -eq 'Security' -and $hash.Id[0] -eq 4768 -and $hash.Id[1] -eq 4769 -and $hash.ContainsKey('StartTime')) `
+    $hashIds = @($hash.Id)
+    Assert-True -Condition ($hash.LogName -eq 'Security' -and ($hashIds -contains 4768) -and ($hashIds -contains 4769) -and $hash.ContainsKey('StartTime')) `
         -Name 'Historical FilterHashtable uses Security log, 4768/4769, and StartTime'
+    Assert-True -Condition ($hash.Id -isnot [int[]]) `
+        -Name 'FilterHashtable Id is not a typed int[] (Get-WinEvent 5.1 ignores that and returns no matches)'
+    $xpathUntimed = New-KerberosFilterXPath -Since ([datetime]'2026-10-28T00:00:00Z') -NoTimeFilter
+    Assert-True -Condition ($xpathUntimed -match 'EventID=4768' -and $xpathUntimed -match 'EventID=4769' -and $xpathUntimed -notmatch 'TimeCreated') `
+        -Name 'Untimed XPath probe matches 4768/4769 without a TimeCreated filter'
     $hashEvtx = New-KerberosFilterHashtable -Since ([datetime]'2026-10-28T00:00:00') -Path 'C:\Temp\Security.evtx'
     Assert-True -Condition ($hashEvtx.ContainsKey('Path') -and -not $hashEvtx.ContainsKey('LogName')) `
         -Name 'EVTX FilterHashtable uses Path instead of LogName'
