@@ -22,7 +22,8 @@
 
   Actual RC4 uses etype 0x17 (23, RC4-HMAC) or 0x18 (24, RC4-HMAC-EXP).
   "RC4 Offered Only" is NOT evidence of RC4 ticket issuance. Almost every modern Windows
-  client still advertises RC4 even when the issued ticket is AES.
+  client still advertises RC4 even when the issued ticket is AES. Use -IncludeAes (or the
+  UI checkbox) to list AES tickets so you can confirm historical 4768/4769 events were read.
 
 .EXAMPLE
   .\Watch-KerberosRC4-Enhanced.ps1 -DomainControllers LAP-MSASDC03.mclaren.org -Mode Both -HoursBack 24
@@ -89,6 +90,10 @@
   - Access-denied Security-log / WinRM failures used Write-Warning, so the GUI only showed
     "Attempted to perform an unauthorized operation." Collector and audit-check paths now
     log Event Log Readers / WinRM guidance once per target.
+  - Historical DC queries used Get-WinEvent -FilterXml QueryList, which often returns
+    zero events on Windows PowerShell 5.1. Historical reads now use FilterHashtable
+    (StartTime + event IDs) with an XPath fallback, and the log reports events-read vs
+    RC4-saved vs AES-skipped so a modern AES-only DC is not mistaken for a query miss.
 #>
 [CmdletBinding()]
 param(
@@ -101,6 +106,7 @@ param(
     [ValidateRange(2,3600)][int]$PollSeconds = 5,
     [ValidateRange(0,10080)][int]$LiveMinutes = 0,
     [switch]$IncludeOffered,
+    [switch]$IncludeAes,
     [switch]$IncludeFailures,
     [switch]$ResolveHostnames,
     [switch]$EnrichAD,
@@ -126,6 +132,7 @@ $script:CancelRequested = $false
 $script:ReportedAccessDenied = @{}
 $script:DnsTimeoutMs = 750
 $script:DoIncludeFailures = $false
+$script:DoIncludeAes = $false
 $script:Ui = $null
 
 # ---------------------------------------------------------------------------
@@ -237,9 +244,30 @@ function Test-IsLocalComputerName {
     if ([string]::IsNullOrWhiteSpace($Name)) { return $true }
     $n = $Name.Trim()
     if ($n -in @('.', 'localhost', '127.0.0.1', '::1')) { return $true }
-    if ($n -eq $env:COMPUTERNAME) { return $true }
-    if (-not [string]::IsNullOrWhiteSpace($env:USERDNSDOMAIN) -and
-        $n -eq ($env:COMPUTERNAME + '.' + $env:USERDNSDOMAIN)) { return $true }
+    $n = $n.TrimEnd('.')
+    if ([string]::IsNullOrWhiteSpace($n)) { return $true }
+    $short = ($n -split '\.')[0]
+    $candidates = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace($env:COMPUTERNAME)) {
+        [void]$candidates.Add($env:COMPUTERNAME)
+        if (-not [string]::IsNullOrWhiteSpace($env:USERDNSDOMAIN)) {
+            [void]$candidates.Add($env:COMPUTERNAME + '.' + $env:USERDNSDOMAIN)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($env:USERDOMAIN)) {
+            [void]$candidates.Add($env:COMPUTERNAME + '.' + $env:USERDOMAIN)
+        }
+    }
+    try {
+        $hostName = [System.Net.Dns]::GetHostName()
+        if (-not [string]::IsNullOrWhiteSpace($hostName)) {
+            [void]$candidates.Add($hostName)
+            [void]$candidates.Add(($hostName -split '\.')[0])
+        }
+    } catch { }
+    foreach ($c in $candidates) {
+        if ($n -eq $c -or $short -eq $c) { return $true }
+        if (($c -split '\.')[0] -eq $n -or ($c -split '\.')[0] -eq $short) { return $true }
+    }
     return $false
 }
 
@@ -455,6 +483,11 @@ function Convert-KerberosEvent {
     elseif ($success -and $sessionRc4) { $category = 'RC4 Session' }
     elseif ($script:DoIncludeFailures -and -not $success -and ($ticketRc4 -or $sessionRc4 -or $offeredRc4)) { $category = 'Failed / RC4 Observed' }
     elseif ($success -and $script:DoIncludeOffered -and $offeredRc4) { $category = 'RC4 Offered Only' }
+    elseif ($success -and $script:DoIncludeAes) {
+        $code = Get-EtypeCode $ticket
+        if ($code -eq 0x11 -or $code -eq 0x12 -or $code -eq 0x13 -or $code -eq 0x14) { $category = 'AES Ticket' }
+        else { $category = 'Other Kerberos' }
+    }
     else { return $null }
 
     $account = Get-NamedField $data @('TargetUserName','AccountName')
@@ -661,6 +694,8 @@ function Get-CategoryHighlightArgb {
     if ($Category -like 'RC4 Ticket*') { return [int[]](255, 228, 225) }
     if ($Category -like 'RC4 Session*') { return [int[]](255, 249, 196) }
     if ($Category -eq 'RC4 Offered Only') { return [int[]](220, 245, 255) }
+    if ($Category -eq 'AES Ticket') { return [int[]](226, 245, 226) }
+    if ($Category -eq 'Other Kerberos') { return [int[]](240, 240, 240) }
     if ($Category -like 'Failed*') { return [int[]](232, 232, 232) }
     return [int[]](255, 255, 255)
 }
@@ -742,6 +777,7 @@ function Initialize-CollectorSession {
         [bool]$ResolveHostnamesFlag,
         [bool]$EnrichADFlag,
         [bool]$IncludeOfferedFlag,
+        [bool]$IncludeAesFlag = $false,
         [bool]$IncludeFailuresFlag,
         [int]$DnsTimeout,
         $CredentialObject,
@@ -752,6 +788,7 @@ function Initialize-CollectorSession {
     $script:DoResolveHostnames = $ResolveHostnamesFlag
     $script:DoEnrichAD = $EnrichADFlag
     $script:DoIncludeOffered = $IncludeOfferedFlag
+    $script:DoIncludeAes = $IncludeAesFlag
     $script:DoIncludeFailures = $IncludeFailuresFlag
     $script:Credential = $CredentialObject
     $script:DnsTimeoutMs = $DnsTimeout
@@ -1146,19 +1183,34 @@ function Invoke-KerberosCollection {
                 $events = ConvertTo-EventArray (Read-KerberosEvents -ComputerName $target.Name -Since $since -Max $MaxHistoryEventsPerDC)
             }
             $eventCount = Get-CollectionCount $events
-            Write-CollectorStatus "Read $eventCount Kerberos event(s) from $($target.Name)."
+            Write-CollectorStatus "Read $eventCount Kerberos 4768/4769 event(s) from $($target.Name)."
             if ($eventCount -ge $MaxHistoryEventsPerDC) {
                 Write-CollectorStatus "Hit MaxHistoryEventsPerDC ($MaxHistoryEventsPerDC) on $($target.Name). Older matching events in the window were not read." 'WARN'
             }
             $n = 0
+            $saved = 0
+            $skipped = 0
             foreach ($ev in ($events | Sort-Object RecordId)) {
                 if (Test-IsCollectorCancelRequested) { break }
                 if ([int64]$ev.RecordId -gt $lastId[$target.Key]) { $lastId[$target.Key] = [int64]$ev.RecordId }
                 $row = Convert-KerberosEvent $ev $target.Name
-                if ($null -ne $row) { Save-Finding $row }
+                if ($null -ne $row) {
+                    Save-Finding $row
+                    $saved++
+                } else {
+                    $skipped++
+                }
                 $n++
                 if (($n % 200) -eq 0) {
                     Write-CollectorStatus "Parsed $n events from $($target.Name)..."
+                }
+            }
+            if ($eventCount -lt 1) {
+                Write-CollectorStatus (Get-HistoricalEmptyHint -ComputerName $target.Name -Path $target.Path -Since $since) 'WARN'
+            } else {
+                Write-CollectorStatus "Parsed $n event(s) from $($target.Name): $saved finding(s) saved, $skipped AES/other skipped."
+                if ($saved -lt 1) {
+                    Write-CollectorStatus "No RC4 tickets in this window. That is expected when the DC issues AES. Check Include AES tickets (or Include offered RC4) to list the events that were read." 'WARN'
                 }
             }
         }
@@ -1238,7 +1290,7 @@ function Invoke-KerberosCollection {
     }
 }
 
-function New-KerberosQueryXml {
+function New-KerberosFilterXPath {
     param(
         [datetime]$Since,
         [int64]$AfterRecordId = -1,
@@ -1247,18 +1299,47 @@ function New-KerberosQueryXml {
     $utc = $Since.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
     $conditions = '(EventID=4768 or EventID=4769)'
     if ($AfterRecordId -ge 0) {
-        $conditions += " and EventRecordID&gt;$AfterRecordId"
+        $conditions += " and EventRecordID>$AfterRecordId"
     }
     if (-not $RecordIdOnly) {
-        $conditions += " and TimeCreated[@SystemTime&gt;='$utc']"
+        $conditions += " and TimeCreated[@SystemTime>='$utc']"
     }
+    return "*[System[$conditions]]"
+}
+
+function New-KerberosQueryXml {
+    param(
+        [datetime]$Since,
+        [int64]$AfterRecordId = -1,
+        [switch]$RecordIdOnly
+    )
+    $xpath = New-KerberosFilterXPath -Since $Since -AfterRecordId $AfterRecordId -RecordIdOnly:$RecordIdOnly
     return @"
 <QueryList>
   <Query Id="0" Path="Security">
-    <Select Path="Security">*[System[$conditions]]</Select>
+    <Select Path="Security">$xpath</Select>
   </Query>
 </QueryList>
 "@
+}
+
+function New-KerberosFilterHashtable {
+    param(
+        [datetime]$Since,
+        [string]$Path,
+        [switch]$NoTimeFilter
+    )
+    $ids = New-Object 'int[]' 2
+    $ids[0] = 4768
+    $ids[1] = 4769
+    $hash = @{ Id = $ids }
+    if (-not $NoTimeFilter) { $hash['StartTime'] = $Since }
+    if (-not [string]::IsNullOrWhiteSpace($Path)) {
+        $hash['Path'] = $Path
+    } else {
+        $hash['LogName'] = 'Security'
+    }
+    return $hash
 }
 
 function Get-WinEventSplat {
@@ -1267,6 +1348,7 @@ function Get-WinEventSplat {
         [string]$Path,
         [xml]$FilterXml,
         [string]$FilterXPath,
+        [hashtable]$FilterHashtable,
         [int]$MaxEvents,
         [switch]$Oldest
     )
@@ -1274,6 +1356,14 @@ function Get-WinEventSplat {
     if ($MaxEvents -gt 0) { $splat['MaxEvents'] = $MaxEvents }
     if ($Oldest) { $splat['Oldest'] = $true }
     if ($script:Credential) { $splat['Credential'] = $script:Credential }
+
+    if ($FilterHashtable) {
+        $splat['FilterHashtable'] = $FilterHashtable
+        if (-not [string]::IsNullOrWhiteSpace($ComputerName) -and -not (Test-IsLocalComputerName $ComputerName) -and [string]::IsNullOrWhiteSpace($Path)) {
+            $splat['ComputerName'] = $ComputerName
+        }
+        return $splat
+    }
 
     if (-not [string]::IsNullOrWhiteSpace($Path)) {
         $splat['Path'] = $Path
@@ -1296,6 +1386,15 @@ function Get-WinEventSplat {
     return $splat
 }
 
+function ConvertFrom-WinEventResult {
+    param($Raw)
+    $list = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($item in @($Raw)) {
+        if ($null -ne $item) { [void]$list.Add($item) }
+    }
+    return ,$list.ToArray()
+}
+
 function Read-KerberosEvents {
     param(
         [string]$ComputerName,
@@ -1306,19 +1405,24 @@ function Read-KerberosEvents {
         [switch]$Oldest,
         [switch]$RecordIdOnly
     )
-    $list = New-Object 'System.Collections.Generic.List[object]'
+    $xpath = New-KerberosFilterXPath -Since $Since -AfterRecordId $AfterRecordId -RecordIdOnly:$RecordIdOnly
+    $useRecordId = ($AfterRecordId -ge 0 -or $RecordIdOnly)
     try {
-        if ($Path) {
-            $xpath = "*[System[(EventID=4768 or EventID=4769) and TimeCreated[@SystemTime>='$($Since.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ'))']]]"
-            $splat = Get-WinEventSplat -Path $Path -FilterXPath $xpath -MaxEvents $Max -Oldest:$Oldest
-            $raw = @(Get-WinEvent @splat)
-        } else {
-            $query = New-KerberosQueryXml -Since $Since -AfterRecordId $AfterRecordId -RecordIdOnly:$RecordIdOnly
-            $splat = Get-WinEventSplat -ComputerName $ComputerName -FilterXml ([xml]$query) -MaxEvents $Max -Oldest:$Oldest
-            $raw = @(Get-WinEvent @splat)
+        if ($useRecordId) {
+            $splat = Get-WinEventSplat -ComputerName $ComputerName -Path $Path -FilterXPath $xpath -MaxEvents $Max -Oldest:$Oldest
+            return ,(ConvertFrom-WinEventResult (Get-WinEvent @splat))
         }
-        foreach ($item in $raw) {
-            if ($null -ne $item) { [void]$list.Add($item) }
+
+        $hash = New-KerberosFilterHashtable -Since $Since -Path $Path
+        try {
+            $splat = Get-WinEventSplat -ComputerName $ComputerName -Path $Path -FilterHashtable $hash -MaxEvents $Max -Oldest:$Oldest
+            return ,(ConvertFrom-WinEventResult (Get-WinEvent @splat))
+        } catch {
+            if (Test-IsNoMatchingEventsError $_) { throw }
+            if (Test-IsAccessDeniedError $_) { throw }
+            Write-CollectorStatus "FilterHashtable query failed ($($_.Exception.Message)); retrying with XPath." 'WARN'
+            $splat = Get-WinEventSplat -ComputerName $ComputerName -Path $Path -FilterXPath $xpath -MaxEvents $Max -Oldest:$Oldest
+            return ,(ConvertFrom-WinEventResult (Get-WinEvent @splat))
         }
     } catch {
         if (Test-IsNoMatchingEventsError $_) { return ,([object[]]@()) }
@@ -1331,7 +1435,32 @@ function Read-KerberosEvents {
         }
         return ,([object[]]@())
     }
-    return ,$list.ToArray()
+}
+
+function Get-HistoricalEmptyHint {
+    param(
+        [string]$ComputerName,
+        [string]$Path,
+        [datetime]$Since
+    )
+    $target = if ($Path) { $Path } else { $ComputerName }
+    try {
+        $hash = New-KerberosFilterHashtable -Since $Since -Path $Path -NoTimeFilter
+        $splat = Get-WinEventSplat -ComputerName $ComputerName -Path $Path -FilterHashtable $hash -MaxEvents 1
+        $any = ConvertTo-EventArray (Get-WinEvent @splat)
+        if ((Get-CollectionCount $any) -gt 0) {
+            $when = $any[0].TimeCreated
+            return "No 4768/4769 events in the window since $($Since.ToString('yyyy-MM-dd HH:mm:ss')) on $target. Newest Kerberos ticket event in the log is $($when.ToString('yyyy-MM-dd HH:mm:ss')). Increase Hours, or the Security log may have wrapped."
+        }
+    } catch {
+        if (Test-IsAccessDeniedError $_) {
+            return (Get-AccessDeniedGuidance -Target $target -Message $_.Exception.Message -Action 'probe for 4768/4769 events')
+        }
+        if (-not (Test-IsNoMatchingEventsError $_)) {
+            return "Could not probe for 4768/4769 on ${target}: $($_.Exception.Message)"
+        }
+    }
+    return "No 4768/4769 events are in the Security log on $target. Enable Account Logon > Kerberos Authentication Service (4768) and Kerberos Service Ticket Operations (4769) with Success. This tool does not change audit policy."
 }
 
 function Get-NewestSecurityRecordId {
@@ -1741,6 +1870,7 @@ function Start-UiCollector {
         ResolveHostnames      = [bool]$script:Ui.ChkDns.Checked
         EnrichAD              = [bool]$script:Ui.ChkAd.Checked
         IncludeOffered        = [bool]$script:Ui.ChkOffered.Checked
+        IncludeAes            = [bool]($script:Ui.ChkAes -and $script:Ui.ChkAes.Checked)
         IncludeFailures       = [bool]$script:Ui.ChkFailures.Checked
         DnsTimeoutMs          = $script:DnsTimeoutMs
         Mode                  = $mode
@@ -1775,6 +1905,7 @@ function Start-UiCollector {
                 -ResolveHostnamesFlag $Settings.ResolveHostnames `
                 -EnrichADFlag $Settings.EnrichAD `
                 -IncludeOfferedFlag $Settings.IncludeOffered `
+                -IncludeAesFlag $Settings.IncludeAes `
                 -IncludeFailuresFlag $Settings.IncludeFailures `
                 -DnsTimeout $Settings.DnsTimeoutMs `
                 -CredentialObject $cred `
@@ -1825,6 +1956,7 @@ function Show-KerberosRc4Gui {
         [int]$InitialLiveMinutes = 0,
         [string]$InitialOutput = '',
         [bool]$InitialOffered = $false,
+        [bool]$InitialAes = $false,
         [bool]$InitialFailures = $false,
         [bool]$InitialDns = $false,
         [bool]$InitialAd = $false,
@@ -1902,9 +2034,9 @@ function Show-KerberosRc4Gui {
     $y += 22
     $targetList = New-Object System.Windows.Forms.CheckedListBox
     $targetList.Location = New-Object System.Drawing.Point(12, $y)
-    $targetList.Size = New-Object System.Drawing.Size(332, 128)
+    $targetList.Size = New-Object System.Drawing.Size(332, 108)
     $targetList.CheckOnClick = $true
-    $y += 136
+    $y += 116
     $btnDiscover = New-UiButton 'Discover DCs' 100
     $btnDiscover.Location = New-Object System.Drawing.Point(12, $y)
     $btnAddDc = New-UiButton 'Add DC' 72 28
@@ -1965,7 +2097,13 @@ function Show-KerberosRc4Gui {
     $chkOffered.Location = New-Object System.Drawing.Point(12, $y)
     $chkOffered.AutoSize = $true
     $chkOffered.Checked = $InitialOffered
-    $y += 24
+    $y += 22
+    $chkAes = New-Object System.Windows.Forms.CheckBox
+    $chkAes.Text = 'Include AES tickets (noisy; confirms log reads)'
+    $chkAes.Location = New-Object System.Drawing.Point(12, $y)
+    $chkAes.AutoSize = $true
+    $chkAes.Checked = $InitialAes
+    $y += 22
     $chkFailures = New-Object System.Windows.Forms.CheckBox
     $chkFailures.Text = 'Include failed tickets that mention RC4'
     $chkFailures.Location = New-Object System.Drawing.Point(12, $y)
@@ -2036,7 +2174,7 @@ function Show-KerberosRc4Gui {
         $lblTargets, $targetList, $btnDiscover, $btnAddDc, $btnAddEvtx, $btnRemove,
         $lblMode, $modeBox, $lblHours, $hoursBox, $lblPoll, $pollBox,
         $lblLive, $liveBox, $lblLiveHint,
-        $chkOffered, $chkFailures, $chkDns, $chkAd, $chkRodc, $chkRequireAudit,
+        $chkOffered, $chkAes, $chkFailures, $chkDns, $chkAd, $chkRodc, $chkRequireAudit,
         $lblOut, $outputBox, $btnBrowse, $btnStart, $btnStop, $btnCred,
         $btnHtml, $btnCsv, $btnFolder, $btnAudit
     ))
@@ -2057,7 +2195,7 @@ function Show-KerberosRc4Gui {
     $filterBox.DropDownStyle = 'DropDownList'
     $filterBox.Location = New-Object System.Drawing.Point(434, 8)
     $filterBox.Width = 180
-    [void]$filterBox.Items.AddRange(@('All','RC4 Ticket','RC4 Session','RC4 Offered Only','Failed / RC4 Observed'))
+    [void]$filterBox.Items.AddRange(@('All','RC4 Ticket','RC4 Session','RC4 Offered Only','AES Ticket','Other Kerberos','Failed / RC4 Observed'))
     $filterBox.SelectedIndex = 0
     $hint = New-Object System.Windows.Forms.Label
     $hint.Text = 'Double-click a row for details'
@@ -2106,6 +2244,7 @@ function Show-KerberosRc4Gui {
         PollBox         = $pollBox
         LiveBox         = $liveBox
         ChkOffered      = $chkOffered
+        ChkAes          = $chkAes
         ChkFailures     = $chkFailures
         ChkDns          = $chkDns
         ChkAd           = $chkAd
@@ -2319,6 +2458,7 @@ function Start-InteractiveUi {
         [void]$argList.Add('-PollSeconds'); [void]$argList.Add([string]$PollSeconds)
         [void]$argList.Add('-LiveMinutes'); [void]$argList.Add([string]$LiveMinutes)
         if ($IncludeOffered) { [void]$argList.Add('-IncludeOffered') }
+        if ($IncludeAes) { [void]$argList.Add('-IncludeAes') }
         if ($IncludeFailures) { [void]$argList.Add('-IncludeFailures') }
         if ($ResolveHostnames) { [void]$argList.Add('-ResolveHostnames') }
         if ($EnrichAD) { [void]$argList.Add('-EnrichAD') }
@@ -2333,6 +2473,7 @@ function Start-InteractiveUi {
         -InitialMode $Mode -InitialHours $HoursBack -InitialPoll $PollSeconds `
         -InitialLiveMinutes $LiveMinutes `
         -InitialOutput $OutputFolder -InitialOffered ([bool]$IncludeOffered) `
+        -InitialAes ([bool]$IncludeAes) `
         -InitialFailures ([bool]$IncludeFailures) -InitialDns ([bool]$ResolveHostnames) `
         -InitialAd ([bool]$EnrichAD) -InitialRequireAuditing ([bool]$RequireAuditing)
 }
@@ -2395,6 +2536,7 @@ function Invoke-KerberosRc4SelfTest {
     $script:DoResolveHostnames = $false
     $script:DoEnrichAD = $false
     $script:DoIncludeOffered = $false
+    $script:DoIncludeAes = $false
     $script:DoIncludeFailures = $false
     $script:Credential = $null
     $script:DnsTimeoutMs = 750
@@ -2499,6 +2641,11 @@ function Invoke-KerberosRc4SelfTest {
 
     $aesOnly = Convert-KerberosEvent (New-MockKerberosEvent -Ticket '0x12' -Session '0x12') 'DC01'
     Assert-True -Condition ($null -eq $aesOnly) -Name 'AES ticket + AES session is ignored by default'
+    $script:DoIncludeAes = $true
+    $aesKept = Convert-KerberosEvent (New-MockKerberosEvent -Ticket '0x12' -Session '0x12') 'DC01'
+    Assert-True -Condition ($null -ne $aesKept -and $aesKept.Category -eq 'AES Ticket') `
+        -Name '-IncludeAes keeps successful AES tickets as AES Ticket'
+    $script:DoIncludeAes = $false
 
     $script:DoIncludeOffered = $true
     $offeredOnly = Convert-KerberosEvent (New-MockKerberosEvent -Ticket '0x12' -Session '0x12') 'DC01'
@@ -2566,10 +2713,26 @@ function Invoke-KerberosRc4SelfTest {
     $timeXPath = ([xml]$qTime).QueryList.Query.Select.InnerText
     Assert-True -Condition ($timeXPath -match 'EventID=4768' -and $timeXPath -match 'TimeCreated' -and $timeXPath -match "SystemTime>='2026-10-28T00:00:00.000Z'") `
         -Name 'Historical query XML includes event IDs and a quoted UTC TimeCreated filter'
+    $xpathTime = New-KerberosFilterXPath -Since ([datetime]'2026-10-28T00:00:00Z')
+    Assert-True -Condition ($xpathTime -match 'EventID=4768' -and $xpathTime -match "SystemTime>='2026-10-28T00:00:00.000Z'" -and $xpathTime -notmatch '&gt;') `
+        -Name 'FilterXPath uses a real greater-than for TimeCreated (not an XML entity)'
     $qLive = New-KerberosQueryXml -Since ([datetime]'2026-10-28T00:00:00Z') -AfterRecordId 12345 -RecordIdOnly
     $liveXPath = ([xml]$qLive).QueryList.Query.Select.InnerText
     Assert-True -Condition ($liveXPath -match 'EventRecordID>12345' -and $liveXPath -notmatch 'TimeCreated') `
         -Name 'Live catch-up query uses EventRecordID and omits TimeCreated to avoid clock-skew gaps'
+    $hash = New-KerberosFilterHashtable -Since ([datetime]'2026-10-28T00:00:00')
+    Assert-True -Condition ($hash.LogName -eq 'Security' -and $hash.Id[0] -eq 4768 -and $hash.Id[1] -eq 4769 -and $hash.ContainsKey('StartTime')) `
+        -Name 'Historical FilterHashtable uses Security log, 4768/4769, and StartTime'
+    $hashEvtx = New-KerberosFilterHashtable -Since ([datetime]'2026-10-28T00:00:00') -Path 'C:\Temp\Security.evtx'
+    Assert-True -Condition ($hashEvtx.ContainsKey('Path') -and -not $hashEvtx.ContainsKey('LogName')) `
+        -Name 'EVTX FilterHashtable uses Path instead of LogName'
+    $hashProbe = New-KerberosFilterHashtable -Since ([datetime]'2026-10-28T00:00:00') -NoTimeFilter
+    Assert-True -Condition (-not $hashProbe.ContainsKey('StartTime')) `
+        -Name 'Empty-window probe FilterHashtable omits StartTime'
+    if (-not [string]::IsNullOrWhiteSpace($env:COMPUTERNAME)) {
+        Assert-True -Condition (Test-IsLocalComputerName ($env:COMPUTERNAME + '.contoso.local')) `
+            -Name 'FQDN of this computer is treated as local so the DC query does not go out over RPC'
+    }
 
     Assert-True -Condition (Test-ShouldStartInteractiveUi) `
         -Name 'No targeting arguments start the interactive UI'
@@ -2735,6 +2898,7 @@ Initialize-CollectorSession -OutputFolderPath $OutputFolder `
     -ResolveHostnamesFlag ([bool]$ResolveHostnames) `
     -EnrichADFlag ([bool]$EnrichAD) `
     -IncludeOfferedFlag ([bool]$IncludeOffered) `
+    -IncludeAesFlag ([bool]$IncludeAes) `
     -IncludeFailuresFlag ([bool]$IncludeFailures) `
     -DnsTimeout $DnsTimeoutMs `
     -CredentialObject $Credential `
