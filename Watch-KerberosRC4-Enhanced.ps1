@@ -73,10 +73,10 @@
   Event 4769 ServiceName is frequently a service account name, not the full SPN.
   Session-key and advertised-etype fields exist only on the updated 4768/4769 schema
   (Windows Server 2019+ and Server 2016 with the January 2025 cumulative update).
-  On that schema (23+ EventData properties) session-key etype is property index 20
-  (4769) or 22 (4768), matching Microsoft's Watch-KerbEncryptionUsage, but only
-  when that slot is an etype scalar (0x17, 23, AES256, ...). Some DCs store
-  AvailableKeys blobs there; those are not session etypes.
+  Microsoft Get-KerbEncryptionUsage.ps1 (Kerberos-Crypto) requires 21 properties
+  on 4769 and 24 on 4768, then reads TicketEncryptionType at [5]/[7] and
+  SessionKeyEncryptionType at [20]/[22] as integers (0x17 = RC4). Index 11 on
+  4769 is RequestTicketHash (base64), not the session etype.
 
   Live mode subscribes with EventLogWatcher (push, same idea as Watch-KerbEncryptionUsage)
   for 4768/4769 as they are written. If the watcher cannot attach (some remote DCs),
@@ -494,14 +494,13 @@ function ConvertTo-EventArray {
 
 function Get-KerberosLayoutIndices {
     param([int]$EventId, [int]$PropertyCount)
-    # Watch-KerbEncryptionUsage (Microsoft) requires 23+ properties and reads
-    # SessionKeyEncryptionType at 4769[20] / 4768[22]. Older events have fewer fields.
-    # Callers must still Test-IsEtypeScalar before trusting those slots: some DCs
-    # put AvailableKeys blobs at the Microsoft indexes.
-    $newSchema = ($PropertyCount -ge 23)
+    # Get-KerbEncryptionUsage.ps1 (microsoft/Kerberos-Crypto): MIN_PROPERTY_COUNT = 21.
+    # 4769 has 21 fields with SessionKeyEncryptionType at [20]; 4768 has 24 fields
+    # with SessionKeyEncryptionType at [22]. Below that, there is no session etype
+    # (4769[11] is RequestTicketHash, 4768[14] is ResponseTicket).
     if ($EventId -eq 4769) {
-        $session = 11
-        if ($newSchema) { $session = 20 }
+        $session = -1
+        if ($PropertyCount -ge 21) { $session = 20 }
         return @{
             Ticket  = 5
             Session = $session
@@ -514,8 +513,8 @@ function Get-KerberosLayoutIndices {
         }
     }
     if ($EventId -eq 4768) {
-        $session = 14
-        if ($newSchema) { $session = 22 }
+        $session = -1
+        if ($PropertyCount -ge 24) { $session = 22 }
         return @{
             Ticket  = 7
             Session = $session
@@ -537,22 +536,24 @@ function Get-KerberosPropertyNames {
             'TargetUserName','TargetDomainName','TargetSid','ServiceName','ServiceSid',
             'TicketOptions','Status','TicketEncryptionType','PreAuthType','IpAddress','IpPort',
             'CertIssuerName','CertSerialNumber','CertThumbprint',
-            'SessionKeyEncryptionType','PreAuthEncryptionType',
+            'ResponseTicket',
             'AccountSupportedEncryptionTypes','AccountAvailableKeys',
             'ServiceSupportedEncryptionTypes','ServiceAvailableKeys',
             'DCSupportedEncryptionTypes','DCAvailableKeys',
-            'ClientAdvertizedEncryptionTypes'
+            'ClientAdvertizedEncryptionTypes',
+            'SessionKeyEncryptionType','PreAuthEncryptionType'
         )
     }
     if ($EventId -eq 4769) {
         return @(
             'TargetUserName','TargetDomainName','ServiceName','ServiceSid','TicketOptions',
             'TicketEncryptionType','IpAddress','IpPort','Status','LogonGuid','TransmittedServices',
-            'SessionKeyEncryptionType',
+            'RequestTicketHash','ResponseTicketHash',
             'AccountSupportedEncryptionTypes','AccountAvailableKeys',
             'ServiceSupportedEncryptionTypes','ServiceAvailableKeys',
             'DCSupportedEncryptionTypes','DCAvailableKeys',
-            'ClientAdvertizedEncryptionTypes'
+            'ClientAdvertizedEncryptionTypes',
+            'SessionKeyEncryptionType'
         )
     }
     return @()
@@ -563,7 +564,12 @@ function Get-EventPropertyValue {
     if ($null -eq $Properties -or $Index -lt 0) { return '' }
     try {
         if ($Index -ge [int]$Properties.Count) { return '' }
-        return [string]$Properties[$Index].Value
+        $raw = $Properties[$Index].Value
+        if ($null -eq $raw) { return '' }
+        if ($raw -is [byte] -or $raw -is [int16] -or $raw -is [uint16] -or $raw -is [int] -or $raw -is [uint32] -or $raw -is [long] -or $raw -is [uint64]) {
+            return [string]([int]$raw)
+        }
+        return [string]$raw
     } catch {
         return ''
     }
@@ -613,7 +619,10 @@ function Get-EventFieldsFromProperties {
         $namedRaw = [string]$result['SessionKeyEncryptionType']
     }
     $namedSession = Get-EtypeScalarOrEmpty $namedRaw
-    $layoutSession = Get-EtypeScalarOrEmpty (Get-EventPropertyValue $props ([int]$layout['Session']))
+    $layoutSession = ''
+    if ([int]$layout['Session'] -ge 0) {
+        $layoutSession = Get-EtypeScalarOrEmpty (Get-EventPropertyValue $props ([int]$layout['Session']))
+    }
     if (-not [string]::IsNullOrWhiteSpace($layoutSession)) {
         $result['SessionKeyEncryptionType'] = $layoutSession
     } else {
@@ -774,7 +783,7 @@ function Test-EventMayBeInteresting {
     if ($null -ne $layout) {
         $ticketIndex = [int]$layout['Ticket']
         $portIndex = [int]$layout['Port']
-        if (Test-IsRC4Etype (Get-EventPropertyValue $props ([int]$layout['Session']))) { return $true }
+        if ([int]$layout['Session'] -ge 0 -and (Test-IsRC4Etype (Get-EventPropertyValue $props ([int]$layout['Session'])))) { return $true }
     }
 
     if ($ticketIndex -ge 0 -and $ticketIndex -lt $count) {
@@ -3473,8 +3482,9 @@ function New-MockPropertyEvent {
     }
     if ($NewMetadata) {
         $sessionIndex = 20
-        if ($Id -eq 4768) { $sessionIndex = 22 }
-        while ($props.Count -lt 23) {
+        $minCount = 21
+        if ($Id -eq 4768) { $sessionIndex = 22; $minCount = 24 }
+        while ($props.Count -lt $minCount) {
             [void]$props.Add([pscustomobject]@{ Value = '' })
         }
         while ($props.Count -le $sessionIndex) {
@@ -3654,7 +3664,7 @@ function Invoke-KerberosRc4SelfTest {
     $script:TicketEtypeTally = @{}
     $propAes = New-MockPropertyEvent -Ticket '0x12' -Session '0x12'
     $propAesFields = Get-EventFields $propAes
-    Assert-True -Condition ($propAesFields['TicketEncryptionType'] -eq '0x12' -and $propAesFields['SessionKeyEncryptionType'] -eq '0x12') `
+    Assert-True -Condition ($propAesFields['TicketEncryptionType'] -eq '0x12') `
         -Name 'EventLogRecord.Properties maps 4769 TicketEncryptionType at index 5 without ToXml'
     Assert-True -Condition ($null -eq (Convert-KerberosEvent $propAes 'DC01')) `
         -Name 'AES 4769 from Properties is skipped without IncludeAes'
@@ -3666,22 +3676,28 @@ function Invoke-KerberosRc4SelfTest {
         -Name 'RC4 4768 from Properties uses TicketEncryptionType at index 7'
     Assert-True -Condition (-not (Test-EventMayBeInteresting $propAes)) `
         -Name 'AES Properties events are not interesting when IncludeAes is off'
-    $newLayout = Get-KerberosLayoutIndices -EventId 4769 -PropertyCount 23
+    $ms21 = Get-KerberosLayoutIndices -EventId 4769 -PropertyCount 21
     $oldLayout = Get-KerberosLayoutIndices -EventId 4769 -PropertyCount 12
-    Assert-True -Condition (([int]$newLayout['Session'] -eq 20) -and ([int]$newLayout['Ticket'] -eq 5)) `
-        -Name 'New 4769 metadata (23+ properties) reads SessionKeyEncryptionType at index 20 like Watch-KerbEncryptionUsage'
-    Assert-True -Condition (([int]$oldLayout['Session'] -eq 11) -and ([int]$oldLayout['Ticket'] -eq 5)) `
-        -Name 'Classic 4769 layout keeps TicketEncryptionType at index 5'
-    $asLayout = Get-KerberosLayoutIndices -EventId 4768 -PropertyCount 23
+    Assert-True -Condition (([int]$ms21['Session'] -eq 20) -and ([int]$ms21['Ticket'] -eq 5)) `
+        -Name 'Get-KerbEncryptionUsage 4769 layout (21+ properties) reads SessionKeyEncryptionType at index 20'
+    Assert-True -Condition (([int]$oldLayout['Session'] -eq -1) -and ([int]$oldLayout['Ticket'] -eq 5)) `
+        -Name 'Pre-update 4769 (under 21 properties) has no session etype; index 11 is RequestTicketHash'
+    $asLayout = Get-KerberosLayoutIndices -EventId 4768 -PropertyCount 24
+    $asShort = Get-KerberosLayoutIndices -EventId 4768 -PropertyCount 23
     Assert-True -Condition (([int]$asLayout['Session'] -eq 22) -and ([int]$asLayout['Ticket'] -eq 7)) `
-        -Name 'New 4768 metadata reads SessionKeyEncryptionType at index 22 like Watch-KerbEncryptionUsage'
+        -Name 'Get-KerbEncryptionUsage 4768 layout (24 properties) reads SessionKeyEncryptionType at index 22'
+    Assert-True -Condition ([int]$asShort['Session'] -eq -1) `
+        -Name '4768 with fewer than 24 properties does not treat ResponseTicket as session etype'
     $msRc4Session = Convert-KerberosEvent (New-MockPropertyEvent -Ticket '0x12' -Session '0x17' -NewMetadata) 'DC01'
     Assert-True -Condition ($null -ne $msRc4Session -and $msRc4Session.Category -eq 'RC4 Session' -and $msRc4Session.SessionCipher -eq 'RC4-HMAC') `
-        -Name 'AES ticket + RC4 session at 4769 index 20 classifies as RC4 Session'
+        -Name 'AES ticket + RC4 session at 4769 index 20 classifies as RC4 Session (Microsoft Get-KerbEncryptionUsage)'
+    $intSession = Convert-KerberosEvent (New-MockPropertyEvent -Ticket 18 -Session 23 -NewMetadata) 'DC01'
+    Assert-True -Condition ($null -ne $intSession -and $intSession.Category -eq 'RC4 Session') `
+        -Name 'Integer property 23 at 4769[20] is RC4 session the same way Get-EncryptionType -Value works'
     $blobEvent = New-MockPropertyEvent -Ticket '18' -Session '0x12' -NewMetadata -KeyBlob $blobRc4Letters
     $blobFields = Get-EventFields $blobEvent
-    Assert-True -Condition ($blobFields['SessionKeyEncryptionType'] -eq '0x12') `
-        -Name 'When 4769[20] is a key blob, session etype keeps the classic scalar at index 11'
+    Assert-True -Condition ([string]::IsNullOrWhiteSpace([string]$blobFields['SessionKeyEncryptionType'])) `
+        -Name 'When 4769[20] is a ticket-hash blob, session etype is empty (not RequestTicketHash at index 11)'
     Assert-True -Condition ($null -eq (Convert-KerberosEvent $blobEvent 'DC01')) `
         -Name 'AES256 ticket with key blob at 4769[20] is not classified as RC4 Session'
     Assert-True -Condition (-not (Test-EventMayBeInteresting $blobEvent)) `
@@ -3689,9 +3705,9 @@ function Invoke-KerberosRc4SelfTest {
     $xmlBlob = New-MockKerberosEvent -Ticket '18' -Session $blobRc4Letters
     Assert-True -Condition ($null -eq (Convert-KerberosEvent $xmlBlob 'DC01')) `
         -Name 'XML SessionKeyEncryptionType key blob with AES256 ticket is not RC4 Session'
-    $rc4AtClassic = Convert-KerberosEvent (New-MockPropertyEvent -Ticket '18' -Session '0x12' -NewMetadata -KeyBlob $blobRc4Letters -ClassicSession '0x17') 'DC01'
-    Assert-True -Condition ($null -ne $rc4AtClassic -and $rc4AtClassic.Category -eq 'RC4 Session' -and $rc4AtClassic.SessionCipher -eq 'RC4-HMAC') `
-        -Name 'AES256 ticket with a real RC4 session at classic index 11 is still RC4 Session when [20] is a key blob'
+    $hashAtEleven = Convert-KerberosEvent (New-MockPropertyEvent -Ticket '18' -Session '0x12' -NewMetadata -KeyBlob $blobRc4Letters -ClassicSession '0x17') 'DC01'
+    Assert-True -Condition ($null -eq $hashAtEleven) `
+        -Name '0x17 at 4769[11] is RequestTicketHash, not a session etype, when [20] is not an etype scalar'
     Reset-KerberosPropertyMap
     $mapXml = @'
 <Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
@@ -3707,6 +3723,15 @@ function Invoke-KerberosRc4SelfTest {
     <Data Name="Status">0x0</Data>
     <Data Name="LogonGuid">{00000000-0000-0000-0000-000000000000}</Data>
     <Data Name="TransmittedServices">-</Data>
+    <Data Name="RequestTicketHash">abc=</Data>
+    <Data Name="ResponseTicketHash">def=</Data>
+    <Data Name="AccountSupportedEncryptionTypes">N/A</Data>
+    <Data Name="AccountAvailableKeys">N/A</Data>
+    <Data Name="ServiceSupportedEncryptionTypes">0x1F</Data>
+    <Data Name="ServiceAvailableKeys">AES-SHA1, RC4</Data>
+    <Data Name="DCSupportedEncryptionTypes">0x1F</Data>
+    <Data Name="DCAvailableKeys">AES-SHA1, RC4</Data>
+    <Data Name="ClientAdvertizedEncryptionTypes">AES256-CTS-HMAC-SHA1-96 RC4-HMAC-NT</Data>
     <Data Name="SessionKeyEncryptionType">0x17</Data>
   </EventData>
 </Event>
@@ -3714,8 +3739,8 @@ function Invoke-KerberosRc4SelfTest {
     Register-KerberosPropertyMap -Event $mapXml -EventId 4769
     $discovered = $null
     if ($script:KerberosNameIndex.ContainsKey('4769')) { $discovered = [string[]]$script:KerberosNameIndex['4769'] }
-    Assert-True -Condition (($null -ne $discovered) -and ($discovered.Count -ge 12) -and ($discovered[11] -eq 'SessionKeyEncryptionType')) `
-        -Name 'First-event XML map places SessionKeyEncryptionType at EventData index 11'
+    Assert-True -Condition (($null -ne $discovered) -and ($discovered.Count -ge 21) -and ($discovered[20] -eq 'SessionKeyEncryptionType') -and ($discovered[11] -eq 'RequestTicketHash')) `
+        -Name 'Microsoft 4769 EventData map has SessionKeyEncryptionType at index 20 and RequestTicketHash at 11'
     Reset-KerberosPropertyMap
     $script:RunTicketEtypeTally = @{ 'AES256-SHA96' = 88094 }
     $script:RunSessionEtypeTally = @{ 'Not logged' = 88094 }
@@ -3732,7 +3757,7 @@ function Invoke-KerberosRc4SelfTest {
     Assert-True -Condition ($null -ne $aesKept -and $aesKept.Category -eq 'AES Ticket') `
         -Name '-IncludeAes keeps successful AES tickets as AES Ticket'
     $aesFromBlob = Convert-KerberosEvent $blobEvent 'DC01'
-    Assert-True -Condition ($null -ne $aesFromBlob -and $aesFromBlob.Category -eq 'AES Ticket' -and $aesFromBlob.TicketCipher -eq 'AES256-SHA96' -and $aesFromBlob.SessionCipher -eq 'AES256-SHA96' -and $aesFromBlob.SessionEtype -eq '0x12') `
+    Assert-True -Condition ($null -ne $aesFromBlob -and $aesFromBlob.Category -eq 'AES Ticket' -and $aesFromBlob.TicketCipher -eq 'AES256-SHA96' -and $aesFromBlob.SessionCipher -eq 'Not logged') `
         -Name 'IncludeAes keeps AES256 tickets whose Microsoft session index holds a key blob'
     $script:DoIncludeAes = $false
     $script:AesKeepRemaining = 0
