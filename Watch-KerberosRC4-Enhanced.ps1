@@ -24,10 +24,11 @@
   "RC4 Offered Only" is NOT evidence of RC4 ticket issuance. Almost every modern Windows
   client still advertises RC4 even when the issued ticket is AES. Historical reads
   pull every 4768/4769 in the Hours window (paged), then keep RC4 ticket/session rows.
-  Use -IncludeAes (or Include AES tickets) to list AES tickets too — that is how you
-  confirm the Security log is being read. The log prints Hours, IncludeAes, and a
-  ticket-etype histogram. A tiny RC4-only result (for example 14 session rows) with
-  Include AES off is not the full Kerberos volume on the DC.
+  Use -IncludeAes (or Include AES tickets) to list more AES tickets (capped so the
+  grid does not freeze). With Include AES off the collector still keeps a small AES
+  sample so a successful read is not an empty grid. The log prints Hours, IncludeAes,
+  and a ticket-etype histogram. A tiny RC4-only result (for example 14 session rows)
+  with Include AES off is not the full Kerberos volume on the DC.
 
 .EXAMPLE
   .\Watch-KerberosRC4-Enhanced.ps1 -DomainControllers LAP-MSASDC03.mclaren.org -Mode Both -HoursBack 24
@@ -177,6 +178,10 @@ $script:CsvBuffer = $null
 $script:DnsTimeoutMs = 750
 $script:DoIncludeFailures = $false
 $script:DoIncludeAes = $false
+$script:MaxAesRows = 500
+$script:AesSampleRows = 50
+$script:AesKeepRemaining = 0
+$script:AesListedCount = 0
 $script:Ui = $null
 
 # ---------------------------------------------------------------------------
@@ -302,6 +307,24 @@ function Test-IsRC4Etype {
     $code = Get-EtypeCode $Etype
     if ($null -eq $code) { return $false }
     return ($code -eq 0x17 -or $code -eq 0x18)
+}
+
+function Test-IsAesEtype {
+    param([string]$Etype)
+    $code = Get-EtypeCode $Etype
+    if ($null -eq $code) { return $false }
+    return ($code -eq 0x11 -or $code -eq 0x12 -or $code -eq 0x13 -or $code -eq 0x14)
+}
+
+function Reset-AesListingCap {
+    if ($null -eq $script:MaxAesRows) { $script:MaxAesRows = 500 }
+    if ($null -eq $script:AesSampleRows) { $script:AesSampleRows = 50 }
+    if ($script:DoIncludeAes) {
+        $script:AesKeepRemaining = [int]$script:MaxAesRows
+    } else {
+        $script:AesKeepRemaining = [int]$script:AesSampleRows
+    }
+    $script:AesListedCount = 0
 }
 
 function Get-EncryptionName {
@@ -889,10 +912,22 @@ function Get-CollectionCompleteText {
     if ([string]::IsNullOrWhiteSpace($ticketTally)) { $ticketTally = Get-TicketEtypeTallyText }
     $sessionTally = Get-EtypeTallyText $script:RunSessionEtypeTally
     if ([string]::IsNullOrWhiteSpace($sessionTally)) { $sessionTally = Get-EtypeTallyText $script:SessionEtypeTally }
-    if ($FindingCount -lt 1) {
-        $note = ''
-        if (-not [string]::IsNullOrWhiteSpace($ticketTally)) { $note = " Ticket etypes read: $ticketTally." }
-        if (-not [string]::IsNullOrWhiteSpace($sessionTally)) { $note += " Session etypes: $sessionTally." }
+    $aesListed = 0
+    $rc4Listed = 0
+    if ($null -ne $script:Records) {
+        foreach ($row in $script:Records) {
+            $cat = [string]$row.Category
+            if ($cat -like 'AES Ticket*') { $aesListed++ }
+            elseif ($cat -like 'RC4*' -or $cat -like 'Failed*') { $rc4Listed++ }
+        }
+    }
+    $note = ''
+    if (-not [string]::IsNullOrWhiteSpace($ticketTally)) { $note = " Ticket etypes read: $ticketTally." }
+    if (-not [string]::IsNullOrWhiteSpace($sessionTally)) { $note += " Session etypes: $sessionTally." }
+    if ($rc4Listed -lt 1) {
+        if ($aesListed -gt 0) {
+            return "${Prefix}: 0 RC4 findings; $aesListed AES confirmation row(s) listed.$note These AES rows are not RC4."
+        }
         return "${Prefix}: 0 RC4 findings.$note That is expected when the DC issues AES. Check Include AES tickets to list those rows."
     }
     $skip = 0
@@ -930,11 +965,16 @@ function Convert-KerberosEvent {
     elseif ($success -and $sessionRc4) { $category = 'RC4 Session' }
     elseif ($script:DoIncludeFailures -and -not $success -and ($ticketRc4 -or $sessionRc4 -or $offeredRc4)) { $category = 'Failed / RC4 Observed' }
     elseif ($success -and $script:DoIncludeOffered -and $offeredRc4) { $category = 'RC4 Offered Only' }
-    elseif ($success -and $script:DoIncludeAes) {
-        $code = Get-EtypeCode $ticket
-        if ($code -eq 0x11 -or $code -eq 0x12 -or $code -eq 0x13 -or $code -eq 0x14) { $category = 'AES Ticket' }
-        else { $category = 'Other Kerberos' }
+    elseif ($success -and (Test-IsAesEtype $ticket)) {
+        $keepAes = $false
+        try { $keepAes = ([int]$script:AesKeepRemaining -gt 0) } catch { $keepAes = $false }
+        if (-not $keepAes) { return $null }
+        $script:AesKeepRemaining = [int]$script:AesKeepRemaining - 1
+        try { $script:AesListedCount = [int]$script:AesListedCount + 1 } catch { $script:AesListedCount = 1 }
+        if ($script:DoIncludeAes) { $category = 'AES Ticket' }
+        else { $category = 'AES Ticket (sample)' }
     }
+    elseif ($success -and $script:DoIncludeAes) { $category = 'Other Kerberos' }
     else { return $null }
 
     $account = Get-NamedField $data @('TargetUserName','AccountName')
@@ -1046,8 +1086,8 @@ function Write-HtmlReport {
     $offeredCount = 0
     $escRows = New-Object System.Text.StringBuilder
     foreach ($r in $script:Records) {
-        if ($r.Category -like '*Ticket*') { $ticketCount++ }
-        if ($r.Category -like '*Session*') { $sessionCount++ }
+        if ($r.Category -like 'RC4 Ticket*') { $ticketCount++ }
+        if ($r.Category -like 'RC4*' -and $r.Category -like '*Session*') { $sessionCount++ }
         if ($r.Category -eq 'RC4 Offered Only') { $offeredCount++ }
         [void]$escRows.Append('<tr>')
         foreach ($field in $script:ReportColumns) {
@@ -1175,7 +1215,7 @@ function Get-CategoryHighlightArgb {
     if ($Category -like 'RC4 Ticket*') { return [int[]](255, 228, 225) }
     if ($Category -like 'RC4 Session*') { return [int[]](255, 249, 196) }
     if ($Category -eq 'RC4 Offered Only') { return [int[]](220, 245, 255) }
-    if ($Category -eq 'AES Ticket') { return [int[]](226, 245, 226) }
+    if ($Category -like 'AES Ticket*') { return [int[]](226, 245, 226) }
     if ($Category -eq 'Other Kerberos') { return [int[]](240, 240, 240) }
     if ($Category -like 'Failed*') { return [int[]](232, 232, 232) }
     return [int[]](255, 255, 255)
@@ -1271,6 +1311,7 @@ function Initialize-CollectorSession {
     $script:DoIncludeOffered = $IncludeOfferedFlag
     $script:DoIncludeAes = $IncludeAesFlag
     $script:DoIncludeFailures = $IncludeFailuresFlag
+    Reset-AesListingCap
     $script:Credential = $CredentialObject
     $script:DnsTimeoutMs = $DnsTimeout
     $script:QuietHost = $Quiet
@@ -1654,6 +1695,7 @@ function Invoke-KerberosCollection {
     $script:RunSessionEtypeTally = @{}
     $script:RunSkippedCount = 0
     Reset-KerberosPropertyMap
+    Reset-AesListingCap
 
     $targetNames = @($Targets | ForEach-Object { if ($_.Kind -eq 'evtx') { $_.Path } else { $_.Name } })
     Write-CollectorStatus "Monitoring $($targetNames -join ', ') | Mode=$Mode | CSV=$script:CsvPath" 'SUCCESS'
@@ -1685,9 +1727,9 @@ function Invoke-KerberosCollection {
             Write-CollectorStatus "Options: Hours=$HoursBack IncludeAes=$($script:DoIncludeAes) IncludeOffered=$($script:DoIncludeOffered) IncludeFailures=$($script:DoIncludeFailures). Querying every 4768/4769 since $since (EventID + time only)."
             Write-CollectorStatus "Paging newest matching events first (page size $HistoryPageSize). EventData is read from event Properties (ToXml only if needed). The log updates after each page; Stop is checked between pages."
             if ($script:DoIncludeAes) {
-                Write-CollectorStatus 'Include AES is on: AES tickets are listed as well as RC4. AES rows skip DNS/AD; uncheck Include AES for the fastest RC4-only grid.'
+                Write-CollectorStatus ("Include AES is on: listing up to {0} AES tickets plus every RC4 row. AES rows skip DNS/AD." -f $script:MaxAesRows)
             } else {
-                Write-CollectorStatus 'Include AES is off: every 4768/4769 in the window is still read, but AES tickets are counted and skipped. Check Include AES tickets to list them.'
+                Write-CollectorStatus ("Include AES is off: listing up to {0} AES confirmation row(s) so the grid is not empty, then skipping the rest. Those sample rows are not RC4. Check Include AES tickets to list more (capped at {1})." -f $script:AesSampleRows, $script:MaxAesRows)
             }
 
             $beforeId = [int64]-1
@@ -1791,7 +1833,9 @@ function Invoke-KerberosCollection {
                     if (-not [string]::IsNullOrWhiteSpace($sessionNote)) { $etypeNote += " Session etypes were $sessionNote." }
                     Write-CollectorStatus "No RC4 tickets in this window.$etypeNote That is expected when the DC issues AES. Include AES tickets only if you want those rows listed." 'WARN'
                 } elseif ($skipped -gt 0 -and -not $script:DoIncludeAes) {
-                    Write-CollectorStatus "Listed RC4 ticket/session rows only. $skipped AES/other event(s) were read and skipped. Check Include AES tickets to list every 4768/4769 in this window." 'WARN'
+                    $aesNote = ''
+                    try { if ([int]$script:AesListedCount -gt 0) { $aesNote = " $($script:AesListedCount) AES confirmation row(s) are listed so the grid is not empty; they are not RC4." } } catch { }
+                    Write-CollectorStatus "Listed RC4 ticket/session rows (if any). $skipped AES/other event(s) were read and skipped.$aesNote Check Include AES tickets to list more (capped at $($script:MaxAesRows))." 'WARN'
                 }
             }
         }
@@ -2458,8 +2502,8 @@ function Add-FindingToUi {
         $dataRow[$col] = if ($null -ne $prop) { [string]$prop.Value } else { '' }
     }
     $script:Ui.Table.Rows.Add($dataRow)
-    if ($Row.Category -like '*Ticket*') { $script:Ui.TicketCount++ }
-    if ($Row.Category -like '*Session*') { $script:Ui.SessionCount++ }
+    if ($Row.Category -like 'RC4 Ticket*') { $script:Ui.TicketCount++ }
+    if ($Row.Category -like 'RC4*' -and $Row.Category -like '*Session*') { $script:Ui.SessionCount++ }
     if ($Row.Category -eq 'RC4 Offered Only') { $script:Ui.OfferedCount++ }
 }
 
@@ -2958,7 +3002,7 @@ function Show-KerberosRc4Gui {
     $chkOffered.Checked = $InitialOffered
     $y += 22
     $chkAes = New-Object System.Windows.Forms.CheckBox
-    $chkAes.Text = 'Include AES tickets (noisy; confirms log reads)'
+    $chkAes.Text = 'Include AES tickets (up to 500 rows; confirms log reads)'
     $chkAes.Location = New-Object System.Drawing.Point(12, $y)
     $chkAes.AutoSize = $true
     $chkAes.Checked = $InitialAes
@@ -3465,6 +3509,10 @@ function Invoke-KerberosRc4SelfTest {
     $script:RunTicketEtypeTally = @{}
     $script:RunSessionEtypeTally = @{}
     $script:RunSkippedCount = 0
+    $script:MaxAesRows = 500
+    $script:AesSampleRows = 50
+    $script:AesKeepRemaining = 0
+    $script:AesListedCount = 0
     Reset-KerberosPropertyMap
     $script:EventDataRegex = $null
     $script:CsvBuffer = New-Object System.Text.StringBuilder
@@ -3586,10 +3634,22 @@ function Invoke-KerberosRc4SelfTest {
     Assert-True -Condition ($sessionOnly.RequestType -eq 'AS') -Name 'Event 4768 is RequestType AS'
 
     $script:TicketEtypeTally = @{}
+    $script:AesKeepRemaining = 0
     $aesOnly = Convert-KerberosEvent (New-MockKerberosEvent -Ticket '0x12' -Session '0x12') 'DC01'
-    Assert-True -Condition ($null -eq $aesOnly) -Name 'AES ticket + AES session is ignored by default'
+    Assert-True -Condition ($null -eq $aesOnly) -Name 'AES ticket + AES session is ignored when the AES sample cap is exhausted'
     Assert-True -Condition ((Get-TicketEtypeTallyText) -match 'AES256-SHA96=1') `
         -Name 'Skipped AES tickets are counted in the etype tally so 0 findings still shows what was read'
+    $script:AesKeepRemaining = 2
+    $script:AesListedCount = 0
+    $aesSample = Convert-KerberosEvent (New-MockKerberosEvent -Ticket '0x12' -Session '0x12') 'DC01'
+    Assert-True -Condition ($null -ne $aesSample -and $aesSample.Category -eq 'AES Ticket (sample)') `
+        -Name 'With Include AES off, a small AES sample is kept so the grid is not empty'
+    $aesSample2 = Convert-KerberosEvent (New-MockKerberosEvent -Ticket '18' -Session '0x12') 'DC01'
+    Assert-True -Condition ($null -ne $aesSample2 -and $aesSample2.Category -eq 'AES Ticket (sample)') `
+        -Name 'AES sample cap keeps a second confirmation row'
+    $script:AesKeepRemaining = 0
+    Assert-True -Condition ($null -eq (Convert-KerberosEvent (New-MockKerberosEvent -Ticket '0x12' -Session '0x12') 'DC01')) `
+        -Name 'AES tickets after the sample cap are skipped'
 
     $script:TicketEtypeTally = @{}
     $propAes = New-MockPropertyEvent -Ticket '0x12' -Session '0x12'
@@ -3667,6 +3727,7 @@ function Invoke-KerberosRc4SelfTest {
     Assert-True -Condition ((Get-KerberosLiveXPath) -eq '*[System[(EventID=4768 or EventID=4769)]]') `
         -Name 'Live EventLogWatcher XPath matches Watch-KerbEncryptionUsage (all 4768/4769)'
     $script:DoIncludeAes = $true
+    Reset-AesListingCap
     $aesKept = Convert-KerberosEvent (New-MockKerberosEvent -Ticket '0x12' -Session '0x12') 'DC01'
     Assert-True -Condition ($null -ne $aesKept -and $aesKept.Category -eq 'AES Ticket') `
         -Name '-IncludeAes keeps successful AES tickets as AES Ticket'
@@ -3674,6 +3735,7 @@ function Invoke-KerberosRc4SelfTest {
     Assert-True -Condition ($null -ne $aesFromBlob -and $aesFromBlob.Category -eq 'AES Ticket' -and $aesFromBlob.TicketCipher -eq 'AES256-SHA96' -and $aesFromBlob.SessionCipher -eq 'AES256-SHA96' -and $aesFromBlob.SessionEtype -eq '0x12') `
         -Name 'IncludeAes keeps AES256 tickets whose Microsoft session index holds a key blob'
     $script:DoIncludeAes = $false
+    $script:AesKeepRemaining = 0
 
     $script:DoIncludeOffered = $true
     $offeredOnly = Convert-KerberosEvent (New-MockKerberosEvent -Ticket '0x12' -Session '0x12') 'DC01'
