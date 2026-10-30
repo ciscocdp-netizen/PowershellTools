@@ -34,9 +34,10 @@
   Available Keys and Advertized Etypes that mention RC4 are NOT RC4 communications
   (Learn: "RC4 is shown regardless of usage" on Available Keys).
 
-  The GUI lists ticket + session etypes like Get-KerbEncryptionUsage (All), capped
-  so the grid does not freeze. Uncheck that box for -Encryption RC4 only, plus a
-  small AES sample. The log prints Hours, IncludeAes, and a ticket-etype histogram.
+  The GUI defaults to that RC4 filter (ticket or session 0x17/0x18) and reverse-DNS
+  of ClientIP. Check Include AES tickets for Get-KerbEncryptionUsage Encryption=All
+  (capped so the grid does not freeze). The log prints Hours, IncludeAes, and a
+  ticket-etype histogram.
 
 .EXAMPLE
   .\Watch-KerberosRC4-Enhanced.ps1 -DomainControllers LAP-MSASDC03.mclaren.org -Mode Both -HoursBack 24
@@ -133,7 +134,9 @@
     and AES tickets stop appearing as RC4 Session.
   - Historical parse walked every 4768/4769 (mostly AES) and ran ToXml/XmlDocument on
     each. EventData is read from EventLogRecord.Properties (classic 4768/4769 layout)
-    and ToXml is only a fallback. AES confirmation rows skip DNS/AD. CSV is buffered
+    and ToXml is only a fallback. Listed rows reverse-DNS ClientIP when Resolve
+    hostnames is on; machine accounts (SAM$) fall back to host.dnsdomain if PTR
+    is missing. AES rows still skip AD enrichment. CSV is buffered
     per page. The collector pages 4768/4769 by EventID and time only.
 #>
 [CmdletBinding()]
@@ -156,7 +159,7 @@ param(
     [ValidateRange(10,1000000)][int]$MaxHistoryEventsPerDC = 100000,
     [ValidateRange(50,20000)][int]$HistoryPageSize = 2000,
     [ValidateRange(100,100000)][int]$LivePageSize = 20000,
-    [ValidateRange(250,15000)][int]$DnsTimeoutMs = 750,
+    [ValidateRange(250,15000)][int]$DnsTimeoutMs = 2000,
     [switch]$SkipAuditCheck,
     [switch]$RequireAuditing,
     [switch]$Gui,
@@ -327,7 +330,11 @@ function Test-IsMicrosoftRc4Usage {
 }
 
 function Get-GuiMicrosoftUsageDefault {
-    # Learn runs Get-KerbEncryptionUsage with no -Encryption filter (All).
+    # GUI defaults to Get-KerbEncryptionUsage -Encryption RC4 (not All).
+    return $false
+}
+
+function Get-GuiResolveHostnamesDefault {
     return $true
 }
 
@@ -880,24 +887,50 @@ function Test-EventMayBeInteresting {
     return $false
 }
 
+function Get-HostnameFromKerberosAccount {
+    param([string]$Account, [string]$Domain)
+    $sam = Get-SamAccountCandidate $Account
+    if ([string]::IsNullOrWhiteSpace($sam) -or -not $sam.EndsWith('$')) { return '' }
+    $hostShort = $sam.TrimEnd('$').Trim()
+    if ([string]::IsNullOrWhiteSpace($hostShort)) { return '' }
+    $dns = [string]$Domain
+    if ([string]::IsNullOrWhiteSpace($dns) -or $dns.Trim() -eq '-') {
+        if ($Account -match '@([^@]+)$') { $dns = $Matches[1] }
+    }
+    $dns = ([string]$dns).Trim()
+    if ([string]::IsNullOrWhiteSpace($dns) -or $dns.IndexOf('.') -lt 0) { return $hostShort }
+    return ($hostShort + '.' + $dns)
+}
+
 function Resolve-ClientHostname {
-    param([string]$Address)
-    if (-not $script:DoResolveHostnames -or [string]::IsNullOrWhiteSpace($Address)) { return '' }
+    param(
+        [string]$Address,
+        [string]$Account = '',
+        [string]$Domain = ''
+    )
+    if (-not $script:DoResolveHostnames) { return '' }
     $ip = ConvertTo-NormalizedIp $Address
-    if ([string]::IsNullOrWhiteSpace($ip)) { return '' }
-    if ($ip -in @('127.0.0.1', '::1', '0.0.0.0')) { return '' }
-    if ($script:DnsCache.ContainsKey($ip)) { return $script:DnsCache[$ip] }
+    $fromAccount = Get-HostnameFromKerberosAccount $Account $Domain
+    if ([string]::IsNullOrWhiteSpace($ip) -or $ip -in @('127.0.0.1', '::1', '0.0.0.0')) {
+        return $fromAccount
+    }
+    if ($script:DnsCache.ContainsKey($ip)) {
+        $cached = [string]$script:DnsCache[$ip]
+        if (-not [string]::IsNullOrWhiteSpace($cached)) { return $cached }
+        return $fromAccount
+    }
 
     $name = ''
+    $timeoutMs = 2000
+    try { $timeoutMs = [int]$script:DnsTimeoutMs } catch { $timeoutMs = 2000 }
+    if ($timeoutMs -lt 250) { $timeoutMs = 250 }
     try {
-        $parsed = [System.Net.IPAddress]::Parse($ip)
-        $async = [System.Net.Dns]::GetHostEntryAsync($parsed)
-        if ($async.Wait($script:DnsTimeoutMs)) {
-            if ($async.Status -eq [System.Threading.Tasks.TaskStatus]::RanToCompletion -and $null -ne $async.Result) {
-                $name = [string]$async.Result.HostName
-            }
+        $async = [System.Net.Dns]::GetHostEntryAsync($ip)
+        if ($async.Wait($timeoutMs) -and -not $async.IsFaulted -and $null -ne $async.Result) {
+            $name = [string]$async.Result.HostName
         }
     } catch { }
+    if ([string]::IsNullOrWhiteSpace($name)) { $name = $fromAccount }
     $script:DnsCache[$ip] = $name
     return $name
 }
@@ -1097,13 +1130,12 @@ function Convert-KerberosEvent {
     $row.ClientPort = (Get-NamedField $data @('IpPort','ClientPort'))
     $row.ServiceName = $service
     $row.ServiceSPNIfLogged = $spn
-    $needEnrich = ($category -like 'RC4*') -or ($category -like 'Failed*')
-    if ($needEnrich) {
-        $row.ClientHostname = (Resolve-ClientHostname $ip)
+    $row.ClientHostname = (Resolve-ClientHostname -Address $ip -Account $account -Domain $domain)
+    $needAd = ($category -like 'RC4*') -or ($category -like 'Failed*')
+    if ($needAd) {
         $row.AccountADObject = (Find-ADIdentity $account)
         $row.ServiceADObject = (Find-ADIdentity $service)
     } else {
-        $row.ClientHostname = ''
         $row.AccountADObject = ''
         $row.ServiceADObject = ''
     }
@@ -1822,7 +1854,7 @@ function Invoke-KerberosCollection {
             Write-CollectorStatus "Microsoft Get-KerbEncryptionUsage indexes: 4769 Ticket[5] SessionKey[20] (21+ fields), 4768 Ticket[7] SessionKey[22] (24 fields). RC4 communications = etype 0x17 (Either ticket or session). Available Keys / Advertized Etypes mentioning RC4 are not RC4 use."
             Write-CollectorStatus "Paging newest matching events first (page size $HistoryPageSize). EventData is read from event Properties (ToXml only if needed). The log updates after each page; Stop is checked between pages."
             if ($script:DoIncludeAes) {
-                Write-CollectorStatus ("Microsoft listing (Get-KerbEncryptionUsage Encryption=All): up to {0} ticket/session rows plus every RC4 row. AES rows skip DNS/AD." -f $script:MaxAesRows)
+                Write-CollectorStatus ("Microsoft listing (Get-KerbEncryptionUsage Encryption=All): up to {0} ticket/session rows plus every RC4 row. Reverse-DNS runs on listed rows when Resolve hostnames is on." -f $script:MaxAesRows)
             } else {
                 Write-CollectorStatus ("Microsoft RC4 filter (Get-KerbEncryptionUsage -Encryption RC4): ticket or session 0x17/0x18, plus {0} AES confirmation row(s) so Ticket/SessionKey are visible. Those sample rows are not RC4. Check Include AES tickets for Encryption=All (capped at {1})." -f $script:AesSampleRows, $script:MaxAesRows)
             }
@@ -3097,7 +3129,7 @@ function Show-KerberosRc4Gui {
     $chkOffered.Checked = $InitialOffered
     $y += 22
     $chkAes = New-Object System.Windows.Forms.CheckBox
-    $chkAes.Text = 'Microsoft All: list ticket + session etypes (cap 500)'
+    $chkAes.Text = 'Include AES tickets (Microsoft All; cap 500)'
     $chkAes.Location = New-Object System.Drawing.Point(12, $y)
     $chkAes.AutoSize = $true
     $chkAes.Checked = [bool](Get-GuiMicrosoftUsageDefault)
@@ -3110,10 +3142,11 @@ function Show-KerberosRc4Gui {
     $chkFailures.Checked = $InitialFailures
     $y += 24
     $chkDns = New-Object System.Windows.Forms.CheckBox
-    $chkDns.Text = 'Resolve client hostnames'
+    $chkDns.Text = 'Resolve client hostnames from IP'
     $chkDns.Location = New-Object System.Drawing.Point(12, $y)
     $chkDns.AutoSize = $true
-    $chkDns.Checked = $InitialDns
+    $chkDns.Checked = [bool](Get-GuiResolveHostnamesDefault)
+    if ($InitialDns) { $chkDns.Checked = $true }
     $y += 24
     $chkAd = New-Object System.Windows.Forms.CheckBox
     $chkAd.Text = 'Enrich accounts in Active Directory'
@@ -3430,7 +3463,7 @@ function Show-KerberosRc4Gui {
         }
     }
     if ($script:Ui.Targets.Count -lt 1) {
-        Add-UiLogLine 'Add a DC (Discover, Add DC, or Add EVTX) then click Start. Ticket/session etypes follow Microsoft Get-KerbEncryptionUsage (4769[5]/[20], 4768[7]/[22]; RC4 = 0x17). Collection is read-only.'
+        Add-UiLogLine 'Add a DC (Discover, Add DC, or Add EVTX) then click Start. Default filter is Microsoft Get-KerbEncryptionUsage -Encryption RC4 (ticket or session 0x17). Client IPs reverse-DNS when Resolve hostnames is on. Collection is read-only.'
     } else {
         Add-UiLogLine 'Targets loaded. Review options and click Start.'
     }
@@ -3661,8 +3694,10 @@ function Invoke-KerberosRc4SelfTest {
         -Name 'Get-KerbEncryptionUsage -Encryption RC4 Either matches AES ticket + RC4 session'
     Assert-True -Condition (-not (Test-IsMicrosoftRc4Usage -Ticket '0x12' -Session '0x12')) `
         -Name 'Get-KerbEncryptionUsage -Encryption RC4 Either skips AES ticket + AES session'
-    Assert-True -Condition ([bool](Get-GuiMicrosoftUsageDefault) -eq $true) `
-        -Name 'GUI defaults to Get-KerbEncryptionUsage Encryption=All listing'
+    Assert-True -Condition ([bool](Get-GuiMicrosoftUsageDefault) -eq $false) `
+        -Name 'GUI defaults to Get-KerbEncryptionUsage -Encryption RC4 (AES listing off)'
+    Assert-True -Condition ([bool](Get-GuiResolveHostnamesDefault) -eq $true) `
+        -Name 'GUI defaults to resolving client hostnames from IP'
     Assert-True -Condition ((Get-EncryptionName '0x12') -eq 'AES256-SHA96') -Name 'Get-EncryptionName maps 0x12'
     Assert-True -Condition ((Get-EncryptionName '') -eq 'Not logged') -Name 'Missing etype is Not logged'
 
@@ -3699,6 +3734,10 @@ function Invoke-KerberosRc4SelfTest {
     Assert-True -Condition ((Get-SamAccountCandidate 'HOST/dc01.contoso.local') -eq 'dc01.contoso.local') -Name 'SPN splits on slash'
     Assert-True -Condition ((Get-SamAccountCandidate 'CONTOSO\sqlsvc') -eq 'sqlsvc') -Name 'DOMAIN\user splits to SAM'
     Assert-True -Condition ((Get-SamAccountCandidate 'jsmith@CONTOSO.LOCAL') -eq 'jsmith') -Name 'UPN splits to SAM'
+    Assert-True -Condition ((Get-HostnameFromKerberosAccount -Account 'LAPNAS01$@MCLAREN.ORG' -Domain 'MCLAREN.ORG') -eq 'LAPNAS01.MCLAREN.ORG') `
+        -Name 'Machine account plus DNS domain becomes a client hostname fallback'
+    Assert-True -Condition ([string]::IsNullOrWhiteSpace((Get-HostnameFromKerberosAccount -Account 'cdw_stor_mon_s11_ro' -Domain 'MCLAREN.ORG'))) `
+        -Name 'User accounts are not used as a hostname fallback'
     Assert-True -Condition ((ConvertTo-LdapEscaped 'a*b(c)') -eq 'a\2ab\28c\29') -Name 'LDAP special characters are escaped'
 
     $namespaced = @'
@@ -3859,6 +3898,17 @@ function Invoke-KerberosRc4SelfTest {
     $msAll = Convert-KerberosEvent (New-MockPropertyEvent -Ticket 18 -Session 18 -NewMetadata) 'DC01'
     Assert-True -Condition ($null -ne $msAll -and $msAll.Category -eq 'AES Ticket' -and $msAll.TicketCipher -eq 'AES256-SHA96' -and $msAll.SessionCipher -eq 'AES256-SHA96' -and $msAll.TicketEtype -eq '0x12' -and $msAll.SessionEtype -eq '0x12') `
         -Name 'Get-KerbEncryptionUsage Encryption=All lists AES256 ticket and session like the Learn example'
+    $script:DoResolveHostnames = $true
+    $script:DnsCache = @{ '10.10.10.25' = 'pc25.contoso.local' }
+    $aesDns = Convert-KerberosEvent (New-MockKerberosEvent -Ticket '0x12' -Session '0x12') 'DC01'
+    Assert-True -Condition ($null -ne $aesDns -and $aesDns.ClientHostname -eq 'pc25.contoso.local') `
+        -Name 'AES rows reverse-DNS ClientIP when Resolve hostnames is on'
+    $script:DnsCache = @{ '10.10.128.40' = '' }
+    $machineDns = Convert-KerberosEvent (New-MockKerberosEvent -Ticket '0x17' -Account 'LAPNAS01$@MCLAREN.ORG' -Domain 'MCLAREN.ORG' -Ip '::ffff:10.10.128.40') 'DC01'
+    Assert-True -Condition ($null -ne $machineDns -and $machineDns.ClientHostname -eq 'LAPNAS01.MCLAREN.ORG') `
+        -Name 'When PTR is missing, a machine account becomes host.dnsdomain'
+    $script:DoResolveHostnames = $false
+    $script:DnsCache = @{}
     $aesFromBlob = Convert-KerberosEvent $blobEvent 'DC01'
     Assert-True -Condition ($null -ne $aesFromBlob -and $aesFromBlob.Category -eq 'AES Ticket' -and $aesFromBlob.TicketCipher -eq 'AES256-SHA96' -and $aesFromBlob.SessionCipher -eq 'Not logged') `
         -Name 'IncludeAes keeps AES256 tickets whose Microsoft session index holds a key blob'
