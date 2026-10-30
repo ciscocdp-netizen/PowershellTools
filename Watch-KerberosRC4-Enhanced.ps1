@@ -165,6 +165,13 @@ $script:CancelRequested = $false
 $script:ReportedAccessDenied = @{}
 $script:LoggedRc4Filter = $false
 $script:TicketEtypeTally = @{}
+$script:SessionEtypeTally = @{}
+$script:RunTicketEtypeTally = @{}
+$script:RunSessionEtypeTally = @{}
+$script:RunSkippedCount = 0
+$script:KerberosNameIndex = @{}
+$script:KerberosNameIndexTried = @{}
+$script:LogEventDataMap = $true
 $script:EventDataRegex = $null
 $script:CsvBuffer = $null
 $script:DnsTimeoutMs = 750
@@ -558,10 +565,20 @@ function Get-EventFieldsFromProperties {
     if ($null -eq $layout) { return $null }
     if ([int]$layout['Ticket'] -ge $count) { return $null }
 
+    Register-KerberosPropertyMap -Event $Event -EventId $eventId
+    $mapKey = [string]$eventId
+    if ($script:KerberosNameIndex.ContainsKey($mapKey)) {
+        $cachedNames = $script:KerberosNameIndex[$mapKey]
+        if ($null -ne $cachedNames -and $cachedNames.Count -gt 5) {
+            $names = [string[]]$cachedNames
+        }
+    }
+
     $result = @{}
     $limit = $count
     if ($limit -gt $names.Count) { $limit = $names.Count }
     for ($i = 0; $i -lt $limit; $i++) {
+        if ([string]::IsNullOrWhiteSpace([string]$names[$i])) { continue }
         $result[$names[$i]] = Get-EventPropertyValue $props $i
     }
     $result['TargetUserName'] = Get-EventPropertyValue $props ([int]$layout['Account'])
@@ -586,6 +603,68 @@ function Get-EventFieldsFromProperties {
         return $null
     }
     return $result
+}
+
+function Reset-KerberosPropertyMap {
+    $script:KerberosNameIndex = @{}
+    $script:KerberosNameIndexTried = @{}
+}
+
+function Register-KerberosPropertyMap {
+    param($Event, [int]$EventId)
+    if ($null -eq $script:KerberosNameIndex) { $script:KerberosNameIndex = @{} }
+    if ($null -eq $script:KerberosNameIndexTried) { $script:KerberosNameIndexTried = @{} }
+    $key = [string]$EventId
+    if ($script:KerberosNameIndex.ContainsKey($key) -and $script:KerberosNameIndex[$key].Count -gt 5) {
+        return
+    }
+
+    $inlineXml = $false
+    if ($Event -is [string]) {
+        $inlineXml = $true
+    } else {
+        try {
+            $xmlProp = $Event.PSObject.Properties['XmlText']
+            if ($null -ne $xmlProp -and -not [string]::IsNullOrWhiteSpace([string]$xmlProp.Value)) {
+                $inlineXml = $true
+            }
+        } catch { }
+    }
+    if (-not $inlineXml -and $script:KerberosNameIndexTried.ContainsKey($key)) {
+        return
+    }
+
+    $xmlText = Get-EventXmlText $Event
+    if (-not $inlineXml) {
+        $script:KerberosNameIndexTried[$key] = $true
+    }
+    if ([string]::IsNullOrWhiteSpace($xmlText)) {
+        return
+    }
+    if ($null -eq $script:EventDataRegex) {
+        $regexOpts = [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::Compiled
+        $script:EventDataRegex = New-Object System.Text.RegularExpressions.Regex -ArgumentList @('<Data Name="([^"]+)">([^<]*)</Data>', $regexOpts)
+    }
+    $matchList = $script:EventDataRegex.Matches($xmlText)
+    if ($matchList.Count -lt 6) {
+        return
+    }
+    $list = New-Object System.Collections.Generic.List[string]
+    foreach ($m in $matchList) {
+        [void]$list.Add($m.Groups[1].Value)
+    }
+    if (-not ($list.Contains('TicketEncryptionType'))) {
+        return
+    }
+    $arr = [string[]]$list.ToArray()
+    $script:KerberosNameIndex[$key] = $arr
+    $sessionIdx = -1
+    for ($i = 0; $i -lt $arr.Length; $i++) {
+        if ($arr[$i] -eq 'SessionKeyEncryptionType') { $sessionIdx = $i; break }
+    }
+    if ($script:LogEventDataMap) {
+        Write-CollectorStatus ("Event ${EventId} EventData map: {0} field(s); SessionKeyEncryptionType index={1} (ToXml once, then Properties)." -f $arr.Length, $sessionIdx)
+    }
 }
 
 function Get-EventXmlText {
@@ -759,24 +838,70 @@ function New-EmptyFinding {
     return [pscustomobject]$row
 }
 
-function Add-TicketEtypeTally {
-    param([string]$Etype)
-    if ($null -eq $script:TicketEtypeTally) { $script:TicketEtypeTally = @{} }
-    $name = Get-EncryptionName $Etype
-    if ($script:TicketEtypeTally.ContainsKey($name)) {
-        $script:TicketEtypeTally[$name] = [int]$script:TicketEtypeTally[$name] + 1
+function Add-EtypeTally {
+    param($Table, [string]$Name)
+    if ($null -eq $Table) { return }
+    if ($Table.ContainsKey($Name)) {
+        $Table[$Name] = [int]$Table[$Name] + 1
     } else {
-        $script:TicketEtypeTally[$name] = 1
+        $Table[$Name] = 1
     }
 }
 
-function Get-TicketEtypeTallyText {
-    if ($null -eq $script:TicketEtypeTally -or $script:TicketEtypeTally.Count -lt 1) { return '' }
+function Add-TicketEtypeTally {
+    param([string]$Etype)
+    if ($null -eq $script:TicketEtypeTally) { $script:TicketEtypeTally = @{} }
+    if ($null -eq $script:RunTicketEtypeTally) { $script:RunTicketEtypeTally = @{} }
+    $name = Get-EncryptionName $Etype
+    Add-EtypeTally $script:TicketEtypeTally $name
+    Add-EtypeTally $script:RunTicketEtypeTally $name
+}
+
+function Add-SessionEtypeTally {
+    param([string]$Etype)
+    if ($null -eq $script:SessionEtypeTally) { $script:SessionEtypeTally = @{} }
+    if ($null -eq $script:RunSessionEtypeTally) { $script:RunSessionEtypeTally = @{} }
+    $name = Get-EncryptionName $Etype
+    Add-EtypeTally $script:SessionEtypeTally $name
+    Add-EtypeTally $script:RunSessionEtypeTally $name
+}
+
+function Get-EtypeTallyText {
+    param($Table)
+    if ($null -eq $Table -or $Table.Count -lt 1) { return '' }
     $parts = New-Object System.Collections.Generic.List[string]
-    foreach ($entry in ($script:TicketEtypeTally.GetEnumerator() | Sort-Object Name)) {
+    foreach ($entry in ($Table.GetEnumerator() | Sort-Object Name)) {
         [void]$parts.Add(('{0}={1}' -f $entry.Name, $entry.Value))
     }
     return ($parts -join ', ')
+}
+
+function Get-TicketEtypeTallyText {
+    return (Get-EtypeTallyText $script:TicketEtypeTally)
+}
+
+function Get-CollectionCompleteText {
+    param(
+        [int]$FindingCount = 0,
+        [string]$Prefix = 'Completed'
+    )
+    $ticketTally = Get-EtypeTallyText $script:RunTicketEtypeTally
+    if ([string]::IsNullOrWhiteSpace($ticketTally)) { $ticketTally = Get-TicketEtypeTallyText }
+    $sessionTally = Get-EtypeTallyText $script:RunSessionEtypeTally
+    if ([string]::IsNullOrWhiteSpace($sessionTally)) { $sessionTally = Get-EtypeTallyText $script:SessionEtypeTally }
+    if ($FindingCount -lt 1) {
+        $note = ''
+        if (-not [string]::IsNullOrWhiteSpace($ticketTally)) { $note = " Ticket etypes read: $ticketTally." }
+        if (-not [string]::IsNullOrWhiteSpace($sessionTally)) { $note += " Session etypes: $sessionTally." }
+        return "${Prefix}: 0 RC4 findings.$note That is expected when the DC issues AES. Check Include AES tickets to list those rows."
+    }
+    $skip = 0
+    try { $skip = [int]$script:RunSkippedCount } catch { $skip = 0 }
+    $extra = ''
+    if ($skip -gt 0 -and -not $script:DoIncludeAes) {
+        $extra = " $skip AES/other event(s) skipped."
+    }
+    return "${Prefix}: $FindingCount finding(s).$extra"
 }
 
 function Convert-KerberosEvent {
@@ -791,6 +916,7 @@ function Convert-KerberosEvent {
     $ticket  = Get-NamedField $data @('TicketEncryptionType')
     Add-TicketEtypeTally $ticket
     $session = Get-EtypeScalarOrEmpty (Get-NamedField $data @('SessionKeyEncryptionType','SessionEncryptionType'))
+    Add-SessionEtypeTally $session
     $offered = Get-NamedField $data @('ClientAdvertizedEncryptionTypes','ClientAdvertisedEncryptionTypes','AdvertizedEtypes','AdvertisedEtypes')
     $status  = Get-NamedField $data @('Status')
     $success = Test-IsKerberosSuccess $status
@@ -933,11 +1059,23 @@ function Write-HtmlReport {
     }
     $heads = ($script:ReportColumns | ForEach-Object { '<th>' + (ConvertTo-HtmlEncoded $_) + '</th>' }) -join ''
     $generated = ConvertTo-HtmlEncoded ((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))
+    $emptyNote = ''
+    if ($total -lt 1) {
+        $tallyNote = Get-EtypeTallyText $script:RunTicketEtypeTally
+        if ([string]::IsNullOrWhiteSpace($tallyNote)) { $tallyNote = Get-TicketEtypeTallyText }
+        $emptyBody = 'No RC4 ticket or session rows.'
+        if (-not [string]::IsNullOrWhiteSpace($tallyNote)) {
+            $emptyBody += ' Ticket etypes read: ' + $tallyNote + '.'
+        }
+        $emptyBody += ' That is expected when the DC issues AES. Use Include AES tickets to list those events.'
+        $emptyNote = '<p class="note"><b>' + (ConvertTo-HtmlEncoded $emptyBody) + '</b></p>'
+    }
     $html = @"
 <!doctype html><html lang="en"><head><meta charset="utf-8"><title>Kerberos RC4 Investigation</title>
 <style>body{font:14px Segoe UI,Arial,sans-serif;background:#f4f6fa;color:#172338;margin:24px}h1{margin-bottom:4px}.muted{color:#5c6677}.cards{display:flex;gap:12px;flex-wrap:wrap;margin:20px 0}.card{background:white;border:1px solid #dbe1eb;border-radius:9px;padding:15px;min-width:150px}.num{font-size:28px;font-weight:700}.pane{overflow:auto;max-height:70vh;background:white;border:1px solid #dbe1eb;border-radius:8px}table{border-collapse:collapse;width:100%;font-size:12px}th,td{padding:9px 10px;border-bottom:1px solid #e8edf2;text-align:left;white-space:nowrap}th{position:sticky;top:0;background:#eaf0f6}tr:hover{background:#f2f8fe}input{width:min(550px,90%);padding:10px;border:1px solid #abb8c8;border-radius:6px;margin:12px 0}.note{max-width:1100px;line-height:1.5}</style></head><body>
 <h1>Kerberos RC4 Investigation</h1><div class="muted">Updated $generated | Event IDs 4768, 4769 | read-only collection</div>
 <div class="cards"><div class="card">Records<div class="num">$total</div></div><div class="card">RC4 ticket categories<div class="num">$ticketCount</div></div><div class="card">RC4 session categories<div class="num">$sessionCount</div></div><div class="card">Offered only<div class="num">$offeredCount</div></div></div>
+$emptyNote
 <p class="note"><b>Interpretation:</b> RC4 Ticket / RC4 Session categories require a successful event and a matching encryption field (0x17 / 23 or 0x18 / 24). "RC4 Offered Only" is not proof of RC4 ticket issuance — Windows clients commonly still advertise RC4 while receiving AES tickets. Older or unpatched DCs omit session and advertised fields. Event 4769 ServiceName often names the service account, not the complete SPN. DNS and AD enrichment are best effort.</p>
 <input id="q" placeholder="Search accounts, clients, ciphers, services, DCs..." oninput="filterRows()" aria-label="Search records"><span id="shown"></span>
 <div class="pane"><table id="events"><thead><tr>$heads</tr></thead><tbody>$($escRows.ToString())</tbody></table></div>
@@ -1140,6 +1278,12 @@ function Initialize-CollectorSession {
     $script:ReportedAccessDenied = @{}
     $script:LoggedRc4Filter = $false
     $script:TicketEtypeTally = @{}
+    $script:SessionEtypeTally = @{}
+    $script:RunTicketEtypeTally = @{}
+    $script:RunSessionEtypeTally = @{}
+    $script:RunSkippedCount = 0
+    $script:LogEventDataMap = $true
+    Reset-KerberosPropertyMap
     $script:EventDataRegex = $null
     $script:CsvBuffer = New-Object System.Text.StringBuilder
     $script:Utf8NoBom = New-Object System.Text.UTF8Encoding $false
@@ -1506,6 +1650,11 @@ function Invoke-KerberosCollection {
         return
     }
 
+    $script:RunTicketEtypeTally = @{}
+    $script:RunSessionEtypeTally = @{}
+    $script:RunSkippedCount = 0
+    Reset-KerberosPropertyMap
+
     $targetNames = @($Targets | ForEach-Object { if ($_.Kind -eq 'evtx') { $_.Path } else { $_.Name } })
     Write-CollectorStatus "Monitoring $($targetNames -join ', ') | Mode=$Mode | CSV=$script:CsvPath" 'SUCCESS'
     if ($null -ne $script:UiSync) {
@@ -1551,6 +1700,7 @@ function Invoke-KerberosCollection {
             $oldestSaved = $null
             $newestSaved = $null
             $script:TicketEtypeTally = @{}
+            $script:SessionEtypeTally = @{}
             $logSummary = Get-SecurityLogSummary -ComputerName $target.Name -Path $target.Path
             if (-not [string]::IsNullOrWhiteSpace($logSummary)) {
                 Write-CollectorStatus $logSummary
@@ -1595,6 +1745,7 @@ function Invoke-KerberosCollection {
                         }
                     } else {
                         $skipped++
+                        $script:RunSkippedCount++
                     }
                 }
                 Flush-CsvBuffer
@@ -1607,6 +1758,10 @@ function Invoke-KerberosCollection {
                 $span = ''
                 if ($null -ne $pageOldest -and $null -ne $pageNewest) {
                     $span = " Times $($pageOldest.ToString('yyyy-MM-dd HH:mm:ss')) .. $($pageNewest.ToString('yyyy-MM-dd HH:mm:ss'))."
+                }
+                if ($null -ne $script:UiSync) {
+                    $script:UiSync.SkippedCount = $script:RunSkippedCount
+                    $script:UiSync.TallyText = Get-EtypeTallyText $script:RunTicketEtypeTally
                 }
                 Write-CollectorStatus "Page $pageNum from $($target.Name): $pageCount event(s), $saved finding(s), $skipped AES/other skipped. Total read $totalRead.$span"
                 # Do not stop just because this page is smaller than MaxEvents. Remote Get-WinEvent
@@ -1632,6 +1787,8 @@ function Invoke-KerberosCollection {
                 }
                 if ($saved -lt 1) {
                     $etypeNote = if ([string]::IsNullOrWhiteSpace($tallyText)) { '' } else { " Ticket etypes were $tallyText." }
+                    $sessionNote = Get-EtypeTallyText $script:SessionEtypeTally
+                    if (-not [string]::IsNullOrWhiteSpace($sessionNote)) { $etypeNote += " Session etypes were $sessionNote." }
                     Write-CollectorStatus "No RC4 tickets in this window.$etypeNote That is expected when the DC issues AES. Include AES tickets only if you want those rows listed." 'WARN'
                 } elseif ($skipped -gt 0 -and -not $script:DoIncludeAes) {
                     Write-CollectorStatus "Listed RC4 ticket/session rows only. $skipped AES/other event(s) were read and skipped. Check Include AES tickets to list every 4768/4769 in this window." 'WARN'
@@ -1650,7 +1807,7 @@ function Invoke-KerberosCollection {
 
     Write-CollectorStatus "HTML report: $script:HtmlPath" 'SUCCESS'
     if (-not $runLive -or (Test-IsCollectorCancelRequested)) {
-        Write-CollectorStatus "Completed: $($script:Records.Count) findings." 'SUCCESS'
+        Write-CollectorStatus (Get-CollectionCompleteText -FindingCount $script:Records.Count) 'SUCCESS'
         return
     }
 
@@ -1741,9 +1898,9 @@ function Invoke-KerberosCollection {
         }
         try { Write-HtmlReport } catch { }
         if (Test-IsLiveWatchExpired $liveDeadline) {
-            Write-CollectorStatus "Live watch of $LiveMinutes minute(s) finished. Saved $($script:Records.Count) finding(s) to $script:CsvPath and $script:HtmlPath" 'SUCCESS'
+            Write-CollectorStatus ((Get-CollectionCompleteText -FindingCount $script:Records.Count -Prefix ("Live watch of $LiveMinutes minute(s) finished")) + " CSV=$script:CsvPath") 'SUCCESS'
         } else {
-            Write-CollectorStatus "Stopped. Findings: $($script:Records.Count). CSV=$script:CsvPath" 'SUCCESS'
+            Write-CollectorStatus ((Get-CollectionCompleteText -FindingCount $script:Records.Count -Prefix 'Stopped') + " CSV=$script:CsvPath") 'SUCCESS'
         }
     }
 }
@@ -2283,7 +2440,13 @@ function Update-UiCountLabels {
     $offered = $script:Ui.OfferedCount
     $total = $script:Ui.Table.Rows.Count
     $shown = $script:Ui.Table.DefaultView.Count
-    $script:Ui.CountLabel.Text = "Records $total  |  Shown $shown  |  RC4 tickets $ticket  |  RC4 sessions $session  |  Offered $offered"
+    $skipped = 0
+    if ($null -ne $script:UiSync) {
+        try { $skipped = [int]$script:UiSync.SkippedCount } catch { $skipped = 0 }
+    }
+    $text = "Records $total  |  Shown $shown  |  RC4 tickets $ticket  |  RC4 sessions $session  |  Offered $offered"
+    if ($skipped -gt 0) { $text += "  |  AES/other skipped $skipped" }
+    $script:Ui.CountLabel.Text = $text
 }
 
 function Add-FindingToUi {
@@ -2314,7 +2477,7 @@ function Drain-UiCollectorQueue {
         [System.Threading.Monitor]::Exit($lockObj)
     }
     foreach ($row in $batch) { Add-FindingToUi $row }
-    if ($batch.Count -gt 0) { Update-UiFilter }
+    if ($batch.Count -gt 0) { Update-UiFilter } else { Update-UiCountLabels }
 
     $logLock = $script:UiSync.Log.SyncRoot
     $logLines = @()
@@ -2549,6 +2712,8 @@ function Start-UiCollector {
         Queue        = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
         Log          = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
         FindingCount = 0
+        SkippedCount = 0
+        TallyText    = ''
         CsvPath      = ''
         HtmlPath     = ''
         Error        = ''
@@ -3236,22 +3401,26 @@ function New-MockPropertyEvent {
         [string]$Service = 'HOST/dc01.contoso.local',
         [string]$Ip = '::ffff:10.10.10.25',
         [string]$KeyBlob = '',
+        [string]$ClassicSession = '',
         [switch]$NewMetadata
     )
-    $classicSession = $Session
-    if ($NewMetadata) { $classicSession = '0x12' }
+    $sessionAtClassicIndex = $Session
+    if ($NewMetadata) {
+        if (-not [string]::IsNullOrWhiteSpace($ClassicSession)) { $sessionAtClassicIndex = $ClassicSession }
+        else { $sessionAtClassicIndex = '0x12' }
+    }
     $values = @()
     if ($Id -eq 4768) {
         $values = @(
             $Account, $Domain, 'S-1-5-21-1-2-3-1001', $Service, 'S-1-5-21-1-2-3-502',
             '0x40810010', $Status, $Ticket, '15', $Ip, '54321',
-            '-', '-', '-', $classicSession
+            '-', '-', '-', $sessionAtClassicIndex
         )
     } else {
         $values = @(
             $Account, $Domain, $Service, 'S-1-5-21-1-2-3-502', '0x40810010',
             $Ticket, $Ip, '54321', $Status, '{00000000-0000-0000-0000-000000000000}', '-',
-            $classicSession
+            $sessionAtClassicIndex
         )
     }
     $props = New-Object System.Collections.ArrayList
@@ -3290,7 +3459,13 @@ function Invoke-KerberosRc4SelfTest {
     $script:DoIncludeAes = $false
     $script:DoIncludeFailures = $false
     $script:LoggedRc4Filter = $false
+    $script:LogEventDataMap = $false
     $script:TicketEtypeTally = @{}
+    $script:SessionEtypeTally = @{}
+    $script:RunTicketEtypeTally = @{}
+    $script:RunSessionEtypeTally = @{}
+    $script:RunSkippedCount = 0
+    Reset-KerberosPropertyMap
     $script:EventDataRegex = $null
     $script:CsvBuffer = New-Object System.Text.StringBuilder
     $script:Credential = $null
@@ -3454,6 +3629,41 @@ function Invoke-KerberosRc4SelfTest {
     $xmlBlob = New-MockKerberosEvent -Ticket '18' -Session $blobRc4Letters
     Assert-True -Condition ($null -eq (Convert-KerberosEvent $xmlBlob 'DC01')) `
         -Name 'XML SessionKeyEncryptionType key blob with AES256 ticket is not RC4 Session'
+    $rc4AtClassic = Convert-KerberosEvent (New-MockPropertyEvent -Ticket '18' -Session '0x12' -NewMetadata -KeyBlob $blobRc4Letters -ClassicSession '0x17') 'DC01'
+    Assert-True -Condition ($null -ne $rc4AtClassic -and $rc4AtClassic.Category -eq 'RC4 Session' -and $rc4AtClassic.SessionCipher -eq 'RC4-HMAC') `
+        -Name 'AES256 ticket with a real RC4 session at classic index 11 is still RC4 Session when [20] is a key blob'
+    Reset-KerberosPropertyMap
+    $mapXml = @'
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <EventData>
+    <Data Name="TargetUserName">jsmith@CONTOSO.LOCAL</Data>
+    <Data Name="TargetDomainName">CONTOSO.LOCAL</Data>
+    <Data Name="ServiceName">HOST/dc01</Data>
+    <Data Name="ServiceSid">S-1-5</Data>
+    <Data Name="TicketOptions">0x40810010</Data>
+    <Data Name="TicketEncryptionType">18</Data>
+    <Data Name="IpAddress">::ffff:10.10.10.25</Data>
+    <Data Name="IpPort">54321</Data>
+    <Data Name="Status">0x0</Data>
+    <Data Name="LogonGuid">{00000000-0000-0000-0000-000000000000}</Data>
+    <Data Name="TransmittedServices">-</Data>
+    <Data Name="SessionKeyEncryptionType">0x17</Data>
+  </EventData>
+</Event>
+'@
+    Register-KerberosPropertyMap -Event $mapXml -EventId 4769
+    $discovered = $null
+    if ($script:KerberosNameIndex.ContainsKey('4769')) { $discovered = [string[]]$script:KerberosNameIndex['4769'] }
+    Assert-True -Condition (($null -ne $discovered) -and ($discovered.Count -ge 12) -and ($discovered[11] -eq 'SessionKeyEncryptionType')) `
+        -Name 'First-event XML map places SessionKeyEncryptionType at EventData index 11'
+    Reset-KerberosPropertyMap
+    $script:RunTicketEtypeTally = @{ 'AES256-SHA96' = 88094 }
+    $script:RunSessionEtypeTally = @{ 'Not logged' = 88094 }
+    $doneText = Get-CollectionCompleteText -FindingCount 0
+    Assert-True -Condition ($doneText -match '0 RC4 findings' -and $doneText -match 'AES256-SHA96=88094' -and $doneText -match 'Include AES') `
+        -Name '0-finding completion text includes the AES ticket tally so an empty grid is not mistaken for a failed read'
+    $script:RunTicketEtypeTally = @{}
+    $script:RunSessionEtypeTally = @{}
     Assert-True -Condition ((Get-KerberosLiveXPath) -eq '*[System[(EventID=4768 or EventID=4769)]]') `
         -Name 'Live EventLogWatcher XPath matches Watch-KerbEncryptionUsage (all 4768/4769)'
     $script:DoIncludeAes = $true
