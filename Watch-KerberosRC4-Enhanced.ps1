@@ -73,7 +73,9 @@
   Session-key and advertised-etype fields exist only on the updated 4768/4769 schema
   (Windows Server 2019+ and Server 2016 with the January 2025 cumulative update).
   On that schema (23+ EventData properties) session-key etype is property index 20
-  (4769) or 22 (4768), matching Microsoft's Watch-KerbEncryptionUsage.
+  (4769) or 22 (4768), matching Microsoft's Watch-KerbEncryptionUsage, but only
+  when that slot is an etype scalar (0x17, 23, AES256, ...). Some DCs store
+  AvailableKeys blobs there; those are not session etypes.
 
   Live mode subscribes with EventLogWatcher (push, same idea as Watch-KerbEncryptionUsage)
   for 4768/4769 as they are written. If the watcher cannot attach (some remote DCs),
@@ -113,6 +115,13 @@
     looked hung on a busy DC. It now pages newest-first until a page is empty (a short
     Get-WinEvent page is not treated as end-of-log). The log reports Hours vs the
     actual 4768/4769 time span so a wrapped Security log is not mistaken for an Hours bug.
+  - Session etype used an unanchored (?i)RC4 name match. AvailableKeys blobs such as
+    gW8sCt4e...RC4H...= and advertised group strings "AES-SHA1, RC4" were classified
+    as RC4 Session even when TicketEncryptionType was 18 (AES256). Etype parsing now
+    accepts only scalars (0xNN, 0-255, short cipher names). Microsoft's 4769[20] /
+    4768[22] overlay is used only when that slot is a scalar; otherwise the classic
+    session field is kept. Live and Historical exports of the same RecordId then match,
+    and AES tickets stop appearing as RC4 Session.
   - Historical parse walked every 4768/4769 (mostly AES) and ran ToXml/XmlDocument on
     each. EventData is read from EventLogRecord.Properties (classic 4768/4769 layout)
     and ToXml is only a fallback. AES confirmation rows skip DNS/AD. CSV is buffered
@@ -209,11 +218,39 @@ function Get-NamedField {
     return ''
 }
 
+function Test-IsEtypeScalar {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    $text = $Value.Trim()
+    if ($text -eq '-' -or $text -eq 'N/A') { return $false }
+    # Lists, SET captions, and key material are not a single ticket/session etype.
+    if ($text.IndexOf(',') -ge 0) { return $false }
+    if ($text.IndexOf(' ') -ge 0) { return $false }
+    if ($text.IndexOf('(') -ge 0) { return $false }
+    if ($text.Length -gt 48) { return $false }
+    # 32-byte AvailableKeys encode as 44-char base64 and often contain the letters RC4.
+    if ($text.Length -ge 24 -and $text -match '^[A-Za-z0-9+/]+=*$') { return $false }
+
+    if ($text -match '^(?i)0x[0-9a-f]{1,8}$') { return $true }
+
+    [int]$parsed = 0
+    if ([int]::TryParse($text, [ref]$parsed)) {
+        return ($parsed -ge 0 -and $parsed -le 255)
+    }
+
+    return [bool]($text -match '^(?i)(RC4|ARCFOUR|AES256|AES128|DES)([-_A-Za-z0-9]*)$')
+}
+
+function Get-EtypeScalarOrEmpty {
+    param([string]$Value)
+    if (Test-IsEtypeScalar $Value) { return $Value.Trim() }
+    return ''
+}
+
 function Get-EtypeCode {
     param([string]$Etype)
-    if ([string]::IsNullOrWhiteSpace($Etype)) { return $null }
+    if (-not (Test-IsEtypeScalar $Etype)) { return $null }
     $value = $Etype.Trim()
-    if ($value -eq '-' -or $value -eq 'N/A') { return $null }
 
     switch ($value) {
         '0x17' { return 0x17 }
@@ -239,16 +276,16 @@ function Get-EtypeCode {
     [int]$parsed = 0
     if ([int]::TryParse($value, [ref]$parsed)) { return $parsed }
 
-    # Names from ClientAdvertizedEncryptionTypes / ticket fields. Check EXP first.
+    # Names from ticket/session fields. Anchored so "rc4" inside a key blob cannot match.
     switch -Regex ($value) {
-        '(?i)RC4-HMAC-NT-EXP|RC4-HMAC-EXP|RC4-HMAC-OLD-EXP' { return 0x18 }
-        '(?i)RC4|ARCFOUR' { return 0x17 }
-        '(?i)AES256-SHA384|AES256-CTS-HMAC-SHA384' { return 0x14 }
-        '(?i)AES128-SHA256|AES128-CTS-HMAC-SHA256' { return 0x13 }
-        '(?i)AES256' { return 0x12 }
-        '(?i)AES128' { return 0x11 }
-        '(?i)DES-CBC-MD5|DES_CBC_MD5' { return 0x3 }
-        '(?i)DES' { return 0x1 }
+        '^(?i)(RC4-HMAC-NT-EXP|RC4-HMAC-EXP|RC4-HMAC-OLD-EXP)$' { return 0x18 }
+        '^(?i)(RC4(-HMAC(-NT)?)?|ARCFOUR([-_]HMAC)?)$' { return 0x17 }
+        '^(?i)(AES256-SHA384|AES256-CTS-HMAC-SHA384([-_]192)?)$' { return 0x14 }
+        '^(?i)(AES128-SHA256|AES128-CTS-HMAC-SHA256([-_]128)?)$' { return 0x13 }
+        '^(?i)(AES256(-SHA96)?|AES256-CTS-HMAC-SHA1-96)$' { return 0x12 }
+        '^(?i)(AES128(-SHA96)?|AES128-CTS-HMAC-SHA1-96)$' { return 0x11 }
+        '^(?i)(DES-CBC-MD5|DES_CBC_MD5)$' { return 0x3 }
+        '^(?i)(DES-CBC-CRC|DES)$' { return 0x1 }
         default { return $null }
     }
 }
@@ -263,6 +300,7 @@ function Test-IsRC4Etype {
 function Get-EncryptionName {
     param([string]$Etype)
     if ([string]::IsNullOrWhiteSpace($Etype) -or $Etype.Trim() -eq '-' ) { return 'Not logged' }
+    if (-not (Test-IsEtypeScalar $Etype)) { return 'Not logged' }
     $code = Get-EtypeCode $Etype
     if ($null -eq $code) { return 'Other / unknown' }
     switch ($code) {
@@ -428,6 +466,8 @@ function Get-KerberosLayoutIndices {
     param([int]$EventId, [int]$PropertyCount)
     # Watch-KerbEncryptionUsage (Microsoft) requires 23+ properties and reads
     # SessionKeyEncryptionType at 4769[20] / 4768[22]. Older events have fewer fields.
+    # Callers must still Test-IsEtypeScalar before trusting those slots: some DCs
+    # put AvailableKeys blobs at the Microsoft indexes.
     $newSchema = ($PropertyCount -ge 23)
     if ($EventId -eq 4769) {
         $session = 11
@@ -528,7 +568,17 @@ function Get-EventFieldsFromProperties {
     $result['TargetDomainName'] = Get-EventPropertyValue $props ([int]$layout['Domain'])
     $result['ServiceName'] = Get-EventPropertyValue $props ([int]$layout['Service'])
     $result['TicketEncryptionType'] = Get-EventPropertyValue $props ([int]$layout['Ticket'])
-    $result['SessionKeyEncryptionType'] = Get-EventPropertyValue $props ([int]$layout['Session'])
+    $namedRaw = ''
+    if ($result.ContainsKey('SessionKeyEncryptionType')) {
+        $namedRaw = [string]$result['SessionKeyEncryptionType']
+    }
+    $namedSession = Get-EtypeScalarOrEmpty $namedRaw
+    $layoutSession = Get-EtypeScalarOrEmpty (Get-EventPropertyValue $props ([int]$layout['Session']))
+    if (-not [string]::IsNullOrWhiteSpace($layoutSession)) {
+        $result['SessionKeyEncryptionType'] = $layoutSession
+    } else {
+        $result['SessionKeyEncryptionType'] = $namedSession
+    }
     $result['Status'] = Get-EventPropertyValue $props ([int]$layout['Status'])
     $result['IpAddress'] = Get-EventPropertyValue $props ([int]$layout['Ip'])
     $result['IpPort'] = Get-EventPropertyValue $props ([int]$layout['Port'])
@@ -740,7 +790,7 @@ function Convert-KerberosEvent {
 
     $ticket  = Get-NamedField $data @('TicketEncryptionType')
     Add-TicketEtypeTally $ticket
-    $session = Get-NamedField $data @('SessionKeyEncryptionType','SessionEncryptionType')
+    $session = Get-EtypeScalarOrEmpty (Get-NamedField $data @('SessionKeyEncryptionType','SessionEncryptionType'))
     $offered = Get-NamedField $data @('ClientAdvertizedEncryptionTypes','ClientAdvertisedEncryptionTypes','AdvertizedEtypes','AdvertisedEtypes')
     $status  = Get-NamedField $data @('Status')
     $success = Test-IsKerberosSuccess $status
@@ -3185,6 +3235,7 @@ function New-MockPropertyEvent {
         [string]$Domain = 'CONTOSO.LOCAL',
         [string]$Service = 'HOST/dc01.contoso.local',
         [string]$Ip = '::ffff:10.10.10.25',
+        [string]$KeyBlob = '',
         [switch]$NewMetadata
     )
     $classicSession = $Session
@@ -3216,7 +3267,11 @@ function New-MockPropertyEvent {
         while ($props.Count -le $sessionIndex) {
             [void]$props.Add([pscustomobject]@{ Value = '' })
         }
-        $props[$sessionIndex] = [pscustomobject]@{ Value = $Session }
+        if (-not [string]::IsNullOrWhiteSpace($KeyBlob)) {
+            $props[$sessionIndex] = [pscustomobject]@{ Value = $KeyBlob }
+        } else {
+            $props[$sessionIndex] = [pscustomobject]@{ Value = $Session }
+        }
     }
     return [pscustomobject]@{
         Id          = $Id
@@ -3279,6 +3334,22 @@ function Invoke-KerberosRc4SelfTest {
     Assert-True -Condition ((Get-EncryptionName '0x17') -eq 'RC4-HMAC') -Name 'Get-EncryptionName maps 0x17'
     Assert-True -Condition ((Get-EncryptionName '0x12') -eq 'AES256-SHA96') -Name 'Get-EncryptionName maps 0x12'
     Assert-True -Condition ((Get-EncryptionName '') -eq 'Not logged') -Name 'Missing etype is Not logged'
+
+    $blobRc4Letters = 'gW8sCt4eBg+v76puGQSRRC4Hrpe7aI26frnCahEJib4='
+    $blobRc4Lower = '/5UYR6z9JHvBVzyFXSU0rc4ED69063cmzX/LNV6rVf8='
+    Assert-True -Condition (-not (Test-IsEtypeScalar $blobRc4Letters)) -Name 'Base64 session-key blob is not an etype scalar'
+    Assert-True -Condition (-not (Test-IsRC4Etype $blobRc4Letters)) -Name 'RC4 letters inside a key blob are not RC4-HMAC'
+    Assert-True -Condition (-not (Test-IsRC4Etype $blobRc4Lower)) -Name 'Lowercase rc4 inside a key blob is not RC4-HMAC'
+    Assert-True -Condition (-not (Test-IsRC4Etype '0x1F (DES, RC4, AES128-SHA96, AES256-SHA96)')) `
+        -Name 'msDS-SET caption containing RC4 is not a session etype'
+    Assert-True -Condition (-not (Test-IsRC4Etype 'AES-SHA1, RC4')) `
+        -Name 'Advertised-etype group string is not a ticket/session etype'
+    Assert-True -Condition (Test-IsOfferedRC4 'AES-SHA1, RC4') `
+        -Name 'AES-SHA1, RC4 still counts as offered RC4'
+    Assert-True -Condition ((Get-EncryptionName $blobRc4Letters) -eq 'Not logged') `
+        -Name 'Key blob session field is reported as Not logged'
+    Assert-True -Condition (Test-IsEtypeScalar '18' -and (Get-EncryptionName '18') -eq 'AES256-SHA96') `
+        -Name 'Decimal 18 ticket etype is AES256-SHA96'
 
     $offeredModern = 'AES256-CTS-HMAC-SHA1-96 AES128-CTS-HMAC-SHA1-96 RC4-HMAC-NT RC4-HMAC-NT-EXP RC4-HMAC-OLD-EXP'
     $offeredAesOnly = 'AES256-CTS-HMAC-SHA1-96 AES128-CTS-HMAC-SHA1-96'
@@ -3372,12 +3443,26 @@ function Invoke-KerberosRc4SelfTest {
     $msRc4Session = Convert-KerberosEvent (New-MockPropertyEvent -Ticket '0x12' -Session '0x17' -NewMetadata) 'DC01'
     Assert-True -Condition ($null -ne $msRc4Session -and $msRc4Session.Category -eq 'RC4 Session' -and $msRc4Session.SessionCipher -eq 'RC4-HMAC') `
         -Name 'AES ticket + RC4 session at 4769 index 20 classifies as RC4 Session'
+    $blobEvent = New-MockPropertyEvent -Ticket '18' -Session '0x12' -NewMetadata -KeyBlob $blobRc4Letters
+    $blobFields = Get-EventFields $blobEvent
+    Assert-True -Condition ($blobFields['SessionKeyEncryptionType'] -eq '0x12') `
+        -Name 'When 4769[20] is a key blob, session etype keeps the classic scalar at index 11'
+    Assert-True -Condition ($null -eq (Convert-KerberosEvent $blobEvent 'DC01')) `
+        -Name 'AES256 ticket with key blob at 4769[20] is not classified as RC4 Session'
+    Assert-True -Condition (-not (Test-EventMayBeInteresting $blobEvent)) `
+        -Name 'AES256 ticket with RC4-looking key blob is not interesting when IncludeAes is off'
+    $xmlBlob = New-MockKerberosEvent -Ticket '18' -Session $blobRc4Letters
+    Assert-True -Condition ($null -eq (Convert-KerberosEvent $xmlBlob 'DC01')) `
+        -Name 'XML SessionKeyEncryptionType key blob with AES256 ticket is not RC4 Session'
     Assert-True -Condition ((Get-KerberosLiveXPath) -eq '*[System[(EventID=4768 or EventID=4769)]]') `
         -Name 'Live EventLogWatcher XPath matches Watch-KerbEncryptionUsage (all 4768/4769)'
     $script:DoIncludeAes = $true
     $aesKept = Convert-KerberosEvent (New-MockKerberosEvent -Ticket '0x12' -Session '0x12') 'DC01'
     Assert-True -Condition ($null -ne $aesKept -and $aesKept.Category -eq 'AES Ticket') `
         -Name '-IncludeAes keeps successful AES tickets as AES Ticket'
+    $aesFromBlob = Convert-KerberosEvent $blobEvent 'DC01'
+    Assert-True -Condition ($null -ne $aesFromBlob -and $aesFromBlob.Category -eq 'AES Ticket' -and $aesFromBlob.TicketCipher -eq 'AES256-SHA96' -and $aesFromBlob.SessionCipher -eq 'AES256-SHA96' -and $aesFromBlob.SessionEtype -eq '0x12') `
+        -Name 'IncludeAes keeps AES256 tickets whose Microsoft session index holds a key blob'
     $script:DoIncludeAes = $false
 
     $script:DoIncludeOffered = $true
