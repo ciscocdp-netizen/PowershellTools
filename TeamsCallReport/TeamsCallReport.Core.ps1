@@ -911,6 +911,23 @@ function Get-TeamsPublicClientId {
     return '14d82eec-204b-4c2f-b7e8-296a70dab67e'
 }
 
+function Resolve-TeamsWindowAuthMode {
+    param(
+        [string]$SavedMode,
+        [string]$TenantId,
+        [string]$ClientId
+    )
+    $mode = [string]$SavedMode
+    if ([string]::IsNullOrWhiteSpace($mode)) { return 'Account' }
+    $manualApp = @('CertificateThumbprint', 'CertificateFile', 'Secret') -contains $mode
+    if ($manualApp) {
+        if ([string]::IsNullOrWhiteSpace($TenantId) -or [string]::IsNullOrWhiteSpace($ClientId)) {
+            return 'Account'
+        }
+    }
+    return $mode
+}
+
 function Get-TeamsCallReportAppRoles {
     return @(
         [pscustomobject]@{ Name = 'CallRecords.Read.All'; Id = '45bbb07e-7321-4fd7-a8f6-3ff27e6a81c8' },

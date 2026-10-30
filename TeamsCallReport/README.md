@@ -9,6 +9,8 @@ Graph keeps these records for 30 days, and a record is created only after the ca
 
 The certificate private key stays in the Windows certificate store on this PC. Later runs reuse that grant and do not ask you to sign in again.
 
+The window does not ask for a tenant id or a client id. Those boxes appear only after you choose certificate or client-secret sign-in for an app registration that already exists. If an older window saved certificate sign-in with both boxes empty, the next open returns to **Sign in with my account**.
+
 ## Desktop window
 
 Double-click `Start-TeamsCallReport.cmd`. Leave **Sign in with my account** selected, enter the person whose calls you want, and click **Run export**. A browser opens for the administrator sign-in and shows a device code.

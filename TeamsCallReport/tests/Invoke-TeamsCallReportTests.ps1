@@ -38,6 +38,11 @@ Assert-Equal 'empty duration' (Get-DurationSeconds '' '2024-01-01T00:00:00Z') $n
 Assert-Equal 'thirty minutes' (Get-DurationSeconds '2024-01-01T00:00:00Z' '2024-01-01T00:30:00Z') 1800
 Assert-Equal 'negative duration' (Get-DurationSeconds '2024-01-02T00:00:00Z' '2024-01-01T00:00:00Z') $null
 Assert-Equal 'utc format' (ConvertTo-UtcString '2020-02-25T18:52:21.2169889Z') '2020-02-25T18:52:21Z'
+Assert-Equal 'blank sign-in is account' (Resolve-TeamsWindowAuthMode -SavedMode '' -TenantId '' -ClientId '') 'Account'
+Assert-Equal 'certificate without ids returns to account' (Resolve-TeamsWindowAuthMode -SavedMode 'CertificateThumbprint' -TenantId '' -ClientId '') 'Account'
+Assert-Equal 'certificate with ids stays' (Resolve-TeamsWindowAuthMode -SavedMode 'CertificateThumbprint' -TenantId 'tenant' -ClientId 'client') 'CertificateThumbprint'
+Assert-Equal 'secret without client id returns to account' (Resolve-TeamsWindowAuthMode -SavedMode 'Secret' -TenantId 'tenant' -ClientId ' ') 'Account'
+Assert-Equal 'sample sign-in is kept' (Resolve-TeamsWindowAuthMode -SavedMode 'Sample' -TenantId '' -ClientId '') 'Sample'
 
 $roles = ConvertTo-StringArray 'CallRecords.Read.All'
 Assert-Equal 'one role count' @($roles).Count 1

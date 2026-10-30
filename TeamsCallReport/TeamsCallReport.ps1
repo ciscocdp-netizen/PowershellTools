@@ -209,6 +209,8 @@ finally {
 }
 '@
 
+. $script:CorePath
+
 $script:Ui = @{}
 $logList = New-Object System.Collections.ArrayList
 $script:Ui.Sync = [hashtable]::Synchronized(@{
@@ -344,11 +346,13 @@ function Update-AuthPanels {
     $script:Ui.ClientBox.Visible = -not $account
     if ($account) {
         $script:Ui.ConnectButton.Text = 'Sign in'
-        $script:Ui.AuthNote.Height = 70
+        $script:Ui.AuthNote.Location = New-Object System.Drawing.Point(300, 6)
+        $script:Ui.AuthNote.Size = New-Object System.Drawing.Size(840, 44)
     }
     else {
         $script:Ui.ConnectButton.Text = 'Test connection'
-        $script:Ui.AuthNote.Height = 34
+        $script:Ui.AuthNote.Location = New-Object System.Drawing.Point(500, 50)
+        $script:Ui.AuthNote.Size = New-Object System.Drawing.Size(640, 40)
     }
     $script:Ui.ThumbLabel.Visible = ($mode -eq 'CertificateThumbprint')
     $script:Ui.ThumbBox.Visible = ($mode -eq 'CertificateThumbprint')
@@ -362,7 +366,7 @@ function Update-AuthPanels {
     $script:Ui.SecretLabel.Visible = $secret
     $script:Ui.SecretBox.Visible = $secret
     if ($account) {
-        $script:Ui.AuthNote.Text = 'Sign in with a Global Administrator or Privileged Role Administrator. Call records cannot use a user token, so this creates an app named Teams Call Report and grants CallRecords.Read.All and User.Read.All. The private key stays in your Windows certificate store. Later runs reuse that grant.'
+        $script:Ui.AuthNote.Text = 'No tenant id or client id. An administrator sign-in grants CallRecords.Read.All and User.Read.All. Later runs reuse that grant.'
     }
     elseif ($mode -eq 'Existing') {
         $script:Ui.AuthNote.Text = 'Uses Connect-MgGraph from this Windows PowerShell process. Start-TeamsCallReport.cmd opens a new process, so sign in with your account instead.'
@@ -371,7 +375,7 @@ function Update-AuthPanels {
         $script:Ui.AuthNote.Text = 'Offline sample records. Leave the user blank to use alice@contoso.com. Nothing is sent to Microsoft.'
     }
     else {
-        $script:Ui.AuthNote.Text = 'Use an app registration that already has application permissions CallRecords.Read.All and User.Read.All.'
+        $script:Ui.AuthNote.Text = 'Tenant id and client id are only for an app registration you already created. Choose Sign in with my account to skip both.'
     }
     if (-not $script:Ui.Busy) { Set-ReportBusy $false }
 }
@@ -649,13 +653,14 @@ $script:Ui.AuthMode.DropDownStyle = 'DropDownList'
         'Sample data (offline)'
     ))
 $script:Ui.AuthMode.SelectedIndex = 0
-$script:Ui.AuthMode.Location = New-Object System.Drawing.Point(124, 46)
-$script:Ui.AuthMode.Size = New-Object System.Drawing.Size(250, 24)
+$script:Ui.AuthMode.Location = New-Object System.Drawing.Point(124, 52)
+$script:Ui.AuthMode.Size = New-Object System.Drawing.Size(360, 24)
+$script:Ui.AuthMode.DropDownWidth = 360
 $script:Ui.AuthMode.Add_SelectedIndexChanged({ Update-AuthPanels })
 
 $script:Ui.AuthNote = New-Object System.Windows.Forms.Label
-$script:Ui.AuthNote.Location = New-Object System.Drawing.Point(390, 40)
-$script:Ui.AuthNote.Size = New-Object System.Drawing.Size(750, 70)
+$script:Ui.AuthNote.Location = New-Object System.Drawing.Point(300, 6)
+$script:Ui.AuthNote.Size = New-Object System.Drawing.Size(840, 44)
 $script:Ui.AuthNote.Anchor = 'Top, Left, Right'
 
 $script:Ui.ThumbLabel = New-UiLabel 'Thumbprint' 12 84 100
@@ -718,41 +723,66 @@ $script:Ui.NewFolder.Anchor = 'Top, Right'
 
 $script:Ui.SkipDirectory = New-Object System.Windows.Forms.CheckBox
 $script:Ui.SkipDirectory.Text = 'Skip Entra directory lookup'
-$script:Ui.SkipDirectory.Location = New-Object System.Drawing.Point(124, 220)
-$script:Ui.SkipDirectory.Size = New-Object System.Drawing.Size(200, 22)
+$script:Ui.SkipDirectory.AutoSize = $true
+$script:Ui.SkipDirectory.Margin = New-Object System.Windows.Forms.Padding(0, 4, 16, 0)
 $script:Ui.SaveRaw = New-Object System.Windows.Forms.CheckBox
 $script:Ui.SaveRaw.Text = 'Save raw Graph JSON'
 $script:Ui.SaveRaw.Checked = $true
-$script:Ui.SaveRaw.Location = New-Object System.Drawing.Point(340, 220)
-$script:Ui.SaveRaw.Size = New-Object System.Drawing.Size(170, 22)
+$script:Ui.SaveRaw.AutoSize = $true
+$script:Ui.SaveRaw.Margin = New-Object System.Windows.Forms.Padding(0, 4, 16, 0)
 $script:Ui.LinkCheck = New-Object System.Windows.Forms.CheckBox
 $script:Ui.LinkCheck.Text = 'Filter other grids to the selected call'
 $script:Ui.LinkCheck.Checked = $true
-$script:Ui.LinkCheck.Location = New-Object System.Drawing.Point(520, 220)
-$script:Ui.LinkCheck.Size = New-Object System.Drawing.Size(280, 22)
+$script:Ui.LinkCheck.AutoSize = $true
+$script:Ui.LinkCheck.Margin = New-Object System.Windows.Forms.Padding(0, 4, 16, 0)
 $script:Ui.LinkCheck.Add_CheckedChanged({ Update-ReportFilters })
+$script:Ui.OptionRow = New-Object System.Windows.Forms.FlowLayoutPanel
+$script:Ui.OptionRow.FlowDirection = 'LeftToRight'
+$script:Ui.OptionRow.WrapContents = $false
+$script:Ui.OptionRow.AutoSize = $true
+$script:Ui.OptionRow.AutoSizeMode = 'GrowAndShrink'
+$script:Ui.OptionRow.Location = New-Object System.Drawing.Point(124, 214)
+$script:Ui.OptionRow.Controls.Add($script:Ui.SkipDirectory)
+$script:Ui.OptionRow.Controls.Add($script:Ui.SaveRaw)
+$script:Ui.OptionRow.Controls.Add($script:Ui.LinkCheck)
 
 $script:Ui.ConnectButton = New-Object System.Windows.Forms.Button
-$script:Ui.ConnectButton.Text = 'Test connection'
-$script:Ui.ConnectButton.Location = New-Object System.Drawing.Point(12, 252)
-$script:Ui.ConnectButton.Size = New-Object System.Drawing.Size(120, 28)
+$script:Ui.ConnectButton.Text = 'Sign in'
+$script:Ui.ConnectButton.AutoSize = $true
+$script:Ui.ConnectButton.AutoSizeMode = 'GrowAndShrink'
+$script:Ui.ConnectButton.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 0)
 $script:Ui.RunButton = New-Object System.Windows.Forms.Button
 $script:Ui.RunButton.Text = 'Run export'
-$script:Ui.RunButton.Location = New-Object System.Drawing.Point(140, 252)
-$script:Ui.RunButton.Size = New-Object System.Drawing.Size(110, 28)
+$script:Ui.RunButton.AutoSize = $true
+$script:Ui.RunButton.AutoSizeMode = 'GrowAndShrink'
+$script:Ui.RunButton.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 0)
 $script:Ui.CancelButton = New-Object System.Windows.Forms.Button
 $script:Ui.CancelButton.Text = 'Cancel'
 $script:Ui.CancelButton.Enabled = $false
-$script:Ui.CancelButton.Location = New-Object System.Drawing.Point(258, 252)
-$script:Ui.CancelButton.Size = New-Object System.Drawing.Size(80, 28)
+$script:Ui.CancelButton.AutoSize = $true
+$script:Ui.CancelButton.AutoSizeMode = 'GrowAndShrink'
+$script:Ui.CancelButton.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 0)
 $script:Ui.PreviewButton = New-Object System.Windows.Forms.Button
 $script:Ui.PreviewButton.Text = 'Preview sample data'
-$script:Ui.PreviewButton.Location = New-Object System.Drawing.Point(346, 252)
-$script:Ui.PreviewButton.Size = New-Object System.Drawing.Size(150, 28)
+$script:Ui.PreviewButton.AutoSize = $true
+$script:Ui.PreviewButton.AutoSizeMode = 'GrowAndShrink'
+$script:Ui.PreviewButton.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 0)
 $script:Ui.OpenButton = New-Object System.Windows.Forms.Button
 $script:Ui.OpenButton.Text = 'Open output folder'
-$script:Ui.OpenButton.Location = New-Object System.Drawing.Point(504, 252)
-$script:Ui.OpenButton.Size = New-Object System.Drawing.Size(140, 28)
+$script:Ui.OpenButton.AutoSize = $true
+$script:Ui.OpenButton.AutoSizeMode = 'GrowAndShrink'
+$script:Ui.OpenButton.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 0)
+$script:Ui.ButtonRow = New-Object System.Windows.Forms.FlowLayoutPanel
+$script:Ui.ButtonRow.FlowDirection = 'LeftToRight'
+$script:Ui.ButtonRow.WrapContents = $false
+$script:Ui.ButtonRow.AutoSize = $true
+$script:Ui.ButtonRow.AutoSizeMode = 'GrowAndShrink'
+$script:Ui.ButtonRow.Location = New-Object System.Drawing.Point(12, 248)
+$script:Ui.ButtonRow.Controls.Add($script:Ui.ConnectButton)
+$script:Ui.ButtonRow.Controls.Add($script:Ui.RunButton)
+$script:Ui.ButtonRow.Controls.Add($script:Ui.CancelButton)
+$script:Ui.ButtonRow.Controls.Add($script:Ui.PreviewButton)
+$script:Ui.ButtonRow.Controls.Add($script:Ui.OpenButton)
 
 $script:Ui.TenantLabel = New-UiLabel 'Tenant id' 300 12 84
 $script:Ui.ClientLabel = New-UiLabel 'Client id' 660 12 90
@@ -763,7 +793,7 @@ foreach ($control in @(
         $script:Ui.TenantBox,
         $script:Ui.ClientLabel,
         $script:Ui.ClientBox,
-        (New-UiLabel 'Sign-in' 12 46 100),
+        (New-UiLabel 'Sign-in' 12 52 100),
         $script:Ui.AuthMode,
         $script:Ui.AuthNote,
         $script:Ui.ThumbLabel,
@@ -789,14 +819,8 @@ foreach ($control in @(
         $script:Ui.OutputBox,
         $script:Ui.OutputBrowse,
         $script:Ui.NewFolder,
-        $script:Ui.SkipDirectory,
-        $script:Ui.SaveRaw,
-        $script:Ui.LinkCheck,
-        $script:Ui.ConnectButton,
-        $script:Ui.RunButton,
-        $script:Ui.CancelButton,
-        $script:Ui.PreviewButton,
-        $script:Ui.OpenButton
+        $script:Ui.OptionRow,
+        $script:Ui.ButtonRow
     )) {
     $header.Controls.Add($control)
 }
@@ -867,10 +891,10 @@ $script:Ui.Progress.Width = 180
 [void]$status.Items.Add($script:Ui.StatusLabel)
 [void]$status.Items.Add($script:Ui.Progress)
 
-$form.Controls.Add($status)
-$form.Controls.Add($header)
-$form.Controls.Add($filterPanel)
 $form.Controls.Add($script:Ui.Tabs)
+$form.Controls.Add($filterPanel)
+$form.Controls.Add($header)
+$form.Controls.Add($status)
 
 $script:Ui.PfxBrowse.Add_Click({
         $dialog = New-Object System.Windows.Forms.OpenFileDialog
@@ -927,8 +951,9 @@ if ($saved) {
     if ($cloudIndex -ge 0) { $script:Ui.Cloud.SelectedIndex = $cloudIndex }
     if ($saved.TenantId) { $script:Ui.TenantBox.Text = [string]$saved.TenantId }
     if ($saved.ClientId) { $script:Ui.ClientBox.Text = [string]$saved.ClientId }
+    $savedMode = Resolve-TeamsWindowAuthMode -SavedMode ([string]$saved.AuthMode) -TenantId ([string]$saved.TenantId) -ClientId ([string]$saved.ClientId)
     $authIndex = 0
-    switch ([string]$saved.AuthMode) {
+    switch ($savedMode) {
         'Account' { $authIndex = 0 }
         'CertificateThumbprint' { $authIndex = 1 }
         'CertificateFile' { $authIndex = 2 }
