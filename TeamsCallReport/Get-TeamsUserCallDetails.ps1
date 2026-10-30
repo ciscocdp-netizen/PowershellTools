@@ -8,12 +8,16 @@
     in the last 30 days, and write Calls.csv, Participants.csv, Endpoints.csv,
     TargetUser.json, Summary.txt, and the unmodified Graph payloads under RawJson.
 
-    Call records require application permissions. Delegated Graph sign-in is rejected
-    by the API. Grant admin consent for:
-        CallRecords.Read.All
-        User.Read.All
+    By default, sign in with your own account. Call records cannot be read with a
+    user token, so the sign-in creates an app named Teams Call Report and grants
+    CallRecords.Read.All and User.Read.All. The account must be a Global Administrator
+    or Privileged Role Administrator. The certificate private key stays in
+    Cert:\CurrentUser\My. The next run reuses that grant.
 
     Graph keeps call records for 30 days, and a record appears only after the call ends.
+
+.EXAMPLE
+    .\Get-TeamsUserCallDetails.ps1 -User alice@contoso.com
 
 .EXAMPLE
     .\Get-TeamsUserCallDetails.ps1 -User alice@contoso.com -TenantId <tenant-guid> `
@@ -27,7 +31,7 @@
 .EXAMPLE
     .\Get-TeamsUserCallDetails.ps1 -User alice@contoso.com -Sample
 #>
-[CmdletBinding(DefaultParameterSetName = 'Certificate')]
+[CmdletBinding(DefaultParameterSetName = 'Account')]
 param(
     [Parameter(Mandatory)]
     [string] $User,
@@ -37,6 +41,9 @@ param(
     [datetime] $EndDate = (Get-Date),
 
     [string] $OutputPath = (Join-Path (Get-Location) ("TeamsCallReport_{0:yyyyMMdd_HHmmss}" -f (Get-Date))),
+
+    [Parameter(ParameterSetName = 'Account')]
+    [string] $AccountGrantPath,
 
     [Parameter(Mandatory, ParameterSetName = 'Certificate')]
     [Parameter(Mandatory, ParameterSetName = 'Secret')]
@@ -96,6 +103,17 @@ $progress = {
 if ($Sample) {
     Write-Host 'Using built-in sample call records (no tenant connection).' -ForegroundColor Yellow
     $client = New-TeamsSampleGraphClient
+}
+elseif ($PSCmdlet.ParameterSetName -eq 'Account') {
+    Write-Host 'Signing in with your account. A browser window will ask you to approve access.' -ForegroundColor Cyan
+    $connected = Connect-TeamsCallReportAccount -Cloud $Cloud -GrantPath $AccountGrantPath -Log $log -OnDeviceCode {
+        param($Info)
+        Write-Host $Info.Message -ForegroundColor Yellow
+        try { Start-Process $Info.VerificationUrl } catch { }
+    }
+    $client = $connected.Client
+    if ($connected.Reused) { Write-Host 'Reused the Teams Call Report application from the last sign-in.' -ForegroundColor Cyan }
+    else { Write-Host ("Granted call-record access to application {0}." -f $connected.ClientId) -ForegroundColor Cyan }
 }
 else {
     $clientParams = @{ Cloud = $Cloud }

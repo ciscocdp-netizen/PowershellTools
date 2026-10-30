@@ -92,6 +92,22 @@ function New-WorkerClient {
     elseif ($Payload.AuthMode -eq 'Existing') {
         $params.UseExistingConnection = $true
     }
+    elseif ($Payload.AuthMode -eq 'Account') {
+        $connected = Connect-TeamsCallReportAccount -Cloud ([string]$Payload.Cloud) -ShouldCancel { [bool]$script:Sync.Cancel } -Log {
+            param($Level, $Message)
+            Add-WorkerLog $Level $Message
+        } -OnDeviceCode {
+            param($Info)
+            $script:Sync.DeviceCode = [string]$Info.UserCode
+            $script:Sync.DeviceUrl = [string]$Info.VerificationUrl
+            $script:Sync.StatusText = [string]$Info.Message
+            Add-WorkerLog 'INFO' ([string]$Info.Message)
+        }
+        if ($connected.Reused) { Add-WorkerLog 'INFO' 'Reused the Teams Call Report application from the last sign-in.' }
+        else { Add-WorkerLog 'INFO' ("Granted call-record access to application $($connected.ClientId).") }
+        $script:Sync.StatusText = "Ready. Tenant $($connected.TenantId)."
+        return $connected.Client
+    }
     else {
         throw "Unknown sign-in mode."
     }
@@ -229,10 +245,11 @@ function Get-DefaultOutputPath {
 
 function Get-AuthModeName {
     switch ($script:Ui.AuthMode.SelectedIndex) {
-        0 { return 'CertificateThumbprint' }
-        1 { return 'CertificateFile' }
-        2 { return 'Secret' }
-        3 { return 'Existing' }
+        0 { return 'Account' }
+        1 { return 'CertificateThumbprint' }
+        2 { return 'CertificateFile' }
+        3 { return 'Secret' }
+        4 { return 'Existing' }
         default { return 'Sample' }
     }
 }
@@ -320,6 +337,19 @@ function Set-ReportBusy {
 
 function Update-AuthPanels {
     $mode = Get-AuthModeName
+    $account = ($mode -eq 'Account')
+    $script:Ui.TenantLabel.Visible = -not $account
+    $script:Ui.TenantBox.Visible = -not $account
+    $script:Ui.ClientLabel.Visible = -not $account
+    $script:Ui.ClientBox.Visible = -not $account
+    if ($account) {
+        $script:Ui.ConnectButton.Text = 'Sign in'
+        $script:Ui.AuthNote.Height = 70
+    }
+    else {
+        $script:Ui.ConnectButton.Text = 'Test connection'
+        $script:Ui.AuthNote.Height = 34
+    }
     $script:Ui.ThumbLabel.Visible = ($mode -eq 'CertificateThumbprint')
     $script:Ui.ThumbBox.Visible = ($mode -eq 'CertificateThumbprint')
     $pfx = ($mode -eq 'CertificateFile')
@@ -331,14 +361,17 @@ function Update-AuthPanels {
     $secret = ($mode -eq 'Secret')
     $script:Ui.SecretLabel.Visible = $secret
     $script:Ui.SecretBox.Visible = $secret
-    if ($mode -eq 'Existing') {
-        $script:Ui.AuthNote.Text = 'Uses Connect-MgGraph from this Windows PowerShell process. Start-TeamsCallReport.cmd opens a new process, so certificate or secret sign-in is the usual path.'
+    if ($account) {
+        $script:Ui.AuthNote.Text = 'Sign in with a Global Administrator or Privileged Role Administrator. Call records cannot use a user token, so this creates an app named Teams Call Report and grants CallRecords.Read.All and User.Read.All. The private key stays in your Windows certificate store. Later runs reuse that grant.'
+    }
+    elseif ($mode -eq 'Existing') {
+        $script:Ui.AuthNote.Text = 'Uses Connect-MgGraph from this Windows PowerShell process. Start-TeamsCallReport.cmd opens a new process, so sign in with your account instead.'
     }
     elseif ($mode -eq 'Sample') {
         $script:Ui.AuthNote.Text = 'Offline sample records. Leave the user blank to use alice@contoso.com. Nothing is sent to Microsoft.'
     }
     else {
-        $script:Ui.AuthNote.Text = 'App registration with application permissions CallRecords.Read.All and User.Read.All (admin consent). Delegated sign-in cannot read call records.'
+        $script:Ui.AuthNote.Text = 'Use an app registration that already has application permissions CallRecords.Read.All and User.Read.All.'
     }
     if (-not $script:Ui.Busy) { Set-ReportBusy $false }
 }
@@ -439,11 +472,11 @@ function New-ReportPayload {
 }
 
 function Test-ReportInput {
-    param([bool]$NeedOutput, [bool]$SampleExport)
+    param([bool]$NeedOutput, [bool]$SampleExport, [bool]$NeedUser = $true)
     $mode = Get-AuthModeName
     if ($SampleExport) { $mode = 'Sample' }
     $user = $script:Ui.UserBox.Text.Trim()
-    if ($mode -ne 'Sample' -and [string]::IsNullOrWhiteSpace($user)) {
+    if ($NeedUser -and $mode -ne 'Sample' -and [string]::IsNullOrWhiteSpace($user)) {
         throw 'Enter the user principal name, email address, or object id to export.'
     }
     if ($script:Ui.EndPicker.Value -le $script:Ui.StartPicker.Value) {
@@ -452,7 +485,7 @@ function Test-ReportInput {
     if ($NeedOutput -and [string]::IsNullOrWhiteSpace($script:Ui.OutputBox.Text)) {
         throw 'Choose an output folder.'
     }
-    if ($mode -eq 'Sample' -or $mode -eq 'Existing') { return }
+    if ($mode -eq 'Sample' -or $mode -eq 'Existing' -or $mode -eq 'Account') { return }
     if ([string]::IsNullOrWhiteSpace($script:Ui.TenantBox.Text) -or [string]::IsNullOrWhiteSpace($script:Ui.ClientBox.Text)) {
         throw 'Tenant id and application (client) id are required.'
     }
@@ -473,7 +506,8 @@ function Start-ReportOperation {
     param([string]$Operation, [bool]$SampleExport)
     if ($script:Ui.Busy) { return }
     $needOutput = ($Operation -eq 'Export')
-    try { Test-ReportInput -NeedOutput $needOutput -SampleExport $SampleExport }
+    $needUser = ($Operation -ne 'Connect')
+    try { Test-ReportInput -NeedOutput $needOutput -SampleExport $SampleExport -NeedUser $needUser }
     catch {
         [System.Windows.Forms.MessageBox]::Show($script:Ui.Form, $_.Exception.Message, 'Teams Call Report') | Out-Null
         return
@@ -484,6 +518,9 @@ function Start-ReportOperation {
     $sync.ErrorText = $null
     $sync.Result = $null
     $sync.ResolvedText = $null
+    $sync.DeviceCode = $null
+    $sync.DeviceUrl = $null
+    $script:Ui.ShownDeviceCode = $null
     $sync.Progress = 2
     $sync.StatusText = "Starting $Operation..."
     $sync.Operation = $Operation
@@ -604,6 +641,7 @@ $script:Ui.ClientBox.Anchor = 'Top, Left, Right'
 $script:Ui.AuthMode = New-Object System.Windows.Forms.ComboBox
 $script:Ui.AuthMode.DropDownStyle = 'DropDownList'
 [void]$script:Ui.AuthMode.Items.AddRange(@(
+        'Sign in with my account',
         'Certificate in the Windows store',
         'Certificate PFX file',
         'Client secret',
@@ -616,8 +654,8 @@ $script:Ui.AuthMode.Size = New-Object System.Drawing.Size(250, 24)
 $script:Ui.AuthMode.Add_SelectedIndexChanged({ Update-AuthPanels })
 
 $script:Ui.AuthNote = New-Object System.Windows.Forms.Label
-$script:Ui.AuthNote.Location = New-Object System.Drawing.Point(390, 42)
-$script:Ui.AuthNote.Size = New-Object System.Drawing.Size(750, 36)
+$script:Ui.AuthNote.Location = New-Object System.Drawing.Point(390, 40)
+$script:Ui.AuthNote.Size = New-Object System.Drawing.Size(750, 70)
 $script:Ui.AuthNote.Anchor = 'Top, Left, Right'
 
 $script:Ui.ThumbLabel = New-UiLabel 'Thumbprint' 12 84 100
@@ -716,12 +754,14 @@ $script:Ui.OpenButton.Text = 'Open output folder'
 $script:Ui.OpenButton.Location = New-Object System.Drawing.Point(504, 252)
 $script:Ui.OpenButton.Size = New-Object System.Drawing.Size(140, 28)
 
+$script:Ui.TenantLabel = New-UiLabel 'Tenant id' 300 12 84
+$script:Ui.ClientLabel = New-UiLabel 'Client id' 660 12 90
 foreach ($control in @(
         (New-UiLabel 'Cloud' 12 12 100),
         $script:Ui.Cloud,
-        (New-UiLabel 'Tenant id' 300 12 84),
+        $script:Ui.TenantLabel,
         $script:Ui.TenantBox,
-        (New-UiLabel 'Client id' 660 12 90),
+        $script:Ui.ClientLabel,
         $script:Ui.ClientBox,
         (New-UiLabel 'Sign-in' 12 46 100),
         $script:Ui.AuthMode,
@@ -889,11 +929,12 @@ if ($saved) {
     if ($saved.ClientId) { $script:Ui.ClientBox.Text = [string]$saved.ClientId }
     $authIndex = 0
     switch ([string]$saved.AuthMode) {
-        'CertificateThumbprint' { $authIndex = 0 }
-        'CertificateFile' { $authIndex = 1 }
-        'Secret' { $authIndex = 2 }
-        'Existing' { $authIndex = 3 }
-        'Sample' { $authIndex = 4 }
+        'Account' { $authIndex = 0 }
+        'CertificateThumbprint' { $authIndex = 1 }
+        'CertificateFile' { $authIndex = 2 }
+        'Secret' { $authIndex = 3 }
+        'Existing' { $authIndex = 4 }
+        'Sample' { $authIndex = 5 }
     }
     $script:Ui.AuthMode.SelectedIndex = $authIndex
     if ($saved.Thumbprint) { $script:Ui.ThumbBox.Text = [string]$saved.Thumbprint }
@@ -910,7 +951,7 @@ if ($saved) {
 }
 
 Update-AuthPanels
-Write-UiLog 'Ready. Call records require application roles CallRecords.Read.All and User.Read.All.'
+Write-UiLog 'Sign in with your administrator account. Microsoft does not allow a user token to read call records, so the first sign-in grants CallRecords.Read.All and User.Read.All to an app named Teams Call Report.'
 Write-UiLog 'Preview sample data loads alice@contoso.com without contacting a tenant.'
 
 $timer = New-Object System.Windows.Forms.Timer
@@ -926,6 +967,15 @@ $timer.Add_Tick({
             if ($progress -gt 100) { $progress = 100 }
             $script:Ui.Progress.Value = $progress
             if ($sync.StatusText) { $script:Ui.StatusLabel.Text = [string]$sync.StatusText }
+            if ($sync.DeviceCode -and $script:Ui.ShownDeviceCode -ne $sync.DeviceCode) {
+                $script:Ui.ShownDeviceCode = [string]$sync.DeviceCode
+                $script:Ui.AuthNote.Text = [string]$sync.StatusText
+                try { Set-Clipboard -Value ([string]$sync.DeviceCode) } catch { }
+                if ($sync.DeviceUrl) {
+                    try { Start-Process ([string]$sync.DeviceUrl) } catch { }
+                }
+                $script:Ui.Tabs.SelectedIndex = 4
+            }
         }
         if ($sync.Done -and $script:Ui.Handle) { Complete-ReportOperation }
     })

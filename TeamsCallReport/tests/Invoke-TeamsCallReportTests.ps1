@@ -337,6 +337,142 @@ else {
 }
 Remove-Item -LiteralPath $certDir -Recurse -Force -ErrorAction SilentlyContinue
 
+$appJson = ConvertTo-JsonSafe (New-TeamsCallReportAppBody -DisplayName 'Teams Call Report' -Notes 'note' -KeyCredential ([ordered]@{
+            type = 'AsymmetricX509Cert'; usage = 'Verify'; key = 'abc'; displayName = 'Teams Call Report'
+        }))
+Assert-True 'app body keeps resource array' ($appJson.Contains('"requiredResourceAccess":[') -or $appJson.Contains('"requiredResourceAccess": ['))
+Assert-True 'app body keeps key array' ($appJson.Contains('"keyCredentials":[') -or $appJson.Contains('"keyCredentials": ['))
+Assert-True 'app body has call role' ($appJson.Contains('45bbb07e-7321-4fd7-a8f6-3ff27e6a81c8'))
+Assert-True 'app body has user role' ($appJson.Contains('df021288-bdef-4463-88db-98f22de89214'))
+
+function New-AccountTestJwt {
+    param($Payload)
+    $header = ConvertTo-Base64Url ([Text.Encoding]::UTF8.GetBytes('{"alg":"none","typ":"JWT"}'))
+    $body = ConvertTo-Base64Url ([Text.Encoding]::UTF8.GetBytes((ConvertTo-JsonSafe $Payload)))
+    return ($header + '.' + $body + '.sig')
+}
+function New-AccountReply {
+    param([int]$Status, [string]$Raw)
+    return [pscustomobject]@{ StatusCode = $Status; Raw = $Raw; RetryAfter = $null }
+}
+
+if ($openssl) {
+    $accountDir = Join-Path ([System.IO.Path]::GetTempPath()) ('TeamsCallReportAccount-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $accountDir -Force | Out-Null
+    $accountPfx = Join-Path $accountDir 'app.pfx'
+    & openssl req -x509 -newkey rsa:2048 -keyout (Join-Path $accountDir 'key.pem') -out (Join-Path $accountDir 'cert.pem') -days 2 -nodes -subj '/CN=Teams Call Report' 2>$null | Out-Null
+    & openssl pkcs12 -export -out $accountPfx -inkey (Join-Path $accountDir 'key.pem') -in (Join-Path $accountDir 'cert.pem') -passout pass:testpass 2>$null | Out-Null
+    $accountCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($accountPfx, 'testpass', [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet)
+    $accountTenant = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    $accountAppId = '77777777-7777-7777-7777-777777777777'
+    $accountRoles = New-Object System.Collections.Generic.List[string]
+    [void]$accountRoles.Add('CallRecords.Read.All')
+    [void]$accountRoles.Add('User.Read.All')
+    $userJwt = New-AccountTestJwt ([pscustomobject]@{
+            tid = $accountTenant
+            preferred_username = 'admin@contoso.com'
+            scp = 'Application.ReadWrite.All AppRoleAssignment.ReadWrite.All Directory.Read.All'
+        })
+    $appJwt = New-AccountTestJwt ([pscustomobject]@{
+            tid = $accountTenant
+            appid = $accountAppId
+            roles = $accountRoles
+        })
+    $accountState = @{
+        Polls = 0
+        RolePosts = 0
+        CreateBody = $null
+        Requests = (New-Object System.Collections.Generic.List[string])
+    }
+    $accountSend = {
+        param($Method, $Uri, $Body, $ContentType, $Headers)
+        [void]$accountState.Requests.Add("$Method $Uri")
+        if ($Uri -match '/devicecode$') {
+            return (New-AccountReply 200 '{"device_code":"dev-1","user_code":"ABCD-EFGH","verification_uri":"https://microsoft.com/devicelogin","expires_in":900,"interval":0,"message":"Enter code"}')
+        }
+        if ($Uri -match '/organizations/oauth2/v2.0/token$') {
+            $accountState.Polls = $accountState.Polls + 1
+            if ($accountState.Polls -eq 1) { return (New-AccountReply 400 '{"error":"authorization_pending","error_description":"pending"}') }
+            return (New-AccountReply 200 ("{`"access_token`":`"$userJwt`",`"expires_in`":3600}"))
+        }
+        if ($Uri -match '/applications\?' -and $Method -eq 'GET') { return (New-AccountReply 200 '{"value":[]}') }
+        if ($Uri -match '/applications$' -and $Method -eq 'POST') {
+            $accountState.CreateBody = [string]$Body
+            return (New-AccountReply 200 ("{`"id`":`"app-object`",`"appId`":`"$accountAppId`"}"))
+        }
+        if ($Uri -match '/servicePrincipals\?' -and $Uri -match '00000003-0000-0000-c000-000000000000') {
+            return (New-AccountReply 200 '{"value":[{"id":"graph-sp","appId":"00000003-0000-0000-c000-000000000000","appRoles":[{"id":"45bbb07e-7321-4fd7-a8f6-3ff27e6a81c8","value":"CallRecords.Read.All"},{"id":"df021288-bdef-4463-88db-98f22de89214","value":"User.Read.All"}]}]}')
+        }
+        if ($Uri -match '/servicePrincipals\?' -and $Method -eq 'GET') { return (New-AccountReply 200 '{"value":[]}') }
+        if ($Uri -match '/servicePrincipals$' -and $Method -eq 'POST') { return (New-AccountReply 201 '{"id":"app-sp","appId":"77777777-7777-7777-7777-777777777777"}') }
+        if ($Uri -match '/appRoleAssignedTo$') {
+            $accountState.RolePosts = $accountState.RolePosts + 1
+            if ($accountState.RolePosts -eq 1) { return (New-AccountReply 201 '{}') }
+            return (New-AccountReply 400 '{"error":{"code":"Request_BadRequest","message":"Permission entry already exists."}}')
+        }
+        if ($Uri -match '/oauth2/v2.0/token$' -and $Method -eq 'POST') {
+            return (New-AccountReply 200 ("{`"access_token`":`"$appJwt`",`"expires_in`":3600}"))
+        }
+        return (New-AccountReply 500 ("{`"error`":{`"message`":`"unexpected $Method $Uri`"}}"))
+    }
+    $seenCode = $null
+    $grantPath = Join-Path $accountDir 'account.json'
+    $connected = Connect-TeamsCallReportAccount -Cloud Public -GrantPath $grantPath -Certificate $accountCert -Send $accountSend -OnDeviceCode {
+        param($Info)
+        $script:seenCode = $Info.UserCode
+    }
+    Assert-Equal 'device code shown' $seenCode 'ABCD-EFGH'
+    Assert-True 'public client used' (($accountState.Requests -join "`n") -match 'devicecode')
+    Assert-True 'created app keeps roles' ($accountState.CreateBody.Contains('45bbb07e-7321-4fd7-a8f6-3ff27e6a81c8') -and $accountState.CreateBody.Contains('"requiredResourceAccess":['))
+    Assert-Equal 'both roles granted or already present' $accountState.RolePosts 2
+    Assert-True 'app token is application auth' ($connected.Client.TokenInfo.AuthType -eq 'Application')
+    Assert-True 'app token can read calls' (Test-TeamsTokenHasCallRoles $connected.Client.TokenInfo)
+    Assert-Equal 'grant remembers app' ((Get-Content -LiteralPath $grantPath -Raw | ConvertFrom-Json).clientId) $accountAppId
+    $reuseRequests = $accountState.Requests.Count
+    $reused = Connect-TeamsCallReportAccount -Cloud Public -GrantPath $grantPath -Certificate $accountCert -Send $accountSend
+    Assert-True 'second run reuses the grant' $reused.Reused
+    Assert-Equal 'second run does not start another sign-in' $accountState.Requests.Count ($reuseRequests + 1)
+
+    $forbidden = @{
+        Polls = 0
+        RolePosts = 0
+        CreateBody = $null
+        Requests = (New-Object System.Collections.Generic.List[string])
+    }
+    $forbiddenSend = {
+        param($Method, $Uri, $Body, $ContentType, $Headers)
+        if ($Uri -match '/devicecode$') {
+            return (New-AccountReply 200 '{"device_code":"dev-2","user_code":"ZZZZ-ZZZZ","verification_uri":"https://microsoft.com/devicelogin","expires_in":900,"interval":0}')
+        }
+        if ($Uri -match '/organizations/oauth2/v2.0/token$') {
+            return (New-AccountReply 200 ("{`"access_token`":`"$userJwt`",`"expires_in`":3600}"))
+        }
+        if ($Uri -match '/applications\?') { return (New-AccountReply 403 '{"error":{"code":"Authorization_RequestDenied","message":"Insufficient privileges"}}') }
+        return (New-AccountReply 500 '{"error":{"message":"unexpected"}}')
+    }
+    $denied = $false
+    try {
+        Connect-TeamsCallReportAccount -Cloud Public -GrantPath (Join-Path $accountDir 'none.json') -Certificate $accountCert -Send $forbiddenSend | Out-Null
+    }
+    catch { $denied = $_.Exception.Message -match 'Global Administrator' }
+    Assert-True 'non admin is told which role is required' $denied
+
+    $cancelSend = {
+        param($Method, $Uri, $Body, $ContentType, $Headers)
+        if ($Uri -match '/devicecode$') {
+            return (New-AccountReply 200 '{"device_code":"dev-3","user_code":"CANCEL-1","verification_uri":"https://microsoft.com/devicelogin","expires_in":900,"interval":0}')
+        }
+        return (New-AccountReply 500 '{"error":{"message":"should have cancelled"}}')
+    }
+    $cancelledSignIn = $false
+    try {
+        Connect-TeamsCallReportAccount -Cloud Public -GrantPath (Join-Path $accountDir 'cancel.json') -Certificate $accountCert -Send $cancelSend -ShouldCancel { $true } | Out-Null
+    }
+    catch { $cancelledSignIn = $_.Exception.Message -match 'Sign-in cancelled' }
+    Assert-True 'sign-in can be cancelled' $cancelledSignIn
+    Remove-Item -LiteralPath $accountDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 foreach ($name in @('TeamsCallReport.Core.ps1', 'Get-TeamsUserCallDetails.ps1', 'TeamsCallReport.ps1')) {
     $path = Join-Path $root $name
     $tokens = $null

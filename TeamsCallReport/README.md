@@ -2,22 +2,20 @@
 
 Exports Microsoft Teams call records for one user and opens them in a Windows desktop window.
 
-Graph keeps these records for 30 days, and a record is created only after the call ends. The app registration needs application permissions (admin consent), not delegated permissions:
+Graph keeps these records for 30 days, and a record is created only after the call ends. Microsoft does not let a signed-in user read call records directly. The first time you sign in with a Global Administrator or Privileged Role Administrator account, this tool creates an app named **Teams Call Report** and grants it:
 
 - `CallRecords.Read.All`
 - `User.Read.All`
 
+The certificate private key stays in the Windows certificate store on this PC. Later runs reuse that grant and do not ask you to sign in again.
+
 ## Desktop window
 
-Double-click `Start-TeamsCallReport.cmd`, or from an existing Windows PowerShell window:
+Double-click `Start-TeamsCallReport.cmd`. Leave **Sign in with my account** selected, enter the person whose calls you want, and click **Run export**. A browser opens for the administrator sign-in and shows a device code.
 
-```powershell
-powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\TeamsCallReport.ps1 -StaReady
-```
+**Preview sample data** runs the same export against built-in records (try `alice@contoso.com`) so the grids can be checked without a tenant.
 
-Sign in with a certificate thumbprint, a PFX, or a client secret. Choose Public, USGov, or USGovDoD. **Preview sample data** runs the same export against built-in records (try `alice@contoso.com`) so the grids, filters, and CSV files can be checked without a tenant.
-
-An existing `Connect-MgGraph` session is visible only in this process. The `.cmd` launcher starts a new process, so use certificate or secret sign-in from the window. Settings are stored in `%APPDATA%\TeamsCallReport\settings.json`. Secrets and the PFX password are not saved.
+Settings are stored in `%APPDATA%\TeamsCallReport\settings.json`. The app id and certificate thumbprint are stored in `%APPDATA%\TeamsCallReport\account.json`. Secrets are not saved. Certificate, PFX, and client-secret sign-in remain available in the sign-in list when an app registration already exists.
 
 The window lists calls, participants, and endpoints. Selecting a call filters the other two grids. The filter box searches the current text. Output is the folder you choose:
 
@@ -30,6 +28,8 @@ The window lists calls, participants, and endpoints. Selecting a call filters th
 ## Command line
 
 ```powershell
+.\Get-TeamsUserCallDetails.ps1 -User alice@contoso.com
+
 .\Get-TeamsUserCallDetails.ps1 -User alice@contoso.com -TenantId <tenant-guid> `
     -ClientId <app-guid> -CertificateThumbprint <thumbprint>
 

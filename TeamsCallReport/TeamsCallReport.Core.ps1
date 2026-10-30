@@ -904,6 +904,437 @@ function New-TeamsTokenInfo {
     }
 }
 
+function Get-TeamsPublicClientId {
+    # Microsoft Graph Command Line Tools, the public client Connect-MgGraph uses.
+    # Call records have no delegated permission, so this sign-in is only used to
+    # create an app and grant the application roles below.
+    return '14d82eec-204b-4c2f-b7e8-296a70dab67e'
+}
+
+function Get-TeamsCallReportAppRoles {
+    return @(
+        [pscustomobject]@{ Name = 'CallRecords.Read.All'; Id = '45bbb07e-7321-4fd7-a8f6-3ff27e6a81c8' },
+        [pscustomobject]@{ Name = 'User.Read.All'; Id = 'df021288-bdef-4463-88db-98f22de89214' }
+    )
+}
+
+function Get-TeamsAccountGrantPath {
+    param([string]$Path)
+    if ($Path) { return $Path }
+    $root = $env:APPDATA
+    if ([string]::IsNullOrWhiteSpace($root)) { $root = (Join-Path $env:USERPROFILE 'AppData\Roaming') }
+    $dir = Join-Path $root 'TeamsCallReport'
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    return (Join-Path $dir 'account.json')
+}
+
+function Read-TeamsAccountGrant {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    try { return (Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json) }
+    catch { return $null }
+}
+
+function Save-TeamsAccountGrant {
+    param([string]$Path, [string]$ClientId, [string]$Thumbprint, [string]$TenantId)
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $json = ConvertTo-JsonSafe ([ordered]@{
+            clientId   = $ClientId
+            thumbprint = $Thumbprint
+            tenantId   = $TenantId
+        })
+    $utf8 = New-Object System.Text.UTF8Encoding $true
+    [System.IO.File]::WriteAllText($Path, $json, $utf8)
+}
+
+function New-TeamsBootstrapCertificate {
+    if (-not (Get-Command New-SelfSignedCertificate -ErrorAction SilentlyContinue)) {
+        throw 'Signing in with your account needs Windows PowerShell so the certificate can be stored in Cert:\CurrentUser\My.'
+    }
+    $notAfter = (Get-Date).AddYears(2)
+    try {
+        return New-SelfSignedCertificate -Subject 'CN=Teams Call Report' -CertStoreLocation 'Cert:\CurrentUser\My' -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -KeyExportPolicy NonExportable -NotAfter $notAfter -FriendlyName 'Teams Call Report' -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.2')
+    }
+    catch {
+        return New-SelfSignedCertificate -Subject 'CN=Teams Call Report' -CertStoreLocation 'Cert:\CurrentUser\My' -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -KeyExportPolicy NonExportable -NotAfter $notAfter
+    }
+}
+
+function Invoke-TeamsAccountRequest {
+    param(
+        $Send,
+        [string[]]$AllowedHosts,
+        [Parameter(Mandatory)][string]$Method,
+        [Parameter(Mandatory)][string]$Uri,
+        [string]$Body,
+        [string]$ContentType = 'application/json',
+        [hashtable]$Headers
+    )
+    Assert-TeamsAllowedHost -Client $null -AbsoluteUri $Uri -FallbackHosts $AllowedHosts
+    if ($Send) { return (& $Send $Method $Uri $Body $ContentType $Headers) }
+    return (Invoke-TeamsHttp -Method $Method -Uri $Uri -Body $Body -ContentType $ContentType -Headers $Headers)
+}
+
+function Get-TeamsOAuthErrorCode {
+    param($Raw)
+    if ([string]::IsNullOrWhiteSpace([string]$Raw)) { return $null }
+    try {
+        $parsed = $Raw | ConvertFrom-Json
+        if ($parsed.error -is [string]) { return [string]$parsed.error }
+        if ($parsed.error -and $parsed.error.code) { return [string]$parsed.error.code }
+    }
+    catch { }
+    return $null
+}
+
+function Test-TeamsTokenHasCallRoles {
+    param($TokenInfo)
+    if (-not $TokenInfo -or $TokenInfo.AuthType -ne 'Application') { return $false }
+    $have = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($role in (ConvertTo-StringArray $TokenInfo.Roles)) { [void]$have.Add([string]$role) }
+    return ($have.Contains('CallRecords.Read.All') -and $have.Contains('User.Read.All'))
+}
+
+function New-TeamsAppOnlyClient {
+    param(
+        $Send,
+        $CloudConfig,
+        [string[]]$AllowedHosts,
+        [string]$TenantId,
+        [string]$ClientId,
+        $Certificate,
+        [scriptblock]$Log
+    )
+    $tokenEndpoint = "https://$($CloudConfig.LoginHost)/$TenantId/oauth2/v2.0/token"
+    $fields = @{
+        client_id             = $ClientId
+        scope                 = [string]$CloudConfig.Scope
+        grant_type            = 'client_credentials'
+        client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+        client_assertion      = (New-TeamsClientAssertion -ClientId $ClientId -TokenEndpoint $tokenEndpoint -Certificate $Certificate)
+    }
+    $response = Invoke-TeamsAccountRequest -Send $Send -AllowedHosts $AllowedHosts -Method 'POST' -Uri $tokenEndpoint -Body (ConvertTo-FormBody $fields) -ContentType 'application/x-www-form-urlencoded'
+    if ($response.StatusCode -lt 200 -or $response.StatusCode -ge 300) {
+        throw ("Saved app sign-in failed with HTTP {0}: {1}" -f $response.StatusCode, (Get-GraphErrorMessage $response.Raw $response.StatusCode))
+    }
+    $parsed = $response.Raw | ConvertFrom-Json
+    if (-not $parsed.access_token) { throw 'Token response did not include an access token.' }
+    $expires = 3600
+    if ($parsed.expires_in) { $expires = [int]$parsed.expires_in }
+    $payload = Get-TeamsJwtPayload ([string]$parsed.access_token)
+    $expiresOn = [datetimeoffset]::UtcNow.AddSeconds($expires)
+    $client = @{
+        Kind              = 'Http'
+        Cloud             = $CloudConfig.Name
+        BaseUrl           = $CloudConfig.GraphBase
+        AllowedHosts      = @($CloudConfig.GraphHost)
+        TenantId          = $TenantId
+        RequestedTenantId = $TenantId
+        ClientId          = $ClientId
+        AccessToken       = [string]$parsed.access_token
+        ExpiresOn         = $expiresOn
+        TokenMode         = 'Certificate'
+        Certificate       = $Certificate
+        TokenInfo         = (New-TeamsTokenInfo -Payload $payload -ExpiresOn $expiresOn -RequestedTenant $TenantId)
+        Log               = $Log
+        ShouldCancel      = $null
+        Requests          = $null
+    }
+    if ($payload.tid) { $client.TenantId = [string]$payload.tid }
+    return $client
+}
+
+function Get-TeamsGraphCollection {
+    param($Raw)
+    if ([string]::IsNullOrWhiteSpace([string]$Raw)) { return (Get-ObjectList $null).Items }
+    $parsed = $Raw | ConvertFrom-Json
+    $value = $null
+    if ($parsed.PSObject.Properties['value']) { $value = $parsed.value }
+    return (Get-ObjectList $value).Items
+}
+
+function New-TeamsCallReportAppBody {
+    param([string]$DisplayName, [string]$Notes, $KeyCredential)
+    $roles = New-Object System.Collections.Generic.List[object]
+    foreach ($role in @(Get-TeamsCallReportAppRoles)) {
+        $roles.Add([pscustomobject]@{ id = $role.Id; type = 'Role' })
+    }
+    $resources = New-Object System.Collections.Generic.List[object]
+    $resources.Add([pscustomobject]@{
+            resourceAppId  = '00000003-0000-0000-c000-000000000000'
+            resourceAccess = $roles
+        })
+    $keys = New-Object System.Collections.Generic.List[object]
+    $keys.Add([pscustomobject]$KeyCredential)
+    return [pscustomobject]@{
+        displayName            = $DisplayName
+        signInAudience         = 'AzureADMyOrg'
+        notes                  = $Notes
+        requiredResourceAccess = $resources
+        keyCredentials         = $keys
+    }
+}
+
+function Invoke-TeamsUserGraph {
+    param($Send, [string[]]$AllowedHosts, [string]$Method, [string]$Uri, [string]$Token, $BodyObject)
+    $body = $null
+    if ($null -ne $BodyObject) { $body = ConvertTo-JsonSafe $BodyObject }
+    $headers = @{ Authorization = ("Bearer {0}" -f $Token); Accept = 'application/json' }
+    $response = Invoke-TeamsAccountRequest -Send $Send -AllowedHosts $AllowedHosts -Method $Method -Uri $Uri -Body $body -ContentType 'application/json' -Headers $headers
+    return $response
+}
+
+function Connect-TeamsCallReportAccount {
+    param(
+        [ValidateSet('Public', 'USGov', 'USGovDoD')]
+        [string]$Cloud = 'Public',
+        [string]$GrantPath,
+        $Certificate,
+        [scriptblock]$OnDeviceCode,
+        [scriptblock]$ShouldCancel,
+        [scriptblock]$Log,
+        $Send
+    )
+    $cloudConfig = Get-TeamsCloudConfig $Cloud
+    $allowed = @($cloudConfig.LoginHost, $cloudConfig.GraphHost)
+    $grantFile = Get-TeamsAccountGrantPath $GrantPath
+    $saved = Read-TeamsAccountGrant $grantFile
+    $thumb = $null
+    if ($Certificate -and $Certificate.Thumbprint) {
+        $thumb = (($Certificate.Thumbprint -replace '\s', '').ToUpperInvariant())
+    }
+    if ($saved -and $saved.clientId -and $saved.thumbprint -and $saved.tenantId) {
+        $savedThumb = (([string]$saved.thumbprint -replace '\s', '').ToUpperInvariant())
+        $reuseCert = $null
+        if ($Certificate -and $thumb -eq $savedThumb) { $reuseCert = $Certificate }
+        elseif (-not $Certificate) {
+            try { $reuseCert = Get-TeamsCertificate -Thumbprint $savedThumb } catch { $reuseCert = $null }
+        }
+        if ($reuseCert) {
+            try {
+                $existing = New-TeamsAppOnlyClient -Send $Send -CloudConfig $cloudConfig -AllowedHosts $allowed -TenantId ([string]$saved.tenantId) -ClientId ([string]$saved.clientId) -Certificate $reuseCert -Log $Log
+                if (Test-TeamsTokenHasCallRoles $existing.TokenInfo) {
+                    return [pscustomobject]@{
+                        Client      = $existing
+                        ClientId    = [string]$saved.clientId
+                        Thumbprint  = $savedThumb
+                        TenantId    = [string]$existing.TenantId
+                        Reused      = $true
+                        Account     = $null
+                    }
+                }
+                if ($Log) { & $Log 'WARN' 'The saved Teams Call Report app is missing CallRecords.Read.All or User.Read.All. Signing in to grant them.' }
+            }
+            catch {
+                if ($Log) { & $Log 'WARN' ("Saved sign-in could not be reused ({0}). Signing in again." -f $_.Exception.Message) }
+            }
+        }
+    }
+
+    $scopeHost = 'https://' + $cloudConfig.GraphHost
+    $scopes = @(
+        "$scopeHost/Application.ReadWrite.All",
+        "$scopeHost/AppRoleAssignment.ReadWrite.All",
+        "$scopeHost/Directory.Read.All",
+        'offline_access',
+        'openid',
+        'profile'
+    )
+    $deviceEndpoint = "https://$($cloudConfig.LoginHost)/organizations/oauth2/v2.0/devicecode"
+    $deviceResponse = Invoke-TeamsAccountRequest -Send $Send -AllowedHosts $allowed -Method 'POST' -Uri $deviceEndpoint -Body (ConvertTo-FormBody @{
+            client_id = (Get-TeamsPublicClientId)
+            scope     = ($scopes -join ' ')
+        }) -ContentType 'application/x-www-form-urlencoded'
+    if ($deviceResponse.StatusCode -lt 200 -or $deviceResponse.StatusCode -ge 300) {
+        throw ("Could not start sign-in (HTTP {0}): {1}" -f $deviceResponse.StatusCode, (Get-GraphErrorMessage $deviceResponse.Raw $deviceResponse.StatusCode))
+    }
+    $device = $deviceResponse.Raw | ConvertFrom-Json
+    $verifyUrl = $null
+    if ($device.verification_uri) { $verifyUrl = [string]$device.verification_uri }
+    elseif ($device.verification_url) { $verifyUrl = [string]$device.verification_url }
+    else { $verifyUrl = 'https://microsoft.com/devicelogin' }
+    $userCode = [string]$device.user_code
+    $signInMessage = "Open $verifyUrl and enter code $userCode. Sign in as a Global Administrator or Privileged Role Administrator. This grants CallRecords.Read.All and User.Read.All to an app named Teams Call Report. The private key stays on this PC."
+    if ($OnDeviceCode) {
+        & $OnDeviceCode ([pscustomobject]@{
+                UserCode        = $userCode
+                VerificationUrl = $verifyUrl
+                Message         = $signInMessage
+                DeviceCode      = [string]$device.device_code
+            })
+    }
+    $interval = 5
+    if ($device.PSObject.Properties['interval'] -and $null -ne $device.interval) { $interval = [int]$device.interval }
+    $lifetime = 900
+    if ($device.expires_in) { $lifetime = [int]$device.expires_in }
+    $deadline = [datetimeoffset]::UtcNow.AddSeconds($lifetime)
+    $tokenEndpoint = "https://$($cloudConfig.LoginHost)/organizations/oauth2/v2.0/token"
+    $userToken = $null
+    $sleepClient = @{ ShouldCancel = $ShouldCancel }
+    while ([datetimeoffset]::UtcNow -lt $deadline) {
+        if ($ShouldCancel -and (& $ShouldCancel)) { throw 'Sign-in cancelled.' }
+        $tokenResponse = Invoke-TeamsAccountRequest -Send $Send -AllowedHosts $allowed -Method 'POST' -Uri $tokenEndpoint -Body (ConvertTo-FormBody @{
+                grant_type  = 'urn:ietf:params:oauth:grant-type:device_code'
+                client_id   = (Get-TeamsPublicClientId)
+                device_code = [string]$device.device_code
+            }) -ContentType 'application/x-www-form-urlencoded'
+        if ($tokenResponse.StatusCode -ge 200 -and $tokenResponse.StatusCode -lt 300) {
+            $tokenJson = $tokenResponse.Raw | ConvertFrom-Json
+            if ($tokenJson.access_token) { $userToken = [string]$tokenJson.access_token; break }
+        }
+        $oauthError = Get-TeamsOAuthErrorCode $tokenResponse.Raw
+        if ($oauthError -eq 'authorization_pending') {
+            if ($interval -gt 0) { Start-TeamsSleep -Client $sleepClient -Seconds $interval }
+            continue
+        }
+        if ($oauthError -eq 'slow_down') {
+            $interval = $interval + 5
+            Start-TeamsSleep -Client $sleepClient -Seconds $interval
+            continue
+        }
+        if ($oauthError -eq 'expired_token') { throw 'The sign-in code expired. Run sign-in again.' }
+        if ($oauthError -eq 'access_denied' -or $oauthError -eq 'authorization_declined') {
+            throw 'Sign-in was declined. Call records need an administrator to grant the application permission.'
+        }
+        throw ("Sign-in failed with HTTP {0}: {1}" -f $tokenResponse.StatusCode, (Get-GraphErrorMessage $tokenResponse.Raw $tokenResponse.StatusCode))
+    }
+    if (-not $userToken) { throw 'Sign-in timed out before the browser step finished.' }
+    $userPayload = Get-TeamsJwtPayload $userToken
+    $tenantId = ConvertTo-NullableString $userPayload.tid
+    if (-not $tenantId) { throw 'The sign-in token did not include a tenant id.' }
+    $account = ConvertTo-NullableString $userPayload.preferred_username
+    if (-not $account) { $account = ConvertTo-NullableString $userPayload.upn }
+    if ($Log -and $account) { & $Log 'INFO' ("Signed in as $account.") }
+
+    if (-not $Certificate) { $Certificate = New-TeamsBootstrapCertificate }
+    $thumb = (([string]$Certificate.Thumbprint -replace '\s', '').ToUpperInvariant())
+    $certKey = [Convert]::ToBase64String($Certificate.RawData)
+    $keyId = [Convert]::ToBase64String($Certificate.GetCertHash())
+    $keyCredential = [ordered]@{
+        type                = 'AsymmetricX509Cert'
+        usage               = 'Verify'
+        key                 = $certKey
+        displayName         = 'Teams Call Report'
+        customKeyIdentifier = $keyId
+    }
+    $graphBase = $cloudConfig.GraphBase.TrimEnd('/')
+    $appFilter = Format-GraphPath 'applications' @{ '$filter' = "displayName eq 'Teams Call Report'"; '$select' = 'id,appId,displayName,keyCredentials' }
+    $appResponse = Invoke-TeamsUserGraph -Send $Send -AllowedHosts $allowed -Method 'GET' -Uri ($graphBase + '/' + $appFilter) -Token $userToken
+    if ($appResponse.StatusCode -eq 403) {
+        throw 'This account cannot create applications. Sign in with a Global Administrator or Privileged Role Administrator.'
+    }
+    if ($appResponse.StatusCode -lt 200 -or $appResponse.StatusCode -ge 300) {
+        throw ("Could not look for the Teams Call Report app (HTTP {0}): {1}" -f $appResponse.StatusCode, (Get-GraphErrorMessage $appResponse.Raw $appResponse.StatusCode))
+    }
+    $apps = @(Get-TeamsGraphCollection $appResponse.Raw)
+    $application = $null
+    foreach ($candidate in $apps) {
+        if ($candidate.appId) { $application = $candidate; break }
+    }
+    $created = $false
+    if (-not $application) {
+        $createBody = New-TeamsCallReportAppBody -DisplayName 'Teams Call Report' -Notes 'Created by Teams Call Report. Call records only allow an application permission, so this app holds CallRecords.Read.All and User.Read.All.' -KeyCredential $keyCredential
+        $createdResponse = Invoke-TeamsUserGraph -Send $Send -AllowedHosts $allowed -Method 'POST' -Uri ($graphBase + '/applications') -Token $userToken -BodyObject $createBody
+        if ($createdResponse.StatusCode -eq 403) {
+            throw 'This account cannot grant application permissions. Sign in with a Global Administrator or Privileged Role Administrator.'
+        }
+        if ($createdResponse.StatusCode -lt 200 -or $createdResponse.StatusCode -ge 300) {
+            throw ("Could not create the Teams Call Report app (HTTP {0}): {1}" -f $createdResponse.StatusCode, (Get-GraphErrorMessage $createdResponse.Raw $createdResponse.StatusCode))
+        }
+        $application = $createdResponse.Raw | ConvertFrom-Json
+        $created = $true
+    }
+    else {
+        $hasKey = $false
+        foreach ($existingKey in (Get-ObjectList $application.keyCredentials).Items) {
+            $identifier = ConvertTo-NullableString $existingKey.customKeyIdentifier
+            if ($identifier -and $identifier.Trim().Equals($keyId, [StringComparison]::Ordinal)) { $hasKey = $true }
+        }
+        if (-not $hasKey) {
+            $addResponse = Invoke-TeamsUserGraph -Send $Send -AllowedHosts $allowed -Method 'POST' -Uri ($graphBase + "/applications/$($application.id)/addKey") -Token $userToken -BodyObject ([ordered]@{ keyCredential = $keyCredential })
+            if ($addResponse.StatusCode -lt 200 -or $addResponse.StatusCode -ge 300) {
+                $fallbackName = 'Teams Call Report ' + $env:COMPUTERNAME
+                if ([string]::IsNullOrWhiteSpace($fallbackName)) { $fallbackName = 'Teams Call Report local' }
+                $createBody = New-TeamsCallReportAppBody -DisplayName $fallbackName -Notes 'Created by Teams Call Report because the existing app certificate could not be updated.' -KeyCredential $keyCredential
+                $createdResponse = Invoke-TeamsUserGraph -Send $Send -AllowedHosts $allowed -Method 'POST' -Uri ($graphBase + '/applications') -Token $userToken -BodyObject $createBody
+                if ($createdResponse.StatusCode -lt 200 -or $createdResponse.StatusCode -ge 300) {
+                    throw ("Could not add a certificate to the Teams Call Report app (HTTP {0}): {1}" -f $addResponse.StatusCode, (Get-GraphErrorMessage $addResponse.Raw $addResponse.StatusCode))
+                }
+                $application = $createdResponse.Raw | ConvertFrom-Json
+                $created = $true
+            }
+        }
+    }
+    $appId = [string]$application.appId
+    if (-not $appId) { throw 'The Teams Call Report app did not return an application id.' }
+
+    $spFilter = Format-GraphPath 'servicePrincipals' @{ '$filter' = "appId eq '$appId'"; '$select' = 'id,appId' }
+    $spResponse = Invoke-TeamsUserGraph -Send $Send -AllowedHosts $allowed -Method 'GET' -Uri ($graphBase + '/' + $spFilter) -Token $userToken
+    if ($spResponse.StatusCode -lt 200 -or $spResponse.StatusCode -ge 300) {
+        throw ("Could not find the app's service principal (HTTP {0}): {1}" -f $spResponse.StatusCode, (Get-GraphErrorMessage $spResponse.Raw $spResponse.StatusCode))
+    }
+    $servicePrincipals = @(Get-TeamsGraphCollection $spResponse.Raw)
+    $servicePrincipal = $null
+    foreach ($candidate in $servicePrincipals) { if ($candidate.id) { $servicePrincipal = $candidate; break } }
+    if (-not $servicePrincipal) {
+        $spCreate = Invoke-TeamsUserGraph -Send $Send -AllowedHosts $allowed -Method 'POST' -Uri ($graphBase + '/servicePrincipals') -Token $userToken -BodyObject ([ordered]@{ appId = $appId })
+        if ($spCreate.StatusCode -lt 200 -or $spCreate.StatusCode -ge 300) {
+            throw ("Could not enable the Teams Call Report app (HTTP {0}): {1}" -f $spCreate.StatusCode, (Get-GraphErrorMessage $spCreate.Raw $spCreate.StatusCode))
+        }
+        $servicePrincipal = $spCreate.Raw | ConvertFrom-Json
+    }
+
+    $graphFilter = Format-GraphPath 'servicePrincipals' @{ '$filter' = "appId eq '00000003-0000-0000-c000-000000000000'"; '$select' = 'id,appId,appRoles' }
+    $graphResponse = Invoke-TeamsUserGraph -Send $Send -AllowedHosts $allowed -Method 'GET' -Uri ($graphBase + '/' + $graphFilter) -Token $userToken
+    if ($graphResponse.StatusCode -lt 200 -or $graphResponse.StatusCode -ge 300) {
+        throw ("Could not read Microsoft Graph roles (HTTP {0}): {1}" -f $graphResponse.StatusCode, (Get-GraphErrorMessage $graphResponse.Raw $graphResponse.StatusCode))
+    }
+    $graphPrincipals = @(Get-TeamsGraphCollection $graphResponse.Raw)
+    $graphPrincipal = $null
+    foreach ($candidate in $graphPrincipals) { if ($candidate.id) { $graphPrincipal = $candidate; break } }
+    if (-not $graphPrincipal) { throw 'Microsoft Graph is not present as a service principal in this tenant.' }
+    $roleIds = @{}
+    foreach ($known in @(Get-TeamsCallReportAppRoles)) { $roleIds[$known.Name] = $known.Id }
+    foreach ($appRole in (Get-ObjectList $graphPrincipal.appRoles).Items) {
+        $roleName = ConvertTo-NullableString $appRole.value
+        if ($roleName -and $roleIds.ContainsKey($roleName) -and $appRole.id) { $roleIds[$roleName] = [string]$appRole.id }
+    }
+    foreach ($roleName in @($roleIds.Keys)) {
+        $assign = Invoke-TeamsUserGraph -Send $Send -AllowedHosts $allowed -Method 'POST' -Uri ($graphBase + "/servicePrincipals/$($graphPrincipal.id)/appRoleAssignedTo") -Token $userToken -BodyObject ([ordered]@{
+                principalId = [string]$servicePrincipal.id
+                resourceId  = [string]$graphPrincipal.id
+                appRoleId   = [string]$roleIds[$roleName]
+            })
+        $assignError = Get-GraphErrorMessage $assign.Raw $assign.StatusCode
+        $already = ($assign.StatusCode -eq 409) -or ($assignError -match 'already exists')
+        if ($already) { continue }
+        if ($assign.StatusCode -eq 403) {
+            throw 'This account cannot grant CallRecords.Read.All. Sign in with a Global Administrator or Privileged Role Administrator.'
+        }
+        if ($assign.StatusCode -lt 200 -or $assign.StatusCode -ge 300) {
+            throw ("Could not grant $roleName (HTTP $($assign.StatusCode)): $assignError")
+        }
+    }
+
+    $client = New-TeamsAppOnlyClient -Send $Send -CloudConfig $cloudConfig -AllowedHosts $allowed -TenantId $tenantId -ClientId $appId -Certificate $Certificate -Log $Log
+    Save-TeamsAccountGrant -Path $grantFile -ClientId $appId -Thumbprint $thumb -TenantId $client.TenantId
+    if (-not (Test-TeamsTokenHasCallRoles $client.TokenInfo)) {
+        $roleText = (@(ConvertTo-StringArray $client.TokenInfo.Roles) | ForEach-Object { [string]$_ }) -join ', '
+        if (-not $roleText) { $roleText = '(none)' }
+        throw "The app token does not include both call-record roles yet. Auth $($client.TokenInfo.AuthType). Token roles: $roleText. Wait a minute and run sign-in again if the grant was just created."
+    }
+    return [pscustomobject]@{
+        Client     = $client
+        ClientId   = $appId
+        Thumbprint = $thumb
+        TenantId   = [string]$client.TenantId
+        Reused     = $false
+        Account    = $account
+        Created    = [bool]$created
+    }
+}
+
 function New-TeamsGraphClient {
     [CmdletBinding(DefaultParameterSetName = 'CertificateStore')]
     param(
