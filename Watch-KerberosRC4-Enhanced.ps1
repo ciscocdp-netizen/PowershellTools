@@ -110,8 +110,9 @@
     results always fall through to XPath and per-ID queries, and the probe distinguishes
     a readable Security log with no 4768/4769 from an access-denied or wrapped window.
   - Historical collection issued one Get-WinEvent for up to 100,000 events, so the GUI
-    looked hung on a busy DC. It now pages newest-first (default 1,000) with a log line
-    after each page and checks Stop between pages.
+    looked hung on a busy DC. It now pages newest-first until a page is empty (a short
+    Get-WinEvent page is not treated as end-of-log). The log reports Hours vs the
+    actual 4768/4769 time span so a wrapped Security log is not mistaken for an Hours bug.
   - Historical parse walked every 4768/4769 (mostly AES) and ran ToXml/XmlDocument on
     each. EventData is read from EventLogRecord.Properties (classic 4768/4769 layout)
     and ToXml is only a fallback. AES confirmation rows skip DNS/AD. CSV is buffered
@@ -1434,7 +1435,7 @@ function Invoke-KerberosCollection {
         [int]$PollSeconds = 5,
         [int]$LiveMinutes = 0,
         [int]$MaxHistoryEventsPerDC = 100000,
-        [int]$HistoryPageSize = 1000,
+        [int]$HistoryPageSize = 2000,
         [int]$LivePageSize = 20000,
         [switch]$SkipAuditCheck,
         [switch]$RequireAuditing
@@ -1495,7 +1496,15 @@ function Invoke-KerberosCollection {
             $totalRead = 0
             $saved = 0
             $skipped = 0
+            $oldestRead = $null
+            $newestRead = $null
+            $oldestSaved = $null
+            $newestSaved = $null
             $script:TicketEtypeTally = @{}
+            $logSummary = Get-SecurityLogSummary -ComputerName $target.Name -Path $target.Path
+            if (-not [string]::IsNullOrWhiteSpace($logSummary)) {
+                Write-CollectorStatus $logSummary
+            }
             while ($totalRead -lt $MaxHistoryEventsPerDC -and -not (Test-IsCollectorCancelRequested)) {
                 $pageNum++
                 $take = $HistoryPageSize
@@ -1511,24 +1520,47 @@ function Invoke-KerberosCollection {
                 if ($pageCount -lt 1) { break }
 
                 $minId = [int64]::MaxValue
+                $pageOldest = $null
+                $pageNewest = $null
                 foreach ($ev in $page) {
                     if (Test-IsCollectorCancelRequested) { break }
                     $rid = [int64]$ev.RecordId
                     if ($rid -lt $minId) { $minId = $rid }
                     if ($rid -gt $lastId[$target.Key]) { $lastId[$target.Key] = $rid }
+                    $when = $null
+                    try { $when = [datetime]$ev.TimeCreated } catch { }
+                    if ($null -ne $when) {
+                        if ($null -eq $oldestRead -or $when -lt $oldestRead) { $oldestRead = $when }
+                        if ($null -eq $newestRead -or $when -gt $newestRead) { $newestRead = $when }
+                        if ($null -eq $pageOldest -or $when -lt $pageOldest) { $pageOldest = $when }
+                        if ($null -eq $pageNewest -or $when -gt $pageNewest) { $pageNewest = $when }
+                    }
                     $row = Convert-KerberosEvent $ev $target.Name
                     if ($null -ne $row) {
                         Save-Finding $row
                         $saved++
+                        if ($null -ne $when) {
+                            if ($null -eq $oldestSaved -or $when -lt $oldestSaved) { $oldestSaved = $when }
+                            if ($null -eq $newestSaved -or $when -gt $newestSaved) { $newestSaved = $when }
+                        }
                     } else {
                         $skipped++
                     }
                 }
                 Flush-CsvBuffer
+                if ($beforeId -gt 0 -and $minId -ge $beforeId) {
+                    Write-CollectorStatus "Paging did not move older than RecordId $beforeId on $($target.Name); stopping so the same page is not repeated." 'WARN'
+                    break
+                }
                 $beforeId = $minId
                 $totalRead += $pageCount
-                Write-CollectorStatus "Page $pageNum from $($target.Name): $pageCount event(s), $saved finding(s), $skipped AES/other skipped. Total read $totalRead."
-                if ($pageCount -lt $take) { break }
+                $span = ''
+                if ($null -ne $pageOldest -and $null -ne $pageNewest) {
+                    $span = " Times $($pageOldest.ToString('yyyy-MM-dd HH:mm:ss')) .. $($pageNewest.ToString('yyyy-MM-dd HH:mm:ss'))."
+                }
+                Write-CollectorStatus "Page $pageNum from $($target.Name): $pageCount event(s), $saved finding(s), $skipped AES/other skipped. Total read $totalRead.$span"
+                # Do not stop just because this page is smaller than MaxEvents. Remote Get-WinEvent
+                # often returns a short page while older 4768/4769 still exist (looks like only ~4 hours).
             }
 
             if ($totalRead -ge $MaxHistoryEventsPerDC) {
@@ -1542,6 +1574,12 @@ function Invoke-KerberosCollection {
                     Write-CollectorStatus "Ticket etypes parsed on $($target.Name): $tallyText"
                 }
                 Write-CollectorStatus "Finished $($target.Name): $totalRead Kerberos event(s) read, $saved finding(s) saved, $skipped AES/other skipped."
+                if ($null -ne $oldestRead -and $null -ne $newestRead) {
+                    $coverage = @(Get-HistoryCoverageMessages -WindowStart $since -HoursBack $HoursBack -OldestRead $oldestRead -NewestRead $newestRead -OldestSaved $oldestSaved -NewestSaved $newestSaved -SavedCount $saved)
+                    foreach ($msg in $coverage) {
+                        Write-CollectorStatus $msg.Text $msg.Level
+                    }
+                }
                 if ($saved -lt 1) {
                     $etypeNote = if ([string]::IsNullOrWhiteSpace($tallyText)) { '' } else { " Ticket etypes were $tallyText." }
                     Write-CollectorStatus "No RC4 tickets in this window.$etypeNote That is expected when the DC issues AES. Include AES tickets only if you want those rows listed." 'WARN'
@@ -1995,6 +2033,86 @@ function Get-HistoricalEmptyHint {
         $suffix = " The Security log is readable (newest event Id=$($newestSecurity.Id) at $($newestSecurity.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'))), so this is not an access-denied miss. Advanced Audit Policy can show Success while this DC is still not writing 4768/4769 — run ``auditpol /get /category:*`` on the DC and gpupdate if the Kerberos subcategories are No Auditing."
     }
     return "No 4768/4769 events are in the Security log on $target. Enable Account Logon > Kerberos Authentication Service (4768) and Kerberos Service Ticket Operations (4769) with Success. This tool does not change audit policy.$suffix"
+}
+
+function Get-SecurityLogSummary {
+    param(
+        [string]$ComputerName,
+        [string]$Path
+    )
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($Path)) {
+            if (-not (Test-Path -LiteralPath $Path)) { return '' }
+            $item = Get-Item -LiteralPath $Path
+            $mb = [Math]::Round($item.Length / 1MB, 1)
+            return "EVTX $($item.Name): $mb MB."
+        }
+        $splat = @{ ListLog = 'Security'; ErrorAction = 'Stop' }
+        if (-not [string]::IsNullOrWhiteSpace($ComputerName) -and -not (Test-IsLocalComputerName $ComputerName)) {
+            $splat['ComputerName'] = $ComputerName
+        }
+        if ($script:Credential) { $splat['Credential'] = $script:Credential }
+        $log = Get-WinEvent @splat | Select-Object -First 1
+        if ($null -eq $log) { return '' }
+        $maxBytes = 0
+        try { $maxBytes = [int64]$log.MaximumSizeInBytes } catch { }
+        $records = 0
+        try { $records = [int64]$log.RecordCount } catch { }
+        $mode = ''
+        try { $mode = [string]$log.LogMode } catch { }
+        $maxMb = [Math]::Round($maxBytes / 1MB, 1)
+        $parts = New-Object System.Collections.Generic.List[string]
+        if (-not [string]::IsNullOrWhiteSpace($mode)) { [void]$parts.Add($mode) }
+        if ($maxBytes -gt 0) { [void]$parts.Add("max $maxMb MB") }
+        if ($records -gt 0) { [void]$parts.Add("$records records") }
+        if ($parts.Count -lt 1) { return '' }
+        $name = if ($ComputerName) { $ComputerName } else { 'local' }
+        return "Security log on ${name}: $($parts -join ', ')."
+    } catch {
+        return ''
+    }
+}
+
+function Get-HistoryCoverageMessages {
+    param(
+        [datetime]$WindowStart,
+        [int]$HoursBack,
+        [datetime]$OldestRead,
+        [datetime]$NewestRead,
+        $OldestSaved = $null,
+        $NewestSaved = $null,
+        [int]$SavedCount = 0
+    )
+    $messages = New-Object System.Collections.Generic.List[object]
+    $readHours = [Math]::Round(($NewestRead - $OldestRead).TotalHours, 2)
+    if ($readHours -lt 0) { $readHours = 0 }
+    $gapHours = [Math]::Round(($OldestRead - $WindowStart).TotalHours, 2)
+    [void]$messages.Add([pscustomobject]@{
+        Text  = "Requested window: $HoursBack hour(s) since $($WindowStart.ToString('yyyy-MM-dd HH:mm:ss')). 4768/4769 actually in the log: $($OldestRead.ToString('yyyy-MM-dd HH:mm:ss')) through $($NewestRead.ToString('yyyy-MM-dd HH:mm:ss')) ($readHours hour(s))."
+        Level = 'INFO'
+    })
+    if ($gapHours -gt 1) {
+        [void]$messages.Add([pscustomobject]@{
+            Text  = "Oldest Kerberos event is $gapHours hour(s) newer than the Hours start. The Security log has wrapped (circular size limit) and does not retain $HoursBack hours of 4768/4769. That is a log-retention limit, not an Hours-box bug. Increase the Security log maximum size on the DC (Event Viewer > Security > Properties) or collect more often."
+            Level = 'WARN'
+        })
+    } else {
+        [void]$messages.Add([pscustomobject]@{
+            Text  = "Read coverage matches the requested Hours window."
+            Level = 'INFO'
+        })
+    }
+    if ($SavedCount -gt 0 -and $null -ne $OldestSaved -and $null -ne $NewestSaved) {
+        $savedHours = [Math]::Round(([datetime]$NewestSaved - [datetime]$OldestSaved).TotalHours, 2)
+        if ($savedHours -lt 0) { $savedHours = 0 }
+        if ($gapHours -le 1 -and ($readHours - $savedHours) -gt 1) {
+            [void]$messages.Add([pscustomobject]@{
+                Text  = "RC4 findings only span $savedHours hour(s) ($(([datetime]$OldestSaved).ToString('yyyy-MM-dd HH:mm:ss')) through $(([datetime]$NewestSaved).ToString('yyyy-MM-dd HH:mm:ss'))). Older 4768/4769 in this window were AES or otherwise not RC4."
+                Level = 'WARN'
+            })
+        }
+    }
+    return $messages.ToArray()
 }
 
 function Get-NewestSecurityRecordId {
@@ -3339,6 +3457,12 @@ function Invoke-KerberosRc4SelfTest {
     $flagBag = @{ WantAes = 1; HoursBack = 48; IncludeAes = $true }
     Assert-True -Condition (([bool]$flagBag['WantAes'] -eq $true) -and ([int]$flagBag['HoursBack'] -eq 48)) `
         -Name 'GUI collector flags are read by indexer so script params HoursBack/IncludeAes cannot shadow them'
+    $wrapMsgs = @(Get-HistoryCoverageMessages -WindowStart ([datetime]'2026-10-29 07:00:00') -HoursBack 24 -OldestRead ([datetime]'2026-10-30 03:15:00') -NewestRead ([datetime]'2026-10-30 07:14:00'))
+    Assert-True -Condition (@($wrapMsgs | Where-Object { $_.Level -eq 'WARN' -and $_.Text -match 'wrapped' }).Count -eq 1) `
+        -Name 'Oldest Kerberos event 20 hours newer than Hours start is reported as Security log wrap'
+    $subsetMsgs = @(Get-HistoryCoverageMessages -WindowStart ([datetime]'2026-10-29 07:00:00') -HoursBack 24 -OldestRead ([datetime]'2026-10-29 07:05:00') -NewestRead ([datetime]'2026-10-30 07:00:00') -OldestSaved ([datetime]'2026-10-30 03:00:00') -NewestSaved ([datetime]'2026-10-30 07:00:00') -SavedCount 14)
+    Assert-True -Condition (@($subsetMsgs | Where-Object { $_.Text -match 'RC4 findings only span' }).Count -eq 1) `
+        -Name 'Full window of 4768/4769 with RC4 only in the last 4 hours is distinguished from log wrap'
 
     $xpathTime = New-KerberosFilterXPath -Since ([datetime]'2026-10-28T00:00:00Z')
     Assert-True -Condition ($xpathTime -match 'EventID=4768' -and $xpathTime -match "SystemTime>='2026-10-28T00:00:00.000Z'" -and $xpathTime -notmatch '&gt;') `
