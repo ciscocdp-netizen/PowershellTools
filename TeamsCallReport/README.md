@@ -13,7 +13,7 @@ The window does not ask for a tenant id or a client id. Those boxes appear only 
 
 ## Desktop window
 
-Double-click `Start-TeamsCallReport.cmd`. Leave **Sign in with my account** selected, enter the person whose calls you want, and click **Run export**. A browser opens for the administrator sign-in and shows a device code.
+Keep `TeamsCallReport.ps1` and `TeamsCallReport.Core.ps1` in the same folder, then double-click `Start-TeamsCallReport.cmd`. Leave **Sign in with my account** selected, enter the person whose calls you want, and click **Run export**. A browser opens for the administrator sign-in and shows a device code.
 
 **Preview sample data** runs the same export against built-in records (try `alice@contoso.com`) so the grids can be checked without a tenant.
 

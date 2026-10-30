@@ -56,6 +56,19 @@ try { [System.Windows.Forms.Application]::SetHighDpiMode([System.Windows.Forms.H
 try { [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false) } catch { }
 
 $script:CorePath = Join-Path $PSScriptRoot 'TeamsCallReport.Core.ps1'
+if (-not (Test-Path -LiteralPath $script:CorePath)) {
+    $coreMessage = "Keep TeamsCallReport.Core.ps1 in the same folder as this script.`r`n`r`nExpected:`r`n$script:CorePath"
+    [System.Windows.Forms.MessageBox]::Show($coreMessage, 'Teams Call Report') | Out-Null
+    Write-Error $coreMessage
+    return
+}
+$coreSource = [System.IO.File]::ReadAllText($script:CorePath)
+if ($coreSource -notmatch 'function Connect-TeamsCallReportAccount') {
+    $coreMessage = "TeamsCallReport.Core.ps1 next to this script is an older copy. Replace it with the core file from the same download as this window.`r`n`r`n$script:CorePath"
+    [System.Windows.Forms.MessageBox]::Show($coreMessage, 'Teams Call Report') | Out-Null
+    Write-Error $coreMessage
+    return
+}
 $script:WorkerSource = @'
 param($Sync, $CorePath, $Operation, $Payload)
 $ErrorActionPreference = 'Stop'
@@ -209,8 +222,6 @@ finally {
 }
 '@
 
-. $script:CorePath
-
 $script:Ui = @{}
 $logList = New-Object System.Collections.ArrayList
 $script:Ui.Sync = [hashtable]::Synchronized(@{
@@ -243,6 +254,25 @@ function Get-DefaultOutputPath {
     try { $docs = [Environment]::GetFolderPath('MyDocuments') } catch { $docs = '' }
     if ([string]::IsNullOrWhiteSpace($docs)) { $docs = [IO.Path]::GetTempPath() }
     return (Join-Path $docs ("TeamsCallReport_{0:yyyyMMdd_HHmmss}" -f (Get-Date)))
+}
+
+function Resolve-TeamsWindowAuthMode {
+    param(
+        [string]$SavedMode,
+        [string]$TenantId,
+        [string]$ClientId
+    )
+    # The same function lives in TeamsCallReport.Core.ps1 for tests. The window
+    # keeps this copy so an older core file cannot stop the form from opening.
+    $mode = [string]$SavedMode
+    if ([string]::IsNullOrWhiteSpace($mode)) { return 'Account' }
+    $manualApp = @('CertificateThumbprint', 'CertificateFile', 'Secret') -contains $mode
+    if ($manualApp) {
+        if ([string]::IsNullOrWhiteSpace($TenantId) -or [string]::IsNullOrWhiteSpace($ClientId)) {
+            return 'Account'
+        }
+    }
+    return $mode
 }
 
 function Get-AuthModeName {
