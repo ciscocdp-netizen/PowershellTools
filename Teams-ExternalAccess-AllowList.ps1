@@ -391,8 +391,79 @@ function Save-DomainSnapshot {
     return $Path
 }
 
+function Get-TextItems {
+    param($Value)
+    $items = New-Object 'System.Collections.Generic.List[string]'
+    if ($null -eq $Value) {
+        Write-Output -NoEnumerate $items.ToArray()
+        return
+    }
+    # A string is enumerable as characters. Treat it as one domain name.
+    if ($Value -is [string]) {
+        if (-not [string]::IsNullOrWhiteSpace($Value)) { [void]$items.Add($Value) }
+    }
+    else {
+        foreach ($item in $Value) {
+            $text = [string]$item
+            if (-not [string]::IsNullOrWhiteSpace($text)) { [void]$items.Add($text) }
+        }
+    }
+    Write-Output -NoEnumerate $items.ToArray()
+}
+
+function Merge-AllowedDomains {
+    param($Existing, $Add)
+    $merged = New-Object 'System.Collections.Generic.List[string]'
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($domain in (Get-TextItems -Value $Existing)) {
+        if ($seen.Add($domain)) { [void]$merged.Add($domain) }
+    }
+    foreach ($domain in (Get-TextItems -Value $Add)) {
+        if ($seen.Add($domain)) { [void]$merged.Add($domain) }
+    }
+    Write-Output -NoEnumerate $merged
+}
+
+function Test-RetryableAllowListError {
+    param($ErrorRecord)
+    if ($ErrorRecord.Exception -is [System.Management.Automation.ParameterBindingException]) { return $true }
+    $message = [string]$ErrorRecord.Exception.Message
+    return ($message -match 'Invalid input parameters' -or $message -match 'list modifier')
+}
+
+function Add-AllowedDomainStrings {
+    param([Parameter(Mandatory)]$Domains)
+    # A one-item generic List is serialized badly and the service answers
+    # "[ClientError] : Invalid input parameters". A string array stays a list of names.
+    $values = $Domains.ToArray()
+    Set-CsTenantFederationConfiguration -AllowedDomainsAsAList @{ Add = $values } -Confirm:$false -ErrorAction Stop
+}
+
+function Set-AllowedDomainStrings {
+    param([Parameter(Mandatory)]$Domains)
+    Set-CsTenantFederationConfiguration -AllowedDomainsAsAList $Domains -Confirm:$false -ErrorAction Stop
+}
+
+function Set-AllowedDomainsByPattern {
+    param([Parameter(Mandatory)]$Domains)
+    if (-not (Get-Command -Name New-CsEdgeDomainPattern -ErrorAction SilentlyContinue) -or
+        -not (Get-Command -Name New-CsEdgeAllowList -ErrorAction SilentlyContinue)) {
+        throw 'The Teams module rejected the allow-list update, and New-CsEdgeDomainPattern is not available. Update the module with: Update-Module MicrosoftTeams'
+    }
+
+    $patterns = New-Object object[] $Domains.Count
+    for ($i = 0; $i -lt $Domains.Count; $i++) {
+        $patterns[$i] = New-CsEdgeDomainPattern -Domain $Domains[$i]
+    }
+    $allowList = New-CsEdgeAllowList -AllowedDomain @($patterns)
+    Set-CsTenantFederationConfiguration -AllowedDomains $allowList -Confirm:$false -ErrorAction Stop
+}
+
 function Update-AllowedDomainList {
-    param([Parameter(Mandatory)]$List)
+    param(
+        [Parameter(Mandatory)]$List,
+        [string[]]$ExistingDomains
+    )
     if ($List.Count -eq 0) { throw 'No domains were supplied to add.' }
 
     if ($null -ne $script:DomainListUpdater) {
@@ -401,13 +472,49 @@ function Update-AllowedDomainList {
     }
 
     $command = Get-Command -Name Set-CsTenantFederationConfiguration -ErrorAction SilentlyContinue
-    if (-not $command -or -not $command.Parameters.ContainsKey('AllowedDomainsAsAList')) {
-        throw 'This MicrosoftTeams module does not support -AllowedDomainsAsAList. Update it with: Update-Module MicrosoftTeams'
+    if (-not $command) {
+        throw 'Set-CsTenantFederationConfiguration is not available. Install or update the MicrosoftTeams module.'
     }
 
-    # The Teams cmdlet expects a List[string] on the Add key. A bare string is
-    # the wrong shape, and -Confirm would ask a second time after ADD.
-    Set-CsTenantFederationConfiguration -AllowedDomainsAsAList @{ Add = $List } -Confirm:$false -ErrorAction Stop
+    $attempts = New-Object 'System.Collections.Generic.List[string]'
+    try {
+        Add-AllowedDomainStrings -Domains $List
+        return
+    }
+    catch {
+        if (-not (Test-RetryableAllowListError -ErrorRecord $_)) { throw }
+        [void]$attempts.Add("Incremental add: $($_.Exception.Message)")
+        Write-Host "The service rejected the incremental add: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host 'Retrying with the full allow list, including every domain already configured.' -ForegroundColor Yellow
+    }
+
+    $merged = Merge-AllowedDomains -Existing $ExistingDomains -Add $List
+    foreach ($domain in @($ExistingDomains)) {
+        if ([string]::IsNullOrWhiteSpace($domain)) { continue }
+        if (-not $merged.Contains($domain)) {
+            throw "Stopped before replacing the allow list because $domain was missing from the rebuilt list. $($attempts[0])"
+        }
+    }
+
+    if ($command.Parameters.ContainsKey('AllowedDomainsAsAList')) {
+        try {
+            Set-AllowedDomainStrings -Domains $merged
+            return
+        }
+        catch {
+            if (-not (Test-RetryableAllowListError -ErrorRecord $_)) { throw }
+            [void]$attempts.Add("Full list replace: $($_.Exception.Message)")
+            Write-Host "Full list replace was also rejected: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+
+    try {
+        Set-AllowedDomainsByPattern -Domains $merged
+    }
+    catch {
+        [void]$attempts.Add("Domain pattern replace: $($_.Exception.Message)")
+        throw ("The Teams service rejected the allow-list update.`n" + ($attempts -join "`n"))
+    }
 }
 
 function Get-AllowedDomainAddition {
@@ -552,7 +659,7 @@ function Add-AllowedDomains {
     $beforePath = Save-DomainSnapshot -Info $info -Prefix 'BeforeAdd'
     Write-Host "Saved a rollback snapshot: $beforePath" -ForegroundColor Cyan
     Write-Host "Adding $($plan.Domains.Count) domain(s)..." -ForegroundColor Cyan
-    Update-AllowedDomainList -List $plan.Domains
+    Update-AllowedDomainList -List $plan.Domains -ExistingDomains $info.Domains
 
     Write-Host 'Update command completed. Re-reading the tenant configuration...' -ForegroundColor Cyan
     $after = Get-AllowedDomainInfo -Config (Get-Config)
@@ -1179,6 +1286,19 @@ function Invoke-AllowListSelfTest {
         Assert-True 'limit throws' $threw
         $duplicateAtLimit = Get-AllowedDomainAddition -RequestedDomains @('d1.com') -Info $fullInfo
         Assert-True 'duplicate at the limit does not throw' ($duplicateAtLimit.Status -eq 'NothingToAdd')
+
+        $merged = Merge-AllowedDomains -Existing @('b.com', 'a.com') -Add @('c.com', 'a.com')
+        Assert-SameList 'replace list keeps current domains first' $merged @('b.com', 'a.com', 'c.com')
+        $oneDomain = New-Object 'System.Collections.Generic.List[string]'
+        [void]$oneDomain.Add('premiercommfw.com')
+        $mergedOne = Merge-AllowedDomains -Existing @('partner.com') -Add $oneDomain
+        Assert-SameList 'one domain is not split into characters' $mergedOne @('partner.com', 'premiercommfw.com')
+        try { throw '[ClientError] : Invalid input parameters' } catch {
+            Assert-True 'client error can be retried' (Test-RetryableAllowListError -ErrorRecord $_)
+        }
+        try { throw 'Access denied' } catch {
+            Assert-True 'access denied is not retried' (-not (Test-RetryableAllowListError -ErrorRecord $_))
+        }
 
         $semiPath = Join-Path -Path $tempRoot -ChildPath 'semi.csv'
         Set-Content -LiteralPath $semiPath -Value "Domain;Note`r`nsemi.org;x" -Encoding UTF8
