@@ -429,7 +429,44 @@ function Test-RetryableAllowListError {
     if ($ErrorRecord.Exception -is [System.Management.Automation.ParameterBindingException]) { return $true }
     if ($ErrorRecord.Exception -is [System.Management.Automation.CommandNotFoundException]) { return $true }
     $message = [string]$ErrorRecord.Exception.Message
-    return ($message -match 'Invalid input parameters' -or $message -match 'list modifier' -or $message -match 'is not recognized')
+    return ($message -match 'Invalid input parameters' -or $message -match 'list modifier' -or $message -match 'is not recognized' -or $message -match 'not supported')
+}
+
+function Get-TeamsCommandErrorText {
+    param($ErrorRecord)
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($text in @(
+        [string]$ErrorRecord.Exception.Message
+        $(if ($ErrorRecord.ErrorDetails) { [string]$ErrorRecord.ErrorDetails.Message })
+        $(if ($ErrorRecord.Exception.InnerException) { [string]$ErrorRecord.Exception.InnerException.Message })
+        [string]$ErrorRecord.FullyQualifiedErrorId
+    )) {
+        if ([string]::IsNullOrWhiteSpace($text)) { continue }
+        $trimmed = $text.Trim()
+        if (-not $lines.Contains($trimmed)) { [void]$lines.Add($trimmed) }
+    }
+    return ($lines -join ' | ')
+}
+
+function Get-FederationSetParameters {
+    param(
+        [Parameter(Mandatory)][string]$ParameterName,
+        $Value
+    )
+    # The modern cmdlet forwards this call to Set-CsConfigurationModern, whose
+    # only body fields are ConfigType and PropertyBag. Any other bound parameter
+    # is copied into that bag. -Confirm:$false therefore arrives as a setting
+    # the service does not recognize, and every write returns
+    # "[ClientError] : Invalid input parameters". Identity has the same problem
+    # unless Tenant is sent with it, which this cmdlet fills in on its own.
+    return @{ $ParameterName = $Value }
+}
+
+function Invoke-TeamsFederationUpdate {
+    param([Parameter(Mandatory)][hashtable]$Parameters)
+    $ErrorActionPreference = 'Stop'
+    $ConfirmPreference = 'None'
+    Set-CsTenantFederationConfiguration @Parameters
 }
 
 function Add-AllowedDomainPatterns {
@@ -437,13 +474,21 @@ function Add-AllowedDomainPatterns {
     if (-not (Get-Command -Name New-CsEdgeDomainPattern -ErrorAction SilentlyContinue)) {
         throw [System.Management.Automation.CommandNotFoundException]::new('New-CsEdgeDomainPattern is not available.')
     }
-    # A generic List inside @{ Add = $list } is the payload that returned
-    # "[ClientError] : Invalid input parameters". A domain pattern object is the
-    # shape the older cmdlet path accepts for one new name.
     foreach ($domain in (Get-TextItems -Value $Domains)) {
         $pattern = New-CsEdgeDomainPattern -Domain $domain
-        Set-CsTenantFederationConfiguration -AllowedDomainsAsAList @{ Add = $pattern } -Confirm:$false -ErrorAction Stop
+        Invoke-TeamsFederationUpdate -Parameters (Get-FederationSetParameters -ParameterName 'AllowedDomainsAsAList' -Value @{ Add = $pattern })
     }
+}
+
+function Add-AllowedDomainList {
+    param([Parameter(Mandatory)]$Domains)
+    $values = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($domain in (Get-TextItems -Value $Domains)) {
+        [void]$values.Add($domain)
+    }
+    # Example 8: a List[string] inside @{ Add = $list } adds names and leaves
+    # every domain already on the allow list in place.
+    Invoke-TeamsFederationUpdate -Parameters (Get-FederationSetParameters -ParameterName 'AllowedDomainsAsAList' -Value @{ Add = $values })
 }
 
 function Add-AllowedDomainStrings {
@@ -452,14 +497,18 @@ function Add-AllowedDomainStrings {
     foreach ($domain in (Get-TextItems -Value $Domains)) {
         [void]$values.Add($domain)
     }
-    # ToArray() keeps one domain as a one-element array. Casting a single
-    # string to [string[]] would split it into characters.
-    Set-CsTenantFederationConfiguration -AllowedDomainsAsAList @{ Add = $values.ToArray() } -Confirm:$false -ErrorAction Stop
+    Invoke-TeamsFederationUpdate -Parameters (Get-FederationSetParameters -ParameterName 'AllowedDomainsAsAList' -Value @{ Add = $values.ToArray() })
 }
 
 function Set-AllowedDomainStrings {
     param([Parameter(Mandatory)]$Domains)
-    Set-CsTenantFederationConfiguration -AllowedDomainsAsAList $Domains -Confirm:$false -ErrorAction Stop
+    $values = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($domain in (Get-TextItems -Value $Domains)) {
+        [void]$values.Add($domain)
+    }
+    # Example 7: assigning the list replaces the allow list. The merged list
+    # already contains every domain that was configured before this add.
+    Invoke-TeamsFederationUpdate -Parameters (Get-FederationSetParameters -ParameterName 'AllowedDomainsAsAList' -Value $values)
 }
 
 function Set-AllowedDomainsByPattern {
@@ -469,12 +518,13 @@ function Set-AllowedDomainsByPattern {
         throw 'The Teams module rejected the allow-list update, and New-CsEdgeDomainPattern is not available. Update the module with: Update-Module MicrosoftTeams'
     }
 
-    $patterns = New-Object object[] $Domains.Count
-    for ($i = 0; $i -lt $Domains.Count; $i++) {
-        $patterns[$i] = New-CsEdgeDomainPattern -Domain $Domains[$i]
+    $names = @(Get-TextItems -Value $Domains)
+    $patterns = New-Object object[] $names.Count
+    for ($i = 0; $i -lt $names.Count; $i++) {
+        $patterns[$i] = New-CsEdgeDomainPattern -Domain $names[$i]
     }
     $allowList = New-CsEdgeAllowList -AllowedDomain @($patterns)
-    Set-CsTenantFederationConfiguration -AllowedDomains $allowList -Confirm:$false -ErrorAction Stop
+    Invoke-TeamsFederationUpdate -Parameters (Get-FederationSetParameters -ParameterName 'AllowedDomains' -Value $allowList)
 }
 
 function Update-AllowedDomainList {
@@ -496,8 +546,9 @@ function Update-AllowedDomainList {
 
     $attempts = New-Object 'System.Collections.Generic.List[string]'
     foreach ($attempt in @(
-        @{ Name = 'Domain pattern add'; Action = { Add-AllowedDomainPatterns -Domains $List } }
+        @{ Name = 'Domain list add'; Action = { Add-AllowedDomainList -Domains $List } }
         @{ Name = 'String array add'; Action = { Add-AllowedDomainStrings -Domains $List } }
+        @{ Name = 'Domain pattern add'; Action = { Add-AllowedDomainPatterns -Domains $List } }
     )) {
         try {
             & $attempt.Action
@@ -505,8 +556,9 @@ function Update-AllowedDomainList {
         }
         catch {
             if (-not (Test-RetryableAllowListError -ErrorRecord $_)) { throw }
-            [void]$attempts.Add("$($attempt.Name): $($_.Exception.Message)")
-            Write-Host "$($attempt.Name) was rejected: $($_.Exception.Message)" -ForegroundColor Yellow
+            $detail = Get-TeamsCommandErrorText -ErrorRecord $_
+            [void]$attempts.Add("$($attempt.Name): $detail")
+            Write-Host "$($attempt.Name) was rejected: $detail" -ForegroundColor Yellow
         }
     }
 
@@ -527,8 +579,9 @@ function Update-AllowedDomainList {
         }
         catch {
             if (-not (Test-RetryableAllowListError -ErrorRecord $_)) { throw }
-            [void]$attempts.Add("Full list replace: $($_.Exception.Message)")
-            Write-Host "Full list replace was also rejected: $($_.Exception.Message)" -ForegroundColor Yellow
+            $detail = Get-TeamsCommandErrorText -ErrorRecord $_
+            [void]$attempts.Add("Full list replace: $detail")
+            Write-Host "Full list replace was also rejected: $detail" -ForegroundColor Yellow
         }
     }
 
@@ -536,8 +589,10 @@ function Update-AllowedDomainList {
         Set-AllowedDomainsByPattern -Domains $merged
     }
     catch {
-        [void]$attempts.Add("Domain pattern replace: $($_.Exception.Message)")
-        throw ("The Teams service rejected the allow-list update.`n" + ($attempts -join "`n"))
+        [void]$attempts.Add("Domain pattern replace: $(Get-TeamsCommandErrorText -ErrorRecord $_)")
+        $module = Get-Module -Name MicrosoftTeams | Select-Object -First 1
+        $version = if ($module) { [string]$module.Version } else { 'not reported' }
+        throw ("The Teams service rejected the allow-list update. No domains were changed. MicrosoftTeams module: $version`n" + ($attempts -join "`n"))
     }
 }
 
@@ -1323,6 +1378,9 @@ function Invoke-AllowListSelfTest {
         try { throw (New-Object System.Management.Automation.CommandNotFoundException 'New-CsEdgeDomainPattern is not available.') } catch {
             Assert-True 'missing pattern cmdlet can be retried' (Test-RetryableAllowListError -ErrorRecord $_)
         }
+        $setParameters = Get-FederationSetParameters -ParameterName 'AllowedDomainsAsAList' -Value @('premiercommfw.com')
+        Assert-True 'update sends only the domain parameter' ($setParameters.Count -eq 1 -and $setParameters.ContainsKey('AllowedDomainsAsAList'))
+        Assert-True 'update does not bind Confirm, ErrorAction, or Identity' (-not $setParameters.ContainsKey('Confirm') -and -not $setParameters.ContainsKey('ErrorAction') -and -not $setParameters.ContainsKey('Identity'))
         try { throw 'Access denied' } catch {
             Assert-True 'access denied is not retried' (-not (Test-RetryableAllowListError -ErrorRecord $_))
         }
