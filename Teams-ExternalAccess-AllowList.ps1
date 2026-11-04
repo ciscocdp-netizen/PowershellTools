@@ -427,16 +427,34 @@ function Merge-AllowedDomains {
 function Test-RetryableAllowListError {
     param($ErrorRecord)
     if ($ErrorRecord.Exception -is [System.Management.Automation.ParameterBindingException]) { return $true }
+    if ($ErrorRecord.Exception -is [System.Management.Automation.CommandNotFoundException]) { return $true }
     $message = [string]$ErrorRecord.Exception.Message
-    return ($message -match 'Invalid input parameters' -or $message -match 'list modifier')
+    return ($message -match 'Invalid input parameters' -or $message -match 'list modifier' -or $message -match 'is not recognized')
+}
+
+function Add-AllowedDomainPatterns {
+    param([Parameter(Mandatory)]$Domains)
+    if (-not (Get-Command -Name New-CsEdgeDomainPattern -ErrorAction SilentlyContinue)) {
+        throw [System.Management.Automation.CommandNotFoundException]::new('New-CsEdgeDomainPattern is not available.')
+    }
+    # A generic List inside @{ Add = $list } is the payload that returned
+    # "[ClientError] : Invalid input parameters". A domain pattern object is the
+    # shape the older cmdlet path accepts for one new name.
+    foreach ($domain in (Get-TextItems -Value $Domains)) {
+        $pattern = New-CsEdgeDomainPattern -Domain $domain
+        Set-CsTenantFederationConfiguration -AllowedDomainsAsAList @{ Add = $pattern } -Confirm:$false -ErrorAction Stop
+    }
 }
 
 function Add-AllowedDomainStrings {
     param([Parameter(Mandatory)]$Domains)
-    # A one-item generic List is serialized badly and the service answers
-    # "[ClientError] : Invalid input parameters". A string array stays a list of names.
-    $values = $Domains.ToArray()
-    Set-CsTenantFederationConfiguration -AllowedDomainsAsAList @{ Add = $values } -Confirm:$false -ErrorAction Stop
+    $values = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($domain in (Get-TextItems -Value $Domains)) {
+        [void]$values.Add($domain)
+    }
+    # ToArray() keeps one domain as a one-element array. Casting a single
+    # string to [string[]] would split it into characters.
+    Set-CsTenantFederationConfiguration -AllowedDomainsAsAList @{ Add = $values.ToArray() } -Confirm:$false -ErrorAction Stop
 }
 
 function Set-AllowedDomainStrings {
@@ -477,16 +495,22 @@ function Update-AllowedDomainList {
     }
 
     $attempts = New-Object 'System.Collections.Generic.List[string]'
-    try {
-        Add-AllowedDomainStrings -Domains $List
-        return
+    foreach ($attempt in @(
+        @{ Name = 'Domain pattern add'; Action = { Add-AllowedDomainPatterns -Domains $List } }
+        @{ Name = 'String array add'; Action = { Add-AllowedDomainStrings -Domains $List } }
+    )) {
+        try {
+            & $attempt.Action
+            return
+        }
+        catch {
+            if (-not (Test-RetryableAllowListError -ErrorRecord $_)) { throw }
+            [void]$attempts.Add("$($attempt.Name): $($_.Exception.Message)")
+            Write-Host "$($attempt.Name) was rejected: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
     }
-    catch {
-        if (-not (Test-RetryableAllowListError -ErrorRecord $_)) { throw }
-        [void]$attempts.Add("Incremental add: $($_.Exception.Message)")
-        Write-Host "The service rejected the incremental add: $($_.Exception.Message)" -ForegroundColor Yellow
-        Write-Host 'Retrying with the full allow list, including every domain already configured.' -ForegroundColor Yellow
-    }
+
+    Write-Host 'Retrying with the full allow list, including every domain already configured.' -ForegroundColor Yellow
 
     $merged = Merge-AllowedDomains -Existing $ExistingDomains -Add $List
     foreach ($domain in @($ExistingDomains)) {
@@ -1295,6 +1319,9 @@ function Invoke-AllowListSelfTest {
         Assert-SameList 'one domain is not split into characters' $mergedOne @('partner.com', 'premiercommfw.com')
         try { throw '[ClientError] : Invalid input parameters' } catch {
             Assert-True 'client error can be retried' (Test-RetryableAllowListError -ErrorRecord $_)
+        }
+        try { throw (New-Object System.Management.Automation.CommandNotFoundException 'New-CsEdgeDomainPattern is not available.') } catch {
+            Assert-True 'missing pattern cmdlet can be retried' (Test-RetryableAllowListError -ErrorRecord $_)
         }
         try { throw 'Access denied' } catch {
             Assert-True 'access denied is not retried' (-not (Test-RetryableAllowListError -ErrorRecord $_))
