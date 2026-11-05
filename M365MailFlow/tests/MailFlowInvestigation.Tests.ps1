@@ -134,6 +134,13 @@ $back = Get-SearchBackWindows -RequestedStart $backStart -RequestedEnd $backNow 
 Assert-True ($back.Count -ge 8) 'a two-day miss continues back through the 90-day history'
 Assert-Equal $back[0].End $backStart 'the first extra window starts where the selected range ended'
 Assert-Equal $back[-1].Start $backOld 'the search reaches the 90-day floor'
+$noTrace = Get-MessageTraceCommandAvailability
+Assert-True (-not $noTrace.HasTrace) 'this test host has no message trace cmdlets'
+Assert-True (Test-ExoSessionNeedsRefresh -ExistingConnection ([pscustomobject]@{ State = 'Connected' }) -HasTraceCmdlet $false) 'a signed-in session with no trace cmdlets is signed in again'
+Assert-True (-not (Test-ExoSessionNeedsRefresh -ExistingConnection $null -HasTraceCmdlet $false)) 'no session yet does not count as a stale session'
+$access = Get-MessageTraceAccessError -Identity 'admin@contoso.com'
+Assert-Contains $access 'admin@contoso.com' 'the missing-cmdlet error names the signed-in account'
+Assert-Contains $access 'Message Tracking' 'the missing-cmdlet error names the Exchange role'
 Set-M365MailFlowConfig @{
     SenderAddress = @('a@c.com','b@c.com')
     RecipientAddress = @('c@d.com','e@d.com')

@@ -40,11 +40,13 @@
       - Message trace "Data" XML is parsed with DTDs disabled.
 #>
 
-$script:ScriptVersion = '2.1.1'
+$script:ScriptVersion = '2.1.2'
 $script:SeverityRank  = @{ 'Critical' = 3; 'Warning' = 2; 'Info' = 1 }
 $script:LogFile       = $null
 $script:RequestTimes  = New-Object 'System.Collections.Generic.Queue[datetime]'
 $script:UseV2         = $true
+$script:TraceSummaryCommand = 'Get-MessageTraceV2'
+$script:TraceDetailCommand  = 'Get-MessageTraceDetailV2'
 $script:Connected     = $false
 $script:IppsReady     = $false
 $script:OpenedExo     = $false
@@ -1087,6 +1089,74 @@ function Add-ConnectAuthParameter {
     if ($cfg.DisableWAM -and $cmd.Parameters.ContainsKey('DisableWAM')) { $Bag.DisableWAM = $true }
 }
 
+function Get-FirstCommandName {
+    param([string]$Name)
+    $cmd = $null
+    try { $cmd = Get-Command -Name $Name -ErrorAction SilentlyContinue | Select-Object -First 1 } catch { $cmd = $null }
+    if (-not $cmd) { return $null }
+    return [string]$cmd.Name
+}
+
+function Get-MessageTraceCommandAvailability {
+    $summaryV2 = Get-FirstCommandName 'Get-MessageTraceV2'
+    $detailV2 = Get-FirstCommandName 'Get-MessageTraceDetailV2'
+    $summary = Get-FirstCommandName 'Get-MessageTrace'
+    $detail = Get-FirstCommandName 'Get-MessageTraceDetail'
+    if (-not $summaryV2 -and -not $summary) {
+        $wild = @()
+        try { $wild = @(Get-Command -Name '*MessageTrace*' -ErrorAction SilentlyContinue) } catch { $wild = @() }
+        foreach ($c in $wild) {
+            $n = [string]$c.Name
+            if (-not $detailV2 -and $n -match 'Get-MessageTraceDetailV2$') { $detailV2 = $n }
+            elseif (-not $summaryV2 -and $n -match 'Get-MessageTraceV2$') { $summaryV2 = $n }
+            elseif (-not $detail -and $n -match 'Get-MessageTraceDetail$') { $detail = $n }
+            elseif (-not $summary -and $n -match 'Get-MessageTrace$') { $summary = $n }
+        }
+    }
+    $useV2 = -not [string]::IsNullOrWhiteSpace($summaryV2)
+    $summaryName = if ($useV2) { $summaryV2 } else { $summary }
+    $detailName = if ($useV2) { $detailV2 } else { $detail }
+    if ([string]::IsNullOrWhiteSpace($detailName)) {
+        if ($useV2) { $detailName = 'Get-MessageTraceDetailV2' } else { $detailName = 'Get-MessageTraceDetail' }
+    }
+    return [pscustomobject]@{
+        UseV2 = [bool]$useV2
+        HasTrace = (-not [string]::IsNullOrWhiteSpace($summaryName))
+        SummaryName = $summaryName
+        DetailName = $detailName
+    }
+}
+
+function Test-ExoSessionNeedsRefresh {
+    param($ExistingConnection, [bool]$HasTraceCmdlet)
+    return [bool](($null -ne $ExistingConnection) -and (-not $HasTraceCmdlet))
+}
+
+function Get-MessageTraceAccessError {
+    param([string]$Identity)
+    $who = $Identity
+    if ([string]::IsNullOrWhiteSpace($who)) { $who = 'the signed-in account' }
+    return ("Signed in as $who, but Exchange did not load Get-MessageTraceV2 or Get-MessageTrace. " +
+        'Those cmdlets are added to the session only when the account has the Message Tracking role. ' +
+        'Exchange Administrator in Microsoft Entra, or Organization Management in Exchange, includes that role. Exchange Recipient Administrator does not. ' +
+        'If the role was just assigned, wait a few minutes, click Disconnect, then Connect, and run again. ' +
+        'A session opened before the role change keeps the old cmdlet list, so this tool signs in again once when the cmdlets are missing.')
+}
+
+function Disconnect-ExoSessionQuiet {
+    if (-not (Get-Command -Name 'Disconnect-ExchangeOnline' -ErrorAction SilentlyContinue)) { return }
+    try {
+        Disconnect-ExchangeOnline -Confirm:$false -ErrorAction Stop | Out-Null
+        Write-Log 'Disconnected the previous Exchange Online session so this window can sign in again.' 'OK'
+    } catch {
+        Write-Log "Could not disconnect the previous Exchange session: $($_.Exception.Message)" 'WARN'
+    }
+    $script:Connected = $false
+    $script:IppsReady = $false
+    $script:OpenedExo = $false
+    $script:OpenedIpps = $false
+}
+
 function Connect-ExoSession {
     if (-not (Get-Module -ListAvailable -Name ExchangeOnlineManagement)) {
         throw 'ExchangeOnlineManagement module not found. Install it with: Install-Module ExchangeOnlineManagement -Scope CurrentUser'
@@ -1098,18 +1168,32 @@ function Connect-ExoSession {
     }
     Write-Log "ExchangeOnlineManagement module version $($mod.Version)" 'DEBUG'
 
-    $existing = $null
-    try {
-        $existing = @(Get-ConnectionInformation -ErrorAction Stop) |
-            Where-Object { $_.State -eq 'Connected' -and -not $_.IsEopSession } |
-            Select-Object -First 1
-    } catch { }
-
-    if ($existing) {
-        $who = [string](Get-PropValue $existing 'UserPrincipalName')
-        $tid = [string](Get-PropValue $existing 'TenantID')
-        Write-Log "Reusing existing Exchange Online session ($who / $tid)" 'OK'
-    } else {
+    $who = $null
+    $refreshed = $false
+    $avail = $null
+    $guard = 0
+    while ($guard -lt 3) {
+        $guard++
+        $existing = $null
+        try {
+            $existing = @(Get-ConnectionInformation -ErrorAction Stop) |
+                Where-Object { $_.State -eq 'Connected' -and -not $_.IsEopSession } |
+                Select-Object -First 1
+        } catch { }
+        if ($existing) { $who = [string](Get-PropValue $existing 'UserPrincipalName') }
+        $avail = Get-MessageTraceCommandAvailability
+        if ($existing -and $avail.HasTrace) {
+            $tid = [string](Get-PropValue $existing 'TenantID')
+            Write-Log "Reusing existing Exchange Online session ($who / $tid)" 'OK'
+            break
+        }
+        if ((Test-ExoSessionNeedsRefresh -ExistingConnection $existing -HasTraceCmdlet $avail.HasTrace) -and -not $refreshed) {
+            Write-Log "Signed in as $who, but this session does not include Get-MessageTraceV2 or Get-MessageTrace. Exchange keeps the cmdlet list from sign-in, so a role added afterward is invisible until you sign in again. Signing in again now." 'WARN'
+            Disconnect-ExoSessionQuiet
+            $refreshed = $true
+            continue
+        }
+        if ($existing) { break }
         $p = @{ ShowBanner = $false; ErrorAction = 'Stop' }
         Add-ConnectAuthParameter -CommandName 'Connect-ExchangeOnline' -Bag $p
         if ($script:Config.AppId -and $script:Config.CertificateThumbprint -and $script:Config.Organization) {
@@ -1124,16 +1208,22 @@ function Connect-ExoSession {
         Connect-ExchangeOnline @p
         $script:OpenedExo = $true
         Write-Log 'Connected to Exchange Online.' 'OK'
+        $avail = Get-MessageTraceCommandAvailability
+        break
     }
     $script:Connected = $true
 
-    $script:UseV2 = [bool](Get-Command -Name Get-MessageTraceV2 -ErrorAction SilentlyContinue)
-    if ($script:UseV2) {
-        Write-Log 'Using Get-MessageTraceV2 / Get-MessageTraceDetailV2.' 'OK'
-    } elseif (Get-Command -Name Get-MessageTrace -ErrorAction SilentlyContinue) {
-        Write-Log 'Get-MessageTraceV2 not available - falling back to legacy Get-MessageTrace (deprecated by Microsoft). Update the module if possible.' 'WARN'
+    if ($avail.HasTrace) {
+        $script:UseV2 = [bool]$avail.UseV2
+        $script:TraceSummaryCommand = [string]$avail.SummaryName
+        $script:TraceDetailCommand = [string]$avail.DetailName
+        if ($script:UseV2) {
+            Write-Log "Using $($script:TraceSummaryCommand) / $($script:TraceDetailCommand)." 'OK'
+        } else {
+            Write-Log "Get-MessageTraceV2 is not in this session. Using $($script:TraceSummaryCommand) (legacy, deprecated by Microsoft)." 'WARN'
+        }
     } else {
-        throw 'No message trace cmdlets are available. Check that your account has a role that grants message trace (for example Global Reader, Security Reader, or Exchange Administrator).'
+        throw (Get-MessageTraceAccessError -Identity $who)
     }
 }
 
@@ -1354,7 +1444,10 @@ function Get-TraceSummary {
     param([datetime]$Start, [datetime]$End)
     $all = New-Object 'System.Collections.Generic.List[psobject]'
     $seen = @{}
-    $traceCmd = if ($script:UseV2) { 'Get-MessageTraceV2' } else { 'Get-MessageTrace' }
+    $traceCmd = [string]$script:TraceSummaryCommand
+    if (-not $traceCmd) {
+        if ($script:UseV2) { $traceCmd = 'Get-MessageTraceV2' } else { $traceCmd = 'Get-MessageTrace' }
+    }
     $fanOutStatus = -not (Test-ParameterAcceptsCollection -Command $traceCmd -Parameter 'Status')
     $combos = Get-TraceQueryCombinations -FanOutStatus:$fanOutStatus
     $windows = Get-DateWindows -Start $Start -End $End
@@ -1503,7 +1596,10 @@ function Get-TraceDetailEvents {
         StartDate        = $window.Start
         EndDate          = $window.End
     }
-    $cmd = if ($script:UseV2) { 'Get-MessageTraceDetailV2' } else { 'Get-MessageTraceDetail' }
+    $cmd = [string]$script:TraceDetailCommand
+    if (-not $cmd) {
+        if ($script:UseV2) { $cmd = 'Get-MessageTraceDetailV2' } else { $cmd = 'Get-MessageTraceDetail' }
+    }
     $p = Select-SupportedParameters -Command $cmd -Parameters $p
     $raw = Invoke-ExoCommand -Command $cmd -Parameters $p -CountsAgainstTraceThrottle
 
