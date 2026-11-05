@@ -33,6 +33,9 @@
     Quarantine and restricted-sender lookups use a Security & Compliance session.
     -Offline analyses a header file or extended report without contacting Exchange.
     -UseDeviceCode and -DisableWAM are passed through when the installed module supports them.
+    Leave account, app id, thumbprint, and organization blank to sign in with the Microsoft window.
+    When -MessageId or -MessageTraceId is set and the selected dates return nothing, the search
+    continues through the 90-day message trace history. -StrictDateRange keeps the selected dates only.
 
     The WinForms GUI is M365MailFlowInvestigation-GUI.ps1 in this folder.
 
@@ -120,7 +123,8 @@ param(
     [switch]$DisconnectWhenDone,
     [switch]$Offline,
     [switch]$UseDeviceCode,
-    [switch]$DisableWAM
+    [switch]$DisableWAM,
+    [switch]$StrictDateRange
 )
 
 $modulePath = Join-Path $PSScriptRoot 'M365MailFlowInvestigation.psm1'

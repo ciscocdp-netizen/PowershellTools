@@ -22,7 +22,7 @@ param(
     [switch]$StaReady
 )
 
-$script:GuiVersion = '2.1.0'
+$script:GuiVersion = '2.1.1'
 
 if (-not $StaReady -and [System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
     $hostPath = $null
@@ -191,6 +191,8 @@ function Save-GuiSettings {
             SkipDnsChecks = [bool]$script:chkSkipDns.Checked
             DisconnectWhenDone = [bool]$script:chkDisconnect.Checked
             OpenReport = [bool]$script:chkOpenReport.Checked
+            AdvancedSignIn = [bool]$script:chkAdvanced.Checked
+            FindMessageOutsideDates = [bool]$script:chkFindMessage.Checked
             OutputParent = $script:txtOutput.Text.Trim()
             NewTimestampedFolder = [bool]$script:chkStamp.Checked
             WindowWidth = [int]$script:form.Width
@@ -244,6 +246,24 @@ function Get-FirstResult {
         return $Raw[$Raw.Count - 1]
     }
     return $Raw
+}
+
+function Update-LeftLayout {
+    if (-not $script:grpConn) { return }
+    $connH = 176
+    if ($script:chkAdvanced -and $script:chkAdvanced.Checked) { $connH = 400 }
+    $script:grpConn.Height = $connH
+    if ($script:pnlAdvanced) { $script:pnlAdvanced.Visible = [bool]$script:chkAdvanced.Checked }
+    $top = $script:grpConn.Top + $connH + 8
+    foreach ($group in @($script:grpSearch, $script:grpScope, $script:grpSrc, $script:grpOut)) {
+        if (-not $group) { continue }
+        $group.Top = $top
+        $top += $group.Height + 8
+    }
+    $top += 4
+    if ($script:btnRun) { $script:btnRun.Top = $top }
+    if ($script:btnCancel) { $script:btnCancel.Top = $top }
+    if ($script:scrollPad) { $script:scrollPad.Top = $top + 48 }
 }
 
 function Update-ActionButtons {
@@ -353,36 +373,42 @@ function Test-InvestigationForm {
     $errors = New-Object System.Collections.Generic.List[string]
     $p = @{}
 
-    $upn = $script:txtUpn.Text.Trim()
-    $app = $script:txtAppId.Text.Trim()
-    $thumb = ($script:txtThumb.Text -replace '\s', '')
-    $org = $script:txtOrg.Text.Trim()
-    $anyApp = $app -or $thumb -or $org
-    if ($anyApp) {
-        $guid = [guid]::Empty
-        if (-not $app -or -not [guid]::TryParse($app, [ref]$guid)) { $errors.Add('App id must be a GUID when certificate authentication is used.') }
-        if ($thumb -notmatch '^[0-9A-Fa-f]{40}$') { $errors.Add('Certificate thumbprint must be 40 hexadecimal characters.') }
-        if (-not $org) { $errors.Add('Organization (tenant .onmicrosoft.com name) is required for certificate authentication.') }
+    if ($script:chkAdvanced.Checked) {
+        $upn = $script:txtUpn.Text.Trim()
+        $app = $script:txtAppId.Text.Trim()
+        $thumb = ($script:txtThumb.Text -replace '\s', '')
+        $org = $script:txtOrg.Text.Trim()
+        $anyApp = $app -or $thumb -or $org
+        if ($anyApp) {
+            $guid = [guid]::Empty
+            if (-not $app -or -not [guid]::TryParse($app, [ref]$guid)) { $errors.Add('App id must be a GUID when certificate authentication is used.') }
+            if ($thumb -notmatch '^[0-9A-Fa-f]{40}$') { $errors.Add('Certificate thumbprint must be 40 hexadecimal characters.') }
+            if (-not $org) { $errors.Add('Organization (tenant .onmicrosoft.com name) is required for certificate authentication.') }
+        }
+        if ($upn -and $upn -notmatch '@') { $errors.Add('Account should be an email address, or leave it blank.') }
+        if ($upn) { $p.UserPrincipalName = $upn }
+        if ($anyApp -and $errors.Count -eq 0) {
+            $p.AppId = $app
+            $p.CertificateThumbprint = $thumb
+            $p.Organization = $org
+        }
+        $p.UseDeviceCode = [bool]$script:chkDevice.Checked
+        $p.DisableWAM = [bool]$script:chkWam.Checked
     }
-    if ($upn -and $upn -notmatch '@') { $errors.Add('User principal name should be an email address.') }
-    if ($upn) { $p.UserPrincipalName = $upn }
-    if ($anyApp -and $errors.Count -eq 0) {
-        $p.AppId = $app
-        $p.CertificateThumbprint = $thumb
-        $p.Organization = $org
-    }
-    $p.UseDeviceCode = [bool]$script:chkDevice.Checked
-    $p.DisableWAM = [bool]$script:chkWam.Checked
 
     $sender = $script:txtSender.Text.Trim()
     $recip = $script:txtRecipient.Text.Trim()
     $mid = $script:txtMessageId.Text.Trim()
+    $locator = Get-MessageLocatorFromText $mid
     $subject = $script:txtSubject.Text.Trim()
     $fromIp = $script:txtFromIp.Text.Trim()
     $toIp = $script:txtToIp.Text.Trim()
     if ($sender) { $p.SenderAddress = @($sender) }
     if ($recip) { $p.RecipientAddress = @($recip) }
-    if ($mid) { $p.MessageId = @($mid) }
+    $idList = @()
+    if ($locator.MessageIds -is [string]) { $idList = @($locator.MessageIds) }
+    elseif ($locator.MessageIds) { $idList = $locator.MessageIds }
+    if (@($idList).Count -gt 0) { $p.MessageId = $idList }
     if ($subject) { $p.Subject = $subject }
     $p.SubjectFilterType = [string]$script:cmbSubject.SelectedItem
     if ($fromIp) { $p.FromIP = $fromIp }
@@ -392,7 +418,13 @@ function Test-InvestigationForm {
         $g = [guid]::Empty
         if (-not [guid]::TryParse($trace, [ref]$g)) { $errors.Add('Message trace id must be a GUID (the Network Message ID).') }
         else { $p.MessageTraceId = $g }
+    } elseif ($locator.MessageTraceId) {
+        $p.MessageTraceId = $locator.MessageTraceId
     }
+    if ($mid -and @($idList).Count -eq 0 -and -not $p.ContainsKey('MessageTraceId')) {
+        $errors.Add('That text does not contain a message ID. Paste the ID (it contains @), a Message-ID header, or a Network Message ID.')
+    }
+    if (-not $script:chkFindMessage.Checked) { $p.StrictDateRange = $true }
     if ($script:dtEnd.Value -le $script:dtStart.Value) { $errors.Add('End time must be after the start time.') }
     $p.StartDate = $script:dtStart.Value
     $p.EndDate = $script:dtEnd.Value
@@ -809,16 +841,48 @@ function Start-Investigation {
 
 function Start-Connect {
     if ($script:Busy) { return }
-    $authCheck = Get-AuthParameters
-    $blocking = @($authCheck.Errors | Where-Object { $_ -match 'App id|thumbprint|Organization|principal' })
-    if ($blocking.Count -gt 0) {
-        [System.Windows.Forms.MessageBox]::Show(($blocking -join "`r`n"), 'Check the connection', 'OK', 'Warning') | Out-Null
-        return
+    $auth = @{
+        UserPrincipalName = ''
+        AppId = ''
+        CertificateThumbprint = ''
+        Organization = ''
+        UseDeviceCode = $false
+        DisableWAM = $false
     }
-    $script:lblStatus.Text = 'Connecting. Complete the Microsoft sign-in if a window opens. Device codes appear below and in the console.'
+    if ($script:chkAdvanced.Checked) {
+        $upn = $script:txtUpn.Text.Trim()
+        $app = $script:txtAppId.Text.Trim()
+        $thumb = ($script:txtThumb.Text -replace '\s', '')
+        $org = $script:txtOrg.Text.Trim()
+        $anyApp = $app -or $thumb -or $org
+        $problems = New-Object 'System.Collections.Generic.List[string]'
+        if ($anyApp) {
+            $guid = [guid]::Empty
+            if (-not $app -or -not [guid]::TryParse($app, [ref]$guid)) { $problems.Add('App id must be a GUID when certificate authentication is used.') }
+            if ($thumb -notmatch '^[0-9A-Fa-f]{40}$') { $problems.Add('Certificate thumbprint must be 40 hexadecimal characters.') }
+            if (-not $org) { $problems.Add('Organization is required for certificate authentication.') }
+        }
+        if ($upn -and $upn -notmatch '@') { $problems.Add('Account should be an email address, or leave it blank and click Connect.') }
+        if ($problems.Count -gt 0) {
+            [System.Windows.Forms.MessageBox]::Show(($problems.ToArray() -join "`r`n"), 'Check the connection', 'OK', 'Warning') | Out-Null
+            return
+        }
+        $auth.UserPrincipalName = $upn
+        if ($anyApp) {
+            $auth.AppId = $app
+            $auth.CertificateThumbprint = $thumb
+            $auth.Organization = $org
+        }
+        $auth.UseDeviceCode = [bool]$script:chkDevice.Checked
+        $auth.DisableWAM = [bool]$script:chkWam.Checked
+    }
+    $script:lblStatus.Text = 'Connecting. Complete the Microsoft sign-in window. Account, app id, and certificate are not required.'
     $script:tabs.SelectedTab = $script:tabLog
     Append-Log '---- Connect ----' 'INFO'
-    Start-WorkerAction -Action 'Connect' -Script $script:ConnectWorkerScript -Arguments @($script:Sync, $authCheck.Auth)
+    if (-not $script:chkAdvanced.Checked) {
+        Append-Log 'Signing in interactively. Leave Account, App id, Thumbprint, and Organization blank.' 'INFO'
+    }
+    Start-WorkerAction -Action 'Connect' -Script $script:ConnectWorkerScript -Arguments @($script:Sync, $auth)
 }
 
 function Start-Disconnect {
@@ -956,73 +1020,93 @@ $tips = New-Object System.Windows.Forms.ToolTip
 $tips.AutoPopDelay = 12000
 $tips.InitialDelay = 400
 
-# Connection
-$grpConn = New-Object System.Windows.Forms.GroupBox
-$grpConn.Text = 'Connection'
-$grpConn.Font = $script:FontBold
-$grpConn.Location = New-Object System.Drawing.Point(8, 8)
-$grpConn.Size = New-Object System.Drawing.Size(400, 324)
-$left.Controls.Add($grpConn)
-$y = 24
-$script:txtUpn = New-TextBox
-$y = Add-Labeled $grpConn $y 'Account' $script:txtUpn
-$script:txtAppId = New-TextBox
-$y = Add-Labeled $grpConn $y 'App id' $script:txtAppId
-$script:txtThumb = New-TextBox
-$y = Add-Labeled $grpConn $y 'Thumbprint' $script:txtThumb
-$script:txtOrg = New-TextBox
-$y = Add-Labeled $grpConn $y 'Organization' $script:txtOrg
-$script:chkDevice = New-Check 'Sign in with a device code'
-$script:chkDevice.Location = New-Object System.Drawing.Point(14, $y)
-$grpConn.Controls.Add($script:chkDevice)
-$y += 24
-$script:chkWam = New-Check 'Disable WAM and use a browser'
-$script:chkWam.Location = New-Object System.Drawing.Point(14, $y)
-$grpConn.Controls.Add($script:chkWam)
-$y += 28
+# Connection. The normal path is the Connect button alone.
+$script:grpConn = New-Object System.Windows.Forms.GroupBox
+$script:grpConn.Text = 'Connection'
+$script:grpConn.Font = $script:FontBold
+$script:grpConn.Location = New-Object System.Drawing.Point(8, 8)
+$script:grpConn.Size = New-Object System.Drawing.Size(400, 176)
+$left.Controls.Add($script:grpConn)
+$lblConnectHint = New-Object System.Windows.Forms.Label
+$lblConnectHint.Text = 'Click Connect and sign in with the Microsoft window. Account, App id, Thumbprint, and Organization are not required.'
+$lblConnectHint.Font = $script:Font
+$lblConnectHint.Location = New-Object System.Drawing.Point(14, 22)
+$lblConnectHint.Size = New-Object System.Drawing.Size(370, 36)
+$script:grpConn.Controls.Add($lblConnectHint)
 $script:btnConnect = New-Button 'Connect' $script:ColorAccent ([System.Drawing.Color]::White)
-$script:btnConnect.Location = New-Object System.Drawing.Point(14, $y)
-$script:btnConnect.Size = New-Object System.Drawing.Size(88, 30)
+$script:btnConnect.Location = New-Object System.Drawing.Point(14, 62)
+$script:btnConnect.Size = New-Object System.Drawing.Size(110, 32)
 $script:btnDisconnect = New-Button 'Disconnect' ([System.Drawing.Color]::White) $script:ColorDanger
-$script:btnDisconnect.Location = New-Object System.Drawing.Point(108, $y)
-$script:btnDisconnect.Size = New-Object System.Drawing.Size(100, 30)
+$script:btnDisconnect.Location = New-Object System.Drawing.Point(132, 62)
+$script:btnDisconnect.Size = New-Object System.Drawing.Size(100, 32)
 $script:btnInstall = New-Button 'Install module' ([System.Drawing.Color]::White) $script:ColorAccent
-$script:btnInstall.Location = New-Object System.Drawing.Point(214, $y)
-$script:btnInstall.Size = New-Object System.Drawing.Size(120, 30)
-$grpConn.Controls.Add($script:btnConnect)
-$grpConn.Controls.Add($script:btnDisconnect)
-$grpConn.Controls.Add($script:btnInstall)
-$y += 36
+$script:btnInstall.Location = New-Object System.Drawing.Point(240, 62)
+$script:btnInstall.Size = New-Object System.Drawing.Size(120, 32)
+$script:grpConn.Controls.Add($script:btnConnect)
+$script:grpConn.Controls.Add($script:btnDisconnect)
+$script:grpConn.Controls.Add($script:btnInstall)
 $script:lblModule = New-Object System.Windows.Forms.Label
 $script:lblModule.Font = $script:Font
-$script:lblModule.Location = New-Object System.Drawing.Point(14, $y)
+$script:lblModule.Location = New-Object System.Drawing.Point(14, 100)
 $script:lblModule.Size = New-Object System.Drawing.Size(370, 18)
-$grpConn.Controls.Add($script:lblModule)
-$y += 18
+$script:grpConn.Controls.Add($script:lblModule)
 $script:lblConn = New-Object System.Windows.Forms.Label
 $script:lblConn.Font = $script:Font
-$script:lblConn.Location = New-Object System.Drawing.Point(14, $y)
+$script:lblConn.Location = New-Object System.Drawing.Point(14, 118)
 $script:lblConn.Size = New-Object System.Drawing.Size(370, 32)
-$grpConn.Controls.Add($script:lblConn)
-$tips.SetToolTip($script:txtUpn, 'Optional. Leave blank to use the account picker. Ignored when App id, thumbprint, and organization are all set.')
-$tips.SetToolTip($script:txtThumb, 'Certificate thumbprint in the CurrentUser or LocalMachine certificate store. Stored in settings on this PC. The certificate itself is not copied.')
+$script:grpConn.Controls.Add($script:lblConn)
+$script:chkAdvanced = New-Check 'Advanced sign-in (optional)'
+$script:chkAdvanced.Location = New-Object System.Drawing.Point(14, 152)
+$script:grpConn.Controls.Add($script:chkAdvanced)
+$script:pnlAdvanced = New-Object System.Windows.Forms.Panel
+$script:pnlAdvanced.Location = New-Object System.Drawing.Point(4, 176)
+$script:pnlAdvanced.Size = New-Object System.Drawing.Size(390, 214)
+$script:pnlAdvanced.Visible = $false
+$script:grpConn.Controls.Add($script:pnlAdvanced)
+$ay = 4
+$script:txtUpn = New-TextBox
+$ay = Add-Labeled $script:pnlAdvanced $ay 'Account' $script:txtUpn
+$script:txtAppId = New-TextBox
+$ay = Add-Labeled $script:pnlAdvanced $ay 'App id' $script:txtAppId
+$script:txtThumb = New-TextBox
+$ay = Add-Labeled $script:pnlAdvanced $ay 'Thumbprint' $script:txtThumb
+$script:txtOrg = New-TextBox
+$ay = Add-Labeled $script:pnlAdvanced $ay 'Organization' $script:txtOrg
+$script:chkDevice = New-Check 'Sign in with a device code'
+$script:chkDevice.Location = New-Object System.Drawing.Point(14, $ay)
+$script:pnlAdvanced.Controls.Add($script:chkDevice)
+$ay += 24
+$script:chkWam = New-Check 'Disable WAM and use a browser'
+$script:chkWam.Location = New-Object System.Drawing.Point(14, $ay)
+$script:pnlAdvanced.Controls.Add($script:chkWam)
+$tips.SetToolTip($script:btnConnect, 'Opens the Microsoft sign-in window. You do not fill in Account, App id, Thumbprint, or Organization.')
+$tips.SetToolTip($script:txtUpn, 'Optional. Used only when Advanced sign-in is checked. Leave blank to pick the account in the sign-in window.')
+$tips.SetToolTip($script:txtThumb, 'Certificate thumbprint. Used only when Advanced sign-in is checked. Stored in settings on this PC.')
 $tips.SetToolTip($script:chkDevice, 'Use this when the sign-in window does not appear. The code is written to the log and the PowerShell window.')
 $tips.SetToolTip($script:chkWam, 'Passed only when this ExchangeOnlineManagement build has -DisableWAM.')
 
 # Search
-$grpSearch = New-Object System.Windows.Forms.GroupBox
-$grpSearch.Text = 'Trace filters'
-$grpSearch.Font = $script:FontBold
-$grpSearch.Location = New-Object System.Drawing.Point(8, 340)
-$grpSearch.Size = New-Object System.Drawing.Size(400, 548)
-$left.Controls.Add($grpSearch)
+$script:grpSearch = New-Object System.Windows.Forms.GroupBox
+$script:grpSearch.Text = 'Trace filters'
+$script:grpSearch.Font = $script:FontBold
+$script:grpSearch.Location = New-Object System.Drawing.Point(8, 192)
+$script:grpSearch.Size = New-Object System.Drawing.Size(400, 600)
+$left.Controls.Add($script:grpSearch)
+$grpSearch = $script:grpSearch
 $y = 24
 $script:txtSender = New-TextBox -Multi
 $y = Add-Labeled $grpSearch $y 'Senders' $script:txtSender 52
 $script:txtRecipient = New-TextBox -Multi
 $y = Add-Labeled $grpSearch $y 'Recipients' $script:txtRecipient 52
 $script:txtMessageId = New-TextBox -Multi
-$y = Add-Labeled $grpSearch $y 'Message IDs' $script:txtMessageId 44
+$y = Add-Labeled $grpSearch $y 'Message ID' $script:txtMessageId 56
+$script:chkFindMessage = New-Check 'Search the last 90 days if this ID is not in the dates below'
+$script:chkFindMessage.Checked = $true
+$script:chkFindMessage.AutoSize = $false
+$script:chkFindMessage.Location = New-Object System.Drawing.Point(14, $y)
+$script:chkFindMessage.Size = New-Object System.Drawing.Size(370, 32)
+$grpSearch.Controls.Add($script:chkFindMessage)
+$y += 36
 $script:txtTrace = New-TextBox
 $y = Add-Labeled $grpSearch $y 'Trace id' $script:txtTrace
 $script:txtSubject = New-TextBox
@@ -1076,11 +1160,13 @@ $btnClearStatus.Size = New-Object System.Drawing.Size(110, 28)
 $grpSearch.Controls.Add($btnProblems)
 $grpSearch.Controls.Add($btnClearStatus)
 $tips.SetToolTip($script:txtSender, 'One address per line, or separate with semicolons. Display names such as Doe, Jane <user@contoso.com> are accepted.')
-$tips.SetToolTip($script:txtMessageId, 'Internet message ids. Angle brackets are optional. One per line.')
+$tips.SetToolTip($script:txtMessageId, 'Paste a message ID, a Message-ID header, or several IDs. Angle brackets and line wrapping are fine. The search finds the message, including outside the date boxes when the box below is checked, then investigates it.')
+$tips.SetToolTip($script:chkFindMessage, 'Message trace keeps about 90 days. The selected dates are searched first. If the ID is not there, older and newer days are searched until it is found.')
 $tips.SetToolTip($script:txtTrace, 'Network message id / MessageTraceId GUID. A header file can supply this when the other filters are empty.')
 
 # Scope
-$grpScope = New-Object System.Windows.Forms.GroupBox
+$script:grpScope = New-Object System.Windows.Forms.GroupBox
+$grpScope = $script:grpScope
 $grpScope.Text = 'Scope'
 $grpScope.Font = $script:FontBold
 $grpScope.Location = New-Object System.Drawing.Point(8, 896)
@@ -1145,7 +1231,8 @@ $tips.SetToolTip($script:chkMailbox, 'Needs Exchange Recipient Administrator or 
 $tips.SetToolTip($script:chkDisconnect, 'Closes the Exchange session on the worker, including a session that was already open.')
 
 # Sources
-$grpSrc = New-Object System.Windows.Forms.GroupBox
+$script:grpSrc = New-Object System.Windows.Forms.GroupBox
+$grpSrc = $script:grpSrc
 $grpSrc.Text = 'Extra sources'
 $grpSrc.Font = $script:FontBold
 $grpSrc.Location = New-Object System.Drawing.Point(8, 1304)
@@ -1176,7 +1263,8 @@ $tips.SetToolTip($btnPaste, 'Save internet headers from the clipboard into a tem
 $tips.SetToolTip($script:txtCsv, 'Extended message-trace detail report downloaded from the Exchange admin center. UTF-8 and UTF-16 are both accepted.')
 
 # Output
-$grpOut = New-Object System.Windows.Forms.GroupBox
+$script:grpOut = New-Object System.Windows.Forms.GroupBox
+$grpOut = $script:grpOut
 $grpOut.Text = 'Output'
 $grpOut.Font = $script:FontBold
 $grpOut.Location = New-Object System.Drawing.Point(8, 1424)
@@ -1204,7 +1292,8 @@ $script:btnCancel.Size = New-Object System.Drawing.Size(180, 34)
 $script:btnCancel.Enabled = $false
 $left.Controls.Add($script:btnRun)
 $left.Controls.Add($script:btnCancel)
-$scrollPad = New-Object System.Windows.Forms.Panel
+$script:scrollPad = New-Object System.Windows.Forms.Panel
+$scrollPad = $script:scrollPad
 $scrollPad.Location = New-Object System.Drawing.Point(0, 1580)
 $scrollPad.Size = New-Object System.Drawing.Size(10, 20)
 $left.Controls.Add($scrollPad)
@@ -1353,6 +1442,8 @@ if ($saved) {
     $script:chkSkipDns.Checked = ConvertTo-BoolSetting (Get-JsonProperty $saved 'SkipDnsChecks' $false) $false
     $script:chkDisconnect.Checked = ConvertTo-BoolSetting (Get-JsonProperty $saved 'DisconnectWhenDone' $false) $false
     $script:chkOpenReport.Checked = ConvertTo-BoolSetting (Get-JsonProperty $saved 'OpenReport' $false) $false
+    $script:chkAdvanced.Checked = ConvertTo-BoolSetting (Get-JsonProperty $saved 'AdvancedSignIn' $false) $false
+    $script:chkFindMessage.Checked = ConvertTo-BoolSetting (Get-JsonProperty $saved 'FindMessageOutsideDates' $true) $true
     $script:chkStamp.Checked = ConvertTo-BoolSetting (Get-JsonProperty $saved 'NewTimestampedFolder' $true) $true
     $parent = [string](Get-JsonProperty $saved 'OutputParent' '')
     if ($parent) { $script:txtOutput.Text = $parent }
@@ -1376,6 +1467,8 @@ Append-Log 'Search addresses are not saved. The certificate thumbprint is saved 
 $script:btnRun.Add_Click({ Start-Investigation })
 $script:btnCancel.Add_Click({ Stop-Investigation })
 $script:btnConnect.Add_Click({ Start-Connect })
+$script:chkAdvanced.Add_Click({ Update-LeftLayout })
+Update-LeftLayout
 $script:btnDisconnect.Add_Click({ Start-Disconnect })
 $script:btnInstall.Add_Click({ Start-Install })
 $btnHeader.Add_Click({ Browse-File $script:txtHeader 'Text and messages|*.txt;*.eml;*.log|All files|*.*' 'Message headers' })

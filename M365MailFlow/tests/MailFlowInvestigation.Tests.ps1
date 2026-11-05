@@ -106,6 +106,34 @@ Assert-Equal $addrs.Count 2 'display names and duplicates collapse to two addres
 Assert-Equal $addrs[0] 'Jane@Contoso.com' 'address inside angle brackets is kept'
 Assert-Equal (ConvertTo-NormalizedMessageId 'abc@mail.example.com') '<abc@mail.example.com>' 'bare message IDs gain brackets'
 Assert-Equal (ConvertTo-NormalizedMessageId '<abc@mail.example.com>') '<abc@mail.example.com>' 'bracketed message IDs stay bracketed'
+$foldedId = Get-NormalizedMessageIdList "<E1682@BY5PR03MB5141.namprd03.prod`r`n .outlook.com>"
+Assert-Equal $foldedId.Count 1 'a folded message ID stays one value'
+Assert-Equal $foldedId[0] '<E1682@BY5PR03MB5141.namprd03.prod.outlook.com>' 'folding inside the ID is removed'
+$wrappedId = Get-NormalizedMessageIdList "<E1682@BY5PR03MB5141.namprd03.prod`r`n.outlook.com>"
+Assert-Equal $wrappedId[0] '<E1682@BY5PR03MB5141.namprd03.prod.outlook.com>' 'a hard line break inside angle brackets is joined'
+$headerBlob = "From: Jane <jane@contoso.com>`r`nMessage-ID: <abc123@mail.example.com>`r`nTo: Bob <bob@fabrikam.com>"
+$headerIds = Get-NormalizedMessageIdList $headerBlob
+Assert-Equal $headerIds.Count 1 'a Message-ID header is used and From/To addresses are not'
+Assert-Equal $headerIds[0] '<abc123@mail.example.com>' 'the header message ID is kept'
+$twoIds = Get-NormalizedMessageIdList "<one@contoso.com>`r`n<two@fabrikam.com>"
+Assert-Equal $twoIds.Count 2 'two pasted message IDs stay separate'
+$forms = Get-MessageIdQueryForms '<abc@x>'
+Assert-Equal $forms.Count 2 'a bracketed ID is also queried without brackets'
+Assert-Equal $forms[0] '<abc@x>' 'the bracketed form is tried first'
+Assert-Equal $forms[1] 'abc@x' 'the bare form is the retry'
+$locator = Get-MessageLocatorFromText "Message-ID: <abc123@mail.example.com>`r`nX-MS-Exchange-Organization-Network-Message-Id: 22222222-2222-2222-2222-222222222222"
+Assert-Equal $locator.MessageIds[0] '<abc123@mail.example.com>' 'locator keeps the message ID'
+Assert-Equal ([string]$locator.MessageTraceId) '22222222-2222-2222-2222-222222222222' 'locator keeps the network message id'
+$onlyGuid = Get-MessageLocatorFromText '33333333-3333-3333-3333-333333333333'
+Assert-Equal $onlyGuid.MessageIds.Count 0 'a bare GUID is not treated as a message ID'
+Assert-Equal ([string]$onlyGuid.MessageTraceId) '33333333-3333-3333-3333-333333333333' 'a bare GUID is a trace id'
+$backNow = Get-Date '2026-11-05T10:30:00'
+$backStart = $backNow.AddDays(-2)
+$backOld = $backNow.AddDays(-90)
+$back = Get-SearchBackWindows -RequestedStart $backStart -RequestedEnd $backNow -Now $backNow -Oldest $backOld
+Assert-True ($back.Count -ge 8) 'a two-day miss continues back through the 90-day history'
+Assert-Equal $back[0].End $backStart 'the first extra window starts where the selected range ended'
+Assert-Equal $back[-1].Start $backOld 'the search reaches the 90-day floor'
 Set-M365MailFlowConfig @{
     SenderAddress = @('a@c.com','b@c.com')
     RecipientAddress = @('c@d.com','e@d.com')

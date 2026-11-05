@@ -40,7 +40,7 @@
       - Message trace "Data" XML is parsed with DTDs disabled.
 #>
 
-$script:ScriptVersion = '2.1.0'
+$script:ScriptVersion = '2.1.1'
 $script:SeverityRank  = @{ 'Critical' = 3; 'Warning' = 2; 'Info' = 1 }
 $script:LogFile       = $null
 $script:RequestTimes  = New-Object 'System.Collections.Generic.Queue[datetime]'
@@ -75,6 +75,7 @@ $script:Config = @{
     OutputPath = $null; OpenReport = $false; Offline = $false
     UserPrincipalName = $null; AppId = $null; CertificateThumbprint = $null; Organization = $null
     DisconnectWhenDone = $false; UseDeviceCode = $false; DisableWAM = $false
+    SearchBackForMessageId = $true
 }
 
 $script:AllowedStatus = @('Delivered','Expanded','Failed','FilteredAsSpam','GettingStatus','Pending','Quarantined')
@@ -593,29 +594,108 @@ function Get-NormalizedAddressList {
     return ,$list.ToArray()
 }
 
+function Expand-MessageIdText {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+    # RFC 5322 folding, and a hard line break inside <id@domain> from a wrapped paste.
+    $flat = [regex]::Replace($Text, '\r?\n[ \t]+', '')
+    return [regex]::Replace($flat, '(?<=<[^>\r\n]{0,500})\r?\n(?=[^<>\r\n]{0,300}>)', '')
+}
+
 function ConvertTo-NormalizedMessageId {
     param([string]$Value)
     if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
-    $t = $Value.Trim()
-    $t = $t.Trim('"').Trim("'")
-    if ($t -match '^[^<>\s]+@[^<>\s]+$' -and $t -notmatch '[<>]') { return '<' + $t + '>' }
-    return $t
+    $t = $Value.Trim().Trim('"').Trim("'")
+    $t = $t -replace '^(?i)message-?id\s*:\s*', ''
+    $t = ($t -replace '\s', '')
+    if ($t -match '^<?([^<>@\s]+@[^<>@\s]+)>?$') { return '<' + $matches[1] + '>' }
+    return $null
 }
 
 function Get-NormalizedMessageIdList {
     param($Values)
-    $raw = Get-NormalizedTokenList $Values
     $list = New-Object 'System.Collections.Generic.List[string]'
     $seen = @{}
-    foreach ($item in @($raw)) {
-        $id = ConvertTo-NormalizedMessageId $item
-        if (-not $id) { continue }
-        $key = ($id -replace '[<>]', '').ToLowerInvariant()
-        if ($seen.ContainsKey($key)) { continue }
-        $seen[$key] = $true
-        $list.Add($id)
+    foreach ($v in @($Values)) {
+        if ($null -eq $v) { continue }
+        $text = Expand-MessageIdText ([string]$v)
+        if (-not $text) { continue }
+        $candidates = New-Object 'System.Collections.Generic.List[string]'
+        $headerHits = [regex]::Matches($text, '(?im)^\s*Message-ID\s*:\s*(.+)$')
+        if ($headerHits.Count -gt 0) {
+            foreach ($h in $headerHits) { $candidates.Add($h.Groups[1].Value) }
+        } else {
+            $brackets = [regex]::Matches($text, '<\s*([^<>@\s]+@[^<>@\s]+)\s*>')
+            foreach ($b in $brackets) { $candidates.Add($b.Groups[1].Value) }
+            if ($candidates.Count -eq 0) {
+                foreach ($line in ($text -split '\r?\n')) {
+                    $bare = ConvertTo-NormalizedMessageId $line
+                    if ($bare) { $candidates.Add($bare) }
+                }
+            }
+        }
+        foreach ($candidate in $candidates) {
+            $id = ConvertTo-NormalizedMessageId $candidate
+            if (-not $id) { continue }
+            $key = ConvertTo-ComparableMessageId $id
+            if (-not $key -or $seen.ContainsKey($key)) { continue }
+            $seen[$key] = $true
+            $list.Add($id)
+        }
     }
     return ,$list.ToArray()
+}
+
+function Get-MessageIdQueryForms {
+    param([string]$MessageId)
+    $forms = New-Object 'System.Collections.Generic.List[string]'
+    if ($MessageId) { $forms.Add($MessageId) }
+    $bare = ConvertTo-ComparableMessageId $MessageId
+    if ($bare -and ($forms -notcontains $bare)) { $forms.Add($bare) }
+    return ,$forms.ToArray()
+}
+
+function Get-MessageLocatorFromText {
+    param([string]$Text)
+    $ids = Get-NormalizedMessageIdList $Text
+    $trace = $null
+    $flat = Expand-MessageIdText ([string]$Text)
+    $m = [regex]::Match($flat, '(?i)Network-Message-Id\s*:\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')
+    if ($m.Success) {
+        $g = [guid]::Empty
+        if ([guid]::TryParse($m.Groups[1].Value, [ref]$g)) { $trace = $g }
+    }
+    if (-not $trace -and $ids.Count -eq 0) {
+        $g = [guid]::Empty
+        if ([guid]::TryParse(($flat -replace '\s', ''), [ref]$g)) { $trace = $g }
+    }
+    $result = New-Object psobject
+    $result | Add-Member -NotePropertyName MessageIds -NotePropertyValue $ids
+    $result | Add-Member -NotePropertyName MessageTraceId -NotePropertyValue $trace
+    return $result
+}
+
+function Get-SearchBackWindows {
+    param(
+        [datetime]$RequestedStart,
+        [datetime]$RequestedEnd,
+        [datetime]$Now,
+        [datetime]$Oldest
+    )
+    $windows = New-Object 'System.Collections.Generic.List[psobject]'
+    $cursor = $RequestedStart
+    while ($cursor -gt $Oldest.AddMinutes(1)) {
+        $wEnd = $cursor
+        $wStart = $wEnd.AddHours(-239)
+        if ($wStart -lt $Oldest) { $wStart = $Oldest }
+        if ($wEnd -le $wStart.AddSeconds(30)) { break }
+        $windows.Add([pscustomobject]@{ Start = $wStart; End = $wEnd })
+        $cursor = $wStart
+    }
+    if ($RequestedEnd -lt $Now.AddMinutes(-2)) {
+        $windows.Add([pscustomobject]@{ Start = $RequestedEnd; End = $Now })
+    }
+    return ,$windows.ToArray()
 }
 
 function ConvertTo-ComparableMessageId {
@@ -1290,6 +1370,13 @@ function Get-TraceSummary {
         if ($combo.Status) { $labelBits += "status=$($combo.Status -join ',')" }
         $label = if ($labelBits.Count) { $labelBits -join '; ' } else { 'no address filter' }
         Write-Log ("Trace query {0}/{1}: {2}" -f $comboIndex, $combos.Count, $label)
+        $idForms = @($null)
+        if ($combo.MessageId) { $idForms = Get-MessageIdQueryForms ([string]$combo.MessageId) }
+        foreach ($activeMessageId in $idForms) {
+            $countBeforeForm = $all.Count
+            if ($activeMessageId -and $combo.MessageId -and [string]$activeMessageId -ne [string]$combo.MessageId) {
+                Write-Log "No rows for $($combo.MessageId). Retrying the same dates without angle brackets ($activeMessageId)." 'WARN'
+            }
         foreach ($w in $windows) {
             Test-InvestigationCancel
             if ($all.Count -ge [int]$script:Config.MaxResults) { break }
@@ -1311,7 +1398,7 @@ function Get-TraceSummary {
                     $p = @{ StartDate = $w.Start; EndDate = $currentEnd; ResultSize = $size }
                     if ($combo.SenderAddress) { $p.SenderAddress = [string]$combo.SenderAddress }
                     if ($combo.RecipientAddress) { $p.RecipientAddress = [string]$combo.RecipientAddress }
-                    if ($combo.MessageId) { $p.MessageId = [string]$combo.MessageId }
+                    if ($activeMessageId) { $p.MessageId = [string]$activeMessageId }
                     if ($combo.Status) { $p.Status = $combo.Status }
                     if ($script:Config.FromIP) { $p.FromIP = [string]$script:Config.FromIP }
                     if ($script:Config.ToIP) { $p.ToIP = [string]$script:Config.ToIP }
@@ -1351,7 +1438,7 @@ function Get-TraceSummary {
                     $p = @{ StartDate = $w.Start; EndDate = $w.End; PageSize = 5000; Page = $page }
                     if ($combo.SenderAddress) { $p.SenderAddress = [string]$combo.SenderAddress }
                     if ($combo.RecipientAddress) { $p.RecipientAddress = [string]$combo.RecipientAddress }
-                    if ($combo.MessageId) { $p.MessageId = [string]$combo.MessageId }
+                    if ($activeMessageId) { $p.MessageId = [string]$activeMessageId }
                     if ($combo.Status) { $p.Status = $combo.Status }
                     if ($script:Config.FromIP) { $p.FromIP = [string]$script:Config.FromIP }
                     if ($script:Config.ToIP) { $p.ToIP = [string]$script:Config.ToIP }
@@ -1368,6 +1455,8 @@ function Get-TraceSummary {
                     $page++
                 }
             }
+        }
+            if ($all.Count -gt $countBeforeForm) { break }
         }
     }
 
@@ -2836,7 +2925,8 @@ function Invoke-M365MailFlowInvestigation {
         [switch]$DisconnectWhenDone,
         [switch]$Offline,
         [switch]$UseDeviceCode,
-        [switch]$DisableWAM
+        [switch]$DisableWAM,
+        [switch]$StrictDateRange
     )
 
     $exitCode = 0
@@ -2884,6 +2974,7 @@ function Invoke-M365MailFlowInvestigation {
         DisconnectWhenDone = [bool]$DisconnectWhenDone
         UseDeviceCode = [bool]$UseDeviceCode
         DisableWAM = [bool]$DisableWAM
+        SearchBackForMessageId = -not [bool]$StrictDateRange
     }
     if ($PSBoundParameters.ContainsKey('MessageTraceId')) { $script:Config.MessageTraceId = $MessageTraceId }
     $script:DerivedTraceId = $null
@@ -2986,9 +3077,29 @@ function Invoke-M365MailFlowInvestigation {
             if (-not $hasFilter) { Write-Log 'No filters specified. This returns all mail in the date range, capped by -MaxResults.' 'WARN' }
             Write-InvestigationProgress -Activity 'Message trace' -Status 'Querying message trace' -Percent 5
             $summary = Get-TraceSummary -Start $script:Config.StartDate -End $script:Config.EndDate
+            $hasLocator = @($script:Config.MessageId).Count -gt 0 -or $script:Config.MessageTraceIdSpecified -or $script:DerivedTraceId
+            if ($summary.Count -eq 0 -and $script:Config.SearchBackForMessageId -and $hasLocator) {
+                $oldest = (Get-Date).AddDays(-90).AddMinutes(10)
+                $backWindows = Get-SearchBackWindows -RequestedStart $script:Config.StartDate -RequestedEnd $script:Config.EndDate -Now (Get-Date) -Oldest $oldest
+                $wIndex = 0
+                Write-Log 'The message ID was not in the selected dates. Searching the rest of the 90-day message trace history.' 'WARN'
+                foreach ($bw in $backWindows) {
+                    Test-InvestigationCancel
+                    if ($summary.Count -gt 0) { break }
+                    $wIndex++
+                    $pct = [int](5 + (($wIndex / [math]::Max(1, $backWindows.Count)) * 8))
+                    Write-InvestigationProgress -Activity 'Message trace' -Status ("Looking further: {0:g} to {1:g}" -f $bw.Start, $bw.End) -Percent $pct
+                    Write-Log ("Message ID search {0}/{1}: {2:u} -> {3:u}" -f $wIndex, $backWindows.Count, $bw.Start, $bw.End)
+                    $summary = Get-TraceSummary -Start $bw.Start -End $bw.End
+                }
+            }
             foreach ($row in $summary) { $messages.Add((New-MessageRecord -Summary $row)) }
             if ($messages.Count -eq 0) {
-                Write-Log 'No messages matched. Check the address (primary SMTP / exact sender), Message-ID angle brackets, the date range in local time, and that very recent mail can lag 5-30 minutes.' 'WARN'
+                if ($hasLocator -and $script:Config.SearchBackForMessageId) {
+                    Write-Log 'No message with that ID exists in the last 90 days of message trace. Check the ID was copied completely (it usually contains @ and ends with >). Very recent mail can lag 5-30 minutes.' 'WARN'
+                } else {
+                    Write-Log 'No messages matched. Check the address (primary SMTP / exact sender), Message-ID angle brackets, the date range in local time, and that very recent mail can lag 5-30 minutes.' 'WARN'
+                }
             }
             if (-not $script:Config.SkipDetail -and $messages.Count -gt 0) {
                 $candidates = @($messages | Sort-Object @{ Expression = { if ($_.Status -in @('Delivered', 'Expanded')) { 1 } else { 0 } } }, @{ Expression = { $_.ReceivedUtc }; Descending = $true })
