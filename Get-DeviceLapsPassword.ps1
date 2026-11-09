@@ -3,7 +3,7 @@
 ================================================================================
  SCRIPT : Get-DeviceLapsPassword.ps1
  PURPOSE: Return the local administrator account and current Windows LAPS
-          password for an Intune-managed device from Microsoft Entra ID.
+          password for a device from Microsoft Entra ID (app-only, no user sign-in).
           Run with no parameters for an interactive console checkout.
  AUTHOR : Anthony Blake
  UPDATED: 2026-11-09
@@ -12,7 +12,7 @@
 
 .SYNOPSIS
     Retrieves the local administrator account name and current Windows LAPS password
-    for an Intune-managed device from Microsoft Entra ID.
+    for a device from Microsoft Entra ID. App-only certificate auth; no user sign-in.
 
 .DESCRIPTION
     Two ways to run it:
@@ -26,7 +26,12 @@
         Pass -ComputerName (and optional -RequestId / -RequesterUpn).
         Writes exactly ONE line of JSON to stdout and sets the process exit code.
 
-    Flow: Intune managed device -> Entra device ID -> LAPS password backed up to Entra ID.
+    Lookup order (first hit wins):
+      1. Entra LAPS catalog by device name   (DeviceLocalCredential.Read.All) — required
+      2. Entra device object by displayName  (Device.Read.All) — optional fallback
+      3. Intune managed device               (DeviceManagementManagedDevices.Read.All) — optional,
+         only used for primary-user / ownership checks when that permission is on the token
+
     Authenticates to Microsoft Graph app-only with a certificate (no browser sign-in).
     The password is never written to the log file.
 
@@ -46,8 +51,8 @@
     Force the ServiceNow JSON contract (no prompts). Used by the MID Server.
 
 .PARAMETER RequesterUpn
-    Optional. If supplied, the request is refused unless this UPN is the device's Intune
-    primary user (case-insensitive). Leave empty to keep the current catalog behaviour.
+    Optional. If supplied AND the token can read Intune, the request is refused unless this
+    UPN is the device's Intune primary user. Ignored when Intune access is not granted.
 
 .PARAMETER RequestId
     Optional ServiceNow request/RITM number, used only to correlate log entries.
@@ -60,16 +65,17 @@
 
 .NOTES
     Microsoft Graph APPLICATION permissions (admin consent required):
-      DeviceManagementManagedDevices.Read.All  - look up the device in Intune
-      DeviceLocalCredential.Read.All           - read the LAPS password from Entra ID
+      DeviceLocalCredential.Read.All             REQUIRED — list/read Windows LAPS passwords
+      Device.Read.All                            optional  — resolve the Entra device object
+      DeviceManagementManagedDevices.Read.All    optional  — Intune primary user / ownership
 
     Exit codes:
       0  Success
       1  Invalid input
       2  Configuration or authentication error
-      3  Device not found in Intune
+      3  Device not found
       4  Device found, but no LAPS password is available
-      5  Requester is not the device's primary user (only when -RequesterUpn is used)
+      5  Requester is not the device's primary user (only when -RequesterUpn is used and Intune is readable)
       9  Unexpected error
 
 .EXAMPLE
@@ -119,7 +125,7 @@ $DefaultCertificateThumbprint = 'CA226E648AE75DEFEE298111D8DC4A1E33E34A3B'
 $GraphBase    = 'https://graph.microsoft.com/v1.0'
 $EmptyGuid    = '00000000-0000-0000-0000-000000000000'
 $ClientName   = 'ServiceNow-LAPS-Checkout'
-$ClientVer    = '1.3'
+$ClientVer    = '1.4'
 
 $script:GraphConnected  = $false
 $script:UsedMgGraph     = $false
@@ -532,29 +538,68 @@ function Invoke-LapsCheckout {
         Connect-GraphAppOnly
     }
 
-    $device = Get-IntuneDevice -Name $normalized
-    if (-not $device) {
-        throw (New-LapsError "$normalized was not found in Intune." 3)
+    $candidateIds = New-Object System.Collections.Generic.List[string]
+    $os = $null
+
+    # 1. Entra LAPS catalog — this is the required, app-only path (no user, no Intune).
+    $lapsDevice = Get-LapsDeviceByName -Name $normalized
+    if ($lapsDevice) {
+        $lapsId = [string](Get-NotePropertyValue $lapsDevice 'id')
+        if ($lapsId) { [void]$candidateIds.Add($lapsId) }
+        Write-Log "LAPS catalog hit. DeviceId=$lapsId; DeviceName=$(Get-NotePropertyValue $lapsDevice 'deviceName'); LastBackup=$(Get-NotePropertyValue $lapsDevice 'lastBackupDateTime')"
     }
 
-    $os            = [string](Get-NotePropertyValue $device 'operatingSystem')
-    $entraDeviceId = [string](Get-NotePropertyValue $device 'azureADDeviceId')
-    $Result.primaryUser = Get-NotePropertyValue $device 'userPrincipalName'
-    Write-Log "Intune device found. IntuneId=$(Get-NotePropertyValue $device 'id'); EntraDeviceId=$entraDeviceId; OS=$os; PrimaryUser=$($Result.primaryUser)"
-
-    if ($os -and $os -notmatch 'Windows') {
-        throw (New-LapsError "$normalized is enrolled in Intune as '$os'. Windows LAPS is only available on Windows devices." 4)
+    # 2. Optional Entra device object (Device.Read.All) when the LAPS list did not find a name match.
+    if ($candidateIds.Count -eq 0 -and (Test-TokenHasRole 'Device.Read.All')) {
+        $entraDevice = Get-EntraDirectoryDevice -Name $normalized
+        if ($entraDevice) {
+            $os = [string](Get-NotePropertyValue $entraDevice 'operatingSystem')
+            foreach ($idName in @('deviceId', 'id')) {
+                $idVal = [string](Get-NotePropertyValue $entraDevice $idName)
+                if ($idVal -and $idVal -ne $EmptyGuid) { [void]$candidateIds.Add($idVal) }
+            }
+            Write-Log "Entra device found. ObjectId=$(Get-NotePropertyValue $entraDevice 'id'); DeviceId=$(Get-NotePropertyValue $entraDevice 'deviceId'); OS=$os"
+        }
+    }
+    elseif ($candidateIds.Count -eq 0) {
+        Write-Log 'Skipping Entra /devices lookup (token does not include Device.Read.All).'
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($Requester) -and -not (Test-SameUpn $Result.primaryUser $Requester)) {
-        throw (New-LapsError "Requester '$Requester' is not the primary user of $normalized." 5)
+    # 3. Optional Intune record — only when the app actually has that role (this tenant token does not).
+    $intuneDevice = $null
+    if (Test-TokenHasRole 'DeviceManagementManagedDevices.Read.All', 'DeviceManagementManagedDevices.ReadWrite.All') {
+        $intuneDevice = Get-IntuneDevice -Name $normalized
+    }
+    else {
+        Write-Log 'Skipping Intune lookup (token does not include DeviceManagementManagedDevices.Read.All).'
     }
 
-    if ([string]::IsNullOrWhiteSpace($entraDeviceId) -or $entraDeviceId -eq $EmptyGuid) {
-        throw (New-LapsError "The Intune record for $normalized has no Entra device ID." 4)
+    if ($intuneDevice) {
+        $os = [string](Get-NotePropertyValue $intuneDevice 'operatingSystem')
+        $Result.primaryUser = Get-NotePropertyValue $intuneDevice 'userPrincipalName'
+        $intuneEntraId = [string](Get-NotePropertyValue $intuneDevice 'azureADDeviceId')
+        if ($intuneEntraId -and $intuneEntraId -ne $EmptyGuid) { [void]$candidateIds.Add($intuneEntraId) }
+        Write-Log "Intune device found. IntuneId=$(Get-NotePropertyValue $intuneDevice 'id'); EntraDeviceId=$intuneEntraId; OS=$os; PrimaryUser=$($Result.primaryUser)"
+        if ($os -and $os -notmatch 'Windows') {
+            throw (New-LapsError "$normalized is enrolled in Intune as '$os'. Windows LAPS is only available on Windows devices." 4)
+        }
     }
 
-    $cred = Get-EntraLapsCredential -DeviceId $entraDeviceId
+    if (-not [string]::IsNullOrWhiteSpace($Requester)) {
+        if ([string]::IsNullOrWhiteSpace([string]$Result.primaryUser)) {
+            Add-Warning "Ownership check skipped for '$Requester'; this app token cannot read Intune primary user."
+        }
+        elseif (-not (Test-SameUpn $Result.primaryUser $Requester)) {
+            throw (New-LapsError "Requester '$Requester' is not the primary user of $normalized." 5)
+        }
+    }
+
+    $uniqueIds = @($candidateIds | Where-Object { $_ } | Select-Object -Unique)
+    if ($uniqueIds.Count -eq 0) {
+        throw (New-LapsError "$normalized was not found in the Entra LAPS catalog. Confirm a Windows LAPS policy is assigned and the device has backed up a password to Entra ID." 3)
+    }
+
+    $cred = Get-EntraLapsCredential -DeviceId $uniqueIds
     if (-not $cred) {
         throw (New-LapsError "No LAPS password is backed up to Entra ID for $normalized. Confirm a Windows LAPS policy is assigned and the device has checked in." 4)
     }
@@ -583,8 +628,8 @@ function Set-LapsFailure {
 
 function Invoke-InteractiveCheckout {
     Write-Banner @(
-        'Windows LAPS checkout  (Entra ID / Intune)'
-        'App-only certificate authentication  |  password is never written to the log'
+        'Windows LAPS checkout  (Entra ID, app-only — no user sign-in)'
+        'Looks up the password in the Entra LAPS catalog. Intune is optional.'
         'Enter a computer name, or Q to quit'
     )
 
@@ -943,8 +988,28 @@ function Get-TokenFromMgGraphSession {
     return $null
 }
 
+function Test-TokenHasRole {
+    param([Parameter(Mandatory = $true)][string[]]$Name)
+    $roles = @($script:GraphTokenRoles)
+    if ($roles.Count -eq 0) { return $false }
+    foreach ($n in $Name) {
+        if ($roles -contains $n) { return $true }
+    }
+    return $false
+}
+
+function Test-DeviceNameMatch {
+    param([string]$StoredName, [string]$WantedHost)
+    if ([string]::IsNullOrWhiteSpace($StoredName) -or [string]::IsNullOrWhiteSpace($WantedHost)) { return $false }
+    $storedHost = ("$StoredName".Trim()).Split('.')[0]
+    return ($storedHost -ieq $WantedHost)
+}
+
 function Get-GraphRequestHeaders {
-    param([switch]$IncludeAuthorization)
+    param(
+        [switch]$IncludeAuthorization,
+        [hashtable]$Extra
+    )
 
     $headers = @{
         'User-Agent'         = "$ClientName/$ClientVer"
@@ -956,12 +1021,22 @@ function Get-GraphRequestHeaders {
     if ($IncludeAuthorization -and -not [string]::IsNullOrWhiteSpace($script:GraphAccessToken)) {
         $headers['Authorization'] = "Bearer $($script:GraphAccessToken)"
     }
+    if ($Extra) {
+        foreach ($key in $Extra.Keys) {
+            $headers[$key] = $Extra[$key]
+        }
+    }
     return $headers
 }
 
 function Invoke-GraphGet {
-    <# GET with retry on throttling/transient errors. Returns $null on 404. #>
-    param([string]$Uri, [int]$MaxAttempts = 4)
+    <# GET with retry on throttling/transient errors. Returns $null on ignored statuses (default 404). #>
+    param(
+        [string]$Uri,
+        [int]$MaxAttempts = 4,
+        [int[]]$IgnoreStatus = @(404),
+        [hashtable]$ExtraHeaders
+    )
 
     if ($script:GraphAccessToken -and ((Get-Date).ToUniversalTime() -gt $script:GraphTokenExpires) -and $script:SigningCertificate) {
         Write-Log 'Graph access token is near expiry; requesting a new one.'
@@ -974,7 +1049,7 @@ function Invoke-GraphGet {
                 $irParams = @{
                     Uri         = $Uri
                     Method      = 'GET'
-                    Headers     = (Get-GraphRequestHeaders -IncludeAuthorization)
+                    Headers     = (Get-GraphRequestHeaders -IncludeAuthorization -Extra $ExtraHeaders)
                     ErrorAction = 'Stop'
                 }
                 $cmd = Get-Command Invoke-RestMethod
@@ -1001,7 +1076,7 @@ function Invoke-GraphGet {
             $status = Get-GraphStatusCode -ErrorRecord $_
             $body   = Get-HttpExceptionBody -ErrorRecord $_
 
-            if ($status -eq 404) { return $null }
+            if ($status -gt 0 -and $IgnoreStatus -contains $status) { return $null }
             if ($status -eq 401) {
                 $hint = 'The Graph SDK -Headers parameter was sending this request without a bearer token; the script now attaches the token itself.'
                 if ($body -match 'Access token is empty') {
@@ -1014,7 +1089,7 @@ function Invoke-GraphGet {
             }
             if ($status -eq 403) {
                 $roleText = if (@($script:GraphTokenRoles).Count -gt 0) { $script:GraphTokenRoles -join ', ' } else { '(none)' }
-                throw (New-LapsError "Graph returned 403 Forbidden for $Uri. Token roles: $roleText. DeviceManagementManagedDevices.Read.All and DeviceLocalCredential.Read.All must be APPLICATION permissions with admin consent. $body" 2)
+                throw (New-LapsError "Graph returned 403 Forbidden for $Uri. Token roles: $roleText. $body" 2)
             }
 
             $transient = $status -in 429, 500, 502, 503, 504
@@ -1033,12 +1108,16 @@ function Invoke-GraphGet {
 }
 
 function Get-GraphCollection {
-    param([string]$Uri)
+    param(
+        [string]$Uri,
+        [int[]]$IgnoreStatus = @(404),
+        [hashtable]$ExtraHeaders
+    )
 
     $items = New-Object System.Collections.Generic.List[object]
     $next  = $Uri
     while ($next) {
-        $resp = Invoke-GraphGet -Uri $next
+        $resp = Invoke-GraphGet -Uri $next -IgnoreStatus $IgnoreStatus -ExtraHeaders $ExtraHeaders
         if ($null -eq $resp) { break }
         foreach ($item in @((Get-NotePropertyValue $resp 'value'))) {
             if ($null -ne $item) { [void]$items.Add($item) }
@@ -1130,10 +1209,11 @@ function Connect-GraphAppOnly {
         $script:GraphConnected = $true
         $roleText = if (@($script:GraphTokenRoles).Count -gt 0) { $script:GraphTokenRoles -join ', ' } else { '(none listed)' }
         Write-Log "Connected to Graph as app $($script:ClientId) using certificate $thumb. Token roles: $roleText."
-        foreach ($perm in @('DeviceManagementManagedDevices.Read.All', 'DeviceLocalCredential.Read.All')) {
-            if (@($script:GraphTokenRoles).Count -gt 0 -and ($script:GraphTokenRoles -notcontains $perm)) {
-                Write-Log "Token does not list application permission '$perm'. Confirm admin consent on the app registration." 'WARN'
-            }
+        if (@($script:GraphTokenRoles).Count -gt 0 -and -not (Test-TokenHasRole 'DeviceLocalCredential.Read.All')) {
+            Write-Log "Token does not list DeviceLocalCredential.Read.All. Grant that APPLICATION permission with admin consent or LAPS reads will fail." 'WARN'
+        }
+        if (-not (Test-TokenHasRole 'DeviceManagementManagedDevices.Read.All')) {
+            Write-Log 'Intune permission is not on this token. Device lookup will use the Entra LAPS catalog (no signed-in user, no Intune).'
         }
         return
     }
@@ -1202,6 +1282,29 @@ function Connect-GraphAppOnly {
     Write-Log "Connected to Graph as app $($script:ClientId) using certificate $thumb."
 }
 
+function Select-BestNamedDevice {
+    param(
+        [object[]]$Devices,
+        [string]$Name,
+        [string]$NameProperty,
+        [string]$IdProperty,
+        [string]$DateProperty
+    )
+    $matched = @(
+        $Devices | Where-Object { Test-DeviceNameMatch -StoredName (Get-NotePropertyValue $_ $NameProperty) -WantedHost $Name }
+    )
+    if ($matched.Count -eq 0) { $matched = @($Devices) }
+    if ($matched.Count -eq 0) { return $null }
+    return $matched | Sort-Object -Property @{
+        Expression = {
+            $id = [string](Get-NotePropertyValue $_ $IdProperty)
+            [bool]($id -and $id -ne $EmptyGuid)
+        }; Descending = $true
+    }, @{
+        Expression = { Get-SortableDate (Get-NotePropertyValue $_ $DateProperty) }; Descending = $true
+    } | Select-Object -First 1
+}
+
 function Get-IntuneDevice {
     param([string]$Name)
 
@@ -1210,7 +1313,7 @@ function Get-IntuneDevice {
     $query   = {
         param([string]$Filter)
         $encoded = [uri]::EscapeDataString($Filter)
-        Get-GraphCollection -Uri "$GraphBase/deviceManagement/managedDevices?`$filter=$encoded&`$select=$select"
+        Get-GraphCollection -Uri "$GraphBase/deviceManagement/managedDevices?`$filter=$encoded&`$select=$select" -IgnoreStatus @(404, 403)
     }
 
     # Intune's OData subset is picky about 'or'; try exact name first, then FQDN-style names.
@@ -1238,11 +1341,67 @@ function Get-IntuneDevice {
         Select-Object -First 1
 }
 
+function Get-EntraDirectoryDevice {
+    param([string]$Name)
+
+    $escaped = $Name.Replace("'", "''")
+    $select  = 'id,deviceId,displayName,operatingSystem,approximateLastSignInDateTime'
+    $query   = {
+        param([string]$Filter)
+        $encoded = [uri]::EscapeDataString($Filter)
+        Get-GraphCollection -Uri "$GraphBase/devices?`$filter=$encoded&`$select=$select" -IgnoreStatus @(404, 403, 400)
+    }
+
+    $devices = @(& $query "displayName eq '$escaped'")
+    if ($devices.Count -eq 0) {
+        $devices = @(& $query "startswith(displayName,'$escaped.')")
+    }
+    if ($devices.Count -eq 0) { return $null }
+
+    if ($devices.Count -gt 1) {
+        Add-Warning "$($devices.Count) Entra device records match '$Name'; using the most recently signed-in record."
+    }
+    return Select-BestNamedDevice -Devices $devices -Name $Name -NameProperty 'displayName' -IdProperty 'deviceId' -DateProperty 'approximateLastSignInDateTime'
+}
+
+function Get-LapsDeviceByName {
+    param([string]$Name)
+
+    $escaped = $Name.Replace("'", "''")
+    $select  = 'id,deviceName,lastBackupDateTime,refreshDateTime'
+    $query   = {
+        param([string]$Filter)
+        $encoded = [uri]::EscapeDataString($Filter)
+        Get-GraphCollection -Uri "$GraphBase/directory/deviceLocalCredentials?`$filter=$encoded&`$select=$select" -IgnoreStatus @(404, 400)
+    }
+
+    $items = @(& $query "deviceName eq '$escaped'")
+    if ($items.Count -eq 0) {
+        $items = @(& $query "startswith(deviceName,'$escaped.')")
+    }
+    if ($items.Count -eq 0) {
+        $search = [uri]::EscapeDataString('"' + $escaped + '"')
+        $items = @(Get-GraphCollection -Uri "$GraphBase/directory/deviceLocalCredentials?`$search=$search&`$count=true&`$select=$select" -IgnoreStatus @(404, 400) -ExtraHeaders @{ ConsistencyLevel = 'eventual' })
+        $items = @($items | Where-Object { Test-DeviceNameMatch -StoredName (Get-NotePropertyValue $_ 'deviceName') -WantedHost $Name })
+    }
+    if ($items.Count -eq 0) { return $null }
+
+    if ($items.Count -gt 1) {
+        Add-Warning "$($items.Count) LAPS backups match '$Name'; using the most recently backed-up record."
+    }
+    return Select-BestNamedDevice -Devices $items -Name $Name -NameProperty 'deviceName' -IdProperty 'id' -DateProperty 'lastBackupDateTime'
+}
+
 function Get-EntraLapsCredential {
-    param([string]$DeviceId)
+    param([string[]]$DeviceId)
 
     $select = [uri]::EscapeDataString('id,deviceName,lastBackupDateTime,refreshDateTime,credentials')
-    $info   = Unprotect-GraphResource (Invoke-GraphGet -Uri "$GraphBase/directory/deviceLocalCredentials/${DeviceId}?`$select=$select")
+    $info   = $null
+    foreach ($id in @($DeviceId | Where-Object { $_ -and $_ -ne $EmptyGuid } | Select-Object -Unique)) {
+        $info = Unprotect-GraphResource (Invoke-GraphGet -Uri "$GraphBase/directory/deviceLocalCredentials/${id}?`$select=$select" -IgnoreStatus @(404, 400))
+        if ($info -and (Get-NotePropertyValue $info 'credentials')) { break }
+        if ($info) { break }
+    }
     if ($null -eq $info) { return $null }
 
     $credentials = @((Get-NotePropertyValue $info 'credentials') | Where-Object { $_ })
@@ -1377,6 +1536,25 @@ function Invoke-SelfTest {
         $json = ConvertTo-JwtJson -Map ([ordered]@{ aud = 'https://login.microsoftonline.com/t/oauth2/v2.0/token'; nbf = 1 })
         if ($json -match '\\/') { throw "Audience slashes were escaped: $json" }
         if ($json -notmatch 'https://login.microsoftonline.com') { throw "Audience missing: $json" }
+    }
+
+    Invoke-Case 'Device name matching ignores FQDN and case' {
+        if (-not (Test-DeviceNameMatch -StoredName '015CD415BR20.corp.com' -WantedHost '015CD415BR20')) {
+            throw 'Expected FQDN stored name to match host.'
+        }
+        if (-not (Test-DeviceNameMatch -StoredName '015cd415br20' -WantedHost '015CD415BR20')) {
+            throw 'Expected case-insensitive match.'
+        }
+        if (Test-DeviceNameMatch -StoredName 'OTHERPC' -WantedHost '015CD415BR20') {
+            throw 'Expected different names not to match.'
+        }
+    }
+
+    Invoke-Case 'Token role helper requires DeviceLocalCredential.Read.All and does not require Intune' {
+        $script:GraphTokenRoles = @('DeviceLocalCredential.Read.All')
+        if (-not (Test-TokenHasRole 'DeviceLocalCredential.Read.All')) { throw 'Expected LAPS role to be present.' }
+        if (Test-TokenHasRole 'DeviceManagementManagedDevices.Read.All') { throw 'Intune role should be absent.' }
+        $script:GraphTokenRoles = @()
     }
 
     Invoke-Case 'JWT payload roles are read from a Graph app-only token' {
