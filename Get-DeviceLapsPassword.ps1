@@ -4,6 +4,7 @@
  SCRIPT : Get-DeviceLapsPassword.ps1
  PURPOSE: Return the local administrator account and current Windows LAPS
           password for an Intune-managed device from Microsoft Entra ID.
+          Run with no parameters for an interactive console checkout.
  AUTHOR : Anthony Blake
  UPDATED: 2026-11-09
  COMPAT : Windows PowerShell 5.1 (Microsoft.Graph.Authentication, app-only cert)
@@ -14,13 +15,19 @@
     for an Intune-managed device from Microsoft Entra ID.
 
 .DESCRIPTION
-    Built for unattended execution from a ServiceNow MID Server
-    ("Checkout Admin on my laptop" catalog item).
+    Two ways to run it:
+
+      Interactive (helpdesk / console)
+        Double-click or run with no parameters. Prompts for a computer name,
+        shows the local admin account and LAPS password, can copy the password
+        to the clipboard, then asks whether to look up another device.
+
+      Unattended (ServiceNow MID Server catalog item)
+        Pass -ComputerName (and optional -RequestId / -RequesterUpn).
+        Writes exactly ONE line of JSON to stdout and sets the process exit code.
 
     Flow: Intune managed device -> Entra device ID -> LAPS password backed up to Entra ID.
-
-    Authenticates to Microsoft Graph app-only with a certificate (no interactive prompt).
-    Writes exactly ONE line of JSON to stdout and sets the process exit code.
+    Authenticates to Microsoft Graph app-only with a certificate (no browser sign-in).
     The password is never written to the log file.
 
     Credentials are resolved in this order:
@@ -29,8 +36,14 @@
         3. Values in the CONFIGURATION region below
 
 .PARAMETER ComputerName
-    Device name as entered in the catalog item. An FQDN is reduced to the host name.
-    Required unless -SelfTest is used.
+    Device name as entered in the catalog item or at the interactive prompt.
+    An FQDN is reduced to the host name. Optional in interactive mode.
+
+.PARAMETER Interactive
+    Force the console prompts and formatted result, even if -ComputerName was supplied.
+
+.PARAMETER NonInteractive
+    Force the ServiceNow JSON contract (no prompts). Used by the MID Server.
 
 .PARAMETER RequesterUpn
     Optional. If supplied, the request is refused unless this UPN is the device's Intune
@@ -60,7 +73,12 @@
       9  Unexpected error
 
 .EXAMPLE
+    .\Get-DeviceLapsPassword.ps1
+    Interactive checkout: prompts for a computer name and prints the password.
+
+.EXAMPLE
     .\Get-DeviceLapsPassword.ps1 -ComputerName LAPTOP-1234 -RequestId RITM0012345
+    Unattended MID Server call. One JSON line on stdout.
 
 .EXAMPLE
     .\Get-DeviceLapsPassword.ps1 -ComputerName LAPTOP-1234 -RequesterUpn jsmith@contoso.com
@@ -79,6 +97,8 @@ param(
     [string]$RequesterUpn,
     [string]$RequestId,
     [string]$LogPath,
+    [switch]$Interactive,
+    [switch]$NonInteractive,
     [switch]$SelfTest
 )
 
@@ -96,7 +116,7 @@ $DefaultCertificateThumbprint = 'CA226E648AE75DEFEE298111D8DC4A1E33E34A3B'
 $GraphBase    = 'https://graph.microsoft.com/v1.0'
 $EmptyGuid    = '00000000-0000-0000-0000-000000000000'
 $ClientName   = 'ServiceNow-LAPS-Checkout'
-$ClientVer    = '1.1'
+$ClientVer    = '1.2'
 
 $script:GraphConnected  = $false
 $script:LogFile         = $LogPath
@@ -104,6 +124,7 @@ $script:NormalizedName  = $null
 $script:TenantId        = $null
 $script:ClientId        = $null
 $script:CertificateThumbprint = $null
+$script:InteractiveMode = $false
 
 $Result = [ordered]@{
     success             = $false
@@ -172,7 +193,17 @@ function Write-Log {
     $reqTag  = if ([string]::IsNullOrWhiteSpace($RequestId)) { '-' } else { $RequestId }
     $devTag  = if ([string]::IsNullOrWhiteSpace($script:NormalizedName)) { $ComputerName } else { $script:NormalizedName }
     $line    = '{0} [{1}] [{2}] [{3}] {4}' -f (Get-Date).ToString('s'), $Level, $reqTag, $devTag, $Message
-    Write-Verbose $line
+    if ($script:InteractiveMode) {
+        $color = switch ($Level) {
+            'ERROR' { 'Red' }
+            'WARN'  { 'Yellow' }
+            default { 'Gray' }
+        }
+        Write-Host ("  {0}" -f $Message) -ForegroundColor $color
+    }
+    else {
+        Write-Verbose $line
+    }
     if ([string]::IsNullOrWhiteSpace($script:LogFile)) { return }
     try {
         $logDir = Split-Path -Parent $script:LogFile
@@ -335,6 +366,275 @@ function Write-ResultAndExit {
     $json = ConvertTo-SingleJsonLine -InputObject $Result
     Write-Output $json
     exit $Result.exitCode
+}
+
+function Reset-LapsResult {
+    $Result.success             = $false
+    $Result.computerName        = $null
+    $Result.account             = $null
+    $Result.loginName           = $null
+    $Result.password            = $null
+    $Result.passwordLastUpdated = $null
+    $Result.passwordExpires     = $null
+    $Result.primaryUser         = $null
+    $Result.warnings            = New-Object System.Collections.Generic.List[string]
+    $Result.error               = $null
+    $Result.exitCode            = 9
+}
+
+function Test-ShouldUseInteractiveUi {
+    if ($NonInteractive -or $SelfTest) { return $false }
+    if ($Interactive) { return $true }
+    if (-not [string]::IsNullOrWhiteSpace($ComputerName)) { return $false }
+    if (-not [Environment]::UserInteractive) { return $false }
+    return $true
+}
+
+function Write-Banner {
+    param([string[]]$Lines)
+    $rule = ('=' * 78)
+    Write-Host ''
+    Write-Host $rule -ForegroundColor Cyan
+    foreach ($line in $Lines) {
+        Write-Host ("  {0}" -f $line) -ForegroundColor Cyan
+    }
+    Write-Host $rule -ForegroundColor Cyan
+    Write-Host ''
+}
+
+function Read-RawInput {
+    param([Parameter(Mandatory = $true)][string]$PromptText)
+    try {
+        return Read-Host $PromptText
+    }
+    catch {
+        Write-Host "$PromptText " -NoNewline
+        try { $line = [Console]::In.ReadLine() } catch { $line = '' }
+        if ($null -eq $line) { return '' }
+        return $line
+    }
+}
+
+function Read-Prompt {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [string]$Default
+    )
+    $suffix = if ($PSBoundParameters.ContainsKey('Default') -and -not [string]::IsNullOrWhiteSpace($Default)) {
+        " [$Default]"
+    } else { '' }
+    $raw = Read-RawInput -PromptText ($Message + $suffix)
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        if ($PSBoundParameters.ContainsKey('Default')) { return $Default }
+        return ''
+    }
+    return $raw.Trim()
+}
+
+function Read-YesNo {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [bool]$Default = $true
+    )
+    $hint = if ($Default) { 'Y/n' } else { 'y/N' }
+    while ($true) {
+        $raw = Read-RawInput -PromptText "$Message [$hint]"
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $Default }
+        switch -Regex ($raw.Trim()) {
+            '^(y|yes)$' { return $true }
+            '^(n|no)$'  { return $false }
+            default     { Write-Host '  Please enter Y or N.' -ForegroundColor Yellow }
+        }
+    }
+}
+
+function Copy-TextToClipboard {
+    param([Parameter(Mandatory = $true)][string]$Text)
+    try {
+        Set-Clipboard -Value $Text -ErrorAction Stop
+        return $true
+    } catch { }
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        [System.Windows.Forms.Clipboard]::SetText($Text)
+        return $true
+    } catch { }
+    return $false
+}
+
+function Format-DisplayTime {
+    param($Value)
+    if ($null -eq $Value -or "$Value" -eq '') { return '(none)' }
+    try {
+        return ([datetime]$Value).ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss')
+    } catch {
+        $iso = ConvertTo-IsoString $Value
+        if ($iso) { return $iso }
+        return '(none)'
+    }
+}
+
+function Write-LabeledValue {
+    param([string]$Label, [string]$Value, [ConsoleColor]$ValueColor = 'White')
+    $text = if ([string]::IsNullOrWhiteSpace($Value)) { '(none)' } else { $Value }
+    Write-Host ('  {0,-22}' -f "${Label}:") -NoNewline -ForegroundColor DarkGray
+    Write-Host $text -ForegroundColor $ValueColor
+}
+
+function Show-LapsResult {
+    Write-Host ''
+    if ($Result.success) {
+        Write-Host '  LAPS password retrieved' -ForegroundColor Green
+        Write-LabeledValue 'Computer' $Result.computerName 'Cyan'
+        Write-LabeledValue 'Account' $Result.account
+        Write-LabeledValue 'Logon as' $Result.loginName 'Cyan'
+        Write-LabeledValue 'Password' $Result.password 'Yellow'
+        Write-LabeledValue 'Last updated' (Format-DisplayTime $Result.passwordLastUpdated)
+        Write-LabeledValue 'Expires / refreshes' (Format-DisplayTime $Result.passwordExpires)
+        Write-LabeledValue 'Intune primary user' $Result.primaryUser
+    }
+    else {
+        Write-Host '  Lookup failed' -ForegroundColor Red
+        if ($Result.computerName) { Write-LabeledValue 'Computer' $Result.computerName 'Cyan' }
+        Write-LabeledValue 'Error' $Result.error 'Red'
+        Write-LabeledValue 'Exit code' ([string]$Result.exitCode)
+    }
+    foreach ($warning in @($Result.warnings)) {
+        if (-not [string]::IsNullOrWhiteSpace($warning)) {
+            Write-Host ("  WARNING: {0}" -f $warning) -ForegroundColor Yellow
+        }
+    }
+    Write-Host ''
+}
+
+function Invoke-LapsCheckout {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [string]$Requester
+    )
+
+    Reset-LapsResult
+    $normalized              = Get-NormalizedComputerName -Name $Name
+    $script:NormalizedName   = $normalized
+    $Result.computerName     = $normalized
+
+    Write-Log "Request started. Requester=$Requester; RunAs=$env:USERDOMAIN\$env:USERNAME"
+
+    if (-not $script:GraphConnected) {
+        Connect-GraphAppOnly
+    }
+
+    $device = Get-IntuneDevice -Name $normalized
+    if (-not $device) {
+        throw (New-LapsError "$normalized was not found in Intune." 3)
+    }
+
+    $os            = [string](Get-NotePropertyValue $device 'operatingSystem')
+    $entraDeviceId = [string](Get-NotePropertyValue $device 'azureADDeviceId')
+    $Result.primaryUser = Get-NotePropertyValue $device 'userPrincipalName'
+    Write-Log "Intune device found. IntuneId=$(Get-NotePropertyValue $device 'id'); EntraDeviceId=$entraDeviceId; OS=$os; PrimaryUser=$($Result.primaryUser)"
+
+    if ($os -and $os -notmatch 'Windows') {
+        throw (New-LapsError "$normalized is enrolled in Intune as '$os'. Windows LAPS is only available on Windows devices." 4)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Requester) -and -not (Test-SameUpn $Result.primaryUser $Requester)) {
+        throw (New-LapsError "Requester '$Requester' is not the primary user of $normalized." 5)
+    }
+
+    if ([string]::IsNullOrWhiteSpace($entraDeviceId) -or $entraDeviceId -eq $EmptyGuid) {
+        throw (New-LapsError "The Intune record for $normalized has no Entra device ID." 4)
+    }
+
+    $cred = Get-EntraLapsCredential -DeviceId $entraDeviceId
+    if (-not $cred) {
+        throw (New-LapsError "No LAPS password is backed up to Entra ID for $normalized. Confirm a Windows LAPS policy is assigned and the device has checked in." 4)
+    }
+
+    $Result.success             = $true
+    $Result.account             = $cred.Account
+    $Result.loginName           = ".\$($cred.Account)"
+    $Result.password            = $cred.Password
+    $Result.passwordLastUpdated = ConvertTo-IsoString $cred.PasswordUpdated
+    $Result.passwordExpires     = ConvertTo-IsoString $cred.Expiration
+    $Result.exitCode            = 0
+    Write-Log "Password retrieved for account '$($cred.Account)'."
+}
+
+function Set-LapsFailure {
+    param($ErrorRecord)
+    $code = Get-ErrorExitCode -ErrorRecord $ErrorRecord -Default 9
+    $Result.success  = $false
+    $Result.password = $null
+    $Result.error    = $ErrorRecord.Exception.Message
+    $Result.exitCode = $code
+    $lineNo = $null
+    try { $lineNo = $ErrorRecord.InvocationInfo.ScriptLineNumber } catch { }
+    Write-Log ("Failed (exit {0}) at line {1}: {2}" -f $code, $lineNo, $ErrorRecord.Exception.Message) 'ERROR'
+}
+
+function Invoke-InteractiveCheckout {
+    Write-Banner @(
+        'Windows LAPS checkout  (Entra ID / Intune)'
+        'App-only certificate authentication  |  password is never written to the log'
+        'Enter a computer name, or Q to quit'
+    )
+
+    try {
+        Connect-GraphAppOnly
+        Write-Host '  Connected to Microsoft Graph.' -ForegroundColor Green
+        Write-Host ''
+        $Result.exitCode = 0
+    }
+    catch {
+        Set-LapsFailure $_
+        Show-LapsResult
+        [void](Read-RawInput -PromptText 'Press Enter to exit')
+        return
+    }
+
+    $prefill = $ComputerName
+    while ($true) {
+        $nameInput = $prefill
+        $prefill = $null
+        if ([string]::IsNullOrWhiteSpace($nameInput)) {
+            $nameInput = Read-Prompt -Message 'Computer name'
+        }
+        if ($nameInput -match '^(q|quit|exit)$') {
+            Write-Host '  Done.' -ForegroundColor DarkGray
+            break
+        }
+        if ([string]::IsNullOrWhiteSpace($nameInput)) {
+            Write-Host '  Enter a computer name, or Q to quit.' -ForegroundColor Yellow
+            continue
+        }
+
+        try {
+            Invoke-LapsCheckout -Name $nameInput -Requester $RequesterUpn
+        }
+        catch {
+            Set-LapsFailure $_
+        }
+
+        Show-LapsResult
+
+        if ($Result.success -and -not [string]::IsNullOrWhiteSpace($Result.password)) {
+            if (Read-YesNo -Message 'Copy password to clipboard?' -Default $true) {
+                if (Copy-TextToClipboard -Text $Result.password) {
+                    Write-Host '  Password copied to the clipboard.' -ForegroundColor Green
+                }
+                else {
+                    Write-Host '  Could not copy to the clipboard. Copy it from the line above.' -ForegroundColor Yellow
+                }
+            }
+        }
+
+        if (-not (Read-YesNo -Message 'Look up another device?' -Default $true)) {
+            Write-Host '  Done.' -ForegroundColor DarkGray
+            break
+        }
+        Write-Host ''
+    }
 }
 
 #endregion
@@ -803,6 +1103,12 @@ function Invoke-SelfTest {
         catch { Assert-Equal (Get-ErrorExitCode $_) 3 'wrapped exit' }
     }
 
+    Invoke-Case 'SelfTest and -ComputerName stay on the JSON path' {
+        if (Test-ShouldUseInteractiveUi) {
+            throw 'SelfTest must not open the interactive UI.'
+        }
+    }
+
     $Result.computerName = 'SELFTEST'
     $Result.account      = 'ContosoLocalAdminAccount'
     $Result.loginName    = '.\ContosoLocalAdminAccount'
@@ -817,81 +1123,33 @@ function Invoke-SelfTest {
 
 #region ### 6. MAIN ------------------------------------------------------------
 
+$script:InteractiveMode = Test-ShouldUseInteractiveUi
+
 try {
     if ($SelfTest) {
         Invoke-SelfTest
     }
+    elseif ($script:InteractiveMode) {
+        Invoke-InteractiveCheckout
+    }
     else {
-        # 1. Validate and normalise input (also prevents OData filter injection)
         if ([string]::IsNullOrWhiteSpace($ComputerName)) {
-            throw (New-LapsError '-ComputerName is required.' 1)
+            throw (New-LapsError '-ComputerName is required. Run without parameters for the interactive prompt, or pass -ComputerName for JSON output.' 1)
         }
-        $name                  = Get-NormalizedComputerName -Name $ComputerName
-        $script:NormalizedName = $name
-        $ComputerName          = $name
-        $Result.computerName   = $name
-
-        Write-Log "Request started. Requester=$RequesterUpn; RunAs=$env:USERDOMAIN\$env:USERNAME"
-
-        # 2. Connect and find the device in Intune
-        Connect-GraphAppOnly
-        $device = Get-IntuneDevice -Name $name
-        if (-not $device) {
-            throw (New-LapsError "$name was not found in Intune." 3)
-        }
-
-        $os            = [string](Get-NotePropertyValue $device 'operatingSystem')
-        $entraDeviceId = [string](Get-NotePropertyValue $device 'azureADDeviceId')
-        $Result.primaryUser = Get-NotePropertyValue $device 'userPrincipalName'
-        Write-Log "Intune device found. IntuneId=$(Get-NotePropertyValue $device 'id'); EntraDeviceId=$entraDeviceId; OS=$os; PrimaryUser=$($Result.primaryUser)"
-
-        if ($os -and $os -notmatch 'Windows') {
-            throw (New-LapsError "$name is enrolled in Intune as '$os'. Windows LAPS is only available on Windows devices." 4)
-        }
-
-        # 3. Optional ownership check
-        if (-not [string]::IsNullOrWhiteSpace($RequesterUpn) -and -not (Test-SameUpn $Result.primaryUser $RequesterUpn)) {
-            throw (New-LapsError "Requester '$RequesterUpn' is not the primary user of $name." 5)
-        }
-
-        # 4. Read the LAPS password from Entra ID (id == Entra device.deviceId / Intune azureADDeviceId)
-        if ([string]::IsNullOrWhiteSpace($entraDeviceId) -or $entraDeviceId -eq $EmptyGuid) {
-            throw (New-LapsError "The Intune record for $name has no Entra device ID." 4)
-        }
-
-        $cred = Get-EntraLapsCredential -DeviceId $entraDeviceId
-        if (-not $cred) {
-            throw (New-LapsError "No LAPS password is backed up to Entra ID for $name. Confirm a Windows LAPS policy is assigned and the device has checked in." 4)
-        }
-
-        # 5. Success
-        $Result.success             = $true
-        $Result.account             = $cred.Account
-        $Result.loginName           = ".\$($cred.Account)"
-        $Result.password            = $cred.Password
-        $Result.passwordLastUpdated = ConvertTo-IsoString $cred.PasswordUpdated
-        $Result.passwordExpires     = ConvertTo-IsoString $cred.Expiration
-        $Result.exitCode            = 0
-
-        Write-Log "Password retrieved for account '$($cred.Account)'."
+        Invoke-LapsCheckout -Name $ComputerName -Requester $RequesterUpn
     }
 }
 catch {
-    $code = Get-ErrorExitCode -ErrorRecord $_ -Default 9
-
-    $Result.success  = $false
-    $Result.password = $null
-    $Result.error    = $_.Exception.Message
-    $Result.exitCode = $code
-
-    $lineNo = $null
-    try { $lineNo = $_.InvocationInfo.ScriptLineNumber } catch { }
-    Write-Log ("Failed (exit {0}) at line {1}: {2}" -f $code, $lineNo, $_.Exception.Message) 'ERROR'
+    Set-LapsFailure $_
 }
 finally {
     if ($script:GraphConnected) {
         try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { }
     }
+}
+
+if ($script:InteractiveMode -and -not $SelfTest) {
+    exit $Result.exitCode
 }
 
 Write-ResultAndExit
