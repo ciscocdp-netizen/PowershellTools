@@ -105,6 +105,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+} catch { }
 
 #region ### 1. CONFIGURATION ###################################################
 
@@ -116,15 +119,20 @@ $DefaultCertificateThumbprint = 'CA226E648AE75DEFEE298111D8DC4A1E33E34A3B'
 $GraphBase    = 'https://graph.microsoft.com/v1.0'
 $EmptyGuid    = '00000000-0000-0000-0000-000000000000'
 $ClientName   = 'ServiceNow-LAPS-Checkout'
-$ClientVer    = '1.2'
+$ClientVer    = '1.3'
 
 $script:GraphConnected  = $false
+$script:UsedMgGraph     = $false
 $script:LogFile         = $LogPath
 $script:NormalizedName  = $null
 $script:TenantId        = $null
 $script:ClientId        = $null
 $script:CertificateThumbprint = $null
 $script:InteractiveMode = $false
+$script:GraphAccessToken = $null
+$script:GraphTokenExpires = [datetime]::MinValue
+$script:GraphTokenRoles = @()
+$script:SigningCertificate = $null
 
 $Result = [ordered]@{
     success             = $false
@@ -725,53 +733,294 @@ function Get-RetryAfterSeconds {
     return $fallback
 }
 
+function ConvertTo-Base64Url {
+    param([Parameter(Mandatory = $true)][byte[]]$Bytes)
+    $b64 = [Convert]::ToBase64String($Bytes)
+    return (($b64.TrimEnd('=') -replace '\+', '-') -replace '/', '_')
+}
+
+function ConvertTo-JwtJson {
+    <# Built by hand so ConvertTo-Json cannot turn https:// into https:\/\/ (invalid JWT aud). #>
+    param([Parameter(Mandatory = $true)][System.Collections.IDictionary]$Map)
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($key in $Map.Keys) {
+        $val = $Map[$key]
+        if ($val -is [int] -or $val -is [long] -or $val -is [double]) {
+            [void]$parts.Add(('"{0}":{1}' -f $key, $val))
+        }
+        else {
+            $escaped = ([string]$val).Replace('\', '\\').Replace('"', '\"')
+            [void]$parts.Add(('"{0}":"{1}"' -f $key, $escaped))
+        }
+    }
+    return ('{' + ($parts -join ',') + '}')
+}
+
+function Get-JwtPayloadObject {
+    param([string]$Jwt)
+    if ([string]::IsNullOrWhiteSpace($Jwt)) { return $null }
+    $parts = $Jwt.Split('.')
+    if ($parts.Count -lt 2) { return $null }
+    try {
+        $payload = $parts[1].Replace('-', '+').Replace('_', '/')
+        switch ($payload.Length % 4) {
+            2 { $payload += '==' }
+            3 { $payload += '=' }
+        }
+        $json = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload))
+        return ($json | ConvertFrom-Json)
+    } catch {
+        return $null
+    }
+}
+
+function Get-GraphTokenRoles {
+    param([string]$Jwt)
+    $payload = Get-JwtPayloadObject -Jwt $Jwt
+    if ($null -eq $payload) { return @() }
+    $roles = Get-NotePropertyValue $payload 'roles'
+    if ($null -eq $roles) { $roles = Get-NotePropertyValue $payload 'scp' }
+    if ($null -eq $roles) { return @() }
+    if ($roles -is [string]) { return @($roles -split '[, ]+' | Where-Object { $_ }) }
+    return @($roles | ForEach-Object { "$_" } | Where-Object { $_ })
+}
+
+function Get-HttpExceptionBody {
+    param($ErrorRecord)
+    try {
+        $resp = $null
+        if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) {
+            $resp = $ErrorRecord.Exception.Response
+            if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+                return [string]$ErrorRecord.ErrorDetails.Message
+            }
+        }
+        elseif ($ErrorRecord.Response) {
+            $resp = $ErrorRecord.Response
+        }
+        if ($resp -and $resp.GetResponseStream) {
+            $stream = $resp.GetResponseStream()
+            if ($stream) {
+                $reader = New-Object System.IO.StreamReader($stream)
+                $body = $reader.ReadToEnd()
+                if ($body) { return $body }
+            }
+        }
+    } catch { }
+    if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) {
+        return [string]$ErrorRecord.Exception.Message
+    }
+    return [string]$ErrorRecord.Message
+}
+
+function New-GraphUnauthorizedError {
+    param([string]$Uri, [string]$Detail)
+    $roleText = if (@($script:GraphTokenRoles).Count -gt 0) {
+        $script:GraphTokenRoles -join ', '
+    } else {
+        '(none — grant APPLICATION permissions with admin consent)'
+    }
+    $msg = "Graph returned 401 Unauthorized for $Uri. Token roles: $roleText. $Detail Confirm app $($script:ClientId) has certificate $($script:CertificateThumbprint) uploaded, and that DeviceManagementManagedDevices.Read.All plus DeviceLocalCredential.Read.All are APPLICATION permissions with admin consent."
+    return (New-LapsError $msg 2)
+}
+
+function ConvertTo-RsaPrivateKey {
+    param($Certificate)
+    try {
+        $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($Certificate)
+        if ($rsa) { return $rsa }
+    } catch { }
+    try {
+        if ($Certificate.PrivateKey -is [System.Security.Cryptography.RSA]) {
+            return $Certificate.PrivateKey
+        }
+    } catch { }
+    return $null
+}
+
+function New-EntraClientAssertion {
+    param(
+        [Parameter(Mandatory = $true)]$Certificate,
+        [Parameter(Mandatory = $true)][string]$ClientId,
+        [Parameter(Mandatory = $true)][string]$TokenEndpoint
+    )
+
+    $rsa = ConvertTo-RsaPrivateKey -Certificate $Certificate
+    if (-not $rsa) {
+        throw (New-LapsError "Certificate $($Certificate.Thumbprint) has a private key listed, but it cannot be used to sign a token. Grant $($env:USERDOMAIN)\$($env:USERNAME) Read on the private key (certlm.msc -> All Tasks -> Manage Private Keys)." 2)
+    }
+
+    $headerJson = ConvertTo-JwtJson -Map ([ordered]@{
+        alg = 'RS256'
+        typ = 'JWT'
+        x5t = (ConvertTo-Base64Url -Bytes $Certificate.GetCertHash())
+    })
+
+    $now = [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $payloadJson = ConvertTo-JwtJson -Map ([ordered]@{
+        aud = $TokenEndpoint
+        iss = $ClientId
+        sub = $ClientId
+        jti = [guid]::NewGuid().ToString()
+        nbf = $now
+        iat = $now
+        exp = ($now + 600)
+    })
+
+    $toSign = '{0}.{1}' -f (ConvertTo-Base64Url -Bytes ([Text.Encoding]::UTF8.GetBytes($headerJson))), (ConvertTo-Base64Url -Bytes ([Text.Encoding]::UTF8.GetBytes($payloadJson)))
+    $signature = $rsa.SignData(
+        [Text.Encoding]::UTF8.GetBytes($toSign),
+        [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+        [System.Security.Cryptography.RSASignaturePadding]::Pkcs1
+    )
+    return '{0}.{1}' -f $toSign, (ConvertTo-Base64Url -Bytes $signature)
+}
+
+function Get-GraphAppOnlyToken {
+    param(
+        [Parameter(Mandatory = $true)]$Certificate,
+        [Parameter(Mandatory = $true)][string]$TenantId,
+        [Parameter(Mandatory = $true)][string]$ClientId
+    )
+
+    $tokenEndpoint = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
+    $assertion = New-EntraClientAssertion -Certificate $Certificate -ClientId $ClientId -TokenEndpoint $tokenEndpoint
+    $body = @{
+        client_id             = $ClientId
+        client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+        client_assertion      = $assertion
+        scope                 = 'https://graph.microsoft.com/.default'
+        grant_type            = 'client_credentials'
+    }
+
+    try {
+        $irParams = @{
+            Uri         = $tokenEndpoint
+            Method      = 'POST'
+            Body        = $body
+            ErrorAction = 'Stop'
+        }
+        $cmd = Get-Command Invoke-RestMethod
+        if ($cmd.Parameters.ContainsKey('UseBasicParsing')) {
+            $irParams['UseBasicParsing'] = $true
+        }
+        $tokenResponse = Invoke-RestMethod @irParams
+    }
+    catch {
+        $detail = Get-HttpExceptionBody -ErrorRecord $_
+        throw (New-LapsError "Azure AD token request failed: $detail Confirm the certificate is uploaded to app $ClientId (Certificates & secrets) and that $env:USERDOMAIN\$env:USERNAME can sign with the private key." 2)
+    }
+
+    $accessToken = Get-NotePropertyValue $tokenResponse 'access_token'
+    if ([string]::IsNullOrWhiteSpace($accessToken)) {
+        throw (New-LapsError 'Azure AD token response did not include access_token.' 2)
+    }
+
+    $expiresIn = 3599
+    try {
+        $rawExpires = Get-NotePropertyValue $tokenResponse 'expires_in'
+        if ($rawExpires) { $expiresIn = [int]$rawExpires }
+    } catch { }
+
+    $script:GraphAccessToken  = $accessToken
+    $script:GraphTokenExpires = (Get-Date).ToUniversalTime().AddSeconds([math]::Max(60, $expiresIn - 120))
+    $script:GraphTokenRoles   = @(Get-GraphTokenRoles -Jwt $accessToken)
+    return $accessToken
+}
+
+function Get-TokenFromMgGraphSession {
+    $paths = @(
+        { [Microsoft.Graph.PowerShell.Authentication.GraphSession]::Instance.AuthContext.LastAuthResult.AccessToken },
+        { [Microsoft.Graph.PowerShell.Authentication.GraphSession]::Instance.AuthContext.LastAuthenticationResult.AccessToken },
+        { [Microsoft.Graph.PowerShell.Authentication.GraphSession]::Instance.AuthContext.AccessToken }
+    )
+    foreach ($getter in $paths) {
+        try {
+            $token = & $getter
+            if (-not [string]::IsNullOrWhiteSpace([string]$token)) { return [string]$token }
+        } catch { }
+    }
+    return $null
+}
+
 function Get-GraphRequestHeaders {
-    return @{
+    param([switch]$IncludeAuthorization)
+
+    $headers = @{
         'User-Agent'         = "$ClientName/$ClientVer"
         'ocp-client-name'    = $ClientName
         'ocp-client-version' = $ClientVer
         'client-request-id'  = [guid]::NewGuid().ToString()
+        'Accept'             = 'application/json'
     }
+    if ($IncludeAuthorization -and -not [string]::IsNullOrWhiteSpace($script:GraphAccessToken)) {
+        $headers['Authorization'] = "Bearer $($script:GraphAccessToken)"
+    }
+    return $headers
 }
 
 function Invoke-GraphGet {
     <# GET with retry on throttling/transient errors. Returns $null on 404. #>
     param([string]$Uri, [int]$MaxAttempts = 4)
 
-    $graphCmd = Get-Command Invoke-MgGraphRequest -ErrorAction Stop
+    if ($script:GraphAccessToken -and ((Get-Date).ToUniversalTime() -gt $script:GraphTokenExpires) -and $script:SigningCertificate) {
+        Write-Log 'Graph access token is near expiry; requesting a new one.'
+        [void](Get-GraphAppOnlyToken -Certificate $script:SigningCertificate -TenantId $script:TenantId -ClientId $script:ClientId)
+    }
 
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
-        $headers = Get-GraphRequestHeaders
-        $irParams = @{
-            Method      = 'GET'
-            Uri         = $Uri
-            ErrorAction = 'Stop'
-        }
-        if ($graphCmd.Parameters.ContainsKey('Headers')) {
-            $irParams['Headers'] = $headers
-        }
-        if ($graphCmd.Parameters.ContainsKey('OutputType')) {
-            $irParams['OutputType'] = 'PSObject'
-        }
-
         try {
-            return Invoke-MgGraphRequest @irParams
+            if ($script:GraphAccessToken) {
+                $irParams = @{
+                    Uri         = $Uri
+                    Method      = 'GET'
+                    Headers     = (Get-GraphRequestHeaders -IncludeAuthorization)
+                    ErrorAction = 'Stop'
+                }
+                $cmd = Get-Command Invoke-RestMethod
+                if ($cmd.Parameters.ContainsKey('UseBasicParsing')) {
+                    $irParams['UseBasicParsing'] = $true
+                }
+                return Invoke-RestMethod @irParams
+            }
+
+            # Fallback: Microsoft Graph SDK, with NO custom headers.
+            # Passing -Headers without Authorization drops the bearer token and Graph returns 401.
+            $graphCmd = Get-Command Invoke-MgGraphRequest -ErrorAction Stop
+            $mgParams = @{
+                Method      = 'GET'
+                Uri         = $Uri
+                ErrorAction = 'Stop'
+            }
+            if ($graphCmd.Parameters.ContainsKey('OutputType')) {
+                $mgParams['OutputType'] = 'PSObject'
+            }
+            return Invoke-MgGraphRequest @mgParams
         }
         catch {
             $status = Get-GraphStatusCode -ErrorRecord $_
+            $body   = Get-HttpExceptionBody -ErrorRecord $_
 
             if ($status -eq 404) { return $null }
             if ($status -eq 401) {
-                throw (New-LapsError "Graph returned 401 Unauthorized for $Uri. Confirm the certificate is uploaded to the app registration and that the MID Server account can read the private key." 2)
+                $hint = 'The Graph SDK -Headers parameter was sending this request without a bearer token; the script now attaches the token itself.'
+                if ($body -match 'Access token is empty') {
+                    $hint = 'Graph said the access token is empty (the request had no Authorization header).'
+                }
+                elseif ($body) {
+                    $hint = $body
+                }
+                throw (New-GraphUnauthorizedError -Uri $Uri -Detail $hint)
             }
             if ($status -eq 403) {
-                throw (New-LapsError "Graph returned 403 Forbidden for $Uri. Check that the app registration has DeviceManagementManagedDevices.Read.All and DeviceLocalCredential.Read.All with admin consent." 2)
+                $roleText = if (@($script:GraphTokenRoles).Count -gt 0) { $script:GraphTokenRoles -join ', ' } else { '(none)' }
+                throw (New-LapsError "Graph returned 403 Forbidden for $Uri. Token roles: $roleText. DeviceManagementManagedDevices.Read.All and DeviceLocalCredential.Read.All must be APPLICATION permissions with admin consent. $body" 2)
             }
 
             $transient = $status -in 429, 500, 502, 503, 504
             if (-not $transient -or $attempt -eq $MaxAttempts) {
                 if ($status -gt 0) {
-                    throw (New-LapsError "Graph GET failed (HTTP $status) for $Uri : $($_.Exception.Message)" 9)
+                    throw (New-LapsError "Graph GET failed (HTTP $status) for $Uri : $body" 9)
                 }
                 throw
             }
@@ -846,11 +1095,6 @@ function Connect-GraphAppOnly {
         }
     }
 
-    if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
-        throw (New-LapsError 'PowerShell module Microsoft.Graph.Authentication is not installed on this server.' 2)
-    }
-    Import-Module Microsoft.Graph.Authentication -ErrorAction Stop | Out-Null
-
     # Strip spaces and the invisible character that certlm.msc adds when copying a thumbprint
     $thumb = ($script:CertificateThumbprint -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
     if ($thumb.Length -ne 40) {
@@ -876,6 +1120,39 @@ function Connect-GraphAppOnly {
         Add-Warning "Graph authentication certificate expires on $($cert.NotAfter.ToString('yyyy-MM-dd')). Renew it soon."
     }
 
+    $script:SigningCertificate = $cert
+
+    # Preferred path: sign a client assertion and call the token endpoint ourselves.
+    # Invoke-MgGraphRequest -Headers drops the bearer token in several SDK versions (HTTP 401, "Access token is empty").
+    $tokenError = $null
+    try {
+        [void](Get-GraphAppOnlyToken -Certificate $cert -TenantId $script:TenantId -ClientId $script:ClientId)
+        $script:GraphConnected = $true
+        $roleText = if (@($script:GraphTokenRoles).Count -gt 0) { $script:GraphTokenRoles -join ', ' } else { '(none listed)' }
+        Write-Log "Connected to Graph as app $($script:ClientId) using certificate $thumb. Token roles: $roleText."
+        foreach ($perm in @('DeviceManagementManagedDevices.Read.All', 'DeviceLocalCredential.Read.All')) {
+            if (@($script:GraphTokenRoles).Count -gt 0 -and ($script:GraphTokenRoles -notcontains $perm)) {
+                Write-Log "Token does not list application permission '$perm'. Confirm admin consent on the app registration." 'WARN'
+            }
+        }
+        return
+    }
+    catch {
+        if ($_.Exception.Data -and $_.Exception.Data.Contains('ExitCode')) {
+            $tokenError = $_.Exception.Message
+            Write-Log "Direct token request failed; trying Microsoft.Graph.Authentication. $($_.Exception.Message)" 'WARN'
+        }
+        else {
+            $tokenError = $_.Exception.Message
+            Write-Log "Direct token request failed; trying Microsoft.Graph.Authentication. $tokenError" 'WARN'
+        }
+    }
+
+    if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
+        $extra = if ($tokenError) { " Direct token request: $tokenError" } else { '' }
+        throw (New-LapsError "Could not get a Graph token with the certificate, and Microsoft.Graph.Authentication is not installed.$extra" 2)
+    }
+    Import-Module Microsoft.Graph.Authentication -ErrorAction Stop | Out-Null
     try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { }
 
     $connectCmd    = Get-Command Connect-MgGraph -ErrorAction Stop
@@ -887,53 +1164,40 @@ function Connect-GraphAppOnly {
     if ($connectCmd.Parameters.ContainsKey('NoWelcome')) {
         $connectParams['NoWelcome'] = $true
     }
+    # CertificateThumbprint is more reliable than -Certificate for actually acquiring a token.
+    if ($connectCmd.Parameters.ContainsKey('CertificateThumbprint')) {
+        $connectParams['CertificateThumbprint'] = $thumb
+    }
+    elseif ($connectCmd.Parameters.ContainsKey('Certificate')) {
+        $connectParams['Certificate'] = $cert
+    }
+    else {
+        throw (New-LapsError 'This version of Microsoft.Graph.Authentication does not support certificate authentication.' 2)
+    }
 
     try {
-        if ($connectCmd.Parameters.ContainsKey('Certificate')) {
-            $connectParams['Certificate'] = $cert
-            Connect-MgGraph @connectParams | Out-Null
-        }
-        elseif ($connectCmd.Parameters.ContainsKey('CertificateThumbprint')) {
-            $connectParams['CertificateThumbprint'] = $thumb
-            Connect-MgGraph @connectParams | Out-Null
-        }
-        else {
-            throw (New-LapsError 'This version of Microsoft.Graph.Authentication does not support certificate authentication.' 2)
-        }
+        Connect-MgGraph @connectParams | Out-Null
     }
     catch {
-        if ($_.Exception.Data -and $_.Exception.Data.Contains('ExitCode')) { throw }
-        $fallback = $null
-        if ($connectParams.ContainsKey('Certificate') -and $connectCmd.Parameters.ContainsKey('CertificateThumbprint')) {
-            try {
-                $connectParams.Remove('Certificate')
-                $connectParams['CertificateThumbprint'] = $thumb
-                Connect-MgGraph @connectParams | Out-Null
-                $fallback = $true
-            } catch {
-                $fallback = $false
-            }
-        }
-        if (-not $fallback) {
-            throw (New-LapsError ("Microsoft Graph authentication failed: {0} Confirm the certificate is uploaded to the app registration and that {1} can read its private key." -f $_.Exception.Message, $runAs) 2)
-        }
+        throw (New-LapsError ("Microsoft Graph authentication failed: {0} Confirm the certificate is uploaded to the app registration and that {1} can read its private key." -f $_.Exception.Message, $runAs) 2)
     }
 
     $ctx = Get-MgContext
     if (-not $ctx -or (Get-NotePropertyValue $ctx 'AuthType') -ne 'AppOnly') {
         throw (New-LapsError 'Graph connection did not establish an app-only session.' 2)
     }
+    $script:UsedMgGraph    = $true
     $script:GraphConnected = $true
 
-    $granted = @()
-    foreach ($scope in @((Get-NotePropertyValue $ctx 'Scopes'))) {
-        if ([string]::IsNullOrWhiteSpace($scope)) { continue }
-        $granted += @($scope -split '[, ]+' | Where-Object { $_ })
+    $extracted = Get-TokenFromMgGraphSession
+    if (-not [string]::IsNullOrWhiteSpace($extracted)) {
+        $script:GraphAccessToken  = $extracted
+        $script:GraphTokenExpires = (Get-Date).ToUniversalTime().AddMinutes(45)
+        $script:GraphTokenRoles   = @(Get-GraphTokenRoles -Jwt $extracted)
+        Write-Log "Using access token from Microsoft.Graph session. Token roles: $($script:GraphTokenRoles -join ', ')."
     }
-    foreach ($perm in @('DeviceManagementManagedDevices.Read.All', 'DeviceLocalCredential.Read.All')) {
-        if ($granted.Count -gt 0 -and ($granted -notcontains $perm)) {
-            Write-Log "Token does not list application permission '$perm'. Confirm admin consent." 'WARN'
-        }
+    else {
+        Write-Log 'Microsoft.Graph session is connected; Graph calls will use Invoke-MgGraphRequest without custom headers (custom headers were causing HTTP 401).'
     }
     Write-Log "Connected to Graph as app $($script:ClientId) using certificate $thumb."
 }
@@ -1109,6 +1373,23 @@ function Invoke-SelfTest {
         }
     }
 
+    Invoke-Case 'JWT JSON does not escape slashes in the token audience' {
+        $json = ConvertTo-JwtJson -Map ([ordered]@{ aud = 'https://login.microsoftonline.com/t/oauth2/v2.0/token'; nbf = 1 })
+        if ($json -match '\\/') { throw "Audience slashes were escaped: $json" }
+        if ($json -notmatch 'https://login.microsoftonline.com') { throw "Audience missing: $json" }
+    }
+
+    Invoke-Case 'JWT payload roles are read from a Graph app-only token' {
+        $header  = ConvertTo-Base64Url -Bytes ([Text.Encoding]::UTF8.GetBytes('{"alg":"none"}'))
+        $payload = ConvertTo-Base64Url -Bytes ([Text.Encoding]::UTF8.GetBytes('{"roles":["DeviceManagementManagedDevices.Read.All","DeviceLocalCredential.Read.All"]}'))
+        $jwt     = "$header.$payload.sig"
+        $roles   = @(Get-GraphTokenRoles -Jwt $jwt)
+        Assert-Equal $roles.Count 2 'role count'
+        if ($roles -notcontains 'DeviceLocalCredential.Read.All') {
+            throw "Expected DeviceLocalCredential.Read.All in $roles"
+        }
+    }
+
     $Result.computerName = 'SELFTEST'
     $Result.account      = 'ContosoLocalAdminAccount'
     $Result.loginName    = '.\ContosoLocalAdminAccount'
@@ -1143,9 +1424,11 @@ catch {
     Set-LapsFailure $_
 }
 finally {
-    if ($script:GraphConnected) {
+    if ($script:UsedMgGraph) {
         try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { }
     }
+    $script:GraphAccessToken = $null
+    $script:SigningCertificate = $null
 }
 
 if ($script:InteractiveMode -and -not $SelfTest) {
