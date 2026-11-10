@@ -51,7 +51,7 @@
     .\PasswordNotRequired-Audit.ps1 -SelfTest
 
 .NOTES
-    Version: 1.1
+    Version: 1.2
     Requires: Windows PowerShell 5.1, RSAT ActiveDirectory module, STA (auto-relaunched).
     Keep PasswordNotRequired-Audit.Gui.ps1 in the same folder as this script.
 #>
@@ -65,7 +65,7 @@ param(
     [switch]$SelfTest
 )
 
-$script:PnrVersion = '1.1'
+$script:PnrVersion = '1.2'
 $script:WinFormsLoaded = $false
 $script:LdapTypesLoaded = $false
 $script:TxtLog = $null
@@ -396,6 +396,50 @@ function Get-AdChangeErrorMessage {
     return $msg
 }
 
+function Get-UnknownAdPropertyName {
+    # Get-ADObject validates -Properties against its property map and throws
+    # ArgumentException with ParamName set to the unknown LDAP name
+    # (e.g. badPwdTime — the real attribute is badPasswordTime).
+    param($ErrorRecord)
+    if ($null -eq $ErrorRecord) { return $null }
+    $ex = $ErrorRecord
+    if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { $ex = $ErrorRecord.Exception }
+    while ($ex) {
+        if ($ex -is [ArgumentException] -and -not [string]::IsNullOrWhiteSpace($ex.ParamName) -and $ex.ParamName -ne 'Properties') {
+            return $ex.ParamName
+        }
+        $msg = [string]$ex.Message
+        if ($msg -match '(?im)Parameter name:\s*(\S+)') {
+            $name = $Matches[1].Trim().TrimEnd('.')
+            if ($name -and $name -ne 'Properties') { return $name }
+        }
+        $ex = $ex.InnerException
+    }
+    return $null
+}
+
+function Get-AdPropertyValue {
+    param($Object, [string[]]$Names)
+    if ($null -eq $Object) { return $null }
+    foreach ($n in $Names) {
+        if ([string]::IsNullOrWhiteSpace($n)) { continue }
+        $prop = $Object.PSObject.Properties[$n]
+        if ($prop -and $null -ne $prop.Value) { return $prop.Value }
+    }
+    return $null
+}
+
+$script:PnrLdapProperties = @(
+    'sAMAccountName', 'displayName', 'description', 'info', 'userAccountControl',
+    'pwdLastSet', 'lastLogonTimestamp', 'lastLogon', 'logonCount', 'badPasswordTime',
+    'badPwdCount', 'accountExpires', 'whenCreated', 'whenChanged', 'memberOf',
+    'adminCount', 'primaryGroupID', 'servicePrincipalName',
+    'msDS-SupportedEncryptionTypes', 'userWorkstations', 'scriptPath',
+    'homeDirectory', 'manager', 'sIDHistory',
+    'msDS-UserPasswordExpiryTimeComputed', 'msDS-ResultantPSO',
+    'objectSid', 'lockoutTime', 'userPrincipalName'
+)
+
 function Get-FilterExpression {
     param([string]$Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
@@ -454,6 +498,13 @@ function Invoke-PnrSelfTest {
 
     $policy = Get-AdChangeErrorMessage 'The password does not meet the length, complexity, or history requirement'
     Ok 'policy-error' ($policy -match 'blank') $true
+
+    $ae = New-Object System.ArgumentException('The specified directory service attribute or value does not exist', 'badPwdTime')
+    Ok 'unknown-prop-name' (Get-UnknownAdPropertyName $ae) 'badPwdTime'
+    Ok 'ldap-has-badPasswordTime' ($script:PnrLdapProperties -contains 'badPasswordTime') $true
+    Ok 'ldap-no-badPwdTime' ($script:PnrLdapProperties -contains 'badPwdTime') $false
+    $probe = [pscustomobject]@{ badPasswordTime = 123; LastBadPasswordAttempt = $null }
+    Ok 'prop-alias-badPasswordTime' (Get-AdPropertyValue $probe @('badPwdTime', 'badPasswordTime', 'LastBadPasswordAttempt')) 123
 
     $tmp = Join-Path ([IO.Path]::GetTempPath()) ('pnr-selftest-' + [guid]::NewGuid().ToString('n'))
     New-Item -Path $tmp -ItemType Directory -Force | Out-Null

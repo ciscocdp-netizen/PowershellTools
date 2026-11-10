@@ -128,21 +128,45 @@ function Get-ObjectMetadata {
     )
 }
 
+function Get-AdObjectWithProperties {
+    # Get-ADObject validates the entire -Properties list up front. One unknown
+    # name (badPwdTime vs badPasswordTime) aborts the lookup. Drop the named
+    # parameter from the error and retry so one schema mismatch cannot fail the account.
+    param($Identity, [string]$Server, [string[]]$Properties)
+
+    $props = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($p in @($Properties)) {
+        if ($p -and -not ($props -contains $p)) { $props.Add($p) }
+    }
+
+    $guard = $props.Count + 2
+    while ($guard-- -gt 0) {
+        try {
+            $splat = @{ Identity = $Identity; Server = $Server; ErrorAction = 'Stop' }
+            if ($props.Count) { $splat.Properties = [string[]]$props.ToArray() }
+            return Get-ADObject @splat
+        }
+        catch {
+            $bad = Get-UnknownAdPropertyName $_
+            if (-not $bad) { throw }
+            $removed = $false
+            for ($i = $props.Count - 1; $i -ge 0; $i--) {
+                if ($props[$i] -ieq $bad) {
+                    $props.RemoveAt($i)
+                    $removed = $true
+                }
+            }
+            if (-not $removed) { throw }
+            Write-Log "  AD property '$bad' is not available via Get-ADObject - skipped" 'Warn'
+        }
+    }
+    throw "Could not read $Identity via $Server after dropping unknown properties."
+}
+
 function Get-PnrAdObject {
     param($Identity, [string]$Server)
 
-    $ldapProps = @(
-        'sAMAccountName', 'displayName', 'description', 'info', 'userAccountControl',
-        'pwdLastSet', 'lastLogonTimestamp', 'lastLogon', 'logonCount', 'badPwdTime',
-        'badPwdCount', 'accountExpires', 'whenCreated', 'whenChanged', 'memberOf',
-        'adminCount', 'primaryGroupID', 'servicePrincipalName',
-        'msDS-SupportedEncryptionTypes', 'userWorkstations', 'scriptPath',
-        'homeDirectory', 'manager', 'sIDHistory',
-        'msDS-UserPasswordExpiryTimeComputed', 'msDS-ResultantPSO',
-        'objectSid', 'lockoutTime', 'userPrincipalName'
-    )
-
-    $o = Get-ADObject -Identity $Identity -Server $Server -Properties $ldapProps -ErrorAction Stop
+    $o = Get-AdObjectWithProperties -Identity $Identity -Server $Server -Properties $script:PnrLdapProperties
     $uac = 0
     try { $uac = [int]$o.userAccountControl } catch { $uac = 0 }
 
@@ -174,8 +198,8 @@ function Get-PnrAdObject {
         lastLogonTimestamp               = $o.lastLogonTimestamp
         lastLogon                        = $o.lastLogon
         logonCount                       = $o.logonCount
-        badPwdTime                       = $o.badPwdTime
-        BadLogonCount                    = $o.badPwdCount
+        badPwdTime                       = (Get-AdPropertyValue $o @('badPasswordTime', 'LastBadPasswordAttempt', 'badPwdTime'))
+        BadLogonCount                    = (Get-AdPropertyValue $o @('badPwdCount', 'BadLogonCount'))
         LockedOut                        = [bool](ConvertFrom-FileTime $o.lockoutTime)
         AccountExpirationDate            = ConvertFrom-FileTime $o.accountExpires
         whenCreated                      = $o.whenCreated
@@ -249,11 +273,11 @@ function Invoke-PnrAccountAudit {
         Invoke-UiDoEvents
         if ($ctx.DeadDCs.Contains($dc)) { $unreachable.Add($dc); continue }
         try {
-            $o  = Get-ADObject -Identity $u.ObjectGUID -Server $dc -Properties lastLogon, logonCount, badPwdTime
+            $o  = Get-AdObjectWithProperties -Identity $u.ObjectGUID -Server $dc -Properties @('lastLogon', 'logonCount', 'badPasswordTime')
             $ll = ConvertFrom-FileTime $o.lastLogon
             if ($ll -and (-not $lastLogon -or $ll -gt $lastLogon)) { $lastLogon = $ll; $lastLogonDc = $dc }
             if ($o.logonCount -gt $logonCount) { $logonCount = [int]$o.logonCount }
-            $bp = ConvertFrom-FileTime $o.badPwdTime
+            $bp = ConvertFrom-FileTime (Get-AdPropertyValue $o @('badPasswordTime', 'LastBadPasswordAttempt', 'badPwdTime'))
             if ($bp -and (-not $badPwdTime -or $bp -gt $badPwdTime)) { $badPwdTime = $bp }
         }
         catch {
