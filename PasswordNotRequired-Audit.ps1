@@ -51,7 +51,7 @@
     .\PasswordNotRequired-Audit.ps1 -SelfTest
 
 .NOTES
-    Version: 1.2
+    Version: 1.3
     Requires: Windows PowerShell 5.1, RSAT ActiveDirectory module, STA (auto-relaunched).
     Keep PasswordNotRequired-Audit.Gui.ps1 in the same folder as this script.
 #>
@@ -65,7 +65,7 @@ param(
     [switch]$SelfTest
 )
 
-$script:PnrVersion = '1.2'
+$script:PnrVersion = '1.3'
 $script:WinFormsLoaded = $false
 $script:LdapTypesLoaded = $false
 $script:TxtLog = $null
@@ -112,10 +112,26 @@ $script:ColumnAliases = @{
         'Object guid', 'ObjectGUID', 'Object GUID', 'GUID', 'objectGuid', 'ObjectGuid'
     )
     SamAccountName = @(
-        'sAMAccountName', 'SamAccountName', 'Name', 'Account', 'sAM Account Name'
+        'sAMAccountName', 'SamAccountName', 'Sam account name', 'sAM Account Name',
+        'Name', 'Account'
     )
     ObjectClass = @(
         'Object class', 'ObjectClass', 'Object Class', 'Class', 'objectClass'
+    )
+    UserAccountControl = @(
+        'User account control', 'UserAccountControl', 'userAccountControl', 'UAC'
+    )
+    ManagedBy = @(
+        'Managed by', 'ManagedBy', 'Manager'
+    )
+    LastChanged = @(
+        'Last changed', 'LastChanged', 'Modified', 'whenChanged', 'When changed'
+    )
+    Created = @(
+        'Created', 'whenCreated', 'When created'
+    )
+    Ignored = @(
+        'Ignored', 'Ignore'
     )
 }
 
@@ -253,6 +269,166 @@ function Clear-PasswdNotReqdBit {
     [int]$new
 }
 
+function Get-PnrAccountCategory {
+    param([string]$Sam, [switch]$IsComputer)
+    if ($IsComputer) { return 'Computer account - confirm whether PASSWD_NOTREQD is still required' }
+    if ([string]::IsNullOrWhiteSpace($Sam)) { return 'Unclassified - confirm owner/purpose' }
+    switch -Regex ($Sam) {
+        '^IUSR_'                 { return 'Legacy IIS 5/6 anonymous web user (auto-created per server)' }
+        '^IWAM_'                 { return 'Legacy IIS 5/6 out-of-process application account (auto-created per server)' }
+        '^MSOL_[0-9a-fA-F]{12}$' { return 'Azure AD / Entra Connect AD DS connector account' }
+        '^AAD_[0-9a-fA-F]{12}$'  { return 'Azure AD Connect sync service account (legacy)' }
+        '^TsInternetUser$'       { return 'Legacy Windows 2000 Terminal Services Internet Connector account' }
+        '^SUPPORT_388945a0$'     { return 'Legacy Help and Support Center account' }
+        '^USbms_'                { return 'Likely Cisco Unity messaging-system mailbox account' }
+        default                  { return 'Unclassified - confirm owner/purpose' }
+    }
+}
+
+function Get-PnrAssociatedServerName {
+    param([string]$Sam)
+    if ($Sam -match '^(IUSR|IWAM|USbms)_(.+)$') { return $Matches[2] }
+    return $null
+}
+
+function ConvertFrom-SemperisUac {
+    param($Value)
+    if ($null -eq $Value -or $Value -eq '') { return $null }
+    if ($Value -is [int] -or $Value -is [int64] -or $Value -is [long]) { return [int]$Value }
+    $text = [string]$Value
+    if ($text -match '^\s*(-?\d+)') {
+        $n = 0
+        if ([int]::TryParse($Matches[1], [ref]$n)) { return $n }
+    }
+    return $null
+}
+
+function Get-PnrCsvRecommendation {
+    param([string]$Sam, [string]$Category, [string]$AssociatedServer, $Enabled)
+    if ($Sam -match '^MSOL_') {
+        return 'Confirm this is the CURRENT AD DS connector account on the Entra Connect server (Synchronization Service Manager > Connectors > AD connector > Properties > Connect to AD forest). If current: clear the flag (no password change, no outage). If not current: disable, then delete after a hold period.'
+    }
+    if ($AssociatedServer) {
+        return "Named after server '$AssociatedServer'. If that host is gone, disable, quarantine, and delete after a hold period. Run the AD audit to confirm whether the computer object still exists."
+    }
+    if ($Sam -match '^(TsInternetUser|SUPPORT_388945a0)$') {
+        return 'Legacy built-in account. Clearing the flag has no operational value; disable and delete after a hold period unless something still depends on it.'
+    }
+    if ($Enabled -eq $false) {
+        return 'Already disabled in the spreadsheet UAC. Clearing the flag has zero impact; consider deleting if no longer required.'
+    }
+    return 'Enabled PASSWD_NOTREQD account. Run the AD audit for last logon, groups and password metadata before changing it.'
+}
+
+function Get-PnrSummaryTemplate {
+    [pscustomobject][ordered]@{
+        SamAccountName             = $null
+        DisplayName                = $null
+        Enabled                    = $null
+        Category                   = $null
+        RiskFlags                  = $null
+        Recommendation             = $null
+        Description                = $null
+        Info                       = $null
+        UserAccountControl         = $null
+        UacFlags                   = $null
+        UacLastChanged             = $null
+        UacChangedOnDC             = $null
+        UacVersion                 = $null
+        BlankPasswordTest          = $null
+        PasswordLastSet            = $null
+        PwdLastSetRaw              = $null
+        PasswordAgeDays            = $null
+        PasswordSetCount_Approx    = $null
+        PasswordWrittenOn          = $null
+        PasswordWrittenByDC        = $null
+        PasswordNeverExpires       = $null
+        CannotChangePassword       = $null
+        FineGrainedPSO             = $null
+        LastLogon_AllDCs           = $null
+        LastLogonDC                = $null
+        LastLogonTimestamp         = $null
+        EffectiveLastLogon         = $null
+        DaysSinceLastLogon         = $null
+        LogonCount_MaxDC           = $null
+        LastBadPasswordTime        = $null
+        BadLogonCount              = $null
+        LockedOut                  = $null
+        AccountExpires             = $null
+        Created                    = $null
+        Modified                   = $null
+        LastChangedAttributes      = $null
+        LastChangedOnDC            = $null
+        DirectGroups               = $null
+        AllGroups_Nested           = $null
+        PrivilegedGroups           = $null
+        AdminCount                 = $null
+        PrimaryGroupID             = $null
+        SPNs                       = $null
+        TrustedForDelegation       = $null
+        TrustedToAuthForDelegation = $null
+        DoesNotRequirePreAuth      = $null
+        ReversibleEncryption       = $null
+        UseDESKeyOnly              = $null
+        SupportedEncryptionTypes   = $null
+        LogonWorkstations          = $null
+        ScriptPath                 = $null
+        HomeDirectory              = $null
+        Manager                    = $null
+        AssociatedServer           = $null
+        AssociatedServerInAD       = $null
+        AssociatedServerInDNS      = $null
+        SIDHistory                 = $null
+        ProtectedFromDeletion      = $null
+        ObjectSID                  = $null
+        ObjectGUID                 = $null
+        DistinguishedName          = $null
+        QueriedDC                  = $null
+        DCsUnreachable             = $null
+    }
+}
+
+function New-PnrStubRecord {
+    param($CsvRow, [string]$LookupError)
+    $sam = [string]$CsvRow.SamAccountName
+    if (-not $sam) { $sam = Get-RdnValue $CsvRow.DistinguishedName }
+    $uac = ConvertFrom-SemperisUac $CsvRow.UserAccountControl
+    $enabled = $null
+    if ($null -ne $uac) { $enabled = -not ($uac -band $script:AccountDisableBit) }
+    $assoc = Get-PnrAssociatedServerName $sam
+    $category = Get-PnrAccountCategory -Sam $sam
+    $flags = New-Object System.Collections.Generic.List[string]
+    if ($LookupError) { $flags.Add('LOOKUP_FAILED') } else { $flags.Add('CSV_ONLY') }
+    if ($enabled -eq $true) { $flags.Add('ENABLED') } elseif ($enabled -eq $false) { $flags.Add('DISABLED') }
+    if ($null -ne $uac -and ($uac -band $script:PasswdNotReqdBit)) { $flags.Add('PASSWD_NOTREQD') }
+    if ($null -ne $uac -and ($uac -band 0x10000)) { $flags.Add('DONT_EXPIRE_PASSWORD') }
+    if ($assoc) { $flags.Add('NAMED_FOR_SERVER') }
+    $rec = Get-PnrSummaryTemplate
+    $rec.SamAccountName     = $sam
+    $rec.Enabled            = $enabled
+    $rec.Category           = $category
+    $rec.RiskFlags          = ($flags -join ', ')
+    $rec.UserAccountControl = $uac
+    $rec.UacFlags           = if ($null -ne $uac) { ConvertTo-UacText $uac } else { $null }
+    $rec.PasswordNeverExpires = if ($null -ne $uac) { [bool]($uac -band 0x10000) } else { $null }
+    $rec.Created            = $CsvRow.Created
+    $rec.Modified           = $CsvRow.LastChanged
+    $rec.Manager            = $CsvRow.ManagedBy
+    $rec.AssociatedServer   = $assoc
+    $rec.ObjectGUID         = $CsvRow.ObjectGuid
+    $rec.DistinguishedName  = $CsvRow.DistinguishedName
+    $rec.BlankPasswordTest  = 'Not tested'
+    if ($LookupError) {
+        $rec.Description     = "AD lookup failed. Showing Semperis CSV values. $LookupError"
+        $rec.Recommendation  = "AD lookup failed: $LookupError Spreadsheet identity is still usable for a retry or for remediation by ObjectGUID."
+    }
+    else {
+        $rec.Description     = 'Loaded from Semperis CSV. Click Run audit to pull live AD replication, logon, group and password metadata.'
+        $rec.Recommendation  = Get-PnrCsvRecommendation -Sam $sam -Category $category -AssociatedServer $assoc -Enabled $enabled
+    }
+    $rec
+}
+
 function Get-RowField {
     param($Row, [string]$LogicalName)
     if ($null -eq $Row) { return '' }
@@ -328,11 +504,18 @@ function Import-PnrCsv {
     foreach ($row in $bestRows) {
         $dn = (Get-RowField -Row $row -LogicalName 'DistinguishedName').Trim().Trim('"')
         if (-not $dn) { continue }
+        $sam = (Get-RowField -Row $row -LogicalName 'SamAccountName').Trim().Trim('"')
+        if (-not $sam) { $sam = Get-RdnValue $dn }
         $out.Add([pscustomobject]@{
-                DistinguishedName = $dn
-                ObjectGuid        = (Get-RowField -Row $row -LogicalName 'ObjectGuid').Trim().Trim('"')
-                SamAccountName    = (Get-RowField -Row $row -LogicalName 'SamAccountName').Trim().Trim('"')
-                ObjectClass       = (Get-RowField -Row $row -LogicalName 'ObjectClass').Trim().Trim('"')
+                DistinguishedName  = $dn
+                ObjectGuid         = (Get-RowField -Row $row -LogicalName 'ObjectGuid').Trim().Trim('"')
+                SamAccountName     = $sam
+                ObjectClass        = (Get-RowField -Row $row -LogicalName 'ObjectClass').Trim().Trim('"')
+                UserAccountControl = (Get-RowField -Row $row -LogicalName 'UserAccountControl').Trim()
+                ManagedBy          = (Get-RowField -Row $row -LogicalName 'ManagedBy').Trim()
+                Created            = (Get-RowField -Row $row -LogicalName 'Created').Trim()
+                LastChanged        = (Get-RowField -Row $row -LogicalName 'LastChanged').Trim()
+                Ignored            = (Get-RowField -Row $row -LogicalName 'Ignored').Trim()
             })
     }
     if ($out.Count -eq 0) { throw "No rows with a distinguished name were found in $Path" }
@@ -506,6 +689,17 @@ function Invoke-PnrSelfTest {
     $probe = [pscustomobject]@{ badPasswordTime = 123; LastBadPasswordAttempt = $null }
     Ok 'prop-alias-badPasswordTime' (Get-AdPropertyValue $probe @('badPwdTime', 'badPasswordTime', 'LastBadPasswordAttempt')) 123
 
+    Ok 'category-iusr' (Get-PnrAccountCategory 'IUSR_DC4100') 'Legacy IIS 5/6 anonymous web user (auto-created per server)'
+    Ok 'category-iwam' ((Get-PnrAccountCategory 'IWAM_EXCH2000') -match 'IIS') $true
+    Ok 'category-msol' ((Get-PnrAccountCategory 'MSOL_2a09c4e0405a') -match 'Entra Connect') $true
+    Ok 'category-tsinternet' ((Get-PnrAccountCategory 'TsInternetUser') -match 'Terminal Services') $true
+    Ok 'category-usbms' ((Get-PnrAccountCategory 'USbms_UNITY') -match 'Unity') $true
+    Ok 'assoc-iusr' (Get-PnrAssociatedServerName 'IUSR_DC4100') 'DC4100'
+    Ok 'assoc-usbms' (Get-PnrAssociatedServerName 'USbms_UNITY') 'UNITY'
+    Ok 'semperis-uac' (ConvertFrom-SemperisUac '66080 [PasswordNotRequired, NormalAccount, PasswordDoesNotExpire]') 66080
+    Ok 'semperis-uac-usbms' (ConvertFrom-SemperisUac '544 [PasswordNotRequired, NormalAccount]') 544
+    Ok 'semperis-uac-enabled' (-not (66080 -band 2)) $true
+
     $tmp = Join-Path ([IO.Path]::GetTempPath()) ('pnr-selftest-' + [guid]::NewGuid().ToString('n'))
     New-Item -Path $tmp -ItemType Directory -Force | Out-Null
     try {
@@ -550,8 +744,34 @@ function Invoke-PnrSelfTest {
                 $sampleRows = @(Import-PnrCsv -Path $sample)
                 Ok 'sample-min-rows' ($sampleRows.Count -ge 5) $true
                 Ok 'sample-iusr' ($sampleRows[0].DistinguishedName -match 'IUSR_WEB01') $true
+                Ok 'sample-sam-header' $sampleRows[0].SamAccountName 'IUSR_WEB01'
+                Ok 'sample-uac-header' ($sampleRows[0].UserAccountControl -match '66080') $true
+                $stub = New-PnrStubRecord $sampleRows[0]
+                Ok 'stub-category' ($stub.Category -match 'IIS') $true
+                Ok 'stub-server' $stub.AssociatedServer 'WEB01'
+                Ok 'stub-enabled' ([string]$stub.Enabled) 'True'
             }
         }
+
+        $kci = @(
+            'Distinguished name,Object guid,Sam account name,User account control,Managed by,Last changed,Created,Ignored'
+            '"CN=IUSR_DC4100,CN=Users,DC=contoso,DC=com",62f4ec5d-ab82-4109-8c97-9348e192b2b4,IUSR_DC4100,"66080 [PasswordNotRequired, NormalAccount, PasswordDoesNotExpire]",,2024-08-17T13:53:22Z,2008-04-24T15:39:59Z,FALSE'
+            '"CN=MSOL_2a09c4e0405a,CN=Users,DC=contoso,DC=com",A13f1ed0-1ca4-4f45-ae91-3887af990efa,MSOL_2a09c4e0405a,"66080 [PasswordNotRequired, NormalAccount, PasswordDoesNotExpire]",,2024-08-17T13:54:14Z,2015-03-02T14:51:21Z,FALSE'
+            '"CN=USbms_UNITY,CN=Users,DC=contoso,DC=com",4abca282-f87d-4b4e-93eb-b0c7eddffb8b,USbms_UNITY,"544 [PasswordNotRequired, NormalAccount]",,2024-08-17T13:54:32Z,2006-09-30T06:32:53Z,FALSE'
+        ) -join [Environment]::NewLine
+        $pKci = Join-Path $tmp 'kci-layout.csv'
+        [IO.File]::WriteAllText($pKci, $kci)
+        $kciRows = @(Import-PnrCsv -Path $pKci)
+        Ok 'kci-count' $kciRows.Count 3
+        Ok 'kci-sam' $kciRows[0].SamAccountName 'IUSR_DC4100'
+        $k0 = New-PnrStubRecord $kciRows[0]
+        $k1 = New-PnrStubRecord $kciRows[1]
+        $k2 = New-PnrStubRecord $kciRows[2]
+        Ok 'kci-iusr-server' $k0.AssociatedServer 'DC4100'
+        Ok 'kci-msol-cat' ($k1.Category -match 'Entra Connect') $true
+        Ok 'kci-usbms-server' $k2.AssociatedServer 'UNITY'
+        Ok 'kci-usbms-uac' $k2.UserAccountControl 544
+        Ok 'kci-fail-flag' ((New-PnrStubRecord $kciRows[0] -LookupError 'badPwdTime').RiskFlags -match 'LOOKUP_FAILED') $true
     }
     finally {
         Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue

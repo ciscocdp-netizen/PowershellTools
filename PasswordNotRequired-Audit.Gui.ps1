@@ -332,21 +332,11 @@ function Invoke-PnrAccountAudit {
     $directGroups = (@($u.MemberOf) | ForEach-Object { Get-RdnValue $_ }) -join '; '
 
     # ---- Classification & associated server --------------------------------------------------
-    switch -Regex ($sam) {
-        '^IUSR_'                 { $category = 'Legacy IIS 5/6 anonymous web user (auto-created per server)'; break }
-        '^IWAM_'                 { $category = 'Legacy IIS 5/6 out-of-process application account (auto-created per server)'; break }
-        '^MSOL_[0-9a-fA-F]{12}$' { $category = 'Azure AD / Entra Connect AD DS connector account'; break }
-        '^AAD_[0-9a-fA-F]{12}$'  { $category = 'Azure AD Connect sync service account (legacy)'; break }
-        '^TsInternetUser$'       { $category = 'Legacy Windows 2000 Terminal Services Internet Connector account'; break }
-        '^SUPPORT_388945a0$'     { $category = 'Legacy Help and Support Center account'; break }
-        '^USbms_'                { $category = 'Likely Cisco Unity messaging-system mailbox account'; break }
-        default                  { $category = 'Unclassified - confirm owner/purpose' }
-    }
-    if ($u.IsComputer) { $category = 'Computer account - confirm whether PASSWD_NOTREQD is still required' }
+    $category = Get-PnrAccountCategory -Sam $sam -IsComputer:$u.IsComputer
 
-    $assocServer = $null; $assocServerInAD = $null; $assocServerDns = $null
-    if ($sam -match '^(IUSR|IWAM|USbms)_(.+)$') {
-        $assocServer = $Matches[2]
+    $assocServer = Get-PnrAssociatedServerName $sam
+    $assocServerInAD = $null; $assocServerDns = $null
+    if ($assocServer) {
         try {
             $assocServerInAD = [bool](Get-ADComputer -Filter "Name -eq '$($assocServer -replace "'", "''")'" -Server $ctx.Server -ErrorAction SilentlyContinue)
         }
@@ -1055,6 +1045,64 @@ function Set-Busy {
 # =============================================================================================
 # Shared behaviour
 # =============================================================================================
+function New-PnrResultsTable {
+    param($Sample)
+    $dt = New-Object System.Data.DataTable
+    foreach ($p in $Sample.PSObject.Properties) { [void]$dt.Columns.Add($p.Name, [string]) }
+    $dt
+}
+
+function Add-PnrResultRow {
+    param($Record)
+    if (-not $script:ResultsTable) {
+        $script:ResultsTable = New-PnrResultsTable $Record
+        $gridResults.DataSource = $script:ResultsTable
+    }
+    $dr = $script:ResultsTable.NewRow()
+    foreach ($p in $Record.PSObject.Properties) {
+        if ($script:ResultsTable.Columns.Contains($p.Name)) { $dr[$p.Name] = Format-Cell $p.Value }
+    }
+    $script:ResultsTable.Rows.Add($dr)
+}
+
+function Set-PnrResultRow {
+    param([int]$Index, $Record)
+    if (-not $script:ResultsTable -or $Index -lt 0 -or $Index -ge $script:ResultsTable.Rows.Count) {
+        Add-PnrResultRow $Record
+        return
+    }
+    $dr = $script:ResultsTable.Rows[$Index]
+    foreach ($p in $Record.PSObject.Properties) {
+        if ($script:ResultsTable.Columns.Contains($p.Name)) { $dr[$p.Name] = Format-Cell $p.Value }
+    }
+}
+
+function Show-PnrCsvPreview {
+    param([object[]]$Rows, [string]$SourcePath, [switch]$Quiet)
+    $script:EvidenceByKey = @{}
+    $script:ResultsTable = $null
+    $gridResults.DataSource = $null
+    if (-not $Quiet) { $txtFilter.Text = '' }
+    foreach ($row in $Rows) {
+        $stub = New-PnrStubRecord $row
+        Add-PnrResultRow $stub
+        if (-not $Quiet) {
+            Write-Log ("  {0}: {1} | {2}" -f $stub.SamAccountName, $stub.RiskFlags, $stub.Category)
+        }
+    }
+    if ($gridResults.Columns.Count) {
+        $gridResults.AutoResizeColumns('DisplayedCells')
+        foreach ($wide in 'Recommendation', 'Category', 'DistinguishedName', 'Description') {
+            $col = $gridResults.Columns[$wide]
+            if ($col) { $col.Width = [Math]::Min($col.Width, 360) }
+        }
+        if ($gridResults.Columns['SamAccountName']) { $gridResults.Columns['SamAccountName'].Frozen = $true }
+    }
+    if ($SourcePath -and -not $Quiet) {
+        Write-Log "CSV loaded: $SourcePath — $($Rows.Count) account(s). Click Run audit for live AD metadata." 'Success'
+    }
+}
+
 function Update-CsvInfo {
     $path = $txtCsv.Text.Trim().Trim('"')
     if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
@@ -1065,9 +1113,11 @@ function Update-CsvInfo {
     try {
         $rows = @(Import-PnrCsv -Path $path)
         $domains = @($rows | ForEach-Object { Get-DomainFromDN $_.DistinguishedName } | Where-Object { $_ } | Sort-Object -Unique)
-        $lblCsvInfo.Text = "$($rows.Count) object(s), $($domains.Count) domain(s)"
+        $enabled = @($rows | ForEach-Object { New-PnrStubRecord $_ } | Where-Object { $_.Enabled -eq $true }).Count
+        $lblCsvInfo.Text = "$($rows.Count) object(s), $($domains.Count) domain(s), $enabled enabled"
         $lblCsvInfo.ForeColor = [System.Drawing.Color]::ForestGreen
         if (-not $txtOut.Text) { $txtOut.Text = Split-Path -Path $path -Parent }
+        Show-PnrCsvPreview -Rows $rows -SourcePath $path
     }
     catch {
         $lblCsvInfo.Text = $_.Exception.Message
@@ -1243,9 +1293,8 @@ $btnRun.Add_Click({
         $script:Cancel = $false
         $script:DomainCache = @{}
         $script:EvidenceByKey = @{}
-        $script:ResultsTable = $null
-        $gridResults.DataSource = $null
         $txtFilter.Text = ''
+        Show-PnrCsvPreview -Rows $rows -Quiet
 
         $summary  = New-Object System.Collections.Generic.List[object]
         $allMeta  = New-Object System.Collections.Generic.List[object]
@@ -1270,6 +1319,7 @@ $btnRun.Add_Click({
             foreach ($row in $rows) {
                 if ($script:Cancel) { Write-Log 'Audit cancelled by user.' 'Warn'; break }
                 $i++
+                $gridIndex = $i - 1
                 $dn = $row.DistinguishedName
                 $guid = $row.ObjectGuid
                 $dedupe = if ($guid) { $guid } else { $dn }
@@ -1284,38 +1334,32 @@ $btnRun.Add_Click({
 
                 try {
                     $res = Invoke-PnrAccountAudit -DistinguishedName $dn -Guid $guid -Server $dc -StaleDays $stale -AllDcLastLogon $allDcs -TestBlank $testBlank
+                    $rec = $res.Record
+                    foreach ($e in $res.Meta) { $allMeta.Add($e) }
+                    $rollback.Add($res.Rollback)
+                    Save-Evidence -Key ([string]$rec.ObjectGUID) -Text $res.Detail
+                    Save-Evidence -Key $rec.SamAccountName -Text $res.Detail
+                    $safeName = $rec.SamAccountName -replace '[\\/:*?"<>|]', '_'
+                    $res.Detail | Out-File -FilePath (Join-Path $detailFolder "$safeName.txt") -Encoding UTF8
+                    if ($rec.RiskFlags -match 'BLANK_PASSWORD|PRIVILEGED_GROUP') { $lvl = 'Error' }
+                    elseif ($rec.Enabled) { $lvl = 'Warn' }
+                    else { $lvl = 'Info' }
+                    Write-Log "  $($rec.SamAccountName): $($rec.RiskFlags)" $lvl
                 }
                 catch {
                     Write-Log "  could not be read: $($_.Exception.Message)" 'Error'
-                    $errors.Add([pscustomobject]@{ DistinguishedName = $dn; ObjectGuid = $guid; Error = $_.Exception.Message })
-                    $progress.Value = $i
-                    continue
+                    $errors.Add([pscustomobject]@{ DistinguishedName = $dn; ObjectGuid = $guid; SamAccountName = $row.SamAccountName; Error = $_.Exception.Message })
+                    $rec = New-PnrStubRecord $row -LookupError $_.Exception.Message
+                    $evidence = @("PASSWD_NOTREQD spreadsheet values : $($rec.SamAccountName)", "AD lookup failed: $($_.Exception.Message)", ($rec | Format-List | Out-String -Width 300)) -join [Environment]::NewLine
+                    Save-Evidence -Key ([string]$rec.ObjectGUID) -Text $evidence
+                    Save-Evidence -Key $rec.SamAccountName -Text $evidence
+                    $safeName = $rec.SamAccountName -replace '[\\/:*?"<>|]', '_'
+                    if (-not $safeName) { $safeName = 'unknown' }
+                    $evidence | Out-File -FilePath (Join-Path $detailFolder "$safeName.txt") -Encoding UTF8
                 }
 
-                $rec = $res.Record
                 $summary.Add($rec)
-                foreach ($e in $res.Meta) { $allMeta.Add($e) }
-                $rollback.Add($res.Rollback)
-                Save-Evidence -Key ([string]$rec.ObjectGUID) -Text $res.Detail
-                Save-Evidence -Key $rec.SamAccountName -Text $res.Detail
-
-                $safeName = $rec.SamAccountName -replace '[\\/:*?"<>|]', '_'
-                $res.Detail | Out-File -FilePath (Join-Path $detailFolder "$safeName.txt") -Encoding UTF8
-
-                if (-not $script:ResultsTable) {
-                    $script:ResultsTable = New-Object System.Data.DataTable
-                    foreach ($p in $rec.PSObject.Properties) { [void]$script:ResultsTable.Columns.Add($p.Name, [string]) }
-                    $gridResults.DataSource = $script:ResultsTable
-                }
-                $dr = $script:ResultsTable.NewRow()
-                foreach ($p in $rec.PSObject.Properties) { $dr[$p.Name] = Format-Cell $p.Value }
-                $script:ResultsTable.Rows.Add($dr)
-
-                if ($rec.RiskFlags -match 'BLANK_PASSWORD|PRIVILEGED_GROUP') { $lvl = 'Error' }
-                elseif ($rec.Enabled) { $lvl = 'Warn' }
-                else { $lvl = 'Info' }
-                Write-Log "  $($rec.SamAccountName): $($rec.RiskFlags)" $lvl
-
+                Set-PnrResultRow -Index $gridIndex -Record $rec
                 $progress.Value = $i
             }
 
