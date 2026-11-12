@@ -78,17 +78,32 @@ function Get-HostName {
 function ConvertFrom-LapsPassword {
     param([string]$PasswordBase64)
     $bytes = [Convert]::FromBase64String($PasswordBase64)
-    $utf16 = ($bytes.Length -ge 2) -and (($bytes.Length % 2) -eq 0)
-    if ($utf16) {
-        $nuls = 0
-        for ($i = 1; $i -lt $bytes.Length; $i += 2) {
-            if ($bytes[$i] -eq 0) { $nuls++ }
-        }
-        if ($nuls -ge [math]::Ceiling($bytes.Length / 4.0)) {
-            return [Text.Encoding]::Unicode.GetString($bytes).Trim([char]0)
-        }
+    # Graph / Get-LapsAADPassword store this as UTF-16LE. UTF-8 decoding leaves
+    # hidden NUL characters: the password looks right on screen and fails at logon.
+    $plain = if (($bytes.Length -ge 2) -and ($bytes[1] -eq 0)) {
+        [Text.Encoding]::Unicode.GetString($bytes)
+    } else {
+        [Text.Encoding]::UTF8.GetString($bytes)
     }
-    return [Text.Encoding]::UTF8.GetString($bytes).Trim([char]0)
+    return ($plain -replace [char]0, '').Trim()
+}
+
+function Format-LapsTime {
+    param($Value)
+    if ($null -eq $Value -or "$Value" -eq '') { return '(none)' }
+    try {
+        $dt = [datetime]$Value
+        if ($dt.Kind -eq [DateTimeKind]::Local) {
+            $dt = $dt.ToUniversalTime()
+        } elseif ($dt.Kind -eq [DateTimeKind]::Unspecified) {
+            $dt = [datetime]::SpecifyKind($dt, [DateTimeKind]::Utc)
+        } else {
+            $dt = $dt.ToUniversalTime()
+        }
+        return $dt.ToString("dd-MMM-yyyy HH:mm 'UTC'", [cultureinfo]::InvariantCulture)
+    } catch {
+        return "$Value"
+    }
 }
 
 function Connect-LapsGraph {
@@ -138,22 +153,31 @@ function Get-LapsPassword {
         throw "$Name was not found in the Entra LAPS catalog. Confirm Windows LAPS is backing the password up to Entra ID."
     }
 
-    $device = $matches | Sort-Object lastBackupDateTime -Descending | Select-Object -First 1
+    $device = $matches | Sort-Object { [datetime]$_.lastBackupDateTime } -Descending | Select-Object -First 1
     $id     = $device.id
     $info   = Invoke-MgGraphRequest -Method GET -Uri "$Graph/directory/deviceLocalCredentials/${id}?`$select=id,deviceName,lastBackupDateTime,refreshDateTime,credentials"
+    if ($info.value -and -not $info.credentials) { $info = $info.value }
 
-    $cred = @($info.credentials) | Sort-Object backupDateTime -Descending | Select-Object -First 1
-    if (-not $cred -or -not $cred.passwordBase64) {
+    $allCreds = @($info.credentials)
+    $current  = $allCreds | Where-Object {
+        $_.backupDateTime -and $info.lastBackupDateTime -and
+        ([datetime]$_.backupDateTime -eq [datetime]$info.lastBackupDateTime)
+    } | Select-Object -First 1
+    if (-not $current) {
+        $current = $allCreds | Sort-Object { [datetime]$_.backupDateTime } -Descending | Select-Object -First 1
+    }
+    if (-not $current -or -not $current.passwordBase64) {
         throw "A LAPS record exists for $Name but the password was not returned. DeviceLocalCredential.Read.All (not ReadBasic.All) is required."
     }
 
+    $hostName = if ($info.deviceName) { ("$($info.deviceName)").Split('.')[0] } else { $Name }
     return [pscustomobject]@{
-        ComputerName = $info.deviceName
-        Account      = $cred.accountName
-        LoginName    = ".\$($cred.accountName)"
-        Password     = (ConvertFrom-LapsPassword -PasswordBase64 $cred.passwordBase64)
-        LastUpdated  = $cred.backupDateTime
-        Expires      = $info.refreshDateTime
+        ComputerName = $hostName
+        Account      = $current.accountName
+        LoginName    = "$hostName\$($current.accountName)"
+        Password     = (ConvertFrom-LapsPassword -PasswordBase64 $current.passwordBase64)
+        LastUpdated  = $current.backupDateTime
+        NextRotation = $info.refreshDateTime
     }
 }
 
@@ -161,12 +185,12 @@ function Show-LapsPassword {
     param($Item)
     Write-Host ''
     Write-Host '  LAPS password retrieved' -ForegroundColor Green
-    Write-Line 'Computer' $Item.ComputerName 'Cyan'
-    Write-Line 'Account'  $Item.Account
-    Write-Line 'Logon as' $Item.LoginName 'Cyan'
-    Write-Line 'Password' $Item.Password 'Yellow'
-    Write-Line 'Updated'  $Item.LastUpdated
-    Write-Line 'Expires'  $Item.Expires
+    Write-Line 'Computer'      $Item.ComputerName 'Cyan'
+    Write-Line 'Account'       $Item.Account
+    Write-Line 'Logon as'      $Item.LoginName 'Cyan'
+    Write-Line 'Password'      $Item.Password 'Yellow'
+    Write-Line 'Last backup'   (Format-LapsTime $Item.LastUpdated)
+    Write-Line 'Next rotation' (Format-LapsTime $Item.NextRotation)
     Write-Host ''
 }
 
