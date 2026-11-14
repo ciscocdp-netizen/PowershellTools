@@ -274,6 +274,18 @@ function ConvertTo-JsonString {
     return ($text.Replace('\', '\\').Replace('"', '\"').Replace("`r", '\r').Replace("`n", '\n').Replace("`t", '\t'))
 }
 
+function New-IgnoreCaseMap {
+    # Do not use New-Object 'Dictionary[string,object]' in Windows PowerShell 5.1:
+    # the comma in the type name is parsed as a second argument ("Argument types do not match").
+    return [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
+}
+
+function Disconnect-MfaSmsGraph {
+    try {
+        Disconnect-MgGraph -ErrorAction SilentlyContinue -WarningAction SilentlyContinue | Out-Null
+    } catch { }
+}
+
 function Get-ListChunks {
     param(
         $Items,
@@ -729,7 +741,7 @@ function Connect-MfaSmsGraph {
         return
     }
     if ($ctx) {
-        try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { }
+        Disconnect-MfaSmsGraph
     }
 
     try {
@@ -952,7 +964,7 @@ function Resolve-EntraUsersBatched {
     if ($Size -lt 1) { $Size = 1 }
     if ($Size -gt $script:GraphBatchMax) { $Size = $script:GraphBatchMax }
 
-    $map = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+    $map = New-IgnoreCaseMap
     $needFilter = New-Object System.Collections.Generic.List[string]
     $chunks = Get-ListChunks -Items $Identities -Size $Size
     $done = 0
@@ -1349,6 +1361,12 @@ function Invoke-SelfTest {
     $previewLines = Get-UserPreviewLines -Users (1..20 | ForEach-Object { "user$_@contoso.com" })
     Assert-True -Condition ($previewLines.Count -eq 16 -and $previewLines[15] -like '*and 5 more*') -Name 'Large lists preview the first names instead of printing thousands of lines'
     Assert-True -Condition (-not $Preview) -Name '-Preview is not clobbered by preview line output (PowerShell variables are case-insensitive)'
+
+    $map = New-IgnoreCaseMap
+    $map['Alice@Contoso.com'] = 'ok'
+    Assert-True -Condition ($map.ContainsKey('alice@contoso.com') -and $map['ALICE@CONTOSO.COM'] -eq 'ok') -Name 'Ignore-case map is built with ::new() so Windows PowerShell 5.1 does not throw Argument types do not match'
+    $src = [IO.File]::ReadAllText($PSCommandPath)
+    Assert-True -Condition ($src -notmatch "New-Object 'System.Collections.Generic.Dictionary\[string,object\]'") -Name 'Script does not use New-Object Dictionary[string,object] (PS 5.1 comma parsing)'
     Assert-True -Condition (Test-IsAlreadyMemberText "One or more added object references already exist for the following modified properties: 'members'.") -Name 'Batch 400 already-exists text is classified as Skipped'
 
     Write-Host ''
@@ -1449,7 +1467,7 @@ function Invoke-AddMfaSmsUsers {
     $resolved = Resolve-EntraUsersBatched -Identities $users -Size $BatchSize
 
     $toAdd = New-Object System.Collections.Generic.List[object]
-    $outcomeMap = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+    $outcomeMap = New-IgnoreCaseMap
     foreach ($upn in $users) {
         $identity = [string]$upn
         if (-not $resolved.ContainsKey($identity)) {
@@ -1544,7 +1562,7 @@ catch {
 }
 finally {
     if ($script:ConnectedToGraph) {
-        try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { }
+        Disconnect-MfaSmsGraph
     }
     if (-not $SelfTest -and -not $NonInteractive) {
         try { Read-Host 'Press Enter to exit' | Out-Null } catch { }
