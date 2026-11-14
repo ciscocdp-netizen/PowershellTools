@@ -579,11 +579,15 @@ function Get-UserManagersByBatch {
 
         $requests = New-Object 'System.Collections.Generic.List[hashtable]'
         foreach ($userId in $chunk) {
-            [void]$requests.Add(@{
+            # Build the URL first. Windows PowerShell 5.1 cannot parse -f (or commas)
+            # on the right-hand side of a hashtable entry.
+            $managerUrl = '/users/{0}/manager?$select={1}' -f $userId, $script:ManagerSelect
+            $request = @{
                 id     = [string]$userId
                 method = 'GET'
-                url    = '/users/{0}/manager?$select={1}' -f $userId, $script:ManagerSelect
-            })
+                url    = $managerUrl
+            }
+            [void]$requests.Add($request)
         }
 
         $retryIds  = New-Object 'System.Collections.Generic.List[string]'
