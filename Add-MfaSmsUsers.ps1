@@ -14,12 +14,17 @@
 
     Fixes versus the original paste:
       - Membership is added with Invoke-MgGraphRequest hashtable bodies, not
-        New-MgGroupMember -DirectoryObjectId and not Graph JSON $batch.
-      - Users are processed in this same script in batches of 10-20 (default 20).
-        Known members are skipped from the preloaded member list. Remaining
-        users are looked up with a userPrincipalName in-filter, then added with
-        PATCH members@odata.bind. A failed PATCH falls back to per-user POST
-        /members/$ref unless Graph returns HTTP 403, which stops further adds.
+        New-MgGroupMember -DirectoryObjectId. Graph JSON $batch is posted as a
+        pre-built JSON string (not a generic Dictionary), so Windows PowerShell
+        5.1 does not throw "Argument types do not match".
+      - Users are processed in this same script. Known members are skipped from
+        the preloaded member list. Remaining users are looked up with a
+        userPrincipalName in-filter. Adds use PATCH members@odata.bind (Graph's
+        max of 20 members per PATCH) packed into JSON $batch (up to 20 PATCH
+        requests), so one HTTP call can add up to 400 users. A failed PATCH
+        falls back to per-user POST /members/$ref unless Graph returns HTTP 403,
+        which stops further adds. If $batch is rejected, the script falls back
+        to sequential 20-user PATCH calls.
       - Connect-MgGraph requests Group.ReadWrite.All in addition to
         GroupMember.ReadWrite.All. A 403 means the signed-in account cannot
         change this group's membership (needs Groups Administrator or owner,
@@ -60,7 +65,9 @@
     Use -Force to skip the confirmation prompt.
 
 .PARAMETER BatchSize
-    Users processed together in each Graph pass (1-20). Default 20.
+    Members bound in each PATCH members@odata.bind call (1-20). Graph's
+    documented maximum is 20. Default 20. Up to 20 of those PATCH calls are
+    sent together in one JSON $batch (up to 400 users per HTTP round trip).
 
 .PARAMETER SelfTest
     Run helper checks (no Graph, no WinForms dialogs) and exit.
@@ -92,7 +99,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$script:ToolVersion = '1.9'
+$script:ToolVersion = '1.10'
 $script:GraphBase = 'https://graph.microsoft.com/v1.0'
 $script:GraphBatchMax = 20
 $script:LookupInSize = 15
@@ -430,6 +437,40 @@ function Get-GraphBatchJson {
     return $sb.ToString()
 }
 
+function Get-GraphBatchUri {
+    return ('{0}/$batch' -f (Get-RuntimeGraphBase))
+}
+
+function Get-BatchItemDetail {
+    param($Item)
+    if ($null -eq $Item) { return 'Graph $batch did not return a response for this PATCH' }
+    $body = Get-PropertyValue $Item 'body' $null
+    $msg = Get-GraphErrorMessageFromBody $body
+    if ($msg) { return $msg }
+    $status = Get-BatchItemStatus $Item
+    if ($status -eq 403) { return $script:PrivilegeDeniedDetail }
+    if ($status -ge 400) { return ('Graph add-member failed with HTTP {0}' -f $status) }
+    return ''
+}
+
+function Invoke-GraphBatchPost {
+    param([string]$JsonBody)
+    $uri = Get-GraphBatchUri
+    try {
+        $resp = Invoke-GraphWithRetry -ScriptBlock {
+            Invoke-MgGraphRequest -Method POST -Uri $uri -Body $JsonBody
+        }
+        return [pscustomobject]@{ Status = 200; Body = $resp; Error = '' }
+    }
+    catch {
+        return [pscustomobject]@{
+            Status = (Get-HttpStatusFromError $_)
+            Body   = $null
+            Error  = (Get-ErrorText $_)
+        }
+    }
+}
+
 function Get-UserLookupRelativeUrl {
     param([string]$Identity)
     $encoded = [uri]::EscapeDataString((ConvertTo-TrimmedString $Identity))
@@ -750,7 +791,7 @@ function Confirm-UserList {
 
     $prompt = "Add $Count user(s) to '$GroupName'?`r`n`r`nFile: $Path"
     if ($Count -ge 50) {
-        $prompt = $prompt + ("`r`n`r`nProcesses {0} users per batch. Large lists take several minutes." -f $BatchSize)
+        $prompt = $prompt + ("`r`n`r`nAdds up to {0} members per PATCH, packed into Graph `$batch calls of up to {1} users. Large lists still take a few minutes." -f $BatchSize, (20 * $BatchSize))
     }
     if (-not $NonInteractive) {
         try {
@@ -1095,6 +1136,75 @@ function Invoke-ResolveGraphUser {
     return (New-ResolvedUser -Identity $Identity -ObjectId $objectId -ResolvedUpn $upn)
 }
 
+function Invoke-AddMemberChunk {
+    param(
+        $Members,
+        [string]$GroupId,
+        [switch]$RefOnly
+    )
+    $rows = New-Object System.Collections.ArrayList
+    $privilegeDenied = $false
+    $toAdd = @($Members)
+    if ($toAdd.Count -eq 0) {
+        return [pscustomobject]@{ Rows = $rows; PrivilegeDenied = $false }
+    }
+
+    $patchError = ''
+    if (-not $RefOnly) {
+        $ids = New-Object System.Collections.ArrayList
+        foreach ($member in $toAdd) { [void]$ids.Add([string]$member.ObjectId) }
+        $patchUri = '{0}/groups/{1}' -f (Get-RuntimeGraphBase), $GroupId
+        $patchResp = Invoke-GraphSdkSend -Method PATCH -Uri $patchUri -Body (Get-BindMembersHashtable -DirectoryObjectIds $ids)
+        if (($patchResp.Status -in 200, 204, 0) -and -not $patchResp.Error) {
+            foreach ($member in $toAdd) {
+                [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Added' -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+            }
+            return [pscustomobject]@{ Rows = $rows; PrivilegeDenied = $false }
+        }
+        if ($toAdd.Count -eq 1 -and (Test-IsAlreadyMemberText $patchResp.Error)) {
+            $member = $toAdd[0]
+            [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Skipped' -Detail 'Already a member' -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+            return [pscustomobject]@{ Rows = $rows; PrivilegeDenied = $false }
+        }
+        if (($patchResp.Status -eq 403) -or (Test-IsPrivilegeDeniedText $patchResp.Error)) {
+            foreach ($member in $toAdd) {
+                [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Failed' -Detail $script:PrivilegeDeniedDetail -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+            }
+            return [pscustomobject]@{ Rows = $rows; PrivilegeDenied = $true }
+        }
+        $patchError = ConvertTo-TrimmedString $patchResp.Error
+    }
+
+    foreach ($member in $toAdd) {
+        if ($privilegeDenied) {
+            [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Failed' -Detail $script:PrivilegeDeniedDetail -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+            continue
+        }
+        $refUri = Get-AddMemberUri -TargetGroupId $GroupId
+        $refBody = @{}
+        $refBody['@odata.id'] = Get-GroupMemberODataId $member.ObjectId
+        $refResp = Invoke-GraphSdkSend -Method POST -Uri $refUri -Body $refBody
+        if (($refResp.Status -in 200, 204, 0) -and -not $refResp.Error) {
+            [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Added' -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+        }
+        elseif (Test-IsAlreadyMemberText $refResp.Error) {
+            [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Skipped' -Detail 'Already a member' -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+        }
+        elseif (($refResp.Status -eq 403) -or (Test-IsPrivilegeDeniedText $refResp.Error)) {
+            $privilegeDenied = $true
+            [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Failed' -Detail $script:PrivilegeDeniedDetail -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+        }
+        else {
+            $detail = Get-ShortGraphDetail $refResp.Error
+            if (-not $detail) { $detail = Get-ShortGraphDetail $patchError }
+            if (-not $detail) { $detail = "Graph add-member failed with HTTP $($refResp.Status)" }
+            [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Failed' -Detail $detail -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+        }
+    }
+
+    return [pscustomobject]@{ Rows = $rows; PrivilegeDenied = $privilegeDenied }
+}
+
 function Invoke-SequentialSdkAdds {
     param(
         $Identities,
@@ -1238,81 +1348,133 @@ function Invoke-SequentialSdkAdds {
     Write-Progress -Activity "Looking up users" -Completed
 
     $addChunks = Get-ListChunks -Items $resolved -Size $Size
+    $chunkList = New-Object System.Collections.ArrayList
+    foreach ($c in $addChunks) { [void]$chunkList.Add(@($c)) }
     $addStarted = Get-Date
     $addDone = 0
     $addTotal = $resolved.Count
+    $perBatch = $Size * $script:GraphBatchMax
     if ($addTotal -gt 0 -and -not $privilegeDenied) {
-        Write-Host ("Adding {0} user(s) in batches of {1}..." -f $addTotal, $Size) -ForegroundColor Cyan
+        Write-Host ("Adding {0} user(s): {1} members per PATCH, up to {2} users per Graph `$batch..." -f $addTotal, $Size, $perBatch) -ForegroundColor Cyan
     }
 
-    foreach ($chunk in $addChunks) {
-        $toAdd = @($chunk)
+    $batchDisabled = $false
+    $i = 0
+    while ($i -lt $chunkList.Count) {
+        $window = New-Object System.Collections.ArrayList
+        $n = 0
+        while ($n -lt $script:GraphBatchMax -and $i -lt $chunkList.Count) {
+            [void]$window.Add($chunkList[$i])
+            $i++
+            $n++
+        }
+
+        $windowCount = 0
+        foreach ($chunk in $window) { $windowCount += @($chunk).Count }
+
         if ($privilegeDenied) {
-            foreach ($member in $toAdd) {
-                [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Failed' -Detail $script:PrivilegeDeniedDetail -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
-                $recorded[$member.Identity] = $true
+            foreach ($chunk in $window) {
+                foreach ($member in @($chunk)) {
+                    [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Failed' -Detail $script:PrivilegeDeniedDetail -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+                    $recorded[$member.Identity] = $true
+                }
             }
-            $addDone += $toAdd.Count
+            $addDone += $windowCount
             continue
         }
 
-        $ids = New-Object System.Collections.ArrayList
-        foreach ($member in $toAdd) { [void]$ids.Add([string]$member.ObjectId) }
-        $patchUri = '{0}/groups/{1}' -f $base, $GroupId
-        $patchResp = Invoke-GraphSdkSend -Method PATCH -Uri $patchUri -Body (Get-BindMembersHashtable -DirectoryObjectIds $ids)
-        if (($patchResp.Status -in 200, 204, 0) -and -not $patchResp.Error) {
-            foreach ($member in $toAdd) {
-                [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Added' -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
-                $recorded[$member.Identity] = $true
+        $useSequential = $batchDisabled -or ($window.Count -le 1)
+        if (-not $useSequential) {
+            $reqs = New-Object System.Collections.ArrayList
+            $rid = 1
+            foreach ($chunk in $window) {
+                $ids = New-Object System.Collections.ArrayList
+                foreach ($member in @($chunk)) { [void]$ids.Add([string]$member.ObjectId) }
+                $bindJson = Get-BindMembersJson -DirectoryObjectIds (ConvertTo-StringArray $ids)
+                [void]$reqs.Add((New-GraphBatchItem -Id ([string]$rid) -Method 'PATCH' -Url ('/groups/{0}' -f $GroupId) -Headers @{ 'Content-Type' = 'application/json' } -BodyJson $bindJson))
+                $rid++
             }
-        }
-        elseif ($toAdd.Count -eq 1 -and (Test-IsAlreadyMemberText $patchResp.Error)) {
-            $member = $toAdd[0]
-            [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Skipped' -Detail 'Already a member' -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
-            $recorded[$member.Identity] = $true
-        }
-        elseif (($patchResp.Status -eq 403) -or (Test-IsPrivilegeDeniedText $patchResp.Error)) {
-            $privilegeDenied = $true
-            foreach ($member in $toAdd) {
-                [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Failed' -Detail $script:PrivilegeDeniedDetail -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
-                $recorded[$member.Identity] = $true
+            $batchResp = Invoke-GraphBatchPost -JsonBody (Get-GraphBatchJson $reqs)
+            $responses = @((Get-PropertyValue $batchResp.Body 'responses' @()))
+            if (($batchResp.Status -in 200, 0) -and -not $batchResp.Error -and $responses.Count -gt 0) {
+                $byId = @{}
+                foreach ($item in $responses) {
+                    $id = ConvertTo-TrimmedString (Get-PropertyValue $item 'id' '')
+                    if ($id) { $byId[$id] = $item }
+                }
+                $rid = 1
+                foreach ($chunk in $window) {
+                    $toAdd = @($chunk)
+                    $item = $null
+                    $key = [string]$rid
+                    if ($byId.ContainsKey($key)) { $item = $byId[$key] }
+                    $rid++
+                    if ($privilegeDenied) {
+                        foreach ($member in $toAdd) {
+                            [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Failed' -Detail $script:PrivilegeDeniedDetail -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+                            $recorded[$member.Identity] = $true
+                        }
+                        continue
+                    }
+                    $status = Get-BatchItemStatus $item
+                    $detail = Get-BatchItemDetail $item
+                    if ($status -in 200, 204) {
+                        foreach ($member in $toAdd) {
+                            [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Added' -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+                            $recorded[$member.Identity] = $true
+                        }
+                    }
+                    elseif (($status -eq 403) -or (Test-IsPrivilegeDeniedText $detail)) {
+                        $privilegeDenied = $true
+                        foreach ($member in $toAdd) {
+                            [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Failed' -Detail $script:PrivilegeDeniedDetail -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+                            $recorded[$member.Identity] = $true
+                        }
+                    }
+                    elseif ($toAdd.Count -eq 1 -and (Test-IsAlreadyMemberText $detail)) {
+                        $member = $toAdd[0]
+                        [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Skipped' -Detail 'Already a member' -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+                        $recorded[$member.Identity] = $true
+                    }
+                    else {
+                        $outcome = Invoke-AddMemberChunk -Members $toAdd -GroupId $GroupId -RefOnly
+                        foreach ($row in @($outcome.Rows)) {
+                            [void]$rows.Add($row)
+                            $recorded[$row.UserPrincipalName] = $true
+                        }
+                        if ($outcome.PrivilegeDenied) { $privilegeDenied = $true }
+                    }
+                }
+                $addDone += $windowCount
+                if ($addTotal -gt 0) {
+                    Write-Progress -Activity "Adding users to $GroupName" -Status (Get-RateStatus -Done $addDone -Total $addTotal -Started $addStarted -Verb 'Added') -PercentComplete (Get-PercentComplete -Current $addDone -Total $addTotal)
+                    Write-Host (Get-RateStatus -Done $addDone -Total $addTotal -Started $addStarted -Verb 'Added') -ForegroundColor DarkGray
+                }
+                continue
             }
-        }
-        else {
-            foreach ($member in $toAdd) {
-                if ($privilegeDenied) {
-                    [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Failed' -Detail $script:PrivilegeDeniedDetail -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
-                    $recorded[$member.Identity] = $true
-                    continue
-                }
-                $refUri = Get-AddMemberUri -TargetGroupId $GroupId
-                $refBody = @{}
-                $refBody['@odata.id'] = Get-GroupMemberODataId $member.ObjectId
-                $refResp = Invoke-GraphSdkSend -Method POST -Uri $refUri -Body $refBody
-                if (($refResp.Status -in 200, 204, 0) -and -not $refResp.Error) {
-                    [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Added' -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
-                    $recorded[$member.Identity] = $true
-                }
-                elseif (Test-IsAlreadyMemberText $refResp.Error) {
-                    [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Skipped' -Detail 'Already a member' -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
-                    $recorded[$member.Identity] = $true
-                }
-                elseif (($refResp.Status -eq 403) -or (Test-IsPrivilegeDeniedText $refResp.Error)) {
-                    $privilegeDenied = $true
-                    [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Failed' -Detail $script:PrivilegeDeniedDetail -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
-                    $recorded[$member.Identity] = $true
-                }
-                else {
-                    $detail = Get-ShortGraphDetail $refResp.Error
-                    if (-not $detail) { $detail = Get-ShortGraphDetail $patchResp.Error }
-                    if (-not $detail) { $detail = "Graph add-member failed with HTTP $($refResp.Status)" }
-                    [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Failed' -Detail $detail -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
-                    $recorded[$member.Identity] = $true
-                }
-            }
+
+            Write-Host 'Graph JSON $batch was not accepted; adding 20 users per PATCH instead.' -ForegroundColor Yellow
+            $batchDisabled = $true
         }
 
-        $addDone += $toAdd.Count
+        foreach ($chunk in $window) {
+            $toAdd = @($chunk)
+            if ($privilegeDenied) {
+                foreach ($member in $toAdd) {
+                    [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Failed' -Detail $script:PrivilegeDeniedDetail -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+                    $recorded[$member.Identity] = $true
+                }
+                continue
+            }
+            $outcome = Invoke-AddMemberChunk -Members $toAdd -GroupId $GroupId
+            foreach ($row in @($outcome.Rows)) {
+                [void]$rows.Add($row)
+                $recorded[$row.UserPrincipalName] = $true
+            }
+            if ($outcome.PrivilegeDenied) { $privilegeDenied = $true }
+        }
+
+        $addDone += $windowCount
         if ($addTotal -gt 0) {
             Write-Progress -Activity "Adding users to $GroupName" -Status (Get-RateStatus -Done $addDone -Total $addTotal -Started $addStarted -Verb 'Added') -PercentComplete (Get-PercentComplete -Current $addDone -Total $addTotal)
             Write-Host (Get-RateStatus -Done $addDone -Total $addTotal -Started $addStarted -Verb 'Added') -ForegroundColor DarkGray
@@ -1514,7 +1676,8 @@ function Invoke-SelfTest {
     Assert-True -Condition ($src -notmatch 'param\(\[System\.Collections\.Generic\.IList') -Name 'JSON batch helper Items parameter is untyped for Windows PowerShell 5.1'
     Assert-True -Condition ($src -notmatch 'New-Object System\.Collections\.Generic\.List\[') -Name 'Generic lists are created with ::new(), not unquoted New-Object'
     Assert-True -Condition (Test-IsAlreadyMemberText "One or more added object references already exist for the following modified properties: 'members'.") -Name 'Batch 400 already-exists text is classified as Skipped'
-    Assert-True -Condition ($src -notmatch '(?m)^function Invoke-GraphJsonBatch') -Name 'Live path no longer uses Invoke-MgGraphRequest JSON $batch'
+    Assert-True -Condition ($src -notmatch '(?m)^function Invoke-GraphJsonBatch') -Name 'Typed Invoke-GraphJsonBatch helper stays removed (5.1 Dictionary crash)'
+    Assert-True -Condition ($null -ne (Get-Command -Name Invoke-GraphBatchPost -ErrorAction SilentlyContinue)) -Name 'Adds post Graph JSON $batch as a JSON string'
     Assert-True -Condition ($null -eq (Get-Command -Name Get-GraphAccessToken -ErrorAction SilentlyContinue)) -Name 'Script does not read Graph session secrets'
     Assert-True -Condition ($null -eq (Get-Command -Name Get-UserChunkWorkerScriptBlock -ErrorAction SilentlyContinue)) -Name 'Script does not build dynamic worker scriptblocks'
     $bindHash = Get-BindMembersHashtable -DirectoryObjectIds @('11111111-2222-3333-4444-555555555555')
@@ -1523,7 +1686,21 @@ function Invoke-SelfTest {
     Assert-True -Condition ($ids.Count -eq 2 -and $ids[0] -eq 'aaa' -and $ids[1] -eq 'bbb') -Name 'Existing member ids convert to a string array without empty entries'
     $tenChunks = Get-ListChunks -Items (1..25) -Size 10
     Assert-True -Condition ($tenChunks.Count -eq 3 -and $tenChunks[0].Count -eq 10 -and $tenChunks[2].Count -eq 5) -Name 'Lists split into batches of 10'
-    Assert-True -Condition ($script:ToolVersion -eq '1.9') -Name 'ToolVersion is 1.9'
+    Assert-True -Condition ($script:ToolVersion -eq '1.10') -Name 'ToolVersion is 1.10'
+    Assert-True -Condition ($script:GraphBatchMax -eq 20) -Name 'Graph JSON $batch is limited to 20 requests'
+    Assert-True -Condition ((Get-GraphBatchUri) -eq 'https://graph.microsoft.com/v1.0/$batch') -Name 'JSON $batch URI stays on v1.0/$batch'
+    $packedReqs = New-Object System.Collections.ArrayList
+    1..20 | ForEach-Object {
+        [void]$packedReqs.Add((New-GraphBatchItem -Id "$_" -Method 'PATCH' -Url '/groups/cf5c24b8-2289-4311-8b80-e43e6df8455d' -Headers @{ 'Content-Type' = 'application/json' } -BodyJson $bindOne))
+    }
+    $packedJson = Get-GraphBatchJson $packedReqs
+    Assert-True -Condition ($packedJson -like '*"id":"1"*' -and $packedJson -like '*"id":"20"*' -and $packedJson -like '*"method":"PATCH"*') -Name 'JSON $batch can hold 20 PATCH requests (up to 400 members)'
+    $batch403 = [pscustomobject]@{
+        id     = '2'
+        status = 403
+        body   = @{ error = @{ code = 'Authorization_RequestDenied'; message = 'Insufficient privileges to complete the operation.' } }
+    }
+    Assert-True -Condition (Test-IsPrivilegeDeniedText (Get-BatchItemDetail $batch403)) -Name 'JSON $batch 403 subresponses are classified as privilege denied'
     Assert-True -Condition ($script:LookupInSize -eq 15) -Name 'UPN in-filter lookups use batches of 15'
     $inUrl = Get-UserInFilterRelativeUrl @('jane.doe@contoso.com', 'a@b.com')
     Assert-True -Condition ($inUrl -like '*userPrincipalName*' -and $inUrl -like '*in*' -and $inUrl -like '*$count=true*' -and $inUrl -like '*jane.doe*' -and $inUrl -like '*$select=*') -Name 'Lookup URL uses userPrincipalName in-filter with $count=true'
@@ -1640,7 +1817,7 @@ function Invoke-AddMfaSmsUsers {
 
     $started = Get-Date
     $existingIds = ConvertTo-StringArray @($existingIndex.ById.Keys)
-    Write-Host ("Processing {0} user(s) in batches of {1}..." -f $users.Count, $BatchSize) -ForegroundColor Cyan
+    Write-Host ("Processing {0} user(s) in PATCH batches of {1} (up to {2} per Graph `$batch)..." -f $users.Count, $BatchSize, ($BatchSize * 20)) -ForegroundColor Cyan
     $outcomeRows = Invoke-SequentialSdkAdds -Identities $users -GroupId $GroupId -ExistingIds $existingIds -ExistingByUpn $existingIndex.ByUpn -Size $BatchSize
 
     $outcomeMap = New-IgnoreCaseMap
