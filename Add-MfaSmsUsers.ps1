@@ -10,9 +10,9 @@
     - Shows a results window and saves a CSV log next to the input file
 
     Fixes versus the original paste:
-      - Membership is added with POST /groups/{id}/members/$ref (Invoke-MgGraphRequest).
-        New-MgGroupMember -DirectoryObjectId is broken or missing in several Graph SDK
-        versions ("Invalid URL format specified in payload" / parameter not found).
+      - Membership is added with Graph JSON $batch and PATCH members@odata.bind
+        (Invoke-MgGraphRequest), not New-MgGroupMember -DirectoryObjectId, which is
+        broken or missing in several Graph SDK versions.
       - Lines may be a UPN or a mail address; lookup falls back from /users/{id} to
         userPrincipalName and mail filters.
       - On-premises-synced and dynamic groups are rejected with a clear error instead
@@ -1346,8 +1346,9 @@ function Invoke-SelfTest {
     Assert-True -Condition ($batchJson -match '"body":\{"members@odata.bind":\[') -Name 'JSON $batch embeds PATCH bind body as an object, not a string'
     Assert-True -Condition ((Get-ListChunks -Items (1..400) -Size 20).Count -eq 20) -Name '400 members become 20 PATCH operations (one Graph $batch HTTP call)'
 
-    $preview = Get-UserPreviewLines -Users (1..20 | ForEach-Object { "user$_@contoso.com" })
-    Assert-True -Condition ($preview.Count -eq 16 -and $preview[15] -like '*and 5 more*') -Name 'Large lists preview the first names instead of printing thousands of lines'
+    $previewLines = Get-UserPreviewLines -Users (1..20 | ForEach-Object { "user$_@contoso.com" })
+    Assert-True -Condition ($previewLines.Count -eq 16 -and $previewLines[15] -like '*and 5 more*') -Name 'Large lists preview the first names instead of printing thousands of lines'
+    Assert-True -Condition (-not $Preview) -Name '-Preview is not clobbered by preview line output (PowerShell variables are case-insensitive)'
     Assert-True -Condition (Test-IsAlreadyMemberText "One or more added object references already exist for the following modified properties: 'members'.") -Name 'Batch 400 already-exists text is classified as Skipped'
 
     Write-Host ''
@@ -1398,8 +1399,10 @@ function Invoke-AddMfaSmsUsers {
 
     Write-Host ''
     Write-Host ("Found {0} user(s):" -f $users.Count) -ForegroundColor Cyan
-    $preview = Get-UserPreviewLines -Users $users
-    foreach ($line in $preview) { Write-Host $line }
+    # Do not assign $preview — PowerShell is case-insensitive, so that would
+    # overwrite the -Preview switch and skip Graph entirely.
+    $previewLines = Get-UserPreviewLines -Users $users
+    foreach ($line in $previewLines) { Write-Host $line }
     Write-Host ''
 
     if ($Preview) {
