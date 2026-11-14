@@ -24,6 +24,10 @@
       - 429/503/504 responses are retried. Member lists are paged.
       - TXT parsing strips BOM, comments, mailto:, quotes, and CSV/TSV first-column noise.
       - NuGet / PSGallery trust is ensured on Windows PowerShell 5.1 before Install-Module.
+      - Large lists (~5000) use Graph JSON $batch (20 lookups per HTTP call) and
+        PATCH members@odata.bind (20 members per PATCH, up to 20 PATCHes per $batch
+        = 400 adds per HTTP call). Failed PATCHes fall back to per-user POST $ref
+        in a batch so one bad row does not fail the other 19.
 
 .PARAMETER UserListPath
     Skip the file picker and use this .txt file.
@@ -47,6 +51,10 @@
     No MessageBox, Out-GridView, or "Press Enter to exit". Requires -UserListPath.
     Use -Force to skip the confirmation prompt.
 
+.PARAMETER BatchSize
+    Graph JSON $batch / members@odata.bind size (1-20). Default 20. Lower this
+    only if the tenant throttles aggressively.
+
 .PARAMETER SelfTest
     Run helper checks (no Graph, no WinForms dialogs) and exit.
 
@@ -69,6 +77,8 @@ param(
     [switch]$Preview,
     [switch]$SkipGridView,
     [switch]$NonInteractive,
+    [ValidateRange(1, 20)]
+    [int]$BatchSize = 20,
     [switch]$SelfTest
 )
 
@@ -76,6 +86,8 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:GraphBase = 'https://graph.microsoft.com/v1.0'
+$script:GraphBatchMax = 20
+$script:UserSelect = 'id,userPrincipalName,displayName,mail'
 $script:WinFormsReady = $false
 $script:ConnectedToGraph = $false
 $script:RequiredScopes = @('GroupMember.ReadWrite.All', 'User.Read.All', 'Group.Read.All')
@@ -253,6 +265,171 @@ function Get-AddMemberJsonBody {
     param([string]$DirectoryObjectId)
     $odataId = Get-GroupMemberODataId $DirectoryObjectId
     return ('{{"@odata.id":"{0}"}}' -f $odataId)
+}
+
+function ConvertTo-JsonString {
+    param([string]$Value)
+    $text = ''
+    if ($null -ne $Value) { $text = [string]$Value }
+    return ($text.Replace('\', '\\').Replace('"', '\"').Replace("`r", '\r').Replace("`n", '\n').Replace("`t", '\t'))
+}
+
+function Get-ListChunks {
+    param(
+        $Items,
+        [int]$Size
+    )
+    if ($Size -lt 1) { $Size = 1 }
+    $chunks = New-Object System.Collections.Generic.List[object]
+    $current = New-Object System.Collections.Generic.List[object]
+    foreach ($item in @($Items)) {
+        [void]$current.Add($item)
+        if ($current.Count -ge $Size) {
+            [void]$chunks.Add($current)
+            $current = New-Object System.Collections.Generic.List[object]
+        }
+    }
+    if ($current.Count -gt 0) { [void]$chunks.Add($current) }
+    return ,$chunks
+}
+
+function Get-BindMembersJson {
+    param([string[]]$DirectoryObjectIds)
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($id in @($DirectoryObjectIds)) {
+        $oid = ConvertTo-TrimmedString $id
+        if (-not $oid) { continue }
+        [void]$parts.Add(('"{0}"' -f (ConvertTo-JsonString (Get-GroupMemberODataId $oid))))
+    }
+    return ('{{"members@odata.bind":[{0}]}}' -f ($parts -join ','))
+}
+
+function New-GraphBatchItem {
+    param(
+        [Parameter(Mandatory)][string]$Id,
+        [Parameter(Mandatory)][string]$Method,
+        [Parameter(Mandatory)][string]$Url,
+        $Headers = $null,
+        [string]$BodyJson = ''
+    )
+    return [pscustomobject]@{
+        Id       = $Id
+        Method   = $Method
+        Url      = $Url
+        Headers  = $Headers
+        BodyJson = $BodyJson
+    }
+}
+
+function Get-GraphBatchJson {
+    param($Requests)
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('{"requests":[')
+    $first = $true
+    foreach ($req in @($Requests)) {
+        if (-not $first) { [void]$sb.Append(',') }
+        $first = $false
+        [void]$sb.Append('{"id":"')
+        [void]$sb.Append((ConvertTo-JsonString ([string](Get-PropertyValue $req 'Id' ''))))
+        [void]$sb.Append('","method":"')
+        [void]$sb.Append((ConvertTo-JsonString ([string](Get-PropertyValue $req 'Method' ''))))
+        [void]$sb.Append('","url":"')
+        [void]$sb.Append((ConvertTo-JsonString ([string](Get-PropertyValue $req 'Url' ''))))
+        [void]$sb.Append('"')
+
+        $headers = Get-PropertyValue $req 'Headers' $null
+        if ($headers) {
+            [void]$sb.Append(',"headers":{')
+            $headerFirst = $true
+            if ($headers -is [System.Collections.IDictionary]) {
+                foreach ($key in $headers.Keys) {
+                    if (-not $headerFirst) { [void]$sb.Append(',') }
+                    $headerFirst = $false
+                    [void]$sb.Append('"')
+                    [void]$sb.Append((ConvertTo-JsonString ([string]$key)))
+                    [void]$sb.Append('":"')
+                    [void]$sb.Append((ConvertTo-JsonString ([string]$headers[$key])))
+                    [void]$sb.Append('"')
+                }
+            }
+            [void]$sb.Append('}')
+        }
+
+        $bodyJson = ConvertTo-TrimmedString (Get-PropertyValue $req 'BodyJson' '')
+        if ($bodyJson) {
+            [void]$sb.Append(',"body":')
+            [void]$sb.Append($bodyJson)
+        }
+        [void]$sb.Append('}')
+    }
+    [void]$sb.Append(']}')
+    return $sb.ToString()
+}
+
+function Get-UserLookupRelativeUrl {
+    param([string]$Identity)
+    $encoded = [uri]::EscapeDataString((ConvertTo-TrimmedString $Identity))
+    return ('/users/{0}?$select={1}' -f $encoded, $script:UserSelect)
+}
+
+function Get-UserFilterRelativeUrl {
+    param([string]$Identity)
+    $literal = ConvertTo-ODataLiteral $Identity
+    $filter = "userPrincipalName eq '$literal' or mail eq '$literal'"
+    return ('/users?$filter={0}&$select={1}' -f [uri]::EscapeDataString($filter), $script:UserSelect)
+}
+
+function Get-GraphErrorMessageFromBody {
+    param($Body)
+    if ($null -eq $Body) { return '' }
+    $err = Get-PropertyValue $Body 'error' $null
+    if ($err) {
+        $code = ConvertTo-TrimmedString (Get-PropertyValue $err 'code' '')
+        $msg = ConvertTo-TrimmedString (Get-PropertyValue $err 'message' '')
+        if ($code -and $msg) { return "$code : $msg" }
+        if ($msg) { return $msg }
+        if ($code) { return $code }
+    }
+    return (ConvertTo-TrimmedString $Body)
+}
+
+function Test-IsAlreadyMemberText {
+    param([string]$Text)
+    return ((ConvertTo-TrimmedString $Text) -match 'already exist|already a member|added object references already exist')
+}
+
+function Get-BatchItemStatus {
+    param($Item)
+    $status = Get-PropertyValue $Item 'status' 0
+    try { return [int]$status } catch { return 0 }
+}
+
+function Get-UserPreviewLines {
+    param($Users, [int]$MaxNamed = 15)
+    $lines = New-Object System.Collections.Generic.List[string]
+    $count = $Users.Count
+    $shown = [Math]::Min($MaxNamed, $count)
+    $i = 0
+    foreach ($upn in $Users) {
+        if ($i -ge $shown) { break }
+        [void]$lines.Add("  $upn")
+        $i++
+    }
+    if ($count -gt $shown) {
+        [void]$lines.Add(('  ... and {0} more' -f ($count - $shown)))
+    }
+    return ,$lines
+}
+
+function Get-RateStatus {
+    param([int]$Done, [int]$Total, [datetime]$Started, [string]$Verb)
+    if ($Done -le 0) { return ('{0} {1} of {2}' -f $Verb, $Done, $Total) }
+    $elapsed = (Get-Date) - $Started
+    $seconds = [Math]::Max($elapsed.TotalSeconds, 0.001)
+    $rate = $Done / $seconds
+    $remain = [int][Math]::Ceiling(($Total - $Done) / [Math]::Max($rate, 0.001))
+    if ($remain -lt 0) { $remain = 0 }
+    return ('{0} {1} of {2} ({3:N0}/s, ~{4}s left)' -f $Verb, $Done, $Total, $rate, $remain)
 }
 
 function Get-GroupMembershipBlockers {
@@ -478,6 +655,9 @@ function Confirm-UserList {
     if ($Force) { return $true }
 
     $prompt = "Add $Count user(s) to '$GroupName'?`r`n`r`nFile: $Path"
+    if ($Count -ge 50) {
+        $prompt = $prompt + "`r`n`r`nUses Graph batches (20 lookups / up to 400 adds per request), typically a few minutes for thousands of users."
+    }
     if (-not $NonInteractive) {
         try {
             $answer = Show-Message -Text $prompt -Buttons ([System.Windows.Forms.MessageBoxButtons]::YesNo) -Icon ([System.Windows.Forms.MessageBoxIcon]::Question)
@@ -664,6 +844,342 @@ function Add-EntraGroupMember {
     } | Out-Null
 }
 
+function Invoke-GraphJsonBatch {
+    param([System.Collections.Generic.IList[object]]$Items)
+
+    $byId = @{}
+    if ($null -eq $Items -or $Items.Count -eq 0) { return $byId }
+    if ($Items.Count -gt $script:GraphBatchMax) {
+        throw ("JSON batch cannot exceed {0} requests (got {1})." -f $script:GraphBatchMax, $Items.Count)
+    }
+
+    $pending = New-Object System.Collections.Generic.List[object]
+    foreach ($item in $Items) { [void]$pending.Add($item) }
+
+    $attempt = 0
+    while ($pending.Count -gt 0) {
+        $attempt++
+        $json = Get-GraphBatchJson -Requests $pending
+        $uri = '{0}/$batch' -f $script:GraphBase
+        $resp = Invoke-GraphWithRetry -ScriptBlock {
+            Invoke-MgGraphRequest -Method POST -Uri $uri -Body $json -ContentType 'application/json'
+        }
+
+        $returned = @{}
+        foreach ($item in @((Get-PropertyValue $resp 'responses' @()))) {
+            $id = [string](Get-PropertyValue $item 'id' '')
+            if ($id) { $returned[$id] = $item }
+        }
+
+        $retry = New-Object System.Collections.Generic.List[object]
+        $wait = 0
+        foreach ($item in $pending) {
+            $id = [string](Get-PropertyValue $item 'Id' '')
+            if (-not $returned.ContainsKey($id)) {
+                [void]$retry.Add($item)
+                continue
+            }
+            $row = $returned[$id]
+            $status = Get-BatchItemStatus $row
+            if ($status -in 429, 503, 504) {
+                [void]$retry.Add($item)
+                $headers = Get-PropertyValue $row 'headers' $null
+                if ($headers) {
+                    foreach ($key in @('Retry-After', 'retry-after', 'RetryAfter')) {
+                        $headerVal = Get-PropertyValue $headers $key $null
+                        if ($headerVal) {
+                            $n = 0
+                            if ([int]::TryParse((ConvertTo-TrimmedString $headerVal), [ref]$n) -and $n -gt $wait) { $wait = $n }
+                        }
+                    }
+                }
+                continue
+            }
+            $byId[$id] = $row
+        }
+
+        if ($retry.Count -eq 0) { break }
+        if ($attempt -ge 5) {
+            foreach ($item in $retry) {
+                $id = [string](Get-PropertyValue $item 'Id' '')
+                if ($id -and -not $byId.ContainsKey($id) -and $returned.ContainsKey($id)) {
+                    $byId[$id] = $returned[$id]
+                }
+            }
+            break
+        }
+        if ($wait -lt 1) { $wait = [Math]::Min(60, [int][Math]::Pow(2, $attempt)) }
+        Write-Host ("Graph batch throttled ({0} request(s)); retrying in {1} s..." -f $retry.Count, $wait) -ForegroundColor Yellow
+        Start-Sleep -Seconds $wait
+        $pending = $retry
+    }
+
+    return $byId
+}
+
+function New-ResolvedUser {
+    param(
+        [string]$Identity,
+        [string]$ObjectId = '',
+        [string]$ResolvedUpn = '',
+        [string]$ErrorText = ''
+    )
+    return [pscustomobject]@{
+        Identity    = $Identity
+        ObjectId    = $ObjectId
+        ResolvedUpn = $ResolvedUpn
+        ErrorText   = $ErrorText
+        Found       = -not [string]::IsNullOrWhiteSpace($ObjectId)
+    }
+}
+
+function Read-UserFromGraphBody {
+    param($Body)
+    if ($null -eq $Body) { return $null }
+    $directId = ConvertTo-TrimmedString (Get-PropertyValue $Body 'id' '')
+    if ($directId) { return $Body }
+    $values = @((Get-PropertyValue $Body 'value' @()))
+    if ($values.Count -eq 1) { return $values[0] }
+    if ($values.Count -gt 1) { return 'AMBIGUOUS' }
+    return $null
+}
+
+function Resolve-EntraUsersBatched {
+    param(
+        $Identities,
+        [int]$Size = 20
+    )
+    if ($Size -lt 1) { $Size = 1 }
+    if ($Size -gt $script:GraphBatchMax) { $Size = $script:GraphBatchMax }
+
+    $map = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+    $needFilter = New-Object System.Collections.Generic.List[string]
+    $chunks = Get-ListChunks -Items $Identities -Size $Size
+    $done = 0
+    $total = $Identities.Count
+    $started = Get-Date
+
+    foreach ($chunk in $chunks) {
+        $batch = New-Object System.Collections.Generic.List[object]
+        for ($i = 0; $i -lt $chunk.Count; $i++) {
+            $identity = [string]$chunk[$i]
+            [void]$batch.Add((New-GraphBatchItem -Id ([string]($i + 1)) -Method 'GET' -Url (Get-UserLookupRelativeUrl $identity)))
+        }
+
+        $responses = Invoke-GraphJsonBatch -Items $batch
+        for ($i = 0; $i -lt $chunk.Count; $i++) {
+            $identity = [string]$chunk[$i]
+            $id = [string]($i + 1)
+            if (-not $responses.ContainsKey($id)) {
+                $map[$identity] = New-ResolvedUser -Identity $identity -ErrorText 'No Graph batch response for user lookup'
+                continue
+            }
+            $row = $responses[$id]
+            $status = Get-BatchItemStatus $row
+            $body = Get-PropertyValue $row 'body' $null
+            if ($status -eq 200) {
+                $user = Read-UserFromGraphBody $body
+                $objectId = ConvertTo-TrimmedString (Get-PropertyValue $user 'id' '')
+                $upn = ConvertTo-TrimmedString (Get-PropertyValue $user 'userPrincipalName' '')
+                if ($objectId) {
+                    $map[$identity] = New-ResolvedUser -Identity $identity -ObjectId $objectId -ResolvedUpn $upn
+                }
+                else {
+                    $map[$identity] = New-ResolvedUser -Identity $identity -ErrorText 'Graph returned a user without an id'
+                }
+            }
+            elseif ($status -eq 404) {
+                [void]$needFilter.Add($identity)
+            }
+            else {
+                $map[$identity] = New-ResolvedUser -Identity $identity -ErrorText (Get-GraphErrorMessageFromBody $body)
+            }
+        }
+
+        $done += $chunk.Count
+        Write-Progress -Activity "Resolving users in Microsoft Graph" -Status (Get-RateStatus -Done $done -Total $total -Started $started -Verb 'Looked up') -PercentComplete (Get-PercentComplete -Current $done -Total $total)
+    }
+
+    $filterChunks = Get-ListChunks -Items $needFilter -Size $Size
+    foreach ($chunk in $filterChunks) {
+        $batch = New-Object System.Collections.Generic.List[object]
+        for ($i = 0; $i -lt $chunk.Count; $i++) {
+            $identity = [string]$chunk[$i]
+            [void]$batch.Add((New-GraphBatchItem -Id ([string]($i + 1)) -Method 'GET' -Url (Get-UserFilterRelativeUrl $identity)))
+        }
+        $responses = Invoke-GraphJsonBatch -Items $batch
+        for ($i = 0; $i -lt $chunk.Count; $i++) {
+            $identity = [string]$chunk[$i]
+            $id = [string]($i + 1)
+            if (-not $responses.ContainsKey($id)) {
+                $map[$identity] = New-ResolvedUser -Identity $identity -ErrorText 'User not found'
+                continue
+            }
+            $row = $responses[$id]
+            $status = Get-BatchItemStatus $row
+            $body = Get-PropertyValue $row 'body' $null
+            if ($status -ne 200) {
+                $detail = Get-GraphErrorMessageFromBody $body
+                if (-not $detail) { $detail = "User not found: $identity" }
+                $map[$identity] = New-ResolvedUser -Identity $identity -ErrorText $detail
+                continue
+            }
+            $user = Read-UserFromGraphBody $body
+            if ($user -eq 'AMBIGUOUS') {
+                $map[$identity] = New-ResolvedUser -Identity $identity -ErrorText "Multiple Entra users matched '$identity'"
+                continue
+            }
+            $objectId = ConvertTo-TrimmedString (Get-PropertyValue $user 'id' '')
+            $upn = ConvertTo-TrimmedString (Get-PropertyValue $user 'userPrincipalName' '')
+            if ($objectId) {
+                $map[$identity] = New-ResolvedUser -Identity $identity -ObjectId $objectId -ResolvedUpn $upn
+            }
+            else {
+                $map[$identity] = New-ResolvedUser -Identity $identity -ErrorText "User not found: $identity"
+            }
+        }
+    }
+
+    Write-Progress -Activity "Resolving users in Microsoft Graph" -Completed
+    return $map
+}
+
+function Set-IdentityOutcome {
+    param(
+        $OutcomeMap,
+        $Members,
+        [string]$Status,
+        [string]$Detail = ''
+    )
+    foreach ($member in @($Members)) {
+        $identity = [string](Get-PropertyValue $member 'Identity' '')
+        if (-not $identity) { continue }
+        $objectId = ConvertTo-TrimmedString (Get-PropertyValue $member 'ObjectId' '')
+        $upn = ConvertTo-TrimmedString (Get-PropertyValue $member 'ResolvedUpn' '')
+        $OutcomeMap[$identity] = New-UserResult -UserPrincipalName $identity -Status $Status -Detail $Detail -ObjectId $objectId -ResolvedUpn $upn
+    }
+}
+
+function Add-EntraGroupMembersBatched {
+    param(
+        [string]$TargetGroupId,
+        $Members,
+        $ExistingMembers,
+        $OutcomeMap,
+        [int]$Size = 20
+    )
+    if ($Size -lt 1) { $Size = 1 }
+    if ($Size -gt $script:GraphBatchMax) { $Size = $script:GraphBatchMax }
+
+    $pending = New-Object System.Collections.Generic.List[object]
+    $seenIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($member in @($Members)) {
+        $identity = [string](Get-PropertyValue $member 'Identity' '')
+        $objectId = ConvertTo-TrimmedString (Get-PropertyValue $member 'ObjectId' '')
+        if (-not $identity -or -not $objectId) { continue }
+        if ($ExistingMembers.Contains($objectId) -or -not $seenIds.Add($objectId)) {
+            Set-IdentityOutcome -OutcomeMap $OutcomeMap -Members @($member) -Status 'Skipped' -Detail 'Already a member'
+            continue
+        }
+        [void]$pending.Add($member)
+    }
+
+    $bindChunks = Get-ListChunks -Items $pending -Size $Size
+    $httpChunks = Get-ListChunks -Items $bindChunks -Size $script:GraphBatchMax
+    $done = 0
+    $total = $pending.Count
+    $started = Get-Date
+
+    foreach ($httpChunk in $httpChunks) {
+        $batch = New-Object System.Collections.Generic.List[object]
+        $chunkById = @{}
+        for ($i = 0; $i -lt $httpChunk.Count; $i++) {
+            $bindChunk = $httpChunk[$i]
+            $id = [string]($i + 1)
+            $chunkById[$id] = $bindChunk
+            $ids = New-Object System.Collections.Generic.List[string]
+            foreach ($member in $bindChunk) { [void]$ids.Add([string](Get-PropertyValue $member 'ObjectId' '')) }
+            [void]$batch.Add((New-GraphBatchItem -Id $id -Method 'PATCH' -Url ('/groups/{0}' -f $TargetGroupId) -Headers @{ 'Content-Type' = 'application/json' } -BodyJson (Get-BindMembersJson -DirectoryObjectIds $ids)))
+        }
+
+        $responses = Invoke-GraphJsonBatch -Items $batch
+        $fallback = New-Object System.Collections.Generic.List[object]
+        foreach ($id in ($chunkById.Keys | Sort-Object)) {
+            $bindChunk = $chunkById[$id]
+            if (-not $responses.ContainsKey($id)) {
+                foreach ($member in $bindChunk) { [void]$fallback.Add($member) }
+                continue
+            }
+            $row = $responses[$id]
+            $status = Get-BatchItemStatus $row
+            if ($status -in 200, 204) {
+                foreach ($member in $bindChunk) {
+                    $objectId = ConvertTo-TrimmedString (Get-PropertyValue $member 'ObjectId' '')
+                    if ($objectId) { [void]$ExistingMembers.Add($objectId) }
+                }
+                Set-IdentityOutcome -OutcomeMap $OutcomeMap -Members $bindChunk -Status 'Added'
+                $done += $bindChunk.Count
+            }
+            elseif ($bindChunk.Count -eq 1 -and (Test-IsAlreadyMemberText (Get-GraphErrorMessageFromBody (Get-PropertyValue $row 'body' $null)))) {
+                $objectId = ConvertTo-TrimmedString (Get-PropertyValue $bindChunk[0] 'ObjectId' '')
+                if ($objectId) { [void]$ExistingMembers.Add($objectId) }
+                Set-IdentityOutcome -OutcomeMap $OutcomeMap -Members $bindChunk -Status 'Skipped' -Detail 'Already a member'
+                $done += 1
+            }
+            else {
+                foreach ($member in $bindChunk) { [void]$fallback.Add($member) }
+            }
+        }
+
+        if ($fallback.Count -gt 0) {
+            $refChunks = Get-ListChunks -Items $fallback -Size $script:GraphBatchMax
+            foreach ($refChunk in $refChunks) {
+                $refBatch = New-Object System.Collections.Generic.List[object]
+                for ($i = 0; $i -lt $refChunk.Count; $i++) {
+                    $member = $refChunk[$i]
+                    $objectId = ConvertTo-TrimmedString (Get-PropertyValue $member 'ObjectId' '')
+                    [void]$refBatch.Add((New-GraphBatchItem -Id ([string]($i + 1)) -Method 'POST' -Url ('/groups/{0}/members/$ref' -f $TargetGroupId) -Headers @{ 'Content-Type' = 'application/json' } -BodyJson (Get-AddMemberJsonBody -DirectoryObjectId $objectId)))
+                }
+                $refResponses = Invoke-GraphJsonBatch -Items $refBatch
+                for ($i = 0; $i -lt $refChunk.Count; $i++) {
+                    $member = $refChunk[$i]
+                    $rid = [string]($i + 1)
+                    $objectId = ConvertTo-TrimmedString (Get-PropertyValue $member 'ObjectId' '')
+                    if (-not $refResponses.ContainsKey($rid)) {
+                        Set-IdentityOutcome -OutcomeMap $OutcomeMap -Members @($member) -Status 'Failed' -Detail 'No Graph batch response for add-member'
+                        $done += 1
+                        continue
+                    }
+                    $row = $refResponses[$rid]
+                    $status = Get-BatchItemStatus $row
+                    $detail = Get-GraphErrorMessageFromBody (Get-PropertyValue $row 'body' $null)
+                    if ($status -in 200, 204) {
+                        if ($objectId) { [void]$ExistingMembers.Add($objectId) }
+                        Set-IdentityOutcome -OutcomeMap $OutcomeMap -Members @($member) -Status 'Added'
+                    }
+                    elseif (Test-IsAlreadyMemberText $detail) {
+                        if ($objectId) { [void]$ExistingMembers.Add($objectId) }
+                        Set-IdentityOutcome -OutcomeMap $OutcomeMap -Members @($member) -Status 'Skipped' -Detail 'Already a member'
+                    }
+                    else {
+                        if (-not $detail) { $detail = "Graph add-member failed with HTTP $status" }
+                        Set-IdentityOutcome -OutcomeMap $OutcomeMap -Members @($member) -Status 'Failed' -Detail $detail
+                        Write-Host ("[FAIL]  {0} - {1}" -f (Get-PropertyValue $member 'Identity' ''), $detail) -ForegroundColor Red
+                    }
+                    $done += 1
+                }
+            }
+        }
+
+        Write-Progress -Activity "Adding users to $GroupName" -Status (Get-RateStatus -Done $done -Total $total -Started $started -Verb 'Added') -PercentComplete (Get-PercentComplete -Current $done -Total $total)
+        if ($total -gt 0) {
+            Write-Host (Get-RateStatus -Done $done -Total $total -Started $started -Verb 'Added') -ForegroundColor DarkGray
+        }
+    }
+
+    Write-Progress -Activity "Adding users to $GroupName" -Completed
+}
+
 # ---------------------------------------------------------------------------
 # Self-test (no Graph / no WinForms dialogs)
 # ---------------------------------------------------------------------------
@@ -808,6 +1324,32 @@ function Invoke-SelfTest {
     $log = Get-ResultLogPath -SourcePath $tmp -Prefix 'MFA-SMS_Users'
     Assert-True -Condition ($log -like '*MFA-SMS_Users_Results_*.csv') -Name 'Result log name matches MFA-SMS_Users_Results_<timestamp>.csv'
 
+    $fortyFive = 1..45
+    $chunks = Get-ListChunks -Items $fortyFive -Size 20
+    Assert-True -Condition ($chunks.Count -eq 3 -and $chunks[0].Count -eq 20 -and $chunks[1].Count -eq 20 -and $chunks[2].Count -eq 5) -Name 'Lists split into Graph-sized chunks of 20'
+    $oneChunk = Get-ListChunks -Items @(1) -Size 20
+    Assert-True -Condition ($oneChunk.Count -eq 1 -and $oneChunk[0].Count -eq 1) -Name 'A single item still returns one chunk collection'
+
+    $bindOne = Get-BindMembersJson -DirectoryObjectIds @('11111111-2222-3333-4444-555555555555')
+    Assert-True -Condition ($bindOne -eq '{"members@odata.bind":["https://graph.microsoft.com/v1.0/directoryObjects/11111111-2222-3333-4444-555555555555"]}') -Name 'Single-member PATCH body stays a JSON array (PowerShell 5.1 ConvertTo-Json would unwrap it)'
+    $bindTwo = Get-BindMembersJson -DirectoryObjectIds @('11111111-2222-3333-4444-555555555555', 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')
+    Assert-True -Condition ($bindTwo -like '*directoryObjects/11111111-2222-3333-4444-555555555555*directoryObjects/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee*') -Name 'PATCH body can bind 20 members via members@odata.bind'
+
+    $lookupUrl = Get-UserLookupRelativeUrl 'jane.doe@contoso.com'
+    Assert-True -Condition ($lookupUrl -eq '/users/jane.doe%40contoso.com?$select=id,userPrincipalName,displayName,mail') -Name 'Batch lookup URLs encode @ and keep $select literal'
+
+    $batchJson = Get-GraphBatchJson @(
+        (New-GraphBatchItem -Id '1' -Method 'GET' -Url $lookupUrl),
+        (New-GraphBatchItem -Id '2' -Method 'PATCH' -Url '/groups/cf5c24b8-2289-4311-8b80-e43e6df8455d' -Headers @{ 'Content-Type' = 'application/json' } -BodyJson $bindOne)
+    )
+    Assert-True -Condition ($batchJson -like '*"url":"/users/jane.doe%40contoso.com?$select=id,userPrincipalName,displayName,mail"*') -Name 'JSON $batch keeps relative URLs and $select'
+    Assert-True -Condition ($batchJson -match '"body":\{"members@odata.bind":\[') -Name 'JSON $batch embeds PATCH bind body as an object, not a string'
+    Assert-True -Condition ((Get-ListChunks -Items (1..400) -Size 20).Count -eq 20) -Name '400 members become 20 PATCH operations (one Graph $batch HTTP call)'
+
+    $preview = Get-UserPreviewLines -Users (1..20 | ForEach-Object { "user$_@contoso.com" })
+    Assert-True -Condition ($preview.Count -eq 16 -and $preview[15] -like '*and 5 more*') -Name 'Large lists preview the first names instead of printing thousands of lines'
+    Assert-True -Condition (Test-IsAlreadyMemberText "One or more added object references already exist for the following modified properties: 'members'.") -Name 'Batch 400 already-exists text is classified as Skipped'
+
     Write-Host ''
     Write-Host ('  {0} passed, {1} failed' -f $script:SelfTestPassed, $script:SelfTestFailed) -ForegroundColor $(if ($script:SelfTestFailed) { 'Red' } else { 'Green' })
     return ($script:SelfTestFailed -eq 0)
@@ -856,7 +1398,8 @@ function Invoke-AddMfaSmsUsers {
 
     Write-Host ''
     Write-Host ("Found {0} user(s):" -f $users.Count) -ForegroundColor Cyan
-    foreach ($upn in $users) { Write-Host "  $upn" }
+    $preview = Get-UserPreviewLines -Users $users
+    foreach ($line in $preview) { Write-Host $line }
     Write-Host ''
 
     if ($Preview) {
@@ -898,56 +1441,45 @@ function Invoke-AddMfaSmsUsers {
         $existingMembers = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     }
 
-    $results = New-Object System.Collections.Generic.List[object]
-    $i = 0
+    $started = Get-Date
+    Write-Host ("Resolving {0} user(s) with Graph JSON batches of {1}..." -f $users.Count, $BatchSize) -ForegroundColor Cyan
+    $resolved = Resolve-EntraUsersBatched -Identities $users -Size $BatchSize
+
+    $toAdd = New-Object System.Collections.Generic.List[object]
+    $outcomeMap = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($upn in $users) {
-        $i++
-        Write-Progress -Activity "Adding users to $GroupName" -Status "$i of $($users.Count): $upn" -PercentComplete (Get-PercentComplete -Current $i -Total $users.Count)
-
-        $status = ''
-        $detail = ''
-        $objectId = ''
-        $resolvedUpn = ''
-        try {
-            $user = Resolve-EntraUser -Identity $upn
-            $objectId = ConvertTo-TrimmedString (Get-PropertyValue $user 'id' '')
-            $resolvedUpn = ConvertTo-TrimmedString (Get-PropertyValue $user 'userPrincipalName' '')
-            if (-not $objectId) { throw "Graph returned a user without an id for $upn." }
-
-            if ($existingMembers.Contains($objectId)) {
-                $status = 'Skipped'
-                $detail = 'Already a member'
-                Write-Host "[SKIP]  $upn - already a member" -ForegroundColor DarkGray
-            }
-            else {
-                try {
-                    Add-EntraGroupMember -TargetGroupId $GroupId -DirectoryObjectId $objectId
-                    [void]$existingMembers.Add($objectId)
-                    $status = 'Added'
-                    Write-Host "[ADDED] $upn" -ForegroundColor Green
-                }
-                catch {
-                    if (Test-IsAlreadyMemberError $_) {
-                        [void]$existingMembers.Add($objectId)
-                        $status = 'Skipped'
-                        $detail = 'Already a member'
-                        Write-Host "[SKIP]  $upn - already a member" -ForegroundColor DarkGray
-                    }
-                    else {
-                        throw
-                    }
-                }
-            }
+        $identity = [string]$upn
+        if (-not $resolved.ContainsKey($identity)) {
+            $outcomeMap[$identity] = New-UserResult -UserPrincipalName $identity -Status 'Failed' -Detail 'User lookup returned no result'
+            Write-Host "[FAIL]  $identity - User lookup returned no result" -ForegroundColor Red
+            continue
         }
-        catch {
-            $status = 'Failed'
-            $detail = Get-ErrorText $_
-            Write-Host "[FAIL]  $upn - $detail" -ForegroundColor Red
+        $item = $resolved[$identity]
+        if (-not $item.Found) {
+            $detail = ConvertTo-TrimmedString $item.ErrorText
+            if (-not $detail) { $detail = "User not found: $identity" }
+            $outcomeMap[$identity] = New-UserResult -UserPrincipalName $identity -Status 'Failed' -Detail $detail
+            Write-Host "[FAIL]  $identity - $detail" -ForegroundColor Red
+            continue
         }
-
-        $results.Add((New-UserResult -UserPrincipalName $upn -Status $status -Detail $detail -ObjectId $objectId -ResolvedUpn $resolvedUpn))
+        [void]$toAdd.Add($item)
     }
-    Write-Progress -Activity "Adding users to $GroupName" -Completed
+
+    $lookupFailed = $users.Count - $toAdd.Count
+    Write-Host ("Lookup complete: {0} resolved, {1} not found (~{2} Graph HTTP calls)." -f $toAdd.Count, $lookupFailed, [int][Math]::Ceiling($users.Count / [double]$BatchSize)) -ForegroundColor DarkGray
+    Write-Host ("Adding {0} resolved user(s); up to {1} members per PATCH, {2} PATCHes per HTTP call..." -f $toAdd.Count, $BatchSize, $script:GraphBatchMax) -ForegroundColor Cyan
+    Add-EntraGroupMembersBatched -TargetGroupId $GroupId -Members $toAdd -ExistingMembers $existingMembers -OutcomeMap $outcomeMap -Size $BatchSize
+
+    $results = New-Object System.Collections.Generic.List[object]
+    foreach ($upn in $users) {
+        $identity = [string]$upn
+        if ($outcomeMap.ContainsKey($identity)) {
+            [void]$results.Add($outcomeMap[$identity])
+        }
+        else {
+            [void]$results.Add((New-UserResult -UserPrincipalName $identity -Status 'Failed' -Detail 'No result recorded'))
+        }
+    }
 
     $logPath = Get-ResultLogPath -SourcePath $path -Prefix 'MFA-SMS_Users'
     $results | Export-Csv -Path $logPath -NoTypeInformation -Encoding UTF8
@@ -956,7 +1488,8 @@ function Invoke-AddMfaSmsUsers {
     $skipped = @($results | Where-Object { $_.Status -eq 'Skipped' }).Count
     $failed = @($results | Where-Object { $_.Status -eq 'Failed' }).Count
 
-    $summary = "Added:   $added`nSkipped: $skipped`nFailed:  $failed`n`nLog saved to:`n$logPath"
+    $elapsed = (Get-Date) - $started
+    $summary = "Added:   $added`nSkipped: $skipped`nFailed:  $failed`nElapsed: {0:N1}s`n`nLog saved to:`n$logPath" -f $elapsed.TotalSeconds
     Write-Host ''
     Write-Host $summary
 
@@ -968,7 +1501,12 @@ function Invoke-AddMfaSmsUsers {
         } catch { }
     }
 
-    if (-not $SkipGridView -and -not $NonInteractive) {
+    $showGrid = -not $SkipGridView -and -not $NonInteractive
+    if ($showGrid -and $results.Count -gt 250) {
+        Write-Host 'Skipping Out-GridView for a large result set; open the CSV log instead.' -ForegroundColor DarkGray
+        $showGrid = $false
+    }
+    if ($showGrid) {
         try {
             $results | Out-GridView -Title "$GroupName - Results (close this window to finish)" -Wait
         }
