@@ -16,9 +16,14 @@
       - Membership is added with Invoke-MgGraphRequest hashtable bodies, not
         New-MgGroupMember -DirectoryObjectId and not Graph JSON $batch.
       - Users are processed in this same script in batches of 10-20 (default 20).
-        Each batch looks users up, then PATCH members@odata.bind for that chunk.
-        A failed PATCH falls back to per-user POST /members/$ref so one bad row
-        does not fail the other 19.
+        Known members are skipped from the preloaded member list. Remaining
+        users are looked up with a userPrincipalName in-filter, then added with
+        PATCH members@odata.bind. A failed PATCH falls back to per-user POST
+        /members/$ref unless Graph returns HTTP 403, which stops further adds.
+      - Connect-MgGraph requests Group.ReadWrite.All in addition to
+        GroupMember.ReadWrite.All. A 403 means the signed-in account cannot
+        change this group's membership (needs Groups Administrator or owner,
+        plus admin consent).
       - Lines may be a UPN or a mail address; lookup falls back from /users/{id} to
         userPrincipalName and mail filters.
       - On-premises-synced and dynamic groups are rejected with a clear error instead
@@ -26,7 +31,8 @@
       - "Already a member" Graph errors are counted as Skipped, not Failed.
       - Connect-MgGraph -NoWelcome is used only when the installed module has it.
       - WAM / ISE "window handle" sign-in failures fall back to device code.
-      - Existing Graph sessions missing GroupMember.ReadWrite.All are re-authenticated.
+      - Existing Graph sessions missing GroupMember.ReadWrite.All or
+        Group.ReadWrite.All are re-authenticated.
       - 429/503/504 responses are retried. Member lists are paged.
       - TXT parsing strips BOM, comments, mailto:, quotes, and CSV/TSV first-column noise.
       - NuGet / PSGallery trust is ensured on Windows PowerShell 5.1 before Install-Module.
@@ -86,13 +92,15 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$script:ToolVersion = '1.8'
+$script:ToolVersion = '1.9'
 $script:GraphBase = 'https://graph.microsoft.com/v1.0'
 $script:GraphBatchMax = 20
+$script:LookupInSize = 15
 $script:UserSelect = 'id,userPrincipalName,displayName,mail'
 $script:WinFormsReady = $false
 $script:ConnectedToGraph = $false
-$script:RequiredScopes = @('GroupMember.ReadWrite.All', 'User.Read.All', 'Group.Read.All')
+$script:RequiredScopes = @('GroupMember.ReadWrite.All', 'Group.ReadWrite.All', 'User.Read.All', 'Group.Read.All')
+$script:PrivilegeDeniedDetail = 'HTTP 403: insufficient privileges to add group members. Sign in as Groups Administrator or as an owner of this group, then consent to Group.ReadWrite.All and GroupMember.ReadWrite.All (an Entra admin may need to grant admin consent).'
 
 # ---------------------------------------------------------------------------
 # Generic helpers
@@ -435,6 +443,18 @@ function Get-UserFilterRelativeUrl {
     return ('/users?$filter={0}&$select={1}' -f [uri]::EscapeDataString($filter), (Get-RuntimeUserSelect))
 }
 
+function Get-UserInFilterRelativeUrl {
+    param($Identities)
+    $quoted = New-Object System.Collections.ArrayList
+    foreach ($item in @($Identities)) {
+        $lit = ConvertTo-ODataLiteral $item
+        if ($lit) { [void]$quoted.Add("'$lit'") }
+    }
+    if ($quoted.Count -eq 0) { return '' }
+    $filter = 'userPrincipalName in ({0})' -f ($quoted -join ',')
+    return ('/users?$filter={0}&$count=true&$select={1}' -f [uri]::EscapeDataString($filter), (Get-RuntimeUserSelect))
+}
+
 function Get-GraphErrorMessageFromBody {
     param($Body)
     if ($null -eq $Body) { return '' }
@@ -452,6 +472,24 @@ function Get-GraphErrorMessageFromBody {
 function Test-IsAlreadyMemberText {
     param([string]$Text)
     return ((ConvertTo-TrimmedString $Text) -match 'already exist|already a member|added object references already exist')
+}
+
+function Test-IsPrivilegeDeniedText {
+    param([string]$Text)
+    $value = ConvertTo-TrimmedString $Text
+    return ($value -match 'Insufficient privileges|Authorization_RequestDenied|Forbidden \(Forbidden\)|\b403\b')
+}
+
+function Get-ShortGraphDetail {
+    param([string]$Text)
+    $value = ConvertTo-TrimmedString $Text
+    if (-not $value) { return '' }
+    if (Test-IsPrivilegeDeniedText $value) { return $script:PrivilegeDeniedDetail }
+    if (Test-IsAlreadyMemberText $value) { return 'Already a member' }
+    $first = (($value -split '(\r\n|\n)') | Select-Object -First 1)
+    $first = ConvertTo-TrimmedString $first
+    if ($first.Length -gt 180) { $first = $first.Substring(0, 177) + '...' }
+    return $first
 }
 
 function Get-BatchItemStatus {
@@ -785,6 +823,7 @@ function Connect-MfaSmsGraph {
         return
     }
     if ($ctx) {
+        Write-Host 'Existing Graph session is missing required scopes (including Group.ReadWrite.All). Reconnecting so you can consent...' -ForegroundColor Yellow
         Disconnect-MfaSmsGraph
     }
 
@@ -809,6 +848,7 @@ function Connect-MfaSmsGraph {
     $embedded = Test-IsEmbeddedHost
 
     Write-Host 'Connecting to Microsoft Graph (a sign-in window will appear)...' -ForegroundColor Cyan
+    Write-Host 'Accept Group.ReadWrite.All if prompted. An Entra admin may need to grant admin consent.' -ForegroundColor Yellow
 
     if ($embedded -and $useDevice) {
         Write-Host 'Embedded host (ISE / VS) detected. WAM sign-in needs a window handle, so device code will be used.' -ForegroundColor Yellow
@@ -841,20 +881,98 @@ function Get-TargetGroup {
     return Invoke-GraphWithRetry -ScriptBlock { Invoke-MgGraphRequest -Method GET -Uri $uri }
 }
 
-function Get-ExistingMemberIdSet {
+function Get-ExistingMemberIndex {
     param([string]$TargetGroupId)
-    $set = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    $uri = '{0}/groups/{1}/members?$select=id&$top=999' -f $script:GraphBase, $TargetGroupId
-    while ($uri) {
-        $pageUri = $uri
-        $resp = Invoke-GraphWithRetry -ScriptBlock { Invoke-MgGraphRequest -Method GET -Uri $pageUri }
-        foreach ($item in @((Get-PropertyValue $resp 'value' @()))) {
-            $mid = ConvertTo-TrimmedString (Get-PropertyValue $item 'id' '')
-            if ($mid) { [void]$set.Add($mid) }
+    $byId = New-IgnoreCaseMap
+    $byUpn = New-IgnoreCaseMap
+    $candidates = @(
+        ('{0}/groups/{1}/members/microsoft.graph.user?$select=id,userPrincipalName,mail&$top=999' -f $script:GraphBase, $TargetGroupId),
+        ('{0}/groups/{1}/members?$select=id,userPrincipalName,mail&$top=999' -f $script:GraphBase, $TargetGroupId)
+    )
+    $lastError = $null
+    foreach ($startUri in $candidates) {
+        $byId = New-IgnoreCaseMap
+        $byUpn = New-IgnoreCaseMap
+        $uri = $startUri
+        try {
+            while ($uri) {
+                $pageUri = $uri
+                $resp = Invoke-GraphWithRetry -ScriptBlock { Invoke-MgGraphRequest -Method GET -Uri $pageUri }
+                foreach ($item in @((Get-PropertyValue $resp 'value' @()))) {
+                    $mid = ConvertTo-TrimmedString (Get-PropertyValue $item 'id' '')
+                    if (-not $mid) { continue }
+                    $byId[$mid] = $true
+                    $upn = ConvertTo-TrimmedString (Get-PropertyValue $item 'userPrincipalName' '')
+                    if ($upn) { $byUpn[$upn] = $mid }
+                    $mail = ConvertTo-TrimmedString (Get-PropertyValue $item 'mail' '')
+                    if ($mail) { $byUpn[$mail] = $mid }
+                }
+                $uri = Get-PropertyValue $resp '@odata.nextLink' $null
+            }
+            $lastError = $null
+            break
         }
-        $uri = Get-PropertyValue $resp '@odata.nextLink' $null
+        catch {
+            $lastError = $_
+        }
     }
-    return ,$set
+    if ($lastError) { throw $lastError }
+    return [pscustomobject]@{
+        ById  = $byId
+        ByUpn = $byUpn
+        Count = $byId.Count
+    }
+}
+
+function Show-GraphConnectionInfo {
+    $ctx = $null
+    try { $ctx = Get-MgContext } catch { }
+    if (-not $ctx) { return }
+    $account = ConvertTo-TrimmedString (Get-PropertyValue $ctx 'Account' '')
+    if ($account) {
+        Write-Host ("Signed in as {0}" -f $account) -ForegroundColor DarkGray
+    }
+    $have = New-Object System.Collections.ArrayList
+    foreach ($need in @($script:RequiredScopes)) {
+        if (Test-HasGraphScopes -Context $ctx -Required @($need)) {
+            [void]$have.Add($need)
+        }
+    }
+    if ($have.Count -gt 0) {
+        Write-Host ("Consented scopes: {0}" -f ($have -join ', ')) -ForegroundColor DarkGray
+    }
+}
+
+function Show-GroupOwnerHint {
+    param([string]$TargetGroupId)
+    try {
+        $me = Invoke-GraphWithRetry -ScriptBlock {
+            Invoke-MgGraphRequest -Method GET -Uri ('{0}/me?$select=id,userPrincipalName' -f $script:GraphBase)
+        }
+        $meId = ConvertTo-TrimmedString (Get-PropertyValue $me 'id' '')
+        if (-not $meId) { return }
+        $isOwner = $false
+        $uri = '{0}/groups/{1}/owners?$select=id&$top=999' -f $script:GraphBase, $TargetGroupId
+        while ($uri) {
+            $pageUri = $uri
+            $resp = Invoke-GraphWithRetry -ScriptBlock { Invoke-MgGraphRequest -Method GET -Uri $pageUri }
+            foreach ($item in @((Get-PropertyValue $resp 'value' @()))) {
+                $oid = ConvertTo-TrimmedString (Get-PropertyValue $item 'id' '')
+                if ($oid -and ($oid -eq $meId)) {
+                    $isOwner = $true
+                    break
+                }
+            }
+            if ($isOwner) { break }
+            $uri = Get-PropertyValue $resp '@odata.nextLink' $null
+        }
+        if (-not $isOwner) {
+            Write-Host 'Warning: the signed-in account is not an owner of this group. Adds require Groups Administrator (or User Administrator) or group owner, plus Group.ReadWrite.All consent. HTTP 403 is expected otherwise.' -ForegroundColor Yellow
+        }
+    }
+    catch {
+        # Owner lookup is optional; a later add-member 403 still explains the issue.
+    }
 }
 
 function New-ResolvedUser {
@@ -884,10 +1002,23 @@ function Read-UserFromGraphBody {
     return $null
 }
 
+function Get-AdvancedQueryHeaders {
+    $headers = @{}
+    $headers['ConsistencyLevel'] = 'eventual'
+    return $headers
+}
+
 function Invoke-GraphSdkGet {
-    param([string]$Uri)
+    param([string]$Uri, $Headers = $null)
     try {
-        $resp = Invoke-GraphWithRetry -ScriptBlock { Invoke-MgGraphRequest -Method GET -Uri $Uri }
+        $resp = Invoke-GraphWithRetry -ScriptBlock {
+            if ($null -ne $Headers) {
+                Invoke-MgGraphRequest -Method GET -Uri $Uri -Headers $Headers
+            }
+            else {
+                Invoke-MgGraphRequest -Method GET -Uri $Uri
+            }
+        }
         return [pscustomobject]@{ Status = 200; Body = $resp; Error = '' }
     }
     catch {
@@ -924,11 +1055,52 @@ function Get-BindMembersHashtable {
     return $map
 }
 
+function Invoke-ResolveGraphUser {
+    param([string]$Identity)
+    $base = Get-RuntimeGraphBase
+    $select = Get-RuntimeUserSelect
+    $encoded = [uri]::EscapeDataString($Identity)
+    $directUri = '{0}/users/{1}?$select={2}' -f $base, $encoded, $select
+    $resp = Invoke-GraphSdkGet -Uri $directUri
+    $user = $null
+    if ($resp.Status -eq 200) {
+        $user = Read-UserFromGraphBody $resp.Body
+    }
+    elseif ($resp.Status -in 0, 404) {
+        $filterUri = '{0}{1}' -f $base, (Get-UserFilterRelativeUrl $Identity)
+        $filterResp = Invoke-GraphSdkGet -Uri $filterUri
+        if ($filterResp.Status -eq 200) {
+            $user = Read-UserFromGraphBody $filterResp.Body
+            if ($user -eq 'AMBIGUOUS') {
+                return (New-ResolvedUser -Identity $Identity -ErrorText "Multiple Entra users matched '$Identity'")
+            }
+        }
+        else {
+            $detail = Get-ShortGraphDetail $filterResp.Error
+            if (-not $detail) { $detail = "User not found: $Identity" }
+            return (New-ResolvedUser -Identity $Identity -ErrorText $detail)
+        }
+    }
+    else {
+        $detail = Get-ShortGraphDetail $resp.Error
+        if (-not $detail) { $detail = "Graph user lookup failed with HTTP $($resp.Status)" }
+        return (New-ResolvedUser -Identity $Identity -ErrorText $detail)
+    }
+
+    $objectId = ConvertTo-TrimmedString (Get-PropertyValue $user 'id' '')
+    $upn = ConvertTo-TrimmedString (Get-PropertyValue $user 'userPrincipalName' '')
+    if (-not $objectId) {
+        return (New-ResolvedUser -Identity $Identity -ErrorText "User not found: $Identity")
+    }
+    return (New-ResolvedUser -Identity $Identity -ObjectId $objectId -ResolvedUpn $upn)
+}
+
 function Invoke-SequentialSdkAdds {
     param(
         $Identities,
         [string]$GroupId,
         $ExistingIds,
+        $ExistingByUpn,
         [int]$Size = 20
     )
     if ($Size -lt 1) { $Size = 1 }
@@ -940,110 +1112,221 @@ function Invoke-SequentialSdkAdds {
         if ($mid) { $existing[$mid] = $true }
     }
 
-    $rows = New-Object System.Collections.ArrayList
-    $chunks = Get-ListChunks -Items $Identities -Size $Size
-    $total = @($Identities).Count
-    $started = Get-Date
-    $done = 0
-    $select = Get-RuntimeUserSelect
-    $base = Get-RuntimeGraphBase
-
-    foreach ($chunk in $chunks) {
-        $toAdd = New-Object System.Collections.ArrayList
-        $seenIds = @{}
-        foreach ($raw in @($chunk)) {
-            $identity = [string]$raw
-            $encoded = [uri]::EscapeDataString($identity)
-            $directUri = '{0}/users/{1}?$select={2}' -f $base, $encoded, $select
-            $resp = Invoke-GraphSdkGet -Uri $directUri
-            $user = $null
-            if ($resp.Status -eq 200) {
-                $user = Read-UserFromGraphBody $resp.Body
-            }
-            elseif ($resp.Status -in 0, 404) {
-                $filterUri = '{0}{1}' -f $base, (Get-UserFilterRelativeUrl $identity)
-                $filterResp = Invoke-GraphSdkGet -Uri $filterUri
-                if ($filterResp.Status -eq 200) {
-                    $user = Read-UserFromGraphBody $filterResp.Body
-                    if ($user -eq 'AMBIGUOUS') {
-                        [void]$rows.Add((New-UserResult -UserPrincipalName $identity -Status 'Failed' -Detail "Multiple Entra users matched '$identity'"))
-                        continue
-                    }
-                }
-                else {
-                    $detail = ConvertTo-TrimmedString $filterResp.Error
-                    if (-not $detail) { $detail = "User not found: $identity" }
-                    [void]$rows.Add((New-UserResult -UserPrincipalName $identity -Status 'Failed' -Detail $detail))
-                    continue
-                }
-            }
-            else {
-                $detail = ConvertTo-TrimmedString $resp.Error
-                if (-not $detail) { $detail = "Graph user lookup failed with HTTP $($resp.Status)" }
-                [void]$rows.Add((New-UserResult -UserPrincipalName $identity -Status 'Failed' -Detail $detail))
-                continue
-            }
-
-            $objectId = ConvertTo-TrimmedString (Get-PropertyValue $user 'id' '')
-            $upn = ConvertTo-TrimmedString (Get-PropertyValue $user 'userPrincipalName' '')
-            if (-not $objectId) {
-                [void]$rows.Add((New-UserResult -UserPrincipalName $identity -Status 'Failed' -Detail "User not found: $identity"))
-                continue
-            }
-            if ($existing.ContainsKey($objectId) -or $seenIds.ContainsKey($objectId)) {
-                [void]$rows.Add((New-UserResult -UserPrincipalName $identity -Status 'Skipped' -Detail 'Already a member' -ObjectId $objectId -ResolvedUpn $upn))
-                continue
-            }
-            $seenIds[$objectId] = $true
-            [void]$toAdd.Add((New-ResolvedUser -Identity $identity -ObjectId $objectId -ResolvedUpn $upn))
+    $byUpn = @{}
+    if ($null -ne $ExistingByUpn) {
+        foreach ($key in @($ExistingByUpn.Keys)) {
+            $name = ConvertTo-TrimmedString $key
+            $mid = ConvertTo-TrimmedString $ExistingByUpn[$key]
+            if ($name -and $mid) { $byUpn[$name] = $mid }
         }
-
-        if ($toAdd.Count -gt 0) {
-            $ids = New-Object System.Collections.ArrayList
-            foreach ($member in $toAdd) { [void]$ids.Add([string]$member.ObjectId) }
-            $patchUri = '{0}/groups/{1}' -f $base, $GroupId
-            $patchResp = Invoke-GraphSdkSend -Method PATCH -Uri $patchUri -Body (Get-BindMembersHashtable -DirectoryObjectIds $ids)
-            if (($patchResp.Status -in 200, 204, 0) -and -not $patchResp.Error) {
-                foreach ($member in $toAdd) {
-                    $existing[$member.ObjectId] = $true
-                    [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Added' -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
-                }
-            }
-            elseif ($toAdd.Count -eq 1 -and (Test-IsAlreadyMemberText $patchResp.Error)) {
-                $member = $toAdd[0]
-                $existing[$member.ObjectId] = $true
-                [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Skipped' -Detail 'Already a member' -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
-            }
-            else {
-                foreach ($member in $toAdd) {
-                    $refUri = Get-AddMemberUri -TargetGroupId $GroupId
-                    $refBody = @{}
-                    $refBody['@odata.id'] = Get-GroupMemberODataId $member.ObjectId
-                    $refResp = Invoke-GraphSdkSend -Method POST -Uri $refUri -Body $refBody
-                    if (($refResp.Status -in 200, 204, 0) -and -not $refResp.Error) {
-                        $existing[$member.ObjectId] = $true
-                        [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Added' -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
-                    }
-                    elseif (Test-IsAlreadyMemberText $refResp.Error) {
-                        $existing[$member.ObjectId] = $true
-                        [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Skipped' -Detail 'Already a member' -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
-                    }
-                    else {
-                        $detail = ConvertTo-TrimmedString $refResp.Error
-                        if (-not $detail) { $detail = ConvertTo-TrimmedString $patchResp.Error }
-                        if (-not $detail) { $detail = "Graph add-member failed with HTTP $($refResp.Status)" }
-                        [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Failed' -Detail $detail -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
-                    }
-                }
-            }
-        }
-
-        $done += @($chunk).Count
-        Write-Progress -Activity "Adding users to $GroupName" -Status (Get-RateStatus -Done $done -Total $total -Started $started -Verb 'Processed') -PercentComplete (Get-PercentComplete -Current $done -Total $total)
-        Write-Host (Get-RateStatus -Done $done -Total $total -Started $started -Verb 'Processed') -ForegroundColor DarkGray
     }
 
+    $rows = New-Object System.Collections.ArrayList
+    $recorded = New-IgnoreCaseMap
+    $privilegeDenied = $false
+    $base = Get-RuntimeGraphBase
+    $all = @($Identities)
+    $total = $all.Count
+
+    $needLookup = New-Object System.Collections.ArrayList
+    foreach ($raw in $all) {
+        $identity = [string]$raw
+        if ($byUpn.ContainsKey($identity)) {
+            $knownId = ConvertTo-TrimmedString $byUpn[$identity]
+            [void]$rows.Add((New-UserResult -UserPrincipalName $identity -Status 'Skipped' -Detail 'Already a member' -ObjectId $knownId -ResolvedUpn $identity))
+            $recorded[$identity] = $true
+            continue
+        }
+        [void]$needLookup.Add($identity)
+    }
+
+    if ($needLookup.Count -lt $total) {
+        Write-Host ("{0} already in the group; {1} remaining to look up." -f ($total - $needLookup.Count), $needLookup.Count) -ForegroundColor DarkGray
+    }
+
+    $resolved = New-Object System.Collections.ArrayList
+    $lookupSize = $script:LookupInSize
+    if ($lookupSize -lt 1) { $lookupSize = 15 }
+    $lookupChunks = Get-ListChunks -Items $needLookup -Size $lookupSize
+    $lookupStarted = Get-Date
+    $lookupDone = 0
+    $lookupTotal = $needLookup.Count
+
+    foreach ($chunk in $lookupChunks) {
+        if ($privilegeDenied) { break }
+
+        $foundMap = New-IgnoreCaseMap
+        $inUrl = Get-UserInFilterRelativeUrl $chunk
+        $inWorked = $false
+        if ($inUrl) {
+            $inUri = '{0}{1}' -f $base, $inUrl
+            $inResp = Invoke-GraphSdkGet -Uri $inUri -Headers (Get-AdvancedQueryHeaders)
+            if ($inResp.Status -eq 200) {
+                $inWorked = $true
+                foreach ($item in @((Get-PropertyValue $inResp.Body 'value' @()))) {
+                    $oid = ConvertTo-TrimmedString (Get-PropertyValue $item 'id' '')
+                    if (-not $oid) { continue }
+                    $upn = ConvertTo-TrimmedString (Get-PropertyValue $item 'userPrincipalName' '')
+                    $mail = ConvertTo-TrimmedString (Get-PropertyValue $item 'mail' '')
+                    if ($upn) { $foundMap[$upn] = $item }
+                    if ($mail) { $foundMap[$mail] = $item }
+                }
+            }
+            elseif (($inResp.Status -eq 403) -or (Test-IsPrivilegeDeniedText $inResp.Error)) {
+                $privilegeDenied = $true
+            }
+        }
+
+        foreach ($raw in @($chunk)) {
+            $identity = [string]$raw
+            if ($privilegeDenied) {
+                [void]$rows.Add((New-UserResult -UserPrincipalName $identity -Status 'Failed' -Detail $script:PrivilegeDeniedDetail))
+                $recorded[$identity] = $true
+                continue
+            }
+
+            $user = $null
+            if ($foundMap.ContainsKey($identity)) {
+                $user = $foundMap[$identity]
+            }
+
+            $resolvedUser = $null
+            if ($user) {
+                $objectId = ConvertTo-TrimmedString (Get-PropertyValue $user 'id' '')
+                $upn = ConvertTo-TrimmedString (Get-PropertyValue $user 'userPrincipalName' '')
+                if ($objectId) {
+                    $resolvedUser = New-ResolvedUser -Identity $identity -ObjectId $objectId -ResolvedUpn $upn
+                }
+            }
+            if (-not $resolvedUser) {
+                if ($inWorked) {
+                    [void]$rows.Add((New-UserResult -UserPrincipalName $identity -Status 'Failed' -Detail "User not found: $identity"))
+                    $recorded[$identity] = $true
+                    continue
+                }
+                $resolvedUser = Invoke-ResolveGraphUser -Identity $identity
+            }
+
+            if (-not $resolvedUser.Found) {
+                $detail = Get-ShortGraphDetail $resolvedUser.ErrorText
+                if (-not $detail) { $detail = "User not found: $identity" }
+                if (Test-IsPrivilegeDeniedText $detail) {
+                    $privilegeDenied = $true
+                    $detail = $script:PrivilegeDeniedDetail
+                }
+                [void]$rows.Add((New-UserResult -UserPrincipalName $identity -Status 'Failed' -Detail $detail))
+                $recorded[$identity] = $true
+                continue
+            }
+
+            if ($existing.ContainsKey($resolvedUser.ObjectId)) {
+                [void]$rows.Add((New-UserResult -UserPrincipalName $identity -Status 'Skipped' -Detail 'Already a member' -ObjectId $resolvedUser.ObjectId -ResolvedUpn $resolvedUser.ResolvedUpn))
+                $recorded[$identity] = $true
+                continue
+            }
+
+            $existing[$resolvedUser.ObjectId] = $true
+            [void]$resolved.Add($resolvedUser)
+        }
+
+        $lookupDone += @($chunk).Count
+        if ($lookupTotal -gt 0) {
+            Write-Progress -Activity "Looking up users" -Status (Get-RateStatus -Done $lookupDone -Total $lookupTotal -Started $lookupStarted -Verb 'Looked up') -PercentComplete (Get-PercentComplete -Current $lookupDone -Total $lookupTotal)
+            Write-Host (Get-RateStatus -Done $lookupDone -Total $lookupTotal -Started $lookupStarted -Verb 'Looked up') -ForegroundColor DarkGray
+        }
+    }
+    Write-Progress -Activity "Looking up users" -Completed
+
+    $addChunks = Get-ListChunks -Items $resolved -Size $Size
+    $addStarted = Get-Date
+    $addDone = 0
+    $addTotal = $resolved.Count
+    if ($addTotal -gt 0 -and -not $privilegeDenied) {
+        Write-Host ("Adding {0} user(s) in batches of {1}..." -f $addTotal, $Size) -ForegroundColor Cyan
+    }
+
+    foreach ($chunk in $addChunks) {
+        $toAdd = @($chunk)
+        if ($privilegeDenied) {
+            foreach ($member in $toAdd) {
+                [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Failed' -Detail $script:PrivilegeDeniedDetail -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+                $recorded[$member.Identity] = $true
+            }
+            $addDone += $toAdd.Count
+            continue
+        }
+
+        $ids = New-Object System.Collections.ArrayList
+        foreach ($member in $toAdd) { [void]$ids.Add([string]$member.ObjectId) }
+        $patchUri = '{0}/groups/{1}' -f $base, $GroupId
+        $patchResp = Invoke-GraphSdkSend -Method PATCH -Uri $patchUri -Body (Get-BindMembersHashtable -DirectoryObjectIds $ids)
+        if (($patchResp.Status -in 200, 204, 0) -and -not $patchResp.Error) {
+            foreach ($member in $toAdd) {
+                [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Added' -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+                $recorded[$member.Identity] = $true
+            }
+        }
+        elseif ($toAdd.Count -eq 1 -and (Test-IsAlreadyMemberText $patchResp.Error)) {
+            $member = $toAdd[0]
+            [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Skipped' -Detail 'Already a member' -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+            $recorded[$member.Identity] = $true
+        }
+        elseif (($patchResp.Status -eq 403) -or (Test-IsPrivilegeDeniedText $patchResp.Error)) {
+            $privilegeDenied = $true
+            foreach ($member in $toAdd) {
+                [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Failed' -Detail $script:PrivilegeDeniedDetail -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+                $recorded[$member.Identity] = $true
+            }
+        }
+        else {
+            foreach ($member in $toAdd) {
+                if ($privilegeDenied) {
+                    [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Failed' -Detail $script:PrivilegeDeniedDetail -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+                    $recorded[$member.Identity] = $true
+                    continue
+                }
+                $refUri = Get-AddMemberUri -TargetGroupId $GroupId
+                $refBody = @{}
+                $refBody['@odata.id'] = Get-GroupMemberODataId $member.ObjectId
+                $refResp = Invoke-GraphSdkSend -Method POST -Uri $refUri -Body $refBody
+                if (($refResp.Status -in 200, 204, 0) -and -not $refResp.Error) {
+                    [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Added' -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+                    $recorded[$member.Identity] = $true
+                }
+                elseif (Test-IsAlreadyMemberText $refResp.Error) {
+                    [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Skipped' -Detail 'Already a member' -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+                    $recorded[$member.Identity] = $true
+                }
+                elseif (($refResp.Status -eq 403) -or (Test-IsPrivilegeDeniedText $refResp.Error)) {
+                    $privilegeDenied = $true
+                    [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Failed' -Detail $script:PrivilegeDeniedDetail -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+                    $recorded[$member.Identity] = $true
+                }
+                else {
+                    $detail = Get-ShortGraphDetail $refResp.Error
+                    if (-not $detail) { $detail = Get-ShortGraphDetail $patchResp.Error }
+                    if (-not $detail) { $detail = "Graph add-member failed with HTTP $($refResp.Status)" }
+                    [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Failed' -Detail $detail -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+                    $recorded[$member.Identity] = $true
+                }
+            }
+        }
+
+        $addDone += $toAdd.Count
+        if ($addTotal -gt 0) {
+            Write-Progress -Activity "Adding users to $GroupName" -Status (Get-RateStatus -Done $addDone -Total $addTotal -Started $addStarted -Verb 'Added') -PercentComplete (Get-PercentComplete -Current $addDone -Total $addTotal)
+            Write-Host (Get-RateStatus -Done $addDone -Total $addTotal -Started $addStarted -Verb 'Added') -ForegroundColor DarkGray
+        }
+    }
     Write-Progress -Activity "Adding users to $GroupName" -Completed
+
+    foreach ($raw in $all) {
+        $identity = [string]$raw
+        if ($recorded.ContainsKey($identity)) { continue }
+        $detail = if ($privilegeDenied) { $script:PrivilegeDeniedDetail } else { 'No result recorded' }
+        [void]$rows.Add((New-UserResult -UserPrincipalName $identity -Status 'Failed' -Detail $detail))
+    }
+
     return ,$rows
 }
 
@@ -1182,8 +1465,10 @@ function Invoke-SelfTest {
 
     $ctx = [pscustomobject]@{ Scopes = @('https://graph.microsoft.com/User.Read.All', 'GroupMember.ReadWrite.All') }
     Assert-True -Condition (-not (Test-HasGraphScopes -Context $ctx -Required $script:RequiredScopes)) -Name 'Existing Graph session missing Group.Read.All is not reused'
-    $full = [pscustomobject]@{ Scopes = @('GroupMember.ReadWrite.All', 'User.Read.All', 'Group.Read.All') }
-    Assert-True -Condition (Test-HasGraphScopes -Context $full -Required $script:RequiredScopes) -Name 'Existing Graph session with all three scopes is reused'
+    $withoutWrite = [pscustomobject]@{ Scopes = @('GroupMember.ReadWrite.All', 'User.Read.All', 'Group.Read.All') }
+    Assert-True -Condition (-not (Test-HasGraphScopes -Context $withoutWrite -Required $script:RequiredScopes)) -Name 'Existing Graph session missing Group.ReadWrite.All is not reused'
+    $full = [pscustomobject]@{ Scopes = @('GroupMember.ReadWrite.All', 'Group.ReadWrite.All', 'User.Read.All', 'Group.Read.All') }
+    Assert-True -Condition (Test-HasGraphScopes -Context $full -Required $script:RequiredScopes) -Name 'Existing Graph session with all required scopes is reused'
 
     $row = New-UserResult -UserPrincipalName 'a@x.com' -Status 'Added' -ResolvedUpn 'a@x.com' -ObjectId 'abc'
     Assert-True -Condition ($row.Status -eq 'Added' -and $row.UserPrincipalName -eq 'a@x.com') -Name 'Result rows include Status and the original identity'
@@ -1238,6 +1523,18 @@ function Invoke-SelfTest {
     Assert-True -Condition ($ids.Count -eq 2 -and $ids[0] -eq 'aaa' -and $ids[1] -eq 'bbb') -Name 'Existing member ids convert to a string array without empty entries'
     $tenChunks = Get-ListChunks -Items (1..25) -Size 10
     Assert-True -Condition ($tenChunks.Count -eq 3 -and $tenChunks[0].Count -eq 10 -and $tenChunks[2].Count -eq 5) -Name 'Lists split into batches of 10'
+    Assert-True -Condition ($script:ToolVersion -eq '1.9') -Name 'ToolVersion is 1.9'
+    Assert-True -Condition ($script:LookupInSize -eq 15) -Name 'UPN in-filter lookups use batches of 15'
+    $inUrl = Get-UserInFilterRelativeUrl @('jane.doe@contoso.com', 'a@b.com')
+    Assert-True -Condition ($inUrl -like '*userPrincipalName*' -and $inUrl -like '*in*' -and $inUrl -like '*$count=true*' -and $inUrl -like '*jane.doe*' -and $inUrl -like '*$select=*') -Name 'Lookup URL uses userPrincipalName in-filter with $count=true'
+    $denied = "POST https://graph.microsoft.com/v1.0/groups/cf5c24b8-2289-4311-8b80-e43e6df8455d/members/`$ref HTTP/1.1 403 Forbidden Authorization_RequestDenied : Insufficient privileges to complete the operation."
+    Assert-True -Condition (Test-IsPrivilegeDeniedText $denied) -Name 'Graph 403 Authorization_RequestDenied is classified as privilege denied'
+    Assert-True -Condition ((Get-ShortGraphDetail $denied) -eq $script:PrivilegeDeniedDetail) -Name 'CSV 403 dumps collapse to a short privilege message'
+    $longDetail = 'x' * 500
+    Assert-True -Condition ((Get-ShortGraphDetail $longDetail).Length -eq 180) -Name 'Non-403 Graph details are truncated to 180 characters'
+    Assert-True -Condition ($script:RequiredScopes -contains 'Group.ReadWrite.All') -Name 'Connect-MgGraph requests Group.ReadWrite.All'
+    Assert-True -Condition ($src -notmatch 'SecureStringToBSTR\(') -Name 'Script does not marshal session secrets through BSTR'
+    Assert-True -Condition ($src -notmatch '\[scriptblock\]::Create') -Name 'Script does not compile dynamic scriptblocks'
 
     Write-Host ''
     Write-Host ('  {0} passed, {1} failed' -f $script:SelfTestPassed, $script:SelfTestFailed) -ForegroundColor $(if ($script:SelfTestFailed) { 'Red' } else { 'Green' })
@@ -1306,6 +1603,7 @@ function Invoke-AddMfaSmsUsers {
     }
 
     Connect-MfaSmsGraph
+    Show-GraphConnectionInfo
 
     $group = Get-TargetGroup -TargetGroupId $GroupId
     $display = ConvertTo-TrimmedString (Get-PropertyValue $group 'displayName' $GroupName)
@@ -1324,30 +1622,54 @@ function Invoke-AddMfaSmsUsers {
         Write-Host 'Warning: this group is role-assignable. Privileged Role Administrator may be required.' -ForegroundColor Yellow
     }
 
-    $existingMembers = $null
+    Show-GroupOwnerHint -TargetGroupId $GroupId
+
+    $existingIndex = $null
     try {
-        $existingMembers = Get-ExistingMemberIdSet -TargetGroupId $GroupId
-        Write-Host ("Loaded {0} existing member(s)." -f $existingMembers.Count) -ForegroundColor DarkGray
+        $existingIndex = Get-ExistingMemberIndex -TargetGroupId $GroupId
+        Write-Host ("Loaded {0} existing member(s)." -f $existingIndex.Count) -ForegroundColor DarkGray
     }
     catch {
         Write-Host ("Could not preload members (will treat Graph already-exists as Skipped): {0}" -f (Get-ErrorText $_)) -ForegroundColor Yellow
-        $existingMembers = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $existingIndex = [pscustomobject]@{
+            ById  = (New-IgnoreCaseMap)
+            ByUpn = (New-IgnoreCaseMap)
+            Count = 0
+        }
     }
 
     $started = Get-Date
-    $existingIds = ConvertTo-StringArray $existingMembers
+    $existingIds = ConvertTo-StringArray @($existingIndex.ById.Keys)
     Write-Host ("Processing {0} user(s) in batches of {1}..." -f $users.Count, $BatchSize) -ForegroundColor Cyan
-    $outcomeRows = Invoke-SequentialSdkAdds -Identities $users -GroupId $GroupId -ExistingIds $existingIds -Size $BatchSize
+    $outcomeRows = Invoke-SequentialSdkAdds -Identities $users -GroupId $GroupId -ExistingIds $existingIds -ExistingByUpn $existingIndex.ByUpn -Size $BatchSize
 
     $outcomeMap = New-IgnoreCaseMap
+    $failPrinted = 0
+    $failHidden = 0
+    $privilegeNoted = $false
     foreach ($row in @($outcomeRows)) {
         $identity = ConvertTo-TrimmedString (Get-PropertyValue $row 'UserPrincipalName' '')
         if (-not $identity) { continue }
         $outcomeMap[$identity] = $row
-        if ((Get-PropertyValue $row 'Status' '') -eq 'Failed') {
-            $detail = ConvertTo-TrimmedString (Get-PropertyValue $row 'Detail' '')
-            Write-Host ("[FAIL]  {0} - {1}" -f $identity, $detail) -ForegroundColor Red
+        if ((Get-PropertyValue $row 'Status' '') -ne 'Failed') { continue }
+        $detail = ConvertTo-TrimmedString (Get-PropertyValue $row 'Detail' '')
+        if (Test-IsPrivilegeDeniedText $detail) {
+            if (-not $privilegeNoted) {
+                Write-Host $script:PrivilegeDeniedDetail -ForegroundColor Red
+                $privilegeNoted = $true
+            }
+            continue
         }
+        if ($failPrinted -lt 15) {
+            Write-Host ("[FAIL]  {0} - {1}" -f $identity, $detail) -ForegroundColor Red
+            $failPrinted++
+        }
+        else {
+            $failHidden++
+        }
+    }
+    if ($failHidden -gt 0) {
+        Write-Host ("... and {0} more failure(s); see the CSV log." -f $failHidden) -ForegroundColor DarkGray
     }
 
     $results = New-ObjectList
@@ -1370,6 +1692,9 @@ function Invoke-AddMfaSmsUsers {
 
     $elapsed = (Get-Date) - $started
     $summary = "Added:   $added`nSkipped: $skipped`nFailed:  $failed`nElapsed: {0:N1}s`n`nLog saved to:`n$logPath" -f $elapsed.TotalSeconds
+    if ($privilegeNoted) {
+        $summary = $summary + "`n`n" + $script:PrivilegeDeniedDetail
+    }
     Write-Host ''
     Write-Host $summary
 
