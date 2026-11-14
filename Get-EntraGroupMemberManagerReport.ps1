@@ -62,6 +62,8 @@
 
     Save to a specific path and review the rows in Out-GridView.
 
+    PowerShell parameters use one dash (-OutputPath), not two (--OutputPath).
+
 .EXAMPLE
     .\Get-EntraGroupMemberManagerReport.ps1 -GroupId 'cf5c24b8-2289-4311-8b80-e43e6df8455d' -Transitive
 
@@ -78,11 +80,17 @@
     users (never synced from AD) will have an empty SAM column. That is expected.
 
     Sign-in account must be able to read group membership and user manager properties.
+
+    Use PowerShell parameter syntax, for example:
+
+        .\Get-EntraGroupMemberManagerReport.ps1 -OutputPath C:\Temp\MFA-SMS_Users.csv
+
+    A GNU-style double dash (--OutputPath) is also accepted.
 #>
 
 #Requires -Version 5.1
 
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [Parameter()]
     [ValidatePattern('^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$')]
@@ -111,7 +119,10 @@ param(
     [switch]$SkipConnect,
 
     [Parameter()]
-    [switch]$Disconnect
+    [switch]$Disconnect,
+
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$RemainingArguments
 )
 
 Set-StrictMode -Version Latest
@@ -197,6 +208,74 @@ function ConvertTo-PlainText {
     }
 
     return ([string]$Value).Trim()
+}
+
+function ConvertFrom-DoubleDashArguments {
+    <#
+    .SYNOPSIS
+        Map GNU-style --OutputPath value pairs onto the script parameters.
+    #>
+    param(
+        [AllowNull()]
+        [string[]]$Arguments
+    )
+
+    $overrides = @{}
+    if ($null -eq $Arguments -or $Arguments.Count -eq 0) {
+        return $overrides
+    }
+
+    $switchNames = @('Transitive', 'ShowGridView', 'PassThru', 'SkipConnect', 'Disconnect')
+    $tokens = @($Arguments)
+    $index = 0
+
+    while ($index -lt $tokens.Count) {
+        $token = [string]$tokens[$index]
+        $name  = $null
+        $value = $null
+
+        if ($token -match '^--([A-Za-z][A-Za-z0-9]*)=(.*)$') {
+            $name  = $Matches[1]
+            $value = $Matches[2]
+        } elseif ($token -match '^--([A-Za-z][A-Za-z0-9]*)$') {
+            $name = $Matches[1]
+            $isSwitch = $switchNames -contains $name
+            $nextIndex = $index + 1
+            if (-not $isSwitch -and $nextIndex -lt $tokens.Count -and $tokens[$nextIndex] -notmatch '^-') {
+                $value = $tokens[$nextIndex]
+                $index++
+            } else {
+                $value = $true
+            }
+        } else {
+            throw @"
+Unexpected argument '$token'.
+
+PowerShell parameters use one dash, for example:
+
+    .\Get-EntraGroupMemberManagerReport.ps1 -OutputPath `"C:\Temp\MFA-SMS_Users.csv`"
+"@
+        }
+
+        switch -Regex ($name) {
+            '^(?i)GroupId$'       { $overrides['GroupId'] = [string]$value }
+            '^(?i)GroupName$'     { $overrides['GroupName'] = [string]$value }
+            '^(?i)OutputPath$'    { $overrides['OutputPath'] = [string]$value }
+            '^(?i)TenantId$'      { $overrides['TenantId'] = [string]$value }
+            '^(?i)Transitive$'    { $overrides['Transitive'] = $true }
+            '^(?i)ShowGridView$'  { $overrides['ShowGridView'] = $true }
+            '^(?i)PassThru$'      { $overrides['PassThru'] = $true }
+            '^(?i)SkipConnect$'   { $overrides['SkipConnect'] = $true }
+            '^(?i)Disconnect$'    { $overrides['Disconnect'] = $true }
+            default {
+                throw "Unknown parameter --$name. Use -$name instead (one dash)."
+            }
+        }
+
+        $index++
+    }
+
+    return $overrides
 }
 
 function ConvertTo-GraphBatchJson {
@@ -669,6 +748,31 @@ $reportRows = New-Object 'System.Collections.Generic.List[object]'
 $connectedThisRun = $false
 
 try {
+    $argumentOverrides = ConvertFrom-DoubleDashArguments -Arguments $RemainingArguments
+    if ($argumentOverrides.ContainsKey('GroupId')) {
+        $GroupId = [string]$argumentOverrides['GroupId']
+        if ($GroupId -notmatch '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') {
+            throw "GroupId '$GroupId' is not a valid GUID."
+        }
+    }
+    if ($argumentOverrides.ContainsKey('GroupName')) {
+        $GroupName = [string]$argumentOverrides['GroupName']
+    }
+    if ($argumentOverrides.ContainsKey('OutputPath')) {
+        $OutputPath = [string]$argumentOverrides['OutputPath']
+        if ([string]::IsNullOrWhiteSpace($OutputPath) -or $OutputPath -eq 'True') {
+            throw 'OutputPath requires a file path, for example: -OutputPath C:\Temp\MFA-SMS_Users.csv'
+        }
+    }
+    if ($argumentOverrides.ContainsKey('TenantId')) {
+        $TenantId = [string]$argumentOverrides['TenantId']
+    }
+    if ($argumentOverrides.ContainsKey('Transitive'))    { $Transitive = $true }
+    if ($argumentOverrides.ContainsKey('ShowGridView'))  { $ShowGridView = $true }
+    if ($argumentOverrides.ContainsKey('PassThru'))      { $PassThru = $true }
+    if ($argumentOverrides.ContainsKey('SkipConnect'))   { $SkipConnect = $true }
+    if ($argumentOverrides.ContainsKey('Disconnect'))    { $Disconnect = $true }
+
     Write-Host ''
     Write-ReportLog "Entra Group Member + Manager Report v$script:AppVersion" 'INFO'
     Write-ReportLog "PowerShell $($PSVersionTable.PSVersion)" 'INFO'
