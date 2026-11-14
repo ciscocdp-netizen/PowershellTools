@@ -4,6 +4,9 @@
     Interactively adds users from a TXT file to the Entra ID group "MFA-SMS_Users".
 
 .DESCRIPTION
+    Standalone single-file script. Save or rename it (SMSAdd.ps1 is fine) and run
+    that one .ps1. Nothing else is dotted-sourced or written out to extra scripts.
+
     - Opens a file picker to choose a .txt file (one UPN/email per line)
     - Shows the users found and asks for confirmation
     - Skips users who are already members
@@ -91,7 +94,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$script:ToolVersion = '1.5'
+$script:ToolVersion = '1.6'
 $script:GraphBase = 'https://graph.microsoft.com/v1.0'
 $script:GraphBatchMax = 20
 $script:UserSelect = 'id,userPrincipalName,displayName,mail'
@@ -1254,7 +1257,7 @@ function Invoke-UserChunkWork {
     return ,$results.ToArray()
 }
 
-function Get-ParallelHelperFunctionNames {
+function Get-UserChunkWorkerFunctionNames {
     return @(
         'ConvertTo-TrimmedString',
         'Get-PropertyValue',
@@ -1284,18 +1287,47 @@ function Get-ParallelHelperFunctionNames {
     )
 }
 
-function New-GraphRunspacePool {
-    param([int]$Throttle = 6)
-    if ($Throttle -lt 1) { $Throttle = 1 }
-    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
-    try { $iss.ImportPSModule(@('Microsoft.PowerShell.Utility')) } catch { }
-    foreach ($name in (Get-ParallelHelperFunctionNames)) {
+function Get-UserChunkWorkerScriptBlock {
+    # Embed this file's functions inside one scriptblock so parallel workers
+    # do not depend on extra .ps1 files, modules, or InitialSessionState copies.
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('param($ChunkIdentities, $Token, $GraphBase, $UserSelect, $GroupId, $ExistingIds)')
+    [void]$sb.AppendLine('Set-StrictMode -Version 2.0')
+    [void]$sb.AppendLine('$ErrorActionPreference = ''Stop''')
+    [void]$sb.AppendLine('$script:GraphBase = $GraphBase')
+    [void]$sb.AppendLine('$script:UserSelect = $UserSelect')
+    [void]$sb.AppendLine('$global:GraphBase = $GraphBase')
+    [void]$sb.AppendLine('$global:UserSelect = $UserSelect')
+    [void]$sb.AppendLine('try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }')
+    foreach ($name in (Get-UserChunkWorkerFunctionNames)) {
         $cmd = Get-Command -Name $name -CommandType Function -ErrorAction Stop
-        $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($name, $cmd.Definition)))
+        [void]$sb.Append('function ')
+        [void]$sb.Append($name)
+        [void]$sb.AppendLine(' {')
+        [void]$sb.AppendLine($cmd.Definition)
+        [void]$sb.AppendLine('}')
     }
-    $pool = [runspacefactory]::CreateRunspacePool(1, $Throttle, $iss, $Host)
-    $pool.Open()
-    return $pool
+    [void]$sb.AppendLine('try {')
+    [void]$sb.AppendLine('    Invoke-UserChunkWork -Identities $ChunkIdentities -Token $Token -GroupId $GroupId -ExistingIds $ExistingIds')
+    [void]$sb.AppendLine('} catch {')
+    [void]$sb.AppendLine('    $msg = $_.Exception.Message')
+    [void]$sb.AppendLine('    $out = New-Object System.Collections.ArrayList')
+    [void]$sb.AppendLine('    foreach ($id in @($ChunkIdentities)) {')
+    [void]$sb.AppendLine('        [void]$out.Add((New-UserResult -UserPrincipalName ([string]$id) -Status ''Failed'' -Detail $msg))')
+    [void]$sb.AppendLine('    }')
+    [void]$sb.AppendLine('    return ,$out.ToArray()')
+    [void]$sb.AppendLine('}')
+    return [scriptblock]::Create($sb.ToString())
+}
+
+function Invoke-UserChunkWorkLocal {
+    param(
+        $Identities,
+        [string]$Token,
+        [string]$GroupId,
+        $ExistingIds
+    )
+    Invoke-UserChunkWork -Identities $Identities -Token $Token -GroupId $GroupId -ExistingIds $ExistingIds
 }
 
 function Invoke-ParallelUserAdds {
@@ -1315,33 +1347,58 @@ function Invoke-ParallelUserAdds {
     $total = @($Identities).Count
     $started = Get-Date
     $existingIdArray = ConvertTo-StringArray $ExistingIds
+    $graphBase = Get-RuntimeGraphBase
+    $userSelect = Get-RuntimeUserSelect
 
-    $pool = New-GraphRunspacePool -Throttle $Throttle
-    $jobs = New-Object System.Collections.ArrayList
-    $worker = {
-        param($ChunkIdentities, $Token, $GraphBase, $UserSelect, $GroupId, $ExistingIds)
-        Set-StrictMode -Version 2.0
-        $ErrorActionPreference = 'Stop'
-        $script:GraphBase = $GraphBase
-        $script:UserSelect = $UserSelect
-        $global:GraphBase = $GraphBase
-        $global:UserSelect = $UserSelect
-        try {
-            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-        } catch { }
-        try {
-            Invoke-UserChunkWork -Identities $ChunkIdentities -Token $Token -GroupId $GroupId -ExistingIds $ExistingIds
-        }
-        catch {
-            $msg = $_.Exception.Message
-            $out = New-Object System.Collections.ArrayList
-            foreach ($id in @($ChunkIdentities)) {
-                [void]$out.Add((New-UserResult -UserPrincipalName ([string]$id) -Status 'Failed' -Detail $msg))
-            }
-            return ,$out.ToArray()
+    function Add-ChunkOutput {
+        param($Target, $Output)
+        foreach ($row in @($Output)) {
+            if ($row) { [void]$Target.Add($row) }
         }
     }
 
+    $rows = New-Object System.Collections.ArrayList
+    $doneUsers = 0
+    $doneChunks = 0
+    $chunkCount = @($chunks).Count
+
+    $worker = $null
+    $pool = $null
+    $useRunspaces = $Throttle -gt 1
+    if ($useRunspaces) {
+        try {
+            $worker = Get-UserChunkWorkerScriptBlock
+            $pool = [runspacefactory]::CreateRunspacePool(1, $Throttle)
+            try { $pool.ApartmentState = [System.Threading.ApartmentState]::MTA } catch { }
+            $pool.Open()
+        }
+        catch {
+            Write-Host ("Parallel runspaces unavailable ({0}); staying in this script and processing batches one at a time." -f $_.Exception.Message) -ForegroundColor Yellow
+            $useRunspaces = $false
+            if ($pool) {
+                try { $pool.Dispose() } catch { }
+                $pool = $null
+            }
+        }
+    }
+
+    if (-not $useRunspaces) {
+        foreach ($chunk in $chunks) {
+            $chunkIds = ConvertTo-StringArray $chunk
+            $output = Invoke-UserChunkWorkLocal -Identities $chunkIds -Token $Token -GroupId $GroupId -ExistingIds $existingIdArray
+            Add-ChunkOutput -Target $rows -Output $output
+            $doneChunks++
+            $doneUsers += $chunkIds.Count
+            Write-Progress -Activity "Adding users to $GroupName" -Status (Get-RateStatus -Done $doneUsers -Total $total -Started $started -Verb 'Processed') -PercentComplete (Get-PercentComplete -Current $doneUsers -Total $total)
+            if ($doneChunks -eq 1 -or ($doneChunks % 5) -eq 0 -or $doneChunks -eq $chunkCount) {
+                Write-Host (Get-RateStatus -Done $doneUsers -Total $total -Started $started -Verb 'Processed') -ForegroundColor DarkGray
+            }
+        }
+        Write-Progress -Activity "Adding users to $GroupName" -Completed
+        return ,$rows
+    }
+
+    $jobs = New-Object System.Collections.ArrayList
     try {
         foreach ($chunk in $chunks) {
             $chunkIds = ConvertTo-StringArray $chunk
@@ -1350,8 +1407,8 @@ function Invoke-ParallelUserAdds {
             [void]$ps.AddScript($worker)
             [void]$ps.AddArgument($chunkIds)
             [void]$ps.AddArgument($Token)
-            [void]$ps.AddArgument($script:GraphBase)
-            [void]$ps.AddArgument($script:UserSelect)
+            [void]$ps.AddArgument($graphBase)
+            [void]$ps.AddArgument($userSelect)
             [void]$ps.AddArgument($GroupId)
             [void]$ps.AddArgument($existingIdArray)
             $handle = $ps.BeginInvoke()
@@ -1362,9 +1419,6 @@ function Invoke-ParallelUserAdds {
                 })
         }
 
-        $rows = New-Object System.Collections.ArrayList
-        $doneChunks = 0
-        $doneUsers = 0
         $pending = New-Object System.Collections.ArrayList
         foreach ($job in $jobs) { [void]$pending.Add($job) }
 
@@ -1397,10 +1451,7 @@ function Invoke-ParallelUserAdds {
                     }
                 } catch { }
 
-                foreach ($row in @($output)) {
-                    if ($row) { [void]$rows.Add($row) }
-                }
-
+                Add-ChunkOutput -Target $rows -Output $output
                 try { $job.PowerShell.Dispose() } catch { }
                 $doneChunks++
                 $doneUsers += [int]$job.Size
@@ -1416,8 +1467,13 @@ function Invoke-ParallelUserAdds {
         return ,$rows
     }
     finally {
-        try { $pool.Close() } catch { }
-        try { $pool.Dispose() } catch { }
+        foreach ($job in $jobs) {
+            try { $job.PowerShell.Dispose() } catch { }
+        }
+        if ($pool) {
+            try { $pool.Close() } catch { }
+            try { $pool.Dispose() } catch { }
+        }
     }
 }
 
@@ -1604,7 +1660,8 @@ function Invoke-SelfTest {
     Assert-True -Condition ($src -notmatch 'New-Object System\.Collections\.Generic\.List\[') -Name 'Generic lists are created with ::new(), not unquoted New-Object'
     Assert-True -Condition (Test-IsAlreadyMemberText "One or more added object references already exist for the following modified properties: 'members'.") -Name 'Batch 400 already-exists text is classified as Skipped'
     Assert-True -Condition ($src -notmatch '(?m)^function Invoke-GraphJsonBatch') -Name 'Live path no longer uses Invoke-MgGraphRequest JSON $batch'
-    Assert-True -Condition ($src -match 'RunspacePool' -and $src -match 'Invoke-WebRequest') -Name 'Live path uses parallel runspaces and Invoke-WebRequest'
+    Assert-True -Condition ($src -notmatch 'Runspaces\.SessionStateFunctionEntry') -Name 'Single-file script does not copy helpers into a separate InitialSessionState'
+    Assert-True -Condition ($src -match 'Get-UserChunkWorkerScriptBlock' -and $src -match 'Invoke-WebRequest') -Name 'Parallel workers are built from this same .ps1'
 
     $tokenObj = [pscustomobject]@{ AuthContext = [pscustomobject]@{ LastAuthResult = [pscustomobject]@{ AccessToken = 'abcdefghijklmnopqrstuvwxyz012345' } } }
     Assert-True -Condition ((Get-TokenFromObject $tokenObj) -eq 'abcdefghijklmnopqrstuvwxyz012345') -Name 'Graph access token is read from nested AuthContext.LastAuthResult'
@@ -1613,27 +1670,32 @@ function Invoke-SelfTest {
     $tenChunks = Get-ListChunks -Items (1..25) -Size 10
     Assert-True -Condition ($tenChunks.Count -eq 3 -and $tenChunks[0].Count -eq 10 -and $tenChunks[2].Count -eq 5) -Name 'Lists split into parallel batches of 10'
 
+    $worker = Get-UserChunkWorkerScriptBlock
+    $emptyLocal = @(& $worker ([string[]]@()) 'token' $script:GraphBase $script:UserSelect '11111111-2222-3333-4444-555555555555' ([string[]]@()))
+    Assert-True -Condition ($emptyLocal.Count -eq 0) -Name 'Chunk worker runs inside this same .ps1 with no extra files'
+
     $pool = $null
+    $ps = $null
     try {
-        $pool = New-GraphRunspacePool -Throttle 1
+        $pool = [runspacefactory]::CreateRunspacePool(1, 1)
+        $pool.Open()
         $ps = [powershell]::Create()
         $ps.RunspacePool = $pool
-        [void]$ps.AddScript({
-                param($GraphBase, $UserSelect, $ObjectId)
-                $script:GraphBase = $GraphBase
-                $script:UserSelect = $UserSelect
-                $global:GraphBase = $GraphBase
-                $global:UserSelect = $UserSelect
-                Get-GroupMemberODataId $ObjectId
-            }).AddArgument($script:GraphBase).AddArgument($script:UserSelect).AddArgument('11111111-2222-3333-4444-555555555555')
-        $odataFromWorker = @($ps.Invoke())
-        $ps.Dispose()
-        Assert-True -Condition ($odataFromWorker[0] -eq 'https://graph.microsoft.com/v1.0/directoryObjects/11111111-2222-3333-4444-555555555555') -Name 'Parallel runspace helpers can see GraphBase after it is set in the worker'
+        [void]$ps.AddScript($worker)
+        [void]$ps.AddArgument([string[]]@())
+        [void]$ps.AddArgument('token')
+        [void]$ps.AddArgument($script:GraphBase)
+        [void]$ps.AddArgument($script:UserSelect)
+        [void]$ps.AddArgument('11111111-2222-3333-4444-555555555555')
+        [void]$ps.AddArgument([string[]]@())
+        $emptyRemote = @($ps.Invoke())
+        Assert-True -Condition ($emptyRemote.Count -eq 0) -Name 'Self-contained worker scriptblock runs in a default runspace pool'
     }
     catch {
-        Assert-True -Condition $false -Name ('Parallel runspace helpers can see GraphBase after it is set in the worker: ' + $_.Exception.Message)
+        Assert-True -Condition $false -Name ('Self-contained worker scriptblock runs in a default runspace pool: ' + $_.Exception.Message)
     }
     finally {
+        if ($ps) { try { $ps.Dispose() } catch { } }
         if ($pool) {
             try { $pool.Close() } catch { }
             try { $pool.Dispose() } catch { }
