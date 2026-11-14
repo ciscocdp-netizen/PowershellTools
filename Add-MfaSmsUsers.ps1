@@ -94,7 +94,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$script:ToolVersion = '1.6'
+$script:ToolVersion = '1.7'
 $script:GraphBase = 'https://graph.microsoft.com/v1.0'
 $script:GraphBatchMax = 20
 $script:UserSelect = 'id,userPrincipalName,displayName,mail'
@@ -877,15 +877,36 @@ function ConvertTo-PlainToken {
             [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
         }
     }
+    try {
+        $prop = $Value.PSObject.Properties['Token']
+        if ($prop -and $null -ne $prop.Value -and -not [object]::ReferenceEquals($prop.Value, $Value)) {
+            $inner = ConvertTo-PlainToken $prop.Value
+            if ($inner) { return $inner }
+        }
+    } catch { }
     $text = ConvertTo-TrimmedString $Value
     if ($text.Length -lt 20) { return '' }
     if ($text -match '\s') { return '' }
+    if ($text -notmatch '^eyJ') { return '' }
     return $text
+}
+
+function Get-JwtFromCacheText {
+    param([string]$Text)
+    $raw = ConvertTo-TrimmedString $Text
+    if (-not $raw) { return '' }
+    $direct = ConvertTo-PlainToken $raw
+    if ($direct) { return $direct }
+    $found = ''
+    foreach ($match in [regex]::Matches($raw, 'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+')) {
+        if ($match.Value.Length -gt $found.Length) { $found = $match.Value }
+    }
+    return $found
 }
 
 function Get-TokenFromObject {
     param($Object, [int]$Depth = 0)
-    if ($null -eq $Object -or $Depth -gt 4) { return '' }
+    if ($null -eq $Object -or $Depth -gt 5) { return '' }
 
     foreach ($name in @('AccessToken', 'Token', 'GraphToken', 'RawToken')) {
         try {
@@ -904,7 +925,7 @@ function Get-TokenFromObject {
         } catch { }
     }
 
-    foreach ($name in @('LastAuthResult', 'AuthResult', 'AuthContext', 'Result', 'AuthenticationResult')) {
+    foreach ($name in @('LastAuthResult', 'AuthResult', 'AuthContext', 'Result', 'AuthenticationResult', 'TokenCredential', 'Credential')) {
         $child = $null
         try {
             $prop = $Object.PSObject.Properties[$name]
@@ -919,34 +940,177 @@ function Get-TokenFromObject {
         if ($null -ne $child -and -not [object]::ReferenceEquals($child, $Object)) {
             $text = Get-TokenFromObject -Object $child -Depth ($Depth + 1)
             if ($text) { return $text }
+            if ($name -in @('TokenCredential', 'Credential')) {
+                $text = Get-TokenFromTokenCredential -Credential $child -Scopes (Get-GraphTokenScopes)
+                if ($text) { return $text }
+            }
         }
     }
-    return ''
-}
 
-function Get-GraphAccessToken {
     try {
-        $type = [type]'Microsoft.Graph.PowerShell.Authentication.GraphSession'
-        if ($type) {
-            $instance = $type::Instance
-            $text = Get-TokenFromObject $instance
+        $flags = [System.Reflection.BindingFlags]'Instance,Public,NonPublic'
+        foreach ($field in $Object.GetType().GetFields($flags)) {
+            if ($field.Name -notmatch 'token|auth|credential|cache|result') { continue }
+            $val = $null
+            try { $val = $field.GetValue($Object) } catch { continue }
+            if ($null -eq $val -or [object]::ReferenceEquals($val, $Object)) { continue }
+            $text = ConvertTo-PlainToken $val
             if ($text) { return $text }
-            foreach ($p in $type.GetProperties()) {
-                $val = $null
-                try { $val = $p.GetValue($instance, $null) } catch { continue }
-                $text = Get-TokenFromObject $val
+            if ($Depth -lt 4) {
+                $text = Get-TokenFromObject -Object $val -Depth ($Depth + 1)
                 if ($text) { return $text }
             }
         }
     } catch { }
 
+    return ''
+}
+
+function Get-GraphSessionInstance {
+    try {
+        $type = [type]'Microsoft.Graph.PowerShell.Authentication.GraphSession'
+        if ($type) { return $type::Instance }
+    } catch { }
+    return $null
+}
+
+function Get-GraphTokenScopes {
+    $scopes = New-Object System.Collections.ArrayList
+    try {
+        $auth = $null
+        $session = Get-GraphSessionInstance
+        if ($session) {
+            try { $auth = $session.AuthContext } catch { }
+        }
+        if (-not $auth) {
+            try { $auth = Get-MgContext } catch { }
+        }
+        foreach ($scope in @((Get-PropertyValue $auth 'Scopes' @()))) {
+            $name = ConvertTo-TrimmedString $scope
+            if ($name) { [void]$scopes.Add($name) }
+        }
+    } catch { }
+    if ($scopes.Count -eq 0) {
+        [void]$scopes.Add('https://graph.microsoft.com/.default')
+    }
+    return [string[]]$scopes.ToArray()
+}
+
+function Get-TokenFromTokenCredential {
+    param($Credential, $Scopes)
+    if ($null -eq $Credential) { return '' }
+    $scopeArray = [string[]]@($Scopes)
+    if ($scopeArray.Count -eq 0) {
+        $scopeArray = [string[]]@('https://graph.microsoft.com/.default')
+    }
+
+    $requestContext = $null
+    $ctxType = $null
+    try { $ctxType = [type]'Azure.Core.TokenRequestContext' } catch { }
+    if (-not $ctxType) { return '' }
+    try {
+        $requestContext = [Azure.Core.TokenRequestContext]::new($scopeArray, $null, $null, $null, $true)
+    } catch {
+        try { $requestContext = [Azure.Core.TokenRequestContext]::new($scopeArray) } catch { return '' }
+    }
+
+    $none = [System.Threading.CancellationToken]::None
+    foreach ($name in @('GetToken', 'GetTokenAsync')) {
+        try {
+            $result = $Credential.$name($requestContext, $none)
+            if ($result -is [System.Threading.Tasks.Task]) {
+                $result = $result.GetAwaiter().GetResult()
+            }
+            $text = ConvertTo-PlainToken $result
+            if (-not $text) { $text = ConvertTo-PlainToken (Get-PropertyValue $result 'Token' $null) }
+            if ($text) { return $text }
+        } catch { }
+    }
+    return ''
+}
+
+function Get-TokenFromInMemoryCache {
+    param($Session)
+    if ($null -eq $Session) { return '' }
+    $cache = $null
+    try { $cache = $Session.InMemoryTokenCache } catch { }
+    if ($null -eq $cache) { return '' }
+
+    $bytes = $null
+    try {
+        $flags = [System.Reflection.BindingFlags]'Instance,Public,NonPublic'
+        $method = $cache.GetType().GetMethod('ReadTokenData', $flags)
+        if ($method) { $bytes = $method.Invoke($cache, @()) }
+    } catch { }
+    if ($null -eq $bytes) {
+        try { $bytes = $cache.ReadTokenData() } catch { }
+    }
+    if ($null -eq $bytes) { return '' }
+
+    $text = ''
+    try {
+        if ($bytes -is [byte[]]) {
+            $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+        }
+        else {
+            $text = [string]$bytes
+        }
+    } catch { }
+    return (Get-JwtFromCacheText $text)
+}
+
+function Get-TokenFromGraphHttpClient {
+    try {
+        $helpers = [type]'Microsoft.Graph.PowerShell.Authentication.Helpers.HttpHelpers'
+        if (-not $helpers) { return '' }
+        $client = $helpers::GetGraphHttpClient()
+        if (-not $client) { return '' }
+        $header = $null
+        try { $header = $client.DefaultRequestHeaders.Authorization } catch { }
+        if ($header) {
+            $text = ConvertTo-PlainToken (Get-PropertyValue $header 'Parameter' $null)
+            if ($text) { return $text }
+        }
+    } catch { }
+    return ''
+}
+
+function Get-GraphAccessToken {
+    $session = Get-GraphSessionInstance
+    if ($session) {
+        $text = Get-TokenFromObject $session
+        if ($text) { return $text }
+        try {
+            foreach ($p in $session.GetType().GetProperties()) {
+                $val = $null
+                try { $val = $p.GetValue($session, $null) } catch { continue }
+                $text = Get-TokenFromObject $val
+                if ($text) { return $text }
+            }
+        } catch { }
+        try {
+            $auth = $session.AuthContext
+            $cred = Get-PropertyValue $auth 'TokenCredential' $null
+            $text = Get-TokenFromTokenCredential -Credential $cred -Scopes (Get-GraphTokenScopes)
+            if ($text) { return $text }
+        } catch { }
+        $text = Get-TokenFromInMemoryCache $session
+        if ($text) { return $text }
+    }
+
+    $text = Get-TokenFromGraphHttpClient
+    if ($text) { return $text }
+
     try {
         $ctx = Get-MgContext
         $text = Get-TokenFromObject $ctx
         if ($text) { return $text }
+        $cred = Get-PropertyValue $ctx 'TokenCredential' $null
+        $text = Get-TokenFromTokenCredential -Credential $cred -Scopes (Get-GraphTokenScopes)
+        if ($text) { return $text }
     } catch { }
 
-    throw 'Could not read a Graph access token from the signed-in session. Update Microsoft.Graph.Authentication, sign out, and sign in again.'
+    return ''
 }
 
 function Invoke-GraphWebRequest {
@@ -1330,6 +1494,169 @@ function Invoke-UserChunkWorkLocal {
     Invoke-UserChunkWork -Identities $Identities -Token $Token -GroupId $GroupId -ExistingIds $ExistingIds
 }
 
+function Invoke-GraphSdkGet {
+    param([string]$Uri)
+    try {
+        $resp = Invoke-GraphWithRetry -ScriptBlock { Invoke-MgGraphRequest -Method GET -Uri $Uri }
+        return [pscustomobject]@{ Status = 200; Body = $resp; Error = '' }
+    }
+    catch {
+        $status = Get-HttpStatusFromError $_
+        if ($status -eq 0 -and (Test-IsNotFoundError $_)) { $status = 404 }
+        return [pscustomobject]@{ Status = $status; Body = $null; Error = (Get-ErrorText $_) }
+    }
+}
+
+function Invoke-GraphSdkSend {
+    param([string]$Method, [string]$Uri, $Body)
+    try {
+        Invoke-GraphWithRetry -ScriptBlock { Invoke-MgGraphRequest -Method $Method -Uri $Uri -Body $Body } | Out-Null
+        return [pscustomobject]@{ Status = 204; Body = $null; Error = '' }
+    }
+    catch {
+        return [pscustomobject]@{
+            Status = (Get-HttpStatusFromError $_)
+            Body   = $null
+            Error  = (Get-ErrorText $_)
+        }
+    }
+}
+
+function Get-BindMembersHashtable {
+    param($DirectoryObjectIds)
+    $ids = New-Object System.Collections.ArrayList
+    foreach ($id in @($DirectoryObjectIds)) {
+        $oid = ConvertTo-TrimmedString $id
+        if ($oid) { [void]$ids.Add((Get-GroupMemberODataId $oid)) }
+    }
+    $map = @{}
+    $map['members@odata.bind'] = $ids.ToArray()
+    return $map
+}
+
+function Invoke-SequentialSdkAdds {
+    param(
+        $Identities,
+        [string]$GroupId,
+        $ExistingIds,
+        [int]$Size = 20
+    )
+    if ($Size -lt 1) { $Size = 1 }
+    if ($Size -gt 20) { $Size = 20 }
+
+    $existing = @{}
+    foreach ($id in @($ExistingIds)) {
+        $mid = ConvertTo-TrimmedString $id
+        if ($mid) { $existing[$mid] = $true }
+    }
+
+    $rows = New-Object System.Collections.ArrayList
+    $chunks = Get-ListChunks -Items $Identities -Size $Size
+    $total = @($Identities).Count
+    $started = Get-Date
+    $done = 0
+    $select = Get-RuntimeUserSelect
+    $base = Get-RuntimeGraphBase
+
+    foreach ($chunk in $chunks) {
+        $toAdd = New-Object System.Collections.ArrayList
+        $seenIds = @{}
+        foreach ($raw in @($chunk)) {
+            $identity = [string]$raw
+            $encoded = [uri]::EscapeDataString($identity)
+            $directUri = '{0}/users/{1}?$select={2}' -f $base, $encoded, $select
+            $resp = Invoke-GraphSdkGet -Uri $directUri
+            $user = $null
+            if ($resp.Status -eq 200) {
+                $user = Read-UserFromGraphBody $resp.Body
+            }
+            elseif ($resp.Status -in 0, 404) {
+                $filterUri = '{0}{1}' -f $base, (Get-UserFilterRelativeUrl $identity)
+                $filterResp = Invoke-GraphSdkGet -Uri $filterUri
+                if ($filterResp.Status -eq 200) {
+                    $user = Read-UserFromGraphBody $filterResp.Body
+                    if ($user -eq 'AMBIGUOUS') {
+                        [void]$rows.Add((New-UserResult -UserPrincipalName $identity -Status 'Failed' -Detail "Multiple Entra users matched '$identity'"))
+                        continue
+                    }
+                }
+                else {
+                    $detail = ConvertTo-TrimmedString $filterResp.Error
+                    if (-not $detail) { $detail = "User not found: $identity" }
+                    [void]$rows.Add((New-UserResult -UserPrincipalName $identity -Status 'Failed' -Detail $detail))
+                    continue
+                }
+            }
+            else {
+                $detail = ConvertTo-TrimmedString $resp.Error
+                if (-not $detail) { $detail = "Graph user lookup failed with HTTP $($resp.Status)" }
+                [void]$rows.Add((New-UserResult -UserPrincipalName $identity -Status 'Failed' -Detail $detail))
+                continue
+            }
+
+            $objectId = ConvertTo-TrimmedString (Get-PropertyValue $user 'id' '')
+            $upn = ConvertTo-TrimmedString (Get-PropertyValue $user 'userPrincipalName' '')
+            if (-not $objectId) {
+                [void]$rows.Add((New-UserResult -UserPrincipalName $identity -Status 'Failed' -Detail "User not found: $identity"))
+                continue
+            }
+            if ($existing.ContainsKey($objectId) -or $seenIds.ContainsKey($objectId)) {
+                [void]$rows.Add((New-UserResult -UserPrincipalName $identity -Status 'Skipped' -Detail 'Already a member' -ObjectId $objectId -ResolvedUpn $upn))
+                continue
+            }
+            $seenIds[$objectId] = $true
+            [void]$toAdd.Add((New-ResolvedUser -Identity $identity -ObjectId $objectId -ResolvedUpn $upn))
+        }
+
+        if ($toAdd.Count -gt 0) {
+            $ids = New-Object System.Collections.ArrayList
+            foreach ($member in $toAdd) { [void]$ids.Add([string]$member.ObjectId) }
+            $patchUri = '{0}/groups/{1}' -f $base, $GroupId
+            $patchResp = Invoke-GraphSdkSend -Method PATCH -Uri $patchUri -Body (Get-BindMembersHashtable -DirectoryObjectIds $ids)
+            if (($patchResp.Status -in 200, 204, 0) -and -not $patchResp.Error) {
+                foreach ($member in $toAdd) {
+                    $existing[$member.ObjectId] = $true
+                    [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Added' -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+                }
+            }
+            elseif ($toAdd.Count -eq 1 -and (Test-IsAlreadyMemberText $patchResp.Error)) {
+                $member = $toAdd[0]
+                $existing[$member.ObjectId] = $true
+                [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Skipped' -Detail 'Already a member' -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+            }
+            else {
+                foreach ($member in $toAdd) {
+                    $refUri = Get-AddMemberUri -TargetGroupId $GroupId
+                    $refBody = @{}
+                    $refBody['@odata.id'] = Get-GroupMemberODataId $member.ObjectId
+                    $refResp = Invoke-GraphSdkSend -Method POST -Uri $refUri -Body $refBody
+                    if (($refResp.Status -in 200, 204, 0) -and -not $refResp.Error) {
+                        $existing[$member.ObjectId] = $true
+                        [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Added' -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+                    }
+                    elseif (Test-IsAlreadyMemberText $refResp.Error) {
+                        $existing[$member.ObjectId] = $true
+                        [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Skipped' -Detail 'Already a member' -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+                    }
+                    else {
+                        $detail = ConvertTo-TrimmedString $refResp.Error
+                        if (-not $detail) { $detail = ConvertTo-TrimmedString $patchResp.Error }
+                        if (-not $detail) { $detail = "Graph add-member failed with HTTP $($refResp.Status)" }
+                        [void]$rows.Add((New-UserResult -UserPrincipalName $member.Identity -Status 'Failed' -Detail $detail -ObjectId $member.ObjectId -ResolvedUpn $member.ResolvedUpn))
+                    }
+                }
+            }
+        }
+
+        $done += @($chunk).Count
+        Write-Progress -Activity "Adding users to $GroupName" -Status (Get-RateStatus -Done $done -Total $total -Started $started -Verb 'Processed') -PercentComplete (Get-PercentComplete -Current $done -Total $total)
+        Write-Host (Get-RateStatus -Done $done -Total $total -Started $started -Verb 'Processed') -ForegroundColor DarkGray
+    }
+
+    Write-Progress -Activity "Adding users to $GroupName" -Completed
+    return ,$rows
+}
+
 function Invoke-ParallelUserAdds {
     param(
         $Identities,
@@ -1663,8 +1990,15 @@ function Invoke-SelfTest {
     Assert-True -Condition ($src -notmatch 'Runspaces\.SessionStateFunctionEntry') -Name 'Single-file script does not copy helpers into a separate InitialSessionState'
     Assert-True -Condition ($src -match 'Get-UserChunkWorkerScriptBlock' -and $src -match 'Invoke-WebRequest') -Name 'Parallel workers are built from this same .ps1'
 
-    $tokenObj = [pscustomobject]@{ AuthContext = [pscustomobject]@{ LastAuthResult = [pscustomobject]@{ AccessToken = 'abcdefghijklmnopqrstuvwxyz012345' } } }
-    Assert-True -Condition ((Get-TokenFromObject $tokenObj) -eq 'abcdefghijklmnopqrstuvwxyz012345') -Name 'Graph access token is read from nested AuthContext.LastAuthResult'
+    $sampleJwt = 'eyJhbGciOiJub25lIn0.eyJzdWIiOiIxIn0.abcdefghijklmnopqrstuv'
+    $tokenObj = [pscustomobject]@{ AuthContext = [pscustomobject]@{ LastAuthResult = [pscustomobject]@{ AccessToken = $sampleJwt } } }
+    Assert-True -Condition ((Get-TokenFromObject $tokenObj) -eq $sampleJwt) -Name 'Graph access token is read from nested AuthContext.LastAuthResult'
+    $tokenStruct = [pscustomobject]@{ Token = $sampleJwt; ExpiresOn = [datetime]::UtcNow }
+    Assert-True -Condition ((ConvertTo-PlainToken $tokenStruct) -eq $sampleJwt) -Name 'Azure.Core AccessToken-shaped objects unwrap .Token'
+    Assert-True -Condition ((Get-JwtFromCacheText ('prefix ' + $sampleJwt + ' suffix')) -eq $sampleJwt) -Name 'MSAL cache blobs yield the JWT'
+    Assert-True -Condition ((Get-GraphAccessToken) -eq '') -Name 'Get-GraphAccessToken returns empty without a Graph session instead of throwing'
+    $bindHash = Get-BindMembersHashtable -DirectoryObjectIds @('11111111-2222-3333-4444-555555555555')
+    Assert-True -Condition (@($bindHash['members@odata.bind']).Count -eq 1) -Name 'SDK fallback PATCH body keeps members@odata.bind as an array'
     $ids = ConvertTo-StringArray @('aaa', '', 'bbb', $null)
     Assert-True -Condition ($ids.Count -eq 2 -and $ids[0] -eq 'aaa' -and $ids[1] -eq 'bbb') -Name 'Existing member ids convert to a string array without empty entries'
     $tenChunks = Get-ListChunks -Items (1..25) -Size 10
@@ -1800,8 +2134,14 @@ function Invoke-AddMfaSmsUsers {
     $started = Get-Date
     $token = Get-GraphAccessToken
     $existingIds = ConvertTo-StringArray $existingMembers
-    Write-Host ("Processing {0} user(s) with {1} parallel workers, {2} users per batch..." -f $users.Count, $ThrottleLimit, $BatchSize) -ForegroundColor Cyan
-    $outcomeRows = Invoke-ParallelUserAdds -Identities $users -Token $token -GroupId $GroupId -ExistingIds $existingIds -Size $BatchSize -Throttle $ThrottleLimit
+    if ($token) {
+        Write-Host ("Processing {0} user(s) with {1} parallel workers, {2} users per batch..." -f $users.Count, $ThrottleLimit, $BatchSize) -ForegroundColor Cyan
+        $outcomeRows = Invoke-ParallelUserAdds -Identities $users -Token $token -GroupId $GroupId -ExistingIds $existingIds -Size $BatchSize -Throttle $ThrottleLimit
+    }
+    else {
+        Write-Host ("Could not copy a bearer token from Microsoft.Graph.Authentication (normal on current SDK versions). Processing {0} user(s) in this script with Graph batches of {1}..." -f $users.Count, $BatchSize) -ForegroundColor Yellow
+        $outcomeRows = Invoke-SequentialSdkAdds -Identities $users -GroupId $GroupId -ExistingIds $existingIds -Size $BatchSize
+    }
 
     $outcomeMap = New-IgnoreCaseMap
     foreach ($row in @($outcomeRows)) {
