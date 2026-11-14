@@ -85,6 +85,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
+$script:ToolVersion = '1.4'
 $script:GraphBase = 'https://graph.microsoft.com/v1.0'
 $script:GraphBatchMax = 20
 $script:UserSelect = 'id,userPrincipalName,displayName,mail'
@@ -130,7 +131,7 @@ function ConvertTo-ODataLiteral {
 function Get-ErrorText {
     param($ErrorRecord)
     if ($null -eq $ErrorRecord) { return '' }
-    $parts = New-Object System.Collections.Generic.List[string]
+    $parts = New-StringList
     try {
         $msg = ConvertTo-TrimmedString $ErrorRecord.Exception.Message
         if ($msg) { [void]$parts.Add($msg) }
@@ -275,9 +276,18 @@ function ConvertTo-JsonString {
 }
 
 function New-IgnoreCaseMap {
-    # Do not use New-Object 'Dictionary[string,object]' in Windows PowerShell 5.1:
-    # the comma in the type name is parsed as a second argument ("Argument types do not match").
-    return [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
+    # PowerShell @{} is a case-insensitive Hashtable. A two-parameter generic
+    # dictionary throws "Argument types do not match" on Windows PowerShell 5.1.
+    return @{}
+}
+
+function New-ObjectList {
+    # Unary comma: an empty List is IEnumerable and would otherwise return $null.
+    return ,[System.Collections.Generic.List[object]]::new()
+}
+
+function New-StringList {
+    return ,[System.Collections.Generic.List[string]]::new()
 }
 
 function Disconnect-MfaSmsGraph {
@@ -292,13 +302,13 @@ function Get-ListChunks {
         [int]$Size
     )
     if ($Size -lt 1) { $Size = 1 }
-    $chunks = New-Object System.Collections.Generic.List[object]
-    $current = New-Object System.Collections.Generic.List[object]
+    $chunks = New-ObjectList
+    $current = New-ObjectList
     foreach ($item in @($Items)) {
         [void]$current.Add($item)
         if ($current.Count -ge $Size) {
             [void]$chunks.Add($current)
-            $current = New-Object System.Collections.Generic.List[object]
+            $current = New-ObjectList
         }
     }
     if ($current.Count -gt 0) { [void]$chunks.Add($current) }
@@ -307,7 +317,7 @@ function Get-ListChunks {
 
 function Get-BindMembersJson {
     param([string[]]$DirectoryObjectIds)
-    $parts = New-Object System.Collections.Generic.List[string]
+    $parts = New-StringList
     foreach ($id in @($DirectoryObjectIds)) {
         $oid = ConvertTo-TrimmedString $id
         if (-not $oid) { continue }
@@ -418,7 +428,7 @@ function Get-BatchItemStatus {
 
 function Get-UserPreviewLines {
     param($Users, [int]$MaxNamed = 15)
-    $lines = New-Object System.Collections.Generic.List[string]
+    $lines = New-StringList
     $count = $Users.Count
     $shown = [Math]::Min($MaxNamed, $count)
     $i = 0
@@ -446,7 +456,7 @@ function Get-RateStatus {
 
 function Get-GroupMembershipBlockers {
     param($Group)
-    $blockers = New-Object System.Collections.Generic.List[string]
+    $blockers = New-StringList
 
     $sync = Get-PropertyValue $Group 'onPremisesSyncEnabled' $false
     if ($sync -eq $true -or "$sync" -eq 'True') {
@@ -471,7 +481,7 @@ function ConvertTo-UserIdentityList {
     param([string[]]$Lines)
 
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    $list = New-Object System.Collections.Generic.List[string]
+    $list = New-StringList
 
     foreach ($raw in @($Lines)) {
         $text = ConvertTo-TrimmedString $raw
@@ -539,7 +549,7 @@ function Get-ResultLogPath {
     param([string]$SourcePath, [string]$Prefix)
 
     $name = ('{0}_Results_{1}.csv' -f $Prefix, (Get-Date -Format 'yyyyMMdd_HHmmss'))
-    $candidates = New-Object System.Collections.Generic.List[string]
+    $candidates = New-StringList
 
     $parent = ''
     try { $parent = Split-Path -Path $SourcePath -Parent } catch { }
@@ -857,7 +867,9 @@ function Add-EntraGroupMember {
 }
 
 function Invoke-GraphJsonBatch {
-    param([System.Collections.Generic.IList[object]]$Items)
+    # Keep -Items untyped. A generic list parameter type throws
+    # "Argument types do not match" on Windows PowerShell 5.1.
+    param($Items)
 
     $byId = @{}
     if ($null -eq $Items -or $Items.Count -eq 0) { return $byId }
@@ -865,7 +877,7 @@ function Invoke-GraphJsonBatch {
         throw ("JSON batch cannot exceed {0} requests (got {1})." -f $script:GraphBatchMax, $Items.Count)
     }
 
-    $pending = New-Object System.Collections.Generic.List[object]
+    $pending = New-ObjectList
     foreach ($item in $Items) { [void]$pending.Add($item) }
 
     $attempt = 0
@@ -883,7 +895,7 @@ function Invoke-GraphJsonBatch {
             if ($id) { $returned[$id] = $item }
         }
 
-        $retry = New-Object System.Collections.Generic.List[object]
+        $retry = New-ObjectList
         $wait = 0
         foreach ($item in $pending) {
             $id = [string](Get-PropertyValue $item 'Id' '')
@@ -965,14 +977,14 @@ function Resolve-EntraUsersBatched {
     if ($Size -gt $script:GraphBatchMax) { $Size = $script:GraphBatchMax }
 
     $map = New-IgnoreCaseMap
-    $needFilter = New-Object System.Collections.Generic.List[string]
+    $needFilter = New-StringList
     $chunks = Get-ListChunks -Items $Identities -Size $Size
     $done = 0
     $total = $Identities.Count
     $started = Get-Date
 
     foreach ($chunk in $chunks) {
-        $batch = New-Object System.Collections.Generic.List[object]
+        $batch = New-ObjectList
         for ($i = 0; $i -lt $chunk.Count; $i++) {
             $identity = [string]$chunk[$i]
             [void]$batch.Add((New-GraphBatchItem -Id ([string]($i + 1)) -Method 'GET' -Url (Get-UserLookupRelativeUrl $identity)))
@@ -1014,7 +1026,7 @@ function Resolve-EntraUsersBatched {
 
     $filterChunks = Get-ListChunks -Items $needFilter -Size $Size
     foreach ($chunk in $filterChunks) {
-        $batch = New-Object System.Collections.Generic.List[object]
+        $batch = New-ObjectList
         for ($i = 0; $i -lt $chunk.Count; $i++) {
             $identity = [string]$chunk[$i]
             [void]$batch.Add((New-GraphBatchItem -Id ([string]($i + 1)) -Method 'GET' -Url (Get-UserFilterRelativeUrl $identity)))
@@ -1083,7 +1095,7 @@ function Add-EntraGroupMembersBatched {
     if ($Size -lt 1) { $Size = 1 }
     if ($Size -gt $script:GraphBatchMax) { $Size = $script:GraphBatchMax }
 
-    $pending = New-Object System.Collections.Generic.List[object]
+    $pending = New-ObjectList
     $seenIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($member in @($Members)) {
         $identity = [string](Get-PropertyValue $member 'Identity' '')
@@ -1103,19 +1115,19 @@ function Add-EntraGroupMembersBatched {
     $started = Get-Date
 
     foreach ($httpChunk in $httpChunks) {
-        $batch = New-Object System.Collections.Generic.List[object]
+        $batch = New-ObjectList
         $chunkById = @{}
         for ($i = 0; $i -lt $httpChunk.Count; $i++) {
             $bindChunk = $httpChunk[$i]
             $id = [string]($i + 1)
             $chunkById[$id] = $bindChunk
-            $ids = New-Object System.Collections.Generic.List[string]
+            $ids = New-StringList
             foreach ($member in $bindChunk) { [void]$ids.Add([string](Get-PropertyValue $member 'ObjectId' '')) }
             [void]$batch.Add((New-GraphBatchItem -Id $id -Method 'PATCH' -Url ('/groups/{0}' -f $TargetGroupId) -Headers @{ 'Content-Type' = 'application/json' } -BodyJson (Get-BindMembersJson -DirectoryObjectIds $ids)))
         }
 
         $responses = Invoke-GraphJsonBatch -Items $batch
-        $fallback = New-Object System.Collections.Generic.List[object]
+        $fallback = New-ObjectList
         foreach ($id in ($chunkById.Keys | Sort-Object)) {
             $bindChunk = $chunkById[$id]
             if (-not $responses.ContainsKey($id)) {
@@ -1146,7 +1158,7 @@ function Add-EntraGroupMembersBatched {
         if ($fallback.Count -gt 0) {
             $refChunks = Get-ListChunks -Items $fallback -Size $script:GraphBatchMax
             foreach ($refChunk in $refChunks) {
-                $refBatch = New-Object System.Collections.Generic.List[object]
+                $refBatch = New-ObjectList
                 for ($i = 0; $i -lt $refChunk.Count; $i++) {
                     $member = $refChunk[$i]
                     $objectId = ConvertTo-TrimmedString (Get-PropertyValue $member 'ObjectId' '')
@@ -1362,11 +1374,17 @@ function Invoke-SelfTest {
     Assert-True -Condition ($previewLines.Count -eq 16 -and $previewLines[15] -like '*and 5 more*') -Name 'Large lists preview the first names instead of printing thousands of lines'
     Assert-True -Condition (-not $Preview) -Name '-Preview is not clobbered by preview line output (PowerShell variables are case-insensitive)'
 
+    $emptyStrings = New-StringList
+    [void]$emptyStrings.Add('one')
+    Assert-True -Condition ($emptyStrings.Count -eq 1 -and $emptyStrings[0] -eq 'one') -Name 'Empty generic lists are returned as collections, not $null'
+
     $map = New-IgnoreCaseMap
     $map['Alice@Contoso.com'] = 'ok'
-    Assert-True -Condition ($map.ContainsKey('alice@contoso.com') -and $map['ALICE@CONTOSO.COM'] -eq 'ok') -Name 'Ignore-case map is built with ::new() so Windows PowerShell 5.1 does not throw Argument types do not match'
+    Assert-True -Condition ($map.ContainsKey('alice@contoso.com') -and $map['ALICE@CONTOSO.COM'] -eq 'ok') -Name 'Ignore-case map is a PowerShell hashtable (Windows PowerShell 5.1 safe)'
     $src = [IO.File]::ReadAllText($PSCommandPath)
-    Assert-True -Condition ($src -notmatch "New-Object 'System.Collections.Generic.Dictionary\[string,object\]'") -Name 'Script does not use New-Object Dictionary[string,object] (PS 5.1 comma parsing)'
+    Assert-True -Condition ($src -notmatch '\[System\.Collections\.Generic\.Dictionary') -Name 'Script does not construct a two-parameter generic dictionary'
+    Assert-True -Condition ($src -notmatch 'param\(\[System\.Collections\.Generic\.IList') -Name 'JSON batch helper Items parameter is untyped for Windows PowerShell 5.1'
+    Assert-True -Condition ($src -notmatch 'New-Object System\.Collections\.Generic\.List\[') -Name 'Generic lists are created with ::new(), not unquoted New-Object'
     Assert-True -Condition (Test-IsAlreadyMemberText "One or more added object references already exist for the following modified properties: 'members'.") -Name 'Batch 400 already-exists text is classified as Skipped'
 
     Write-Host ''
@@ -1379,6 +1397,8 @@ function Invoke-SelfTest {
 # ---------------------------------------------------------------------------
 
 function Invoke-AddMfaSmsUsers {
+    Write-Host ("Add-MfaSmsUsers v{0}" -f $script:ToolVersion) -ForegroundColor DarkGray
+
     if (-not (Test-IsGuid $GroupId)) {
         throw "GroupId '$GroupId' is not a valid GUID."
     }
@@ -1466,7 +1486,7 @@ function Invoke-AddMfaSmsUsers {
     Write-Host ("Resolving {0} user(s) with Graph JSON batches of {1}..." -f $users.Count, $BatchSize) -ForegroundColor Cyan
     $resolved = Resolve-EntraUsersBatched -Identities $users -Size $BatchSize
 
-    $toAdd = New-Object System.Collections.Generic.List[object]
+    $toAdd = New-ObjectList
     $outcomeMap = New-IgnoreCaseMap
     foreach ($upn in $users) {
         $identity = [string]$upn
@@ -1491,7 +1511,7 @@ function Invoke-AddMfaSmsUsers {
     Write-Host ("Adding {0} resolved user(s); up to {1} members per PATCH, {2} PATCHes per HTTP call..." -f $toAdd.Count, $BatchSize, $script:GraphBatchMax) -ForegroundColor Cyan
     Add-EntraGroupMembersBatched -TargetGroupId $GroupId -Members $toAdd -ExistingMembers $existingMembers -OutcomeMap $outcomeMap -Size $BatchSize
 
-    $results = New-Object System.Collections.Generic.List[object]
+    $results = New-ObjectList
     foreach ($upn in $users) {
         $identity = [string]$upn
         if ($outcomeMap.ContainsKey($identity)) {
@@ -1551,11 +1571,20 @@ try {
 }
 catch {
     $text = Get-ErrorText $_
-    Write-Host "ERROR: $text" -ForegroundColor Red
+    $where = ''
+    try {
+        $line = Get-PropertyValue $_.InvocationInfo 'ScriptLineNumber' $null
+        if ($line) { $where = " (line $line)" }
+    } catch { }
+    Write-Host "ERROR: $text$where" -ForegroundColor Red
+    try {
+        $stack = ConvertTo-TrimmedString $_.ScriptStackTrace
+        if ($stack) { Write-Host $stack -ForegroundColor DarkGray }
+    } catch { }
     if (-not $NonInteractive) {
         try {
             Initialize-WinForms
-            Show-Message -Text "An error occurred:`r`n`r`n$text" -Icon ([System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+            Show-Message -Text "An error occurred:`r`n`r`n$text$where" -Icon ([System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
         } catch { }
     }
     exit 1
