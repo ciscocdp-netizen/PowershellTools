@@ -41,9 +41,13 @@
         slices, Discovery and mailbox/file dumps off, Graph PowerShell apps in one query.
       - Exchange sign-in uses DisableWAM so the login window is not trapped in the
         background runspace.
+    Version 2.1.3:
+      - When Suspect Users are supplied, collection is limited to those accounts
+        (UAL UserIds, Graph UPN sign-ins, directory audit initiated-by, mailbox state).
+        Use -TenantWide to hunt the whole tenant and only highlight the suspects.
 #>
 
-$script:ScriptVersion = '2.1.2'
+$script:ScriptVersion = '2.1.3'
 $script:Inv = [Globalization.CultureInfo]::InvariantCulture
 $script:UiSync = $null
 $script:LogFile = $null
@@ -114,6 +118,7 @@ $script:Config = @{
     MaxReportEvents = 12000
     Fast = $true
     IncludeDiscovery = $false
+    TenantWide = $false
 }
 
 #region Config / UI bridge
@@ -663,6 +668,75 @@ function Get-NormalizedIdList {
     return @(Get-NormalizedTokenList $Values)
 }
 
+function Test-SuspectScoped {
+    return ($script:SuspectUserSet.Count -gt 0 -and -not [bool]$script:Config.TenantWide)
+}
+
+function Get-ScopedUserIds {
+    $ids = New-Object System.Collections.Generic.List[string]
+    if (Test-SuspectScoped) {
+        foreach ($u in @($script:Config.SuspectUsers)) {
+            if ($u) { [void]$ids.Add([string]$u) }
+        }
+    }
+    return , $ids.ToArray()
+}
+
+function Test-TextMentionsSuspect {
+    param([string]$Text)
+    if (-not $Text -or $script:SuspectUserSet.Count -eq 0) { return $false }
+    foreach ($u in $script:SuspectUserSet) {
+        if ($u -and $Text.IndexOf($u, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+    }
+    return $false
+}
+
+function Test-RowInSuspectScope {
+    param($Row)
+    if (-not (Test-SuspectScoped)) { return $true }
+    if (-not $Row) { return $false }
+    if ($Row.PSObject.Properties['SuspectMatch'] -and [string]$Row.SuspectMatch) { return $true }
+    $hay = @(
+        $(if ($Row.PSObject.Properties['Actor']) { $Row.Actor }),
+        $(if ($Row.PSObject.Properties['User']) { $Row.User }),
+        $(if ($Row.PSObject.Properties['Target']) { $Row.Target }),
+        $(if ($Row.PSObject.Properties['TargetIdentity']) { $Row.TargetIdentity }),
+        $(if ($Row.PSObject.Properties['CommandLine']) { $Row.CommandLine }),
+        $(if ($Row.PSObject.Properties['Details']) { $Row.Details }),
+        $(if ($Row.PSObject.Properties['Item']) { $Row.Item }),
+        $(if ($Row.PSObject.Properties['Detail']) { $Row.Detail })
+    ) -join ' '
+    return (Test-TextMentionsSuspect $hay)
+}
+
+function Get-GraphSuspectUserFilter {
+    param([string]$Field = 'userPrincipalName')
+    $users = @($script:Config.SuspectUsers)
+    if ($users.Count -eq 0) { return '' }
+    $parts = foreach ($u in $users) {
+        if ($u) { "{0} eq '{1}'" -f $Field, ($u -replace "'", "''") }
+    }
+    $arr = @($parts)
+    if ($arr.Count -eq 0) { return '' }
+    if ($arr.Count -eq 1) { return $arr[0] }
+    return '(' + ($arr -join ' or ') + ')'
+}
+
+function Add-UniqueEventRows {
+    param(
+        [System.Collections.Generic.List[object]]$Target,
+        [System.Collections.Generic.HashSet[string]]$Seen,
+        $Rows
+    )
+    foreach ($x in @($Rows)) {
+        if ($null -eq $x) { continue }
+        $id = ''
+        if ($x.PSObject.Properties['RecordId']) { $id = [string]$x.RecordId }
+        if ($id -and $Seen -and -not $Seen.Add($id)) { continue }
+        $Target.Add($x)
+    }
+}
+
 function Get-DefaultOutputParent {
     foreach ($known in @([Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('MyDocuments'), $env:USERPROFILE, (Get-Location).Path)) {
         if ($known -and "$known".Trim()) { return $known }
@@ -909,12 +983,15 @@ function ConvertFrom-UalSignIn {
 }
 
 function Get-UalRecords {
-    param([datetime]$From, [datetime]$To, [string]$RecordType = '', [string[]]$Operations = @(), [string[]]$UserIds = @(), [int]$Depth = 0)
+    param([datetime]$From, [datetime]$To, [string]$RecordType = '', [string[]]$Operations = @(), [string[]]$UserIds = @(), [string[]]$ObjectIds = @(), [int]$Depth = 0)
     $results = New-Object System.Collections.Generic.List[object]
     $sessionRetries = 0
     $label = $RecordType
     if (-not $label -and $Operations.Count) { $label = ($Operations | Select-Object -First 3) -join ',' }
     if (-not $label) { $label = 'UAL' }
+    $scopeNote = ''
+    if ($UserIds.Count -gt 0) { $scopeNote = (' · {0} user(s)' -f $UserIds.Count) }
+    elseif ($ObjectIds.Count -gt 0) { $scopeNote = (' · targeting {0} object(s)' -f $ObjectIds.Count) }
     while ($true) {
         Test-InvestigationCancel
         $sessionId = [guid]::NewGuid().ToString()
@@ -928,9 +1005,10 @@ function Get-UalRecords {
             if ($RecordType) { $ualParams['RecordType'] = $RecordType }
             if ($Operations.Count -gt 0) { $ualParams['Operations'] = $Operations }
             if ($UserIds.Count -gt 0) { $ualParams['UserIds'] = $UserIds }
+            if ($ObjectIds.Count -gt 0) { $ualParams['ObjectIds'] = $ObjectIds }
             $pageNum = $pages + 1
-            Set-InvestigationActivity -WaitingOn ("Search-UnifiedAuditLog {0} page {1}" -f $label, $pageNum) -Detail ("{0:yyyy-MM-dd HH:mm} -> {1:yyyy-MM-dd HH:mm} UTC · {2:N0} in this slice so far" -f $From, $To, $results.Count)
-            Write-Log 'INFO' ("UAL {0}: requesting {1:yyyy-MM-dd HH:mm} -> {2:yyyy-MM-dd HH:mm} UTC, page {3} ({4:N0} in this slice so far). This Microsoft 365 call can take several minutes." -f $label, $From, $To, $pageNum, $results.Count)
+            Set-InvestigationActivity -WaitingOn ("Search-UnifiedAuditLog {0} page {1}{2}" -f $label, $pageNum, $scopeNote) -Detail ("{0:yyyy-MM-dd HH:mm} -> {1:yyyy-MM-dd HH:mm} UTC · {2:N0} in this slice so far{3}" -f $From, $To, $results.Count, $scopeNote)
+            Write-Log 'INFO' ("UAL {0}: requesting {1:yyyy-MM-dd HH:mm} -> {2:yyyy-MM-dd HH:mm} UTC, page {3} ({4:N0} in this slice so far{5}). This Microsoft 365 call can take several minutes." -f $label, $From, $To, $pageNum, $results.Count, $scopeNote)
             $page = @(Invoke-WithRetry -Activity ("UAL {0}" -f $label) -Script { Search-UnifiedAuditLog @ualParams })
             $pages++
             Set-InvestigationActivity -PagesDelta 1
@@ -945,8 +1023,8 @@ function Get-UalRecords {
                     $mid = $From.AddTicks([long](($To - $From).Ticks / 2))
                     Write-Log 'WARN' ("UAL {0}: {1:N0} results in {2:u} -> {3:u} exceeds the 50,000 session cap - splitting window" -f $label, $expected, $From, $To)
                     $combined = New-Object System.Collections.Generic.List[object]
-                    foreach ($x in (Get-UalRecords -From $From -To $mid -RecordType $RecordType -Operations $Operations -UserIds $UserIds -Depth ($Depth + 1))) { $combined.Add($x) }
-                    foreach ($x in (Get-UalRecords -From $mid -To $To -RecordType $RecordType -Operations $Operations -UserIds $UserIds -Depth ($Depth + 1))) { $combined.Add($x) }
+                    foreach ($x in (Get-UalRecords -From $From -To $mid -RecordType $RecordType -Operations $Operations -UserIds $UserIds -ObjectIds $ObjectIds -Depth ($Depth + 1))) { $combined.Add($x) }
+                    foreach ($x in (Get-UalRecords -From $mid -To $To -RecordType $RecordType -Operations $Operations -UserIds $UserIds -ObjectIds $ObjectIds -Depth ($Depth + 1))) { $combined.Add($x) }
                     return , $combined.ToArray()
                 }
                 if ($expected -ge 50000) { Write-Log 'WARN' "UAL ${label}: >50,000 events in a 2-minute window - results truncated (export this window via Purview Audit search)." }
@@ -986,7 +1064,7 @@ function Get-AdminUalChunkHours {
 }
 
 function Invoke-UalCollection {
-    param([string]$Name, [datetime]$From, [datetime]$To, [string]$RecordType = '', [string[]]$Operations = @(), [string[]]$UserIds = @(), [string]$Label = 'Admin', [string]$Kind = 'Event', [int]$ChunkHours = 0)
+    param([string]$Name, [datetime]$From, [datetime]$To, [string]$RecordType = '', [string[]]$Operations = @(), [string[]]$UserIds = @(), [string[]]$ObjectIds = @(), [string]$Label = 'Admin', [string]$Kind = 'Event', [int]$ChunkHours = 0)
     $rows = New-Object System.Collections.Generic.List[object]
     if ($From -ge $To) { return , $rows.ToArray() }
     $rawFile = Join-Path $script:RawPath ('UAL-{0}-{1}.jsonl' -f $Label, $Name)
@@ -1003,8 +1081,11 @@ function Invoke-UalCollection {
             Test-InvestigationCancel
             $chunkEnd = $cursor.AddHours($chunkHours)
             if ($chunkEnd -gt $To) { $chunkEnd = $To }
-            Set-InvestigationActivity -Phase 'Unified Audit Log' -Step $Name -Detail ("{0:yyyy-MM-dd HH:mm} -> {1:yyyy-MM-dd HH:mm} UTC · {2:N0} collected" -f $cursor, $chunkEnd, $rows.Count) -WaitingOn ("UAL slice $Name")
-            $records = Get-UalRecords -From $cursor -To $chunkEnd -RecordType $RecordType -Operations $Operations -UserIds $UserIds
+            $scopeDetail = ''
+            if ($UserIds.Count -gt 0) { $scopeDetail = (' · scoped to {0}' -f ($UserIds -join ', ')) }
+            elseif ($ObjectIds.Count -gt 0) { $scopeDetail = (' · targeting {0}' -f ($ObjectIds -join ', ')) }
+            Set-InvestigationActivity -Phase 'Unified Audit Log' -Step $Name -Detail ("{0:yyyy-MM-dd HH:mm} -> {1:yyyy-MM-dd HH:mm} UTC · {2:N0} collected{3}" -f $cursor, $chunkEnd, $rows.Count, $scopeDetail) -WaitingOn ("UAL slice $Name")
+            $records = Get-UalRecords -From $cursor -To $chunkEnd -RecordType $RecordType -Operations $Operations -UserIds $UserIds -ObjectIds $ObjectIds
             $new = 0
             foreach ($r in $records) {
                 $id = [string]$r.Identity
@@ -1055,39 +1136,72 @@ function Invoke-ExchangeStateCollection {
     }
     catch { Write-Log 'WARN' "Get-OrganizationConfig: $($_.Exception.Message)" }
 
-    Set-InvestigationActivity -Step 'Mailbox audit bypass' -WaitingOn 'Get-MailboxAuditBypassAssociation'
-    try {
-        foreach ($b in @(Get-MailboxAuditBypassAssociation -ResultSize Unlimited -ErrorAction Stop | Where-Object { $_.AuditBypassEnabled })) {
-            Add-Finding 'Critical' 'Audit Configuration' ("Audit bypass enabled: " + $b.Name) ("Identity=" + $b.Identity + "; WhenChanged=" + $b.WhenChanged) 'Actions by this account against mailboxes are not audited (T1562.008).' $b.WhenChanged $src
+    $scoped = Test-SuspectScoped
+    if ($scoped) {
+        Write-Log 'INFO' ('Current-state sweep limited to suspect mailboxes: {0}' -f ($script:Config.SuspectUsers -join ', '))
+        foreach ($mbx in @($script:Config.SuspectUsers)) {
+            Test-InvestigationCancel
+            Set-InvestigationActivity -Step ("Suspect mailbox $mbx") -WaitingOn "Get-Mailbox $mbx"
+            try {
+                $m = Get-Mailbox -Identity $mbx -ErrorAction Stop
+                if (-not $m.AuditEnabled) {
+                    Add-Finding 'Medium' 'Audit Configuration' ("Mailbox auditing disabled: " + $m.PrimarySmtpAddress) ("WhenChanged=" + $m.WhenChanged) 'Access to this mailbox is not audited.' $m.WhenChanged $src
+                }
+                if ($m.ForwardingSmtpAddress -or $m.ForwardingAddress) {
+                    $sev = 'Medium'; if ($m.ForwardingSmtpAddress) { $sev = 'High' }
+                    $recent = $m.WhenChanged -and $m.WhenChanged.ToUniversalTime() -ge $script:StartUtc
+                    if ($recent -and $sev -eq 'High') { $sev = 'Critical' }
+                    Add-Finding $sev 'Mail Forwarding' ([string]$m.PrimarySmtpAddress) ("ForwardingSmtpAddress={0}; ForwardingAddress={1}; DeliverToMailboxAndForward={2}; MailboxLastChanged={3}" -f $m.ForwardingSmtpAddress, $m.ForwardingAddress, $m.DeliverToMailboxAndForward, $m.WhenChanged) 'Mailbox-level forwarding is a primary exfiltration technique (T1114.003).' $m.WhenChanged $src
+                }
+            }
+            catch { Write-Log 'INFO' "Get-Mailbox ${mbx}: $($_.Exception.Message)" }
+            try {
+                foreach ($b in @(Get-MailboxAuditBypassAssociation -Identity $mbx -ErrorAction Stop | Where-Object { $_.AuditBypassEnabled })) {
+                    Add-Finding 'Critical' 'Audit Configuration' ("Audit bypass enabled: " + $b.Name) ("Identity=" + $b.Identity + "; WhenChanged=" + $b.WhenChanged) 'Actions by this account against mailboxes are not audited (T1562.008).' $b.WhenChanged $src
+                }
+            }
+            catch { Write-Log 'INFO' "Get-MailboxAuditBypassAssociation ${mbx}: $($_.Exception.Message)" }
         }
-    }
-    catch { Write-Log 'WARN' "Get-MailboxAuditBypassAssociation: $($_.Exception.Message)" }
-
-    if ($script:Config.Fast) {
-        Write-Log 'INFO' 'Fast collection: skipping tenant-wide Get-Mailbox walks (audit-disabled and forwarding). Uncheck Fast collection to include them.'
     }
     else {
-        Set-InvestigationActivity -Step 'Mailboxes with auditing disabled' -WaitingOn 'Get-Mailbox (AuditEnabled)'
+        Set-InvestigationActivity -Step 'Mailbox audit bypass' -WaitingOn 'Get-MailboxAuditBypassAssociation'
         try {
-            $noAudit = @(Get-Mailbox -ResultSize Unlimited -Filter 'AuditEnabled -eq $false' -ErrorAction Stop)
-            foreach ($m in ($noAudit | Select-Object -First 500)) {
-                Add-Finding 'Medium' 'Audit Configuration' ("Mailbox auditing disabled: " + $m.PrimarySmtpAddress) ("WhenChanged=" + $m.WhenChanged) 'Access to this mailbox is not audited.' $m.WhenChanged $src
+            foreach ($b in @(Get-MailboxAuditBypassAssociation -ResultSize Unlimited -ErrorAction Stop | Where-Object { $_.AuditBypassEnabled })) {
+                Add-Finding 'Critical' 'Audit Configuration' ("Audit bypass enabled: " + $b.Name) ("Identity=" + $b.Identity + "; WhenChanged=" + $b.WhenChanged) 'Actions by this account against mailboxes are not audited (T1562.008).' $b.WhenChanged $src
             }
         }
-        catch { Write-Log 'WARN' "Mailbox audit status: $($_.Exception.Message)" }
+        catch { Write-Log 'WARN' "Get-MailboxAuditBypassAssociation: $($_.Exception.Message)" }
 
-        Set-InvestigationActivity -Step 'Mailbox forwarding' -WaitingOn 'Get-Mailbox (Forwarding*)'
-        try {
-            foreach ($m in @(Get-Mailbox -ResultSize Unlimited -Filter 'ForwardingSmtpAddress -ne $null -or ForwardingAddress -ne $null' -ErrorAction Stop)) {
-                $sev = 'Medium'; if ($m.ForwardingSmtpAddress) { $sev = 'High' }
-                $recent = $m.WhenChanged -and $m.WhenChanged.ToUniversalTime() -ge $script:StartUtc
-                if ($recent -and $sev -eq 'High') { $sev = 'Critical' }
-                Add-Finding $sev 'Mail Forwarding' ([string]$m.PrimarySmtpAddress) ("ForwardingSmtpAddress={0}; ForwardingAddress={1}; DeliverToMailboxAndForward={2}; MailboxLastChanged={3}" -f $m.ForwardingSmtpAddress, $m.ForwardingAddress, $m.DeliverToMailboxAndForward, $m.WhenChanged) 'Mailbox-level forwarding is a primary exfiltration technique (T1114.003).' $m.WhenChanged $src
-            }
+        if ($script:Config.Fast) {
+            Write-Log 'INFO' 'Fast collection: skipping tenant-wide Get-Mailbox walks (audit-disabled and forwarding). Uncheck Fast collection to include them.'
         }
-        catch { Write-Log 'WARN' "Forwarding sweep: $($_.Exception.Message)" }
+        else {
+            Set-InvestigationActivity -Step 'Mailboxes with auditing disabled' -WaitingOn 'Get-Mailbox (AuditEnabled)'
+            try {
+                $noAudit = @(Get-Mailbox -ResultSize Unlimited -Filter 'AuditEnabled -eq $false' -ErrorAction Stop)
+                foreach ($m in ($noAudit | Select-Object -First 500)) {
+                    Add-Finding 'Medium' 'Audit Configuration' ("Mailbox auditing disabled: " + $m.PrimarySmtpAddress) ("WhenChanged=" + $m.WhenChanged) 'Access to this mailbox is not audited.' $m.WhenChanged $src
+                }
+            }
+            catch { Write-Log 'WARN' "Mailbox audit status: $($_.Exception.Message)" }
+
+            Set-InvestigationActivity -Step 'Mailbox forwarding' -WaitingOn 'Get-Mailbox (Forwarding*)'
+            try {
+                foreach ($m in @(Get-Mailbox -ResultSize Unlimited -Filter 'ForwardingSmtpAddress -ne $null -or ForwardingAddress -ne $null' -ErrorAction Stop)) {
+                    $sev = 'Medium'; if ($m.ForwardingSmtpAddress) { $sev = 'High' }
+                    $recent = $m.WhenChanged -and $m.WhenChanged.ToUniversalTime() -ge $script:StartUtc
+                    if ($recent -and $sev -eq 'High') { $sev = 'Critical' }
+                    Add-Finding $sev 'Mail Forwarding' ([string]$m.PrimarySmtpAddress) ("ForwardingSmtpAddress={0}; ForwardingAddress={1}; DeliverToMailboxAndForward={2}; MailboxLastChanged={3}" -f $m.ForwardingSmtpAddress, $m.ForwardingAddress, $m.DeliverToMailboxAndForward, $m.WhenChanged) 'Mailbox-level forwarding is a primary exfiltration technique (T1114.003).' $m.WhenChanged $src
+                }
+            }
+            catch { Write-Log 'WARN' "Forwarding sweep: $($_.Exception.Message)" }
+        }
     }
 
+    if ($scoped) {
+        Write-Log 'INFO' 'Skipping tenant-wide outbound spam, transport rule, connector, and RBAC dumps (not limited to the suspect users).'
+    }
+    else {
     Set-InvestigationActivity -Step 'Outbound spam / auto-forward policy' -WaitingOn 'Get-HostedOutboundSpamFilterPolicy'
     try {
         foreach ($p in @(Get-HostedOutboundSpamFilterPolicy -ErrorAction Stop)) {
@@ -1161,12 +1275,15 @@ function Invoke-ExchangeStateCollection {
         }
         catch { Write-Log 'INFO' "Role group '$rg' not readable or not present: $($_.Exception.Message)" }
     }
+    }
 
     $targets = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($u in $script:SuspectUserSet) { [void]$targets.Add($u) }
-    foreach ($e in $UalRows) {
-        if ($null -eq $e) { continue }
-        if ($e.Category -match 'Mailbox Access|Mail Forwarding|Mailbox Impersonation' -and $e.TargetIdentity) { [void]$targets.Add($e.TargetIdentity) }
+    if (-not $scoped) {
+        foreach ($e in $UalRows) {
+            if ($null -eq $e) { continue }
+            if ($e.Category -match 'Mailbox Access|Mail Forwarding|Mailbox Impersonation' -and $e.TargetIdentity) { [void]$targets.Add($e.TargetIdentity) }
+        }
     }
     $hasHidden = $false
     try { $hasHidden = (Get-Command Get-InboxRule -ErrorAction Stop).Parameters.ContainsKey('IncludeHidden') } catch { }
@@ -1273,21 +1390,34 @@ function Invoke-ExchangePhase {
     }
 
     $adminChunk = Get-AdminUalChunkHours
+    $scopeUsers = Get-ScopedUserIds
+    if ($scopeUsers.Count -gt 0) {
+        Write-Log 'INFO' ("UAL collection is scoped to suspect users: {0}. Tenant-wide admin dumps are skipped. Check Tenant-wide to hunt the whole tenant." -f ($scopeUsers -join ', '))
+        Set-InvestigationActivity -Step 'Suspect-user scope' -Detail ($scopeUsers -join ', ')
+    }
+    else {
+        Write-Log 'INFO' 'No suspect-user scope: UAL admin collection is tenant-wide. Enter Suspect users to limit the hunt.'
+    }
     Write-Log 'INFO' ("UAL admin slices are {0} hours. Discovery UAL={1}. Deep suspect mailbox/file dump={2}." -f $adminChunk, [bool]$script:Config.IncludeDiscovery, (-not [bool]$script:Config.SkipSuspectDataAccess))
     Write-InvestigationProgress 'Unified Audit Log' 'Collecting admin cmdlets' 10
     $adminRows = New-Object System.Collections.Generic.List[object]
+    $seenAdmin = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $tenantTypes = Get-UalAdminRecordTypes
     foreach ($rt in $tenantTypes) {
         Test-InvestigationCancel
-        foreach ($x in (Invoke-UalCollection -Name $rt -RecordType $rt -From $script:StartUtc -To $script:EndUtc -Label 'Admin' -ChunkHours $adminChunk)) { $adminRows.Add($x) }
+        Add-UniqueEventRows -Target $adminRows -Seen $seenAdmin -Rows (Invoke-UalCollection -Name $rt -RecordType $rt -From $script:StartUtc -To $script:EndUtc -Label 'Admin' -ChunkHours $adminChunk -UserIds $scopeUsers)
+        if ($scopeUsers.Count -gt 0 -and $rt -match 'ExchangeAdmin|SecurityComplianceCenterEOPCmdlet') {
+            Add-UniqueEventRows -Target $adminRows -Seen $seenAdmin -Rows (Invoke-UalCollection -Name ($rt + '-Target') -RecordType $rt -From $script:StartUtc -To $script:EndUtc -Label 'Admin' -ChunkHours $adminChunk -ObjectIds $scopeUsers)
+        }
     }
 
     $highSignalOps = @('SiteCollectionAdminAdded', 'SiteCollectionAdminRemoved', 'SharingPolicyChanged', 'SiteAdminChangeRequest',
         'UpdateInboxRules', 'New-InboxRule', 'Set-InboxRule', 'AddFolderPermissions', 'UpdateFolderPermissions', 'CreateFlow', 'EditFlow',
         'TeamCreated', 'MemberAdded', 'MemberRemoved', 'AddedToRoster')
     Write-InvestigationProgress 'Unified Audit Log' 'High-signal operations' 25
-    foreach ($x in (Invoke-UalCollection -Name 'HighSignalOperations' -Operations $highSignalOps -From $script:StartUtc -To $script:EndUtc -Label 'Admin' -ChunkHours $adminChunk)) {
-        if ($x.RecordType -notmatch 'ExchangeAdmin') { $adminRows.Add($x) }
+    $hsRows = Invoke-UalCollection -Name 'HighSignalOperations' -Operations $highSignalOps -From $script:StartUtc -To $script:EndUtc -Label 'Admin' -ChunkHours $adminChunk -UserIds $scopeUsers
+    foreach ($x in $hsRows) {
+        if ($x.RecordType -notmatch 'ExchangeAdmin') { Add-UniqueEventRows -Target $adminRows -Seen $seenAdmin -Rows @($x) }
     }
 
     # Graph covers ~30 days of Entra changes. Pull older Entra activity from UAL.
@@ -1296,7 +1426,7 @@ function Invoke-ExchangePhase {
     $aadTo = $script:GraphCutoffUtc
     if ($script:Config.SkipGraph) { $aadTo = $script:EndUtc }
     if ($aadTo -gt $script:StartUtc) {
-        foreach ($x in (Invoke-UalCollection -Name 'AzureActiveDirectory' -RecordType 'AzureActiveDirectory' -From $script:StartUtc -To $aadTo -Label 'Admin' -ChunkHours $adminChunk)) { $adminRows.Add($x) }
+        Add-UniqueEventRows -Target $adminRows -Seen $seenAdmin -Rows (Invoke-UalCollection -Name 'AzureActiveDirectory' -RecordType 'AzureActiveDirectory' -From $script:StartUtc -To $aadTo -Label 'Admin' -ChunkHours $adminChunk -UserIds $scopeUsers)
     }
     Save-Rows -Rows $adminRows -FileName 'Events-UAL-Admin.csv'
 
@@ -1307,9 +1437,13 @@ function Invoke-ExchangePhase {
         Save-Rows -Rows $signIns -FileName 'SignIns-UAL-SuspectUsers.csv'
         if (-not $script:Config.SkipSuspectDataAccess) {
             $actRows = New-Object System.Collections.Generic.List[object]
+            $seenAct = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
             foreach ($rt in @('ExchangeItem', 'ExchangeItemAggregated', 'ExchangeItemGroup', 'SharePointFileOperation', 'SharePointSharingOperation', 'SharePoint', 'MicrosoftTeams', 'MicrosoftFlow')) {
                 Test-InvestigationCancel
-                foreach ($x in (Invoke-UalCollection -Name $rt -RecordType $rt -UserIds $suspects -From $script:StartUtc -To $script:EndUtc -Label 'SuspectActivity')) { $actRows.Add($x) }
+                Add-UniqueEventRows -Target $actRows -Seen $seenAct -Rows (Invoke-UalCollection -Name $rt -RecordType $rt -UserIds $suspects -From $script:StartUtc -To $script:EndUtc -Label 'SuspectActivity')
+                if ($rt -match '^ExchangeItem') {
+                    Add-UniqueEventRows -Target $actRows -Seen $seenAct -Rows (Invoke-UalCollection -Name ($rt + '-Target') -RecordType $rt -ObjectIds $suspects -From $script:StartUtc -To $script:EndUtc -Label 'SuspectActivity')
+                }
             }
             Save-Rows -Rows $actRows -FileName 'Events-UAL-SuspectActivity.csv'
         }
@@ -1457,7 +1591,68 @@ function Get-GraphSignIns {
     return @($items, $note)
 }
 
+function Invoke-GraphStateCollectionForSuspects {
+    $script:Findings.Clear()
+    $src = 'Entra ID (current state, suspect-scoped)'
+    Write-Log 'INFO' ('Entra current-state sweep limited to suspect users: {0}' -f ($script:Config.SuspectUsers -join ', '))
+    Write-InvestigationProgress 'Entra current state' 'Suspect accounts' 85
+    foreach ($upn in @($script:Config.SuspectUsers)) {
+        Test-InvestigationCancel
+        Set-InvestigationActivity -Step ("Suspect $upn") -WaitingOn ("GET users/$upn")
+        $user = $null
+        try {
+            $uri = 'https://graph.microsoft.com/v1.0/users/' + [uri]::EscapeDataString($upn) + '?$select=id,userPrincipalName,displayName,accountEnabled,createdDateTime,userType,mail'
+            $user = Invoke-WithRetry -Activity ("Graph user $upn") -Script { Invoke-MgGraphRequest -Method GET -Uri $uri -OutputType PSObject -ErrorAction Stop }
+        }
+        catch {
+            if (Test-IsCancelError $_) { throw }
+            Write-Log 'WARN' "Could not resolve suspect ${upn}: $($_.Exception.Message)"
+            Add-Finding 'Medium' 'Suspect Account' $upn 'User was not found in Entra ID (wrong UPN, deleted, or insufficient permission).' 'Confirm the UPN. Collection still uses this string in Unified Audit Log UserIds.' $null $src
+            continue
+        }
+        Add-Finding 'Info' 'Suspect Account' ([string]$user.userPrincipalName) ("DisplayName={0}; Enabled={1}; Type={2}; Created={3}; ObjectId={4}" -f $user.displayName, $user.accountEnabled, $user.userType, (ConvertTo-UtcIso $user.createdDateTime), $user.id) 'Baseline identity for the scoped investigation.' $user.createdDateTime $src
+
+        Set-InvestigationActivity -Step ("Roles: $upn") -WaitingOn ("GET users/$upn/memberOf")
+        try {
+            $memberOf = Get-GraphAll -Uri ('https://graph.microsoft.com/v1.0/users/{0}/memberOf?$select=id,displayName' -f $user.id) -Label ("memberOf $upn")
+            foreach ($m in $memberOf) {
+                $type = ([string]$m.'@odata.type') -replace '#microsoft.graph.', ''
+                if ($type -ne 'directoryRole' -and $type -ne 'group') { continue }
+                $sev = 'Info'
+                if ($type -eq 'directoryRole' -and $m.displayName -match 'Global Administrator|Privileged Role Administrator|Exchange Administrator|Application Administrator') { $sev = 'High' }
+                elseif ($type -eq 'directoryRole') { $sev = 'Medium' }
+                Add-Finding $sev 'Entra Directory Role / Group' ("{0}: {1}" -f $upn, $m.displayName) ("MemberType={0}; ObjectId={1}" -f $type, $m.id) 'Privileged membership on a suspect account is persistence or the blast radius of the compromise.' $null $src
+            }
+        }
+        catch { Write-Log 'WARN' "memberOf ${upn}: $($_.Exception.Message)" }
+
+        try {
+            Set-InvestigationActivity -Step ("OAuth grants: $upn") -WaitingOn 'GET oauth2PermissionGrants'
+            $uri = New-GraphUri 'v1.0/oauth2PermissionGrants' ([ordered]@{ '$filter' = ("principalId eq '" + $user.id + "'"); '$top' = '999' })
+            foreach ($g in (Get-GraphAll -Uri $uri -Label ("oauth grants $upn"))) {
+                Add-Finding 'Medium' 'OAuth Delegated Grant' ("{0} -> client {1}" -f $upn, $g.clientId) ("ConsentType={0}; Resource={1}; Scopes={2}" -f $g.consentType, $g.resourceId, $g.scope) 'Delegated grant on the suspect account.' $null $src
+            }
+        }
+        catch { Write-Log 'WARN' "OAuth grants ${upn}: $($_.Exception.Message)" }
+
+        try {
+            Set-InvestigationActivity -Step ("App roles: $upn") -WaitingOn 'GET appRoleAssignments'
+            foreach ($a in (Get-GraphAll -Uri ('https://graph.microsoft.com/v1.0/users/{0}/appRoleAssignments' -f $user.id) -Label ("app roles $upn"))) {
+                Add-Finding 'Medium' 'App Role Assignment' ("{0} -> {1}" -f $upn, $a.resourceDisplayName) ("AppRoleId={0}; Principal={1}; ResourceId={2}" -f $a.appRoleId, $a.principalDisplayName, $a.resourceId) 'Application role assigned to the suspect account.' $null $src
+            }
+        }
+        catch { Write-Log 'WARN' "App roles ${upn}: $($_.Exception.Message)" }
+    }
+    Set-InvestigationActivity -FindingsDelta $script:Findings.Count
+    Save-Rows -Rows $script:Findings -FileName 'Findings-Entra.csv' -SortProperty 'WhenUtc'
+    Add-Coverage -Source 'Entra current-state sweep (suspect-scoped)' -Status 'OK' -Records $script:Findings.Count
+}
+
 function Invoke-GraphStateCollection {
+    if (Test-SuspectScoped) {
+        Invoke-GraphStateCollectionForSuspects
+        return
+    }
     $script:Findings.Clear()
     $src = 'Entra ID (current state)'
     Write-Log 'INFO' 'Entra current-state persistence sweep...'
@@ -1636,12 +1831,20 @@ function Invoke-GraphPhase {
         try {
             $raw = New-Object System.IO.StreamWriter((Join-Path $script:RawPath 'Graph-SignIns.jsonl'), $false, (New-Object System.Text.UTF8Encoding($false)))
             $queries = New-Object System.Collections.Generic.List[object]
-            $psAppOr = (@($script:PowerShellApps.Keys) | ForEach-Object { "appId eq '$_'" }) -join ' or '
-            $queries.Add(@(('(' + $psAppOr + ') and ' + $win), 'All PowerShell / CLI clients', $null))
-            $abuseOr = (@($script:AbuseProneApps.Keys) | ForEach-Object { "appId eq '$_'" }) -join ' or '
-            $queries.Add(@(('(' + $abuseOr + ') and ' + $win), 'Token-abuse-prone clients', $null))
-            foreach ($u in @($script:Config.SuspectUsers)) { $queries.Add(@(("userPrincipalName eq '" + ($u -replace "'", "''") + "' and " + $win), ('Suspect user ' + $u), $null)) }
-            if ($script:Config.IncludeServicePrincipalSignIns) { $queries.Add(@($win, 'All service principal sign-ins', "signInEventTypes/any(t: t eq 'servicePrincipal')")) }
+            if (Test-SuspectScoped) {
+                Write-Log 'INFO' ('Graph sign-ins scoped to suspect users: {0}. Tenant-wide PowerShell/CLI queries are skipped.' -f ($script:Config.SuspectUsers -join ', '))
+                foreach ($u in @($script:Config.SuspectUsers)) {
+                    $queries.Add(@(("userPrincipalName eq '" + ($u -replace "'", "''") + "' and " + $win), ('Suspect user ' + $u), $null))
+                }
+            }
+            else {
+                $psAppOr = (@($script:PowerShellApps.Keys) | ForEach-Object { "appId eq '$_'" }) -join ' or '
+                $queries.Add(@(('(' + $psAppOr + ') and ' + $win), 'All PowerShell / CLI clients', $null))
+                $abuseOr = (@($script:AbuseProneApps.Keys) | ForEach-Object { "appId eq '$_'" }) -join ' or '
+                $queries.Add(@(('(' + $abuseOr + ') and ' + $win), 'Token-abuse-prone clients', $null))
+                foreach ($u in @($script:Config.SuspectUsers)) { $queries.Add(@(("userPrincipalName eq '" + ($u -replace "'", "''") + "' and " + $win), ('Suspect user ' + $u), $null)) }
+                if ($script:Config.IncludeServicePrincipalSignIns) { $queries.Add(@($win, 'All service principal sign-ins', "signInEventTypes/any(t: t eq 'servicePrincipal')")) }
+            }
             $qIndex = 0
             foreach ($q in $queries) {
                 Test-InvestigationCancel
@@ -1678,12 +1881,30 @@ function Invoke-GraphPhase {
         $rawA = $null
         try {
             $rawA = New-Object System.IO.StreamWriter((Join-Path $script:RawPath 'Graph-DirectoryAudits.jsonl'), $false, (New-Object System.Text.UTF8Encoding($false)))
-            $uri = New-GraphUri 'v1.0/auditLogs/directoryAudits' ([ordered]@{ '$filter' = "activityDateTime ge $sIso and activityDateTime le $eIso"; '$top' = '999' })
+            $dirFilter = "activityDateTime ge $sIso and activityDateTime le $eIso"
+            $userDirFilter = Get-GraphSuspectUserFilter -Field 'initiatedBy/user/userPrincipalName'
+            if (Test-SuspectScoped -and $userDirFilter) {
+                $dirFilter = "($userDirFilter) and $dirFilter"
+                Write-Log 'INFO' 'Directory audit query is limited to actions initiated by the suspect users.'
+            }
+            $uri = New-GraphUri 'v1.0/auditLogs/directoryAudits' ([ordered]@{ '$filter' = $dirFilter; '$top' = '999' })
             Set-InvestigationActivity -Step 'Directory audit log' -WaitingOn 'GET auditLogs/directoryAudits'
-            $audits = Get-GraphAll -Uri $uri -MaxItems $script:Config.MaxDirectoryAuditRecords -Label 'directoryAudits'
+            try {
+                $audits = Get-GraphAll -Uri $uri -MaxItems $script:Config.MaxDirectoryAuditRecords -Label 'directoryAudits'
+            }
+            catch {
+                if (Test-IsCancelError $_) { throw }
+                if (Test-SuspectScoped -and $userDirFilter) {
+                    Write-Log 'WARN' ("Directory audit user filter was rejected ({0}) - collecting the window then keeping suspect-related rows only." -f (Limit-Text $_.Exception.Message 200))
+                    $uri = New-GraphUri 'v1.0/auditLogs/directoryAudits' ([ordered]@{ '$filter' = "activityDateTime ge $sIso and activityDateTime le $eIso"; '$top' = '999' })
+                    $audits = Get-GraphAll -Uri $uri -MaxItems $script:Config.MaxDirectoryAuditRecords -Label 'directoryAudits'
+                }
+                else { throw }
+            }
             foreach ($d in $audits) {
                 if ($rawA) { $rawA.WriteLine(($d | ConvertTo-Json -Depth 8 -Compress)) }
-                $aRows.Add((ConvertFrom-GraphDirectoryAudit $d))
+                $row = ConvertFrom-GraphDirectoryAudit $d
+                if ($row -and (Test-RowInSuspectScope $row)) { $aRows.Add($row) }
             }
             Set-InvestigationActivity -EventsDelta $aRows.Count -ClearWait
             Write-Log 'OK' ("Graph directory audits: {0:N0}" -f $aRows.Count)
@@ -1928,6 +2149,7 @@ function New-InvestigationReport {
             Computer = [string]$env:COMPUTERNAME
             Suspects = @($script:Config.SuspectUsers)
             SuspectIPs = @($script:Config.SuspectIPs)
+            Scope = $(if (Test-SuspectScoped) { 'Suspect users' } else { 'Tenant-wide' })
             Tenant = $tenantNotes
             CorrelationHours = $corrHours
             Errors = $errCount
@@ -1938,6 +2160,7 @@ function New-InvestigationReport {
         counts = $cnt
         recs = @($rec)
         notes = @(
+            $(if (Test-SuspectScoped) { 'Collection was limited to the suspect users listed above (UAL UserIds, Graph sign-ins, directory audit initiated-by, and that mailbox/Entra state). Re-run with Tenant-wide collection if you need other actors.' } else { 'Collection was tenant-wide. The Suspect only chip is on when suspect users were supplied so the report starts on those accounts.' }),
             'Exchange Online / Purview cmdlets are logged with full parameters, but Get-* (read) cmdlets are never logged.',
             ('Entra, SharePoint, Teams and Az PowerShell do not log command text; the resulting change plus the PowerShell-client sign-in is shown instead. "InferredIP" links a cmdlet to the same actor''s preceding PowerShell sign-in within ' + $corrHours + ' hours - treat it as a lead, not proof.'),
             '"Cmdlet - PowerShell or Admin Center" means Microsoft did not record which interface was used; the Exchange Admin Center also executes cmdlets.',
@@ -2010,7 +2233,7 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
     $js = @'
 (function(){
   var D = JSON.parse(document.getElementById("report-data").textContent);
-  var S = {q:"", sev:"", cat:"", actor:"", ip:"", ps:"", suspect:false, sort:"TimeUtc", dir:-1, page:1, size:100, tab:"commands", row:-1};
+  var S = {q:"", sev:"", cat:"", actor:"", ip:"", ps:"", suspect:!!((D.meta.Suspects||[]).length), sort:"TimeUtc", dir:-1, page:1, size:100, tab:"commands", row:-1};
   var TABS = [
     ["commands","Commands"],["timeline","Timeline"],["access","Access gained"],["path","Attack path"],
     ["actors","Actors"],["signins","Sign-ins"],["ips","IPs"],["failed","Failed"],["findings","Persistence"],["coverage","Coverage"]
@@ -2020,6 +2243,14 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
   function enc(v){ return String(v==null?"":v).replace(/[&<>"']/g, function(c){ return ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]); }); }
   function badge(sev){ if(!sev) return ""; return '<span class="badge b-'+enc(lc(sev))+'">'+enc(sev)+'</span>'; }
   function blob(row){ var k, s=[]; for(k in row){ if(Object.prototype.hasOwnProperty.call(row,k)) s.push(row[k]); } return s.join(" ").toLowerCase(); }
+  function mentionsSuspect(r){
+    if(r.SuspectMatch) return true;
+    var list = D.meta.Suspects||[];
+    if(!list.length) return false;
+    var hay = ((r.Actor||"")+" "+(r.User||"")+" "+(r.Target||"")+" "+(r.TargetIdentity||"")+" "+(r.Item||"")+" "+(r.Detail||"")+" "+(r.CommandLine||"")).toLowerCase();
+    for(var i=0;i<list.length;i++){ if(list[i] && hay.indexOf(String(list[i]).toLowerCase())>=0) return true; }
+    return false;
+  }
   function matchEvent(r){
     if(S.sev && lc(r.Severity)!==lc(S.sev)) return false;
     if(S.cat && lc(r.Category)!==lc(S.cat)) return false;
@@ -2027,7 +2258,7 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
     if(S.ip && lc(r.ClientIP)!==lc(S.ip) && lc(r.InferredIP)!==lc(S.ip) && lc(r.IPAddress)!==lc(S.ip)) return false;
     if(S.ps==="yes" && r.PowerShellRelated!=="Yes" && r.PowerShellRelated!=="Possible") return false;
     if(S.ps==="cmd" && !(r.CommandLine||"").length) return false;
-    if(S.suspect && !r.SuspectMatch) return false;
+    if(S.suspect && !mentionsSuspect(r)) return false;
     if(S.q && blob(r).indexOf(S.q)<0) return false;
     return true;
   }
@@ -2118,7 +2349,7 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
     document.body.className = localStorage.getItem("m365ps-dark")==="1" ? "dark" : "";
     $("meta").innerHTML = "Window: "+enc(D.meta.StartUtc)+" → "+enc(D.meta.EndUtc)+" (UTC) &nbsp;|&nbsp; Generated "+enc(D.meta.GeneratedUtc)+" by "+enc(D.meta.User)+" on "+enc(D.meta.Computer)+" &nbsp;|&nbsp; v"+enc(D.meta.Version);
     $("tenant").textContent = "Tenant: "+(D.meta.Tenant||"(not recorded)");
-    $("suspects").textContent = "Suspect accounts: "+((D.meta.Suspects||[]).join(", ")||"(none)")+"  |  Suspect IPs: "+((D.meta.SuspectIPs||[]).join(", ")||"(none)");
+    $("suspects").textContent = "Scope: "+(D.meta.Scope||"Tenant-wide")+"  |  Suspect accounts: "+((D.meta.Suspects||[]).join(", ")||"(none)")+"  |  Suspect IPs: "+((D.meta.SuspectIPs||[]).join(", ")||"(none)");
     var nav=$("tabs"); nav.innerHTML="";
     TABS.forEach(function(t){ var b=document.createElement("button"); b.textContent=t[1]; if(S.tab===t[0]) b.className="on"; b.onclick=function(){ setTab(t[0]); }; nav.appendChild(b); });
     var cards=[
@@ -2169,7 +2400,7 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
     if(S.tab==="signins"){ $("view-signins").className=""; table("tbl-signins", D.signIns||[], ["TimeUtc","User","Result","AppName","PowerShellApp","IPAddress","Location","ErrorCode","FailureReason","Resource","UserAgent","SuspectMatch"], {match:function(r){ return matchEvent(r); }}); } else $("view-signins").className="hide";
     if(S.tab==="ips"){ $("view-ips").className=""; table("tbl-ips", D.ipSummary||[], ["IPAddress","Suspect","Activity","FirstUtc","LastUtc","Accounts","Locations","Activities"], {match:function(r){ return (!S.q || blob(r).indexOf(S.q)>=0) && (!S.ip || r.IPAddress===S.ip) && (!S.suspect || r.Suspect==="YES"); }}); } else $("view-ips").className="hide";
     if(S.tab==="failed"){ $("view-failed").className=""; table("tbl-failed", D.events||[], ["TimeUtc","Severity","Category","AccessGained","Operation","Actor","ClientIP","Target","CommandLine","Details"], {match:function(r){ return eventMatch(r) && r.Outcome==="Failed"; }}); } else $("view-failed").className="hide";
-    if(S.tab==="findings"){ $("view-findings").className=""; table("tbl-findings", D.findings||[], ["Severity","Area","Item","Detail","Reason","WhenUtc","SuspectMatch"], {match:function(r){ return (!S.sev || lc(r.Severity)===lc(S.sev)) && (!S.q || blob(r).indexOf(S.q)>=0) && (!S.suspect || r.SuspectMatch); }}); } else $("view-findings").className="hide";
+    if(S.tab==="findings"){ $("view-findings").className=""; table("tbl-findings", D.findings||[], ["Severity","Area","Item","Detail","Reason","WhenUtc","SuspectMatch"], {match:function(r){ return (!S.sev || lc(r.Severity)===lc(S.sev)) && (!S.q || blob(r).indexOf(S.q)>=0) && (!S.suspect || mentionsSuspect(r)); }}); } else $("view-findings").className="hide";
     if(S.tab==="coverage"){ $("view-coverage").className=""; table("tbl-coverage", D.coverage||[], ["RunUtc","Source","Status","Records","FromUtc","ToUtc","Notes"], {match:function(r){ return !S.q || blob(r).indexOf(S.q)>=0; }}); } else $("view-coverage").className="hide";
     $("notes").innerHTML="<h2>Interpretation notes</h2><ul>"+(D.notes||[]).map(function(n){ return "<li>"+enc(n)+"</li>"; }).join("")+"</ul>";
   }
@@ -2336,7 +2567,8 @@ function Invoke-M365PowerShellForensics {
         [switch]$NoDisconnect,
         [switch]$OpenReport,
         [bool]$Fast = $true,
-        [switch]$IncludeDiscovery
+        [switch]$IncludeDiscovery,
+        [switch]$TenantWide
     )
 
     $exitCode = 0
@@ -2371,6 +2603,7 @@ function Invoke-M365PowerShellForensics {
         OpenReport = [bool]$OpenReport
         Fast = [bool]$Fast
         IncludeDiscovery = [bool]$IncludeDiscovery
+        TenantWide = [bool]$TenantWide
     }
     if ($script:Config.Fast) {
         $script:Config.SkipSuspectDataAccess = $true
@@ -2389,6 +2622,15 @@ function Invoke-M365PowerShellForensics {
 
         Write-Log 'INFO' ("M365 PowerShell Forensics v{0} | PowerShell {1} | Output: {2}" -f $script:ScriptVersion, $PSVersionTable.PSVersion, $script:OutputPath)
         Write-Log 'INFO' ("Window (UTC): {0} -> {1} | Suspect users: {2} | Suspect IPs: {3}" -f (ConvertTo-UtcIso $script:StartUtc), (ConvertTo-UtcIso $script:EndUtc), ($script:Config.SuspectUsers -join ', '), ($script:Config.SuspectIPs -join ', '))
+        if (Test-SuspectScoped) {
+            Write-Log 'INFO' ('Scope: SUSPECT USERS ONLY ({0}). Cmdlets, sign-ins, directory audit, and mailbox/Entra state are limited to these accounts. Check Tenant-wide to hunt the rest of the tenant.' -f ($script:Config.SuspectUsers -join ', '))
+        }
+        elseif ($script:Config.SuspectUsers.Count -gt 0) {
+            Write-Log 'INFO' 'Scope: TENANT-WIDE. Suspect users are highlighted but other accounts are still collected.'
+        }
+        else {
+            Write-Log 'INFO' 'Scope: TENANT-WIDE (no suspect users supplied). Enter Suspect users to limit collection to those accounts.'
+        }
         if ($script:Config.Fast) {
             Write-Log 'INFO' 'Fast collection ON: Exchange/Purview cmdlets + Graph PowerShell sign-ins. Discovery UAL, MailItemsAccessed dumps, and tenant-wide Get-Mailbox walks are skipped. Uncheck Fast collection for a deep sweep.'
         }
@@ -2494,6 +2736,8 @@ function Start-M365PsForensicsWizard {
     $skipGraph = -not (Read-WizardYesNo 'Collect Microsoft Graph sign-ins and directory audit?' $true)
     $skipState = -not (Read-WizardYesNo 'Run current-state persistence sweep?' $true)
     $skipData = -not (Read-WizardYesNo 'Collect suspect mailbox/file/Teams activity (needs suspect users)?' $true)
+    $tenantWide = $false
+    if ($users) { $tenantWide = -not (Read-WizardYesNo 'Limit collection to those suspect users only?' $true) }
     $sp = Read-WizardYesNo 'Include all service-principal sign-ins?' $false
     $install = Read-WizardYesNo 'Install missing modules for the current user if needed?' $false
     $extra = Read-WizardLine 'Additional UAL record types (comma-separated, e.g. MicrosoftTeams,PowerBIAudit)' ''
@@ -2509,6 +2753,7 @@ function Start-M365PsForensicsWizard {
         SkipGraph = $skipGraph
         SkipCurrentState = $skipState
         SkipSuspectDataAccess = $skipData
+        TenantWide = $tenantWide
     }
     if ($users) { $p.SuspectUsers = @(Get-NormalizedIdList $users) }
     if ($ips) { $p.SuspectIPs = @(Get-NormalizedIdList $ips) }

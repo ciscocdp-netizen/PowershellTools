@@ -20,7 +20,7 @@ param(
     [switch]$StaReady
 )
 
-$script:GuiVersion = '2.1.2'
+$script:GuiVersion = '2.1.3'
 
 if (-not $StaReady -and [System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
     $hostPath = $null
@@ -189,6 +189,7 @@ function Save-GuiSettings {
             SkipExchange = [bool]$script:chkSkipExo.Checked
             SkipGraph = [bool]$script:chkSkipGraph.Checked
             SkipCurrentState = [bool]$script:chkSkipState.Checked
+            TenantWide = [bool]$script:chkTenantWide.Checked
             ReportOnly = [bool]$script:chkReportOnly.Checked
             NoDisconnect = [bool]$script:chkNoDisc.Checked
             OpenReport = [bool]$script:chkOpenReport.Checked
@@ -375,6 +376,7 @@ function Test-InvestigationForm {
     $p.SkipExchange = [bool]$script:chkSkipExo.Checked
     $p.SkipGraph = [bool]$script:chkSkipGraph.Checked
     $p.SkipCurrentState = [bool]$script:chkSkipState.Checked
+    $p.TenantWide = [bool]$script:chkTenantWide.Checked
     $p.NoDisconnect = [bool]$script:chkNoDisc.Checked
     $p.OpenReport = [bool]$script:chkOpenReport.Checked
     $p.Fast = [bool]$script:chkFast.Checked
@@ -1015,14 +1017,14 @@ $script:chkStamp = New-Check 'Create a timestamped subfolder for each run'
 $script:chkStamp.Checked = $true
 $script:chkStamp.Location = New-Object System.Drawing.Point(14, $y)
 $script:grpCase.Controls.Add($script:chkStamp)
-$tips.SetToolTip($script:txtUsers, 'One UPN per line or comma-separated. Enables deep per-account UAL collection and highlighting.')
+$tips.SetToolTip($script:txtUsers, 'One UPN per line or comma-separated. Collection is limited to these accounts (UAL, Graph sign-ins, mailbox/Entra state) unless Tenant-wide is checked.')
 $tips.SetToolTip($script:txtExtra, 'Optional extra Unified Audit Log record types, e.g. MicrosoftTeams, PowerBIAudit.')
 
 $script:grpScope = New-Object System.Windows.Forms.GroupBox
 $script:grpScope.Text = 'Collection options'
 $script:grpScope.Font = $script:FontBold
 $script:grpScope.Location = New-Object System.Drawing.Point(8, 654)
-$script:grpScope.Size = New-Object System.Drawing.Size(400, 324)
+$script:grpScope.Size = New-Object System.Drawing.Size(400, 346)
 $left.Controls.Add($script:grpScope)
 $y = 22
 $script:numChunk = New-Object System.Windows.Forms.NumericUpDown
@@ -1036,6 +1038,7 @@ $script:numMbx.Minimum = 1; $script:numMbx.Maximum = 5000; $script:numMbx.Value 
 $y = Add-Labeled $script:grpScope $y 'Max mailboxes' $script:numMbx
 foreach ($pair in @(
         @{ N = 'chkFast'; T = 'Fast collection (cmdlets first; skip mailbox dumps)' },
+        @{ N = 'chkTenantWide'; T = 'Tenant-wide (do not limit to suspect users)' },
         @{ N = 'chkDiscovery'; T = 'Include eDiscovery / Discovery UAL (slow)' },
         @{ N = 'chkSkipExo'; T = 'Skip Exchange / Unified Audit Log' },
         @{ N = 'chkSkipGraph'; T = 'Skip Microsoft Graph' },
@@ -1056,27 +1059,29 @@ $script:chkNoDisc.Checked = $true
 $script:chkOpenReport.Checked = $true
 $script:chkFast.Checked = $true
 $script:chkSkipData.Checked = $true
+$script:chkTenantWide.Checked = $false
 $tips.SetToolTip($script:chkFast, 'Recommended. Collects Exchange/Purview cmdlets and PowerShell sign-ins. Skips MailItemsAccessed dumps, Discovery UAL, and tenant-wide Get-Mailbox walks that can take hours.')
+$tips.SetToolTip($script:chkTenantWide, 'Leave off (recommended) when Suspect users are filled in. Collection then queries only those UPNs. Check this only to hunt the whole tenant and highlight the suspects.')
 $tips.SetToolTip($script:chkDiscovery, 'Tenant-wide Discovery/eDiscovery UAL is high volume. Leave off unless that is in scope.')
 
 $script:btnRun = New-Button 'Run investigation (F5)' $script:ColorAccent ([System.Drawing.Color]::White)
-$script:btnRun.Location = New-Object System.Drawing.Point(8, 986)
+$script:btnRun.Location = New-Object System.Drawing.Point(8, 1008)
 $script:btnRun.Size = New-Object System.Drawing.Size(200, 36)
 $script:btnCancel = New-Button 'Cancel (Esc)' ([System.Drawing.Color]::White) $script:ColorDanger
-$script:btnCancel.Location = New-Object System.Drawing.Point(216, 986)
+$script:btnCancel.Location = New-Object System.Drawing.Point(216, 1008)
 $script:btnCancel.Size = New-Object System.Drawing.Size(120, 36)
 $script:btnOpenReport = New-Button 'Open report' ([System.Drawing.Color]::White) $script:ColorAccent
-$script:btnOpenReport.Location = New-Object System.Drawing.Point(8, 1030)
+$script:btnOpenReport.Location = New-Object System.Drawing.Point(8, 1052)
 $script:btnOpenReport.Size = New-Object System.Drawing.Size(130, 32)
 $script:btnOpenFolder = New-Button 'Open folder' ([System.Drawing.Color]::White) ([System.Drawing.Color]::FromArgb(31, 35, 40))
-$script:btnOpenFolder.Location = New-Object System.Drawing.Point(146, 1030)
+$script:btnOpenFolder.Location = New-Object System.Drawing.Point(146, 1052)
 $script:btnOpenFolder.Size = New-Object System.Drawing.Size(120, 32)
 $left.Controls.Add($script:btnRun)
 $left.Controls.Add($script:btnCancel)
 $left.Controls.Add($script:btnOpenReport)
 $left.Controls.Add($script:btnOpenFolder)
 $pad = New-Object System.Windows.Forms.Panel
-$pad.Location = New-Object System.Drawing.Point(8, 1074)
+$pad.Location = New-Object System.Drawing.Point(8, 1096)
 $pad.Size = New-Object System.Drawing.Size(10, 20)
 $left.Controls.Add($pad)
 
@@ -1215,6 +1220,7 @@ if ($saved) {
     $script:chkSkipExo.Checked = ConvertTo-BoolSetting (Get-JsonProperty $saved 'SkipExchange' $false) $false
     $script:chkSkipGraph.Checked = ConvertTo-BoolSetting (Get-JsonProperty $saved 'SkipGraph' $false) $false
     $script:chkSkipState.Checked = ConvertTo-BoolSetting (Get-JsonProperty $saved 'SkipCurrentState' $false) $false
+    $script:chkTenantWide.Checked = ConvertTo-BoolSetting (Get-JsonProperty $saved 'TenantWide' $false) $false
     $script:chkReportOnly.Checked = ConvertTo-BoolSetting (Get-JsonProperty $saved 'ReportOnly' $false) $false
     $script:chkNoDisc.Checked = ConvertTo-BoolSetting (Get-JsonProperty $saved 'NoDisconnect' $true) $true
     $script:chkOpenReport.Checked = ConvertTo-BoolSetting (Get-JsonProperty $saved 'OpenReport' $true) $true

@@ -258,6 +258,8 @@ Assert-Contains $html 'Set-Mailbox' 'report includes the reconstructed command'
 Assert-NotContains $html '<img src=x' 'report does not emit a raw image tag'
 Assert-Contains $html 'function(' 'report includes the interactive script'
 Assert-Contains $html 'PowerShell related' 'report has a PowerShell filter chip'
+Assert-True ($html.IndexOf('suspect:!!((D.meta.Suspects||[]).length)') -ge 0) 'report defaults the suspect-only chip on when suspects were supplied'
+Assert-Contains $html 'Suspect users' 'report records suspect-user collection scope'
 $cov = @(Import-Csv -LiteralPath (Join-Path $out 'Coverage.csv'))
 Assert-Equal $cov.Count 2 'coverage has two data rows, not a repeated header'
 Assert-Equal @($cov | Where-Object { $_.Source -like 'RunUtc*' }).Count 0 'coverage did not treat a header as a row'
@@ -304,7 +306,40 @@ $modErrors = $null
 $null = [System.Management.Automation.Language.Parser]::ParseFile($modulePath, [ref]$null, [ref]$modErrors)
 Assert-Equal @($modErrors).Count 0 'engine module parses'
 
-Assert-Equal (Get-M365PsForensicsVersion) '2.1.2' 'engine version is 2.1.2'
+Assert-Equal (Get-M365PsForensicsVersion) '2.1.3' 'engine version is 2.1.3'
+
+Write-Host 'Suspect-user collection scope'
+Initialize-SuspectSets -Users @('attacker@contoso.com') -IPs @()
+Set-M365PsForensicsConfig -Values @{ TenantWide = $false; SuspectUsers = @('attacker@contoso.com') }
+Assert-True (Test-SuspectScoped) 'suspect users without TenantWide scopes collection'
+$scopedIds = Get-ScopedUserIds
+Assert-Equal $scopedIds.Count 1 'scoped user list has the suspect'
+Assert-Equal ([string]$scopedIds[0]) 'attacker@contoso.com' 'scoped user is the suspect UPN'
+$gFilter = Get-GraphSuspectUserFilter -Field 'userPrincipalName'
+Assert-Contains $gFilter "userPrincipalName eq 'attacker@contoso.com'" 'Graph sign-in filter uses the suspect UPN'
+$dirFilter = Get-GraphSuspectUserFilter -Field 'initiatedBy/user/userPrincipalName'
+Assert-Contains $dirFilter "initiatedBy/user/userPrincipalName eq 'attacker@contoso.com'" 'directory audit filter uses initiatedBy UPN'
+Set-M365PsForensicsConfig -Values @{ TenantWide = $false; SuspectUsers = @("o'brien@contoso.com") }
+Initialize-SuspectSets -Users @("o'brien@contoso.com") -IPs @()
+Assert-Contains (Get-GraphSuspectUserFilter) "userPrincipalName eq 'o''brien@contoso.com'" 'OData filter escapes a quote in the UPN'
+Set-M365PsForensicsConfig -Values @{ TenantWide = $true; SuspectUsers = @('attacker@contoso.com') }
+Initialize-SuspectSets -Users @('attacker@contoso.com') -IPs @()
+Assert-True (-not (Test-SuspectScoped)) 'TenantWide keeps collection tenant-wide'
+$none = Get-ScopedUserIds
+Assert-Equal $none.Count 0 'TenantWide returns no UAL UserIds filter'
+Set-M365PsForensicsConfig -Values @{ TenantWide = $false; SuspectUsers = @() }
+Initialize-SuspectSets -Users @() -IPs @()
+Assert-True (-not (Test-SuspectScoped)) 'no suspects means tenant-wide collection'
+Initialize-SuspectSets -Users @('attacker@contoso.com') -IPs @()
+Set-M365PsForensicsConfig -Values @{ TenantWide = $false; SuspectUsers = @('attacker@contoso.com') }
+$inScope = [pscustomobject]@{ Actor = 'attacker@contoso.com'; Target = 'victim@contoso.com'; SuspectMatch = 'Actor'; CommandLine = 'Set-Mailbox' }
+$outScope = [pscustomobject]@{ Actor = 'other@contoso.com'; Target = 'helpdesk@contoso.com'; SuspectMatch = ''; CommandLine = 'Get-Mailbox' }
+$targetScope = [pscustomobject]@{ Actor = 'other@contoso.com'; Target = 'attacker@contoso.com'; SuspectMatch = 'Target/Params'; CommandLine = 'Set-Mailbox' }
+Assert-True (Test-RowInSuspectScope $inScope) 'actor match is in suspect scope'
+Assert-True (Test-RowInSuspectScope $targetScope) 'target match is in suspect scope'
+Assert-True (-not (Test-RowInSuspectScope $outScope)) 'unrelated actor/target is out of suspect scope'
+Set-M365PsForensicsConfig -Values @{ TenantWide = $true }
+Assert-True (Test-RowInSuspectScope $outScope) 'tenant-wide keeps unrelated rows'
 
 Set-M365PsForensicsConfig -Values @{ Fast = $true; IncludeDiscovery = $false; AdditionalRecordTypes = @(); ChunkHours = 24 }
 $adminTypes = Get-UalAdminRecordTypes

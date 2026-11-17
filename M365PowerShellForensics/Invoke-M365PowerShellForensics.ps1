@@ -31,6 +31,9 @@
 .EXAMPLE
     .\Invoke-M365PowerShellForensics.ps1 -StartDate '2026-09-01' -SuspectUsers 'jdoe@contoso.com' -SuspectIPs '203.0.113.50'
 
+    Scope collection to those accounts (default when -SuspectUsers is set).
+    Add -TenantWide to hunt the whole tenant and only highlight the suspects.
+
 .EXAMPLE
     .\Invoke-M365PowerShellForensics.ps1 -OutputPath C:\IR\Case01 -SuspectUsers jdoe@contoso.com -SkipGraph
     .\Invoke-M365PowerShellForensics.ps1 -OutputPath C:\IR\Case01 -SuspectUsers jdoe@contoso.com -SkipExchange
@@ -63,6 +66,7 @@ param(
     [switch]$OpenReport,
     [bool]$Fast = $true,
     [switch]$IncludeDiscovery,
+    [switch]$TenantWide,
     [switch]$Interactive
 )
 
