@@ -20,7 +20,7 @@ param(
     [switch]$StaReady
 )
 
-$script:GuiVersion = '2.1.0'
+$script:GuiVersion = '2.1.1'
 
 if (-not $StaReady -and [System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
     $hostPath = $null
@@ -84,6 +84,11 @@ $script:InTick = $false
 $script:RunHandle = $null
 $script:LastReport = $null
 $script:LastFolder = $null
+$script:Live = $null
+$script:RunStartedAt = $null
+$script:RunEndedAt = $null
+$script:LastHeartbeatAt = $null
+$script:LiveCoverage = New-Object System.Collections.Generic.List[object]
 $script:SettingsPath = Join-Path (Join-Path $env:APPDATA 'PowershellTools\M365PsForensicsGui') 'settings.json'
 
 function New-Button {
@@ -453,23 +458,192 @@ function Drain-WorkerStreams {
     try { $script:Worker.Streams.ClearStreams() } catch { }
 }
 
+function Format-UiElapsed {
+    param($From, $To = $null)
+    if ($null -eq $From) { return '' }
+    try {
+        $start = $From
+        if ($start -is [string]) { $start = [datetime]$start }
+        $end = $To
+        if ($null -eq $end) { $end = Get-Date }
+        elseif ($end -is [string]) { $end = [datetime]$end }
+        $span = $end.ToUniversalTime() - $start.ToUniversalTime()
+        if ($span.TotalSeconds -lt 0) { return '0s' }
+        if ($span.TotalHours -ge 1) { return ('{0}h {1:00}m {2:00}s' -f [int][math]::Floor($span.TotalHours), $span.Minutes, $span.Seconds) }
+        if ($span.TotalMinutes -ge 1) { return ('{0}m {1:00}s' -f [int][math]::Floor($span.TotalMinutes), $span.Seconds) }
+        return ('{0}s' -f [int]$span.TotalSeconds)
+    } catch { return '' }
+}
+
+function Set-ProgressMode {
+    param([switch]$Marquee, [int]$Value = -1)
+    try {
+        if ($Marquee) {
+            if ($script:progress.Style -ne [System.Windows.Forms.ProgressBarStyle]::Marquee) {
+                $script:progress.Style = [System.Windows.Forms.ProgressBarStyle]::Marquee
+                $script:progress.MarqueeAnimationSpeed = 40
+            }
+        }
+        else {
+            if ($script:progress.Style -ne [System.Windows.Forms.ProgressBarStyle]::Continuous) {
+                $script:progress.Style = [System.Windows.Forms.ProgressBarStyle]::Continuous
+                $script:progress.MarqueeAnimationSpeed = 0
+            }
+            if ($Value -ge 0) { $script:progress.Value = [Math]::Min(100, [Math]::Max(0, $Value)) }
+        }
+    } catch { }
+}
+
+function Add-LiveCoverageRow {
+    param($Row)
+    if ($null -eq $Row) { return }
+    if ($null -eq $script:LiveCoverage) { $script:LiveCoverage = New-Object System.Collections.Generic.List[object] }
+    $script:LiveCoverage.Add($Row)
+    try {
+        if ($script:gridCov.Columns.Count -eq 0) {
+            foreach ($c in @('Source', 'Status', 'Records', 'FromUtc', 'ToUtc', 'Notes')) {
+                $col = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+                $col.Name = $c
+                $col.HeaderText = $c
+                $col.AutoSizeMode = 'DisplayedCells'
+                [void]$script:gridCov.Columns.Add($col)
+            }
+        }
+        [void]$script:gridCov.Rows.Add(@(
+                [string]$Row.Source,
+                [string]$Row.Status,
+                [string]$Row.Records,
+                [string]$Row.FromUtc,
+                [string]$Row.ToUtc,
+                [string]$Row.Notes
+            ))
+        $script:gridCov.FirstDisplayedScrollingRowIndex = [Math]::Max(0, $script:gridCov.Rows.Count - 1)
+    } catch { }
+}
+
+function Update-LivePanel {
+    $busy = [bool]$script:Busy
+    $snap = $script:Live
+    $elapsed = ''
+    $elapsedTo = $null
+    if (-not $busy -and $script:RunEndedAt) { $elapsedTo = $script:RunEndedAt }
+    if ($script:RunStartedAt) { $elapsed = Format-UiElapsed $script:RunStartedAt $elapsedTo }
+    elseif ($snap -and $snap.StartedUtc) { $elapsed = Format-UiElapsed $snap.StartedUtc $elapsedTo }
+
+    if (-not $busy -and -not $snap) {
+        $script:pnlLive.BackColor = [System.Drawing.Color]::FromArgb(248, 250, 252)
+        $script:lblLiveTitle.Text = 'LIVE ACTIVITY'
+        $script:lblLiveElapsed.Text = ''
+        $script:lblLivePhase.Text = 'Idle — run an investigation to see the current Microsoft 365 call, slice, and running totals.'
+        $script:lblLiveWait.Text = ''
+        $script:lblLiveWait.ForeColor = $script:ColorMuted
+        $script:lblLiveCounts.Text = ''
+        $script:lblLiveLast.Text = ''
+        return
+    }
+
+    $script:pnlLive.BackColor = [System.Drawing.Color]::FromArgb(232, 244, 253)
+    $title = 'LIVE ACTIVITY'
+    if ($busy) { $title = 'LIVE ACTIVITY  ·  collecting' }
+    $script:lblLiveTitle.Text = $title
+    $script:lblLiveElapsed.Text = $(if ($elapsed) { "Elapsed $elapsed" } else { '' })
+
+    $phase = ''
+    $step = ''
+    $detail = ''
+    $waiting = ''
+    $waitElapsed = ''
+    $pct = -1
+    if ($snap) {
+        $phase = [string]$snap.Phase
+        $step = [string]$snap.Step
+        $detail = [string]$snap.Detail
+        $waiting = [string]$snap.WaitingOn
+        if ($snap.WaitStartedUtc) { $waitElapsed = Format-UiElapsed $snap.WaitStartedUtc }
+        $pct = [int]$snap.Percent
+        $script:lblLiveCounts.Text = ('Collected  {0:N0} events  ·  {1:N0} sign-ins  ·  {2:N0} findings  ·  {3:N0} API pages  ·  {4:N0} errors' -f
+            [int]$snap.Events, [int]$snap.SignIns, [int]$snap.Findings, [int]$snap.Pages, [int]$snap.Errors)
+        if ($snap.LastSource) {
+            $script:lblLiveLast.Text = ('Last finished: {0}  ·  {1:N0} records  ·  {2}' -f $snap.LastSource, [int]$snap.LastSourceRecords, $snap.LastSourceStatus)
+        }
+        else { $script:lblLiveLast.Text = '' }
+    }
+    else {
+        $script:lblLiveCounts.Text = 'Waiting for the engine to publish the first heartbeat...'
+        $script:lblLiveLast.Text = ''
+    }
+
+    $head = @($phase, $step) | Where-Object { $_ }
+    $line = ($head -join '  ·  ')
+    if ($detail) { $line = if ($line) { "$line  —  $detail" } else { $detail } }
+    if (-not $line) { $line = 'Investigation is running...' }
+    $script:lblLivePhase.Text = $line
+
+    if ($waiting) {
+        $waitText = "Waiting on $waiting"
+        if ($waitElapsed) { $waitText += "  ($waitElapsed)" }
+        $waitText += '. Microsoft 365 audit queries often take several minutes per page or 24-hour slice — this is not frozen.'
+        if ($waitElapsed -match 'm |h ') {
+            $waitText += ' Esc requests cancel after the current call returns.'
+        }
+        $script:lblLiveWait.Text = $waitText
+        if ($waitElapsed -match 'h |\d{2,}m ') { $script:lblLiveWait.ForeColor = $script:ColorDanger }
+        elseif ($waitElapsed -match 'm ') { $script:lblLiveWait.ForeColor = [System.Drawing.Color]::FromArgb(181, 71, 8) }
+        else { $script:lblLiveWait.ForeColor = $script:ColorAccent }
+    }
+    elseif ($busy) {
+        $script:lblLiveWait.Text = 'Working locally (no Microsoft 365 call in flight).'
+        $script:lblLiveWait.ForeColor = $script:ColorOk
+    }
+    else {
+        $script:lblLiveWait.Text = ''
+        $script:lblLiveWait.ForeColor = $script:ColorMuted
+    }
+
+    if ($busy) {
+        $status = $line
+        if ($waiting) {
+            $status = "Waiting: $waiting"
+            if ($waitElapsed) { $status += " ($waitElapsed)" }
+        }
+        if ($elapsed) { $status += "  |  elapsed $elapsed" }
+        $script:lblStatus.Text = $status
+        if ($pct -gt 0) { Set-ProgressMode -Value $pct }
+        else { Set-ProgressMode -Marquee }
+    }
+}
+
 function Drain-WorkerQueue {
     $item = $null
+    $gotActivity = $false
     while ($script:Sync.Queue.TryDequeue([ref]$item)) {
         if ($item.Type -eq 'Log') { Append-Log $item.Message $item.Level }
         elseif ($item.Type -eq 'Progress') {
-            if ($item.Percent -ge 0) { $script:progress.Value = [Math]::Min(100, [Math]::Max(0, $item.Percent)) }
-            if ($item.Message) { $script:lblStatus.Text = $item.Message }
+            if ($item.Percent -ge 0 -and $script:progress.Style -eq [System.Windows.Forms.ProgressBarStyle]::Continuous) {
+                $script:progress.Value = [Math]::Min(100, [Math]::Max(0, $item.Percent))
+            }
+            elseif ($item.Percent -gt 0) { Set-ProgressMode -Value $item.Percent }
+            if ($item.Message -and -not $script:Live) { $script:lblStatus.Text = $item.Message }
+        }
+        elseif ($item.Type -eq 'Activity') {
+            $script:Live = $item.Snapshot
+            $script:LastHeartbeatAt = Get-Date
+            $gotActivity = $true
+        }
+        elseif ($item.Type -eq 'Coverage') {
+            Add-LiveCoverageRow $item.Coverage
         }
     }
+    if ($gotActivity -or $script:Busy) { Update-LivePanel }
 }
 
 function Complete-WorkerAction {
     param($Result, $Failure)
     $script:Busy = $false
     $script:RunHandle = $null
+    $script:RunEndedAt = Get-Date
     Update-ActionButtons
-    $script:progress.Value = 100
+    if ($script:BusyAction -eq 'Run') { Set-ProgressMode -Value 100 } else { Set-ProgressMode -Value 0 }
     if ($Failure) {
         Append-Log ([string]$Failure) 'ERROR'
         $script:lblStatus.Text = 'The background run failed. See the log.'
@@ -483,6 +657,7 @@ function Complete-WorkerAction {
         Show-Prerequisite (Get-FirstResult $Result)
         $script:lblStatus.Text = 'Module install finished.'
     }
+    Update-LivePanel
     if ($script:CloseAfterStop) {
         $script:AllowClose = $true
         $script:form.Close()
@@ -491,7 +666,10 @@ function Complete-WorkerAction {
 
 function Update-WorkerUi {
     Drain-WorkerQueue
-    if ($script:Busy) { Drain-WorkerStreams }
+    if ($script:Busy) {
+        Drain-WorkerStreams
+        Update-LivePanel
+    }
     if ($script:RunHandle -and $script:RunHandle.IsCompleted) {
         $handle = $script:RunHandle
         $script:RunHandle = $null
@@ -561,10 +739,18 @@ function Start-Investigation {
         return
     }
     Save-GuiSettings
-    $script:progress.Value = 0
-    $script:lblStatus.Text = 'Starting investigation...'
+    $script:Live = $null
+    $script:RunStartedAt = Get-Date
+    $script:RunEndedAt = $null
+    $script:LastHeartbeatAt = Get-Date
+    $script:LiveCoverage = New-Object System.Collections.Generic.List[object]
+    try { $script:gridCov.Rows.Clear(); $script:gridCov.Columns.Clear() } catch { }
+    Set-ProgressMode -Marquee
+    $script:lblStatus.Text = 'Starting investigation — waiting for the first engine heartbeat...'
     $script:tabs.SelectedTab = $script:tabLog
     Append-Log '---- Run started ----' 'INFO'
+    Append-Log 'Live activity is on the right. Long Microsoft 365 calls (UAL slices, Graph pages, and sign-in windows) will keep the Waiting line updating even when the log pauses.' 'INFO'
+    Update-LivePanel
     Start-WorkerAction -Action 'Run' -Script $script:RunWorkerScript -Arguments @($script:Sync, $check.Parameters)
 }
 
@@ -840,6 +1026,65 @@ $pad.Location = New-Object System.Drawing.Point(8, 1030)
 $pad.Size = New-Object System.Drawing.Size(10, 20)
 $left.Controls.Add($pad)
 
+$script:pnlLive = New-Object System.Windows.Forms.Panel
+$script:pnlLive.Dock = 'Top'
+$script:pnlLive.Height = 118
+$script:pnlLive.Padding = New-Object System.Windows.Forms.Padding(10, 8, 10, 8)
+$script:pnlLive.BackColor = [System.Drawing.Color]::FromArgb(248, 250, 252)
+$script:lblLiveTitle = New-Object System.Windows.Forms.Label
+$script:lblLiveTitle.Text = 'LIVE ACTIVITY'
+$script:lblLiveTitle.Font = New-Object System.Drawing.Font('Segoe UI', 8, [System.Drawing.FontStyle]::Bold)
+$script:lblLiveTitle.ForeColor = $script:ColorAccent
+$script:lblLiveTitle.Location = New-Object System.Drawing.Point(12, 8)
+$script:lblLiveTitle.AutoSize = $true
+$script:lblLiveElapsed = New-Object System.Windows.Forms.Label
+$script:lblLiveElapsed.Text = ''
+$script:lblLiveElapsed.Font = $script:FontBold
+$script:lblLiveElapsed.ForeColor = $script:ColorHeader
+$script:lblLiveElapsed.TextAlign = 'MiddleRight'
+$script:lblLiveElapsed.Location = New-Object System.Drawing.Point(420, 8)
+$script:lblLiveElapsed.Size = New-Object System.Drawing.Size(220, 18)
+$script:lblLivePhase = New-Object System.Windows.Forms.Label
+$script:lblLivePhase.Font = $script:Font
+$script:lblLivePhase.ForeColor = [System.Drawing.Color]::FromArgb(31, 35, 40)
+$script:lblLivePhase.Location = New-Object System.Drawing.Point(12, 28)
+$script:lblLivePhase.Size = New-Object System.Drawing.Size(780, 18)
+$script:lblLivePhase.Anchor = 'Top,Left,Right'
+$script:lblLiveWait = New-Object System.Windows.Forms.Label
+$script:lblLiveWait.Font = $script:Font
+$script:lblLiveWait.ForeColor = $script:ColorMuted
+$script:lblLiveWait.Location = New-Object System.Drawing.Point(12, 48)
+$script:lblLiveWait.Size = New-Object System.Drawing.Size(780, 32)
+$script:lblLiveWait.Anchor = 'Top,Left,Right'
+$script:lblLiveCounts = New-Object System.Windows.Forms.Label
+$script:lblLiveCounts.Font = $script:Font
+$script:lblLiveCounts.ForeColor = $script:ColorHeader
+$script:lblLiveCounts.Location = New-Object System.Drawing.Point(12, 80)
+$script:lblLiveCounts.Size = New-Object System.Drawing.Size(780, 16)
+$script:lblLiveCounts.Anchor = 'Top,Left,Right'
+$script:lblLiveLast = New-Object System.Windows.Forms.Label
+$script:lblLiveLast.Font = $script:Font
+$script:lblLiveLast.ForeColor = $script:ColorMuted
+$script:lblLiveLast.Location = New-Object System.Drawing.Point(12, 96)
+$script:lblLiveLast.Size = New-Object System.Drawing.Size(780, 16)
+$script:lblLiveLast.Anchor = 'Top,Left,Right'
+$script:pnlLive.Controls.Add($script:lblLiveTitle)
+$script:pnlLive.Controls.Add($script:lblLiveElapsed)
+$script:pnlLive.Controls.Add($script:lblLivePhase)
+$script:pnlLive.Controls.Add($script:lblLiveWait)
+$script:pnlLive.Controls.Add($script:lblLiveCounts)
+$script:pnlLive.Controls.Add($script:lblLiveLast)
+$script:pnlLive.Add_Resize({
+    $w = $script:pnlLive.ClientSize.Width
+    $script:lblLiveElapsed.Width = 220
+    $script:lblLiveElapsed.Left = [Math]::Max(180, $w - 232)
+    $inner = [Math]::Max(100, $w - 24)
+    $script:lblLivePhase.Width = $inner
+    $script:lblLiveWait.Width = $inner
+    $script:lblLiveCounts.Width = $inner
+    $script:lblLiveLast.Width = $inner
+})
+
 $script:tabs = New-Object System.Windows.Forms.TabControl
 $script:tabs.Dock = 'Fill'
 $script:split.Panel2.Controls.Add($script:tabs)
@@ -894,6 +1139,7 @@ $script:lblGrid.Dock = 'Bottom'
 $script:lblGrid.Height = 22
 $script:lblGrid.Text = 'No results loaded yet.'
 $script:split.Panel2.Controls.Add($script:lblGrid)
+$script:split.Panel2.Controls.Add($script:pnlLive)
 
 $script:form.Controls.Add($script:split)
 $script:form.Controls.Add($footer)
@@ -981,6 +1227,7 @@ $script:form.Add_FormClosing({
 })
 $script:form.Add_Shown({
     try { $script:split.SplitterDistance = 430 } catch { }
+    try { Update-LivePanel } catch { }
     try { Start-WorkerAction -Action 'State' -Script $script:StateWorkerScript -Arguments @($script:Sync) } catch { Append-Log $_.Exception.Message 'ERROR' }
 })
 

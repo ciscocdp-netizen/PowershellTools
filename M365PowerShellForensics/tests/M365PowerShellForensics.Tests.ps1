@@ -304,7 +304,27 @@ $modErrors = $null
 $null = [System.Management.Automation.Language.Parser]::ParseFile($modulePath, [ref]$null, [ref]$modErrors)
 Assert-Equal @($modErrors).Count 0 'engine module parses'
 
-Assert-Equal (Get-M365PsForensicsVersion) '2.1.0' 'engine version is 2.1.0'
+Assert-Equal (Get-M365PsForensicsVersion) '2.1.1' 'engine version is 2.1.1'
+
+$liveQ = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+Set-M365PsForensicsUiBridge -Sync ([hashtable]::Synchronized(@{ Cancel = $false; Queue = $liveQ }))
+Reset-InvestigationActivity
+Set-InvestigationActivity -Phase 'Unified Audit Log' -Step 'ExchangeAdmin' -WaitingOn 'Search-UnifiedAuditLog page 1' -EventsDelta 12 -Percent 10
+$liveItem = $null
+Assert-True ($liveQ.TryDequeue([ref]$liveItem)) 'activity heartbeat is published to the UI queue'
+Assert-Equal $liveItem.Type 'Activity' 'heartbeat type is Activity'
+Assert-Equal $liveItem.Snapshot.Phase 'Unified Audit Log' 'heartbeat phase is set'
+Assert-Equal $liveItem.Snapshot.Events 12 'heartbeat event count increments'
+Assert-Equal $liveItem.Snapshot.WaitingOn 'Search-UnifiedAuditLog page 1' 'heartbeat waiting-on is set'
+Assert-Contains (Get-ActivityStatusLine) 'waiting: Search-UnifiedAuditLog page 1' 'status line includes the in-flight call'
+Add-Coverage -Source 'Unified Audit Log - ExchangeAdmin (Admin)' -Status 'OK' -Records 12
+$covItem = $null
+$sawCoverage = $false
+while ($liveQ.TryDequeue([ref]$covItem)) {
+    if ($covItem.Type -eq 'Coverage') { $sawCoverage = $true; break }
+}
+Assert-True $sawCoverage 'coverage rows are published live to the UI queue'
+Set-M365PsForensicsUiBridge -Sync $null
 $pre = Get-M365PsForensicsPrerequisite
 Assert-True ($pre.PowerShell.Length -gt 0) 'prerequisite reports a PowerShell version'
 

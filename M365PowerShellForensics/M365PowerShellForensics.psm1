@@ -31,9 +31,12 @@
         (search, filters, sort, pagination, click-to-pivot, command copy, dark mode).
       - Config, output path, and chunk size are script-scoped so the GUI/module
         host can run the engine more than once.
+    Version 2.1.1:
+      - Live activity heartbeat: the GUI shows the current phase, Microsoft 365
+        call, page/slice, and running totals while long UAL/Graph calls are in flight.
 #>
 
-$script:ScriptVersion = '2.1.0'
+$script:ScriptVersion = '2.1.1'
 $script:Inv = [Globalization.CultureInfo]::InvariantCulture
 $script:UiSync = $null
 $script:LogFile = $null
@@ -46,6 +49,7 @@ $script:OpenedExo = $false
 $script:OpenedGraph = $false
 $script:SuspectUserSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 $script:SuspectIpSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$script:Activity = $null
 
 $script:SevRank = @{ 'Critical' = 4; 'High' = 3; 'Medium' = 2; 'Low' = 1; 'Info' = 0; '' = 0 }
 
@@ -161,22 +165,160 @@ function Get-M365PsForensicsConnectionState {
     }
 }
 
+function Reset-InvestigationActivity {
+    $script:Activity = @{
+        Phase          = 'Idle'
+        Step           = ''
+        Detail         = ''
+        WaitingOn      = ''
+        StartedUtc     = $null
+        WaitStartedUtc = $null
+        LastUpdateUtc  = $null
+        Percent        = 0
+        Events         = 0
+        SignIns        = 0
+        Findings       = 0
+        Pages          = 0
+        Errors         = 0
+        SourceIndex    = 0
+        SourceCount    = 0
+        LastSource     = ''
+        LastSourceStatus = ''
+        LastSourceRecords = 0
+    }
+}
+
+function Get-InvestigationActivity {
+    if ($null -eq $script:Activity) { Reset-InvestigationActivity }
+    return $script:Activity
+}
+
+function Get-InvestigationActivitySnapshot {
+    $a = Get-InvestigationActivity
+    return [pscustomobject]@{
+        Phase             = [string]$a.Phase
+        Step              = [string]$a.Step
+        Detail            = [string]$a.Detail
+        WaitingOn         = [string]$a.WaitingOn
+        StartedUtc        = $a.StartedUtc
+        WaitStartedUtc    = $a.WaitStartedUtc
+        LastUpdateUtc     = $a.LastUpdateUtc
+        Percent           = [int]$a.Percent
+        Events            = [int]$a.Events
+        SignIns           = [int]$a.SignIns
+        Findings          = [int]$a.Findings
+        Pages             = [int]$a.Pages
+        Errors            = [int]$a.Errors
+        SourceIndex       = [int]$a.SourceIndex
+        SourceCount       = [int]$a.SourceCount
+        LastSource        = [string]$a.LastSource
+        LastSourceStatus  = [string]$a.LastSourceStatus
+        LastSourceRecords = [int]$a.LastSourceRecords
+    }
+}
+
+function Get-ActivityStatusLine {
+    $a = Get-InvestigationActivity
+    $parts = New-Object System.Collections.Generic.List[string]
+    if ($a.Phase) { [void]$parts.Add([string]$a.Phase) }
+    if ($a.Step) { [void]$parts.Add([string]$a.Step) }
+    if ($a.Detail) { [void]$parts.Add([string]$a.Detail) }
+    if ($a.WaitingOn) { [void]$parts.Add('waiting: ' + [string]$a.WaitingOn) }
+    $counts = 'events {0:N0} | sign-ins {1:N0} | findings {2:N0}' -f [int]$a.Events, [int]$a.SignIns, [int]$a.Findings
+    [void]$parts.Add($counts)
+    return ($parts -join '  ·  ')
+}
+
 function Publish-UiEvent {
     param(
         [string]$Type = 'Log',
         [string]$Message = '',
         [string]$Level = 'INFO',
         [int]$Percent = -1,
-        [string]$Activity = ''
+        [string]$Activity = '',
+        $Snapshot = $null,
+        $Coverage = $null,
+        [string]$FileName = '',
+        [int]$Records = -1
     )
     $sync = $script:UiSync
     if (-not $sync -or -not $sync.Queue) { return }
     if ($Message -and $Message.Length -gt 4000) { $Message = $Message.Substring(0, 4000) + '...' }
     $entry = [pscustomobject]@{
-        Type = $Type; Message = $Message; Level = $Level; Percent = $Percent
-        Activity = $Activity; Time = (Get-Date)
+        Type     = $Type
+        Message  = $Message
+        Level    = $Level
+        Percent  = $Percent
+        Activity = $Activity
+        Time     = (Get-Date)
+        Snapshot = $Snapshot
+        Coverage = $Coverage
+        FileName = $FileName
+        Records  = $Records
     }
     try { $sync.Queue.Enqueue($entry) } catch { }
+}
+
+function Set-InvestigationActivity {
+    param(
+        [string]$Phase,
+        [string]$Step,
+        [string]$Detail,
+        [string]$WaitingOn,
+        [int]$Percent = -1,
+        [int]$EventsDelta = 0,
+        [int]$SignInsDelta = 0,
+        [int]$FindingsDelta = 0,
+        [int]$PagesDelta = 0,
+        [int]$ErrorsDelta = 0,
+        [int]$SourceIndex = -1,
+        [int]$SourceCount = -1,
+        [string]$LastSource,
+        [string]$LastSourceStatus,
+        [int]$LastSourceRecords = -1,
+        [switch]$ClearWait,
+        [switch]$Log
+    )
+    if ($null -eq $script:Activity) { Reset-InvestigationActivity }
+    $a = $script:Activity
+    $now = (Get-Date).ToUniversalTime()
+    if ($null -eq $a.StartedUtc) { $a.StartedUtc = $now }
+    if ($PSBoundParameters.ContainsKey('Phase') -and $Phase) { $a.Phase = $Phase }
+    if ($PSBoundParameters.ContainsKey('Step')) { $a.Step = $Step }
+    if ($PSBoundParameters.ContainsKey('Detail')) { $a.Detail = $Detail }
+    if ($PSBoundParameters.ContainsKey('WaitingOn')) {
+        $wait = [string]$WaitingOn
+        if ($wait -and $wait -ne [string]$a.WaitingOn) { $a.WaitStartedUtc = $now }
+        $a.WaitingOn = $wait
+        if (-not $wait) { $a.WaitStartedUtc = $null }
+    }
+    if ($ClearWait) {
+        $a.WaitingOn = ''
+        $a.WaitStartedUtc = $null
+    }
+    if ($Percent -ge 0) {
+        if ($Percent -gt 100) { $Percent = 100 }
+        $a.Percent = $Percent
+    }
+    if ($EventsDelta) { $a.Events = [int]$a.Events + $EventsDelta }
+    if ($SignInsDelta) { $a.SignIns = [int]$a.SignIns + $SignInsDelta }
+    if ($FindingsDelta) { $a.Findings = [int]$a.Findings + $FindingsDelta }
+    if ($PagesDelta) { $a.Pages = [int]$a.Pages + $PagesDelta }
+    if ($ErrorsDelta) { $a.Errors = [int]$a.Errors + $ErrorsDelta }
+    if ($SourceIndex -ge 0) { $a.SourceIndex = $SourceIndex }
+    if ($SourceCount -ge 0) { $a.SourceCount = $SourceCount }
+    if ($PSBoundParameters.ContainsKey('LastSource')) { $a.LastSource = $LastSource }
+    if ($PSBoundParameters.ContainsKey('LastSourceStatus')) { $a.LastSourceStatus = $LastSourceStatus }
+    if ($LastSourceRecords -ge 0) { $a.LastSourceRecords = $LastSourceRecords }
+    $a.LastUpdateUtc = $now
+    $snap = Get-InvestigationActivitySnapshot
+    $line = Get-ActivityStatusLine
+    if ($Log) {
+        $msg = @($snap.Phase, $snap.Step, $snap.Detail, $(if ($snap.WaitingOn) { 'waiting on ' + $snap.WaitingOn } else { '' })) |
+            Where-Object { $_ }
+        if ($msg.Count) { Write-Log 'INFO' ($msg -join ' | ') }
+    }
+    Publish-UiEvent -Type 'Activity' -Message $line -Level 'INFO' -Percent ([int]$a.Percent) -Activity ([string]$a.Phase) -Snapshot $snap
 }
 
 function Write-Log {
@@ -196,8 +338,9 @@ function Write-Log {
 function Write-InvestigationProgress {
     param([string]$Activity, [string]$Status, [int]$Percent = -1)
     $pct = $Percent
-    if ($pct -lt 0) { $pct = 0 }
     if ($pct -gt 100) { $pct = 100 }
+    Set-InvestigationActivity -Phase $Activity -Step $Status -Percent $pct
+    if ($pct -lt 0) { $pct = [int](Get-InvestigationActivity).Percent }
     try { Write-Progress -Activity $Activity -Status $Status -PercentComplete $pct } catch { }
     Publish-UiEvent -Type 'Progress' -Activity $Activity -Message $Status -Percent $pct
 }
@@ -402,6 +545,13 @@ function Add-Coverage {
     if ($script:CoverageFile) {
         Export-EvidenceCsv -Rows $script:CoverageRows -Path $script:CoverageFile
     }
+    if ($Status -eq 'ERROR') {
+        Set-InvestigationActivity -ErrorsDelta 1 -LastSource $Source -LastSourceStatus $Status -LastSourceRecords $Records
+    }
+    else {
+        Set-InvestigationActivity -LastSource $Source -LastSourceStatus $Status -LastSourceRecords $Records
+    }
+    Publish-UiEvent -Type 'Coverage' -Message $Source -Level $(if ($Status -eq 'ERROR') { 'ERROR' } elseif ($Status -eq 'OK') { 'OK' } else { 'INFO' }) -Coverage $row -Records $Records
 }
 
 function Export-EvidenceCsv {
@@ -422,6 +572,7 @@ function Save-Rows {
         }
         Export-EvidenceCsv -Rows $arr -Path $path
         Write-Log 'OK' ("Saved {0:N0} rows -> {1}" -f $arr.Count, $FileName)
+        Publish-UiEvent -Type 'Saved' -Message $FileName -Level 'OK' -FileName $FileName -Records $arr.Count
     }
     else { Write-Log 'INFO' "No rows for $FileName" }
 }
@@ -432,6 +583,9 @@ function Invoke-WithRetry {
     while ($true) {
         Test-InvestigationCancel
         $attempt++
+        if ($attempt -gt 1) {
+            Set-InvestigationActivity -WaitingOn ("{0} (attempt {1}/{2})" -f $Activity, $attempt, $MaxAttempts)
+        }
         try {
             if ($ArgumentList) { return (& $Script @ArgumentList) }
             return (& $Script)
@@ -444,6 +598,7 @@ function Invoke-WithRetry {
             $delay = [int][math]::Min(120, [math]::Pow(2, $attempt) * 5)
             if ($msg -match 'Retry-After\D{0,5}(\d+)') { $delay = [int]$matches[1] + 1 }
             Write-Log 'WARN' ("{0} failed (attempt {1}/{2}): {3} - retrying in {4}s" -f $Activity, $attempt, $MaxAttempts, (Limit-Text $msg 300), $delay)
+            Set-InvestigationActivity -WaitingOn ("Retrying {0} in {1}s (attempt {2}/{3})" -f $Activity, $delay, $attempt, $MaxAttempts)
             Start-SleepInterruptible -Seconds $delay
         }
     }
@@ -456,6 +611,7 @@ function Test-RequiredModule {
         if ($script:Config.InstallModules) {
             try {
                 Write-Log 'INFO' "Installing $Name (CurrentUser)..."
+                Set-InvestigationActivity -Step ("Installing $Name") -WaitingOn ("Install-Module $Name")
                 Install-Module -Name $Name -MinimumVersion $MinVersion -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
             }
             catch { Write-Log 'ERROR' "Install of $Name failed: $($_.Exception.Message)"; return $false }
@@ -465,7 +621,14 @@ function Test-RequiredModule {
             return $false
         }
     }
-    try { Import-Module -Name $Name -MinimumVersion $MinVersion -ErrorAction Stop; return $true }
+    try {
+        if (-not (Get-Module -Name $Name -ErrorAction SilentlyContinue)) {
+            Write-Log 'INFO' ("Loading module {0} (this can take a minute)..." -f $Name)
+            Set-InvestigationActivity -Step ("Loading $Name") -WaitingOn ("Import-Module $Name")
+        }
+        Import-Module -Name $Name -MinimumVersion $MinVersion -ErrorAction Stop
+        return $true
+    }
     catch {
         Write-Log 'ERROR' ("Import of $Name failed: {0}. If this is an assembly (MSAL) conflict, run the Exchange and Graph phases in separate PowerShell windows (-SkipGraph / -SkipExchange) into the same -OutputPath, then -ReportOnly." -f $_.Exception.Message)
         return $false
@@ -736,6 +899,9 @@ function Get-UalRecords {
     param([datetime]$From, [datetime]$To, [string]$RecordType = '', [string[]]$Operations = @(), [string[]]$UserIds = @(), [int]$Depth = 0)
     $results = New-Object System.Collections.Generic.List[object]
     $sessionRetries = 0
+    $label = $RecordType
+    if (-not $label -and $Operations.Count) { $label = ($Operations | Select-Object -First 3) -join ',' }
+    if (-not $label) { $label = 'UAL' }
     while ($true) {
         Test-InvestigationCancel
         $sessionId = [guid]::NewGuid().ToString()
@@ -749,28 +915,37 @@ function Get-UalRecords {
             if ($RecordType) { $ualParams['RecordType'] = $RecordType }
             if ($Operations.Count -gt 0) { $ualParams['Operations'] = $Operations }
             if ($UserIds.Count -gt 0) { $ualParams['UserIds'] = $UserIds }
-            $page = @(Invoke-WithRetry -Activity ("UAL {0}" -f $RecordType) -Script { Search-UnifiedAuditLog @ualParams })
+            $pageNum = $pages + 1
+            Set-InvestigationActivity -WaitingOn ("Search-UnifiedAuditLog {0} page {1}" -f $label, $pageNum) -Detail ("{0:yyyy-MM-dd HH:mm} -> {1:yyyy-MM-dd HH:mm} UTC · {2:N0} in this slice so far" -f $From, $To, $results.Count)
+            Write-Log 'INFO' ("UAL {0}: requesting {1:yyyy-MM-dd HH:mm} -> {2:yyyy-MM-dd HH:mm} UTC, page {3} ({4:N0} in this slice so far). This Microsoft 365 call can take several minutes." -f $label, $From, $To, $pageNum, $results.Count)
+            $page = @(Invoke-WithRetry -Activity ("UAL {0}" -f $label) -Script { Search-UnifiedAuditLog @ualParams })
             $pages++
-            if ($page.Count -eq 0 -or $null -eq $page[0]) { break }
+            Set-InvestigationActivity -PagesDelta 1
+            if ($page.Count -eq 0 -or $null -eq $page[0]) {
+                Write-Log 'INFO' ("UAL {0}: page {1} returned no records" -f $label, $pages)
+                break
+            }
             if ($expected -lt 0) {
                 $expected = [int]$page[0].ResultCount
                 if ($expected -eq 0) { $badSession = $true; break }
                 if ($expected -ge 50000 -and ($To - $From).TotalMinutes -gt 2) {
                     $mid = $From.AddTicks([long](($To - $From).Ticks / 2))
-                    Write-Log 'WARN' ("UAL {0}: {1:N0} results in {2:u} -> {3:u} exceeds the 50,000 session cap - splitting window" -f $RecordType, $expected, $From, $To)
+                    Write-Log 'WARN' ("UAL {0}: {1:N0} results in {2:u} -> {3:u} exceeds the 50,000 session cap - splitting window" -f $label, $expected, $From, $To)
                     $combined = New-Object System.Collections.Generic.List[object]
                     foreach ($x in (Get-UalRecords -From $From -To $mid -RecordType $RecordType -Operations $Operations -UserIds $UserIds -Depth ($Depth + 1))) { $combined.Add($x) }
                     foreach ($x in (Get-UalRecords -From $mid -To $To -RecordType $RecordType -Operations $Operations -UserIds $UserIds -Depth ($Depth + 1))) { $combined.Add($x) }
                     return , $combined.ToArray()
                 }
-                if ($expected -ge 50000) { Write-Log 'WARN' "UAL ${RecordType}: >50,000 events in a 2-minute window - results truncated (export this window via Purview Audit search)." }
+                if ($expected -ge 50000) { Write-Log 'WARN' "UAL ${label}: >50,000 events in a 2-minute window - results truncated (export this window via Purview Audit search)." }
             }
             foreach ($r in $page) { $results.Add($r) }
+            Write-Log 'INFO' ("UAL {0}: page {1} returned {2:N0} (slice {3:N0} of ~{4:N0})" -f $label, $pages, $page.Count, $results.Count, $(if ($expected -ge 0) { $expected } else { $results.Count }))
             if ($results.Count -ge $expected -or $pages -ge 11) { break }
         }
         if ($badSession -and $sessionRetries -lt 3) {
             $sessionRetries++
-            Write-Log 'WARN' "UAL ${RecordType}: service returned an invalid result set - retrying window with a new session ($sessionRetries/3)"
+            Write-Log 'WARN' "UAL ${label}: service returned an invalid result set - retrying window with a new session ($sessionRetries/3)"
+            Set-InvestigationActivity -WaitingOn ("UAL $label invalid session retry $sessionRetries/3")
             Start-SleepInterruptible -Seconds (10 * $sessionRetries)
             continue
         }
@@ -796,6 +971,7 @@ function Invoke-UalCollection {
             Test-InvestigationCancel
             $chunkEnd = $cursor.AddHours($chunkHours)
             if ($chunkEnd -gt $To) { $chunkEnd = $To }
+            Set-InvestigationActivity -Phase 'Unified Audit Log' -Step $Name -Detail ("{0:yyyy-MM-dd HH:mm} -> {1:yyyy-MM-dd HH:mm} UTC · {2:N0} collected" -f $cursor, $chunkEnd, $rows.Count) -WaitingOn ("UAL slice $Name")
             $records = Get-UalRecords -From $cursor -To $chunkEnd -RecordType $RecordType -Operations $Operations -UserIds $UserIds
             $new = 0
             foreach ($r in $records) {
@@ -805,6 +981,8 @@ function Invoke-UalCollection {
                 if ($Kind -eq 'SignIn') { $row = ConvertFrom-UalSignIn $r } else { $row = ConvertFrom-UalRecord $r $Label }
                 if ($row) { $rows.Add($row); $new++ }
             }
+            if ($Kind -eq 'SignIn') { Set-InvestigationActivity -SignInsDelta $new -ClearWait }
+            else { Set-InvestigationActivity -EventsDelta $new -ClearWait }
             Write-Log 'INFO' ("UAL {0,-36} {1:yyyy-MM-dd HH:mm} -> {2:yyyy-MM-dd HH:mm} UTC : {3,6:N0} records (total {4:N0})" -f $Name, $cursor, $chunkEnd, $new, $rows.Count)
             $cursor = $chunkEnd
         }
@@ -828,6 +1006,7 @@ function Invoke-ExchangeStateCollection {
     Write-InvestigationProgress 'Exchange current state' 'Sweeping persistence' 55
     $src = 'Exchange Online (current state)'
 
+    Set-InvestigationActivity -Step 'Admin audit log config' -WaitingOn 'Get-AdminAuditLogConfig'
     try {
         $c = Get-AdminAuditLogConfig -ErrorAction Stop
         $sev = 'Info'; if (-not $c.UnifiedAuditLogIngestionEnabled) { $sev = 'Critical' }
@@ -835,6 +1014,7 @@ function Invoke-ExchangeStateCollection {
     }
     catch { Write-Log 'WARN' "Get-AdminAuditLogConfig: $($_.Exception.Message)" }
 
+    Set-InvestigationActivity -Step 'Organization config' -WaitingOn 'Get-OrganizationConfig'
     try {
         $o = Get-OrganizationConfig -ErrorAction Stop
         $sev = 'Info'; if ($o.AuditDisabled) { $sev = 'Critical' }
@@ -843,6 +1023,7 @@ function Invoke-ExchangeStateCollection {
     }
     catch { Write-Log 'WARN' "Get-OrganizationConfig: $($_.Exception.Message)" }
 
+    Set-InvestigationActivity -Step 'Mailbox audit bypass' -WaitingOn 'Get-MailboxAuditBypassAssociation'
     try {
         foreach ($b in @(Get-MailboxAuditBypassAssociation -ResultSize Unlimited -ErrorAction Stop | Where-Object { $_.AuditBypassEnabled })) {
             Add-Finding 'Critical' 'Audit Configuration' ("Audit bypass enabled: " + $b.Name) ("Identity=" + $b.Identity + "; WhenChanged=" + $b.WhenChanged) 'Actions by this account against mailboxes are not audited (T1562.008).' $b.WhenChanged $src
@@ -850,6 +1031,7 @@ function Invoke-ExchangeStateCollection {
     }
     catch { Write-Log 'WARN' "Get-MailboxAuditBypassAssociation: $($_.Exception.Message)" }
 
+    Set-InvestigationActivity -Step 'Mailboxes with auditing disabled' -WaitingOn 'Get-Mailbox (AuditEnabled)'
     try {
         $noAudit = @(Get-Mailbox -ResultSize Unlimited -Filter 'AuditEnabled -eq $false' -ErrorAction Stop)
         foreach ($m in ($noAudit | Select-Object -First 500)) {
@@ -858,6 +1040,7 @@ function Invoke-ExchangeStateCollection {
     }
     catch { Write-Log 'WARN' "Mailbox audit status: $($_.Exception.Message)" }
 
+    Set-InvestigationActivity -Step 'Mailbox forwarding' -WaitingOn 'Get-Mailbox (Forwarding*)'
     try {
         foreach ($m in @(Get-Mailbox -ResultSize Unlimited -Filter 'ForwardingSmtpAddress -ne $null -or ForwardingAddress -ne $null' -ErrorAction Stop)) {
             $sev = 'Medium'; if ($m.ForwardingSmtpAddress) { $sev = 'High' }
@@ -868,6 +1051,7 @@ function Invoke-ExchangeStateCollection {
     }
     catch { Write-Log 'WARN' "Forwarding sweep: $($_.Exception.Message)" }
 
+    Set-InvestigationActivity -Step 'Outbound spam / auto-forward policy' -WaitingOn 'Get-HostedOutboundSpamFilterPolicy'
     try {
         foreach ($p in @(Get-HostedOutboundSpamFilterPolicy -ErrorAction Stop)) {
             if ($p.AutoForwardingMode -eq 'On') {
@@ -877,6 +1061,7 @@ function Invoke-ExchangeStateCollection {
     }
     catch { Write-Log 'WARN' "Get-HostedOutboundSpamFilterPolicy: $($_.Exception.Message)" }
 
+    Set-InvestigationActivity -Step 'Transport rules' -WaitingOn 'Get-TransportRule'
     try {
         foreach ($t in @(Get-TransportRule -ResultSize Unlimited -ErrorAction Stop)) {
             $risky = @()
@@ -899,6 +1084,7 @@ function Invoke-ExchangeStateCollection {
     catch { Write-Log 'WARN' "Get-TransportRule: $($_.Exception.Message)" }
 
     foreach ($kind in @('Inbound', 'Outbound')) {
+        Set-InvestigationActivity -Step ("$kind connectors") -WaitingOn ("Get-${kind}Connector")
         try {
             $list = @()
             if ($kind -eq 'Inbound') { $list = @(Get-InboundConnector -ErrorAction Stop) } else { $list = @(Get-OutboundConnector -ErrorAction Stop) }
@@ -912,6 +1098,7 @@ function Invoke-ExchangeStateCollection {
         catch { Write-Log 'WARN' "Get-${kind}Connector: $($_.Exception.Message)" }
     }
 
+    Set-InvestigationActivity -Step 'Exchange RBAC assignments' -WaitingOn 'Get-ManagementRoleAssignment'
     try {
         foreach ($ra in @(Get-ManagementRoleAssignment -ErrorAction Stop)) {
             if ("$($ra.RoleAssignmentDelegationType)" -like 'Delegating*') { continue }
@@ -928,6 +1115,7 @@ function Invoke-ExchangeStateCollection {
     catch { Write-Log 'WARN' "Get-ManagementRoleAssignment: $($_.Exception.Message)" }
 
     foreach ($rg in @('Organization Management', 'Recipient Management', 'Discovery Management', 'Compliance Management', 'Security Administrator', 'Hygiene Management')) {
+        Set-InvestigationActivity -Step ("Role group: $rg") -WaitingOn "Get-RoleGroupMember $rg"
         try {
             foreach ($m in @(Get-RoleGroupMember -Identity $rg -ResultSize Unlimited -ErrorAction Stop)) {
                 $nm = [string](Get-FirstValue $m @('PrimarySmtpAddress', 'WindowsLiveID', 'Name'))
@@ -951,6 +1139,7 @@ function Invoke-ExchangeStateCollection {
         Test-InvestigationCancel
         $n++
         if ($n -gt $cap) { Write-Log 'WARN' "Mailbox inspection capped at $cap mailboxes (-MaxMailboxesToInspect)."; break }
+        Set-InvestigationActivity -Step ("Mailbox $n/$([math]::Min($targets.Count, $cap)): $mbx") -WaitingOn "Get-MailboxPermission / Get-InboxRule $mbx"
         try {
             foreach ($p in @(Get-MailboxPermission -Identity $mbx -ErrorAction Stop | Where-Object { -not $_.IsInherited -and -not $_.Deny -and "$($_.User)" -notmatch 'NT AUTHORITY\\SELF|^S-1-5-' })) {
                 Add-Finding 'High' 'Mailbox Permission' ("{0}  <-  {1}" -f $mbx, $p.User) ("AccessRights=" + ($p.AccessRights -join ',')) 'The delegate can open and read this entire mailbox.' $null $src
@@ -984,6 +1173,7 @@ function Invoke-ExchangeStateCollection {
         }
         catch { Write-Log 'INFO' "Get-InboxRule ${mbx}: $($_.Exception.Message)" }
     }
+    Set-InvestigationActivity -FindingsDelta $script:Findings.Count
     Save-Rows -Rows $script:Findings -FileName 'Findings-Exchange.csv' -SortProperty 'WhenUtc'
     Add-Coverage -Source 'Exchange current-state sweep' -Status 'OK' -Records $script:Findings.Count -Notes ("Mailboxes inspected: " + [math]::Min($targets.Count, $cap))
 }
@@ -1012,7 +1202,8 @@ function Connect-M365PsForensicsExchange {
         $cmd = Get-Command Connect-ExchangeOnline -ErrorAction SilentlyContinue
         if ($UseDeviceCode -and $cmd -and $cmd.Parameters.ContainsKey('Device')) { $p['Device'] = $true }
         if ($DisableWAM -and $cmd -and $cmd.Parameters.ContainsKey('DisableWAM')) { $p['DisableWAM'] = $true }
-        Write-Log 'INFO' 'Connecting to Exchange Online (sign in with your IR / Global Reader account)...'
+        Write-Log 'INFO' 'Connecting to Exchange Online (sign in with your IR / Global Reader account). If you do not see a Microsoft login window, check the taskbar — it may be behind this form.'
+        Set-InvestigationActivity -Phase 'Exchange Online' -Step 'Signing in' -WaitingOn 'Connect-ExchangeOnline — complete the Microsoft sign-in window (check the taskbar if it is hidden)'
         Connect-ExchangeOnline @p
         $script:OpenedExo = $true
         Write-Log 'OK' 'Connected to Exchange Online.'
@@ -1025,6 +1216,8 @@ function Connect-M365PsForensicsExchange {
 }
 
 function Invoke-ExchangePhase {
+    Write-Log 'INFO' 'Exchange / Unified Audit Log phase starting...'
+    Set-InvestigationActivity -Phase 'Exchange Online' -Step 'Checking existing session' -WaitingOn 'Get-ConnectionInformation' -Percent 5
     $conn = Get-M365PsForensicsConnectionState
     if (-not $conn.ExchangeConnected) {
         $conn = Connect-M365PsForensicsExchange -UserPrincipalName $script:Config.AdminUPN
@@ -1032,6 +1225,9 @@ function Invoke-ExchangePhase {
             Add-Coverage -Source 'Exchange Online' -Status 'ERROR' -From $script:StartUtc -To $script:EndUtc -Notes ([string]$conn.Error)
             return
         }
+    }
+    else {
+        Write-Log 'OK' ("Reusing Exchange Online session as {0}" -f $(if ($conn.ExchangeUser) { $conn.ExchangeUser } else { 'connected' }))
     }
     if ($script:StartUtc -lt $script:NowUtc.AddDays(-180)) {
         Write-Log 'WARN' 'Start date is older than 180 days: data beyond your audit retention (180 days Standard / 1 year+ Premium) will not exist.'
@@ -1092,17 +1288,34 @@ function New-GraphUri {
     return ('https://graph.microsoft.com/' + $Path + '?' + ($qs -join '&'))
 }
 
+function Get-ShortGraphTarget {
+    param([string]$Uri)
+    if (-not $Uri) { return 'Graph' }
+    if ($Uri -match 'graph\.microsoft\.com/[^/]+/([^?]+)') { return $matches[1] }
+    return (Limit-Text $Uri 80)
+}
+
 function Get-GraphAll {
-    param([string]$Uri, [int]$MaxItems = 0, [hashtable]$Headers = @{})
+    param([string]$Uri, [int]$MaxItems = 0, [hashtable]$Headers = @{}, [string]$Label = '')
     $items = New-Object System.Collections.Generic.List[object]
     $next = $Uri
+    $page = 0
+    $target = if ($Label) { $Label } else { Get-ShortGraphTarget $Uri }
     while ($next) {
         Test-InvestigationCancel
-        $resp = Invoke-WithRetry -Activity 'Graph request' -Script { Invoke-MgGraphRequest -Method GET -Uri $next -Headers $Headers -OutputType PSObject -ErrorAction Stop }
-        if ($resp.value) { foreach ($v in $resp.value) { $items.Add($v) } }
+        $page++
+        Set-InvestigationActivity -WaitingOn ("Graph $target page $page") -Detail ("{0:N0} records so far" -f $items.Count)
+        Write-Log 'INFO' ("Graph {0}: requesting page {1} ({2:N0} records so far). This call can take several minutes..." -f $target, $page, $items.Count)
+        $resp = Invoke-WithRetry -Activity ("Graph $target") -Script { Invoke-MgGraphRequest -Method GET -Uri $next -Headers $Headers -OutputType PSObject -ErrorAction Stop }
+        $got = 0
+        if ($resp.value) {
+            foreach ($v in $resp.value) { $items.Add($v); $got++ }
+        }
+        Set-InvestigationActivity -PagesDelta 1
+        Write-Log 'INFO' ("Graph {0}: page {1} returned {2:N0} (total {3:N0})" -f $target, $page, $got, $items.Count)
         $next = $resp.'@odata.nextLink'
         if ($MaxItems -gt 0 -and $items.Count -ge $MaxItems) {
-            Write-Log 'WARN' ("Graph result capped at {0:N0} items for {1}" -f $MaxItems, (Limit-Text $Uri 120)); break
+            Write-Log 'WARN' ("Graph result capped at {0:N0} items for {1}" -f $MaxItems, $target); break
         }
     }
     return , $items.ToArray()
@@ -1186,12 +1399,12 @@ function Get-GraphSignIns {
     try {
         $f = $Filter
         if ($EventTypeClause) { $f = $Filter + ' and ' + $EventTypeClause }
-        $items = Get-GraphAll -Uri (New-GraphUri 'beta/auditLogs/signIns' ([ordered]@{ '$filter' = $f; '$top' = '999' })) -MaxItems $script:Config.MaxSignInsPerQuery
+        $items = Get-GraphAll -Uri (New-GraphUri 'beta/auditLogs/signIns' ([ordered]@{ '$filter' = $f; '$top' = '999' })) -MaxItems $script:Config.MaxSignInsPerQuery -Label ("sign-ins $Label")
     }
     catch {
         Write-Log 'WARN' ("Beta sign-in query failed for {0} ({1}) - falling back to v1.0 interactive sign-ins only" -f $Label, (Limit-Text $_.Exception.Message 200))
         $note = 'interactive only (v1.0 fallback)'
-        $items = Get-GraphAll -Uri (New-GraphUri 'v1.0/auditLogs/signIns' ([ordered]@{ '$filter' = $Filter; '$top' = '999' })) -MaxItems $script:Config.MaxSignInsPerQuery
+        $items = Get-GraphAll -Uri (New-GraphUri 'v1.0/auditLogs/signIns' ([ordered]@{ '$filter' = $Filter; '$top' = '999' })) -MaxItems $script:Config.MaxSignInsPerQuery -Label ("sign-ins $Label v1.0")
     }
     return @($items, $note)
 }
@@ -1201,13 +1414,15 @@ function Invoke-GraphStateCollection {
     $src = 'Entra ID (current state)'
     Write-Log 'INFO' 'Entra current-state persistence sweep...'
     Write-InvestigationProgress 'Entra current state' 'Sweeping persistence' 85
+    Set-InvestigationActivity -Step 'Directory roles' -WaitingOn 'GET directoryRoles'
     $privRoles = 'Global Administrator|Privileged Role Administrator|Privileged Authentication Administrator|Exchange Administrator|Application Administrator|Cloud Application Administrator|Security Administrator|SharePoint Administrator|User Administrator|Authentication Administrator|Hybrid Identity Administrator|Compliance Administrator|Conditional Access Administrator|Intune Administrator|Teams Administrator|Helpdesk Administrator|Directory Writers|Partner Tier2 Support'
 
     try {
-        $roles = Get-GraphAll -Uri 'https://graph.microsoft.com/v1.0/directoryRoles'
+        $roles = Get-GraphAll -Uri 'https://graph.microsoft.com/v1.0/directoryRoles' -Label 'directoryRoles'
         foreach ($role in $roles) {
             Test-InvestigationCancel
-            $members = Get-GraphAll -Uri ('https://graph.microsoft.com/v1.0/directoryRoles/{0}/members?$select=id,displayName,userPrincipalName,appId' -f $role.id)
+            Set-InvestigationActivity -Step ("Role members: " + $role.displayName) -WaitingOn ("GET directoryRoles/{0}/members" -f $role.id)
+            $members = Get-GraphAll -Uri ('https://graph.microsoft.com/v1.0/directoryRoles/{0}/members?$select=id,displayName,userPrincipalName,appId' -f $role.id) -Label ("role members " + $role.displayName)
             foreach ($m in $members) {
                 $type = ([string]$m.'@odata.type') -replace '#microsoft.graph.', ''
                 $name = [string](Get-FirstValue $m @('userPrincipalName', 'displayName', 'id'))
@@ -1226,7 +1441,8 @@ function Invoke-GraphStateCollection {
         try {
             $sel = 'id,appId,displayName,createdDateTime,passwordCredentials,keyCredentials'
             if ($kind -eq 'servicePrincipals') { $sel = 'id,appId,displayName,servicePrincipalType,appOwnerOrganizationId,passwordCredentials,keyCredentials' }
-            $objs = Get-GraphAll -Uri (New-GraphUri ('v1.0/' + $kind) ([ordered]@{ '$select' = $sel; '$top' = '999' }))
+            Set-InvestigationActivity -Step ("$kind credentials") -WaitingOn ("GET $kind")
+            $objs = Get-GraphAll -Uri (New-GraphUri ('v1.0/' + $kind) ([ordered]@{ '$select' = $sel; '$top' = '999' })) -Label $kind
             foreach ($o in $objs) {
                 if ($kind -eq 'servicePrincipals') { $spLookup[[string]$o.id] = $o }
                 $creds = @()
@@ -1251,7 +1467,8 @@ function Invoke-GraphStateCollection {
 
     try {
         $riskyScopes = '(?i)\b(Mail\.Read|Mail\.ReadWrite|Mail\.Send|MailboxSettings\.ReadWrite|EWS\.AccessAsUser\.All|full_access_as_user|Files\.Read\.All|Files\.ReadWrite\.All|Sites\.Read\.All|Sites\.ReadWrite\.All|Sites\.FullControl\.All|Directory\.ReadWrite\.All|RoleManagement\.ReadWrite\.Directory|AppRoleAssignment\.ReadWrite\.All|Application\.ReadWrite\.All|User\.ReadWrite\.All|Notes\.Read\.All|Chat\.Read|Contacts\.Read)\b'
-        foreach ($g in (Get-GraphAll -Uri 'https://graph.microsoft.com/v1.0/oauth2PermissionGrants?$top=999')) {
+        Set-InvestigationActivity -Step 'OAuth delegated grants' -WaitingOn 'GET oauth2PermissionGrants'
+        foreach ($g in (Get-GraphAll -Uri 'https://graph.microsoft.com/v1.0/oauth2PermissionGrants?$top=999' -Label 'oauth2PermissionGrants')) {
             if (-not ([string]$g.scope -match $riskyScopes)) { continue }
             $client = $spLookup[[string]$g.clientId]
             if ($client -and [string]$client.appOwnerOrganizationId -eq $script:MicrosoftTenantId) { continue }
@@ -1264,11 +1481,12 @@ function Invoke-GraphStateCollection {
     catch { Write-Log 'WARN' "OAuth grant sweep: $($_.Exception.Message)" }
 
     try {
-        foreach ($d in (Get-GraphAll -Uri 'https://graph.microsoft.com/v1.0/domains')) {
+        Set-InvestigationActivity -Step 'Domains / federation' -WaitingOn 'GET domains'
+        foreach ($d in (Get-GraphAll -Uri 'https://graph.microsoft.com/v1.0/domains' -Label 'domains')) {
             if (-not $d.isVerified) { Add-Finding 'Info' 'Domain' ([string]$d.id) 'Unverified domain present' 'Unexpected domains can be staging for a federation backdoor.' $null $src }
             if ($d.authenticationType -eq 'Federated') {
                 try {
-                    foreach ($fc in (Get-GraphAll -Uri ('https://graph.microsoft.com/v1.0/domains/{0}/federationConfiguration' -f $d.id))) {
+                    foreach ($fc in (Get-GraphAll -Uri ('https://graph.microsoft.com/v1.0/domains/{0}/federationConfiguration' -f $d.id) -Label ("federation " + $d.id))) {
                         $thumb = ''
                         foreach ($certB64 in @($fc.signingCertificate, $fc.nextSigningCertificate)) {
                             if (-not $certB64) { continue }
@@ -1289,12 +1507,14 @@ function Invoke-GraphStateCollection {
 
     try {
         $uri = New-GraphUri 'v1.0/users' ([ordered]@{ '$filter' = ('createdDateTime ge ' + $startIso); '$select' = 'id,userPrincipalName,displayName,createdDateTime,userType,accountEnabled,creationType'; '$count' = 'true'; '$top' = '999' })
-        foreach ($u in (Get-GraphAll -Uri $uri -Headers @{ ConsistencyLevel = 'eventual' })) {
+        Set-InvestigationActivity -Step 'Accounts created in window' -WaitingOn 'GET users (createdDateTime)'
+        foreach ($u in (Get-GraphAll -Uri $uri -Headers @{ ConsistencyLevel = 'eventual' } -Label 'new users')) {
             Add-Finding 'Medium' 'New Account' ([string]$u.userPrincipalName) ("DisplayName={0}; Type={1}; Enabled={2}; CreationType={3}; Created={4}" -f $u.displayName, $u.userType, $u.accountEnabled, $u.creationType, (ConvertTo-UtcIso $u.createdDateTime)) 'Account created during the investigation window - confirm it is legitimate (T1136.003).' $u.createdDateTime $src
         }
     }
     catch { Write-Log 'WARN' "New-account sweep: $($_.Exception.Message)" }
 
+    Set-InvestigationActivity -FindingsDelta $script:Findings.Count
     Save-Rows -Rows $script:Findings -FileName 'Findings-Entra.csv' -SortProperty 'WhenUtc'
     Add-Coverage -Source 'Entra current-state sweep' -Status 'OK' -Records $script:Findings.Count
 }
@@ -1314,7 +1534,8 @@ function Connect-M365PsForensicsGraph {
         elseif ($script:Config.TenantId) { $p['TenantId'] = $script:Config.TenantId }
         if ($UserPrincipalName -and (Get-Command Connect-MgGraph).Parameters.ContainsKey('ContextScope')) { }
         if ((Get-Command Connect-MgGraph).Parameters.ContainsKey('NoWelcome')) { $p['NoWelcome'] = $true }
-        Write-Log 'INFO' 'Connecting to Microsoft Graph...'
+        Write-Log 'INFO' 'Connecting to Microsoft Graph. If you do not see a Microsoft login window, check the taskbar — it may be behind this form.'
+        Set-InvestigationActivity -Phase 'Microsoft Graph' -Step 'Signing in' -WaitingOn 'Connect-MgGraph — complete the Microsoft sign-in window (check the taskbar if it is hidden)'
         Connect-MgGraph @p | Out-Null
         $script:OpenedGraph = $true
         $ctx = Get-MgContext
@@ -1342,6 +1563,8 @@ function Disconnect-M365PsForensicsSessions {
 }
 
 function Invoke-GraphPhase {
+    Write-Log 'INFO' 'Microsoft Graph phase starting...'
+    Set-InvestigationActivity -Phase 'Microsoft Graph' -Step 'Checking existing session' -WaitingOn 'Get-MgContext' -Percent 60
     $conn = Get-M365PsForensicsConnectionState
     if (-not $conn.GraphConnected) {
         $conn = Connect-M365PsForensicsGraph -TenantId $script:Config.TenantId
@@ -1349,6 +1572,9 @@ function Invoke-GraphPhase {
             Add-Coverage -Source 'Microsoft Graph' -Status 'ERROR' -From $script:StartUtc -To $script:EndUtc -Notes ([string]$conn.Error)
             return
         }
+    }
+    else {
+        Write-Log 'OK' ("Reusing Graph session as {0}" -f $(if ($conn.GraphUser) { $conn.GraphUser } else { 'connected' }))
     }
 
     $gFrom = $script:GraphCutoffUtc; $gTo = $script:EndUtc
@@ -1365,8 +1591,12 @@ function Invoke-GraphPhase {
             foreach ($appId in $script:PowerShellApps.Keys) { $queries.Add(@(("appId eq '$appId' and " + $win), ('PowerShell app ' + $script:PowerShellApps[$appId]), $null)) }
             foreach ($u in @($script:Config.SuspectUsers)) { $queries.Add(@(("userPrincipalName eq '" + ($u -replace "'", "''") + "' and " + $win), ('Suspect user ' + $u), $null)) }
             if ($script:Config.IncludeServicePrincipalSignIns) { $queries.Add(@($win, 'All service principal sign-ins', "signInEventTypes/any(t: t eq 'servicePrincipal')")) }
+            $qIndex = 0
             foreach ($q in $queries) {
                 Test-InvestigationCancel
+                $qIndex++
+                Write-Log 'INFO' ("Graph sign-in query {0}/{1}: {2}" -f $qIndex, $queries.Count, $q[1])
+                Set-InvestigationActivity -Phase 'Microsoft Graph' -Step $q[1] -Detail ("query {0} of {1}" -f $qIndex, $queries.Count) -WaitingOn ("auditLogs/signIns " + $q[1]) -SourceIndex $qIndex -SourceCount $queries.Count
                 try {
                     if ($null -eq $q[2]) { $res = Get-GraphSignIns -Filter $q[0] -Label $q[1] }
                     else { $res = Get-GraphSignIns -Filter $q[0] -Label $q[1] -EventTypeClause $q[2] }
@@ -1376,6 +1606,7 @@ function Invoke-GraphPhase {
                         if ($raw) { $raw.WriteLine(($s | ConvertTo-Json -Depth 8 -Compress)) }
                         $signIns.Add((ConvertFrom-GraphSignIn $s 'SignIn')); $count++
                     }
+                    Set-InvestigationActivity -SignInsDelta $count -ClearWait
                     Write-Log 'INFO' ("Graph sign-ins {0}: {1:N0}" -f $q[1], $count)
                     Add-Coverage -Source ('Entra sign-ins - ' + $q[1]) -Status 'OK' -Records $count -From $gFrom -To $gTo -Notes $res[1]
                 }
@@ -1397,11 +1628,13 @@ function Invoke-GraphPhase {
         try {
             $rawA = New-Object System.IO.StreamWriter((Join-Path $script:RawPath 'Graph-DirectoryAudits.jsonl'), $false, (New-Object System.Text.UTF8Encoding($false)))
             $uri = New-GraphUri 'v1.0/auditLogs/directoryAudits' ([ordered]@{ '$filter' = "activityDateTime ge $sIso and activityDateTime le $eIso"; '$top' = '999' })
-            $audits = Get-GraphAll -Uri $uri -MaxItems $script:Config.MaxDirectoryAuditRecords
+            Set-InvestigationActivity -Step 'Directory audit log' -WaitingOn 'GET auditLogs/directoryAudits'
+            $audits = Get-GraphAll -Uri $uri -MaxItems $script:Config.MaxDirectoryAuditRecords -Label 'directoryAudits'
             foreach ($d in $audits) {
                 if ($rawA) { $rawA.WriteLine(($d | ConvertTo-Json -Depth 8 -Compress)) }
                 $aRows.Add((ConvertFrom-GraphDirectoryAudit $d))
             }
+            Set-InvestigationActivity -EventsDelta $aRows.Count -ClearWait
             Write-Log 'OK' ("Graph directory audits: {0:N0}" -f $aRows.Count)
             Add-Coverage -Source 'Entra directory audit log (Graph)' -Status 'OK' -Records $aRows.Count -From $gFrom -To $gTo
         }
@@ -1458,6 +1691,7 @@ function Get-FirstLast {
 function New-InvestigationReport {
     Write-Log 'INFO' 'Building correlated timeline and interactive HTML report...'
     Write-InvestigationProgress 'Report' 'Correlating evidence' 90
+    Set-InvestigationActivity -WaitingOn 'Reading Events-*.csv / SignIns-*.csv / Findings-*.csv'
     $events = New-Object System.Collections.Generic.List[object]
     foreach ($f in @(Get-ChildItem -LiteralPath $script:OutputPath -Filter 'Events-*.csv' -File -ErrorAction SilentlyContinue)) {
         foreach ($r in @(Import-Csv -LiteralPath $f.FullName)) { $events.Add($r) }
@@ -1942,6 +2176,7 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
 function Write-EvidenceManifest {
     $manifest = Join-Path $script:OutputPath 'Evidence-Manifest.csv'
     Write-Log 'INFO' 'Hashing evidence files (SHA-256)...'
+    Set-InvestigationActivity -Phase 'Report' -Step 'Evidence manifest' -WaitingOn 'SHA-256 hashing' -Percent 98
     $rows = foreach ($f in @(Get-ChildItem -LiteralPath $script:OutputPath -Recurse -File | Where-Object { $_.FullName -ne $manifest -and $_.FullName -ne $script:LogFile })) {
         [pscustomobject]@{
             File         = $f.FullName.Substring($script:OutputPath.Length).TrimStart('\', '/')
@@ -2084,6 +2319,9 @@ function Invoke-M365PowerShellForensics {
     }
 
     try {
+        Reset-InvestigationActivity
+        Set-InvestigationActivity -Phase 'Starting' -Step 'Preparing evidence folder' -WaitingOn 'Creating output folder' -Percent 1
+        Write-Log 'INFO' 'Investigation run started. Live status will update before each Microsoft 365 call.'
         Test-InvestigationCancel
         $resolved = Initialize-M365PsForensicsOutput -OutputPath $OutputPath -ReportOnly:$ReportOnly
         $script:Config.OutputPath = $resolved
@@ -2092,6 +2330,15 @@ function Invoke-M365PowerShellForensics {
 
         Write-Log 'INFO' ("M365 PowerShell Forensics v{0} | PowerShell {1} | Output: {2}" -f $script:ScriptVersion, $PSVersionTable.PSVersion, $script:OutputPath)
         Write-Log 'INFO' ("Window (UTC): {0} -> {1} | Suspect users: {2} | Suspect IPs: {3}" -f (ConvertTo-UtcIso $script:StartUtc), (ConvertTo-UtcIso $script:EndUtc), ($script:Config.SuspectUsers -join ', '), ($script:Config.SuspectIPs -join ', '))
+        $plan = New-Object System.Collections.Generic.List[string]
+        if (-not $ReportOnly) {
+            if (-not $SkipExchange) { $plan.Add('Exchange/UAL admin cmdlets and persistence') } else { $plan.Add('skip Exchange/UAL') }
+            if (-not $SkipGraph) { $plan.Add('Graph PowerShell sign-ins, directory audit, persistence') } else { $plan.Add('skip Graph') }
+        }
+        else { $plan.Add('report-only rebuild') }
+        $plan.Add('correlated HTML report')
+        Write-Log 'INFO' ('Phase plan: ' + ($plan -join ' -> '))
+        Set-InvestigationActivity -Step 'Phase plan' -Detail ($plan -join ' -> ') -ClearWait -Percent 2
 
         if (-not $ReportOnly) {
             if (-not $SkipExchange) { Invoke-ExchangePhase } else { Write-Log 'INFO' 'Exchange / Unified Audit Log phase skipped (-SkipExchange).' }
@@ -2114,6 +2361,7 @@ function Invoke-M365PowerShellForensics {
 
         Write-Host ''
         Write-Host '==================================================================' -ForegroundColor Cyan
+        Set-InvestigationActivity -Phase 'Complete' -Step 'Collection finished' -ClearWait -Percent 100
         Write-Host ' Collection complete.' -ForegroundColor Cyan
         Write-Host (' Evidence folder : ' + $script:OutputPath) -ForegroundColor Cyan
         if ($report) { Write-Host (' Report          : ' + $report) -ForegroundColor Cyan }
