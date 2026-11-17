@@ -20,7 +20,7 @@ param(
     [switch]$StaReady
 )
 
-$script:GuiVersion = '2.1.3'
+$script:GuiVersion = '2.1.4'
 
 if (-not $StaReady -and [System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
     $hostPath = $null

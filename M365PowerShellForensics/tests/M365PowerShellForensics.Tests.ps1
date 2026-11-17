@@ -306,7 +306,38 @@ $modErrors = $null
 $null = [System.Management.Automation.Language.Parser]::ParseFile($modulePath, [ref]$null, [ref]$modErrors)
 Assert-Equal @($modErrors).Count 0 'engine module parses'
 
-Assert-Equal (Get-M365PsForensicsVersion) '2.1.3' 'engine version is 2.1.3'
+Assert-Equal (Get-M365PsForensicsVersion) '2.1.4' 'engine version is 2.1.4'
+
+Write-Host 'Exchange cmdlet status and Graph UAL shaping'
+$exoStatus = Get-ExoCmdletStatus
+Assert-True ($null -ne $exoStatus.GetMailbox) 'EXO cmdlet status reports Get-Mailbox'
+Assert-True ($null -ne $exoStatus.SearchUnifiedAuditLog) 'EXO cmdlet status reports Search-UnifiedAuditLog'
+Assert-Equal (Get-GraphAuditRecordTypeName 'ExchangeAdmin') 'exchangeAdmin' 'UAL ExchangeAdmin maps to Graph exchangeAdmin'
+Assert-Equal (Get-GraphAuditRecordTypeName 'AzureActiveDirectoryStsLogon') 'azureActiveDirectoryStsLogon' 'STS logon record type is camel-cased'
+$shaped = ConvertTo-UalShapedRecord ([pscustomobject]@{
+        id                 = 'rec-1'
+        createdDateTime    = '2026-11-16T12:00:00Z'
+        auditLogRecordType = 'ExchangeAdmin'
+        operation          = 'Set-Mailbox'
+        userPrincipalName  = 'attacker@contoso.com'
+        objectId           = 'victim@contoso.com'
+        auditData          = [pscustomobject]@{
+            CreationTime = '2026-11-16T12:00:00'
+            Operation    = 'Set-Mailbox'
+            UserId       = 'attacker@contoso.com'
+            ResultStatus = 'Succeeded'
+            Workload     = 'Exchange'
+            Parameters   = @([pscustomobject]@{ Name = 'Identity'; Value = 'victim@contoso.com' })
+        }
+    })
+Assert-Equal $shaped.Identity 'rec-1' 'Graph audit record keeps id as Identity'
+Assert-Equal $shaped.UserIds 'attacker@contoso.com' 'Graph audit record keeps UPN'
+$fromGraph = ConvertFrom-UalRecord $shaped 'Admin'
+Assert-Equal $fromGraph.Actor 'attacker@contoso.com' 'Graph-shaped UAL record converts the actor'
+Assert-Contains $fromGraph.CommandLine 'Set-Mailbox' 'Graph-shaped UAL record reconstructs the cmdlet'
+$connState = Get-M365PsForensicsConnectionState
+Assert-True ($connState.PSObject.Properties.Name -contains 'ExchangeCmdletsLoaded') 'connection state reports whether EXO cmdlets are loaded'
+Assert-True ($connState.PSObject.Properties.Name -contains 'UnifiedAuditLogLoaded') 'connection state reports whether Search-UnifiedAuditLog is loaded'
 
 Write-Host 'Suspect-user collection scope'
 Initialize-SuspectSets -Users @('attacker@contoso.com') -IPs @()

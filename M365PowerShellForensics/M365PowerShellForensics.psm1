@@ -45,9 +45,14 @@
       - When Suspect Users are supplied, collection is limited to those accounts
         (UAL UserIds, Graph UPN sign-ins, directory audit initiated-by, mailbox state).
         Use -TenantWide to hunt the whole tenant and only highlight the suspects.
+    Version 2.1.4:
+      - A GUI Connect followed by Run left Exchange "connected" but without cmdlets
+        in the worker (Search-UnifiedAuditLog / Get-Mailbox not recognized).
+        The engine now reloads EXO cmdlets, uses Connect-IPPSSession for UAL, and
+        falls back to Graph security/auditLog/queries when the cmdlet is still missing.
 #>
 
-$script:ScriptVersion = '2.1.3'
+$script:ScriptVersion = '2.1.4'
 $script:Inv = [Globalization.CultureInfo]::InvariantCulture
 $script:UiSync = $null
 $script:LogFile = $null
@@ -57,7 +62,10 @@ $script:Findings = New-Object System.Collections.Generic.List[object]
 $script:OutputPath = $null
 $script:RawPath = $null
 $script:OpenedExo = $false
+$script:OpenedIpp = $false
 $script:OpenedGraph = $false
+$script:UalSource = $null
+$script:UalGraphFailed = $false
 $script:SuspectUserSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 $script:SuspectIpSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 $script:Activity = $null
@@ -154,6 +162,24 @@ function Get-M365PsForensicsPrerequisite {
     }
 }
 
+function Test-CommandAvailable {
+    param([string]$Name)
+    return [bool](Get-Command -Name $Name -ErrorAction SilentlyContinue)
+}
+
+function Get-ExoCmdletStatus {
+    [pscustomobject]@{
+        GetMailbox             = (Test-CommandAvailable 'Get-Mailbox')
+        GetExoMailbox          = (Test-CommandAvailable 'Get-EXOMailbox')
+        SearchUnifiedAuditLog  = (Test-CommandAvailable 'Search-UnifiedAuditLog')
+        GetInboxRule           = (Test-CommandAvailable 'Get-InboxRule')
+        GetMailboxPermission   = (Test-CommandAvailable 'Get-MailboxPermission')
+        GetExoMailboxPermission = (Test-CommandAvailable 'Get-EXOMailboxPermission')
+        GetAdminAuditLogConfig = (Test-CommandAvailable 'Get-AdminAuditLogConfig')
+        ConnectIPPSSession     = (Test-CommandAvailable 'Connect-IPPSSession')
+    }
+}
+
 function Get-M365PsForensicsConnectionState {
     $exo = $null
     try {
@@ -169,14 +195,110 @@ function Get-M365PsForensicsConnectionState {
             $graph = Get-MgContext -ErrorAction SilentlyContinue
         }
     } catch { $graph = $null }
+    $cmd = Get-ExoCmdletStatus
     [pscustomobject]@{
-        ExchangeConnected = [bool]$exo
-        ExchangeUser      = if ($exo) { [string](Get-FirstValue $exo @('UserPrincipalName', 'UserName')) } else { '' }
-        GraphConnected    = [bool]$graph
-        GraphUser         = if ($graph) { [string]$graph.Account } else { '' }
-        TenantId          = if ($graph) { [string]$graph.TenantId } elseif ($exo) { [string](Get-FirstValue $exo @('TenantID', 'TenantId')) } else { '' }
-        Connected         = [bool]$exo -or [bool]$graph
+        ExchangeConnected     = [bool]$exo
+        ExchangeUser          = if ($exo) { [string](Get-FirstValue $exo @('UserPrincipalName', 'UserName')) } else { '' }
+        ExchangeCmdletsLoaded = [bool]$cmd.GetMailbox
+        UnifiedAuditLogLoaded = [bool]$cmd.SearchUnifiedAuditLog
+        GraphConnected        = [bool]$graph
+        GraphUser             = if ($graph) { [string]$graph.Account } else { '' }
+        TenantId              = if ($graph) { [string]$graph.TenantId } elseif ($exo) { [string](Get-FirstValue $exo @('TenantID', 'TenantId')) } else { '' }
+        Connected             = [bool]$exo -or [bool]$graph
+        UalSource             = $script:UalSource
     }
+}
+
+function Write-ExoCmdletStatus {
+    $s = Get-ExoCmdletStatus
+    Write-Log 'INFO' ("Exchange cmdlets in this runspace: Get-Mailbox={0}; Get-EXOMailbox={1}; Search-UnifiedAuditLog={2}; Get-InboxRule={3}" -f $s.GetMailbox, $s.GetExoMailbox, $s.SearchUnifiedAuditLog, $s.GetInboxRule)
+    return $s
+}
+
+function Import-ExoDynamicModules {
+    $n = 0
+    foreach ($m in @(Get-Module | Where-Object { $_.Name -like 'tmpEXO*' -or $_.Name -like 'tmp_*' })) {
+        try {
+            Import-Module -Name $m.Name -Global -ErrorAction SilentlyContinue | Out-Null
+            $n++
+        } catch { }
+    }
+    if ($n -gt 0) { Write-Log 'INFO' ("Re-imported {0} Exchange dynamic cmdlet module(s) into this runspace." -f $n) }
+}
+
+function Get-GraphAuditRecordTypeName {
+    param([string]$UalRecordType)
+    if (-not $UalRecordType) { return $null }
+    $map = @{
+        'ExchangeAdmin'                       = 'exchangeAdmin'
+        'SecurityComplianceCenterEOPCmdlet'   = 'securityComplianceCenterEopCmdlet'
+        'AzureActiveDirectory'                = 'azureActiveDirectory'
+        'AzureActiveDirectoryStsLogon'        = 'azureActiveDirectoryStsLogon'
+        'ExchangeItem'                        = 'exchangeItem'
+        'ExchangeItemAggregated'              = 'exchangeItemAggregated'
+        'ExchangeItemGroup'                   = 'exchangeItemGroup'
+        'SharePointFileOperation'             = 'sharePointFileOperation'
+        'SharePointSharingOperation'          = 'sharePointSharingOperation'
+        'SharePoint'                          = 'sharePoint'
+        'MicrosoftTeams'                      = 'microsoftTeams'
+        'MicrosoftFlow'                       = 'microsoftFlow'
+        'Discovery'                           = 'discovery'
+    }
+    if ($map.ContainsKey($UalRecordType)) { return $map[$UalRecordType] }
+    if ($UalRecordType.Length -lt 2) { return $UalRecordType.ToLowerInvariant() }
+    return ($UalRecordType.Substring(0, 1).ToLowerInvariant() + $UalRecordType.Substring(1))
+}
+
+function ConvertTo-UalShapedRecord {
+    param($GraphRecord)
+    if ($null -eq $GraphRecord) { return $null }
+    $data = $null
+    if ($GraphRecord.PSObject.Properties['auditData']) { $data = $GraphRecord.auditData }
+    $json = ''
+    if ($null -eq $data) { $json = '{}' }
+    elseif ($data -is [string]) { $json = [string]$data }
+    else {
+        try { $json = $data | ConvertTo-Json -Depth 10 -Compress } catch { $json = '{}' }
+    }
+    try {
+        $obj = $json | ConvertFrom-Json
+        $changed = $false
+        if (-not $obj.CreationTime -and $GraphRecord.createdDateTime) {
+            $obj | Add-Member -NotePropertyName CreationTime -NotePropertyValue ([string]$GraphRecord.createdDateTime) -Force
+            $changed = $true
+        }
+        if (-not $obj.UserId -and $GraphRecord.userPrincipalName) {
+            $obj | Add-Member -NotePropertyName UserId -NotePropertyValue ([string]$GraphRecord.userPrincipalName) -Force
+            $changed = $true
+        }
+        if (-not $obj.Operation -and $GraphRecord.operation) {
+            $obj | Add-Member -NotePropertyName Operation -NotePropertyValue ([string]$GraphRecord.operation) -Force
+            $changed = $true
+        }
+        if (-not $obj.ObjectId -and $GraphRecord.objectId) {
+            $obj | Add-Member -NotePropertyName ObjectId -NotePropertyValue ([string]$GraphRecord.objectId) -Force
+            $changed = $true
+        }
+        if ($changed) { $json = $obj | ConvertTo-Json -Depth 10 -Compress }
+    } catch { }
+    [pscustomobject]@{
+        Identity   = [string]$GraphRecord.id
+        RecordType = [string]$GraphRecord.auditLogRecordType
+        Operations = [string]$GraphRecord.operation
+        UserIds    = [string]$GraphRecord.userPrincipalName
+        AuditData  = $json
+    }
+}
+
+function Test-GraphScope {
+    param([string]$Scope)
+    $ctx = $null
+    try { $ctx = Get-MgContext -ErrorAction SilentlyContinue } catch { return $false }
+    if (-not $ctx) { return $false }
+    foreach ($s in @($ctx.Scopes)) {
+        if ([string]$s -eq $Scope) { return $true }
+    }
+    return $false
 }
 
 function Reset-InvestigationActivity {
@@ -992,6 +1114,18 @@ function Get-UalRecords {
     $scopeNote = ''
     if ($UserIds.Count -gt 0) { $scopeNote = (' · {0} user(s)' -f $UserIds.Count) }
     elseif ($ObjectIds.Count -gt 0) { $scopeNote = (' · targeting {0} object(s)' -f $ObjectIds.Count) }
+    if (-not (Test-CommandAvailable 'Search-UnifiedAuditLog')) {
+        if ($script:UalGraphFailed) {
+            throw 'Unified Audit Log is not available: Search-UnifiedAuditLog is not loaded and the Graph audit query already failed.'
+        }
+        try {
+            return Get-GraphUalRecords -From $From -To $To -RecordType $RecordType -Operations $Operations -UserIds $UserIds -ObjectIds $ObjectIds -Depth $Depth
+        }
+        catch {
+            $script:UalGraphFailed = $true
+            throw
+        }
+    }
     while ($true) {
         Test-InvestigationCancel
         $sessionId = [guid]::NewGuid().ToString()
@@ -1143,7 +1277,7 @@ function Invoke-ExchangeStateCollection {
             Test-InvestigationCancel
             Set-InvestigationActivity -Step ("Suspect mailbox $mbx") -WaitingOn "Get-Mailbox $mbx"
             try {
-                $m = Get-Mailbox -Identity $mbx -ErrorAction Stop
+                $m = Invoke-ExoMailboxGet -Identity $mbx
                 if (-not $m.AuditEnabled) {
                     Add-Finding 'Medium' 'Audit Configuration' ("Mailbox auditing disabled: " + $m.PrimarySmtpAddress) ("WhenChanged=" + $m.WhenChanged) 'Access to this mailbox is not audited.' $m.WhenChanged $src
                 }
@@ -1295,7 +1429,11 @@ function Invoke-ExchangeStateCollection {
         if ($n -gt $cap) { Write-Log 'WARN' "Mailbox inspection capped at $cap mailboxes (-MaxMailboxesToInspect)."; break }
         Set-InvestigationActivity -Step ("Mailbox $n/$([math]::Min($targets.Count, $cap)): $mbx") -WaitingOn "Get-MailboxPermission / Get-InboxRule $mbx"
         try {
-            foreach ($p in @(Get-MailboxPermission -Identity $mbx -ErrorAction Stop | Where-Object { -not $_.IsInherited -and -not $_.Deny -and "$($_.User)" -notmatch 'NT AUTHORITY\\SELF|^S-1-5-' })) {
+            $perm = @()
+            if (Test-CommandAvailable 'Get-MailboxPermission') { $perm = @(Get-MailboxPermission -Identity $mbx -ErrorAction Stop) }
+            elseif (Test-CommandAvailable 'Get-EXOMailboxPermission') { $perm = @(Get-EXOMailboxPermission -Identity $mbx -ErrorAction Stop) }
+            else { throw 'Get-MailboxPermission is not available in this runspace.' }
+            foreach ($p in ($perm | Where-Object { -not $_.IsInherited -and -not $_.Deny -and "$($_.User)" -notmatch 'NT AUTHORITY\\SELF|^S-1-5-' })) {
                 Add-Finding 'High' 'Mailbox Permission' ("{0}  <-  {1}" -f $mbx, $p.User) ("AccessRights=" + ($p.AccessRights -join ',')) 'The delegate can open and read this entire mailbox.' $null $src
             }
         }
@@ -1332,6 +1470,170 @@ function Invoke-ExchangeStateCollection {
     Add-Coverage -Source 'Exchange current-state sweep' -Status 'OK' -Records $script:Findings.Count -Notes ("Mailboxes inspected: " + [math]::Min($targets.Count, $cap))
 }
 
+function Connect-M365PsForensicsCompliance {
+    param([string]$UserPrincipalName)
+    $cmd = Get-Command Connect-IPPSSession -ErrorAction SilentlyContinue
+    if (-not $cmd) {
+        Write-Log 'WARN' 'Connect-IPPSSession is not available. Update ExchangeOnlineManagement: Install-Module ExchangeOnlineManagement -Scope CurrentUser -Force'
+        return $false
+    }
+    try {
+        $p = @{ ErrorAction = 'Stop' }
+        if ($UserPrincipalName) { $p['UserPrincipalName'] = $UserPrincipalName }
+        elseif ($script:Config.AdminUPN) { $p['UserPrincipalName'] = $script:Config.AdminUPN }
+        if ($cmd.Parameters.ContainsKey('DisableWAM')) { $p['DisableWAM'] = $true }
+        if ($cmd.Parameters.ContainsKey('ShowBanner')) { $p['ShowBanner'] = $false }
+        Write-Log 'INFO' 'Connecting to Security & Compliance PowerShell for Search-UnifiedAuditLog. Complete the Microsoft sign-in if prompted (check the taskbar).'
+        Set-InvestigationActivity -Phase 'Exchange Online' -Step 'Purview / SCC sign-in' -WaitingOn 'Connect-IPPSSession — complete the Microsoft sign-in window if it appears'
+        Connect-IPPSSession @p
+        $script:OpenedIpp = $true
+        Import-ExoDynamicModules
+        if (Test-CommandAvailable 'Search-UnifiedAuditLog') {
+            Write-Log 'OK' 'Search-UnifiedAuditLog is available via Security & Compliance.'
+            return $true
+        }
+        Write-Log 'WARN' 'Connect-IPPSSession finished but Search-UnifiedAuditLog is still not loaded in this runspace.'
+        return $false
+    }
+    catch {
+        Write-Log 'WARN' ("Connect-IPPSSession failed: {0}" -f $_.Exception.Message)
+        return $false
+    }
+}
+
+function Ensure-M365PsForensicsExchange {
+    param([string]$UserPrincipalName)
+    if (-not (Test-RequiredModule -Name 'ExchangeOnlineManagement' -MinVersion '3.0.0')) {
+        return [pscustomobject]@{ Connected = $false; Error = 'ExchangeOnlineManagement module unavailable' }
+    }
+    $conn = Get-M365PsForensicsConnectionState
+    $status = Get-ExoCmdletStatus
+    $upn = $UserPrincipalName
+    if (-not $upn) { $upn = $conn.ExchangeUser }
+    if (-not $upn) { $upn = $script:Config.AdminUPN }
+
+    if ($conn.ExchangeConnected -and $status.GetMailbox -and $status.SearchUnifiedAuditLog) {
+        Write-Log 'OK' ("Reusing Exchange Online session as {0} (cmdlets loaded)." -f $(if ($conn.ExchangeUser) { $conn.ExchangeUser } else { 'connected' }))
+        $script:UalSource = 'EXO'
+        [void](Write-ExoCmdletStatus)
+        return $conn
+    }
+
+    if ($conn.ExchangeConnected -and -not $status.GetMailbox) {
+        Write-Log 'WARN' ("Exchange reports connected as {0}, but Get-Mailbox / Search-UnifiedAuditLog are not loaded in this runspace. That happens when Connect Exchange and Run use separate worker pipelines. Reloading cmdlets (usually no extra sign-in)." -f $(if ($conn.ExchangeUser) { $conn.ExchangeUser } else { 'connected' }))
+        Import-ExoDynamicModules
+        $status = Get-ExoCmdletStatus
+    }
+
+    if (-not $conn.ExchangeConnected -or -not $status.GetMailbox) {
+        $conn = Connect-M365PsForensicsExchange -UserPrincipalName $upn
+        Import-ExoDynamicModules
+        $status = Write-ExoCmdletStatus
+        if (-not $conn.ExchangeConnected -and -not $conn.Connected) { return $conn }
+    }
+    else {
+        Write-Log 'OK' ("Reusing Exchange Online session as {0}" -f $(if ($conn.ExchangeUser) { $conn.ExchangeUser } else { 'connected' }))
+        [void](Write-ExoCmdletStatus)
+    }
+
+    $status = Get-ExoCmdletStatus
+    if ($status.SearchUnifiedAuditLog) {
+        $script:UalSource = 'EXO'
+        return Get-M365PsForensicsConnectionState
+    }
+
+    Write-Log 'WARN' 'Search-UnifiedAuditLog is not exported by this Exchange REST session. Connecting to Security & Compliance (Connect-IPPSSession) for Unified Audit Log.'
+    if (Connect-M365PsForensicsCompliance -UserPrincipalName $upn) {
+        $script:UalSource = 'IPPS'
+        return Get-M365PsForensicsConnectionState
+    }
+
+    Write-Log 'WARN' 'Search-UnifiedAuditLog is still unavailable. Unified Audit Log collection will use Microsoft Graph security/auditLog/queries.'
+    $script:UalSource = 'Graph'
+    return Get-M365PsForensicsConnectionState
+}
+
+function Ensure-GraphAuditQueryScope {
+    if (Test-GraphScope 'AuditLogsQuery.Read.All') { return $true }
+    Write-Log 'INFO' 'Requesting Graph permission AuditLogsQuery.Read.All so Unified Audit Log can be queried without Search-UnifiedAuditLog. Complete the consent prompt if it appears.'
+    $conn = Connect-M365PsForensicsGraph -TenantId $script:Config.TenantId
+    if (-not $conn.GraphConnected) { return $false }
+    if (Test-GraphScope 'AuditLogsQuery.Read.All') { return $true }
+    Write-Log 'WARN' 'Graph is connected but AuditLogsQuery.Read.All was not granted. Admin consent may be required for audit log queries.'
+    return $false
+}
+
+function Get-GraphUalRecords {
+    param([datetime]$From, [datetime]$To, [string]$RecordType = '', [string[]]$Operations = @(), [string[]]$UserIds = @(), [string[]]$ObjectIds = @(), [int]$Depth = 0)
+    $results = New-Object System.Collections.Generic.List[object]
+    $label = $RecordType
+    if (-not $label -and $Operations.Count) { $label = ($Operations | Select-Object -First 3) -join ',' }
+    if (-not $label) { $label = 'UAL' }
+    if (-not (Ensure-GraphAuditQueryScope)) {
+        throw 'Search-UnifiedAuditLog is not loaded and Graph AuditLogsQuery.Read.All was not granted. Reconnect Graph and consent, or run Connect-IPPSSession in this window.'
+    }
+    $body = [ordered]@{
+        displayName           = ('M365-PS-Forensics {0} {1}' -f $label, (Get-Date -Format 'HHmmss'))
+        filterStartDateTime   = (ConvertTo-UtcIso $From)
+        filterEndDateTime     = (ConvertTo-UtcIso $To)
+    }
+    $rtName = Get-GraphAuditRecordTypeName $RecordType
+    if ($rtName) { $body['recordTypeFilters'] = @($rtName) }
+    if ($Operations.Count -gt 0) { $body['operationFilters'] = @($Operations) }
+    if ($UserIds.Count -gt 0) { $body['userPrincipalNameFilters'] = @($UserIds) }
+    if ($ObjectIds.Count -gt 0) { $body['objectIdFilters'] = @($ObjectIds) }
+    $payload = $body | ConvertTo-Json -Depth 6
+    $job = $null
+    $base = 'https://graph.microsoft.com/v1.0/security/auditLog/queries'
+    Set-InvestigationActivity -WaitingOn ("Graph auditLog/queries $label") -Detail ("{0:yyyy-MM-dd HH:mm} -> {1:yyyy-MM-dd HH:mm} UTC" -f $From, $To)
+    Write-Log 'INFO' ("Graph UAL {0}: creating audit log query {1:yyyy-MM-dd HH:mm} -> {2:yyyy-MM-dd HH:mm} UTC." -f $label, $From, $To)
+    try {
+        $job = Invoke-WithRetry -Activity ("Graph UAL create $label") -Script {
+            Invoke-MgGraphRequest -Method POST -Uri $base -Body $payload -ContentType 'application/json' -OutputType PSObject -ErrorAction Stop
+        }
+    }
+    catch {
+        if (Test-IsCancelError $_) { throw }
+        Write-Log 'WARN' ("Graph v1.0 audit query create failed ({0}); trying beta." -f (Limit-Text $_.Exception.Message 200))
+        $base = 'https://graph.microsoft.com/beta/security/auditLog/queries'
+        $job = Invoke-WithRetry -Activity ("Graph UAL create $label beta") -Script {
+            Invoke-MgGraphRequest -Method POST -Uri $base -Body $payload -ContentType 'application/json' -OutputType PSObject -ErrorAction Stop
+        }
+    }
+    $id = [string]$job.id
+    if (-not $id) { throw 'Graph audit log query did not return an id.' }
+    $deadline = (Get-Date).AddMinutes(15)
+    $status = [string]$job.status
+    while ((Get-Date) -lt $deadline) {
+        Test-InvestigationCancel
+        if ($status -match 'succeed') { break }
+        if ($status -match 'fail|cancel') { throw ("Graph audit query {0} ended with status {1}" -f $label, $status) }
+        Set-InvestigationActivity -WaitingOn ("Graph audit query $label ($status)")
+        Start-SleepInterruptible -Seconds 6
+        $st = Invoke-WithRetry -Activity ("Graph UAL poll $label") -Script {
+            Invoke-MgGraphRequest -Method GET -Uri ($base + '/' + $id) -OutputType PSObject -ErrorAction Stop
+        }
+        $status = [string]$st.status
+    }
+    if ($status -notmatch 'succeed') { throw ("Graph audit query {0} did not finish (status {1})" -f $label, $status) }
+    $items = Get-GraphAll -Uri ($base + '/' + $id + '/records?$top=999') -Label ("audit records $label")
+    foreach ($r in $items) {
+        $shaped = ConvertTo-UalShapedRecord $r
+        if ($shaped) { $results.Add($shaped) }
+    }
+    Write-Log 'INFO' ("Graph UAL {0}: {1:N0} records" -f $label, $results.Count)
+    return , $results.ToArray()
+}
+
+function Invoke-ExoMailboxGet {
+    param([string]$Identity)
+    if (Test-CommandAvailable 'Get-Mailbox') { return Get-Mailbox -Identity $Identity -ErrorAction Stop }
+    if (Test-CommandAvailable 'Get-EXOMailbox') {
+        return Get-EXOMailbox -Identity $Identity -Properties AuditEnabled, ForwardingSmtpAddress, ForwardingAddress, DeliverToMailboxAndForward, PrimarySmtpAddress, WhenChanged -ErrorAction Stop
+    }
+    throw 'Get-Mailbox is not available in this runspace.'
+}
+
 function Connect-M365PsForensicsExchange {
     param(
         [string]$UserPrincipalName,
@@ -1362,7 +1664,9 @@ function Connect-M365PsForensicsExchange {
         Set-InvestigationActivity -Phase 'Exchange Online' -Step 'Signing in' -WaitingOn 'Connect-ExchangeOnline — complete the Microsoft browser sign-in (check the taskbar if it is hidden)'
         Connect-ExchangeOnline @p
         $script:OpenedExo = $true
+        Import-ExoDynamicModules
         Write-Log 'OK' 'Connected to Exchange Online.'
+        [void](Write-ExoCmdletStatus)
         return Get-M365PsForensicsConnectionState
     }
     catch {
@@ -1374,16 +1678,15 @@ function Connect-M365PsForensicsExchange {
 function Invoke-ExchangePhase {
     Write-Log 'INFO' 'Exchange / Unified Audit Log phase starting...'
     Set-InvestigationActivity -Phase 'Exchange Online' -Step 'Checking existing session' -WaitingOn 'Get-ConnectionInformation' -Percent 5
-    $conn = Get-M365PsForensicsConnectionState
-    if (-not $conn.ExchangeConnected) {
-        $conn = Connect-M365PsForensicsExchange -UserPrincipalName $script:Config.AdminUPN
-        if (-not $conn.ExchangeConnected -and -not $conn.Connected) {
-            Add-Coverage -Source 'Exchange Online' -Status 'ERROR' -From $script:StartUtc -To $script:EndUtc -Notes ([string]$conn.Error)
-            return
-        }
+    $conn = Ensure-M365PsForensicsExchange -UserPrincipalName $script:Config.AdminUPN
+    if (-not $conn.ExchangeConnected -and -not $conn.Connected -and $script:UalSource -ne 'Graph') {
+        Add-Coverage -Source 'Exchange Online' -Status 'ERROR' -From $script:StartUtc -To $script:EndUtc -Notes ([string]$conn.Error)
+        return
     }
-    else {
-        Write-Log 'OK' ("Reusing Exchange Online session as {0}" -f $(if ($conn.ExchangeUser) { $conn.ExchangeUser } else { 'connected' }))
+    if (-not (Test-CommandAvailable 'Search-UnifiedAuditLog') -and $script:UalSource -ne 'Graph') {
+        Write-Log 'ERROR' 'Search-UnifiedAuditLog is not available in this runspace. Click Connect Exchange, then Run again so cmdlets load here; or consent Graph to AuditLogsQuery.Read.All. Graph sign-ins will still be collected.'
+        Add-Coverage -Source 'Unified Audit Log' -Status 'ERROR' -From $script:StartUtc -To $script:EndUtc -Notes 'Search-UnifiedAuditLog not loaded in the worker runspace'
+        $script:UalSource = 'Graph'
     }
     if ($script:StartUtc -lt $script:NowUtc.AddDays(-180)) {
         Write-Log 'WARN' 'Start date is older than 180 days: data beyond your audit retention (180 days Standard / 1 year+ Premium) will not exist.'
@@ -1771,7 +2074,7 @@ function Connect-M365PsForensicsGraph {
         return [pscustomobject]@{ Connected = $false; Error = 'Microsoft.Graph.Authentication module unavailable' }
     }
     try {
-        $scopes = @('AuditLog.Read.All', 'Directory.Read.All', 'RoleManagement.Read.Directory', 'Application.Read.All', 'Policy.Read.All', 'Domain.Read.All')
+        $scopes = @('AuditLog.Read.All', 'AuditLogsQuery.Read.All', 'Directory.Read.All', 'RoleManagement.Read.Directory', 'Application.Read.All', 'Policy.Read.All', 'Domain.Read.All')
         $p = @{ Scopes = $scopes; ErrorAction = 'Stop' }
         if ($TenantId) { $p['TenantId'] = $TenantId }
         elseif ($script:Config.TenantId) { $p['TenantId'] = $script:Config.TenantId }
@@ -1794,9 +2097,10 @@ function Connect-M365PsForensicsGraph {
 
 function Disconnect-M365PsForensicsSessions {
     param([switch]$Force)
-    if ($Force -or $script:OpenedExo) {
+    if ($Force -or $script:OpenedExo -or $script:OpenedIpp) {
         try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch { }
         $script:OpenedExo = $false
+        $script:OpenedIpp = $false
     }
     if ($Force -or $script:OpenedGraph) {
         try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { }
@@ -2612,6 +2916,8 @@ function Invoke-M365PowerShellForensics {
 
     try {
         Reset-InvestigationActivity
+        $script:UalSource = $null
+        $script:UalGraphFailed = $false
         Set-InvestigationActivity -Phase 'Starting' -Step 'Preparing evidence folder' -WaitingOn 'Creating output folder' -Percent 1
         Write-Log 'INFO' 'Investigation run started. Live status will update before each Microsoft 365 call.'
         Test-InvestigationCancel
