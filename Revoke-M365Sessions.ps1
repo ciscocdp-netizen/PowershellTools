@@ -12,6 +12,9 @@
     - Offers a DRY RUN (no changes) or a LIVE run, with confirmation.
     - Connects to Microsoft Graph and calls POST /users/{id}/revokeSignInSessions
       for each user, with retry/back-off on throttling.
+    - On a live run, verifies each revoke by re-reading
+      signInSessionsValidFromDateTime (and refreshTokensValidFromDateTime) until
+      the timestamp advances, then records Verified / NotVerified in the report.
     - Shows a progress bar and writes a results CSV (chosen via a Save dialog).
 
     Fixes versus the original script:
@@ -50,6 +53,10 @@
 
     Guest / B2B users (#EXT#) sign in through their home tenant. Microsoft Graph
     does not revoke those sessions from the resource tenant.
+
+    Verification proves Graph reset the session-validity timestamp. It cannot
+    prove that a given access token is already dead: access tokens can remain
+    valid until they expire (typically up to 1 hour) unless the app uses CAE.
 
 .PARAMETER SelfTest
     Run built-in regression tests for helpers (CSV, UPN, retry math, Graph URI,
@@ -223,6 +230,134 @@ function Get-GraphBooleanValue {
         }
     } catch { }
     return $null
+}
+
+function Get-GraphObjectProperty {
+    param(
+        $Object,
+        [string]$Name
+    )
+    if ($null -eq $Object -or [string]::IsNullOrWhiteSpace($Name)) { return $null }
+    try {
+        if ($Object -is [System.Collections.IDictionary] -and $Object.Contains($Name)) {
+            return $Object[$Name]
+        }
+    } catch { }
+    try {
+        if ($null -ne $Object.PSObject.Properties[$Name]) {
+            return $Object.$Name
+        }
+    } catch { }
+    return $null
+}
+
+function ConvertTo-UtcDateTime {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [datetime]) { return ([datetime]$Value).ToUniversalTime() }
+    $s = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($s)) { return $null }
+    $parsed = [datetime]::MinValue
+    $styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
+    if ([datetime]::TryParse($s, [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) {
+        return $parsed.ToUniversalTime()
+    }
+    return $null
+}
+
+function Format-UtcStamp {
+    param($Value)
+    $dt = ConvertTo-UtcDateTime $Value
+    if ($null -eq $dt) { return '' }
+    return $dt.ToString('yyyy-MM-dd HH:mm:ss UTC')
+}
+
+function New-SessionStampSet {
+    param(
+        $SessionsValidFrom = $null,
+        $RefreshTokensValidFrom = $null
+    )
+    return [pscustomobject]@{
+        SessionsValidFrom      = $SessionsValidFrom
+        RefreshTokensValidFrom = $RefreshTokensValidFrom
+    }
+}
+
+function Get-UserSessionStamps {
+    param($UserObject)
+    return New-SessionStampSet `
+        -SessionsValidFrom (ConvertTo-UtcDateTime (Get-GraphObjectProperty -Object $UserObject -Name 'signInSessionsValidFromDateTime')) `
+        -RefreshTokensValidFrom (ConvertTo-UtcDateTime (Get-GraphObjectProperty -Object $UserObject -Name 'refreshTokensValidFromDateTime'))
+}
+
+function Test-RevokeTimestampMoved {
+    param(
+        $BeforeUtc,
+        $AfterUtc,
+        $NowUtc,
+        [int]$RecentMinutes = 15
+    )
+    if ($null -eq $AfterUtc) {
+        return [pscustomobject]@{
+            Verified = $false
+            Reason   = 'timestamp was missing after revoke'
+        }
+    }
+    if ($null -ne $BeforeUtc) {
+        if ($AfterUtc -gt $BeforeUtc) {
+            return [pscustomobject]@{
+                Verified = $true
+                Reason   = 'timestamp advanced'
+            }
+        }
+        return [pscustomobject]@{
+            Verified = $false
+            Reason   = 'timestamp did not change'
+        }
+    }
+    if ($null -eq $NowUtc) { $NowUtc = [datetime]::UtcNow }
+    $age = $NowUtc - $AfterUtc
+    if ($age.TotalMinutes -ge -1 -and $age.TotalMinutes -le $RecentMinutes) {
+        return [pscustomobject]@{
+            Verified = $true
+            Reason   = 'timestamp is recent (no prior baseline)'
+        }
+    }
+    return [pscustomobject]@{
+        Verified = $false
+        Reason   = 'timestamp is not recent and had no prior baseline'
+    }
+}
+
+function Test-SessionRevokeEvidence {
+    param(
+        $Before,
+        $After,
+        $NowUtc
+    )
+    if ($null -eq $Before) { $Before = New-SessionStampSet }
+    if ($null -eq $After) { $After = New-SessionStampSet }
+
+    $sessionCheck = Test-RevokeTimestampMoved -BeforeUtc $Before.SessionsValidFrom -AfterUtc $After.SessionsValidFrom -NowUtc $NowUtc
+    if ($sessionCheck.Verified) {
+        return [pscustomobject]@{
+            Verified = $true
+            Reason   = ('signInSessionsValidFromDateTime {0}' -f $sessionCheck.Reason)
+        }
+    }
+
+    $refreshCheck = Test-RevokeTimestampMoved -BeforeUtc $Before.RefreshTokensValidFrom -AfterUtc $After.RefreshTokensValidFrom -NowUtc $NowUtc
+    if ($refreshCheck.Verified) {
+        return [pscustomobject]@{
+            Verified = $true
+            Reason   = ('refreshTokensValidFromDateTime {0}' -f $refreshCheck.Reason)
+        }
+    }
+
+    return [pscustomobject]@{
+        Verified = $false
+        Reason   = ('signInSessionsValidFromDateTime {0}' -f $sessionCheck.Reason)
+    }
 }
 
 function Get-TextFileEncodingName {
@@ -628,29 +763,22 @@ function Invoke-GraphApi {
 function Resolve-GraphUser {
     param([string]$Upn)
 
-    $select = '$select=id,displayName,userPrincipalName,accountEnabled,userType'
+    $select = '$select=id,displayName,userPrincipalName,accountEnabled,userType,signInSessionsValidFromDateTime,refreshTokensValidFromDateTime'
     $uri = '{0}?{1}' -f (Get-GraphUserPathUri -UserIdOrUpn $Upn), $select
     $response = Invoke-GraphApi -Method GET -Uri $uri
     if ($response.Ok) {
         $content = $response.Content
-        $id = $null
-        $display = $null
-        $userType = $null
-        try { $id = [string]$content.id } catch { }
-        try { $display = [string]$content.displayName } catch { }
-        try { $userType = [string]$content.userType } catch { }
-        if ([string]::IsNullOrWhiteSpace($id) -and ($content -is [System.Collections.IDictionary])) {
-            $id = [string]$content['id']
-            $display = [string]$content['displayName']
-            $userType = [string]$content['userType']
-        }
+        $id = [string](Get-GraphObjectProperty -Object $content -Name 'id')
+        $display = [string](Get-GraphObjectProperty -Object $content -Name 'displayName')
+        $userType = [string](Get-GraphObjectProperty -Object $content -Name 'userType')
         return [pscustomobject]@{
-            Status     = 'Found'
-            Id         = $id
+            Status      = 'Found'
+            Id          = $id
             DisplayName = $display
-            UserType   = $userType
-            Detail     = 'User found'
-            Attempts   = $response.Attempts
+            UserType    = $userType
+            Stamps      = (Get-UserSessionStamps -UserObject $content)
+            Detail      = 'User found'
+            Attempts    = $response.Attempts
         }
     }
 
@@ -665,6 +793,7 @@ function Resolve-GraphUser {
         Id          = $null
         DisplayName = $null
         UserType    = $null
+        Stamps      = (New-SessionStampSet)
         Detail      = $response.Error
         Attempts    = $response.Attempts
     }
@@ -711,6 +840,68 @@ function Invoke-RevokeSession {
         Status   = $status
         Detail   = $response.Error
         Attempts = $response.Attempts
+    }
+}
+
+function Confirm-RevokedSignInSession {
+    param(
+        [string]$Upn,
+        [string]$UserId,
+        $BeforeStamps,
+        [int]$MaxAttempts = 3,
+        [int]$DelaySeconds = 2
+    )
+
+    if ($null -eq $BeforeStamps) { $BeforeStamps = New-SessionStampSet }
+
+    $userUri = $null
+    if (-not [string]::IsNullOrWhiteSpace($UserId)) {
+        $userUri = "https://graph.microsoft.com/v1.0/users/$UserId"
+    } else {
+        $userUri = Get-GraphUserPathUri -UserIdOrUpn $Upn
+    }
+    $select = '$select=id,signInSessionsValidFromDateTime,refreshTokensValidFromDateTime'
+    $uri = '{0}?{1}' -f $userUri, $select
+
+    $lastDetail = 'Verification GET did not run'
+    $after = New-SessionStampSet
+    for ($i = 1; $i -le $MaxAttempts; $i++) {
+        if ($i -gt 1) { Start-Sleep -Seconds $DelaySeconds }
+        $response = Invoke-GraphApi -Method GET -Uri $uri
+        if (-not $response.Ok) {
+            $lastDetail = $response.Error
+            if ($i -ge $MaxAttempts) {
+                return [pscustomobject]@{
+                    Status              = 'CheckFailed'
+                    Detail              = "Could not re-read user after revoke: $lastDetail"
+                    SessionsValidFrom   = $null
+                    RefreshTokensValidFrom = $null
+                    Attempts            = $i
+                }
+            }
+            continue
+        }
+
+        $after = Get-UserSessionStamps -UserObject $response.Content
+        $check = Test-SessionRevokeEvidence -Before $BeforeStamps -After $after -NowUtc ([datetime]::UtcNow)
+        if ($check.Verified) {
+            return [pscustomobject]@{
+                Status                 = 'Verified'
+                Detail                 = $check.Reason
+                SessionsValidFrom      = $after.SessionsValidFrom
+                RefreshTokensValidFrom = $after.RefreshTokensValidFrom
+                Attempts               = $i
+            }
+        }
+        $lastDetail = $check.Reason
+    }
+
+    return [pscustomobject]@{
+        Status                 = 'NotVerified'
+        Detail                 = $lastDetail
+        SessionsValidFrom      = $after.SessionsValidFrom
+        RefreshTokensValidFrom = $after.RefreshTokensValidFrom
+        Attempts               = $MaxAttempts
     }
 }
 
@@ -861,6 +1052,39 @@ function Invoke-SelfTest {
 
     Assert-True 'Graph boolean true from hashtable' ($true -eq (Get-GraphBooleanValue @{ value = $true }))
     Assert-True 'Graph boolean false from hashtable' ($false -eq (Get-GraphBooleanValue @{ value = $false }))
+
+    $iso = ConvertTo-UtcDateTime '2026-11-17T12:00:00Z'
+    Assert-True 'ISO Z timestamp parses to UTC' ($null -ne $iso -and $iso.Hour -eq 12)
+    Assert-True 'Empty timestamp parses as null' ($null -eq (ConvertTo-UtcDateTime ''))
+    $fromDt = ConvertTo-UtcDateTime ([datetime]::SpecifyKind([datetime]'2026-11-17 12:00:00', 'Utc'))
+    Assert-True 'DateTime value converts to UTC' ($null -ne $fromDt -and $fromDt.Kind -eq [datetimeKind]::Utc)
+
+    $now = [datetime]::SpecifyKind([datetime]'2026-11-17 12:00:00', 'Utc')
+    $before = $now.AddMinutes(-30)
+    $after = $now
+    $moved = Test-RevokeTimestampMoved -BeforeUtc $before -AfterUtc $after -NowUtc $now
+    Assert-True 'Timestamp advanced is verified' ($moved.Verified -eq $true)
+    $unchanged = Test-RevokeTimestampMoved -BeforeUtc $before -AfterUtc $before -NowUtc $now
+    Assert-True 'Unchanged timestamp is not verified' ($unchanged.Verified -eq $false)
+    $missing = Test-RevokeTimestampMoved -BeforeUtc $before -AfterUtc $null -NowUtc $now
+    Assert-True 'Missing after timestamp is not verified' ($missing.Verified -eq $false)
+    $recent = Test-RevokeTimestampMoved -BeforeUtc $null -AfterUtc $now.AddMinutes(-2) -NowUtc $now
+    Assert-True 'Recent stamp without baseline is verified' ($recent.Verified -eq $true)
+    $stale = Test-RevokeTimestampMoved -BeforeUtc $null -AfterUtc $now.AddHours(-2) -NowUtc $now
+    Assert-True 'Stale stamp without baseline is not verified' ($stale.Verified -eq $false)
+
+    $evidence = Test-SessionRevokeEvidence `
+        -Before (New-SessionStampSet -SessionsValidFrom $before) `
+        -After (New-SessionStampSet -SessionsValidFrom $before -RefreshTokensValidFrom $after) `
+        -NowUtc $now
+    Assert-True 'Refresh-token stamp can satisfy verification' ($evidence.Verified -eq $true)
+
+    $propObj = [pscustomobject]@{ signInSessionsValidFromDateTime = '2026-11-17T12:00:00Z' }
+    $stamps = Get-UserSessionStamps -UserObject $propObj
+    Assert-True 'Session stamps read from PSCustomObject' ($null -ne $stamps.SessionsValidFrom)
+    $stampsHash = Get-UserSessionStamps -UserObject @{ signInSessionsValidFromDateTime = '2026-11-17T12:00:00Z' }
+    Assert-True 'Session stamps read from hashtable' ($null -ne $stampsHash.SessionsValidFrom)
+    Assert-True 'Format-UtcStamp renders UTC' ((Format-UtcStamp $now) -eq '2026-11-17 12:00:00 UTC')
 
     Assert-True 'User.ReadWrite.All is sufficient' (Test-GraphScopesSufficient -CurrentScopes @('User.ReadWrite.All'))
     Assert-True 'Revoke+Read is sufficient' (Test-GraphScopesSufficient -CurrentScopes @('User.RevokeSessions.All', 'User.Read.All'))
@@ -1043,6 +1267,7 @@ function Start-RevokeM365Sessions {
     if ($modeIndex -eq 2) { Write-Warn2 'Cancelled by user.'; return }
     $dryRun = ($modeIndex -eq 0)
 
+    $verifyRevoke = $false
     if (-not $dryRun) {
         Write-Host ''
         Write-Host "You are about to REVOKE sign-in sessions for $($valid.Count) user(s)." -ForegroundColor Red
@@ -1051,6 +1276,10 @@ function Start-RevokeM365Sessions {
         if ($confirm -cne 'REVOKE') {
             Write-Warn2 'Confirmation not received. Exiting without changes.'
             return
+        }
+        $verifyRevoke = Read-YesNo -Prompt 'Verify each revocation by re-reading signInSessionsValidFromDateTime from Graph?' -Default $true
+        if ($verifyRevoke) {
+            Write-Info 'After each revoke the script will re-read the user and confirm the session-validity timestamp moved forward.'
         }
     }
 
@@ -1088,6 +1317,14 @@ function Start-RevokeM365Sessions {
             $guestNote = 'Guest/B2B: Graph does not revoke home-tenant sessions from this tenant.'
         }
 
+        $verification = 'Skipped'
+        $verifyDetail = 'Verification not run'
+        $stampBefore = $null
+        $stampAfter = $null
+        if ($null -ne $lookup.Stamps) {
+            $stampBefore = $lookup.Stamps.SessionsValidFrom
+        }
+
         if ($dryRun) {
             if ($lookup.Status -eq 'Found') {
                 $detail = 'User found (dry run, no change made)'
@@ -1110,24 +1347,58 @@ function Start-RevokeM365Sessions {
                         Attempts = $outcome.Attempts
                     }
                 }
+                if ($verifyRevoke -and $outcome.Status -eq 'Revoked') {
+                    $check = Confirm-RevokedSignInSession -Upn $upn -UserId $userId -BeforeStamps $lookup.Stamps
+                    $verification = $check.Status
+                    $verifyDetail = $check.Detail
+                    $stampAfter = $check.SessionsValidFrom
+                    if ($verification -eq 'Verified') {
+                        $outcome = [pscustomobject]@{
+                            Status   = $outcome.Status
+                            Detail   = $outcome.Detail + " Verified: $verifyDetail."
+                            Attempts = $outcome.Attempts
+                        }
+                    } elseif ($verification -eq 'NotVerified') {
+                        $outcome = [pscustomobject]@{
+                            Status   = $outcome.Status
+                            Detail   = $outcome.Detail + " Not verified: $verifyDetail."
+                            Attempts = $outcome.Attempts
+                        }
+                    } else {
+                        $outcome = [pscustomobject]@{
+                            Status   = $outcome.Status
+                            Detail   = $outcome.Detail + " Verification check failed: $verifyDetail."
+                            Attempts = $outcome.Attempts
+                        }
+                    }
+                }
             }
         }
 
         switch ($outcome.Status) {
-            'Revoked'     { Write-Ok    "$upn" }
+            'Revoked' {
+                if ($verification -eq 'Verified') { Write-Ok "$upn (verified)" }
+                elseif ($verification -eq 'NotVerified') { Write-Warn2 "$upn - revoked, but session timestamp did not advance" }
+                elseif ($verification -eq 'CheckFailed') { Write-Warn2 "$upn - revoked, but verification GET failed" }
+                else { Write-Ok "$upn" }
+            }
             'WouldRevoke' { Write-Ok    "$upn (would revoke)" }
             'NotFound'    { Write-Warn2 "$upn - user not found" }
             default       { Write-Err2  "$upn - $($outcome.Status): $($outcome.Detail)" }
         }
 
         $results.Add([pscustomobject]@{
-            UserPrincipalName = $upn
-            DisplayName       = $displayName
-            Status            = $outcome.Status
-            Detail            = $outcome.Detail
-            Attempts          = $outcome.Attempts
-            Mode              = $(if ($dryRun) { 'DryRun' } else { 'Live' })
-            Timestamp         = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+            UserPrincipalName          = $upn
+            DisplayName                = $displayName
+            Status                     = $outcome.Status
+            Verification               = $verification
+            VerificationDetail         = $verifyDetail
+            SessionsValidFromBefore    = (Format-UtcStamp $stampBefore)
+            SessionsValidFromAfter     = (Format-UtcStamp $stampAfter)
+            Detail                     = $outcome.Detail
+            Attempts                   = $outcome.Attempts
+            Mode                       = $(if ($dryRun) { 'DryRun' } else { 'Live' })
+            Timestamp                  = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
         })
     }
 
@@ -1135,13 +1406,17 @@ function Start-RevokeM365Sessions {
 
     foreach ($bad in $invalid) {
         $results.Add([pscustomobject]@{
-            UserPrincipalName = $bad.Value
-            DisplayName       = $null
-            Status            = 'Skipped'
-            Detail            = "Invalid or blank UPN on CSV row $($bad.Row)"
-            Attempts          = 0
-            Mode              = $(if ($dryRun) { 'DryRun' } else { 'Live' })
-            Timestamp         = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+            UserPrincipalName          = $bad.Value
+            DisplayName                = $null
+            Status                     = 'Skipped'
+            Verification               = 'Skipped'
+            VerificationDetail         = 'Invalid or blank UPN'
+            SessionsValidFromBefore    = ''
+            SessionsValidFromAfter     = ''
+            Detail                     = "Invalid or blank UPN on CSV row $($bad.Row)"
+            Attempts                   = 0
+            Mode                       = $(if ($dryRun) { 'DryRun' } else { 'Live' })
+            Timestamp                  = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
         })
     }
 
@@ -1151,6 +1426,16 @@ function Start-RevokeM365Sessions {
     $results | Group-Object Status | Sort-Object Count -Descending |
         Select-Object @{ n = 'Status'; e = { $_.Name } }, Count |
         Format-Table -AutoSize | Out-Host
+    if ($verifyRevoke) {
+        Write-Host 'Verification (live revokes):' -ForegroundColor White
+        $results |
+            Where-Object { $_.Status -eq 'Revoked' } |
+            Group-Object Verification |
+            Sort-Object Count -Descending |
+            Select-Object @{ n = 'Verification'; e = { $_.Name } }, Count |
+            Format-Table -AutoSize | Out-Host
+        Write-Info 'Verified means Graph advanced signInSessionsValidFromDateTime (or refreshTokensValidFromDateTime). Access tokens may still work until they expire.'
+    }
     Write-Info ("Elapsed time: {0:hh\:mm\:ss}" -f $elapsed)
     if ($guestCount -gt 0) {
         Write-Warn2 'Guest/B2B (#EXT#) users were included. Graph does not revoke their home-tenant sessions.'
