@@ -34,9 +34,16 @@
     Version 2.1.1:
       - Live activity heartbeat: the GUI shows the current phase, Microsoft 365
         call, page/slice, and running totals while long UAL/Graph calls are in flight.
+    Version 2.1.2:
+      - GUI no longer reads the worker PowerShell streams while a run is in flight
+        (that deadlocked the form at "Elapsed 0s" / no heartbeat).
+      - Fast collection is the default: admin/PowerShell cmdlets first, 7-day UAL
+        slices, Discovery and mailbox/file dumps off, Graph PowerShell apps in one query.
+      - Exchange sign-in uses DisableWAM so the login window is not trapped in the
+        background runspace.
 #>
 
-$script:ScriptVersion = '2.1.1'
+$script:ScriptVersion = '2.1.2'
 $script:Inv = [Globalization.CultureInfo]::InvariantCulture
 $script:UiSync = $null
 $script:LogFile = $null
@@ -105,6 +112,8 @@ $script:Config = @{
     NoDisconnect = $false
     OpenReport = $false
     MaxReportEvents = 12000
+    Fast = $true
+    IncludeDiscovery = $false
 }
 
 #region Config / UI bridge
@@ -313,6 +322,10 @@ function Set-InvestigationActivity {
     $a.LastUpdateUtc = $now
     $snap = Get-InvestigationActivitySnapshot
     $line = Get-ActivityStatusLine
+    if ($script:UiSync) {
+        try { $script:UiSync['Activity'] = $snap } catch { }
+        try { if ($script:OutputPath) { $script:UiSync['OutputPath'] = $script:OutputPath } } catch { }
+    }
     if ($Log) {
         $msg = @($snap.Phase, $snap.Step, $snap.Detail, $(if ($snap.WaitingOn) { 'waiting on ' + $snap.WaitingOn } else { '' })) |
             Where-Object { $_ }
@@ -954,8 +967,26 @@ function Get-UalRecords {
     return , $results.ToArray()
 }
 
+function Get-UalAdminRecordTypes {
+    $types = New-Object System.Collections.Generic.List[string]
+    [void]$types.Add('ExchangeAdmin')
+    [void]$types.Add('SecurityComplianceCenterEOPCmdlet')
+    if ($script:Config.IncludeDiscovery) { [void]$types.Add('Discovery') }
+    foreach ($extra in @($script:Config.AdditionalRecordTypes)) {
+        if ($extra) { [void]$types.Add($extra) }
+    }
+    return @($types | Select-Object -Unique)
+}
+
+function Get-AdminUalChunkHours {
+    $configured = [int]$script:Config.ChunkHours
+    if ($configured -lt 1) { $configured = 24 }
+    if ($script:Config.Fast) { return [Math]::Max($configured, 168) }
+    return [Math]::Max($configured, 72)
+}
+
 function Invoke-UalCollection {
-    param([string]$Name, [datetime]$From, [datetime]$To, [string]$RecordType = '', [string[]]$Operations = @(), [string[]]$UserIds = @(), [string]$Label = 'Admin', [string]$Kind = 'Event')
+    param([string]$Name, [datetime]$From, [datetime]$To, [string]$RecordType = '', [string[]]$Operations = @(), [string[]]$UserIds = @(), [string]$Label = 'Admin', [string]$Kind = 'Event', [int]$ChunkHours = 0)
     $rows = New-Object System.Collections.Generic.List[object]
     if ($From -ge $To) { return , $rows.ToArray() }
     $rawFile = Join-Path $script:RawPath ('UAL-{0}-{1}.jsonl' -f $Label, $Name)
@@ -965,7 +996,8 @@ function Invoke-UalCollection {
     try {
         $writer = New-Object System.IO.StreamWriter($rawFile, $false, (New-Object System.Text.UTF8Encoding($false)))
         $cursor = $From
-        $chunkHours = [int]$script:Config.ChunkHours
+        $chunkHours = $ChunkHours
+        if ($chunkHours -lt 1) { $chunkHours = [int]$script:Config.ChunkHours }
         if ($chunkHours -lt 1) { $chunkHours = 24 }
         while ($cursor -lt $To) {
             Test-InvestigationCancel
@@ -1031,25 +1063,30 @@ function Invoke-ExchangeStateCollection {
     }
     catch { Write-Log 'WARN' "Get-MailboxAuditBypassAssociation: $($_.Exception.Message)" }
 
-    Set-InvestigationActivity -Step 'Mailboxes with auditing disabled' -WaitingOn 'Get-Mailbox (AuditEnabled)'
-    try {
-        $noAudit = @(Get-Mailbox -ResultSize Unlimited -Filter 'AuditEnabled -eq $false' -ErrorAction Stop)
-        foreach ($m in ($noAudit | Select-Object -First 500)) {
-            Add-Finding 'Medium' 'Audit Configuration' ("Mailbox auditing disabled: " + $m.PrimarySmtpAddress) ("WhenChanged=" + $m.WhenChanged) 'Access to this mailbox is not audited.' $m.WhenChanged $src
-        }
+    if ($script:Config.Fast) {
+        Write-Log 'INFO' 'Fast collection: skipping tenant-wide Get-Mailbox walks (audit-disabled and forwarding). Uncheck Fast collection to include them.'
     }
-    catch { Write-Log 'WARN' "Mailbox audit status: $($_.Exception.Message)" }
+    else {
+        Set-InvestigationActivity -Step 'Mailboxes with auditing disabled' -WaitingOn 'Get-Mailbox (AuditEnabled)'
+        try {
+            $noAudit = @(Get-Mailbox -ResultSize Unlimited -Filter 'AuditEnabled -eq $false' -ErrorAction Stop)
+            foreach ($m in ($noAudit | Select-Object -First 500)) {
+                Add-Finding 'Medium' 'Audit Configuration' ("Mailbox auditing disabled: " + $m.PrimarySmtpAddress) ("WhenChanged=" + $m.WhenChanged) 'Access to this mailbox is not audited.' $m.WhenChanged $src
+            }
+        }
+        catch { Write-Log 'WARN' "Mailbox audit status: $($_.Exception.Message)" }
 
-    Set-InvestigationActivity -Step 'Mailbox forwarding' -WaitingOn 'Get-Mailbox (Forwarding*)'
-    try {
-        foreach ($m in @(Get-Mailbox -ResultSize Unlimited -Filter 'ForwardingSmtpAddress -ne $null -or ForwardingAddress -ne $null' -ErrorAction Stop)) {
-            $sev = 'Medium'; if ($m.ForwardingSmtpAddress) { $sev = 'High' }
-            $recent = $m.WhenChanged -and $m.WhenChanged.ToUniversalTime() -ge $script:StartUtc
-            if ($recent -and $sev -eq 'High') { $sev = 'Critical' }
-            Add-Finding $sev 'Mail Forwarding' ([string]$m.PrimarySmtpAddress) ("ForwardingSmtpAddress={0}; ForwardingAddress={1}; DeliverToMailboxAndForward={2}; MailboxLastChanged={3}" -f $m.ForwardingSmtpAddress, $m.ForwardingAddress, $m.DeliverToMailboxAndForward, $m.WhenChanged) 'Mailbox-level forwarding is a primary exfiltration technique (T1114.003).' $m.WhenChanged $src
+        Set-InvestigationActivity -Step 'Mailbox forwarding' -WaitingOn 'Get-Mailbox (Forwarding*)'
+        try {
+            foreach ($m in @(Get-Mailbox -ResultSize Unlimited -Filter 'ForwardingSmtpAddress -ne $null -or ForwardingAddress -ne $null' -ErrorAction Stop)) {
+                $sev = 'Medium'; if ($m.ForwardingSmtpAddress) { $sev = 'High' }
+                $recent = $m.WhenChanged -and $m.WhenChanged.ToUniversalTime() -ge $script:StartUtc
+                if ($recent -and $sev -eq 'High') { $sev = 'Critical' }
+                Add-Finding $sev 'Mail Forwarding' ([string]$m.PrimarySmtpAddress) ("ForwardingSmtpAddress={0}; ForwardingAddress={1}; DeliverToMailboxAndForward={2}; MailboxLastChanged={3}" -f $m.ForwardingSmtpAddress, $m.ForwardingAddress, $m.DeliverToMailboxAndForward, $m.WhenChanged) 'Mailbox-level forwarding is a primary exfiltration technique (T1114.003).' $m.WhenChanged $src
+            }
         }
+        catch { Write-Log 'WARN' "Forwarding sweep: $($_.Exception.Message)" }
     }
-    catch { Write-Log 'WARN' "Forwarding sweep: $($_.Exception.Message)" }
 
     Set-InvestigationActivity -Step 'Outbound spam / auto-forward policy' -WaitingOn 'Get-HostedOutboundSpamFilterPolicy'
     try {
@@ -1201,9 +1238,11 @@ function Connect-M365PsForensicsExchange {
         }
         $cmd = Get-Command Connect-ExchangeOnline -ErrorAction SilentlyContinue
         if ($UseDeviceCode -and $cmd -and $cmd.Parameters.ContainsKey('Device')) { $p['Device'] = $true }
-        if ($DisableWAM -and $cmd -and $cmd.Parameters.ContainsKey('DisableWAM')) { $p['DisableWAM'] = $true }
-        Write-Log 'INFO' 'Connecting to Exchange Online (sign in with your IR / Global Reader account). If you do not see a Microsoft login window, check the taskbar — it may be behind this form.'
-        Set-InvestigationActivity -Phase 'Exchange Online' -Step 'Signing in' -WaitingOn 'Connect-ExchangeOnline — complete the Microsoft sign-in window (check the taskbar if it is hidden)'
+        # WAM inside a background runspace hangs the GUI with no login window. Prefer the browser prompt.
+        $useDisableWam = $DisableWAM -or (-not $AppId)
+        if ($useDisableWam -and $cmd -and $cmd.Parameters.ContainsKey('DisableWAM')) { $p['DisableWAM'] = $true }
+        Write-Log 'INFO' 'Connecting to Exchange Online (browser sign-in). If you do not see a Microsoft login window, check the taskbar — it may be behind this form.'
+        Set-InvestigationActivity -Phase 'Exchange Online' -Step 'Signing in' -WaitingOn 'Connect-ExchangeOnline — complete the Microsoft browser sign-in (check the taskbar if it is hidden)'
         Connect-ExchangeOnline @p
         $script:OpenedExo = $true
         Write-Log 'OK' 'Connected to Exchange Online.'
@@ -1233,26 +1272,31 @@ function Invoke-ExchangePhase {
         Write-Log 'WARN' 'Start date is older than 180 days: data beyond your audit retention (180 days Standard / 1 year+ Premium) will not exist.'
     }
 
+    $adminChunk = Get-AdminUalChunkHours
+    Write-Log 'INFO' ("UAL admin slices are {0} hours. Discovery UAL={1}. Deep suspect mailbox/file dump={2}." -f $adminChunk, [bool]$script:Config.IncludeDiscovery, (-not [bool]$script:Config.SkipSuspectDataAccess))
     Write-InvestigationProgress 'Unified Audit Log' 'Collecting admin cmdlets' 10
     $adminRows = New-Object System.Collections.Generic.List[object]
-    $tenantTypes = @('ExchangeAdmin', 'SecurityComplianceCenterEOPCmdlet', 'Discovery') + @($script:Config.AdditionalRecordTypes) | Where-Object { $_ } | Select-Object -Unique
+    $tenantTypes = Get-UalAdminRecordTypes
     foreach ($rt in $tenantTypes) {
         Test-InvestigationCancel
-        foreach ($x in (Invoke-UalCollection -Name $rt -RecordType $rt -From $script:StartUtc -To $script:EndUtc -Label 'Admin')) { $adminRows.Add($x) }
+        foreach ($x in (Invoke-UalCollection -Name $rt -RecordType $rt -From $script:StartUtc -To $script:EndUtc -Label 'Admin' -ChunkHours $adminChunk)) { $adminRows.Add($x) }
     }
 
     $highSignalOps = @('SiteCollectionAdminAdded', 'SiteCollectionAdminRemoved', 'SharingPolicyChanged', 'SiteAdminChangeRequest',
         'UpdateInboxRules', 'New-InboxRule', 'Set-InboxRule', 'AddFolderPermissions', 'UpdateFolderPermissions', 'CreateFlow', 'EditFlow',
         'TeamCreated', 'MemberAdded', 'MemberRemoved', 'AddedToRoster')
     Write-InvestigationProgress 'Unified Audit Log' 'High-signal operations' 25
-    foreach ($x in (Invoke-UalCollection -Name 'HighSignalOperations' -Operations $highSignalOps -From $script:StartUtc -To $script:EndUtc -Label 'Admin')) {
+    foreach ($x in (Invoke-UalCollection -Name 'HighSignalOperations' -Operations $highSignalOps -From $script:StartUtc -To $script:EndUtc -Label 'Admin' -ChunkHours $adminChunk)) {
         if ($x.RecordType -notmatch 'ExchangeAdmin') { $adminRows.Add($x) }
     }
 
-    # Full-window Entra UAL so a later Graph failure cannot drop the last 30 days.
+    # Graph covers ~30 days of Entra changes. Pull older Entra activity from UAL.
+    # If Graph is skipped, collect AzureActiveDirectory for the full window.
     Write-InvestigationProgress 'Unified Audit Log' 'Entra directory changes' 35
-    if ($script:EndUtc -gt $script:StartUtc) {
-        foreach ($x in (Invoke-UalCollection -Name 'AzureActiveDirectory' -RecordType 'AzureActiveDirectory' -From $script:StartUtc -To $script:EndUtc -Label 'Admin')) { $adminRows.Add($x) }
+    $aadTo = $script:GraphCutoffUtc
+    if ($script:Config.SkipGraph) { $aadTo = $script:EndUtc }
+    if ($aadTo -gt $script:StartUtc) {
+        foreach ($x in (Invoke-UalCollection -Name 'AzureActiveDirectory' -RecordType 'AzureActiveDirectory' -From $script:StartUtc -To $aadTo -Label 'Admin' -ChunkHours $adminChunk)) { $adminRows.Add($x) }
     }
     Save-Rows -Rows $adminRows -FileName 'Events-UAL-Admin.csv'
 
@@ -1305,14 +1349,18 @@ function Get-GraphAll {
         Test-InvestigationCancel
         $page++
         Set-InvestigationActivity -WaitingOn ("Graph $target page $page") -Detail ("{0:N0} records so far" -f $items.Count)
-        Write-Log 'INFO' ("Graph {0}: requesting page {1} ({2:N0} records so far). This call can take several minutes..." -f $target, $page, $items.Count)
+        if ($page -eq 1 -or ($page % 5 -eq 0)) {
+            Write-Log 'INFO' ("Graph {0}: requesting page {1} ({2:N0} records so far). This call can take several minutes..." -f $target, $page, $items.Count)
+        }
         $resp = Invoke-WithRetry -Activity ("Graph $target") -Script { Invoke-MgGraphRequest -Method GET -Uri $next -Headers $Headers -OutputType PSObject -ErrorAction Stop }
         $got = 0
         if ($resp.value) {
             foreach ($v in $resp.value) { $items.Add($v); $got++ }
         }
         Set-InvestigationActivity -PagesDelta 1
-        Write-Log 'INFO' ("Graph {0}: page {1} returned {2:N0} (total {3:N0})" -f $target, $page, $got, $items.Count)
+        if ($page -eq 1 -or ($page % 5 -eq 0) -or -not $resp.'@odata.nextLink') {
+            Write-Log 'INFO' ("Graph {0}: page {1} returned {2:N0} (total {3:N0})" -f $target, $page, $got, $items.Count)
+        }
         $next = $resp.'@odata.nextLink'
         if ($MaxItems -gt 0 -and $items.Count -ge $MaxItems) {
             Write-Log 'WARN' ("Graph result capped at {0:N0} items for {1}" -f $MaxItems, $target); break
@@ -1588,7 +1636,10 @@ function Invoke-GraphPhase {
         try {
             $raw = New-Object System.IO.StreamWriter((Join-Path $script:RawPath 'Graph-SignIns.jsonl'), $false, (New-Object System.Text.UTF8Encoding($false)))
             $queries = New-Object System.Collections.Generic.List[object]
-            foreach ($appId in $script:PowerShellApps.Keys) { $queries.Add(@(("appId eq '$appId' and " + $win), ('PowerShell app ' + $script:PowerShellApps[$appId]), $null)) }
+            $psAppOr = (@($script:PowerShellApps.Keys) | ForEach-Object { "appId eq '$_'" }) -join ' or '
+            $queries.Add(@(('(' + $psAppOr + ') and ' + $win), 'All PowerShell / CLI clients', $null))
+            $abuseOr = (@($script:AbuseProneApps.Keys) | ForEach-Object { "appId eq '$_'" }) -join ' or '
+            $queries.Add(@(('(' + $abuseOr + ') and ' + $win), 'Token-abuse-prone clients', $null))
             foreach ($u in @($script:Config.SuspectUsers)) { $queries.Add(@(("userPrincipalName eq '" + ($u -replace "'", "''") + "' and " + $win), ('Suspect user ' + $u), $null)) }
             if ($script:Config.IncludeServicePrincipalSignIns) { $queries.Add(@($win, 'All service principal sign-ins', "signInEventTypes/any(t: t eq 'servicePrincipal')")) }
             $qIndex = 0
@@ -2283,7 +2334,9 @@ function Invoke-M365PowerShellForensics {
         [switch]$ReportOnly,
         [switch]$InstallModules,
         [switch]$NoDisconnect,
-        [switch]$OpenReport
+        [switch]$OpenReport,
+        [bool]$Fast = $true,
+        [switch]$IncludeDiscovery
     )
 
     $exitCode = 0
@@ -2316,6 +2369,12 @@ function Invoke-M365PowerShellForensics {
         InstallModules = [bool]$InstallModules
         NoDisconnect = [bool]$NoDisconnect
         OpenReport = [bool]$OpenReport
+        Fast = [bool]$Fast
+        IncludeDiscovery = [bool]$IncludeDiscovery
+    }
+    if ($script:Config.Fast) {
+        $script:Config.SkipSuspectDataAccess = $true
+        $script:Config.IncludeDiscovery = $false
     }
 
     try {
@@ -2330,6 +2389,9 @@ function Invoke-M365PowerShellForensics {
 
         Write-Log 'INFO' ("M365 PowerShell Forensics v{0} | PowerShell {1} | Output: {2}" -f $script:ScriptVersion, $PSVersionTable.PSVersion, $script:OutputPath)
         Write-Log 'INFO' ("Window (UTC): {0} -> {1} | Suspect users: {2} | Suspect IPs: {3}" -f (ConvertTo-UtcIso $script:StartUtc), (ConvertTo-UtcIso $script:EndUtc), ($script:Config.SuspectUsers -join ', '), ($script:Config.SuspectIPs -join ', '))
+        if ($script:Config.Fast) {
+            Write-Log 'INFO' 'Fast collection ON: Exchange/Purview cmdlets + Graph PowerShell sign-ins. Discovery UAL, MailItemsAccessed dumps, and tenant-wide Get-Mailbox walks are skipped. Uncheck Fast collection for a deep sweep.'
+        }
         $plan = New-Object System.Collections.Generic.List[string]
         if (-not $ReportOnly) {
             if (-not $SkipExchange) { $plan.Add('Exchange/UAL admin cmdlets and persistence') } else { $plan.Add('skip Exchange/UAL') }

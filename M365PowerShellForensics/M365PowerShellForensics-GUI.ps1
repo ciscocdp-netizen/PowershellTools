@@ -20,7 +20,7 @@ param(
     [switch]$StaReady
 )
 
-$script:GuiVersion = '2.1.1'
+$script:GuiVersion = '2.1.2'
 
 if (-not $StaReady -and [System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
     $hostPath = $null
@@ -184,6 +184,8 @@ function Save-GuiSettings {
             MaxMailboxesToInspect = [int]$script:numMbx.Value
             IncludeServicePrincipalSignIns = [bool]$script:chkSp.Checked
             SkipSuspectDataAccess = [bool]$script:chkSkipData.Checked
+            Fast = [bool]$script:chkFast.Checked
+            IncludeDiscovery = [bool]$script:chkDiscovery.Checked
             SkipExchange = [bool]$script:chkSkipExo.Checked
             SkipGraph = [bool]$script:chkSkipGraph.Checked
             SkipCurrentState = [bool]$script:chkSkipState.Checked
@@ -277,9 +279,12 @@ function Initialize-Worker {
     $script:Sync = [hashtable]::Synchronized(@{
         Cancel = $false
         Queue  = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+        Activity = $null
+        OutputPath = $null
     })
     $script:Runspace = [runspacefactory]::CreateRunspace()
-    $script:Runspace.ApartmentState = 'STA'
+    # MTA keeps the WinForms UI thread free. Exchange sign-in uses DisableWAM (browser) instead of WAM.
+    $script:Runspace.ApartmentState = 'MTA'
     $script:Runspace.ThreadOptions = 'ReuseThread'
     $script:Runspace.Open()
     $script:Worker = [powershell]::Create()
@@ -372,6 +377,9 @@ function Test-InvestigationForm {
     $p.SkipCurrentState = [bool]$script:chkSkipState.Checked
     $p.NoDisconnect = [bool]$script:chkNoDisc.Checked
     $p.OpenReport = [bool]$script:chkOpenReport.Checked
+    $p.Fast = [bool]$script:chkFast.Checked
+    $p.IncludeDiscovery = [bool]$script:chkDiscovery.Checked
+    if ($p.Fast) { $p.SkipSuspectDataAccess = $true }
     if ($p.SkipExchange -and $p.SkipGraph -and -not $p.ReportOnly) {
         $errors.Add('Skip Exchange and Skip Graph are both on. Turn one off, or use Report only.')
     }
@@ -452,6 +460,8 @@ function Show-RunResult {
 }
 
 function Drain-WorkerStreams {
+    # Only call this after the pipeline has completed. Reading streams while
+    # BeginInvoke is running deadlocks the WinForms thread against Connect-* / UAL.
     foreach ($i in @($script:Worker.Streams.Information)) { Append-Log ([string]$i) 'INFO' }
     foreach ($w in @($script:Worker.Streams.Warning)) { Append-Log ([string]$w) 'WARN' }
     foreach ($e in @($script:Worker.Streams.Error)) { Append-Log ([string]$e) 'ERROR' }
@@ -571,6 +581,9 @@ function Update-LivePanel {
     else {
         $script:lblLiveCounts.Text = 'Waiting for the engine to publish the first heartbeat...'
         $script:lblLiveLast.Text = ''
+        $phase = 'Starting'
+        $step = 'Waiting for worker'
+        $waiting = 'Worker thread / module load / Exchange sign-in'
     }
 
     $head = @($phase, $step) | Where-Object { $_ }
@@ -579,10 +592,14 @@ function Update-LivePanel {
     if (-not $line) { $line = 'Investigation is running...' }
     $script:lblLivePhase.Text = $line
 
-    if ($waiting) {
+    if (-not $snap -and $busy) {
+        $script:lblLiveWait.Text = 'The worker has not reported yet. If this lasts more than 15 seconds, look for a Microsoft sign-in window on the taskbar, or click Connect Exchange before Run.'
+        $script:lblLiveWait.ForeColor = [System.Drawing.Color]::FromArgb(181, 71, 8)
+    }
+    elseif ($waiting) {
         $waitText = "Waiting on $waiting"
         if ($waitElapsed) { $waitText += "  ($waitElapsed)" }
-        $waitText += '. Microsoft 365 audit queries often take several minutes per page or 24-hour slice — this is not frozen.'
+        $waitText += '. Microsoft 365 audit queries often take several minutes per slice — this is not frozen.'
         if ($waitElapsed -match 'm |h ') {
             $waitText += ' Esc requests cancel after the current call returns.'
         }
@@ -633,6 +650,17 @@ function Drain-WorkerQueue {
         elseif ($item.Type -eq 'Coverage') {
             Add-LiveCoverageRow $item.Coverage
         }
+        elseif ($item.Type -eq 'Saved' -and $script:Sync.OutputPath) {
+            $script:LastFolder = [string]$script:Sync.OutputPath
+            if ($item.FileName -like 'Events-*' -or $item.FileName -eq 'Timeline-Master.csv') {
+                $path = Join-Path $script:LastFolder $item.FileName
+                try { [void](Import-ResultTable $script:gridCmd $path @('TimeUtc','Severity','Actor','CommandLine','Operation','ClientIP','InferredIP','ExecutionChannel','SuspectMatch')) } catch { }
+            }
+            elseif ($item.FileName -like 'SignIns-*') {
+                $path = Join-Path $script:LastFolder $item.FileName
+                try { [void](Import-ResultTable $script:gridSi $path @('TimeUtc','User','Result','AppName','PowerShellApp','IPAddress','Location','UserAgent')) } catch { }
+            }
+        }
     }
     if ($gotActivity -or $script:Busy) { Update-LivePanel }
 }
@@ -667,12 +695,15 @@ function Complete-WorkerAction {
 function Update-WorkerUi {
     Drain-WorkerQueue
     if ($script:Busy) {
-        Drain-WorkerStreams
+        if ($script:Sync.Activity) { $script:Live = $script:Sync.Activity }
+        if ($script:Sync.OutputPath) { $script:LastFolder = [string]$script:Sync.OutputPath }
         Update-LivePanel
     }
     if ($script:RunHandle -and $script:RunHandle.IsCompleted) {
         $handle = $script:RunHandle
         $script:RunHandle = $null
+        Drain-WorkerQueue
+        try { Drain-WorkerStreams } catch { }
         try {
             $raw = $script:Worker.EndInvoke($handle)
             Complete-WorkerAction -Result (Get-FirstResult $raw) -Failure $null
@@ -684,11 +715,16 @@ function Update-WorkerUi {
 
 $script:RunWorkerScript = {
     param($Bridge, $Params)
-    $ErrorActionPreference = 'Stop'
+    $ErrorActionPreference = 'Continue'
     $InformationPreference = 'Continue'
     Set-M365PsForensicsUiBridge -Sync $Bridge
     $Bridge.Cancel = $false
-    Invoke-M365PowerShellForensics @Params
+    Write-Log 'INFO' 'Worker thread started. Publishing live status before each Microsoft 365 call.'
+    $splat = @{}
+    if ($Params -is [hashtable]) {
+        foreach ($k in @($Params.Keys)) { $splat[$k] = $Params[$k] }
+    }
+    Invoke-M365PowerShellForensics @splat
 }
 
 $script:ConnectExoScript = {
@@ -738,6 +774,15 @@ function Start-Investigation {
         [System.Windows.Forms.MessageBox]::Show(($check.Errors -join "`r`n"), 'Check the form', 'OK', 'Warning') | Out-Null
         return
     }
+    $days = ($check.Parameters.EndDate - $check.Parameters.StartDate).TotalDays
+    if (-not $check.Parameters.Fast -and $days -gt 14) {
+        $answer = [System.Windows.Forms.MessageBox]::Show(
+            ("The window is {0:N0} days with Fast collection off. Tenant-wide Discovery, MailItemsAccessed, and Get-Mailbox walks can take hours.`r`n`r`nContinue with the deep sweep?" -f $days),
+            'Deep collection is slow',
+            'YesNo',
+            'Warning')
+        if ($answer -ne 'Yes') { return }
+    }
     Save-GuiSettings
     $script:Live = $null
     $script:RunStartedAt = Get-Date
@@ -749,9 +794,12 @@ function Start-Investigation {
     $script:lblStatus.Text = 'Starting investigation — waiting for the first engine heartbeat...'
     $script:tabs.SelectedTab = $script:tabLog
     Append-Log '---- Run started ----' 'INFO'
-    Append-Log 'Live activity is on the right. Long Microsoft 365 calls (UAL slices, Graph pages, and sign-in windows) will keep the Waiting line updating even when the log pauses.' 'INFO'
-    Update-LivePanel
+    if ($check.Parameters.Fast) {
+        Append-Log 'Fast collection: Exchange/Purview cmdlets and Graph PowerShell sign-ins. Deep mailbox dumps are skipped.' 'INFO'
+    }
+    Append-Log 'Connect Exchange first if you have not already — a login prompt during Run can sit behind this window.' 'INFO'
     Start-WorkerAction -Action 'Run' -Script $script:RunWorkerScript -Arguments @($script:Sync, $check.Parameters)
+    Update-LivePanel
 }
 
 function Get-AuthBag {
@@ -974,7 +1022,7 @@ $script:grpScope = New-Object System.Windows.Forms.GroupBox
 $script:grpScope.Text = 'Collection options'
 $script:grpScope.Font = $script:FontBold
 $script:grpScope.Location = New-Object System.Drawing.Point(8, 654)
-$script:grpScope.Size = New-Object System.Drawing.Size(400, 280)
+$script:grpScope.Size = New-Object System.Drawing.Size(400, 324)
 $left.Controls.Add($script:grpScope)
 $y = 22
 $script:numChunk = New-Object System.Windows.Forms.NumericUpDown
@@ -987,6 +1035,8 @@ $script:numMbx = New-Object System.Windows.Forms.NumericUpDown
 $script:numMbx.Minimum = 1; $script:numMbx.Maximum = 5000; $script:numMbx.Value = 200
 $y = Add-Labeled $script:grpScope $y 'Max mailboxes' $script:numMbx
 foreach ($pair in @(
+        @{ N = 'chkFast'; T = 'Fast collection (cmdlets first; skip mailbox dumps)' },
+        @{ N = 'chkDiscovery'; T = 'Include eDiscovery / Discovery UAL (slow)' },
         @{ N = 'chkSkipExo'; T = 'Skip Exchange / Unified Audit Log' },
         @{ N = 'chkSkipGraph'; T = 'Skip Microsoft Graph' },
         @{ N = 'chkSkipState'; T = 'Skip current-state persistence sweep' },
@@ -1004,25 +1054,29 @@ foreach ($pair in @(
 }
 $script:chkNoDisc.Checked = $true
 $script:chkOpenReport.Checked = $true
+$script:chkFast.Checked = $true
+$script:chkSkipData.Checked = $true
+$tips.SetToolTip($script:chkFast, 'Recommended. Collects Exchange/Purview cmdlets and PowerShell sign-ins. Skips MailItemsAccessed dumps, Discovery UAL, and tenant-wide Get-Mailbox walks that can take hours.')
+$tips.SetToolTip($script:chkDiscovery, 'Tenant-wide Discovery/eDiscovery UAL is high volume. Leave off unless that is in scope.')
 
 $script:btnRun = New-Button 'Run investigation (F5)' $script:ColorAccent ([System.Drawing.Color]::White)
-$script:btnRun.Location = New-Object System.Drawing.Point(8, 942)
+$script:btnRun.Location = New-Object System.Drawing.Point(8, 986)
 $script:btnRun.Size = New-Object System.Drawing.Size(200, 36)
 $script:btnCancel = New-Button 'Cancel (Esc)' ([System.Drawing.Color]::White) $script:ColorDanger
-$script:btnCancel.Location = New-Object System.Drawing.Point(216, 942)
+$script:btnCancel.Location = New-Object System.Drawing.Point(216, 986)
 $script:btnCancel.Size = New-Object System.Drawing.Size(120, 36)
 $script:btnOpenReport = New-Button 'Open report' ([System.Drawing.Color]::White) $script:ColorAccent
-$script:btnOpenReport.Location = New-Object System.Drawing.Point(8, 986)
+$script:btnOpenReport.Location = New-Object System.Drawing.Point(8, 1030)
 $script:btnOpenReport.Size = New-Object System.Drawing.Size(130, 32)
 $script:btnOpenFolder = New-Button 'Open folder' ([System.Drawing.Color]::White) ([System.Drawing.Color]::FromArgb(31, 35, 40))
-$script:btnOpenFolder.Location = New-Object System.Drawing.Point(146, 986)
+$script:btnOpenFolder.Location = New-Object System.Drawing.Point(146, 1030)
 $script:btnOpenFolder.Size = New-Object System.Drawing.Size(120, 32)
 $left.Controls.Add($script:btnRun)
 $left.Controls.Add($script:btnCancel)
 $left.Controls.Add($script:btnOpenReport)
 $left.Controls.Add($script:btnOpenFolder)
 $pad = New-Object System.Windows.Forms.Panel
-$pad.Location = New-Object System.Drawing.Point(8, 1030)
+$pad.Location = New-Object System.Drawing.Point(8, 1074)
 $pad.Size = New-Object System.Drawing.Size(10, 20)
 $left.Controls.Add($pad)
 
@@ -1155,7 +1209,9 @@ if ($saved) {
     try { $script:numCorr.Value = [decimal](Get-JsonProperty $saved 'CorrelationWindowHours' 12) } catch { }
     try { $script:numMbx.Value = [decimal](Get-JsonProperty $saved 'MaxMailboxesToInspect' 200) } catch { }
     $script:chkSp.Checked = ConvertTo-BoolSetting (Get-JsonProperty $saved 'IncludeServicePrincipalSignIns' $false) $false
-    $script:chkSkipData.Checked = ConvertTo-BoolSetting (Get-JsonProperty $saved 'SkipSuspectDataAccess' $false) $false
+    $script:chkSkipData.Checked = ConvertTo-BoolSetting (Get-JsonProperty $saved 'SkipSuspectDataAccess' $true) $true
+    $script:chkFast.Checked = ConvertTo-BoolSetting (Get-JsonProperty $saved 'Fast' $true) $true
+    $script:chkDiscovery.Checked = ConvertTo-BoolSetting (Get-JsonProperty $saved 'IncludeDiscovery' $false) $false
     $script:chkSkipExo.Checked = ConvertTo-BoolSetting (Get-JsonProperty $saved 'SkipExchange' $false) $false
     $script:chkSkipGraph.Checked = ConvertTo-BoolSetting (Get-JsonProperty $saved 'SkipGraph' $false) $false
     $script:chkSkipState.Checked = ConvertTo-BoolSetting (Get-JsonProperty $saved 'SkipCurrentState' $false) $false

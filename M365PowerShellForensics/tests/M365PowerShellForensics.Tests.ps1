@@ -304,7 +304,18 @@ $modErrors = $null
 $null = [System.Management.Automation.Language.Parser]::ParseFile($modulePath, [ref]$null, [ref]$modErrors)
 Assert-Equal @($modErrors).Count 0 'engine module parses'
 
-Assert-Equal (Get-M365PsForensicsVersion) '2.1.1' 'engine version is 2.1.1'
+Assert-Equal (Get-M365PsForensicsVersion) '2.1.2' 'engine version is 2.1.2'
+
+Set-M365PsForensicsConfig -Values @{ Fast = $true; IncludeDiscovery = $false; AdditionalRecordTypes = @(); ChunkHours = 24 }
+$adminTypes = Get-UalAdminRecordTypes
+Assert-True ($adminTypes -contains 'ExchangeAdmin') 'fast mode still collects ExchangeAdmin cmdlets'
+Assert-True ($adminTypes -contains 'SecurityComplianceCenterEOPCmdlet') 'fast mode still collects Purview cmdlets'
+Assert-True ($adminTypes -notcontains 'Discovery') 'fast mode skips Discovery UAL'
+Assert-Equal (Get-AdminUalChunkHours) 168 'fast mode uses 7-day UAL slices'
+Set-M365PsForensicsConfig -Values @{ Fast = $false; IncludeDiscovery = $true; ChunkHours = 24 }
+Assert-True ((Get-UalAdminRecordTypes) -contains 'Discovery') 'full mode can include Discovery'
+Assert-Equal (Get-AdminUalChunkHours) 72 'full mode uses at least 72-hour UAL slices'
+Set-M365PsForensicsConfig -Values @{ Fast = $true; IncludeDiscovery = $false; ChunkHours = 24 }
 
 $liveQ = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
 Set-M365PsForensicsUiBridge -Sync ([hashtable]::Synchronized(@{ Cancel = $false; Queue = $liveQ }))

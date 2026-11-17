@@ -61,6 +61,8 @@ param(
     [switch]$InstallModules,
     [switch]$NoDisconnect,
     [switch]$OpenReport,
+    [bool]$Fast = $true,
+    [switch]$IncludeDiscovery,
     [switch]$Interactive
 )
 
