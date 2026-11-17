@@ -192,29 +192,83 @@ $si = ConvertFrom-UalSignIn (New-FakeUal -RecordType 'AzureActiveDirectoryStsLog
             ExtendedProperties = @(
                 [pscustomobject]@{ Name = 'ResultStatusDetail'; Value = 'Success' },
                 [pscustomobject]@{ Name = 'City'; Value = 'Ashburn' },
-                [pscustomobject]@{ Name = 'CountryOrRegion'; Value = 'US' }
+                [pscustomobject]@{ Name = 'CountryOrRegion'; Value = 'US' },
+                [pscustomobject]@{ Name = 'OS'; Value = 'Windows 10' },
+                [pscustomobject]@{ Name = 'Browser'; Value = 'Chrome 120' },
+                [pscustomobject]@{ Name = 'DeviceId'; Value = 'dev-1' },
+                [pscustomobject]@{ Name = 'SessionId'; Value = 'sess-ual-1' },
+                [pscustomobject]@{ Name = 'RequestType'; Value = 'Login:login' }
             )
         }))
 Assert-Equal $si.PowerShellApp 'Yes' 'MSOnline app id is a PowerShell sign-in'
 Assert-Equal $si.Result 'Success' 'error 0 is success'
 Assert-Contains $si.Location 'Ashburn' 'UAL sign-in city is kept'
 Assert-Contains $si.SuspectMatch 'User' 'suspect user sign-in is tagged'
+Assert-Equal $si.OperatingSystem 'Windows 10' 'UAL sign-in keeps OS from ExtendedProperties'
+Assert-Equal $si.SessionId 'sess-ual-1' 'UAL sign-in keeps session id'
+Assert-Contains $si.Story 'attacker@contoso.com' 'UAL sign-in story names the account'
 
-$gsi = ConvertFrom-GraphSignIn ([pscustomobject]@{
-        createdDateTime = '2026-10-01T11:55:00Z'
-        appId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
-        appDisplayName = 'Microsoft Graph PowerShell'
-        userPrincipalName = 'attacker@contoso.com'
-        ipAddress = '203.0.113.50'
-        userAgent = 'Mozilla/5.0 PowerShell/7.4'
-        status = [pscustomobject]@{ errorCode = 0; failureReason = '' }
-        location = [pscustomobject]@{ city = 'Ashburn'; state = 'VA'; countryOrRegion = 'US' }
-        resourceDisplayName = 'Microsoft Graph'
-        isInteractive = $true
-        id = 'abc'
-    }) 'SignIn'
+$gsiRaw = [pscustomobject]@{
+    createdDateTime = '2026-10-01T11:55:00Z'
+    appId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
+    appDisplayName = 'Microsoft Graph PowerShell'
+    userPrincipalName = 'attacker@contoso.com'
+    userDisplayName = 'Attacker'
+    userId = '11111111-1111-1111-1111-111111111111'
+    ipAddress = '203.0.113.50'
+    userAgent = 'Mozilla/5.0 PowerShell/7.4'
+    clientAppUsed = 'Mobile Apps and Desktop clients'
+    status = [pscustomobject]@{ errorCode = 0; failureReason = ''; additionalDetails = 'MFA completed in Azure AD' }
+    location = [pscustomobject]@{
+        city = 'Ashburn'; state = 'VA'; countryOrRegion = 'US'
+        geoCoordinates = [pscustomobject]@{ latitude = 39.04; longitude = -77.49 }
+    }
+    resourceDisplayName = 'Microsoft Graph'
+    resourceId = '00000003-0000-0000-c000-000000000000'
+    isInteractive = $true
+    signInEventTypes = @('interactiveUser')
+    authenticationRequirement = 'multiFactorAuthentication'
+    authenticationMethodsUsed = @('Password', 'Mobile app notification')
+    authenticationDetails = @(
+        [pscustomobject]@{ authenticationMethod = 'Password'; authenticationMethodDetail = 'Password in the cloud'; authenticationStepResultDetail = 'Correct password'; succeeded = $true }
+        [pscustomobject]@{ authenticationMethod = 'Mobile app notification'; authenticationMethodDetail = 'Microsoft Authenticator'; authenticationStepResultDetail = 'MFA requirement satisfied by claim in the token'; succeeded = $true }
+    )
+    authenticationProtocol = 'oAuth2'
+    incomingTokenType = 'none'
+    tokenIssuerType = 'AzureAD'
+    clientCredentialType = 'none'
+    conditionalAccessStatus = 'success'
+    appliedConditionalAccessPolicies = @(
+        [pscustomobject]@{ displayName = 'Require MFA for admins'; result = 'success'; enforcedGrantControls = @('Mfa'); enforcedSessionControls = @() }
+        [pscustomobject]@{ displayName = 'Block legacy'; result = 'notApplied'; enforcedGrantControls = @(); enforcedSessionControls = @() }
+    )
+    riskLevelDuringSignIn = 'none'
+    riskState = 'none'
+    riskDetail = 'none'
+    riskEventTypes_v2 = @()
+    deviceDetail = [pscustomobject]@{
+        deviceId = 'dev-graph-1'; displayName = 'ATTACKER-LAPTOP'; operatingSystem = 'Windows 11'
+        browser = 'Edge 120'; isCompliant = $true; isManaged = $true; trustType = 'Hybrid Azure AD joined'
+    }
+    correlationId = 'corr-1'
+    sessionId = 'sess-graph-1'
+    uniqueTokenIdentifier = 'uti-1'
+    originalRequestId = 'req-1'
+    autonomousSystemNumber = '174'
+    crossTenantAccessType = 'none'
+    flaggedForReview = $false
+    id = 'abc'
+}
+$gsi = ConvertFrom-GraphSignIn $gsiRaw 'SignIn'
 Assert-Equal $gsi.PowerShellApp 'Yes' 'Graph PowerShell sign-in is Yes'
 Assert-Contains $gsi.Location 'Ashburn' 'Graph location is joined'
+Assert-Equal $gsi.DeviceName 'ATTACKER-LAPTOP' 'Graph sign-in keeps device name'
+Assert-Contains $gsi.AuthMethods 'Password' 'Graph sign-in lists auth methods'
+Assert-Contains $gsi.AuthDetails 'Microsoft Authenticator' 'Graph sign-in keeps MFA step detail'
+Assert-Contains $gsi.ConditionalAccessPolicies 'Require MFA for admins=success' 'Graph sign-in keeps applied CA policy'
+Assert-Equal $gsi.SessionId 'sess-graph-1' 'Graph sign-in keeps session id'
+Assert-Equal $gsi.ASN '174' 'Graph sign-in keeps ASN'
+Assert-Contains $gsi.Story 'multiFactorAuthentication' 'sign-in story includes the auth requirement'
 
 $failSi = ConvertFrom-GraphSignIn ([pscustomobject]@{
         createdDateTime = '2026-10-01T11:40:00Z'
@@ -223,7 +277,7 @@ $failSi = ConvertFrom-GraphSignIn ([pscustomobject]@{
         userPrincipalName = 'attacker@contoso.com'
         ipAddress = '203.0.113.50'
         userAgent = 'WindowsPowerShell/5.1'
-        status = [pscustomobject]@{ errorCode = 50126; failureReason = 'Invalid username or password.' }
+        status = [pscustomobject]@{ errorCode = 50126; failureReason = 'Invalid username or password.'; additionalDetails = 'The user did not enter the right credentials.' }
         location = [pscustomobject]@{ city = 'Ashburn'; state = 'VA'; countryOrRegion = 'US' }
         resourceDisplayName = 'Windows Azure Active Directory'
         isInteractive = $true
@@ -231,13 +285,15 @@ $failSi = ConvertFrom-GraphSignIn ([pscustomobject]@{
     }) 'SignIn'
 Assert-Equal $failSi.Result 'Failure' 'non-zero Graph error is a failed sign-in'
 Assert-Equal $failSi.PowerShellApp 'Yes' 'failed AAD PowerShell sign-in is still PowerShell'
+Assert-Contains $failSi.Story 'Invalid username or password' 'failed sign-in story keeps the failure reason'
 
 $fromSi = ConvertTo-EventFromSignIn $gsi
 Assert-Equal $fromSi.RecordType 'SignIn' 'sign-in events keep RecordType SignIn'
 Assert-Equal $fromSi.PowerShellRelated 'Yes' 'Graph PowerShell sign-in becomes a PowerShell-related event'
 Assert-Equal $fromSi.Outcome 'Succeeded' 'successful sign-in maps to Succeeded'
 Assert-Equal $fromSi.Actor 'attacker@contoso.com' 'sign-in user becomes the event actor'
-Assert-Contains $fromSi.CommandLine 'Sign-in:' 'sign-in event has a command-line summary'
+Assert-Contains $fromSi.CommandLine 'Success sign-in' 'sign-in event command line is the story'
+Assert-Contains $fromSi.Details 'ATTACKER-LAPTOP' 'sign-in event details include the device'
 $fromFailSi = ConvertTo-EventFromSignIn $failSi
 Assert-Equal $fromFailSi.Outcome 'Failed' 'failed PowerShell sign-in maps to a Failed event'
 Assert-Equal $fromFailSi.Operation 'UserLoginFailed' 'failed sign-in operation is UserLoginFailed'
@@ -280,6 +336,9 @@ Initialize-SuspectSets -Users @('attacker@contoso.com') -IPs @('203.0.113.50')
 Initialize-InvestigationWindow -StartDate ([datetime]'2026-09-01') -EndDate ([datetime]'2026-10-02')
 Save-Rows -Rows @($row, $fedRow, $failRow, $ga) -FileName 'Events-UAL-Admin.csv'
 Save-Rows -Rows @($si, $gsi, $failSi) -FileName 'SignIns-Entra.csv'
+$rawDir = Join-Path $out 'raw'
+if (-not (Test-Path -LiteralPath $rawDir)) { New-Item -ItemType Directory -Path $rawDir -Force | Out-Null }
+$gsiRaw | ConvertTo-Json -Depth 8 -Compress | Set-Content -LiteralPath (Join-Path $rawDir 'Graph-SignIns.jsonl') -Encoding utf8
 Add-Coverage -Source 'Tenant (Graph)' -Status 'INFO' -Notes 'TenantId=11111111-1111-1111-1111-111111111111; Investigator=ir@contoso.com'
 Add-Coverage -Source 'Unified Audit Log - ExchangeAdmin (Admin)' -Status 'OK' -Records 3 -From ([datetime]'2026-09-01') -To ([datetime]'2026-10-02')
 $report = New-InvestigationReport
@@ -303,6 +362,12 @@ Assert-Contains $html 'id="failOnly"' 'report has a failed-sign-in chip'
 Assert-Contains $html 'Focus timeline' 'report can focus the timeline around a sign-in'
 Assert-Contains $html 'id="tbl-sisummary"' 'report rolls up sign-ins by account and client'
 Assert-Contains $html 'function inTime' 'report applies a shared time-window filter'
+Assert-Contains $html 'Sign-in detail' 'report has a dedicated sign-in detail drawer'
+Assert-Contains $html 'Show these sign-ins' 'report can pivot from a client rollup to the matching log'
+Assert-Contains $html 'ATTACKER-LAPTOP' 'report embeds the Graph device name'
+Assert-Contains $html 'Require MFA for admins=success' 'report embeds applied Conditional Access'
+Assert-Contains $html 'sess-graph-1' 'report embeds the sign-in session id'
+Assert-Contains $html 'Auth methods' 'report labels authentication methods in the drawer'
 $tl = @(Import-Csv -LiteralPath (Join-Path $out 'Timeline-Master.csv'))
 $siEvents = @($tl | Where-Object { $_.RecordType -eq 'SignIn' })
 Assert-True ($siEvents.Count -ge 3) 'PowerShell sign-ins are copied onto the command timeline'
@@ -354,7 +419,10 @@ $modErrors = $null
 $null = [System.Management.Automation.Language.Parser]::ParseFile($modulePath, [ref]$null, [ref]$modErrors)
 Assert-Equal @($modErrors).Count 0 'engine module parses'
 
-Assert-Equal (Get-M365PsForensicsVersion) '2.1.7' 'engine version is 2.1.7'
+Assert-Equal (Get-M365PsForensicsVersion) '2.1.8' 'engine version is 2.1.8'
+Assert-True (Test-Path -LiteralPath (Join-Path $out 'SignIns-Master.csv')) 'detailed sign-in master CSV is written'
+$siMaster = @(Import-Csv -LiteralPath (Join-Path $out 'SignIns-Master.csv'))
+Assert-True (@($siMaster | Where-Object { $_.DeviceName -eq 'ATTACKER-LAPTOP' }).Count -ge 1) 'sign-in master CSV keeps device name'
 
 Write-Host 'Exchange cmdlet status and Graph UAL shaping'
 $exoStatus = Get-ExoCmdletStatus

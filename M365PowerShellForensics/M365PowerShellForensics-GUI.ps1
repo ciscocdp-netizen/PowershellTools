@@ -20,7 +20,7 @@ param(
     [switch]$StaReady
 )
 
-$script:GuiVersion = '2.1.7'
+$script:GuiVersion = '2.1.8'
 
 if (-not $StaReady -and [System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
     $hostPath = $null
@@ -427,9 +427,10 @@ function Load-ResultFolder {
     if (Test-Path -LiteralPath $report) { $script:LastReport = $report }
     $cmdPath = Join-Path $Folder 'Timeline-Master.csv'
     $nCmd = Import-ResultTable $script:gridCmd $cmdPath @('TimeUtc','Severity','Actor','CommandLine','Operation','ClientIP','InferredIP','ExecutionChannel','SuspectMatch')
-    $si = Get-ChildItem -LiteralPath $Folder -Filter 'SignIns-*.csv' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    $si = Get-ChildItem -LiteralPath $Folder -Filter 'SignIns-Master.csv' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $si) { $si = Get-ChildItem -LiteralPath $Folder -Filter 'SignIns-*.csv' -File -ErrorAction SilentlyContinue | Select-Object -First 1 }
     $nSi = 0
-    if ($si) { $nSi = Import-ResultTable $script:gridSi $si.FullName @('TimeUtc','User','Result','AppName','PowerShellApp','IPAddress','Location','UserAgent') }
+    if ($si) { $nSi = Import-ResultTable $script:gridSi $si.FullName @('TimeUtc','User','Result','AppName','IPAddress','Location','OperatingSystem','Browser','AuthMethods','ConditionalAccess','Risk','DeviceName','ClientAppUsed','SignInType','UserAgent') }
     $find = @(Get-ChildItem -LiteralPath $Folder -Filter 'Findings-*.csv' -File -ErrorAction SilentlyContinue)
     $script:gridFind.Rows.Clear(); $script:gridFind.Columns.Clear()
     $allFind = @()
@@ -665,7 +666,7 @@ function Drain-WorkerQueue {
             }
             elseif ($item.FileName -like 'SignIns-*') {
                 $path = Join-Path $script:LastFolder $item.FileName
-                try { [void](Import-ResultTable $script:gridSi $path @('TimeUtc','User','Result','AppName','PowerShellApp','IPAddress','Location','UserAgent')) } catch { }
+                try { [void](Import-ResultTable $script:gridSi $path @('TimeUtc','User','Result','AppName','IPAddress','Location','OperatingSystem','Browser','AuthMethods','ConditionalAccess','Risk','DeviceName','ClientAppUsed','SignInType','UserAgent')) } catch { }
             }
         }
     }

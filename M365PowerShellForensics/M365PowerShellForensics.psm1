@@ -63,9 +63,14 @@
       - HTML investigation filters: Eastern time From/To, sign-in result, app,
         location, error, account, IP, failed/success/unusual-client chips.
         Click a sign-in and Focus timeline to see cmdlets in the following hours.
+    Version 2.1.8:
+      - Sign-in rows keep the Entra forensic fields (device, OS/browser, auth
+        methods, CA policies, session/correlation IDs, token type, risk). The
+        HTML Sign-ins tab and detail drawer show how each sign-in happened.
+        -ReportOnly rehydrates those fields from raw\Graph-SignIns.jsonl.
 #>
 
-$script:ScriptVersion = '2.1.7'
+$script:ScriptVersion = '2.1.8'
 $script:EasternTimeZone = $null
 $script:TimeOutputProperties = @('TimeUtc', 'WhenUtc', 'FirstUtc', 'LastUtc', 'RunUtc', 'FromUtc', 'ToUtc', 'LastWriteUtc', 'StartUtc', 'EndUtc', 'GeneratedUtc')
 $script:Inv = [Globalization.CultureInfo]::InvariantCulture
@@ -110,9 +115,14 @@ $script:MicrosoftTenantId = 'f8cdef31-a31e-4b4a-93e4-5f571e91255a'
 $script:EventColumns = @('TimeUtc', 'Severity', 'Category', 'Operation', 'Outcome', 'Actor', 'ClientIP', 'InferredIP',
     'InferredLocation', 'Target', 'TargetIdentity', 'CommandLine', 'Details', 'AccessGained', 'Mitre', 'PowerShellRelated',
     'ExecutionChannel', 'AppId', 'UserAgent', 'SuspectMatch', 'Workload', 'RecordType', 'Source', 'RecordId')
-$script:SignInColumns = @('TimeUtc', 'User', 'Result', 'ErrorCode', 'FailureReason', 'AppName', 'AppId', 'PowerShellApp',
-    'IPAddress', 'Location', 'Resource', 'UserAgent', 'ClientTool', 'ClientAppUsed', 'SignInType', 'ConditionalAccess',
-    'Risk', 'AuthRequirement', 'SuspectMatch', 'Source', 'Id')
+$script:SignInColumns = @('TimeUtc', 'User', 'UserDisplayName', 'UserId', 'Result', 'ErrorCode', 'FailureReason',
+    'AdditionalDetails', 'AppName', 'AppId', 'PowerShellApp', 'IPAddress', 'Location', 'Latitude', 'Longitude', 'ASN',
+    'Resource', 'ResourceId', 'UserAgent', 'ClientTool', 'ClientAppUsed', 'SignInType', 'IsInteractive',
+    'DeviceName', 'DeviceId', 'OperatingSystem', 'Browser', 'DeviceCompliant', 'DeviceManaged', 'DeviceTrustType',
+    'AuthRequirement', 'AuthMethods', 'AuthDetails', 'AuthProtocol', 'IncomingTokenType', 'TokenIssuerType',
+    'ClientCredentialType', 'ConditionalAccess', 'ConditionalAccessPolicies', 'Risk', 'RiskState', 'RiskDetail',
+    'RiskEventTypes', 'CorrelationId', 'SessionId', 'UniqueTokenId', 'OriginalRequestId', 'CrossTenant', 'HomeTenant',
+    'FlaggedForReview', 'Story', 'SuspectMatch', 'Source', 'Id')
 $script:FindingColumns = @('Severity', 'Area', 'Item', 'Detail', 'Reason', 'WhenUtc', 'SuspectMatch', 'Source')
 
 $script:Config = @{
@@ -693,10 +703,126 @@ function New-EventRow {
     return [pscustomobject]$o
 }
 
+function Join-SignInBits {
+    param([string[]]$Parts, [string]$Separator = '; ')
+    $keep = @($Parts | Where-Object { $_ -and "$_".Trim() -and "$_" -notin @('none', 'None', 'unknown', 'notApplied') } | ForEach-Object { "$_".Trim() } | Select-Object -Unique)
+    if ($keep.Count -eq 0) { return '' }
+    return ($keep -join $Separator)
+}
+
+function Format-GraphFlag {
+    param($Value)
+    if ($null -eq $Value -or "$Value" -eq '') { return '' }
+    if ($Value -eq $true -or "$Value" -eq 'True' -or "$Value" -eq 'true') { return 'Yes' }
+    if ($Value -eq $false -or "$Value" -eq 'False' -or "$Value" -eq 'false') { return 'No' }
+    return [string]$Value
+}
+
+function Get-UalExtendedMap {
+    param($Audit)
+    $m = @{}
+    foreach ($p in @($Audit.ExtendedProperties)) {
+        if ($p -and $p.Name -and $null -ne $p.Value -and "$($p.Value)" -ne '') { $m[[string]$p.Name] = [string]$p.Value }
+    }
+    return $m
+}
+
+function Format-GraphAuthMethods {
+    param($S)
+    $named = @($S.authenticationMethodsUsed | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    if ($named.Count) { return (Join-SignInBits $named) }
+    $fromDetails = foreach ($d in @($S.authenticationDetails)) {
+        if ($d -and $d.authenticationMethod) { [string]$d.authenticationMethod }
+    }
+    return (Join-SignInBits @($fromDetails))
+}
+
+function Format-GraphAuthDetails {
+    param($S)
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($d in @($S.authenticationDetails)) {
+        if (-not $d) { continue }
+        $method = [string]$d.authenticationMethod
+        if (-not $method) { continue }
+        $detail = [string]$d.authenticationMethodDetail
+        $step = [string]$d.authenticationStepResultDetail
+        $bit = $method
+        if ($detail) { $bit += ' (' + $detail + ')' }
+        if ($step) { $bit += ': ' + $step }
+        if ($null -ne $d.succeeded) {
+            $bit += $(if ((Format-GraphFlag $d.succeeded) -eq 'Yes') { ' [ok]' } else { ' [failed]' })
+        }
+        $parts.Add($bit)
+    }
+    if ($parts.Count -eq 0) { return (Format-GraphAuthMethods $S) }
+    return (Limit-Text ($parts -join ' | ') 1500)
+}
+
+function Format-GraphCaPolicies {
+    param($S)
+    $parts = New-Object System.Collections.Generic.List[string]
+    $skipped = 0
+    foreach ($p in @($S.appliedConditionalAccessPolicies)) {
+        if (-not $p) { continue }
+        $res = [string]$p.result
+        if ($res -match 'notApplied|notEnabled|unknown') { $skipped++; continue }
+        $name = [string]$p.displayName
+        if (-not $name) { $name = [string]$p.id }
+        $grant = (Join-SignInBits @($p.enforcedGrantControls) ',')
+        $sess = (Join-SignInBits @($p.enforcedSessionControls) ',')
+        $bit = ('{0}={1}' -f $name, $res)
+        if ($grant) { $bit += ' grant:' + $grant }
+        if ($sess) { $bit += ' session:' + $sess }
+        $parts.Add($bit)
+    }
+    $text = $parts -join ' | '
+    if ($skipped -gt 0 -and $text) { $text += (' (+{0} not applied)' -f $skipped) }
+    elseif ($skipped -gt 0) { $text = ('{0} policy(ies) not applied' -f $skipped) }
+    return (Limit-Text $text 1500)
+}
+
+function Get-SignInStory {
+    param($Row)
+    $result = [string]$Row.Result
+    if (-not $result) { $result = 'Sign-in' }
+    $who = [string]$Row.User
+    $app = [string]$Row.AppName
+    if (-not $app) { $app = [string]$Row.ClientTool }
+    $resource = [string]$Row.Resource
+    $from = [string]$Row.IPAddress
+    if ($Row.Location) {
+        if ($from) { $from = '{0} ({1})' -f $from, $Row.Location } else { $from = [string]$Row.Location }
+    }
+    $head = $result + ' sign-in'
+    if ($who) { $head += ': ' + $who } else { $head += ':' }
+    if ($app) { $head += ' via ' + $app }
+    if ($resource) { $head += ' -> ' + $resource }
+    if ($from) { $head += ' from ' + $from }
+    $tech = Join-SignInBits @(
+        $(if ($Row.ClientAppUsed) { [string]$Row.ClientAppUsed } else { '' })
+        $(if ($Row.OperatingSystem) { [string]$Row.OperatingSystem } else { '' })
+        $(if ($Row.Browser) { [string]$Row.Browser } else { '' })
+        $(if ($Row.DeviceName) { 'device ' + $Row.DeviceName } else { '' })
+        $(if ($Row.AuthMethods) { 'auth ' + $Row.AuthMethods } else { '' })
+        $(if ($Row.AuthRequirement) { [string]$Row.AuthRequirement } else { '' })
+        $(if ($Row.ConditionalAccess) { 'CA ' + $Row.ConditionalAccess } else { '' })
+        $(if ($Row.Risk -and $Row.Risk -notin @('none', 'None')) { 'risk ' + $Row.Risk } else { '' })
+        $(if ($Row.SignInType) { [string]$Row.SignInType } else { '' })
+        $(if ($Row.IncomingTokenType -and $Row.IncomingTokenType -notin @('none', 'None')) { 'token ' + $Row.IncomingTokenType } else { '' })
+    ) ' | '
+    $bits = New-Object System.Collections.Generic.List[string]
+    $bits.Add($head)
+    if ($tech) { $bits.Add($tech) }
+    if ($Row.FailureReason) { $bits.Add([string]$Row.FailureReason) }
+    if ($Row.AdditionalDetails) { $bits.Add([string]$Row.AdditionalDetails) }
+    return (Limit-Text ($bits -join '. ') 900)
+}
+
 function New-SignInRow {
     param([hashtable]$H)
     $o = [ordered]@{}
     foreach ($c in $script:SignInColumns) {
+        if ($c -eq 'Story') { continue }
         $v = ''
         if ($H.ContainsKey($c) -and $null -ne $H[$c]) { $v = [string]$H[$c] }
         if ($c -eq 'TimeUtc' -and $v) { $v = ConvertTo-EasternTime $v }
@@ -706,7 +832,18 @@ function New-SignInRow {
     if ($o['User'] -and $script:SuspectUserSet.Contains($o['User'])) { $m += 'User' }
     if ($o['IPAddress'] -and $script:SuspectIpSet.Contains($o['IPAddress'])) { $m += 'IP' }
     $o['SuspectMatch'] = $m -join ','
+    $o['Story'] = Protect-CsvValue (Get-SignInStory $o)
     return [pscustomobject]$o
+}
+
+function Convert-SignInFromCsvRow {
+    param($Row)
+    if ($null -eq $Row) { return $null }
+    $h = @{}
+    foreach ($p in $Row.PSObject.Properties) {
+        if ($p.Name -and $null -ne $p.Value) { $h[$p.Name] = [string]$p.Value }
+    }
+    return (New-SignInRow $h)
 }
 
 function ConvertTo-EventFromSignIn {
@@ -725,6 +862,28 @@ function ConvertTo-EventFromSignIn {
     elseif ($ps -eq 'Yes') { $sev = 'Low' }
     $cat = 'Account Sign-In'
     if ($ps -eq 'Yes' -or $ps -eq 'Possible') { $cat = 'PowerShell / CLI Sign-In' }
+    $story = [string]$SignIn.Story
+    if (-not $story) { $story = Get-SignInStory $SignIn }
+    $detail = Join-SignInBits @(
+        $(if ($SignIn.AppName) { 'App=' + $SignIn.AppName } else { '' })
+        $(if ($SignIn.AppId) { 'AppId=' + $SignIn.AppId } else { '' })
+        $(if ($SignIn.Result) { 'Result=' + $SignIn.Result } else { '' })
+        $(if ($SignIn.ErrorCode) { 'Error=' + $SignIn.ErrorCode } else { '' })
+        $(if ($SignIn.FailureReason) { [string]$SignIn.FailureReason } else { '' })
+        $(if ($SignIn.AdditionalDetails) { [string]$SignIn.AdditionalDetails } else { '' })
+        $(if ($SignIn.ClientAppUsed) { 'ClientApp=' + $SignIn.ClientAppUsed } else { '' })
+        $(if ($SignIn.DeviceName) { 'Device=' + $SignIn.DeviceName } else { '' })
+        $(if ($SignIn.OperatingSystem) { 'OS=' + $SignIn.OperatingSystem } else { '' })
+        $(if ($SignIn.Browser) { 'Browser=' + $SignIn.Browser } else { '' })
+        $(if ($SignIn.AuthMethods) { 'Auth=' + $SignIn.AuthMethods } else { '' })
+        $(if ($SignIn.AuthDetails) { [string]$SignIn.AuthDetails } else { '' })
+        $(if ($SignIn.ConditionalAccess) { 'CA=' + $SignIn.ConditionalAccess } else { '' })
+        $(if ($SignIn.ConditionalAccessPolicies) { [string]$SignIn.ConditionalAccessPolicies } else { '' })
+        $(if ($SignIn.Risk) { 'Risk=' + $SignIn.Risk } else { '' })
+        $(if ($SignIn.SessionId) { 'Session=' + $SignIn.SessionId } else { '' })
+        $(if ($SignIn.CorrelationId) { 'Correlation=' + $SignIn.CorrelationId } else { '' })
+        $(if ($SignIn.UserAgent) { 'UA=' + $SignIn.UserAgent } else { '' })
+    )
     return (New-EventRow @{
             TimeUtc           = $SignIn.TimeUtc
             Severity          = $sev
@@ -735,8 +894,8 @@ function ConvertTo-EventFromSignIn {
             ClientIP          = $SignIn.IPAddress
             InferredLocation  = $SignIn.Location
             Target            = $SignIn.Resource
-            CommandLine       = $(if ($failed) { 'Sign-in FAILED: {0}' -f $channel } else { 'Sign-in: {0}' -f $channel })
-            Details           = (Limit-Text ('App={0}; AppId={1}; Result={2}; Error={3}; {4}; UA={5}' -f $SignIn.AppName, $SignIn.AppId, $SignIn.Result, $SignIn.ErrorCode, $SignIn.FailureReason, $SignIn.UserAgent) 1500)
+            CommandLine       = $story
+            Details           = (Limit-Text $detail 2500)
             PowerShellRelated = $ps
             ExecutionChannel  = $channel
             AppId             = $SignIn.AppId
@@ -1192,8 +1351,9 @@ function ConvertFrom-UalSignIn {
     try { $a = ([string]$Record.AuditData) | ConvertFrom-Json -ErrorAction Stop } catch { return $null }
     $appId = ([string](Get-FirstValue $a @('ApplicationId', 'AppId'))).ToLowerInvariant()
     $ua = Get-UalUserAgent $a
+    $ext = Get-UalExtendedMap $a
     $detail = ''
-    foreach ($p in @($a.ExtendedProperties)) { if ($p -and $p.Name -eq 'ResultStatusDetail') { $detail = [string]$p.Value } }
+    if ($ext['ResultStatusDetail']) { $detail = $ext['ResultStatusDetail'] }
     $err = [string]$a.ErrorNumber
     $result = 'Success'
     if ($a.Operation -eq 'UserLoginFailed' -or ($err -and $err -ne '0')) { $result = 'Failure' }
@@ -1202,12 +1362,29 @@ function ConvertFrom-UalSignIn {
     if ($script:PowerShellApps.ContainsKey($appId) -or $tool -eq 'PowerShell') { $psApp = 'Yes' }
     elseif ($tool) { $psApp = 'Tooling' }
     elseif ($script:AbuseProneApps.ContainsKey($appId)) { $psApp = 'Abuse-prone client' }
+    $requestType = $ext['RequestType']
+    $signType = 'Interactive (UAL)'
+    if ($requestType) { $signType = $requestType }
+    $extraBits = New-Object System.Collections.Generic.List[string]
+    if ($ext['KeepMeSignedIn']) { $extraBits.Add('KeepMeSignedIn=' + $ext['KeepMeSignedIn']) }
+    if ($ext['LoginError']) { $extraBits.Add($ext['LoginError']) }
+    $extra = Join-SignInBits @($extraBits)
     return (New-SignInRow @{
-            TimeUtc = (ConvertTo-UtcIso $a.CreationTime); User = [string]$a.UserId; Result = $result; ErrorCode = $err
-            FailureReason = $detail; AppName = (Get-AppName $appId); AppId = $appId; PowerShellApp = $psApp
-            IPAddress = (Format-Ip ([string]$a.ClientIP)); Location = (Get-UalLocation $a); Resource = [string]$a.ObjectId
-            UserAgent = (Limit-Text $ua 400); ClientTool = $tool; SignInType = 'Interactive (UAL)'; Source = 'UAL-StsLogon'
-            Id = [string]$Record.Identity
+            TimeUtc = (ConvertTo-UtcIso $a.CreationTime); User = [string]$a.UserId; UserId = [string]$a.UserKey
+            Result = $result; ErrorCode = $err; FailureReason = $detail; AdditionalDetails = $extra
+            AppName = (Get-AppName $appId); AppId = $appId; PowerShellApp = $psApp
+            IPAddress = (Format-Ip ([string]$a.ClientIP)); Location = (Get-UalLocation $a)
+            Latitude = $ext['Latitude']; Longitude = $ext['Longitude']
+            Resource = [string]$a.ObjectId
+            UserAgent = (Limit-Text $ua 400); ClientTool = $tool; ClientAppUsed = $ext['ClientAppUsed']
+            SignInType = $signType
+            DeviceName = $ext['DeviceName']; DeviceId = $ext['DeviceId']
+            OperatingSystem = $(if ($ext['OS']) { $ext['OS'] } else { $ext['OperatingSystem'] })
+            Browser = $ext['Browser']
+            DeviceCompliant = $ext['IsCompliant']; DeviceManaged = $ext['IsManaged']; DeviceTrustType = $ext['DeviceTrustType']
+            CorrelationId = $(if ($ext['CorrelationId']) { $ext['CorrelationId'] } else { [string]$a.CorrelationId })
+            SessionId = $ext['SessionId']; UniqueTokenId = $ext['UniqueTokenId']; OriginalRequestId = $ext['RequestId']
+            Source = 'UAL-StsLogon'; Id = [string]$Record.Identity
         })
 }
 
@@ -1932,14 +2109,72 @@ function ConvertFrom-GraphSignIn {
     elseif ($script:AbuseProneApps.ContainsKey($appId)) { $psApp = 'Abuse-prone client' }
     $appName = [string]$S.appDisplayName
     if (-not $appName) { $appName = Get-AppName $appId }
+    $dev = $S.deviceDetail
+    $geo = $null
+    if ($S.location) { $geo = $S.location.geoCoordinates }
+    $riskEvents = @($S.riskEventTypes_v2)
+    if ($riskEvents.Count -eq 0) { $riskEvents = @($S.riskEventTypes) }
+    $home = [string]$S.homeTenantName
+    if (-not $home) { $home = [string]$S.homeTenantId }
+    $interactive = ''
+    if ($null -ne $S.isInteractive) { $interactive = Format-GraphFlag $S.isInteractive }
+    $flagged = ''
+    if ($null -ne $S.flaggedForReview) { $flagged = Format-GraphFlag $S.flaggedForReview }
     return (New-SignInRow @{
-            TimeUtc = (ConvertTo-UtcIso $S.createdDateTime); User = $user; Result = $result; ErrorCode = $err
-            FailureReason = [string]$S.status.failureReason; AppName = $appName; AppId = $appId; PowerShellApp = $psApp
-            IPAddress = (Format-Ip ([string]$S.ipAddress)); Location = $loc; Resource = [string]$S.resourceDisplayName
-            UserAgent = (Limit-Text $ua 400); ClientTool = $tool; ClientAppUsed = [string]$S.clientAppUsed; SignInType = $types
-            ConditionalAccess = [string]$S.conditionalAccessStatus; Risk = [string]$S.riskLevelDuringSignIn
-            AuthRequirement = [string]$S.authenticationRequirement; Source = ('Graph-' + $Label); Id = [string]$S.id
+            TimeUtc = (ConvertTo-UtcIso $S.createdDateTime); User = $user
+            UserDisplayName = [string]$S.userDisplayName; UserId = [string]$S.userId
+            Result = $result; ErrorCode = $err; FailureReason = [string]$S.status.failureReason
+            AdditionalDetails = [string]$S.status.additionalDetails
+            AppName = $appName; AppId = $appId; PowerShellApp = $psApp
+            IPAddress = (Format-Ip ([string]$S.ipAddress)); Location = $loc
+            Latitude = $(if ($geo) { [string]$geo.latitude } else { '' })
+            Longitude = $(if ($geo) { [string]$geo.longitude } else { '' })
+            ASN = [string]$S.autonomousSystemNumber
+            Resource = [string]$S.resourceDisplayName; ResourceId = [string]$S.resourceId
+            UserAgent = (Limit-Text $ua 400); ClientTool = $tool; ClientAppUsed = [string]$S.clientAppUsed
+            SignInType = $types; IsInteractive = $interactive
+            DeviceName = $(if ($dev) { [string]$dev.displayName } else { '' })
+            DeviceId = $(if ($dev) { [string]$dev.deviceId } else { '' })
+            OperatingSystem = $(if ($dev) { [string]$dev.operatingSystem } else { '' })
+            Browser = $(if ($dev) { [string]$dev.browser } else { '' })
+            DeviceCompliant = $(if ($dev) { Format-GraphFlag $dev.isCompliant } else { '' })
+            DeviceManaged = $(if ($dev) { Format-GraphFlag $dev.isManaged } else { '' })
+            DeviceTrustType = $(if ($dev) { [string]$dev.trustType } else { '' })
+            AuthRequirement = [string]$S.authenticationRequirement
+            AuthMethods = (Format-GraphAuthMethods $S)
+            AuthDetails = (Format-GraphAuthDetails $S)
+            AuthProtocol = [string]$S.authenticationProtocol
+            IncomingTokenType = [string]$S.incomingTokenType
+            TokenIssuerType = [string]$S.tokenIssuerType
+            ClientCredentialType = [string]$S.clientCredentialType
+            ConditionalAccess = [string]$S.conditionalAccessStatus
+            ConditionalAccessPolicies = (Format-GraphCaPolicies $S)
+            Risk = [string]$S.riskLevelDuringSignIn
+            RiskState = [string]$S.riskState
+            RiskDetail = [string]$S.riskDetail
+            RiskEventTypes = (Join-SignInBits @($riskEvents))
+            CorrelationId = [string]$S.correlationId
+            SessionId = [string]$S.sessionId
+            UniqueTokenId = [string]$S.uniqueTokenIdentifier
+            OriginalRequestId = [string]$S.originalRequestId
+            CrossTenant = [string]$S.crossTenantAccessType
+            HomeTenant = $home
+            FlaggedForReview = $flagged
+            Source = ('Graph-' + $Label); Id = [string]$S.id
         })
+}
+
+function Read-RawGraphSignIns {
+    $path = Join-Path $script:RawPath 'Graph-SignIns.jsonl'
+    if (-not $script:RawPath -or -not (Test-Path -LiteralPath $path)) { return @{} }
+    $map = @{}
+    foreach ($line in [System.IO.File]::ReadLines($path)) {
+        if (-not $line) { continue }
+        try { $obj = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+        $id = [string]$obj.id
+        if ($id) { $map[$id] = $obj }
+    }
+    return $map
 }
 
 function ConvertFrom-GraphDirectoryAudit {
@@ -2383,6 +2618,22 @@ function New-InvestigationReport {
     foreach ($f in @(Get-ChildItem -LiteralPath $script:OutputPath -Filter 'SignIns-*.csv' -File -ErrorAction SilentlyContinue)) {
         foreach ($r in @(Import-Csv -LiteralPath $f.FullName)) { $signIns.Add((Convert-ObjectTimesToEastern $r)) }
     }
+    $rawGraphSi = Read-RawGraphSignIns
+    if ($rawGraphSi.Count -gt 0) {
+        $merged = New-Object System.Collections.Generic.List[object]
+        foreach ($r in $signIns) {
+            $id = [string]$r.Id
+            if ($id -and $rawGraphSi.ContainsKey($id)) { $merged.Add((ConvertFrom-GraphSignIn $rawGraphSi[$id] 'SignIn')) }
+            else { $merged.Add((Convert-SignInFromCsvRow $r)) }
+        }
+        $signIns = $merged
+        Write-Log 'INFO' ('Rehydrated {0:N0} sign-in(s) from raw Graph-SignIns.jsonl.' -f $rawGraphSi.Count)
+    }
+    else {
+        $shapedSi = New-Object System.Collections.Generic.List[object]
+        foreach ($r in $signIns) { $shapedSi.Add((Convert-SignInFromCsvRow $r)) }
+        $signIns = $shapedSi
+    }
     $findings = @()
     foreach ($f in @(Get-ChildItem -LiteralPath $script:OutputPath -Filter 'Findings-*.csv' -File -ErrorAction SilentlyContinue)) { $findings += @(Import-Csv -LiteralPath $f.FullName | ForEach-Object { Convert-ObjectTimesToEastern $_ }) }
     $coverage = @()
@@ -2435,6 +2686,9 @@ function New-InvestigationReport {
     }
 
     $psSignIns = @($signIns | Where-Object { $_.PowerShellApp -ne 'No' -or $_.SuspectMatch } | Sort-Object TimeUtc -Descending)
+    if ($psSignIns.Count -gt 0) {
+        Export-EvidenceCsv -Rows $psSignIns -Path (Join-Path $script:OutputPath 'SignIns-Master.csv')
+    }
     foreach ($s in $psSignIns) {
         $ev = ConvertTo-EventFromSignIn $s
         if ($ev) { $events.Add($ev) }
@@ -2490,6 +2744,12 @@ function New-InvestigationReport {
             FirstUtc = $fl[0]; LastUtc = $fl[1]; IPs = (Get-TopValues ($g.Group | ForEach-Object { $_.IPAddress }) 6)
             Locations = (Get-TopValues ($g.Group | ForEach-Object { $_.Location }) 4); Resources = (Get-TopValues ($g.Group | ForEach-Object { $_.Resource }) 5)
             UserAgents = (Get-TopValues ($g.Group | ForEach-Object { $_.UserAgent }) 2)
+            OperatingSystems = (Get-TopValues ($g.Group | ForEach-Object { $_.OperatingSystem }) 3)
+            Browsers = (Get-TopValues ($g.Group | ForEach-Object { $_.Browser }) 3)
+            AuthMethods = (Get-TopValues ($g.Group | ForEach-Object { $_.AuthMethods }) 4)
+            Devices = (Get-TopValues ($g.Group | ForEach-Object { $_.DeviceName }) 4)
+            ClientApps = (Get-TopValues ($g.Group | ForEach-Object { $_.ClientAppUsed }) 3)
+            Story = (Get-SignInStory $first)
         }
     }
     $siSummary = @($siSummary | Sort-Object @{ Expression = 'Suspect'; Descending = $true }, @{ Expression = 'Success'; Descending = $true })
@@ -2584,7 +2844,7 @@ function New-InvestigationReport {
             'Entra sign-in and directory audit logs via Graph cover the last 30 days only; older Entra changes come from the Unified Audit Log.',
             'All times are US Eastern Time (America/New_York): EST (UTC-5) in winter, EDT (UTC-4) in summer. Microsoft APIs were queried in UTC; raw jsonl in the raw\ folder stays UTC. Hashes are in Evidence-Manifest.csv.',
             'PowerShell / CLI sign-ins from Entra are copied onto Commands, Timeline, Failed, and Actors so those tabs match SignIns-*.csv. The Sign-ins tab lists the same rows and ignores the Severity dropdown (that filter is for cmdlet events).',
-            'Click a row for the full command. Click an account, IP, app, location, or error to pivot. Use From/To (Eastern Time) plus Focus timeline to reconstruct the sequence. Press / to search, Esc to clear, c to copy the command.'
+            'Click a sign-in row for device, authentication method, Conditional Access, session IDs, and the story of how that logon happened. Click an account/client rollup then Show these sign-ins to open the matching log. Use From/To (Eastern Time) plus Focus timeline to reconstruct the sequence. Press / to search, Esc to clear, c to copy.'
         )
         events = @($embedEvents | ForEach-Object { ConvertTo-JsonMap $_ $script:EventColumns })
         signIns = @($psSignIns | ForEach-Object { ConvertTo-JsonMap $_ $script:SignInColumns })
@@ -2592,7 +2852,7 @@ function New-InvestigationReport {
         coverage = @($coverage | ForEach-Object { ConvertTo-JsonMap $_ @('RunUtc', 'Source', 'Status', 'Records', 'FromUtc', 'ToUtc', 'Notes') })
         tactics = @($tactics | ForEach-Object { ConvertTo-JsonMap $_ @('Severity', 'Category', 'Mitre', 'Events', 'Succeeded', 'Failed', 'FirstUtc', 'LastUtc', 'Actors', 'Operations') })
         actors = @($actors | ForEach-Object { ConvertTo-JsonMap $_ @('Actor', 'Suspect', 'Events', 'Critical', 'High', 'Failed', 'FirstUtc', 'LastUtc', 'IPs', 'Channels', 'TopOperations') })
-        siSummary = @($siSummary | ForEach-Object { ConvertTo-JsonMap $_ @('User', 'Client', 'ClientClass', 'Suspect', 'Success', 'Failure', 'FirstUtc', 'LastUtc', 'IPs', 'Locations', 'Resources', 'UserAgents') })
+        siSummary = @($siSummary | ForEach-Object { ConvertTo-JsonMap $_ @('User', 'Client', 'ClientClass', 'Suspect', 'Success', 'Failure', 'FirstUtc', 'LastUtc', 'IPs', 'Locations', 'Resources', 'UserAgents', 'OperatingSystems', 'Browsers', 'AuthMethods', 'Devices', 'ClientApps', 'Story') })
         ipSummary = @($ipSummary | ForEach-Object { ConvertTo-JsonMap $_ @('IPAddress', 'Suspect', 'Activity', 'FirstUtc', 'LastUtc', 'Accounts', 'Locations', 'Activities') })
         resources = @($resourceSummary | ForEach-Object { ConvertTo-JsonMap $_ @('Resource', 'Result', 'Count', 'FirstUtc', 'LastUtc', 'Accounts', 'FailureReasons') })
         activity = @($actSummary | ForEach-Object { ConvertTo-JsonMap $_ @('Actor', 'Workload', 'Operation', 'Count', 'FirstUtc', 'LastUtc', 'IPs', 'Sample') })
@@ -2644,8 +2904,9 @@ code,pre{font-family:Consolas,ui-monospace,monospace;font-size:12px;white-space:
 .b-critical{background:var(--crit)}.b-high{background:var(--high)}.b-medium{background:var(--med)}.b-low{background:var(--low)}.b-info{background:var(--info)}
 .note,.empty,.pager{color:var(--mut);margin:8px 0}
 .pager button{margin-right:6px}
-.detail{position:fixed;right:0;top:0;height:100%;width:min(520px,46vw);background:var(--card);border-left:1px solid var(--bd);padding:16px 18px;overflow:auto;transform:translateX(110%);transition:transform .15s;z-index:20;box-shadow:0 0 24px rgba(0,0,0,.2)}
-.detail.open{transform:none}.detail h3{margin:0 0 8px}.kv{margin:6px 0}.kv b{display:inline-block;min-width:120px;color:var(--mut)}
+.detail{position:fixed;right:0;top:0;height:100%;width:min(620px,54vw);background:var(--card);border-left:1px solid var(--bd);padding:16px 18px;overflow:auto;transform:translateX(110%);transition:transform .15s;z-index:20;box-shadow:0 0 24px rgba(0,0,0,.2)}
+.detail.open{transform:none}.detail h3{margin:0 0 8px}.detail h4{margin:14px 0 4px;font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--mut);border-bottom:1px solid var(--bd);padding-bottom:3px}
+.detail .lead{background:var(--bg);border-radius:8px;padding:10px 12px;margin:8px 0 12px}.kv{margin:6px 0}.kv b{display:inline-block;min-width:156px;color:var(--mut);vertical-align:top}
 .warn{background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;padding:10px 14px;margin:8px 0}
 .dark .warn{background:#3b2f0b;border-color:#a16207}
 .story{background:var(--card);border:1px solid var(--bd);border-left:4px solid var(--sel);border-radius:8px;padding:10px 14px;margin:8px 0}
@@ -2668,7 +2929,12 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
   function lc(v){ return (v||"").toString().toLowerCase(); }
   function enc(v){ return String(v==null?"":v).replace(/[&<>"']/g, function(c){ return ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]); }); }
   function colLabel(c){
-    var m={TimeUtc:"Time (ET)",WhenUtc:"When (ET)",FirstUtc:"First (ET)",LastUtc:"Last (ET)",RunUtc:"Run (ET)",FromUtc:"From (ET)",ToUtc:"To (ET)",StartUtc:"Start (ET)",EndUtc:"End (ET)",GeneratedUtc:"Generated (ET)",LastWriteUtc:"Last write (ET)"};
+    var m={TimeUtc:"Time (ET)",WhenUtc:"When (ET)",FirstUtc:"First (ET)",LastUtc:"Last (ET)",RunUtc:"Run (ET)",FromUtc:"From (ET)",ToUtc:"To (ET)",StartUtc:"Start (ET)",EndUtc:"End (ET)",GeneratedUtc:"Generated (ET)",LastWriteUtc:"Last write (ET)",
+      UserDisplayName:"Display name",UserId:"User object ID",AdditionalDetails:"Additional details",AppName:"Application",AppId:"App ID",PowerShellApp:"Client class",IPAddress:"IP address",ASN:"ASN",ResourceId:"Resource ID",
+      ClientTool:"Client from UA",ClientAppUsed:"Client app",SignInType:"Sign-in type",IsInteractive:"Interactive",DeviceName:"Device",DeviceId:"Device ID",OperatingSystem:"OS",DeviceCompliant:"Compliant",DeviceManaged:"Managed",DeviceTrustType:"Device trust",
+      AuthRequirement:"Auth requirement",AuthMethods:"Auth methods",AuthDetails:"Authentication",AuthProtocol:"Auth protocol",IncomingTokenType:"Incoming token",TokenIssuerType:"Token issuer",ClientCredentialType:"Client credential",
+      ConditionalAccess:"CA status",ConditionalAccessPolicies:"CA policies",RiskState:"Risk state",RiskDetail:"Risk detail",RiskEventTypes:"Risk events",CorrelationId:"Correlation ID",SessionId:"Session ID",UniqueTokenId:"Unique token ID",
+      OriginalRequestId:"Original request ID",CrossTenant:"Cross-tenant",HomeTenant:"Home tenant",FlaggedForReview:"Flagged for review",FailureReason:"Failure reason",ErrorCode:"Error code",UserAgent:"User agent"};
     return m[c]||c;
   }
   function badge(sev){ if(!sev) return ""; return '<span class="badge b-'+enc(lc(sev))+'">'+enc(sev)+'</span>'; }
@@ -2792,19 +3058,56 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
     if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(text); }
     else { var t=document.createElement("textarea"); t.value=text; document.body.appendChild(t); t.select(); try{ document.execCommand("copy"); }catch(e){} document.body.removeChild(t); }
   }
+  function hasVal(v){ return v!==undefined && v!==null && String(v)!==""; }
+  function kvHtml(k,v){
+    var long = k==="CommandLine"||k==="Details"||k==="Story"||k==="AuthDetails"||k==="ConditionalAccessPolicies"||k==="UserAgent"||k==="UserAgents";
+    return '<div class="kv"><b>'+enc(colLabel(k))+'</b> '+(long?"<pre><code>"+enc(v)+"</code></pre>":enc(v))+"</div>";
+  }
+  var DETAIL_GROUPS = [
+    ["Account", ["User","UserDisplayName","UserId","SuspectMatch"]],
+    ["When and result", ["TimeUtc","Result","ErrorCode","FailureReason","AdditionalDetails","FirstUtc","LastUtc","Success","Failure"]],
+    ["Client and app", ["AppName","Client","ClientClass","AppId","PowerShellApp","ClientTool","ClientAppUsed","ClientApps","Resource","ResourceId","Resources"]],
+    ["Network", ["IPAddress","ClientIP","InferredIP","IPs","Location","InferredLocation","Locations","Latitude","Longitude","ASN"]],
+    ["Device", ["DeviceName","Devices","DeviceId","OperatingSystem","OperatingSystems","Browser","Browsers","DeviceCompliant","DeviceManaged","DeviceTrustType"]],
+    ["Authentication", ["AuthRequirement","AuthMethods","AuthDetails","AuthProtocol","IncomingTokenType","TokenIssuerType","ClientCredentialType","IsInteractive","SignInType"]],
+    ["Conditional Access", ["ConditionalAccess","ConditionalAccessPolicies"]],
+    ["Risk", ["Risk","RiskState","RiskDetail","RiskEventTypes"]],
+    ["Session", ["CorrelationId","SessionId","UniqueTokenId","OriginalRequestId"]],
+    ["Tenant", ["CrossTenant","HomeTenant","FlaggedForReview"]],
+    ["Event", ["Severity","Category","Operation","Outcome","Actor","Target","TargetIdentity","CommandLine","Details","AccessGained","Mitre","PowerShellRelated","ExecutionChannel","Workload","RecordType"]],
+    ["Source", ["Source","RecordId","Id","UserAgent","UserAgents"]]
+  ];
   function showDetail(row){
-    var d=$("detail"), h=["<h3>Event detail</h3>","<button class='btn' onclick='window._irCloseDetail()'>Close</button>"];
+    var d=$("detail");
     if(!row){ d.className="detail"; d.innerHTML=""; return; }
-    var keys=["TimeUtc","Severity","Category","Operation","Outcome","Actor","User","Result","AppName","PowerShellApp","ClientIP","IPAddress","InferredIP","InferredLocation","Location","Target","TargetIdentity","CommandLine","Details","AccessGained","Mitre","PowerShellRelated","ExecutionChannel","AppId","UserAgent","ErrorCode","FailureReason","Resource","SuspectMatch","Workload","RecordType","Source","RecordId"];
-    keys.forEach(function(k){ if(row[k]) h.push('<div class="kv"><b>'+enc(colLabel(k))+'</b> '+(k==="CommandLine"?"<pre><code>"+enc(row[k])+"</code></pre>":enc(row[k]))+"</div>"); });
+    var isSummary = hasVal(row.Client) && hasVal(row.FirstUtc) && !hasVal(row.Result);
+    var isSignIn = hasVal(row.Result) && (hasVal(row.AppName)||hasVal(row.User)||hasVal(row.IPAddress));
+    var title = isSummary ? "How this account signed in" : (isSignIn ? "Sign-in detail" : "Event detail");
+    var h=["<h3>"+title+"</h3>","<button class='btn' onclick='window._irCloseDetail()'>Close</button>"];
+    if(row.Story) h.push("<div class='lead'><code>"+enc(row.Story)+"</code></div>");
+    var seen={Story:1};
+    DETAIL_GROUPS.forEach(function(g){
+      var body=[];
+      g[1].forEach(function(k){ seen[k]=1; if(hasVal(row[k])) body.push(kvHtml(k,row[k])); });
+      if(body.length){ h.push("<h4>"+g[0]+"</h4>"); h.push(body.join("")); }
+    });
+    var extra=[];
+    Object.keys(row).forEach(function(k){ if(seen[k] || !hasVal(row[k])) return; extra.push(kvHtml(k,row[k])); });
+    if(extra.length){ h.push("<h4>Other</h4>"); h.push(extra.join("")); }
     var hours=parseInt(D.meta.CorrelationHours,10)||12;
-    h.push("<p><button class='btn' onclick='window._irFocus()'>Focus timeline ±"+hours+"h</button> ");
-    if(row.CommandLine) h.push("<button class='btn' onclick='window._irCopy()'>Copy command</button> ");
+    h.push("<p>");
+    if(isSummary) h.push("<button class='btn' onclick='window._irShowThese()'>Show these sign-ins</button> ");
+    h.push("<button class='btn' onclick='window._irFocus()'>Focus timeline ±"+hours+"h</button> ");
+    if(row.CommandLine||row.Story) h.push("<button class='btn' onclick='window._irCopy()'>Copy</button> ");
     h.push("<button class='btn' onclick='window._irCloseDetail()'>Close</button></p>");
     d.innerHTML=h.join(""); d.className="detail open";
-    window._irCopy=function(){ copyCmd(row.CommandLine||row.Operation||""); };
+    window._irCopy=function(){ copyCmd(row.CommandLine||row.Story||row.Operation||""); };
     window._irCloseDetail=function(){ d.className="detail"; };
     window._irFocus=function(){ focusAround(row); };
+    window._irShowThese=function(){
+      S.actor=row.User||""; S.app=row.Client||row.AppName||""; S.tab="signins"; S.page=1; render();
+      var el=$("tbl-signins"); if(el && el.scrollIntoView) el.scrollIntoView({behavior:"smooth",block:"start"});
+    };
   }
   function table(id, rows, cols, opts){
     opts=opts||{};
@@ -2952,8 +3255,8 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
     if(S.tab==="actors"){ $("view-actors").className=""; table("tbl-actors", D.actors||[], ["Actor","Suspect","Events","Critical","High","Failed","FirstUtc","LastUtc","IPs","Channels","TopOperations"], {match:function(r){ return (!S.q || blob(r).indexOf(S.q)>=0) && (!S.suspect || r.Suspect==="YES"); }}); } else $("view-actors").className="hide";
     if(S.tab==="signins"){
       $("view-signins").className="";
-      table("tbl-sisummary", D.siSummary||[], ["User","Client","ClientClass","Suspect","Success","Failure","FirstUtc","LastUtc","IPs","Locations","Resources"], {match:function(r){ return (!S.q || blob(r).indexOf(S.q)>=0) && (!S.actor || r.User===S.actor) && (!S.app || r.Client===S.app) && (!S.suspect || r.Suspect==="YES") && (!S.unusual || r.ClientClass==="Tooling" || r.ClientClass==="Abuse-prone client") && inTime({TimeUtc:r.FirstUtc}); }});
-      table("tbl-signins", D.signIns||[], ["TimeUtc","User","Result","AppName","PowerShellApp","IPAddress","Location","ErrorCode","FailureReason","Resource","ClientTool","SignInType","ConditionalAccess","Risk","UserAgent","SuspectMatch"], {match:matchSignIn});
+      table("tbl-sisummary", D.siSummary||[], ["User","Client","ClientClass","Suspect","Success","Failure","FirstUtc","LastUtc","IPs","Locations","OperatingSystems","AuthMethods","Devices","Resources"], {match:function(r){ return (!S.q || blob(r).indexOf(S.q)>=0) && (!S.actor || r.User===S.actor) && (!S.app || r.Client===S.app) && (!S.suspect || r.Suspect==="YES") && (!S.unusual || r.ClientClass==="Tooling" || r.ClientClass==="Abuse-prone client") && inTime({TimeUtc:r.FirstUtc}); }});
+      table("tbl-signins", D.signIns||[], ["TimeUtc","User","Result","Story","AppName","IPAddress","Location","OperatingSystem","Browser","AuthMethods","ConditionalAccess","Risk","ClientAppUsed","SignInType","DeviceName","Resource","ErrorCode","FailureReason","UserAgent","SuspectMatch"], {match:matchSignIn});
     } else $("view-signins").className="hide";
     if(S.tab==="ips"){ $("view-ips").className=""; table("tbl-ips", D.ipSummary||[], ["IPAddress","Suspect","Activity","FirstUtc","LastUtc","Accounts","Locations","Activities"], {match:function(r){ return (!S.q || blob(r).indexOf(S.q)>=0) && (!S.ip || r.IPAddress===S.ip) && (!S.suspect || r.Suspect==="YES"); }}); } else $("view-ips").className="hide";
     if(S.tab==="failed"){ $("view-failed").className=""; table("tbl-failed", D.events||[], ["TimeUtc","Severity","Category","AccessGained","Operation","Actor","ClientIP","Target","CommandLine","Details"], {match:matchFailed}); } else $("view-failed").className="hide";
@@ -3023,9 +3326,9 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
     [void]$sb.Append('<section id="view-path"><h2>Attack path by tactic</h2><div id="tbl-path"></div></section>')
     [void]$sb.Append('<section id="view-actors"><h2>Who ran commands</h2><div id="tbl-actors"></div></section>')
     [void]$sb.Append('<section id="view-signins"><h2>PowerShell &amp; tooling sign-ins</h2>')
-    [void]$sb.Append('<p class="lead">Failed logons then a success from the same IP is often the foothold. Filter by time, account, IP, app, location, or error. Click a row and use Focus timeline to see cmdlets in the following hours.</p>')
+    [void]$sb.Append('<p class="lead">Each row is one Entra sign-in. Click it for device, OS/browser, authentication methods, Conditional Access, session IDs, and a story of how that logon happened. Click an account/client rollup, then Show these sign-ins. Failed logons then a success from the same IP is often the foothold.</p>')
     [void]$sb.Append('<h3 class="block">How they signed in (by account and client)</h3><div id="tbl-sisummary"></div>')
-    [void]$sb.Append('<h3 class="block">Sign-in log</h3><div id="tbl-signins"></div></section>')
+    [void]$sb.Append('<h3 class="block">Sign-in log (one row per attempt)</h3><div id="tbl-signins"></div></section>')
     [void]$sb.Append('<section id="view-ips"><h2>Source IP addresses</h2><div id="tbl-ips"></div></section>')
     [void]$sb.Append('<section id="view-failed"><h2>Failed attempts</h2><div id="tbl-failed"></div></section>')
     [void]$sb.Append('<section id="view-findings"><h2>Current-state persistence</h2><div id="tbl-findings"></div></section>')
