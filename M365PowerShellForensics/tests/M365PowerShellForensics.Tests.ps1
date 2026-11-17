@@ -230,8 +230,14 @@ $gsiRaw = [pscustomobject]@{
     authenticationRequirement = 'multiFactorAuthentication'
     authenticationMethodsUsed = @('Password', 'Mobile app notification')
     authenticationDetails = @(
-        [pscustomobject]@{ authenticationMethod = 'Password'; authenticationMethodDetail = 'Password in the cloud'; authenticationStepResultDetail = 'Correct password'; succeeded = $true }
-        [pscustomobject]@{ authenticationMethod = 'Mobile app notification'; authenticationMethodDetail = 'Microsoft Authenticator'; authenticationStepResultDetail = 'MFA requirement satisfied by claim in the token'; succeeded = $true }
+        [pscustomobject]@{ authenticationMethod = 'Password'; authenticationMethodDetail = 'Password in the cloud'; authenticationStepRequirement = 'primary'; authenticationStepResultDetail = 'Correct password'; succeeded = $true }
+        [pscustomobject]@{ authenticationMethod = 'Mobile app notification'; authenticationMethodDetail = 'Pixel 8'; authenticationStepRequirement = 'multifactor authentication'; authenticationStepResultDetail = 'MFA completed in Azure AD'; succeeded = $true }
+    )
+    authenticationAppDeviceDetails = [pscustomobject]@{
+        clientApp = 'Microsoft Authenticator'; appVersion = '6.2401.0'; deviceId = 'auth-dev-1'; operatingSystem = 'Android 14'
+    }
+    authenticationAppPolicyEvaluationDetails = @(
+        [pscustomobject]@{ policyName = 'Number matching'; adminConfiguration = 'enabled'; status = 'numberMatchCorrectNumberEntered'; authenticationEvaluation = 'success' }
     )
     authenticationProtocol = 'oAuth2'
     incomingTokenType = 'none'
@@ -264,7 +270,9 @@ Assert-Equal $gsi.PowerShellApp 'Yes' 'Graph PowerShell sign-in is Yes'
 Assert-Contains $gsi.Location 'Ashburn' 'Graph location is joined'
 Assert-Equal $gsi.DeviceName 'ATTACKER-LAPTOP' 'Graph sign-in keeps device name'
 Assert-Contains $gsi.AuthMethods 'Password' 'Graph sign-in lists auth methods'
-Assert-Contains $gsi.AuthDetails 'Microsoft Authenticator' 'Graph sign-in keeps MFA step detail'
+Assert-Contains $gsi.MfaChallenge 'number matching' 'Graph sign-in names the Authenticator number-match challenge'
+Assert-Contains $gsi.AuthAppDevice 'Microsoft Authenticator' 'Graph sign-in keeps the Authenticator app/device'
+Assert-Contains $gsi.AuthSteps 'Pixel 8' 'Graph sign-in keeps the Authenticator device name from the MFA step'
 Assert-Contains $gsi.ConditionalAccessPolicies 'Require MFA for admins=success' 'Graph sign-in keeps applied CA policy'
 Assert-Equal $gsi.SessionId 'sess-graph-1' 'Graph sign-in keeps session id'
 Assert-Equal $gsi.ASN '174' 'Graph sign-in keeps ASN'
@@ -286,6 +294,29 @@ $failSi = ConvertFrom-GraphSignIn ([pscustomobject]@{
 Assert-Equal $failSi.Result 'Failure' 'non-zero Graph error is a failed sign-in'
 Assert-Equal $failSi.PowerShellApp 'Yes' 'failed AAD PowerShell sign-in is still PowerShell'
 Assert-Contains $failSi.Story 'Invalid username or password' 'failed sign-in story keeps the failure reason'
+
+$smsSi = ConvertFrom-GraphSignIn ([pscustomobject]@{
+        createdDateTime = '2026-10-01T11:56:00Z'
+        appId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
+        appDisplayName = 'Microsoft Graph PowerShell'
+        userPrincipalName = 'attacker@contoso.com'
+        ipAddress = '203.0.113.50'
+        userAgent = 'Mozilla/5.0 PowerShell/7.4'
+        status = [pscustomobject]@{ errorCode = 0; failureReason = ''; additionalDetails = '' }
+        location = [pscustomobject]@{ city = 'Ashburn'; state = 'VA'; countryOrRegion = 'US' }
+        resourceDisplayName = 'Microsoft Graph'
+        isInteractive = $true
+        authenticationRequirement = 'multiFactorAuthentication'
+        authenticationDetails = @(
+            [pscustomobject]@{ authenticationMethod = 'Password'; authenticationMethodDetail = 'Password in the cloud'; succeeded = $true }
+            [pscustomobject]@{ authenticationMethod = 'Text message'; authenticationMethodDetail = '+1 XXXXXX5555'; authenticationStepRequirement = 'multifactor authentication'; authenticationStepResultDetail = 'MFA completed in Azure AD'; succeeded = $true }
+        )
+        mfaDetail = [pscustomobject]@{ authMethod = 'Text message'; authDetail = '+1 XXXXXX5555' }
+        id = 'sms-si-1'
+    }) 'SignIn'
+Assert-Contains $smsSi.MfaPhone '+1 XXXXXX5555' 'SMS sign-in keeps the destination number'
+Assert-Contains $smsSi.MfaChallenge 'SMS to +1 XXXXXX5555' 'SMS sign-in challenge names the phone number'
+Assert-Contains $smsSi.AuthSteps '+1 XXXXXX5555' 'SMS auth steps include the destination number'
 
 $fromSi = ConvertTo-EventFromSignIn $gsi
 Assert-Equal $fromSi.RecordType 'SignIn' 'sign-in events keep RecordType SignIn'
@@ -335,7 +366,7 @@ Initialize-M365PsForensicsOutput -OutputPath $out | Out-Null
 Initialize-SuspectSets -Users @('attacker@contoso.com') -IPs @('203.0.113.50')
 Initialize-InvestigationWindow -StartDate ([datetime]'2026-09-01') -EndDate ([datetime]'2026-10-02')
 Save-Rows -Rows @($row, $fedRow, $failRow, $ga) -FileName 'Events-UAL-Admin.csv'
-Save-Rows -Rows @($si, $gsi, $failSi) -FileName 'SignIns-Entra.csv'
+Save-Rows -Rows @($si, $gsi, $failSi, $smsSi) -FileName 'SignIns-Entra.csv'
 $rawDir = Join-Path $out 'raw'
 if (-not (Test-Path -LiteralPath $rawDir)) { New-Item -ItemType Directory -Path $rawDir -Force | Out-Null }
 $gsiRaw | ConvertTo-Json -Depth 8 -Compress | Set-Content -LiteralPath (Join-Path $rawDir 'Graph-SignIns.jsonl') -Encoding utf8
@@ -368,6 +399,11 @@ Assert-Contains $html 'ATTACKER-LAPTOP' 'report embeds the Graph device name'
 Assert-Contains $html 'Require MFA for admins=success' 'report embeds applied Conditional Access'
 Assert-Contains $html 'sess-graph-1' 'report embeds the sign-in session id'
 Assert-Contains $html 'Auth methods' 'report labels authentication methods in the drawer'
+Assert-Contains $html 'MFA phone' 'report labels the SMS/voice destination number'
+Assert-Contains $html 'MFA challenge' 'report labels the Authenticator challenge type'
+Assert-Contains $html 'number matching' 'report embeds Authenticator number matching'
+Assert-Contains $html '+1 XXXXXX5555' 'report embeds the SMS destination number'
+Assert-Contains $html 'Pixel 8' 'report embeds the Authenticator device name'
 $tl = @(Import-Csv -LiteralPath (Join-Path $out 'Timeline-Master.csv'))
 $siEvents = @($tl | Where-Object { $_.RecordType -eq 'SignIn' })
 Assert-True ($siEvents.Count -ge 3) 'PowerShell sign-ins are copied onto the command timeline'
@@ -419,7 +455,7 @@ $modErrors = $null
 $null = [System.Management.Automation.Language.Parser]::ParseFile($modulePath, [ref]$null, [ref]$modErrors)
 Assert-Equal @($modErrors).Count 0 'engine module parses'
 
-Assert-Equal (Get-M365PsForensicsVersion) '2.1.8' 'engine version is 2.1.8'
+Assert-Equal (Get-M365PsForensicsVersion) '2.1.9' 'engine version is 2.1.9'
 Assert-True (Test-Path -LiteralPath (Join-Path $out 'SignIns-Master.csv')) 'detailed sign-in master CSV is written'
 $siMaster = @(Import-Csv -LiteralPath (Join-Path $out 'SignIns-Master.csv'))
 Assert-True (@($siMaster | Where-Object { $_.DeviceName -eq 'ATTACKER-LAPTOP' }).Count -ge 1) 'sign-in master CSV keeps device name'

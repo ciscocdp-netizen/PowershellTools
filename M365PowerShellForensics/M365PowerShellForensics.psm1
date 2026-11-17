@@ -68,9 +68,13 @@
         methods, CA policies, session/correlation IDs, token type, risk). The
         HTML Sign-ins tab and detail drawer show how each sign-in happened.
         -ReportOnly rehydrates those fields from raw\Graph-SignIns.jsonl.
+    Version 2.1.9:
+      - Auth method detail now includes the SMS/voice destination number,
+        Authenticator challenge type (push, number matching, TOTP), and the
+        Authenticator device/app that received the MFA prompt.
 #>
 
-$script:ScriptVersion = '2.1.8'
+$script:ScriptVersion = '2.1.9'
 $script:EasternTimeZone = $null
 $script:TimeOutputProperties = @('TimeUtc', 'WhenUtc', 'FirstUtc', 'LastUtc', 'RunUtc', 'FromUtc', 'ToUtc', 'LastWriteUtc', 'StartUtc', 'EndUtc', 'GeneratedUtc')
 $script:Inv = [Globalization.CultureInfo]::InvariantCulture
@@ -119,7 +123,8 @@ $script:SignInColumns = @('TimeUtc', 'User', 'UserDisplayName', 'UserId', 'Resul
     'AdditionalDetails', 'AppName', 'AppId', 'PowerShellApp', 'IPAddress', 'Location', 'Latitude', 'Longitude', 'ASN',
     'Resource', 'ResourceId', 'UserAgent', 'ClientTool', 'ClientAppUsed', 'SignInType', 'IsInteractive',
     'DeviceName', 'DeviceId', 'OperatingSystem', 'Browser', 'DeviceCompliant', 'DeviceManaged', 'DeviceTrustType',
-    'AuthRequirement', 'AuthMethods', 'AuthDetails', 'AuthProtocol', 'IncomingTokenType', 'TokenIssuerType',
+    'AuthRequirement', 'AuthMethods', 'AuthDetails', 'AuthSteps', 'MfaPhone', 'MfaChallenge', 'AuthAppDevice',
+    'AuthProtocol', 'IncomingTokenType', 'TokenIssuerType',
     'ClientCredentialType', 'ConditionalAccess', 'ConditionalAccessPolicies', 'Risk', 'RiskState', 'RiskDetail',
     'RiskEventTypes', 'CorrelationId', 'SessionId', 'UniqueTokenId', 'OriginalRequestId', 'CrossTenant', 'HomeTenant',
     'FlaggedForReview', 'Story', 'SuspectMatch', 'Source', 'Id')
@@ -637,6 +642,12 @@ function Protect-CsvValue {
     return $Value
 }
 
+function Unprotect-CsvValue {
+    param([string]$Value)
+    if ($Value -and $Value.Length -gt 1 -and $Value[0] -eq [char]39 -and $Value[1] -match '[=+\-@]') { return $Value.Substring(1) }
+    return $Value
+}
+
 function Format-Ip {
     param([string]$Ip)
     if (-not $Ip) { return '' }
@@ -727,35 +738,142 @@ function Get-UalExtendedMap {
     return $m
 }
 
-function Format-GraphAuthMethods {
-    param($S)
-    $named = @($S.authenticationMethodsUsed | Where-Object { $_ } | ForEach-Object { [string]$_ })
-    if ($named.Count) { return (Join-SignInBits $named) }
-    $fromDetails = foreach ($d in @($S.authenticationDetails)) {
-        if ($d -and $d.authenticationMethod) { [string]$d.authenticationMethod }
-    }
-    return (Join-SignInBits @($fromDetails))
+function Get-PhoneFromAuthText {
+    param([string]$Text)
+    if (-not $Text) { return '' }
+    if ($Text -match '(\+?\d[\dXx\s\-\.\(\)]{5,}\d)') { return $matches[1].Trim() }
+    if ($Text -match '(X{2,}[\dXx\s\-]{2,}\d)') { return $matches[1].Trim() }
+    return ''
 }
 
-function Format-GraphAuthDetails {
+function Get-MfaChallengeLabel {
+    param([string]$Method, [string]$Detail, [string[]]$PolicyStatuses)
+    $m = [string]$Method
+    $d = [string]$Detail
+    $numberMatch = @($PolicyStatuses | Where-Object { $_ -match 'numberMatch' })
+    $isAuthenticator = ($m -match 'Mobile app notification|Authenticator App|Authenticator app|App Verification code|Software OATH|OATH')
+    if ($isAuthenticator -and $numberMatch.Count -gt 0) {
+        $how = 'Authenticator push (number matching)'
+        $st = $numberMatch[0]
+        if ($st -match 'IncorrectNumberEntered') { $how += ' - wrong number entered' }
+        elseif ($st -match 'Deny') { $how += ' - user denied' }
+        elseif ($st -match 'CorrectNumberEntered') { $how += ' - matched' }
+        elseif ($st -match 'OutOfDate') { $how += ' - app out of date' }
+        return $how
+    }
+    if ($m -match 'Mobile app notification|Authenticator App|Authenticator app') {
+        if ($d -match 'phone sign-?in|passwordless') { return 'Authenticator passwordless phone sign-in' }
+        return 'Authenticator push (approve/deny)'
+    }
+    if ($m -match 'App Verification code|Software OATH') { return 'Authenticator TOTP / verification code' }
+    if ($m -match 'Hardware token') { return 'Hardware OATH token' }
+    if ($m -match 'Text message|SMS') {
+        $phone = Get-PhoneFromAuthText $d
+        if ($phone) { return ('SMS to {0}' -f $phone) }
+        if ($d) { return ('SMS to {0}' -f $d) }
+        return 'SMS'
+    }
+    if ($m -match 'Voice|Phone call|Phone') {
+        $phone = Get-PhoneFromAuthText $d
+        if ($phone) { return ('Voice call to {0}' -f $phone) }
+        if ($d) { return ('Voice call to {0}' -f $d) }
+        return 'Voice call'
+    }
+    if ($m -match 'Previously satisfied|Satisfied by token') { return 'Previously satisfied (MFA claim in token)' }
+    if ($m -match 'Password') {
+        if ($d) { return ('Password ({0})' -f $d) }
+        return 'Password'
+    }
+    if ($m -match 'FIDO|Passkey|Windows Hello') { return $m }
+    return $m
+}
+
+function Get-GraphAuthInsight {
     param($S)
-    $parts = New-Object System.Collections.Generic.List[string]
+    $steps = New-Object System.Collections.Generic.List[string]
+    $methods = New-Object System.Collections.Generic.List[string]
+    $phones = New-Object System.Collections.Generic.List[string]
+    $challenges = New-Object System.Collections.Generic.List[string]
+    $policyStatuses = @()
+    $policyBits = New-Object System.Collections.Generic.List[string]
+    foreach ($p in @($S.authenticationAppPolicyEvaluationDetails)) {
+        if (-not $p) { continue }
+        $st = [string]$p.status
+        if ($st) { $policyStatuses += $st }
+        $name = [string]$p.policyName
+        $ev = [string]$p.authenticationEvaluation
+        $bit = $st
+        if ($name) { $bit = ('{0}={1}' -f $name, $st) }
+        if ($ev) { $bit += (' ({0})' -f $ev) }
+        if ($bit) { $policyBits.Add($bit) }
+    }
+    $n = 0
     foreach ($d in @($S.authenticationDetails)) {
         if (-not $d) { continue }
         $method = [string]$d.authenticationMethod
         if (-not $method) { continue }
+        $n++
         $detail = [string]$d.authenticationMethodDetail
-        $step = [string]$d.authenticationStepResultDetail
-        $bit = $method
-        if ($detail) { $bit += ' (' + $detail + ')' }
-        if ($step) { $bit += ': ' + $step }
-        if ($null -ne $d.succeeded) {
-            $bit += $(if ((Format-GraphFlag $d.succeeded) -eq 'Yes') { ' [ok]' } else { ' [failed]' })
+        $stepReq = [string]$d.authenticationStepRequirement
+        $stepRes = [string]$d.authenticationStepResultDetail
+        $ok = ''
+        if ($null -ne $d.succeeded) { $ok = Format-GraphFlag $d.succeeded }
+        $phone = Get-PhoneFromAuthText $detail
+        if ($method -match 'Text message|SMS|Voice|Phone' -and -not $phone -and $detail) { $phone = $detail }
+        if ($phone) { $phones.Add($phone) }
+        $challenge = Get-MfaChallengeLabel $method $detail $policyStatuses
+        if ($challenge) {
+            if ($method -match 'Password') { $methods.Add($challenge) }
+            else { $challenges.Add($challenge) }
         }
-        $parts.Add($bit)
+        $label = $challenge
+        if (-not $label) { $label = $method }
+        $line = ('{0}. {1}' -f $n, $label)
+        if ($stepReq) { $line += (' [{0}]' -f $stepReq) }
+        if ($detail -and $label.IndexOf($detail, [StringComparison]::OrdinalIgnoreCase) -lt 0) { $line += (' via {0}' -f $detail) }
+        if ($stepRes) { $line += (' - {0}' -f $stepRes) }
+        if ($ok -eq 'Yes') { $line += ' [ok]' }
+        elseif ($ok -eq 'No') { $line += ' [failed]' }
+        $steps.Add($line)
+        if ($phone) { $methods.Add(('{0} {1}' -f $method, $phone)) }
+        else { $methods.Add($method) }
     }
-    if ($parts.Count -eq 0) { return (Format-GraphAuthMethods $S) }
-    return (Limit-Text ($parts -join ' | ') 1500)
+    if ($S.mfaDetail) {
+        $mdPhone = Get-PhoneFromAuthText ([string]$S.mfaDetail.authDetail)
+        if (-not $mdPhone) { $mdPhone = [string]$S.mfaDetail.authDetail }
+        if ($mdPhone -and $mdPhone -match '\+|X|\d') { $phones.Add($mdPhone) }
+        $mdMethod = [string]$S.mfaDetail.authMethod
+        if ($mdMethod -and $challenges.Count -eq 0) { $challenges.Add((Get-MfaChallengeLabel $mdMethod $mdPhone $policyStatuses)) }
+    }
+    $appDev = $S.authenticationAppDeviceDetails
+    $appDevText = ''
+    if ($appDev) {
+        $appDevText = Join-SignInBits @(
+            [string]$appDev.clientApp
+            $(if ($appDev.appVersion) { 'v' + $appDev.appVersion } else { '' })
+            [string]$appDev.operatingSystem
+            $(if ($appDev.deviceId) { 'id ' + $appDev.deviceId } else { '' })
+        ) ' '
+    }
+    $proc = New-Object System.Collections.Generic.List[string]
+    foreach ($kv in @($S.authenticationProcessingDetails)) {
+        if ($kv -and $kv.key) { $proc.Add(('{0}={1}' -f $kv.key, $kv.value)) }
+    }
+    if ($policyBits.Count) { $steps.Add('Authenticator policy: ' + ($policyBits -join '; ')) }
+    if ($appDevText) { $steps.Add('Authenticator device: ' + $appDevText) }
+    if ($proc.Count) { $steps.Add('Processing: ' + ($proc -join '; ')) }
+    if ($methods.Count -eq 0) {
+        foreach ($m in @($S.authenticationMethodsUsed)) { if ($m) { $methods.Add([string]$m) } }
+    }
+    $stepText = Limit-Text ($steps -join ' | ') 2000
+    return @{
+        AuthMethods   = (Join-SignInBits @($methods))
+        AuthDetails   = $stepText
+        AuthSteps     = $stepText
+        MfaPhone      = (Join-SignInBits @($phones))
+        MfaChallenge  = (Join-SignInBits @($challenges))
+        AuthAppDevice = $appDevText
+    }
 }
 
 function Format-GraphCaPolicies {
@@ -803,7 +921,8 @@ function Get-SignInStory {
         $(if ($Row.OperatingSystem) { [string]$Row.OperatingSystem } else { '' })
         $(if ($Row.Browser) { [string]$Row.Browser } else { '' })
         $(if ($Row.DeviceName) { 'device ' + $Row.DeviceName } else { '' })
-        $(if ($Row.AuthMethods) { 'auth ' + $Row.AuthMethods } else { '' })
+        $(if ($Row.MfaChallenge) { 'auth ' + $Row.MfaChallenge } elseif ($Row.AuthMethods) { 'auth ' + $Row.AuthMethods } else { '' })
+        $(if ($Row.MfaPhone -and (-not $Row.MfaChallenge -or $Row.MfaChallenge.IndexOf([string]$Row.MfaPhone) -lt 0)) { 'MFA phone ' + $Row.MfaPhone } else { '' })
         $(if ($Row.AuthRequirement) { [string]$Row.AuthRequirement } else { '' })
         $(if ($Row.ConditionalAccess) { 'CA ' + $Row.ConditionalAccess } else { '' })
         $(if ($Row.Risk -and $Row.Risk -notin @('none', 'None')) { 'risk ' + $Row.Risk } else { '' })
@@ -876,7 +995,10 @@ function ConvertTo-EventFromSignIn {
         $(if ($SignIn.OperatingSystem) { 'OS=' + $SignIn.OperatingSystem } else { '' })
         $(if ($SignIn.Browser) { 'Browser=' + $SignIn.Browser } else { '' })
         $(if ($SignIn.AuthMethods) { 'Auth=' + $SignIn.AuthMethods } else { '' })
-        $(if ($SignIn.AuthDetails) { [string]$SignIn.AuthDetails } else { '' })
+        $(if ($SignIn.MfaChallenge) { 'MFA=' + $SignIn.MfaChallenge } else { '' })
+        $(if ($SignIn.MfaPhone) { 'MFA phone=' + $SignIn.MfaPhone } else { '' })
+        $(if ($SignIn.AuthAppDevice) { 'Auth device=' + $SignIn.AuthAppDevice } else { '' })
+        $(if ($SignIn.AuthSteps) { [string]$SignIn.AuthSteps } elseif ($SignIn.AuthDetails) { [string]$SignIn.AuthDetails } else { '' })
         $(if ($SignIn.ConditionalAccess) { 'CA=' + $SignIn.ConditionalAccess } else { '' })
         $(if ($SignIn.ConditionalAccessPolicies) { [string]$SignIn.ConditionalAccessPolicies } else { '' })
         $(if ($SignIn.Risk) { 'Risk=' + $SignIn.Risk } else { '' })
@@ -1155,7 +1277,7 @@ function ConvertTo-JsonMap {
     $h = [ordered]@{}
     foreach ($c in $Columns) {
         $v = ''
-        if ($Row -and $Row.PSObject.Properties[$c] -and $null -ne $Row.$c) { $v = [string]$Row.$c }
+        if ($Row -and $Row.PSObject.Properties[$c] -and $null -ne $Row.$c) { $v = Unprotect-CsvValue ([string]$Row.$c) }
         $h[$c] = $v
     }
     return $h
@@ -2120,6 +2242,7 @@ function ConvertFrom-GraphSignIn {
     if ($null -ne $S.isInteractive) { $interactive = Format-GraphFlag $S.isInteractive }
     $flagged = ''
     if ($null -ne $S.flaggedForReview) { $flagged = Format-GraphFlag $S.flaggedForReview }
+    $auth = Get-GraphAuthInsight $S
     return (New-SignInRow @{
             TimeUtc = (ConvertTo-UtcIso $S.createdDateTime); User = $user
             UserDisplayName = [string]$S.userDisplayName; UserId = [string]$S.userId
@@ -2141,8 +2264,12 @@ function ConvertFrom-GraphSignIn {
             DeviceManaged = $(if ($dev) { Format-GraphFlag $dev.isManaged } else { '' })
             DeviceTrustType = $(if ($dev) { [string]$dev.trustType } else { '' })
             AuthRequirement = [string]$S.authenticationRequirement
-            AuthMethods = (Format-GraphAuthMethods $S)
-            AuthDetails = (Format-GraphAuthDetails $S)
+            AuthMethods = $auth.AuthMethods
+            AuthDetails = $auth.AuthDetails
+            AuthSteps = $auth.AuthSteps
+            MfaPhone = $auth.MfaPhone
+            MfaChallenge = $auth.MfaChallenge
+            AuthAppDevice = $auth.AuthAppDevice
             AuthProtocol = [string]$S.authenticationProtocol
             IncomingTokenType = [string]$S.incomingTokenType
             TokenIssuerType = [string]$S.tokenIssuerType
@@ -2747,7 +2874,11 @@ function New-InvestigationReport {
             OperatingSystems = (Get-TopValues ($g.Group | ForEach-Object { $_.OperatingSystem }) 3)
             Browsers = (Get-TopValues ($g.Group | ForEach-Object { $_.Browser }) 3)
             AuthMethods = (Get-TopValues ($g.Group | ForEach-Object { $_.AuthMethods }) 4)
+            AuthDetails = (Get-TopValues ($g.Group | ForEach-Object { $_.AuthSteps; $_.AuthDetails }) 4)
+            MfaPhones = (Get-TopValues ($g.Group | ForEach-Object { $_.MfaPhone }) 5)
+            MfaChallenges = (Get-TopValues ($g.Group | ForEach-Object { $_.MfaChallenge }) 5)
             Devices = (Get-TopValues ($g.Group | ForEach-Object { $_.DeviceName }) 4)
+            AuthAppDevices = (Get-TopValues ($g.Group | ForEach-Object { $_.AuthAppDevice }) 3)
             ClientApps = (Get-TopValues ($g.Group | ForEach-Object { $_.ClientAppUsed }) 3)
             Story = (Get-SignInStory $first)
         }
@@ -2852,7 +2983,7 @@ function New-InvestigationReport {
         coverage = @($coverage | ForEach-Object { ConvertTo-JsonMap $_ @('RunUtc', 'Source', 'Status', 'Records', 'FromUtc', 'ToUtc', 'Notes') })
         tactics = @($tactics | ForEach-Object { ConvertTo-JsonMap $_ @('Severity', 'Category', 'Mitre', 'Events', 'Succeeded', 'Failed', 'FirstUtc', 'LastUtc', 'Actors', 'Operations') })
         actors = @($actors | ForEach-Object { ConvertTo-JsonMap $_ @('Actor', 'Suspect', 'Events', 'Critical', 'High', 'Failed', 'FirstUtc', 'LastUtc', 'IPs', 'Channels', 'TopOperations') })
-        siSummary = @($siSummary | ForEach-Object { ConvertTo-JsonMap $_ @('User', 'Client', 'ClientClass', 'Suspect', 'Success', 'Failure', 'FirstUtc', 'LastUtc', 'IPs', 'Locations', 'Resources', 'UserAgents', 'OperatingSystems', 'Browsers', 'AuthMethods', 'Devices', 'ClientApps', 'Story') })
+        siSummary = @($siSummary | ForEach-Object { ConvertTo-JsonMap $_ @('User', 'Client', 'ClientClass', 'Suspect', 'Success', 'Failure', 'FirstUtc', 'LastUtc', 'IPs', 'Locations', 'Resources', 'UserAgents', 'OperatingSystems', 'Browsers', 'AuthMethods', 'AuthDetails', 'MfaPhones', 'MfaChallenges', 'Devices', 'AuthAppDevices', 'ClientApps', 'Story') })
         ipSummary = @($ipSummary | ForEach-Object { ConvertTo-JsonMap $_ @('IPAddress', 'Suspect', 'Activity', 'FirstUtc', 'LastUtc', 'Accounts', 'Locations', 'Activities') })
         resources = @($resourceSummary | ForEach-Object { ConvertTo-JsonMap $_ @('Resource', 'Result', 'Count', 'FirstUtc', 'LastUtc', 'Accounts', 'FailureReasons') })
         activity = @($actSummary | ForEach-Object { ConvertTo-JsonMap $_ @('Actor', 'Workload', 'Operation', 'Count', 'FirstUtc', 'LastUtc', 'IPs', 'Sample') })
@@ -2932,7 +3063,7 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
     var m={TimeUtc:"Time (ET)",WhenUtc:"When (ET)",FirstUtc:"First (ET)",LastUtc:"Last (ET)",RunUtc:"Run (ET)",FromUtc:"From (ET)",ToUtc:"To (ET)",StartUtc:"Start (ET)",EndUtc:"End (ET)",GeneratedUtc:"Generated (ET)",LastWriteUtc:"Last write (ET)",
       UserDisplayName:"Display name",UserId:"User object ID",AdditionalDetails:"Additional details",AppName:"Application",AppId:"App ID",PowerShellApp:"Client class",IPAddress:"IP address",ASN:"ASN",ResourceId:"Resource ID",
       ClientTool:"Client from UA",ClientAppUsed:"Client app",SignInType:"Sign-in type",IsInteractive:"Interactive",DeviceName:"Device",DeviceId:"Device ID",OperatingSystem:"OS",DeviceCompliant:"Compliant",DeviceManaged:"Managed",DeviceTrustType:"Device trust",
-      AuthRequirement:"Auth requirement",AuthMethods:"Auth methods",AuthDetails:"Authentication",AuthProtocol:"Auth protocol",IncomingTokenType:"Incoming token",TokenIssuerType:"Token issuer",ClientCredentialType:"Client credential",
+      AuthRequirement:"Auth requirement",AuthMethods:"Auth methods",AuthDetails:"Authentication",AuthSteps:"Auth steps",MfaPhone:"MFA phone",MfaPhones:"MFA phones",MfaChallenge:"MFA challenge",MfaChallenges:"MFA challenges",AuthAppDevice:"Authenticator device",AuthAppDevices:"Authenticator devices",AuthProtocol:"Auth protocol",IncomingTokenType:"Incoming token",TokenIssuerType:"Token issuer",ClientCredentialType:"Client credential",
       ConditionalAccess:"CA status",ConditionalAccessPolicies:"CA policies",RiskState:"Risk state",RiskDetail:"Risk detail",RiskEventTypes:"Risk events",CorrelationId:"Correlation ID",SessionId:"Session ID",UniqueTokenId:"Unique token ID",
       OriginalRequestId:"Original request ID",CrossTenant:"Cross-tenant",HomeTenant:"Home tenant",FlaggedForReview:"Flagged for review",FailureReason:"Failure reason",ErrorCode:"Error code",UserAgent:"User agent"};
     return m[c]||c;
@@ -3060,7 +3191,7 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
   }
   function hasVal(v){ return v!==undefined && v!==null && String(v)!==""; }
   function kvHtml(k,v){
-    var long = k==="CommandLine"||k==="Details"||k==="Story"||k==="AuthDetails"||k==="ConditionalAccessPolicies"||k==="UserAgent"||k==="UserAgents";
+    var long = k==="CommandLine"||k==="Details"||k==="Story"||k==="AuthDetails"||k==="AuthSteps"||k==="ConditionalAccessPolicies"||k==="UserAgent"||k==="UserAgents";
     return '<div class="kv"><b>'+enc(colLabel(k))+'</b> '+(long?"<pre><code>"+enc(v)+"</code></pre>":enc(v))+"</div>";
   }
   var DETAIL_GROUPS = [
@@ -3069,7 +3200,7 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
     ["Client and app", ["AppName","Client","ClientClass","AppId","PowerShellApp","ClientTool","ClientAppUsed","ClientApps","Resource","ResourceId","Resources"]],
     ["Network", ["IPAddress","ClientIP","InferredIP","IPs","Location","InferredLocation","Locations","Latitude","Longitude","ASN"]],
     ["Device", ["DeviceName","Devices","DeviceId","OperatingSystem","OperatingSystems","Browser","Browsers","DeviceCompliant","DeviceManaged","DeviceTrustType"]],
-    ["Authentication", ["AuthRequirement","AuthMethods","AuthDetails","AuthProtocol","IncomingTokenType","TokenIssuerType","ClientCredentialType","IsInteractive","SignInType"]],
+    ["Authentication", ["AuthRequirement","MfaChallenge","MfaChallenges","MfaPhone","MfaPhones","AuthSteps","AuthDetails","AuthMethods","AuthAppDevice","AuthAppDevices","AuthProtocol","IncomingTokenType","TokenIssuerType","ClientCredentialType","IsInteractive","SignInType"]],
     ["Conditional Access", ["ConditionalAccess","ConditionalAccessPolicies"]],
     ["Risk", ["Risk","RiskState","RiskDetail","RiskEventTypes"]],
     ["Session", ["CorrelationId","SessionId","UniqueTokenId","OriginalRequestId"]],
@@ -3255,8 +3386,8 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
     if(S.tab==="actors"){ $("view-actors").className=""; table("tbl-actors", D.actors||[], ["Actor","Suspect","Events","Critical","High","Failed","FirstUtc","LastUtc","IPs","Channels","TopOperations"], {match:function(r){ return (!S.q || blob(r).indexOf(S.q)>=0) && (!S.suspect || r.Suspect==="YES"); }}); } else $("view-actors").className="hide";
     if(S.tab==="signins"){
       $("view-signins").className="";
-      table("tbl-sisummary", D.siSummary||[], ["User","Client","ClientClass","Suspect","Success","Failure","FirstUtc","LastUtc","IPs","Locations","OperatingSystems","AuthMethods","Devices","Resources"], {match:function(r){ return (!S.q || blob(r).indexOf(S.q)>=0) && (!S.actor || r.User===S.actor) && (!S.app || r.Client===S.app) && (!S.suspect || r.Suspect==="YES") && (!S.unusual || r.ClientClass==="Tooling" || r.ClientClass==="Abuse-prone client") && inTime({TimeUtc:r.FirstUtc}); }});
-      table("tbl-signins", D.signIns||[], ["TimeUtc","User","Result","Story","AppName","IPAddress","Location","OperatingSystem","Browser","AuthMethods","ConditionalAccess","Risk","ClientAppUsed","SignInType","DeviceName","Resource","ErrorCode","FailureReason","UserAgent","SuspectMatch"], {match:matchSignIn});
+      table("tbl-sisummary", D.siSummary||[], ["User","Client","ClientClass","Suspect","Success","Failure","FirstUtc","LastUtc","IPs","Locations","MfaChallenges","MfaPhones","OperatingSystems","AuthMethods","Devices","Resources"], {match:function(r){ return (!S.q || blob(r).indexOf(S.q)>=0) && (!S.actor || r.User===S.actor) && (!S.app || r.Client===S.app) && (!S.suspect || r.Suspect==="YES") && (!S.unusual || r.ClientClass==="Tooling" || r.ClientClass==="Abuse-prone client") && inTime({TimeUtc:r.FirstUtc}); }});
+      table("tbl-signins", D.signIns||[], ["TimeUtc","User","Result","MfaChallenge","MfaPhone","AuthSteps","AppName","IPAddress","Location","OperatingSystem","Browser","ConditionalAccess","Risk","ClientAppUsed","SignInType","DeviceName","Resource","ErrorCode","FailureReason","UserAgent","SuspectMatch"], {match:matchSignIn});
     } else $("view-signins").className="hide";
     if(S.tab==="ips"){ $("view-ips").className=""; table("tbl-ips", D.ipSummary||[], ["IPAddress","Suspect","Activity","FirstUtc","LastUtc","Accounts","Locations","Activities"], {match:function(r){ return (!S.q || blob(r).indexOf(S.q)>=0) && (!S.ip || r.IPAddress===S.ip) && (!S.suspect || r.Suspect==="YES"); }}); } else $("view-ips").className="hide";
     if(S.tab==="failed"){ $("view-failed").className=""; table("tbl-failed", D.events||[], ["TimeUtc","Severity","Category","AccessGained","Operation","Actor","ClientIP","Target","CommandLine","Details"], {match:matchFailed}); } else $("view-failed").className="hide";
