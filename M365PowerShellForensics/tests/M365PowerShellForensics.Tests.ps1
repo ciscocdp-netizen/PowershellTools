@@ -210,6 +210,33 @@ $gsi = ConvertFrom-GraphSignIn ([pscustomobject]@{
 Assert-Equal $gsi.PowerShellApp 'Yes' 'Graph PowerShell sign-in is Yes'
 Assert-Contains $gsi.Location 'Ashburn' 'Graph location is joined'
 
+$failSi = ConvertFrom-GraphSignIn ([pscustomobject]@{
+        createdDateTime = '2026-10-01T11:40:00Z'
+        appId = '1b730954-1685-4b74-9bfd-dac224a7b894'
+        appDisplayName = 'Azure Active Directory PowerShell'
+        userPrincipalName = 'attacker@contoso.com'
+        ipAddress = '203.0.113.50'
+        userAgent = 'WindowsPowerShell/5.1'
+        status = [pscustomobject]@{ errorCode = 50126; failureReason = 'Invalid username or password.' }
+        location = [pscustomobject]@{ city = 'Ashburn'; state = 'VA'; countryOrRegion = 'US' }
+        resourceDisplayName = 'Windows Azure Active Directory'
+        isInteractive = $true
+        id = 'fail-si-1'
+    }) 'SignIn'
+Assert-Equal $failSi.Result 'Failure' 'non-zero Graph error is a failed sign-in'
+Assert-Equal $failSi.PowerShellApp 'Yes' 'failed AAD PowerShell sign-in is still PowerShell'
+
+$fromSi = ConvertTo-EventFromSignIn $gsi
+Assert-Equal $fromSi.RecordType 'SignIn' 'sign-in events keep RecordType SignIn'
+Assert-Equal $fromSi.PowerShellRelated 'Yes' 'Graph PowerShell sign-in becomes a PowerShell-related event'
+Assert-Equal $fromSi.Outcome 'Succeeded' 'successful sign-in maps to Succeeded'
+Assert-Equal $fromSi.Actor 'attacker@contoso.com' 'sign-in user becomes the event actor'
+Assert-Contains $fromSi.CommandLine 'Sign-in:' 'sign-in event has a command-line summary'
+$fromFailSi = ConvertTo-EventFromSignIn $failSi
+Assert-Equal $fromFailSi.Outcome 'Failed' 'failed PowerShell sign-in maps to a Failed event'
+Assert-Equal $fromFailSi.Operation 'UserLoginFailed' 'failed sign-in operation is UserLoginFailed'
+Assert-Equal $fromFailSi.Severity 'Medium' 'failed sign-in is Medium so it appears on Failed'
+
 $ga = ConvertFrom-GraphDirectoryAudit ([pscustomobject]@{
         activityDateTime = '2026-10-01T12:10:00Z'
         activityDisplayName = 'Add member to role'
@@ -246,7 +273,7 @@ Initialize-M365PsForensicsOutput -OutputPath $out | Out-Null
 Initialize-SuspectSets -Users @('attacker@contoso.com') -IPs @('203.0.113.50')
 Initialize-InvestigationWindow -StartDate ([datetime]'2026-09-01') -EndDate ([datetime]'2026-10-02')
 Save-Rows -Rows @($row, $fedRow, $failRow, $ga) -FileName 'Events-UAL-Admin.csv'
-Save-Rows -Rows @($si, $gsi) -FileName 'SignIns-Entra.csv'
+Save-Rows -Rows @($si, $gsi, $failSi) -FileName 'SignIns-Entra.csv'
 Add-Coverage -Source 'Tenant (Graph)' -Status 'INFO' -Notes 'TenantId=11111111-1111-1111-1111-111111111111; Investigator=ir@contoso.com'
 Add-Coverage -Source 'Unified Audit Log - ExchangeAdmin (Admin)' -Status 'OK' -Records 3 -From ([datetime]'2026-09-01') -To ([datetime]'2026-10-02')
 $report = New-InvestigationReport
@@ -258,8 +285,15 @@ Assert-Contains $html 'Set-Mailbox' 'report includes the reconstructed command'
 Assert-NotContains $html '<img src=x' 'report does not emit a raw image tag'
 Assert-Contains $html 'function(' 'report includes the interactive script'
 Assert-Contains $html 'PowerShell related' 'report has a PowerShell filter chip'
-Assert-True ($html.IndexOf('suspect:!!((D.meta.Suspects||[]).length)') -ge 0) 'report defaults the suspect-only chip on when suspects were supplied'
+Assert-True ($html.IndexOf('alreadyScoped') -ge 0) 'report detects suspect-user collection scope in JS'
+Assert-True ($html.IndexOf('function matchSignIn') -ge 0) 'report filters sign-ins separately from cmdlet events'
+Assert-True ($html.IndexOf('S.ps="yes";') -lt 0) 'report does not force PowerShell-related after load'
 Assert-Contains $html 'Suspect users' 'report records suspect-user collection scope'
+$tl = @(Import-Csv -LiteralPath (Join-Path $out 'Timeline-Master.csv'))
+$siEvents = @($tl | Where-Object { $_.RecordType -eq 'SignIn' })
+Assert-True ($siEvents.Count -ge 3) 'PowerShell sign-ins are copied onto the command timeline'
+Assert-True (@($siEvents | Where-Object { $_.Outcome -eq 'Failed' }).Count -ge 1) 'failed PowerShell sign-ins appear as Failed events'
+Assert-Contains $html '"PsFail":1' 'report counts the failed PowerShell sign-in'
 $cov = @(Import-Csv -LiteralPath (Join-Path $out 'Coverage.csv'))
 Assert-Equal $cov.Count 2 'coverage has two data rows, not a repeated header'
 Assert-Equal @($cov | Where-Object { $_.Source -like 'RunUtc*' }).Count 0 'coverage did not treat a header as a row'
@@ -306,7 +340,7 @@ $modErrors = $null
 $null = [System.Management.Automation.Language.Parser]::ParseFile($modulePath, [ref]$null, [ref]$modErrors)
 Assert-Equal @($modErrors).Count 0 'engine module parses'
 
-Assert-Equal (Get-M365PsForensicsVersion) '2.1.4' 'engine version is 2.1.4'
+Assert-Equal (Get-M365PsForensicsVersion) '2.1.5' 'engine version is 2.1.5'
 
 Write-Host 'Exchange cmdlet status and Graph UAL shaping'
 $exoStatus = Get-ExoCmdletStatus
@@ -371,6 +405,27 @@ Assert-True (Test-RowInSuspectScope $targetScope) 'target match is in suspect sc
 Assert-True (-not (Test-RowInSuspectScope $outScope)) 'unrelated actor/target is out of suspect scope'
 Set-M365PsForensicsConfig -Values @{ TenantWide = $true }
 Assert-True (Test-RowInSuspectScope $outScope) 'tenant-wide keeps unrelated rows'
+
+Write-Host 'Add-Finding severity when collection is suspect-scoped'
+$engine = Get-Module M365PowerShellForensics
+& $engine { $script:Findings.Clear() }
+Initialize-SuspectSets -Users @('attacker@contoso.com') -IPs @()
+Set-M365PsForensicsConfig -Values @{ TenantWide = $false; SuspectUsers = @('attacker@contoso.com') }
+Add-Finding 'Info' 'Entra Directory Role / Group' 'attacker@contoso.com: Users' 'MemberType=group' 'Directory role or group membership' $null 'test'
+$got = & $engine { $script:Findings[0] }
+Assert-Equal $got.Severity 'Info' 'suspect-scoped collection does not promote every mention to High'
+Assert-Equal $got.SuspectMatch 'User' 'finding still records the suspect user match'
+& $engine { $script:Findings.Clear() }
+Set-M365PsForensicsConfig -Values @{ TenantWide = $true; SuspectUsers = @('attacker@contoso.com') }
+Add-Finding 'Info' 'Entra Directory Role / Group' 'attacker@contoso.com: Users' 'MemberType=group' 'Directory role or group membership' $null 'test'
+$got = & $engine { $script:Findings[0] }
+Assert-Equal $got.Severity 'High' 'tenant-wide hunt still promotes suspect mentions to High'
+& $engine { $script:Findings.Clear() }
+Initialize-SuspectSets -Users @() -IPs @('203.0.113.50')
+Set-M365PsForensicsConfig -Values @{ TenantWide = $false; SuspectUsers = @('attacker@contoso.com') }
+Add-Finding 'Info' 'Mailbox' 'forwarding to 203.0.113.50' 'Smtp=evil' 'Suspicious IP on mailbox' $null 'test'
+$got = & $engine { $script:Findings[0] }
+Assert-Equal $got.Severity 'High' 'suspect IP still promotes a finding to High when scoped'
 
 Set-M365PsForensicsConfig -Values @{ Fast = $true; IncludeDiscovery = $false; AdditionalRecordTypes = @(); ChunkHours = 24 }
 $adminTypes = Get-UalAdminRecordTypes

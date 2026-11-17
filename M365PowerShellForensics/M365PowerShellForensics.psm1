@@ -50,9 +50,14 @@
         in the worker (Search-UnifiedAuditLog / Get-Mailbox not recognized).
         The engine now reloads EXO cmdlets, uses Connect-IPPSSession for UAL, and
         falls back to Graph security/auditLog/queries when the cmdlet is still missing.
+    Version 2.1.5:
+      - HTML report now puts PowerShell/CLI sign-ins on Commands, Timeline, Failed,
+        and Actors (they were only in CSV / the sign-in card count). Sign-ins are
+        no longer hidden by the PowerShell-related / Severity filters. Suspect-scoped
+        persistence findings are not all promoted to High.
 #>
 
-$script:ScriptVersion = '2.1.4'
+$script:ScriptVersion = '2.1.5'
 $script:Inv = [Globalization.CultureInfo]::InvariantCulture
 $script:UiSync = $null
 $script:LogFile = $null
@@ -645,13 +650,56 @@ function New-SignInRow {
     return [pscustomobject]$o
 }
 
+function ConvertTo-EventFromSignIn {
+    param($SignIn)
+    if ($null -eq $SignIn) { return $null }
+    $psApp = [string]$SignIn.PowerShellApp
+    $ps = 'No'
+    if ($psApp -eq 'Yes' -or $psApp -eq 'Tooling') { $ps = 'Yes' }
+    elseif ($psApp -eq 'Abuse-prone client') { $ps = 'Possible' }
+    elseif ([string]$SignIn.ClientTool -eq 'PowerShell') { $ps = 'Yes' }
+    $channel = [string]$SignIn.AppName
+    if (-not $channel) { $channel = [string]$SignIn.ClientTool }
+    $failed = ([string]$SignIn.Result -eq 'Failure')
+    $sev = 'Info'
+    if ($failed) { $sev = 'Medium' }
+    elseif ($ps -eq 'Yes') { $sev = 'Low' }
+    $cat = 'Account Sign-In'
+    if ($ps -eq 'Yes' -or $ps -eq 'Possible') { $cat = 'PowerShell / CLI Sign-In' }
+    return (New-EventRow @{
+            TimeUtc           = $SignIn.TimeUtc
+            Severity          = $sev
+            Category          = $cat
+            Operation         = $(if ($failed) { 'UserLoginFailed' } else { 'UserLoggedIn' })
+            Outcome           = $(if ($failed) { 'Failed' } else { 'Succeeded' })
+            Actor             = $SignIn.User
+            ClientIP          = $SignIn.IPAddress
+            InferredLocation  = $SignIn.Location
+            Target            = $SignIn.Resource
+            CommandLine       = $(if ($failed) { 'Sign-in FAILED: {0}' -f $channel } else { 'Sign-in: {0}' -f $channel })
+            Details           = (Limit-Text ('App={0}; AppId={1}; Result={2}; Error={3}; {4}; UA={5}' -f $SignIn.AppName, $SignIn.AppId, $SignIn.Result, $SignIn.ErrorCode, $SignIn.FailureReason, $SignIn.UserAgent) 1500)
+            PowerShellRelated = $ps
+            ExecutionChannel  = $channel
+            AppId             = $SignIn.AppId
+            UserAgent         = $SignIn.UserAgent
+            SuspectMatch      = $SignIn.SuspectMatch
+            Workload          = 'Entra ID'
+            RecordType        = 'SignIn'
+            Source            = $SignIn.Source
+            RecordId          = $SignIn.Id
+        })
+}
+
 function Add-Finding {
     param([string]$Severity, [string]$Area, [string]$Item, [string]$Detail, [string]$Reason, $When = $null, [string]$Source = '')
     $hay = "$Item $Detail"
     $m = @()
     foreach ($u in $script:SuspectUserSet) { if ($hay.IndexOf($u, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $m += 'User'; break } }
     foreach ($i in $script:SuspectIpSet) { if ($hay.IndexOf($i, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $m += 'IP'; break } }
-    if ($m.Count -gt 0 -and $script:SevRank[[string]$Severity] -lt 3) { $Severity = 'High' }
+    $promote = $false
+    if ($m -contains 'IP') { $promote = $true }
+    elseif ($m.Count -gt 0 -and -not (Test-SuspectScoped)) { $promote = $true }
+    if ($promote -and $script:SevRank[[string]$Severity] -lt 3) { $Severity = 'High' }
     $script:Findings.Add([pscustomobject]@{
             Severity     = $Severity
             Area         = Protect-CsvValue $Area
@@ -2327,6 +2375,12 @@ function New-InvestigationReport {
         }
     }
 
+    $psSignIns = @($signIns | Where-Object { $_.PowerShellApp -ne 'No' -or $_.SuspectMatch } | Sort-Object TimeUtc -Descending)
+    foreach ($s in $psSignIns) {
+        $ev = ConvertTo-EventFromSignIn $s
+        if ($ev) { $events.Add($ev) }
+    }
+
     $sorted = @($events | Sort-Object TimeUtc)
     if ($sorted.Count -gt 0) { Export-EvidenceCsv -Rows $sorted -Path (Join-Path $script:OutputPath 'Timeline-Master.csv') }
     $desc = @($sorted)
@@ -2337,7 +2391,6 @@ function New-InvestigationReport {
     $keyEvents = @($desc | Where-Object { $script:SevRank[[string]$_.Severity] -ge 2 -or $_.SuspectMatch })
     $access = @($keyEvents | Where-Object { $_.AccessGained -and $_.Outcome -ne 'Failed' -and $script:SevRank[[string]$_.Severity] -ge 3 } | Sort-Object $sevSort)
     $failed = @($desc | Where-Object { $_.Outcome -eq 'Failed' -and ($script:SevRank[[string]$_.Severity] -ge 2 -or $_.SuspectMatch -or $_.PowerShellRelated -eq 'Yes') })
-    $psSignIns = @($signIns | Where-Object { $_.PowerShellApp -ne 'No' -or $_.SuspectMatch } | Sort-Object TimeUtc -Descending)
     $psFailSignIns = @($psSignIns | Where-Object { $_.Result -eq 'Failure' })
     $suspectAct = @($events | Where-Object { $_.Source -eq 'UAL-SuspectActivity' })
     $findSorted = @($findings | Sort-Object @{ Expression = { $script:SevRank[[string]$_.Severity] }; Descending = $true }, Area)
@@ -2470,6 +2523,7 @@ function New-InvestigationReport {
             '"Cmdlet - PowerShell or Admin Center" means Microsoft did not record which interface was used; the Exchange Admin Center also executes cmdlets.',
             'Entra sign-in and directory audit logs via Graph cover the last 30 days only; older Entra changes come from the Unified Audit Log.',
             'All times are UTC. Raw source records are preserved in the raw\ folder; hashes are in Evidence-Manifest.csv.',
+            'PowerShell / CLI sign-ins from Entra are copied onto Commands, Timeline, Failed, and Actors so those tabs match SignIns-*.csv. The Sign-ins tab lists the same rows and ignores the Severity dropdown (that filter is for cmdlet events).',
             'Click a row for the full command. Click an actor, IP, or category to pivot. Press / to search, Esc to clear, j/k to move, c to copy the command.'
         )
         events = @($embedEvents | ForEach-Object { ConvertTo-JsonMap $_ $script:EventColumns })
@@ -2537,7 +2591,8 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
     $js = @'
 (function(){
   var D = JSON.parse(document.getElementById("report-data").textContent);
-  var S = {q:"", sev:"", cat:"", actor:"", ip:"", ps:"", suspect:!!((D.meta.Suspects||[]).length), sort:"TimeUtc", dir:-1, page:1, size:100, tab:"commands", row:-1};
+  var alreadyScoped = (D.meta.Scope==="Suspect users");
+  var S = {q:"", sev:"", cat:"", actor:"", ip:"", ps:"yes", suspect:(alreadyScoped?false:!!((D.meta.Suspects||[]).length)), sort:"TimeUtc", dir:-1, page:1, size:100, tab:"commands", row:-1};
   var TABS = [
     ["commands","Commands"],["timeline","Timeline"],["access","Access gained"],["path","Attack path"],
     ["actors","Actors"],["signins","Sign-ins"],["ips","IPs"],["failed","Failed"],["findings","Persistence"],["coverage","Coverage"]
@@ -2558,7 +2613,27 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
   function matchEvent(r){
     if(S.sev && lc(r.Severity)!==lc(S.sev)) return false;
     if(S.cat && lc(r.Category)!==lc(S.cat)) return false;
-    if(S.actor && lc(r.Actor)!==lc(S.actor)) return false;
+    if(S.actor && lc(r.Actor)!==lc(S.actor) && lc(r.User)!==lc(S.actor)) return false;
+    if(S.ip && lc(r.ClientIP)!==lc(S.ip) && lc(r.InferredIP)!==lc(S.ip) && lc(r.IPAddress)!==lc(S.ip)) return false;
+    if(S.ps==="yes" && r.PowerShellRelated!=="Yes" && r.PowerShellRelated!=="Possible") return false;
+    if(S.ps==="cmd" && !(r.CommandLine||"").length) return false;
+    if(S.suspect && !mentionsSuspect(r)) return false;
+    if(S.q && blob(r).indexOf(S.q)<0) return false;
+    return true;
+  }
+  function matchSignIn(r){
+    if(S.actor && lc(r.User)!==lc(S.actor) && lc(r.Actor)!==lc(S.actor)) return false;
+    if(S.ip && lc(r.IPAddress)!==lc(S.ip) && lc(r.ClientIP)!==lc(S.ip)) return false;
+    if(S.ps==="yes" && r.PowerShellApp!=="Yes" && r.PowerShellApp!=="Tooling" && r.PowerShellApp!=="Abuse-prone client") return false;
+    if(S.ps==="cmd") return false;
+    if(S.suspect && !mentionsSuspect(r)) return false;
+    if(S.q && blob(r).indexOf(S.q)<0) return false;
+    return true;
+  }
+  function matchFailed(r){
+    if(r.Outcome!=="Failed") return false;
+    if(S.cat && lc(r.Category)!==lc(S.cat)) return false;
+    if(S.actor && lc(r.Actor)!==lc(S.actor) && lc(r.User)!==lc(S.actor)) return false;
     if(S.ip && lc(r.ClientIP)!==lc(S.ip) && lc(r.InferredIP)!==lc(S.ip) && lc(r.IPAddress)!==lc(S.ip)) return false;
     if(S.ps==="yes" && r.PowerShellRelated!=="Yes" && r.PowerShellRelated!=="Possible") return false;
     if(S.ps==="cmd" && !(r.CommandLine||"").length) return false;
@@ -2579,7 +2654,7 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
     var start=(S.page-1)*S.size;
     return {total:rows.length, slice:rows.slice(start, start+S.size), pages: Math.max(1, Math.ceil(rows.length/S.size))};
   }
-  function setTab(id){ S.tab=id; S.page=1; S.row=-1; render(); }
+  function setTab(id){ S.tab=id; S.page=1; S.row=-1; if(id==="signins"||id==="failed"||id==="actors"||id==="ips") S.sev=""; render(); }
   function setFilter(k,v){
     if(S[k]===v) S[k]=""; else S[k]=v;
     S.page=1; render();
@@ -2592,7 +2667,7 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
   function showDetail(row){
     var d=$("detail"), h=["<h3>Event detail</h3>","<button class='btn' onclick='window._irCloseDetail()'>Close</button>"];
     if(!row){ d.className="detail"; d.innerHTML=""; return; }
-    var keys=["TimeUtc","Severity","Category","Operation","Outcome","Actor","ClientIP","InferredIP","InferredLocation","Target","TargetIdentity","CommandLine","Details","AccessGained","Mitre","PowerShellRelated","ExecutionChannel","AppId","UserAgent","SuspectMatch","Workload","RecordType","Source","RecordId"];
+    var keys=["TimeUtc","Severity","Category","Operation","Outcome","Actor","User","Result","AppName","PowerShellApp","ClientIP","IPAddress","InferredIP","InferredLocation","Location","Target","TargetIdentity","CommandLine","Details","AccessGained","Mitre","PowerShellRelated","ExecutionChannel","AppId","UserAgent","ErrorCode","FailureReason","Resource","SuspectMatch","Workload","RecordType","Source","RecordId"];
     keys.forEach(function(k){ if(row[k]) h.push('<div class="kv"><b>'+enc(k)+'</b> '+(k==="CommandLine"?"<pre><code>"+enc(row[k])+"</code></pre>":enc(row[k]))+"</div>"); });
     if(row.CommandLine) h.push("<p><button class='btn' onclick='window._irCopy()'>Copy command</button></p>");
     d.innerHTML=h.join(""); d.className="detail open"; window._irCopy=function(){ copyCmd(row.CommandLine||row.Operation||""); };
@@ -2697,13 +2772,13 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
       $("view-commands").className="";
       table("tbl-commands", D.events||[], ["TimeUtc","Severity","Actor","CommandLine","Operation","Outcome","ClientIP","InferredIP","Target","ExecutionChannel","UserAgent","SuspectMatch"], {match:function(r){ return eventMatch(r) && (S.ps?true:(r.PowerShellRelated==="Yes"||r.PowerShellRelated==="Possible"||(r.CommandLine||""))); }});
     } else $("view-commands").className="hide";
-    if(S.tab==="timeline"){ $("view-timeline").className=""; table("tbl-timeline", D.events||[], ["TimeUtc","Severity","Category","Operation","Outcome","Actor","ClientIP","InferredIP","Target","CommandLine","SuspectMatch","Source"], {match:function(r){ return eventMatch(r) && (({Critical:1,High:1,Medium:1}[r.Severity]) || r.SuspectMatch); }}); } else $("view-timeline").className="hide";
+    if(S.tab==="timeline"){ $("view-timeline").className=""; table("tbl-timeline", D.events||[], ["TimeUtc","Severity","Category","Operation","Outcome","Actor","ClientIP","InferredIP","Target","CommandLine","SuspectMatch","Source"], {match:function(r){ return eventMatch(r) && (({Critical:1,High:1,Medium:1}[r.Severity]) || r.SuspectMatch || r.PowerShellRelated==="Yes" || r.RecordType==="SignIn"); }}); } else $("view-timeline").className="hide";
     if(S.tab==="access"){ $("view-access").className=""; table("tbl-access", D.access||[], ["TimeUtc","Severity","Category","AccessGained","Actor","ClientIP","Target","CommandLine","ExecutionChannel","Mitre"], {match:eventMatch}); } else $("view-access").className="hide";
     if(S.tab==="path"){ $("view-path").className=""; table("tbl-path", D.tactics||[], ["Severity","Category","Mitre","Events","Succeeded","Failed","FirstUtc","LastUtc","Actors","Operations"], {match:function(r){ return !S.q || blob(r).indexOf(S.q)>=0; }}); } else $("view-path").className="hide";
     if(S.tab==="actors"){ $("view-actors").className=""; table("tbl-actors", D.actors||[], ["Actor","Suspect","Events","Critical","High","Failed","FirstUtc","LastUtc","IPs","Channels","TopOperations"], {match:function(r){ return (!S.q || blob(r).indexOf(S.q)>=0) && (!S.suspect || r.Suspect==="YES"); }}); } else $("view-actors").className="hide";
-    if(S.tab==="signins"){ $("view-signins").className=""; table("tbl-signins", D.signIns||[], ["TimeUtc","User","Result","AppName","PowerShellApp","IPAddress","Location","ErrorCode","FailureReason","Resource","UserAgent","SuspectMatch"], {match:function(r){ return matchEvent(r); }}); } else $("view-signins").className="hide";
+    if(S.tab==="signins"){ $("view-signins").className=""; table("tbl-signins", D.signIns||[], ["TimeUtc","User","Result","AppName","PowerShellApp","IPAddress","Location","ErrorCode","FailureReason","Resource","UserAgent","SuspectMatch"], {match:matchSignIn}); } else $("view-signins").className="hide";
     if(S.tab==="ips"){ $("view-ips").className=""; table("tbl-ips", D.ipSummary||[], ["IPAddress","Suspect","Activity","FirstUtc","LastUtc","Accounts","Locations","Activities"], {match:function(r){ return (!S.q || blob(r).indexOf(S.q)>=0) && (!S.ip || r.IPAddress===S.ip) && (!S.suspect || r.Suspect==="YES"); }}); } else $("view-ips").className="hide";
-    if(S.tab==="failed"){ $("view-failed").className=""; table("tbl-failed", D.events||[], ["TimeUtc","Severity","Category","AccessGained","Operation","Actor","ClientIP","Target","CommandLine","Details"], {match:function(r){ return eventMatch(r) && r.Outcome==="Failed"; }}); } else $("view-failed").className="hide";
+    if(S.tab==="failed"){ $("view-failed").className=""; table("tbl-failed", D.events||[], ["TimeUtc","Severity","Category","AccessGained","Operation","Actor","ClientIP","Target","CommandLine","Details"], {match:matchFailed}); } else $("view-failed").className="hide";
     if(S.tab==="findings"){ $("view-findings").className=""; table("tbl-findings", D.findings||[], ["Severity","Area","Item","Detail","Reason","WhenUtc","SuspectMatch"], {match:function(r){ return (!S.sev || lc(r.Severity)===lc(S.sev)) && (!S.q || blob(r).indexOf(S.q)>=0) && (!S.suspect || mentionsSuspect(r)); }}); } else $("view-findings").className="hide";
     if(S.tab==="coverage"){ $("view-coverage").className=""; table("tbl-coverage", D.coverage||[], ["RunUtc","Source","Status","Records","FromUtc","ToUtc","Notes"], {match:function(r){ return !S.q || blob(r).indexOf(S.q)>=0; }}); } else $("view-coverage").className="hide";
     $("notes").innerHTML="<h2>Interpretation notes</h2><ul>"+(D.notes||[]).map(function(n){ return "<li>"+enc(n)+"</li>"; }).join("")+"</ul>";
@@ -2721,7 +2796,6 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
     if(e.key==="Escape"){ S.q=""; S.actor=""; S.ip=""; S.cat=""; showDetail(null); render(); }
     if(e.key==="c" && document.activeElement.tagName!=="INPUT"){ var d=$("detail"); if(d.className.indexOf("open")>=0 && window._irCopy) window._irCopy(); }
   });
-  S.ps="yes";
   render();
 })();
 '@
@@ -2740,7 +2814,7 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
     [void]$sb.Append('<nav class="tabs" id="tabs"></nav><main>')
     [void]$sb.Append('<div class="cards" id="cards"></div><div id="gaps"></div><div id="trunc"></div>')
     [void]$sb.Append('<section id="view-overview"><div id="recs"></div></section>')
-    [void]$sb.Append('<section id="view-commands"><h2>Every PowerShell / cmdlet command</h2><p class="lead">Reconstructed command lines from Exchange/Purview audit plus Entra changes made from PowerShell clients. Click a row for details; click an actor or IP to pivot.</p><div id="tbl-commands"></div></section>')
+    [void]$sb.Append('<section id="view-commands"><h2>Every PowerShell / cmdlet command</h2><p class="lead">Reconstructed command lines from Exchange/Purview audit, Entra changes made from PowerShell clients, and PowerShell/CLI sign-ins from SignIns-*.csv. Click a row for details; click an actor or IP to pivot.</p><div id="tbl-commands"></div></section>')
     [void]$sb.Append('<section id="view-timeline"><h2>Investigation timeline</h2><div id="tbl-timeline"></div></section>')
     [void]$sb.Append('<section id="view-access"><h2>What access was gained</h2><div id="tbl-access"></div></section>')
     [void]$sb.Append('<section id="view-path"><h2>Attack path by tactic</h2><div id="tbl-path"></div></section>')
