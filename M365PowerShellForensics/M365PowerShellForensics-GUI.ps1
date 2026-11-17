@@ -20,7 +20,7 @@ param(
     [switch]$StaReady
 )
 
-$script:GuiVersion = '2.1.5'
+$script:GuiVersion = '2.1.6'
 
 if (-not $StaReady -and [System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
     $hostPath = $null
@@ -397,15 +397,20 @@ function Import-ResultTable {
     if ($rows.Count -eq 0) { return 0 }
     $cols = @($rows[0].PSObject.Properties.Name)
     if ($Preferred) { $cols = @($Preferred | Where-Object { $_ -in $cols }) + @($cols | Where-Object { $_ -notin $Preferred }) }
+    $headerMap = @{
+        TimeUtc = 'Time (ET)'; WhenUtc = 'When (ET)'; FirstUtc = 'First (ET)'; LastUtc = 'Last (ET)'
+        RunUtc = 'Run (ET)'; FromUtc = 'From (ET)'; ToUtc = 'To (ET)'; LastWriteUtc = 'Last write (ET)'
+    }
     foreach ($c in $cols) {
         $col = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
         $col.Name = $c
-        $col.HeaderText = $c
+        $col.HeaderText = $(if ($headerMap.ContainsKey($c)) { $headerMap[$c] } else { $c })
         $col.AutoSizeMode = 'DisplayedCells'
         [void]$Grid.Columns.Add($col)
     }
     $n = 0
     foreach ($r in $rows) {
+        if (Get-Command -Name Convert-ObjectTimesToEastern -ErrorAction SilentlyContinue) { Convert-ObjectTimesToEastern $r | Out-Null }
         $vals = foreach ($c in $cols) { [string]$r.$c }
         [void]$Grid.Rows.Add($vals)
         $n++

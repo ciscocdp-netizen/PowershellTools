@@ -55,9 +55,15 @@
         and Actors (they were only in CSV / the sign-in card count). Sign-ins are
         no longer hidden by the PowerShell-related / Severity filters. Suspect-scoped
         persistence findings are not all promoted to High.
+    Version 2.1.6:
+      - Analyst-facing timestamps (HTML report, CSV columns, GUI grids, coverage,
+        findings, evidence manifest) are US Eastern Time (America/New_York, EST/EDT).
+        Microsoft API queries still use UTC. Raw jsonl in raw\ stays UTC.
 #>
 
-$script:ScriptVersion = '2.1.5'
+$script:ScriptVersion = '2.1.6'
+$script:EasternTimeZone = $null
+$script:TimeOutputProperties = @('TimeUtc', 'WhenUtc', 'FirstUtc', 'LastUtc', 'RunUtc', 'FromUtc', 'ToUtc', 'LastWriteUtc', 'StartUtc', 'EndUtc', 'GeneratedUtc')
 $script:Inv = [Globalization.CultureInfo]::InvariantCulture
 $script:UiSync = $null
 $script:LogFile = $null
@@ -468,7 +474,7 @@ function Set-InvestigationActivity {
 
 function Write-Log {
     param([string]$Level = 'INFO', [string]$Message)
-    $line = '{0} [{1}] {2}' -f (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ', $script:Inv), $Level, $Message
+    $line = '{0} [{1}] {2}' -f (ConvertTo-EasternTime (Get-Date)), $Level, $Message
     $color = switch ($Level) { 'ERROR' { 'Red' } 'WARN' { 'Yellow' } 'OK' { 'Green' } default { 'Gray' } }
     try { Write-Host $line -ForegroundColor $color } catch { }
     if ($script:LogFile) {
@@ -545,6 +551,53 @@ function ConvertFrom-UtcIso {
     $styles = [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal
     if ([datetime]::TryParse($Value, $script:Inv, $styles, [ref]$d)) { return $d }
     return $null
+}
+
+function Get-EasternTimeZone {
+    if ($script:EasternTimeZone) { return $script:EasternTimeZone }
+    foreach ($id in @('America/New_York', 'Eastern Standard Time', 'US/Eastern')) {
+        try {
+            $script:EasternTimeZone = [TimeZoneInfo]::FindSystemTimeZoneById($id)
+            return $script:EasternTimeZone
+        }
+        catch { }
+    }
+    $script:EasternTimeZone = [TimeZoneInfo]::CreateCustomTimeZone('EST', [TimeSpan]::FromHours(-5), 'Eastern Standard Time', 'EST')
+    return $script:EasternTimeZone
+}
+
+function ConvertTo-EasternTime {
+    param($Value)
+    if ($null -eq $Value -or "$Value" -eq '') { return '' }
+    $utc = $null
+    if ($Value -is [datetime]) {
+        $d = $Value
+        if ($d.Kind -eq [DateTimeKind]::Local) { $utc = $d.ToUniversalTime() }
+        elseif ($d.Kind -eq [DateTimeKind]::Utc) { $utc = $d }
+        else { $utc = [datetime]::SpecifyKind($d, [DateTimeKind]::Utc) }
+    }
+    else {
+        $parsed = ConvertFrom-UtcIso ([string]$Value)
+        if ($null -eq $parsed) { return [string]$Value }
+        $utc = $parsed
+        if ($utc.Kind -ne [DateTimeKind]::Utc) { $utc = [datetime]::SpecifyKind($utc, [DateTimeKind]::Utc) }
+    }
+    $tz = Get-EasternTimeZone
+    $dto = [DateTimeOffset]::new([datetime]::SpecifyKind($utc, [DateTimeKind]::Utc))
+    $et = [TimeZoneInfo]::ConvertTime($dto, $tz)
+    return $et.ToString('yyyy-MM-dd HH:mm:ss zzz', $script:Inv)
+}
+
+function Convert-ObjectTimesToEastern {
+    param($Row)
+    if ($null -eq $Row) { return $Row }
+    foreach ($name in $script:TimeOutputProperties) {
+        $p = $Row.PSObject.Properties[$name]
+        if ($p -and $null -ne $p.Value -and "$($p.Value)" -ne '') {
+            $p.Value = ConvertTo-EasternTime $p.Value
+        }
+    }
+    return $Row
 }
 
 function Get-FirstValue {
@@ -630,6 +683,7 @@ function New-EventRow {
     foreach ($c in $script:EventColumns) {
         $v = ''
         if ($H.ContainsKey($c) -and $null -ne $H[$c]) { $v = [string]$H[$c] }
+        if ($c -eq 'TimeUtc' -and $v) { $v = ConvertTo-EasternTime $v }
         $o[$c] = Protect-CsvValue $v
     }
     return [pscustomobject]$o
@@ -641,6 +695,7 @@ function New-SignInRow {
     foreach ($c in $script:SignInColumns) {
         $v = ''
         if ($H.ContainsKey($c) -and $null -ne $H[$c]) { $v = [string]$H[$c] }
+        if ($c -eq 'TimeUtc' -and $v) { $v = ConvertTo-EasternTime $v }
         $o[$c] = Protect-CsvValue $v
     }
     $m = @()
@@ -706,7 +761,7 @@ function Add-Finding {
             Item         = Protect-CsvValue (Limit-Text $Item 400)
             Detail       = Protect-CsvValue (Limit-Text $Detail 1500)
             Reason       = $Reason
-            WhenUtc      = ConvertTo-UtcIso $When
+            WhenUtc      = ConvertTo-EasternTime $When
             SuspectMatch = $m -join ','
             Source       = $Source
         })
@@ -715,12 +770,12 @@ function Add-Finding {
 function Add-Coverage {
     param([string]$Source, [string]$Status, [int]$Records = 0, $From = $null, $To = $null, [string]$Notes = '')
     $row = [pscustomobject]@{
-        RunUtc  = ConvertTo-UtcIso (Get-Date)
+        RunUtc  = ConvertTo-EasternTime (Get-Date)
         Source  = $Source
         Status  = $Status
         Records = $Records
-        FromUtc = ConvertTo-UtcIso $From
-        ToUtc   = ConvertTo-UtcIso $To
+        FromUtc = ConvertTo-EasternTime $From
+        ToUtc   = ConvertTo-EasternTime $To
         Notes   = $Notes
     }
     if ($null -eq $script:CoverageRows) {
@@ -1189,8 +1244,8 @@ function Get-UalRecords {
             if ($UserIds.Count -gt 0) { $ualParams['UserIds'] = $UserIds }
             if ($ObjectIds.Count -gt 0) { $ualParams['ObjectIds'] = $ObjectIds }
             $pageNum = $pages + 1
-            Set-InvestigationActivity -WaitingOn ("Search-UnifiedAuditLog {0} page {1}{2}" -f $label, $pageNum, $scopeNote) -Detail ("{0:yyyy-MM-dd HH:mm} -> {1:yyyy-MM-dd HH:mm} UTC · {2:N0} in this slice so far{3}" -f $From, $To, $results.Count, $scopeNote)
-            Write-Log 'INFO' ("UAL {0}: requesting {1:yyyy-MM-dd HH:mm} -> {2:yyyy-MM-dd HH:mm} UTC, page {3} ({4:N0} in this slice so far{5}). This Microsoft 365 call can take several minutes." -f $label, $From, $To, $pageNum, $results.Count, $scopeNote)
+            Set-InvestigationActivity -WaitingOn ("Search-UnifiedAuditLog {0} page {1}{2}" -f $label, $pageNum, $scopeNote) -Detail ("{0} -> {1} ET · {2:N0} in this slice so far{3}" -f (ConvertTo-EasternTime $From), (ConvertTo-EasternTime $To), $results.Count, $scopeNote)
+            Write-Log 'INFO' ("UAL {0}: requesting {1} -> {2} ET, page {3} ({4:N0} in this slice so far{5}). This Microsoft 365 call can take several minutes." -f $label, (ConvertTo-EasternTime $From), (ConvertTo-EasternTime $To), $pageNum, $results.Count, $scopeNote)
             $page = @(Invoke-WithRetry -Activity ("UAL {0}" -f $label) -Script { Search-UnifiedAuditLog @ualParams })
             $pages++
             Set-InvestigationActivity -PagesDelta 1
@@ -1266,7 +1321,7 @@ function Invoke-UalCollection {
             $scopeDetail = ''
             if ($UserIds.Count -gt 0) { $scopeDetail = (' · scoped to {0}' -f ($UserIds -join ', ')) }
             elseif ($ObjectIds.Count -gt 0) { $scopeDetail = (' · targeting {0}' -f ($ObjectIds -join ', ')) }
-            Set-InvestigationActivity -Phase 'Unified Audit Log' -Step $Name -Detail ("{0:yyyy-MM-dd HH:mm} -> {1:yyyy-MM-dd HH:mm} UTC · {2:N0} collected{3}" -f $cursor, $chunkEnd, $rows.Count, $scopeDetail) -WaitingOn ("UAL slice $Name")
+            Set-InvestigationActivity -Phase 'Unified Audit Log' -Step $Name -Detail ("{0} -> {1} ET · {2:N0} collected{3}" -f (ConvertTo-EasternTime $cursor), (ConvertTo-EasternTime $chunkEnd), $rows.Count, $scopeDetail) -WaitingOn ("UAL slice $Name")
             $records = Get-UalRecords -From $cursor -To $chunkEnd -RecordType $RecordType -Operations $Operations -UserIds $UserIds -ObjectIds $ObjectIds
             $new = 0
             foreach ($r in $records) {
@@ -1278,7 +1333,7 @@ function Invoke-UalCollection {
             }
             if ($Kind -eq 'SignIn') { Set-InvestigationActivity -SignInsDelta $new -ClearWait }
             else { Set-InvestigationActivity -EventsDelta $new -ClearWait }
-            Write-Log 'INFO' ("UAL {0,-36} {1:yyyy-MM-dd HH:mm} -> {2:yyyy-MM-dd HH:mm} UTC : {3,6:N0} records (total {4:N0})" -f $Name, $cursor, $chunkEnd, $new, $rows.Count)
+            Write-Log 'INFO' ("UAL {0,-36} {1} -> {2} ET : {3,6:N0} records (total {4:N0})" -f $Name, (ConvertTo-EasternTime $cursor), (ConvertTo-EasternTime $chunkEnd), $new, $rows.Count)
             $cursor = $chunkEnd
         }
     }
@@ -1633,8 +1688,8 @@ function Get-GraphUalRecords {
     $payload = $body | ConvertTo-Json -Depth 6
     $job = $null
     $base = 'https://graph.microsoft.com/v1.0/security/auditLog/queries'
-    Set-InvestigationActivity -WaitingOn ("Graph auditLog/queries $label") -Detail ("{0:yyyy-MM-dd HH:mm} -> {1:yyyy-MM-dd HH:mm} UTC" -f $From, $To)
-    Write-Log 'INFO' ("Graph UAL {0}: creating audit log query {1:yyyy-MM-dd HH:mm} -> {2:yyyy-MM-dd HH:mm} UTC." -f $label, $From, $To)
+    Set-InvestigationActivity -WaitingOn ("Graph auditLog/queries $label") -Detail ("{0} -> {1} ET" -f (ConvertTo-EasternTime $From), (ConvertTo-EasternTime $To))
+    Write-Log 'INFO' ("Graph UAL {0}: creating audit log query {1} -> {2} ET." -f $label, (ConvertTo-EasternTime $From), (ConvertTo-EasternTime $To))
     try {
         $job = Invoke-WithRetry -Activity ("Graph UAL create $label") -Script {
             Invoke-MgGraphRequest -Method POST -Uri $base -Body $payload -ContentType 'application/json' -OutputType PSObject -ErrorAction Stop
@@ -1961,7 +2016,7 @@ function Invoke-GraphStateCollectionForSuspects {
             Add-Finding 'Medium' 'Suspect Account' $upn 'User was not found in Entra ID (wrong UPN, deleted, or insufficient permission).' 'Confirm the UPN. Collection still uses this string in Unified Audit Log UserIds.' $null $src
             continue
         }
-        Add-Finding 'Info' 'Suspect Account' ([string]$user.userPrincipalName) ("DisplayName={0}; Enabled={1}; Type={2}; Created={3}; ObjectId={4}" -f $user.displayName, $user.accountEnabled, $user.userType, (ConvertTo-UtcIso $user.createdDateTime), $user.id) 'Baseline identity for the scoped investigation.' $user.createdDateTime $src
+        Add-Finding 'Info' 'Suspect Account' ([string]$user.userPrincipalName) ("DisplayName={0}; Enabled={1}; Type={2}; Created={3}; ObjectId={4}" -f $user.displayName, $user.accountEnabled, $user.userType, (ConvertTo-EasternTime $user.createdDateTime), $user.id) 'Baseline identity for the scoped investigation.' $user.createdDateTime $src
 
         Set-InvestigationActivity -Step ("Roles: $upn") -WaitingOn ("GET users/$upn/memberOf")
         try {
@@ -2045,13 +2100,13 @@ function Invoke-GraphStateCollection {
                 foreach ($cr in $creds) {
                     $st = ConvertTo-UtcIso $cr.C.startDateTime
                     if ($st -and [string]::CompareOrdinal($st, $startIso) -ge 0) {
-                        Add-Finding 'Critical' ('App Credential (' + $kind + ')') ("{0}  (appId {1})" -f $o.displayName, $o.appId) ("{0}; KeyId={1}; Name={2}; Hint={3}; Start={4}; End={5}" -f $cr.T, $cr.C.keyId, $cr.C.displayName, $cr.C.hint, $st, (ConvertTo-UtcIso $cr.C.endDateTime)) 'Credential created inside the investigation window - confirm it is authorized; otherwise it is an app-only backdoor (T1098.001). Remove it and review service-principal sign-ins.' $st $src
+                        Add-Finding 'Critical' ('App Credential (' + $kind + ')') ("{0}  (appId {1})" -f $o.displayName, $o.appId) ("{0}; KeyId={1}; Name={2}; Hint={3}; Start={4}; End={5}" -f $cr.T, $cr.C.keyId, $cr.C.displayName, $cr.C.hint, (ConvertTo-EasternTime $cr.C.startDateTime), (ConvertTo-EasternTime $cr.C.endDateTime)) 'Credential created inside the investigation window - confirm it is authorized; otherwise it is an app-only backdoor (T1098.001). Remove it and review service-principal sign-ins.' $cr.C.startDateTime $src
                     }
                 }
                 if ($kind -eq 'applications') {
                     $cd = ConvertTo-UtcIso $o.createdDateTime
                     if ($cd -and [string]::CompareOrdinal($cd, $startIso) -ge 0) {
-                        Add-Finding 'Medium' 'New Application Registration' ("{0}  (appId {1})" -f $o.displayName, $o.appId) ("Created=" + $cd) 'Application registered during the investigation window.' $cd $src
+                        Add-Finding 'Medium' 'New Application Registration' ("{0}  (appId {1})" -f $o.displayName, $o.appId) ("Created=" + (ConvertTo-EasternTime $o.createdDateTime)) 'Application registered during the investigation window.' $o.createdDateTime $src
                     }
                 }
             }
@@ -2103,7 +2158,7 @@ function Invoke-GraphStateCollection {
         $uri = New-GraphUri 'v1.0/users' ([ordered]@{ '$filter' = ('createdDateTime ge ' + $startIso); '$select' = 'id,userPrincipalName,displayName,createdDateTime,userType,accountEnabled,creationType'; '$count' = 'true'; '$top' = '999' })
         Set-InvestigationActivity -Step 'Accounts created in window' -WaitingOn 'GET users (createdDateTime)'
         foreach ($u in (Get-GraphAll -Uri $uri -Headers @{ ConsistencyLevel = 'eventual' } -Label 'new users')) {
-            Add-Finding 'Medium' 'New Account' ([string]$u.userPrincipalName) ("DisplayName={0}; Type={1}; Enabled={2}; CreationType={3}; Created={4}" -f $u.displayName, $u.userType, $u.accountEnabled, $u.creationType, (ConvertTo-UtcIso $u.createdDateTime)) 'Account created during the investigation window - confirm it is legitimate (T1136.003).' $u.createdDateTime $src
+            Add-Finding 'Medium' 'New Account' ([string]$u.userPrincipalName) ("DisplayName={0}; Type={1}; Enabled={2}; CreationType={3}; Created={4}" -f $u.displayName, $u.userType, $u.accountEnabled, $u.creationType, (ConvertTo-EasternTime $u.createdDateTime)) 'Account created during the investigation window - confirm it is legitimate (T1136.003).' $u.createdDateTime $src
         }
     }
     catch { Write-Log 'WARN' "New-account sweep: $($_.Exception.Message)" }
@@ -2318,16 +2373,16 @@ function New-InvestigationReport {
     Set-InvestigationActivity -WaitingOn 'Reading Events-*.csv / SignIns-*.csv / Findings-*.csv'
     $events = New-Object System.Collections.Generic.List[object]
     foreach ($f in @(Get-ChildItem -LiteralPath $script:OutputPath -Filter 'Events-*.csv' -File -ErrorAction SilentlyContinue)) {
-        foreach ($r in @(Import-Csv -LiteralPath $f.FullName)) { $events.Add($r) }
+        foreach ($r in @(Import-Csv -LiteralPath $f.FullName)) { $events.Add((Convert-ObjectTimesToEastern $r)) }
     }
     $signIns = New-Object System.Collections.Generic.List[object]
     foreach ($f in @(Get-ChildItem -LiteralPath $script:OutputPath -Filter 'SignIns-*.csv' -File -ErrorAction SilentlyContinue)) {
-        foreach ($r in @(Import-Csv -LiteralPath $f.FullName)) { $signIns.Add($r) }
+        foreach ($r in @(Import-Csv -LiteralPath $f.FullName)) { $signIns.Add((Convert-ObjectTimesToEastern $r)) }
     }
     $findings = @()
-    foreach ($f in @(Get-ChildItem -LiteralPath $script:OutputPath -Filter 'Findings-*.csv' -File -ErrorAction SilentlyContinue)) { $findings += @(Import-Csv -LiteralPath $f.FullName) }
+    foreach ($f in @(Get-ChildItem -LiteralPath $script:OutputPath -Filter 'Findings-*.csv' -File -ErrorAction SilentlyContinue)) { $findings += @(Import-Csv -LiteralPath $f.FullName | ForEach-Object { Convert-ObjectTimesToEastern $_ }) }
     $coverage = @()
-    if ($script:CoverageFile -and (Test-Path -LiteralPath $script:CoverageFile)) { $coverage = @(Import-Csv -LiteralPath $script:CoverageFile) }
+    if ($script:CoverageFile -and (Test-Path -LiteralPath $script:CoverageFile)) { $coverage = @(Import-Csv -LiteralPath $script:CoverageFile | ForEach-Object { Convert-ObjectTimesToEastern $_ }) }
 
     $graphTimes = @($events | Where-Object { $_.Source -eq 'Graph-DirectoryAudit' } | ForEach-Object { $_.TimeUtc } | Sort-Object)
     if ($graphTimes.Count -gt 0) {
@@ -2498,9 +2553,10 @@ function New-InvestigationReport {
 
     $payload = [ordered]@{
         meta = [ordered]@{
-            StartUtc = (ConvertTo-UtcIso $script:StartUtc)
-            EndUtc = (ConvertTo-UtcIso $script:EndUtc)
-            GeneratedUtc = (ConvertTo-UtcIso (Get-Date))
+            StartUtc = (ConvertTo-EasternTime $script:StartUtc)
+            EndUtc = (ConvertTo-EasternTime $script:EndUtc)
+            GeneratedUtc = (ConvertTo-EasternTime (Get-Date))
+            TimeZone = 'US Eastern Time (America/New_York, EST/EDT)'
             Version = $script:ScriptVersion
             User = [string]$env:USERNAME
             Computer = [string]$env:COMPUTERNAME
@@ -2522,7 +2578,7 @@ function New-InvestigationReport {
             ('Entra, SharePoint, Teams and Az PowerShell do not log command text; the resulting change plus the PowerShell-client sign-in is shown instead. "InferredIP" links a cmdlet to the same actor''s preceding PowerShell sign-in within ' + $corrHours + ' hours - treat it as a lead, not proof.'),
             '"Cmdlet - PowerShell or Admin Center" means Microsoft did not record which interface was used; the Exchange Admin Center also executes cmdlets.',
             'Entra sign-in and directory audit logs via Graph cover the last 30 days only; older Entra changes come from the Unified Audit Log.',
-            'All times are UTC. Raw source records are preserved in the raw\ folder; hashes are in Evidence-Manifest.csv.',
+            'All times are US Eastern Time (America/New_York): EST (UTC-5) in winter, EDT (UTC-4) in summer. Microsoft APIs were queried in UTC; raw jsonl in the raw\ folder stays UTC. Hashes are in Evidence-Manifest.csv.',
             'PowerShell / CLI sign-ins from Entra are copied onto Commands, Timeline, Failed, and Actors so those tabs match SignIns-*.csv. The Sign-ins tab lists the same rows and ignores the Severity dropdown (that filter is for cmdlet events).',
             'Click a row for the full command. Click an actor, IP, or category to pivot. Press / to search, Esc to clear, j/k to move, c to copy the command.'
         )
@@ -2600,6 +2656,10 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
   function $(id){ return document.getElementById(id); }
   function lc(v){ return (v||"").toString().toLowerCase(); }
   function enc(v){ return String(v==null?"":v).replace(/[&<>"']/g, function(c){ return ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]); }); }
+  function colLabel(c){
+    var m={TimeUtc:"Time (ET)",WhenUtc:"When (ET)",FirstUtc:"First (ET)",LastUtc:"Last (ET)",RunUtc:"Run (ET)",FromUtc:"From (ET)",ToUtc:"To (ET)",StartUtc:"Start (ET)",EndUtc:"End (ET)",GeneratedUtc:"Generated (ET)",LastWriteUtc:"Last write (ET)"};
+    return m[c]||c;
+  }
   function badge(sev){ if(!sev) return ""; return '<span class="badge b-'+enc(lc(sev))+'">'+enc(sev)+'</span>'; }
   function blob(row){ var k, s=[]; for(k in row){ if(Object.prototype.hasOwnProperty.call(row,k)) s.push(row[k]); } return s.join(" ").toLowerCase(); }
   function mentionsSuspect(r){
@@ -2668,7 +2728,7 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
     var d=$("detail"), h=["<h3>Event detail</h3>","<button class='btn' onclick='window._irCloseDetail()'>Close</button>"];
     if(!row){ d.className="detail"; d.innerHTML=""; return; }
     var keys=["TimeUtc","Severity","Category","Operation","Outcome","Actor","User","Result","AppName","PowerShellApp","ClientIP","IPAddress","InferredIP","InferredLocation","Location","Target","TargetIdentity","CommandLine","Details","AccessGained","Mitre","PowerShellRelated","ExecutionChannel","AppId","UserAgent","ErrorCode","FailureReason","Resource","SuspectMatch","Workload","RecordType","Source","RecordId"];
-    keys.forEach(function(k){ if(row[k]) h.push('<div class="kv"><b>'+enc(k)+'</b> '+(k==="CommandLine"?"<pre><code>"+enc(row[k])+"</code></pre>":enc(row[k]))+"</div>"); });
+    keys.forEach(function(k){ if(row[k]) h.push('<div class="kv"><b>'+enc(colLabel(k))+'</b> '+(k==="CommandLine"?"<pre><code>"+enc(row[k])+"</code></pre>":enc(row[k]))+"</div>"); });
     if(row.CommandLine) h.push("<p><button class='btn' onclick='window._irCopy()'>Copy command</button></p>");
     d.innerHTML=h.join(""); d.className="detail open"; window._irCopy=function(){ copyCmd(row.CommandLine||row.Operation||""); };
     window._irCloseDetail=function(){ d.className="detail"; };
@@ -2682,7 +2742,7 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
     var html=["<p class='note'>"+pg.total.toLocaleString()+" matching row(s)</p>"];
     if(!pg.total){ html.push("<p class='empty'>No records match the current filters.</p>"); $(id).innerHTML=html.join(""); return filtered; }
     html.push("<div class='tw'><table><thead><tr>");
-    cols.forEach(function(c){ html.push("<th data-col='"+enc(c)+"'>"+enc(c)+"</th>"); });
+    cols.forEach(function(c){ html.push("<th data-col='"+enc(c)+"'>"+enc(colLabel(c))+"</th>"); });
     html.push("</tr></thead><tbody>");
     pg.slice.forEach(function(r,i){
       var cls=[];
@@ -2726,7 +2786,7 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
   }
   function render(){
     document.body.className = localStorage.getItem("m365ps-dark")==="1" ? "dark" : "";
-    $("meta").innerHTML = "Window: "+enc(D.meta.StartUtc)+" → "+enc(D.meta.EndUtc)+" (UTC) &nbsp;|&nbsp; Generated "+enc(D.meta.GeneratedUtc)+" by "+enc(D.meta.User)+" on "+enc(D.meta.Computer)+" &nbsp;|&nbsp; v"+enc(D.meta.Version);
+    $("meta").innerHTML = "Window: "+enc(D.meta.StartUtc)+" → "+enc(D.meta.EndUtc)+" (Eastern Time) &nbsp;|&nbsp; Generated "+enc(D.meta.GeneratedUtc)+" by "+enc(D.meta.User)+" on "+enc(D.meta.Computer)+" &nbsp;|&nbsp; v"+enc(D.meta.Version);
     $("tenant").textContent = "Tenant: "+(D.meta.Tenant||"(not recorded)");
     $("suspects").textContent = "Scope: "+(D.meta.Scope||"Tenant-wide")+"  |  Suspect accounts: "+((D.meta.Suspects||[]).join(", ")||"(none)")+"  |  Suspect IPs: "+((D.meta.SuspectIPs||[]).join(", ")||"(none)");
     var nav=$("tabs"); nav.innerHTML="";
@@ -2842,7 +2902,7 @@ function Write-EvidenceManifest {
             File         = $f.FullName.Substring($script:OutputPath.Length).TrimStart('\', '/')
             SizeBytes    = $f.Length
             SHA256       = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash
-            LastWriteUtc = ConvertTo-UtcIso $f.LastWriteTimeUtc
+            LastWriteUtc = ConvertTo-EasternTime $f.LastWriteTimeUtc
         }
     }
     Export-EvidenceCsv -Rows $rows -Path $manifest
@@ -3001,7 +3061,7 @@ function Invoke-M365PowerShellForensics {
         Initialize-SuspectSets -Users $script:Config.SuspectUsers -IPs $script:Config.SuspectIPs
 
         Write-Log 'INFO' ("M365 PowerShell Forensics v{0} | PowerShell {1} | Output: {2}" -f $script:ScriptVersion, $PSVersionTable.PSVersion, $script:OutputPath)
-        Write-Log 'INFO' ("Window (UTC): {0} -> {1} | Suspect users: {2} | Suspect IPs: {3}" -f (ConvertTo-UtcIso $script:StartUtc), (ConvertTo-UtcIso $script:EndUtc), ($script:Config.SuspectUsers -join ', '), ($script:Config.SuspectIPs -join ', '))
+        Write-Log 'INFO' ("Window (Eastern): {0} -> {1} | Suspect users: {2} | Suspect IPs: {3}" -f (ConvertTo-EasternTime $script:StartUtc), (ConvertTo-EasternTime $script:EndUtc), ($script:Config.SuspectUsers -join ', '), ($script:Config.SuspectIPs -join ', '))
         if (Test-SuspectScoped) {
             Write-Log 'INFO' ('Scope: SUSPECT USERS ONLY ({0}). Cmdlets, sign-ins, directory audit, and mailbox/Entra state are limited to these accounts. Check Tenant-wide to hunt the rest of the tenant.' -f ($script:Config.SuspectUsers -join ', '))
         }

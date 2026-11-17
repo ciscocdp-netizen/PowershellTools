@@ -83,6 +83,11 @@ Assert-Equal (Get-ClientFromUserAgent 'Mozilla/5.0') '' 'browser user agent is n
 $iso = ConvertTo-UtcIso ([datetime]::SpecifyKind([datetime]'2026-01-02T03:04:05', 'Utc'))
 Assert-Equal $iso '2026-01-02T03:04:05Z' 'UTC datetime becomes ISO Z'
 Assert-Equal (ConvertFrom-UtcIso '2026-01-02T03:04:05Z').Year 2026 'ISO Z parses'
+$est = ConvertTo-EasternTime ([datetime]::SpecifyKind([datetime]'2026-01-02T03:04:05', 'Utc'))
+Assert-Equal $est '2026-01-01 22:04:05 -05:00' 'January UTC converts to Eastern Standard Time'
+$edt = ConvertTo-EasternTime ([datetime]::SpecifyKind([datetime]'2026-07-02T03:04:05', 'Utc'))
+Assert-Equal $edt '2026-07-01 23:04:05 -04:00' 'July UTC converts to Eastern Daylight Time'
+Assert-Equal (ConvertTo-EasternTime $est) $est 'Eastern conversion is idempotent'
 $ids = Get-NormalizedIdList @('Jane@Contoso.com, bob@contoso.com', 'jane@contoso.com')
 Assert-Equal $ids.Count 2 'duplicate UPNs collapse'
 Assert-True ($ids -contains 'jane@contoso.com') 'UPNs are lowercased'
@@ -125,6 +130,7 @@ $ual = New-FakeUal -RecordType 'ExchangeAdmin' -Audit ([pscustomobject]@{
         ObjectId     = 'cfo@contoso.com'
     })
 $row = ConvertFrom-UalRecord $ual 'Admin'
+Assert-Contains $row.TimeUtc '2026-10-01 08:00:00 -04:00' 'UAL event time is Eastern (EDT in October)'
 Assert-Equal $row.Actor 'attacker@contoso.com' 'actor is the UAL UserId'
 Assert-Equal $row.ClientIP '203.0.113.50' 'client IP port is stripped'
 Assert-Contains $row.CommandLine 'Set-Mailbox' 'command line is reconstructed'
@@ -289,6 +295,9 @@ Assert-True ($html.IndexOf('alreadyScoped') -ge 0) 'report detects suspect-user 
 Assert-True ($html.IndexOf('function matchSignIn') -ge 0) 'report filters sign-ins separately from cmdlet events'
 Assert-True ($html.IndexOf('S.ps="yes";') -lt 0) 'report does not force PowerShell-related after load'
 Assert-Contains $html 'Suspect users' 'report records suspect-user collection scope'
+Assert-Contains $html 'Eastern Time' 'report header states Eastern Time'
+Assert-NotContains $html 'All times are UTC' 'report no longer claims all times are UTC'
+Assert-Contains $html '2026-10-01 08:00:00 -04:00' 'report embeds Eastern event timestamps'
 $tl = @(Import-Csv -LiteralPath (Join-Path $out 'Timeline-Master.csv'))
 $siEvents = @($tl | Where-Object { $_.RecordType -eq 'SignIn' })
 Assert-True ($siEvents.Count -ge 3) 'PowerShell sign-ins are copied onto the command timeline'
@@ -340,7 +349,7 @@ $modErrors = $null
 $null = [System.Management.Automation.Language.Parser]::ParseFile($modulePath, [ref]$null, [ref]$modErrors)
 Assert-Equal @($modErrors).Count 0 'engine module parses'
 
-Assert-Equal (Get-M365PsForensicsVersion) '2.1.5' 'engine version is 2.1.5'
+Assert-Equal (Get-M365PsForensicsVersion) '2.1.6' 'engine version is 2.1.6'
 
 Write-Host 'Exchange cmdlet status and Graph UAL shaping'
 $exoStatus = Get-ExoCmdletStatus
