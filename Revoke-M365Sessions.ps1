@@ -62,10 +62,12 @@
     prove that a given access token is already dead: access tokens can remain
     valid until they expire (typically up to 1 hour) unless the app uses CAE.
 
-    If a browser or Windows account picker never appears, choose device-code
-    sign-in. Recent Microsoft.Graph.Authentication builds use WAM on Windows,
-    which often fails from a console script. Device code always prints a URL
-    and code in the host.
+    Interactive Windows (WAM) sign-in needs a parent window handle. Hosts such
+    as PowerShell ISE, VS Code, Cursor, and many embedded terminals have none,
+    which produces: "A window handle must be configured." This script therefore
+    signs in with device code and opens https://microsoft.com/devicelogin in
+    your default browser. Enter the code printed in the console, then complete
+    MFA / admin consent in that browser tab.
 
 .PARAMETER SelfTest
     Run built-in regression tests for helpers (CSV, UPN, retry math, Graph URI,
@@ -914,6 +916,8 @@ function Confirm-RevokedSignInSession {
     }
 }
 
+$script:DeviceLoginUrl = 'https://microsoft.com/devicelogin'
+
 function Get-GraphDeviceCodeParameterName {
     $cmd = Get-Command Connect-MgGraph -ErrorAction Stop
     foreach ($name in @('UseDeviceCode', 'UseDeviceAuthentication')) {
@@ -922,15 +926,79 @@ function Get-GraphDeviceCodeParameterName {
     return $null
 }
 
-function Disable-GraphWamIfPossible {
-    $cmd = Get-Command Set-MgGraphOption -ErrorAction SilentlyContinue
-    if ($null -eq $cmd) { return }
-    if (-not $cmd.Parameters.ContainsKey('DisableLoginByWAM')) { return }
+function Test-WamParentWindowAvailable {
+    if (-not (Test-IsWindowsOs)) { return $false }
+    if ($Host.Name -match 'ISE|Visual Studio Code') { return $false }
+    if ($env:TERM_PROGRAM -or $env:VSCODE_PID -or $env:VSCODE_INJECTION -or $env:CURSOR_TRACE_ID) { return $false }
+
     try {
-        Set-MgGraphOption -DisableLoginByWAM $true
-        Write-Info 'Asked the Graph SDK to disable WAM (only honoured with a custom ClientId).'
+        $main = [System.Diagnostics.Process]::GetCurrentProcess().MainWindowHandle
+        if ($main -ne [IntPtr]::Zero) { return $true }
+    } catch { }
+
+    try {
+        if (-not ('NativeConsoleWindow' -as [type])) {
+            Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class NativeConsoleWindow {
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetConsoleWindow();
+}
+"@
+        }
+        $console = [NativeConsoleWindow]::GetConsoleWindow()
+        if ($console -ne [IntPtr]::Zero) { return $true }
+    } catch { }
+
+    return $false
+}
+
+function Open-UrlInBrowser {
+    param([string]$Url)
+    Write-Host ("Opening {0} in your default browser..." -f $Url) -ForegroundColor Cyan
+    try {
+        Start-Process -FilePath $Url | Out-Null
+        return $true
+    } catch { }
+    if (Test-IsWindowsOs) {
+        try {
+            Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList @('/c', 'start', '', $Url) | Out-Null
+            return $true
+        } catch { }
+    }
+    Write-Warn2 "Could not open a browser automatically. Please open: $Url"
+    return $false
+}
+
+function Show-SignInHelperWindow {
+    param(
+        [string]$Title,
+        [string]$Message
+    )
+    if (-not (Test-IsWindowsOs)) { return $null }
+    try {
+        Add-Type -AssemblyName System.Windows.Forms | Out-Null
+        Add-Type -AssemblyName System.Drawing | Out-Null
+        $form = New-Object System.Windows.Forms.Form
+        $form.Text = $Title
+        $form.Size = New-Object System.Drawing.Size -ArgumentList @(560, 240)
+        $form.StartPosition = 'CenterScreen'
+        $form.TopMost = $true
+        $form.MinimizeBox = $false
+        $form.MaximizeBox = $false
+        $form.ShowInTaskbar = $true
+        $label = New-Object System.Windows.Forms.Label
+        $label.Text = $Message
+        $label.AutoSize = $false
+        $label.Dock = 'Fill'
+        $label.Padding = New-Object System.Windows.Forms.Padding -ArgumentList @(16)
+        $form.Controls.Add($label)
+        [void]$form.Show()
+        $form.Activate()
+        return $form
     } catch {
-        Write-Warn2 "Could not set DisableLoginByWAM: $($_.Exception.Message)"
+        return $null
     }
 }
 
@@ -948,27 +1016,44 @@ function Invoke-GraphSignIn {
     foreach ($key in $ConnectParams.Keys) { $params[$key] = $ConnectParams[$key] }
 
     if ($connectCmd.Parameters.ContainsKey('ClientTimeout') -and -not $params.ContainsKey('ClientTimeout')) {
-        $params['ClientTimeout'] = 180
+        $params['ClientTimeout'] = 300
+    }
+
+    $helperForm = $null
+    if ($Method -eq 'Browser' -and -not (Test-WamParentWindowAvailable)) {
+        Write-Warn2 'Windows Web Account Manager cannot show a login prompt here (no parent window handle).'
+        Write-Warn2 'This is expected in ISE, VS Code, Cursor, and many embedded terminals.'
+        Write-Warn2 'Opening a browser for device-code sign-in instead.'
+        $Method = 'DeviceCode'
     }
 
     if ($Method -eq 'DeviceCode') {
         $deviceParam = Get-GraphDeviceCodeParameterName
         if ([string]::IsNullOrWhiteSpace($deviceParam)) {
-            throw 'This Microsoft.Graph.Authentication version does not support -UseDeviceCode. Update the module or use browser sign-in.'
+            throw 'This Microsoft.Graph.Authentication version does not support -UseDeviceCode. Update the module.'
         }
         $params[$deviceParam] = $true
         if ($params.ContainsKey('NoWelcome')) { $params.Remove('NoWelcome') }
         Write-Host ''
         Write-Host 'DEVICE CODE SIGN-IN' -ForegroundColor Cyan
-        Write-Host '1. Wait for a URL and code to appear below (do not close this window).' -ForegroundColor White
-        Write-Host '2. Open https://microsoft.com/devicelogin in a browser.' -ForegroundColor White
-        Write-Host '3. Enter the code, then complete MFA / admin consent if prompted.' -ForegroundColor White
+        Write-Host 'A browser window will open. When PowerShell prints a code below, enter it on that page, then complete MFA / admin consent.' -ForegroundColor White
+        Write-Host ("If no browser opens, go to {0} yourself." -f $script:DeviceLoginUrl) -ForegroundColor Yellow
         Write-Host ''
+        [void](Open-UrlInBrowser -Url $script:DeviceLoginUrl)
+        $helperForm = Show-SignInHelperWindow -Title 'Microsoft Graph sign-in' -Message @"
+A browser tab was opened for Microsoft device login.
+
+1. Look at the PowerShell window for a code (for example, A1B2C3D4).
+2. Paste that code into the browser page.
+3. Sign in with your admin account and complete MFA.
+4. Return to PowerShell when finished.
+
+Page: $($script:DeviceLoginUrl)
+"@
+        Write-Host 'Waiting for Microsoft to print a device code in this window...' -ForegroundColor Gray
     } else {
-        Disable-GraphWamIfPossible
         Write-Host ''
-        Write-Host 'A Windows account picker or browser window should open.' -ForegroundColor Cyan
-        Write-Host 'If nothing appears, or sign-in hangs, cancel and choose device code.' -ForegroundColor Yellow
+        Write-Host 'Trying Windows Web Account Manager. If nothing appears, the script will open a browser instead.' -ForegroundColor Cyan
         Write-Host ''
     }
 
@@ -991,6 +1076,9 @@ function Invoke-GraphSignIn {
         $ErrorActionPreference  = $prevEap
         $WarningPreference      = $prevWarn
         $InformationPreference  = $prevInfo
+        if ($null -ne $helperForm) {
+            try { $helperForm.Close(); $helperForm.Dispose() } catch { }
+        }
     }
 
     $ctx = $null
@@ -1013,6 +1101,11 @@ function Connect-RevokeGraphSession {
     )
 
     Initialize-GraphAuthModule
+
+    if ($AuthMethod -eq 'Browser' -and -not (Test-WamParentWindowAvailable)) {
+        Write-Warn2 'Skipping Windows account picker: this host has no window handle for WAM.'
+        $AuthMethod = 'DeviceCode'
+    }
 
     $scopeSets = @(
         ,@('User.RevokeSessions.All', 'User.Read.All')
@@ -1239,6 +1332,11 @@ function Invoke-SelfTest {
     $wait = Get-RetryWaitSeconds -Attempt 3
     Assert-True 'Retry helper returns int 8 for attempt 3' ($wait -eq 8 -and $wait -is [int])
 
+    $wamProbeOk = $false
+    try { $null = Test-WamParentWindowAvailable; $wamProbeOk = $true } catch { $wamProbeOk = $false }
+    Assert-True 'WAM window probe runs without throwing' $wamProbeOk
+    Assert-True 'Device login URL is microsoft.com/devicelogin' ($script:DeviceLoginUrl -eq 'https://microsoft.com/devicelogin')
+
     Write-Host ''
     Write-Info ("Passed: {0}  Failed: {1}" -f $script:SelfPassed, $script:SelfFailed)
     return $script:SelfFailed
@@ -1376,8 +1474,8 @@ function Start-RevokeM365Sessions {
     # --- Step 4: connect to Graph ------------------------------------------------
     Write-Info 'Step 4 of 5: Connecting to Microsoft Graph...'
     $authIndex = Read-Choice -Title 'How do you want to sign in to Microsoft Graph?' -Options @(
-        'Device code (recommended: prints a URL and code in this window)',
-        'Interactive browser / Windows account picker',
+        'Open a browser and sign in with a device code (recommended; works in ISE, VS Code, Cursor)',
+        'Windows account picker (WAM; fails here with "window handle must be configured")',
         'Cancel'
     )
     if ($authIndex -eq 2) { Write-Warn2 'Cancelled by user.'; return }
