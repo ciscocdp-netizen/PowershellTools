@@ -298,6 +298,11 @@ Assert-Contains $html 'Suspect users' 'report records suspect-user collection sc
 Assert-Contains $html 'Eastern Time' 'report header states Eastern Time'
 Assert-NotContains $html 'All times are UTC' 'report no longer claims all times are UTC'
 Assert-Contains $html '2026-10-01 08:00:00 -04:00' 'report embeds Eastern event timestamps'
+Assert-Contains $html 'id="tFrom"' 'report has an Eastern From time filter'
+Assert-Contains $html 'id="failOnly"' 'report has a failed-sign-in chip'
+Assert-Contains $html 'Focus timeline' 'report can focus the timeline around a sign-in'
+Assert-Contains $html 'id="tbl-sisummary"' 'report rolls up sign-ins by account and client'
+Assert-Contains $html 'function inTime' 'report applies a shared time-window filter'
 $tl = @(Import-Csv -LiteralPath (Join-Path $out 'Timeline-Master.csv'))
 $siEvents = @($tl | Where-Object { $_.RecordType -eq 'SignIn' })
 Assert-True ($siEvents.Count -ge 3) 'PowerShell sign-ins are copied onto the command timeline'
@@ -349,7 +354,7 @@ $modErrors = $null
 $null = [System.Management.Automation.Language.Parser]::ParseFile($modulePath, [ref]$null, [ref]$modErrors)
 Assert-Equal @($modErrors).Count 0 'engine module parses'
 
-Assert-Equal (Get-M365PsForensicsVersion) '2.1.6' 'engine version is 2.1.6'
+Assert-Equal (Get-M365PsForensicsVersion) '2.1.7' 'engine version is 2.1.7'
 
 Write-Host 'Exchange cmdlet status and Graph UAL shaping'
 $exoStatus = Get-ExoCmdletStatus

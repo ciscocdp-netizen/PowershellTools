@@ -59,9 +59,13 @@
       - Analyst-facing timestamps (HTML report, CSV columns, GUI grids, coverage,
         findings, evidence manifest) are US Eastern Time (America/New_York, EST/EDT).
         Microsoft API queries still use UTC. Raw jsonl in raw\ stays UTC.
+    Version 2.1.7:
+      - HTML investigation filters: Eastern time From/To, sign-in result, app,
+        location, error, account, IP, failed/success/unusual-client chips.
+        Click a sign-in and Focus timeline to see cmdlets in the following hours.
 #>
 
-$script:ScriptVersion = '2.1.6'
+$script:ScriptVersion = '2.1.7'
 $script:EasternTimeZone = $null
 $script:TimeOutputProperties = @('TimeUtc', 'WhenUtc', 'FirstUtc', 'LastUtc', 'RunUtc', 'FromUtc', 'ToUtc', 'LastWriteUtc', 'StartUtc', 'EndUtc', 'GeneratedUtc')
 $script:Inv = [Globalization.CultureInfo]::InvariantCulture
@@ -2580,7 +2584,7 @@ function New-InvestigationReport {
             'Entra sign-in and directory audit logs via Graph cover the last 30 days only; older Entra changes come from the Unified Audit Log.',
             'All times are US Eastern Time (America/New_York): EST (UTC-5) in winter, EDT (UTC-4) in summer. Microsoft APIs were queried in UTC; raw jsonl in the raw\ folder stays UTC. Hashes are in Evidence-Manifest.csv.',
             'PowerShell / CLI sign-ins from Entra are copied onto Commands, Timeline, Failed, and Actors so those tabs match SignIns-*.csv. The Sign-ins tab lists the same rows and ignores the Severity dropdown (that filter is for cmdlet events).',
-            'Click a row for the full command. Click an actor, IP, or category to pivot. Press / to search, Esc to clear, j/k to move, c to copy the command.'
+            'Click a row for the full command. Click an account, IP, app, location, or error to pivot. Use From/To (Eastern Time) plus Focus timeline to reconstruct the sequence. Press / to search, Esc to clear, c to copy the command.'
         )
         events = @($embedEvents | ForEach-Object { ConvertTo-JsonMap $_ $script:EventColumns })
         signIns = @($psSignIns | ForEach-Object { ConvertTo-JsonMap $_ $script:SignInColumns })
@@ -2610,8 +2614,11 @@ function Get-InteractiveReportHtml {
 *{box-sizing:border-box}html,body{margin:0;height:100%}body{font-family:Segoe UI,system-ui,sans-serif;background:var(--bg);color:var(--fg);font-size:13px;line-height:1.45}
 header{background:var(--acc);color:#fff;padding:18px 24px 12px}header h1{margin:0 0 4px;font-size:20px}header .sub{color:#cbd5e1;margin:2px 0;font-size:12px}
 .toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}
-input[type=search],select{padding:7px 10px;border:1px solid var(--bd);border-radius:6px;font:inherit;background:var(--card);color:var(--fg)}
+.toolbar.inv{margin-top:6px}
+.toolbar label{display:flex;align-items:center;gap:6px;color:#cbd5e1;font-size:12px}
+input[type=search],select,input[type=datetime-local]{padding:7px 10px;border:1px solid var(--bd);border-radius:6px;font:inherit;background:var(--card);color:var(--fg)}
 input[type=search]{min-width:280px;flex:1}
+input[type=datetime-local]{min-width:190px}
 .btn{border:1px solid var(--bd);background:var(--card);color:var(--fg);border-radius:6px;padding:6px 10px;cursor:pointer;font:inherit}
 .btn:hover{border-color:#93c5fd}
 nav.tabs{display:flex;gap:4px;flex-wrap:wrap;padding:10px 24px 0;background:var(--bg);position:sticky;top:0;z-index:5;border-bottom:1px solid var(--bd)}
@@ -2641,6 +2648,10 @@ code,pre{font-family:Consolas,ui-monospace,monospace;font-size:12px;white-space:
 .detail.open{transform:none}.detail h3{margin:0 0 8px}.kv{margin:6px 0}.kv b{display:inline-block;min-width:120px;color:var(--mut)}
 .warn{background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;padding:10px 14px;margin:8px 0}
 .dark .warn{background:#3b2f0b;border-color:#a16207}
+.story{background:var(--card);border:1px solid var(--bd);border-left:4px solid var(--sel);border-radius:8px;padding:10px 14px;margin:8px 0}
+.story b{color:var(--fg)}.active-filters{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0;min-height:0}
+.active-filters .chip{background:var(--chip)}
+h3.block{margin:16px 0 6px;font-size:14px}
 ul{margin:6px 0 0 18px}li{margin:3px 0}
 .hide{display:none}
 '@
@@ -2648,7 +2659,7 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
 (function(){
   var D = JSON.parse(document.getElementById("report-data").textContent);
   var alreadyScoped = (D.meta.Scope==="Suspect users");
-  var S = {q:"", sev:"", cat:"", actor:"", ip:"", ps:"yes", suspect:(alreadyScoped?false:!!((D.meta.Suspects||[]).length)), sort:"TimeUtc", dir:-1, page:1, size:100, tab:"commands", row:-1};
+  var S = {q:"", sev:"", cat:"", actor:"", ip:"", ps:"yes", suspect:(alreadyScoped?false:!!((D.meta.Suspects||[]).length)), result:"", app:"", loc:"", err:"", unusual:false, tFrom:"", tTo:"", sort:"TimeUtc", dir:-1, page:1, size:100, tab:"commands", row:-1};
   var TABS = [
     ["commands","Commands"],["timeline","Timeline"],["access","Access gained"],["path","Attack path"],
     ["actors","Actors"],["signins","Sign-ins"],["ips","IPs"],["failed","Failed"],["findings","Persistence"],["coverage","Coverage"]
@@ -2670,21 +2681,77 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
     for(var i=0;i<list.length;i++){ if(list[i] && hay.indexOf(String(list[i]).toLowerCase())>=0) return true; }
     return false;
   }
+  function uniq(arr){
+    var u={}, o=[];
+    (arr||[]).forEach(function(v){ if(v && !u[v]){ u[v]=1; o.push(v); } });
+    o.sort();
+    return o;
+  }
+  function normTime(s){
+    s=String(s||"").replace("T"," ").trim();
+    if(s.length===16) s+=":00";
+    return s.slice(0,19);
+  }
+  function rowTime(r){ return normTime(r.TimeUtc||r.WhenUtc||r.FirstUtc||""); }
+  function inTime(r){
+    var t=rowTime(r);
+    if(!t) return true;
+    if(S.tFrom && t < normTime(S.tFrom)) return false;
+    if(S.tTo && t.slice(0,16) > normTime(S.tTo).slice(0,16)) return false;
+    return true;
+  }
+  function parseWall(s){
+    var m=String(s||"").match(/(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/);
+    if(!m) return null;
+    return new Date(Date.UTC(+m[1], +m[2]-1, +m[3], +m[4], +m[5], +(m[6]||0)));
+  }
+  function fmtWall(d){
+    function p(n){ return (n<10?"0":"")+n; }
+    return d.getUTCFullYear()+"-"+p(d.getUTCMonth()+1)+"-"+p(d.getUTCDate())+" "+p(d.getUTCHours())+":"+p(d.getUTCMinutes())+":"+p(d.getUTCSeconds());
+  }
+  function toLocalInput(s){
+    var t=normTime(s);
+    return t? t.slice(0,16).replace(" ","T") : "";
+  }
+  function focusAround(row){
+    var hours=parseInt(D.meta.CorrelationHours,10)||12;
+    var d=parseWall(rowTime(row));
+    if(d){
+      S.tFrom=fmtWall(new Date(d.getTime()-hours*3600000));
+      S.tTo=fmtWall(new Date(d.getTime()+hours*3600000));
+    }
+    if(row.User||row.Actor) S.actor=row.User||row.Actor;
+    var ip=row.IPAddress||row.ClientIP||row.InferredIP;
+    if(ip) S.ip=ip;
+    S.ps=""; S.sev=""; S.result=""; S.page=1; S.tab="timeline";
+    render();
+  }
   function matchEvent(r){
+    if(!inTime(r)) return false;
     if(S.sev && lc(r.Severity)!==lc(S.sev)) return false;
     if(S.cat && lc(r.Category)!==lc(S.cat)) return false;
     if(S.actor && lc(r.Actor)!==lc(S.actor) && lc(r.User)!==lc(S.actor)) return false;
     if(S.ip && lc(r.ClientIP)!==lc(S.ip) && lc(r.InferredIP)!==lc(S.ip) && lc(r.IPAddress)!==lc(S.ip)) return false;
+    if(S.app && lc(r.AppName)!==lc(S.app) && lc(r.ExecutionChannel)!==lc(S.app)) return false;
+    if(S.loc && lc(r.Location)!==lc(S.loc) && lc(r.InferredLocation||"").toLowerCase().indexOf(lc(S.loc))<0) return false;
     if(S.ps==="yes" && r.PowerShellRelated!=="Yes" && r.PowerShellRelated!=="Possible") return false;
     if(S.ps==="cmd" && !(r.CommandLine||"").length) return false;
     if(S.suspect && !mentionsSuspect(r)) return false;
+    if(S.result==="Failure" && r.Outcome!=="Failed" && r.Result!=="Failure") return false;
+    if(S.result==="Success" && r.Outcome==="Failed") return false;
     if(S.q && blob(r).indexOf(S.q)<0) return false;
     return true;
   }
   function matchSignIn(r){
+    if(!inTime(r)) return false;
     if(S.actor && lc(r.User)!==lc(S.actor) && lc(r.Actor)!==lc(S.actor)) return false;
     if(S.ip && lc(r.IPAddress)!==lc(S.ip) && lc(r.ClientIP)!==lc(S.ip)) return false;
-    if(S.ps==="yes" && r.PowerShellApp!=="Yes" && r.PowerShellApp!=="Tooling" && r.PowerShellApp!=="Abuse-prone client") return false;
+    if(S.result && lc(r.Result)!==lc(S.result)) return false;
+    if(S.app && lc(r.AppName)!==lc(S.app)) return false;
+    if(S.loc && lc(r.Location)!==lc(S.loc)) return false;
+    if(S.err && String(r.ErrorCode)!==String(S.err)) return false;
+    if(S.unusual && r.PowerShellApp!=="Tooling" && r.PowerShellApp!=="Abuse-prone client") return false;
+    if(!S.unusual && S.ps==="yes" && r.PowerShellApp!=="Yes" && r.PowerShellApp!=="Tooling" && r.PowerShellApp!=="Abuse-prone client") return false;
     if(S.ps==="cmd") return false;
     if(S.suspect && !mentionsSuspect(r)) return false;
     if(S.q && blob(r).indexOf(S.q)<0) return false;
@@ -2692,6 +2759,7 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
   }
   function matchFailed(r){
     if(r.Outcome!=="Failed") return false;
+    if(!inTime(r)) return false;
     if(S.cat && lc(r.Category)!==lc(S.cat)) return false;
     if(S.actor && lc(r.Actor)!==lc(S.actor) && lc(r.User)!==lc(S.actor)) return false;
     if(S.ip && lc(r.ClientIP)!==lc(S.ip) && lc(r.InferredIP)!==lc(S.ip) && lc(r.IPAddress)!==lc(S.ip)) return false;
@@ -2729,9 +2797,14 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
     if(!row){ d.className="detail"; d.innerHTML=""; return; }
     var keys=["TimeUtc","Severity","Category","Operation","Outcome","Actor","User","Result","AppName","PowerShellApp","ClientIP","IPAddress","InferredIP","InferredLocation","Location","Target","TargetIdentity","CommandLine","Details","AccessGained","Mitre","PowerShellRelated","ExecutionChannel","AppId","UserAgent","ErrorCode","FailureReason","Resource","SuspectMatch","Workload","RecordType","Source","RecordId"];
     keys.forEach(function(k){ if(row[k]) h.push('<div class="kv"><b>'+enc(colLabel(k))+'</b> '+(k==="CommandLine"?"<pre><code>"+enc(row[k])+"</code></pre>":enc(row[k]))+"</div>"); });
-    if(row.CommandLine) h.push("<p><button class='btn' onclick='window._irCopy()'>Copy command</button></p>");
-    d.innerHTML=h.join(""); d.className="detail open"; window._irCopy=function(){ copyCmd(row.CommandLine||row.Operation||""); };
+    var hours=parseInt(D.meta.CorrelationHours,10)||12;
+    h.push("<p><button class='btn' onclick='window._irFocus()'>Focus timeline ±"+hours+"h</button> ");
+    if(row.CommandLine) h.push("<button class='btn' onclick='window._irCopy()'>Copy command</button> ");
+    h.push("<button class='btn' onclick='window._irCloseDetail()'>Close</button></p>");
+    d.innerHTML=h.join(""); d.className="detail open";
+    window._irCopy=function(){ copyCmd(row.CommandLine||row.Operation||""); };
     window._irCloseDetail=function(){ d.className="detail"; };
+    window._irFocus=function(){ focusAround(row); };
   }
   function table(id, rows, cols, opts){
     opts=opts||{};
@@ -2756,6 +2829,10 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
         else if(c==="Actor"||c==="User") html.push("<td class='clk-actor'>"+enc(v)+"</td>");
         else if(c==="ClientIP"||c==="InferredIP"||c==="IPAddress") html.push("<td class='clk-ip'>"+enc(v)+"</td>");
         else if(c==="Category") html.push("<td class='clk-cat'>"+enc(v)+"</td>");
+        else if(c==="AppName"||c==="Client") html.push("<td class='clk-app'>"+enc(v)+"</td>");
+        else if(c==="Location") html.push("<td class='clk-loc'>"+enc(v)+"</td>");
+        else if(c==="ErrorCode") html.push("<td class='clk-err'>"+enc(v)+"</td>");
+        else if(c==="Result") html.push("<td class='clk-result'>"+enc(v)+"</td>");
         else html.push("<td>"+enc(v)+"</td>");
       });
       html.push("</tr>");
@@ -2774,6 +2851,10 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
     $(id).querySelectorAll(".clk-actor").forEach(function(td){ td.onclick=function(ev){ ev.stopPropagation(); if(td.textContent) setFilter("actor", td.textContent); }; });
     $(id).querySelectorAll(".clk-ip").forEach(function(td){ td.onclick=function(ev){ ev.stopPropagation(); if(td.textContent) setFilter("ip", td.textContent); }; });
     $(id).querySelectorAll(".clk-cat").forEach(function(td){ td.onclick=function(ev){ ev.stopPropagation(); if(td.textContent) setFilter("cat", td.textContent); }; });
+    $(id).querySelectorAll(".clk-app").forEach(function(td){ td.onclick=function(ev){ ev.stopPropagation(); if(td.textContent) setFilter("app", td.textContent); }; });
+    $(id).querySelectorAll(".clk-loc").forEach(function(td){ td.onclick=function(ev){ ev.stopPropagation(); if(td.textContent) setFilter("loc", td.textContent); }; });
+    $(id).querySelectorAll(".clk-err").forEach(function(td){ td.onclick=function(ev){ ev.stopPropagation(); if(td.textContent) setFilter("err", td.textContent); }; });
+    $(id).querySelectorAll(".clk-result").forEach(function(td){ td.onclick=function(ev){ ev.stopPropagation(); if(td.textContent) setFilter("result", td.textContent); }; });
     $(id).querySelectorAll("button[data-p]").forEach(function(b){
       b.onclick=function(){ if(b.getAttribute("data-p")==="next") S.page=Math.min(pg.pages,S.page+1); else S.page=Math.max(1,S.page-1); render(); };
     });
@@ -2797,16 +2878,19 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
       ["high",D.counts.High,"High events","sev","High"],
       ["crit",D.counts.Access,"Access-gaining actions","tab","access"],
       ["high",D.counts.Failed,"Failed attempts","tab","failed"],
-      ["",D.counts.PsSignIns,"Successful PS/tool sign-ins","tab","signins"],
-      ["high",D.counts.PsFail,"Failed PS/tool sign-ins","tab","signins"],
+      ["",D.counts.PsSignIns,"Successful PS/tool sign-ins","tab","signins","result","Success"],
+      ["high",D.counts.PsFail,"Failed PS/tool sign-ins","tab","signins","result","Failure"],
       ["",D.counts.Actors,"Actors","tab","actors"],
       ["",D.counts.IPs,"Source IPs","tab","ips"],
       ["crit",D.counts.FindCrit,"High/Critical persistence","tab","findings"]
     ];
-    $("cards").innerHTML=cards.map(function(c){ return '<div class="card '+c[0]+'" data-k="'+c[3]+'" data-v="'+c[4]+'"><div class="n">'+(c[1]||0).toLocaleString()+'</div><div class="l">'+c[2]+'</div></div>'; }).join("");
+    $("cards").innerHTML=cards.map(function(c){ return '<div class="card '+c[0]+'" data-k="'+c[3]+'" data-v="'+c[4]+'" data-k2="'+(c[5]||"")+'" data-v2="'+(c[6]||"")+'"><div class="n">'+(c[1]||0).toLocaleString()+'</div><div class="l">'+c[2]+'</div></div>'; }).join("");
     $("cards").querySelectorAll(".card").forEach(function(el){
       el.onclick=function(){
         var k=el.getAttribute("data-k"), v=el.getAttribute("data-v");
+        var k2=el.getAttribute("data-k2"), v2=el.getAttribute("data-v2");
+        if(k2) S[k2]=v2;
+        else if(k==="tab" && v!=="signins") S.result="";
         if(k==="tab") setTab(v);
         else { S[k]=S[k]===v?"":v; S.page=1; if(k==="ps"||k==="sev") S.tab="commands"; render(); }
       };
@@ -2820,9 +2904,39 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
     fillSelect($("sev"), ["Critical","High","Medium","Low","Info"], S.sev||"(any)");
     var cats=(D.events||[]).map(function(e){ return e.Category; });
     fillSelect($("cat"), cats.filter(function(v,i){ return cats.indexOf(v)===i; }).sort(), S.cat||"(any)");
+    fillSelect($("result"), ["Success","Failure"], S.result||"(any)");
+    fillSelect($("app"), uniq((D.signIns||[]).map(function(s){ return s.AppName; }).concat((D.events||[]).map(function(e){ return e.ExecutionChannel; }))), S.app||"(any)");
+    fillSelect($("loc"), uniq((D.signIns||[]).map(function(s){ return s.Location; })), S.loc||"(any)");
+    fillSelect($("err"), uniq((D.signIns||[]).map(function(s){ return s.ErrorCode; }).filter(function(v){ return v && v!=="0"; })), S.err||"(any)");
+    fillSelect($("actorSel"), uniq((D.signIns||[]).map(function(s){ return s.User; }).concat((D.events||[]).map(function(e){ return e.Actor; }))), S.actor||"(any)");
+    fillSelect($("ipSel"), uniq((D.signIns||[]).map(function(s){ return s.IPAddress; }).concat((D.events||[]).map(function(e){ return e.ClientIP; }), (D.events||[]).map(function(e){ return e.InferredIP; }))), S.ip||"(any)");
+    $("tFrom").value=toLocalInput(S.tFrom);
+    $("tTo").value=toLocalInput(S.tTo);
     $("psOnly").className = "chip"+(S.ps==="yes"?" on":"");
     $("cmdOnly").className = "chip"+(S.ps==="cmd"?" on":"");
     $("susOnly").className = "chip"+(S.suspect?" on":"");
+    $("failOnly").className = "chip"+(S.result==="Failure"?" on":"");
+    $("okOnly").className = "chip"+(S.result==="Success"?" on":"");
+    $("unusual").className = "chip"+(S.unusual?" on":"");
+    var bits=[];
+    if(S.tFrom) bits.push("From "+normTime(S.tFrom)+" ET");
+    if(S.tTo) bits.push("To "+normTime(S.tTo)+" ET");
+    if(S.actor) bits.push("Account "+S.actor);
+    if(S.ip) bits.push("IP "+S.ip);
+    if(S.result) bits.push(S.result);
+    if(S.app) bits.push("App "+S.app);
+    if(S.loc) bits.push(S.loc);
+    if(S.err) bits.push("Error "+S.err);
+    if(S.unusual) bits.push("Unusual clients");
+    $("active").innerHTML = bits.length ? bits.map(function(b){ return '<span class="chip on">'+enc(b)+'</span>'; }).join("") : "";
+    var sis=(D.signIns||[]).filter(matchSignIn);
+    var evs=(D.events||[]).filter(matchEvent);
+    var okN=sis.filter(function(s){ return s.Result==="Success"; }).length;
+    var failN=sis.filter(function(s){ return s.Result==="Failure"; }).length;
+    var cmdN=evs.filter(function(e){ return e.RecordType!=="SignIn"; }).length;
+    var ips=uniq(sis.map(function(s){ return s.IPAddress; }).concat(evs.map(function(e){ return e.ClientIP; })));
+    var apps=uniq(sis.map(function(s){ return s.AppName; }));
+    $("story").innerHTML = '<div class="story"><b>Investigation slice.</b> '+sis.length.toLocaleString()+' sign-in(s) ('+okN+' success, '+failN+' failed) and '+cmdN.toLocaleString()+' cmdlet/event(s)'+(S.actor? ' for '+enc(S.actor):'')+(ips.length? ' from '+enc(ips.slice(0,6).join(", ")):'')+(apps.length? ' via '+enc(apps.slice(0,4).join(", ")):'')+(S.tFrom||S.tTo? ' in the selected Eastern Time window':'')+'. Click a sign-in, then <b>Focus timeline ±'+(D.meta.CorrelationHours||12)+'h</b> to see what that account did next. Click an account, IP, app, location, or error to pivot.</div>';
     ["overview","commands","timeline","access","path","actors","signins","ips","failed","findings","coverage"].forEach(function(t){
       var n=$("view-"+t); if(n) n.className = (S.tab===t || (t==="overview" && S.tab==="commands" && false)) ? "" : "hide";
     });
@@ -2836,7 +2950,11 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
     if(S.tab==="access"){ $("view-access").className=""; table("tbl-access", D.access||[], ["TimeUtc","Severity","Category","AccessGained","Actor","ClientIP","Target","CommandLine","ExecutionChannel","Mitre"], {match:eventMatch}); } else $("view-access").className="hide";
     if(S.tab==="path"){ $("view-path").className=""; table("tbl-path", D.tactics||[], ["Severity","Category","Mitre","Events","Succeeded","Failed","FirstUtc","LastUtc","Actors","Operations"], {match:function(r){ return !S.q || blob(r).indexOf(S.q)>=0; }}); } else $("view-path").className="hide";
     if(S.tab==="actors"){ $("view-actors").className=""; table("tbl-actors", D.actors||[], ["Actor","Suspect","Events","Critical","High","Failed","FirstUtc","LastUtc","IPs","Channels","TopOperations"], {match:function(r){ return (!S.q || blob(r).indexOf(S.q)>=0) && (!S.suspect || r.Suspect==="YES"); }}); } else $("view-actors").className="hide";
-    if(S.tab==="signins"){ $("view-signins").className=""; table("tbl-signins", D.signIns||[], ["TimeUtc","User","Result","AppName","PowerShellApp","IPAddress","Location","ErrorCode","FailureReason","Resource","UserAgent","SuspectMatch"], {match:matchSignIn}); } else $("view-signins").className="hide";
+    if(S.tab==="signins"){
+      $("view-signins").className="";
+      table("tbl-sisummary", D.siSummary||[], ["User","Client","ClientClass","Suspect","Success","Failure","FirstUtc","LastUtc","IPs","Locations","Resources"], {match:function(r){ return (!S.q || blob(r).indexOf(S.q)>=0) && (!S.actor || r.User===S.actor) && (!S.app || r.Client===S.app) && (!S.suspect || r.Suspect==="YES") && (!S.unusual || r.ClientClass==="Tooling" || r.ClientClass==="Abuse-prone client") && inTime({TimeUtc:r.FirstUtc}); }});
+      table("tbl-signins", D.signIns||[], ["TimeUtc","User","Result","AppName","PowerShellApp","IPAddress","Location","ErrorCode","FailureReason","Resource","ClientTool","SignInType","ConditionalAccess","Risk","UserAgent","SuspectMatch"], {match:matchSignIn});
+    } else $("view-signins").className="hide";
     if(S.tab==="ips"){ $("view-ips").className=""; table("tbl-ips", D.ipSummary||[], ["IPAddress","Suspect","Activity","FirstUtc","LastUtc","Accounts","Locations","Activities"], {match:function(r){ return (!S.q || blob(r).indexOf(S.q)>=0) && (!S.ip || r.IPAddress===S.ip) && (!S.suspect || r.Suspect==="YES"); }}); } else $("view-ips").className="hide";
     if(S.tab==="failed"){ $("view-failed").className=""; table("tbl-failed", D.events||[], ["TimeUtc","Severity","Category","AccessGained","Operation","Actor","ClientIP","Target","CommandLine","Details"], {match:matchFailed}); } else $("view-failed").className="hide";
     if(S.tab==="findings"){ $("view-findings").className=""; table("tbl-findings", D.findings||[], ["Severity","Area","Item","Detail","Reason","WhenUtc","SuspectMatch"], {match:function(r){ return (!S.sev || lc(r.Severity)===lc(S.sev)) && (!S.q || blob(r).indexOf(S.q)>=0) && (!S.suspect || mentionsSuspect(r)); }}); } else $("view-findings").className="hide";
@@ -2846,15 +2964,27 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
   $("q").addEventListener("input", function(){ S.q=this.value.toLowerCase(); S.page=1; render(); });
   $("sev").addEventListener("change", function(){ S.sev=this.value==="(any)"?"":this.value; S.page=1; render(); });
   $("cat").addEventListener("change", function(){ S.cat=this.value==="(any)"?"":this.value; S.page=1; render(); });
+  $("result").addEventListener("change", function(){ S.result=this.value==="(any)"?"":this.value; S.page=1; render(); });
+  $("app").addEventListener("change", function(){ S.app=this.value==="(any)"?"":this.value; S.page=1; render(); });
+  $("loc").addEventListener("change", function(){ S.loc=this.value==="(any)"?"":this.value; S.page=1; render(); });
+  $("err").addEventListener("change", function(){ S.err=this.value==="(any)"?"":this.value; S.page=1; render(); });
+  $("actorSel").addEventListener("change", function(){ S.actor=this.value==="(any)"?"":this.value; S.page=1; render(); });
+  $("ipSel").addEventListener("change", function(){ S.ip=this.value==="(any)"?"":this.value; S.page=1; render(); });
+  $("tFrom").addEventListener("change", function(){ S.tFrom=this.value?this.value.replace("T"," ")+":00":""; S.page=1; render(); });
+  $("tTo").addEventListener("change", function(){ S.tTo=this.value?this.value.replace("T"," ")+":00":""; S.page=1; render(); });
   $("psOnly").onclick=function(){ S.ps=S.ps==="yes"?"":"yes"; S.page=1; render(); };
   $("cmdOnly").onclick=function(){ S.ps=S.ps==="cmd"?"":"cmd"; S.page=1; render(); };
   $("susOnly").onclick=function(){ S.suspect=!S.suspect; S.page=1; render(); };
-  $("clear").onclick=function(){ S.q=""; S.sev=""; S.cat=""; S.actor=""; S.ip=""; S.ps=""; S.suspect=false; S.page=1; render(); };
+  $("failOnly").onclick=function(){ S.result=S.result==="Failure"?"":"Failure"; S.page=1; render(); };
+  $("okOnly").onclick=function(){ S.result=S.result==="Success"?"":"Success"; S.page=1; render(); };
+  $("unusual").onclick=function(){ S.unusual=!S.unusual; S.page=1; render(); };
+  $("clear").onclick=function(){ S.q=""; S.sev=""; S.cat=""; S.actor=""; S.ip=""; S.ps=""; S.suspect=false; S.result=""; S.app=""; S.loc=""; S.err=""; S.unusual=false; S.tFrom=""; S.tTo=""; S.page=1; render(); };
   $("dark").onclick=function(){ var on=document.body.className==="dark"; localStorage.setItem("m365ps-dark", on?"0":"1"); render(); };
   document.addEventListener("keydown", function(e){
-    if(e.key==="/" && document.activeElement.tagName!=="INPUT"){ e.preventDefault(); $("q").focus(); }
-    if(e.key==="Escape"){ S.q=""; S.actor=""; S.ip=""; S.cat=""; showDetail(null); render(); }
-    if(e.key==="c" && document.activeElement.tagName!=="INPUT"){ var d=$("detail"); if(d.className.indexOf("open")>=0 && window._irCopy) window._irCopy(); }
+    var tag=document.activeElement.tagName;
+    if(e.key==="/" && tag!=="INPUT" && tag!=="SELECT"){ e.preventDefault(); $("q").focus(); }
+    if(e.key==="Escape"){ S.q=""; S.actor=""; S.ip=""; S.cat=""; S.app=""; S.loc=""; S.err=""; showDetail(null); render(); }
+    if(e.key==="c" && tag!=="INPUT" && tag!=="SELECT"){ var d=$("detail"); if(d.className.indexOf("open")>=0 && window._irCopy) window._irCopy(); }
   });
   render();
 })();
@@ -2865,21 +2995,37 @@ ul{margin:6px 0 0 18px}li{margin:3px 0}
     [void]$sb.Append('</style></head><body><header><h1>Microsoft 365 PowerShell &amp; Admin Activity &mdash; Interactive Investigation</h1>')
     [void]$sb.Append('<div class="sub" id="meta"></div><div class="sub" id="tenant"></div><div class="sub" id="suspects"></div>')
     [void]$sb.Append('<div class="toolbar"><input id="q" type="search" placeholder="Search commands, actors, IPs, operations... (/ )" />')
-    [void]$sb.Append('<select id="sev"></select><select id="cat"></select>')
+    [void]$sb.Append('<select id="sev" title="Severity"></select><select id="cat" title="Category"></select>')
     [void]$sb.Append('<button type="button" class="chip" id="psOnly">PowerShell related</button>')
     [void]$sb.Append('<button type="button" class="chip" id="cmdOnly">Has command line</button>')
     [void]$sb.Append('<button type="button" class="chip" id="susOnly">Suspect match</button>')
     [void]$sb.Append('<button type="button" class="btn" id="clear">Clear filters</button>')
-    [void]$sb.Append('<button type="button" class="btn" id="dark">Dark mode</button></div></header>')
+    [void]$sb.Append('<button type="button" class="btn" id="dark">Dark mode</button></div>')
+    [void]$sb.Append('<div class="toolbar inv">')
+    [void]$sb.Append('<label>From (ET) <input id="tFrom" type="datetime-local" /></label>')
+    [void]$sb.Append('<label>To (ET) <input id="tTo" type="datetime-local" /></label>')
+    [void]$sb.Append('<select id="actorSel" title="Account"></select>')
+    [void]$sb.Append('<select id="ipSel" title="IP address"></select>')
+    [void]$sb.Append('<select id="result" title="Sign-in result"></select>')
+    [void]$sb.Append('<select id="app" title="App / client"></select>')
+    [void]$sb.Append('<select id="loc" title="Location"></select>')
+    [void]$sb.Append('<select id="err" title="Error code"></select>')
+    [void]$sb.Append('<button type="button" class="chip" id="okOnly">Success only</button>')
+    [void]$sb.Append('<button type="button" class="chip" id="failOnly">Failed only</button>')
+    [void]$sb.Append('<button type="button" class="chip" id="unusual">Unusual clients</button>')
+    [void]$sb.Append('</div></header>')
     [void]$sb.Append('<nav class="tabs" id="tabs"></nav><main>')
-    [void]$sb.Append('<div class="cards" id="cards"></div><div id="gaps"></div><div id="trunc"></div>')
+    [void]$sb.Append('<div class="cards" id="cards"></div><div id="active" class="active-filters"></div><div id="story"></div><div id="gaps"></div><div id="trunc"></div>')
     [void]$sb.Append('<section id="view-overview"><div id="recs"></div></section>')
     [void]$sb.Append('<section id="view-commands"><h2>Every PowerShell / cmdlet command</h2><p class="lead">Reconstructed command lines from Exchange/Purview audit, Entra changes made from PowerShell clients, and PowerShell/CLI sign-ins from SignIns-*.csv. Click a row for details; click an actor or IP to pivot.</p><div id="tbl-commands"></div></section>')
-    [void]$sb.Append('<section id="view-timeline"><h2>Investigation timeline</h2><div id="tbl-timeline"></div></section>')
+    [void]$sb.Append('<section id="view-timeline"><h2>Investigation timeline</h2><p class="lead">Sign-ins and cmdlets in one chronological list. Set From/To (ET), click an account or IP, or Focus timeline from a sign-in to reconstruct what happened next.</p><div id="tbl-timeline"></div></section>')
     [void]$sb.Append('<section id="view-access"><h2>What access was gained</h2><div id="tbl-access"></div></section>')
     [void]$sb.Append('<section id="view-path"><h2>Attack path by tactic</h2><div id="tbl-path"></div></section>')
     [void]$sb.Append('<section id="view-actors"><h2>Who ran commands</h2><div id="tbl-actors"></div></section>')
-    [void]$sb.Append('<section id="view-signins"><h2>PowerShell &amp; tooling sign-ins</h2><div id="tbl-signins"></div></section>')
+    [void]$sb.Append('<section id="view-signins"><h2>PowerShell &amp; tooling sign-ins</h2>')
+    [void]$sb.Append('<p class="lead">Failed logons then a success from the same IP is often the foothold. Filter by time, account, IP, app, location, or error. Click a row and use Focus timeline to see cmdlets in the following hours.</p>')
+    [void]$sb.Append('<h3 class="block">How they signed in (by account and client)</h3><div id="tbl-sisummary"></div>')
+    [void]$sb.Append('<h3 class="block">Sign-in log</h3><div id="tbl-signins"></div></section>')
     [void]$sb.Append('<section id="view-ips"><h2>Source IP addresses</h2><div id="tbl-ips"></div></section>')
     [void]$sb.Append('<section id="view-failed"><h2>Failed attempts</h2><div id="tbl-failed"></div></section>')
     [void]$sb.Append('<section id="view-findings"><h2>Current-state persistence</h2><div id="tbl-findings"></div></section>')
