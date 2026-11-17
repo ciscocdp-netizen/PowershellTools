@@ -16,7 +16,7 @@ Windows administration scripts for Active Directory, DHCP, and Microsoft 365 / E
 powershell.exe -ExecutionPolicy Bypass -File .\Revoke-M365Sessions.ps1
 ```
 
-The script auto-relaunches in STA mode so the file picker works from a normal console, installs `Microsoft.Graph.Authentication` if needed, and supports a dry run before any sessions are revoked. On a live run it can re-read each user from Graph and confirm `signInSessionsValidFromDateTime` moved forward.
+The script auto-relaunches in STA mode so the file picker works from a normal console, installs `Microsoft.Graph.Authentication` if needed, and supports a dry run before any sessions are revoked. Sign-in defaults to device code (browser/WAM popups often fail from `powershell.exe`). On a live run it can re-read each user from Graph and confirm `signInSessionsValidFromDateTime` moved forward.
 
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -File .\Revoke-M365Sessions.ps1 -SelfTest

@@ -35,6 +35,10 @@
     - Reconnects when the current Graph session lacks revoke/read scopes, and
       falls back to User.ReadWrite.All if User.RevokeSessions.All cannot be
       consented.
+    - Graph sign-in: lowers ErrorActionPreference during Connect-MgGraph (Stop
+      breaks MSAL), does not hide output, offers device code as the default
+      (WAM/browser popups often fail from powershell.exe), and falls back to
+      device code if interactive sign-in fails.
     - Treats Graph { "value": false } as a failure, honours Retry-After, and
       warns that guest/#EXT# users cannot be revoked in the resource tenant.
 
@@ -57,6 +61,11 @@
     Verification proves Graph reset the session-validity timestamp. It cannot
     prove that a given access token is already dead: access tokens can remain
     valid until they expire (typically up to 1 hour) unless the app uses CAE.
+
+    If a browser or Windows account picker never appears, choose device-code
+    sign-in. Recent Microsoft.Graph.Authentication builds use WAM on Windows,
+    which often fails from a console script. Device code always prints a URL
+    and code in the host.
 
 .PARAMETER SelfTest
     Run built-in regression tests for helpers (CSV, UPN, retry math, Graph URI,
@@ -905,8 +914,103 @@ function Confirm-RevokedSignInSession {
     }
 }
 
+function Get-GraphDeviceCodeParameterName {
+    $cmd = Get-Command Connect-MgGraph -ErrorAction Stop
+    foreach ($name in @('UseDeviceCode', 'UseDeviceAuthentication')) {
+        if ($cmd.Parameters.ContainsKey($name)) { return $name }
+    }
+    return $null
+}
+
+function Disable-GraphWamIfPossible {
+    $cmd = Get-Command Set-MgGraphOption -ErrorAction SilentlyContinue
+    if ($null -eq $cmd) { return }
+    if (-not $cmd.Parameters.ContainsKey('DisableLoginByWAM')) { return }
+    try {
+        Set-MgGraphOption -DisableLoginByWAM $true
+        Write-Info 'Asked the Graph SDK to disable WAM (only honoured with a custom ClientId).'
+    } catch {
+        Write-Warn2 "Could not set DisableLoginByWAM: $($_.Exception.Message)"
+    }
+}
+
+function Invoke-GraphSignIn {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$ConnectParams,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('DeviceCode', 'Browser')]
+        [string]$Method
+    )
+
+    $connectCmd = Get-Command Connect-MgGraph -ErrorAction Stop
+    $params = @{}
+    foreach ($key in $ConnectParams.Keys) { $params[$key] = $ConnectParams[$key] }
+
+    if ($connectCmd.Parameters.ContainsKey('ClientTimeout') -and -not $params.ContainsKey('ClientTimeout')) {
+        $params['ClientTimeout'] = 180
+    }
+
+    if ($Method -eq 'DeviceCode') {
+        $deviceParam = Get-GraphDeviceCodeParameterName
+        if ([string]::IsNullOrWhiteSpace($deviceParam)) {
+            throw 'This Microsoft.Graph.Authentication version does not support -UseDeviceCode. Update the module or use browser sign-in.'
+        }
+        $params[$deviceParam] = $true
+        if ($params.ContainsKey('NoWelcome')) { $params.Remove('NoWelcome') }
+        Write-Host ''
+        Write-Host 'DEVICE CODE SIGN-IN' -ForegroundColor Cyan
+        Write-Host '1. Wait for a URL and code to appear below (do not close this window).' -ForegroundColor White
+        Write-Host '2. Open https://microsoft.com/devicelogin in a browser.' -ForegroundColor White
+        Write-Host '3. Enter the code, then complete MFA / admin consent if prompted.' -ForegroundColor White
+        Write-Host ''
+    } else {
+        Disable-GraphWamIfPossible
+        Write-Host ''
+        Write-Host 'A Windows account picker or browser window should open.' -ForegroundColor Cyan
+        Write-Host 'If nothing appears, or sign-in hangs, cancel and choose device code.' -ForegroundColor Yellow
+        Write-Host ''
+    }
+
+    # MSAL / Azure.Identity emit non-terminating errors during interactive auth.
+    # With $ErrorActionPreference = 'Stop' those become terminating and the
+    # browser/WAM flow dies before a token is issued.
+    $prevEap  = $ErrorActionPreference
+    $prevWarn = $WarningPreference
+    $prevInfo = $InformationPreference
+    $ErrorActionPreference  = 'Continue'
+    $WarningPreference      = 'Continue'
+    $InformationPreference  = 'Continue'
+    $errorCountBefore = $Error.Count
+    try {
+        # Do not pipe to Out-Null: device-code URL/code are written to output.
+        Connect-MgGraph @params
+    } catch {
+        throw
+    } finally {
+        $ErrorActionPreference  = $prevEap
+        $WarningPreference      = $prevWarn
+        $InformationPreference  = $prevInfo
+    }
+
+    $ctx = $null
+    try { $ctx = Get-MgContext } catch { $ctx = $null }
+    if ($null -eq $ctx) {
+        $detail = 'Sign-in did not create a Microsoft Graph session.'
+        if ($Error.Count -gt $errorCountBefore) {
+            try { $detail = [string]$Error[0].Exception.Message } catch { }
+        }
+        throw $detail
+    }
+    return $ctx
+}
+
 function Connect-RevokeGraphSession {
-    param([string]$Tenant)
+    param(
+        [string]$Tenant,
+        [ValidateSet('DeviceCode', 'Browser')]
+        [string]$AuthMethod = 'DeviceCode'
+    )
 
     Initialize-GraphAuthModule
 
@@ -921,13 +1025,17 @@ function Connect-RevokeGraphSession {
     if ($null -ne $ctx -and (Test-GraphScopesSufficient -CurrentScopes @($ctx.Scopes))) {
         $tenantOk = [string]::IsNullOrWhiteSpace($Tenant) -or ($ctx.TenantId -eq $Tenant) -or ([string]$ctx.TenantId -ieq $Tenant)
         if ($tenantOk) {
-            Write-Info "Reusing existing Graph session with sufficient scopes."
-            return $ctx
+            $account = [string]$ctx.Account
+            if ([string]::IsNullOrWhiteSpace($account)) { $account = '(current session)' }
+            if (Read-YesNo -Prompt "Reuse existing Graph session as $account ?" -Default $true) {
+                Write-Info "Reusing existing Graph session with sufficient scopes."
+                return $ctx
+            }
         }
     }
 
     if ($null -ne $ctx) {
-        Write-Warn2 "Existing Graph session is missing revoke/read scopes or is for a different tenant. Reconnecting..."
+        Write-Warn2 "Disconnecting the current Graph session so a fresh sign-in can request the right scopes..."
         try { Disconnect-MgGraph | Out-Null } catch { }
     }
 
@@ -938,14 +1046,11 @@ function Connect-RevokeGraphSession {
             Scopes = @($scopes)
         }
         if (-not [string]::IsNullOrWhiteSpace($Tenant)) { $connectParams['TenantId'] = $Tenant.Trim() }
-        if ($connectCmd.Parameters.ContainsKey('NoWelcome')) { $connectParams['NoWelcome'] = $true }
         if ($connectCmd.Parameters.ContainsKey('ContextScope')) { $connectParams['ContextScope'] = 'Process' }
 
         try {
             Write-Info ("Requesting Graph scopes: {0}" -f ($scopes -join ', '))
-            Connect-MgGraph @connectParams | Out-Null
-            $ctx = Get-MgContext
-            if ($null -eq $ctx) { throw 'No Microsoft Graph context after sign-in.' }
+            $ctx = Invoke-GraphSignIn -ConnectParams $connectParams -Method $AuthMethod
             if (-not (Test-GraphScopesSufficient -CurrentScopes @($ctx.Scopes))) {
                 throw "Connected, but the token is missing required revoke/read scopes. Granted: $($ctx.Scopes -join ', ')"
             }
@@ -954,27 +1059,12 @@ function Connect-RevokeGraphSession {
             $lastError = $_
             Write-Warn2 ("Could not connect with scopes [{0}]: {1}" -f ($scopes -join ', '), $_.Exception.Message)
             try { Disconnect-MgGraph | Out-Null } catch { }
-        }
-    }
 
-    $deviceParam = $null
-    if ($connectCmd.Parameters.ContainsKey('UseDeviceCode')) { $deviceParam = 'UseDeviceCode' }
-    elseif ($connectCmd.Parameters.ContainsKey('UseDeviceAuthentication')) { $deviceParam = 'UseDeviceAuthentication' }
-
-    if ($deviceParam) {
-        Write-Warn2 "Interactive sign-in failed. Trying device-code authentication..."
-        $connectParams = @{ Scopes = @('User.RevokeSessions.All', 'User.Read.All') }
-        $connectParams[$deviceParam] = $true
-        if (-not [string]::IsNullOrWhiteSpace($Tenant)) { $connectParams['TenantId'] = $Tenant.Trim() }
-        if ($connectCmd.Parameters.ContainsKey('NoWelcome')) { $connectParams['NoWelcome'] = $true }
-        if ($connectCmd.Parameters.ContainsKey('ContextScope')) { $connectParams['ContextScope'] = 'Process' }
-        try {
-            Connect-MgGraph @connectParams | Out-Null
-            $ctx = Get-MgContext
-            if ($null -eq $ctx) { throw 'No Microsoft Graph context after device-code sign-in.' }
-            return $ctx
-        } catch {
-            $lastError = $_
+            if ($AuthMethod -eq 'Browser') {
+                Write-Warn2 'Interactive / WAM sign-in failed. Microsoft Graph on Windows often cannot open a browser from a script.'
+                Write-Warn2 'Falling back to device-code sign-in so the URL and code print in this window.'
+                return (Connect-RevokeGraphSession -Tenant $Tenant -AuthMethod DeviceCode)
+            }
         }
     }
 
@@ -1285,15 +1375,25 @@ function Start-RevokeM365Sessions {
 
     # --- Step 4: connect to Graph ------------------------------------------------
     Write-Info 'Step 4 of 5: Connecting to Microsoft Graph...'
+    $authIndex = Read-Choice -Title 'How do you want to sign in to Microsoft Graph?' -Options @(
+        'Device code (recommended: prints a URL and code in this window)',
+        'Interactive browser / Windows account picker',
+        'Cancel'
+    )
+    if ($authIndex -eq 2) { Write-Warn2 'Cancelled by user.'; return }
+    $authMethod = 'DeviceCode'
+    if ($authIndex -eq 1) { $authMethod = 'Browser' }
+
     try {
         $tenant = Read-Host 'Tenant ID or domain (press Enter to use your account''s home tenant)'
-        $ctx = Connect-RevokeGraphSession -Tenant $tenant
+        $ctx = Connect-RevokeGraphSession -Tenant $tenant -AuthMethod $authMethod
         Write-Ok ("Connected as {0} (tenant {1})" -f $ctx.Account, $ctx.TenantId)
         if ($ctx.Scopes) {
             Write-Info ("Granted scopes: {0}" -f ($ctx.Scopes -join ', '))
         }
     } catch {
         Write-Err2 "Could not connect to Microsoft Graph: $($_.Exception.Message)"
+        Write-Err2 'If a browser window never opened, re-run and choose device-code sign-in.'
         return
     }
 
