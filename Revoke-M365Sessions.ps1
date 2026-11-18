@@ -67,7 +67,10 @@
     which produces: "A window handle must be configured." This script therefore
     signs in with device code and opens https://microsoft.com/devicelogin in
     your default browser. Enter the code printed in the console, then complete
-    MFA / admin consent in that browser tab.
+    MFA / admin consent in that browser tab. The Graph cmdlet writes that code
+    to the pipeline (not the host) and can hang if a WinForms dialog left a
+    synchronization context on the thread; this script prints the code to the
+    host and clears that context first.
 
 .PARAMETER SelfTest
     Run built-in regression tests for helpers (CSV, UPN, retry math, Graph URI,
@@ -543,6 +546,7 @@ function Show-TopMostFileDialog {
         return $Dialog.ShowDialog($owner)
     } finally {
         $owner.Dispose()
+        Reset-UiSynchronizationContext
     }
 }
 
@@ -971,34 +975,52 @@ function Open-UrlInBrowser {
     return $false
 }
 
-function Show-SignInHelperWindow {
-    param(
-        [string]$Title,
-        [string]$Message
-    )
-    if (-not (Test-IsWindowsOs)) { return $null }
+function Reset-UiSynchronizationContext {
+    # File-picker dialogs install WindowsFormsSynchronizationContext on this
+    # STA thread. Connect-MgGraph -UseDeviceCode then deadlocks (async over
+    # sync) and the device code never appears.
     try {
-        Add-Type -AssemblyName System.Windows.Forms | Out-Null
-        Add-Type -AssemblyName System.Drawing | Out-Null
-        $form = New-Object System.Windows.Forms.Form
-        $form.Text = $Title
-        $form.Size = New-Object System.Drawing.Size -ArgumentList @(560, 240)
-        $form.StartPosition = 'CenterScreen'
-        $form.TopMost = $true
-        $form.MinimizeBox = $false
-        $form.MaximizeBox = $false
-        $form.ShowInTaskbar = $true
-        $label = New-Object System.Windows.Forms.Label
-        $label.Text = $Message
-        $label.AutoSize = $false
-        $label.Dock = 'Fill'
-        $label.Padding = New-Object System.Windows.Forms.Padding -ArgumentList @(16)
-        $form.Controls.Add($label)
-        [void]$form.Show()
-        $form.Activate()
-        return $form
-    } catch {
-        return $null
+        [System.Threading.SynchronizationContext]::SetSynchronizationContext($null)
+    } catch { }
+}
+
+function Get-GraphConnectOutputText {
+    param($Object)
+    if ($null -eq $Object) { return '' }
+    try {
+        if ($Object -is [System.Management.Automation.VerboseRecord] -or
+            $Object -is [System.Management.Automation.WarningRecord] -or
+            $Object -is [System.Management.Automation.InformationRecord]) {
+            return [string]$Object.Message
+        }
+    } catch { }
+    try {
+        if ($Object -is [System.Management.Automation.ErrorRecord] -and $null -ne $Object.Exception) {
+            return [string]$Object.Exception.Message
+        }
+    } catch { }
+    return [string]$Object
+}
+
+function Get-DeviceCodeFromMessage {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    if ($Text -match '(?i)enter the code\s+([A-Z0-9]{4,})') { return $Matches[1] }
+    if ($Text -match '(?i)code\s+([A-Z0-9]{8,9})\s+to authenticate') { return $Matches[1] }
+    return $null
+}
+
+function Write-GraphConnectOutput {
+    param($Object)
+    $text = Get-GraphConnectOutputText -Object $Object
+    if ([string]::IsNullOrWhiteSpace($text)) { return }
+    Write-Host $text -ForegroundColor White
+    $code = Get-DeviceCodeFromMessage -Text $text
+    if ($code) {
+        Write-Host ''
+        Write-Host ('Your device code is: {0}' -f $code) -ForegroundColor Green
+        Write-Host ("Enter it at {0}" -f $script:DeviceLoginUrl) -ForegroundColor Green
+        Write-Host ''
     }
 }
 
@@ -1019,13 +1041,14 @@ function Invoke-GraphSignIn {
         $params['ClientTimeout'] = 300
     }
 
-    $helperForm = $null
     if ($Method -eq 'Browser' -and -not (Test-WamParentWindowAvailable)) {
         Write-Warn2 'Windows Web Account Manager cannot show a login prompt here (no parent window handle).'
         Write-Warn2 'This is expected in ISE, VS Code, Cursor, and many embedded terminals.'
         Write-Warn2 'Opening a browser for device-code sign-in instead.'
         $Method = 'DeviceCode'
     }
+
+    Reset-UiSynchronizationContext
 
     if ($Method -eq 'DeviceCode') {
         $deviceParam = Get-GraphDeviceCodeParameterName
@@ -1036,21 +1059,12 @@ function Invoke-GraphSignIn {
         if ($params.ContainsKey('NoWelcome')) { $params.Remove('NoWelcome') }
         Write-Host ''
         Write-Host 'DEVICE CODE SIGN-IN' -ForegroundColor Cyan
-        Write-Host 'A browser window will open. When PowerShell prints a code below, enter it on that page, then complete MFA / admin consent.' -ForegroundColor White
+        Write-Host 'A browser window will open. The next lines from Microsoft Graph contain the code.' -ForegroundColor White
         Write-Host ("If no browser opens, go to {0} yourself." -f $script:DeviceLoginUrl) -ForegroundColor Yellow
         Write-Host ''
         [void](Open-UrlInBrowser -Url $script:DeviceLoginUrl)
-        $helperForm = Show-SignInHelperWindow -Title 'Microsoft Graph sign-in' -Message @"
-A browser tab was opened for Microsoft device login.
-
-1. Look at the PowerShell window for a code (for example, A1B2C3D4).
-2. Paste that code into the browser page.
-3. Sign in with your admin account and complete MFA.
-4. Return to PowerShell when finished.
-
-Page: $($script:DeviceLoginUrl)
-"@
-        Write-Host 'Waiting for Microsoft to print a device code in this window...' -ForegroundColor Gray
+        Write-Host 'Requesting a device code from Microsoft. This can take several seconds...' -ForegroundColor Gray
+        Write-Host ''
     } else {
         Write-Host ''
         Write-Host 'Trying Windows Web Account Manager. If nothing appears, the script will open a browser instead.' -ForegroundColor Cyan
@@ -1063,22 +1077,24 @@ Page: $($script:DeviceLoginUrl)
     $prevEap  = $ErrorActionPreference
     $prevWarn = $WarningPreference
     $prevInfo = $InformationPreference
+    $prevVerbose = $VerbosePreference
     $ErrorActionPreference  = 'Continue'
     $WarningPreference      = 'Continue'
     $InformationPreference  = 'Continue'
+    $VerbosePreference      = 'Continue'
     $errorCountBefore = $Error.Count
     try {
-        # Do not pipe to Out-Null: device-code URL/code are written to output.
-        Connect-MgGraph @params
+        # Device code is written to the success pipeline, NOT Write-Host.
+        # This function is assigned to a variable by the caller, so we must
+        # write it to the host here or the code stays hidden until login ends.
+        Connect-MgGraph @params -Verbose *>&1 | ForEach-Object { Write-GraphConnectOutput $_ }
     } catch {
         throw
     } finally {
         $ErrorActionPreference  = $prevEap
         $WarningPreference      = $prevWarn
         $InformationPreference  = $prevInfo
-        if ($null -ne $helperForm) {
-            try { $helperForm.Close(); $helperForm.Dispose() } catch { }
-        }
+        $VerbosePreference      = $prevVerbose
     }
 
     $ctx = $null
@@ -1336,6 +1352,9 @@ function Invoke-SelfTest {
     try { $null = Test-WamParentWindowAvailable; $wamProbeOk = $true } catch { $wamProbeOk = $false }
     Assert-True 'WAM window probe runs without throwing' $wamProbeOk
     Assert-True 'Device login URL is microsoft.com/devicelogin' ($script:DeviceLoginUrl -eq 'https://microsoft.com/devicelogin')
+    $sampleMsg = 'To sign in, use a web browser to open the page https://microsoft.com/devicelogin and enter the code LK6RW4ZSN to authenticate.'
+    Assert-True 'Device code parsed from Graph message' ((Get-DeviceCodeFromMessage -Text $sampleMsg) -eq 'LK6RW4ZSN')
+    Assert-True 'Device code parser ignores empty text' ($null -eq (Get-DeviceCodeFromMessage -Text ''))
 
     Write-Host ''
     Write-Info ("Passed: {0}  Failed: {1}" -f $script:SelfPassed, $script:SelfFailed)
