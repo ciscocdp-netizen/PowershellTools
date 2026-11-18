@@ -15,6 +15,10 @@
     - On a live run, verifies each revoke by re-reading
       signInSessionsValidFromDateTime (and refreshTokensValidFromDateTime) until
       the timestamp advances, then records Verified / NotVerified in the report.
+    - Processes users with Microsoft Graph JSON batching (up to 20 requests
+      per HTTP call) so large CSVs are not one round-trip per user.
+    - Processes users with Microsoft Graph JSON batching (up to 20 requests
+      per HTTP call) so large CSVs are not one round-trip per user.
     - Shows a progress bar and writes a results CSV (chosen via a Save dialog).
 
     Fixes versus the original script:
@@ -152,6 +156,40 @@ function Get-GraphUserPathUri {
     # because they treat the segment as a literal id. Keep '@' unencoded.
     $encoded = [Uri]::EscapeDataString($UserIdOrUpn) -replace '%40', '@'
     return "https://graph.microsoft.com/v1.0/users/$encoded"
+}
+
+function Get-GraphUserRelativePath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$UserIdOrUpn,
+        [string]$Select = $null,
+        [switch]$Revoke
+    )
+    $encoded = [Uri]::EscapeDataString($UserIdOrUpn) -replace '%40', '@'
+    if ($Revoke) {
+        return "/users/$encoded/revokeSignInSessions"
+    }
+    if ([string]::IsNullOrWhiteSpace($Select)) {
+        return "/users/$encoded"
+    }
+    return '/users/{0}?{1}' -f $encoded, ('$select=' + $Select)
+}
+
+function Split-IntoChunks {
+    param(
+        $Items,
+        [int]$Size = 20
+    )
+    $arr = @($Items)
+    if ($arr.Count -eq 0 -or $Size -lt 1) { return @() }
+    $chunks = New-Object System.Collections.Generic.List[object]
+    for ($i = 0; $i -lt $arr.Count; $i += $Size) {
+        $last = [Math]::Min($i + $Size - 1, $arr.Count - 1)
+        $chunks.Add(@($arr[$i..$last]))
+    }
+    if ($chunks.Count -eq 0) { return @() }
+    # Unary comma prevents PowerShell from unwrapping a single chunk into loose items.
+    return ,$chunks.ToArray()
 }
 
 function Get-HttpStatusCode {
@@ -775,43 +813,113 @@ function Invoke-GraphApi {
     }
 }
 
-function Resolve-GraphUser {
-    param([string]$Upn)
+function Get-GraphBatchResponseItems {
+    param($Content)
+    if ($null -eq $Content) { return @() }
+    $items = Get-GraphObjectProperty -Object $Content -Name 'responses'
+    if ($null -eq $items) { return @() }
+    return @($items)
+}
 
-    $select = '$select=id,displayName,userPrincipalName,accountEnabled,userType,signInSessionsValidFromDateTime,refreshTokensValidFromDateTime'
-    $uri = '{0}?{1}' -f (Get-GraphUserPathUri -UserIdOrUpn $Upn), $select
-    $response = Invoke-GraphApi -Method GET -Uri $uri
-    if ($response.Ok) {
-        $content = $response.Content
-        $id = [string](Get-GraphObjectProperty -Object $content -Name 'id')
-        $display = [string](Get-GraphObjectProperty -Object $content -Name 'displayName')
-        $userType = [string](Get-GraphObjectProperty -Object $content -Name 'userType')
+function Invoke-GraphBatch {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Requests,
+        [int]$MaxRetries = 5
+    )
+    $uri = 'https://graph.microsoft.com/v1.0/$batch'
+    $body = @{ requests = @($Requests) }
+    $response = Invoke-GraphApi -Method POST -Uri $uri -Body $body -MaxRetries $MaxRetries
+    if (-not $response.Ok) {
         return [pscustomobject]@{
-            Status      = 'Found'
-            Id          = $id
-            DisplayName = $display
-            UserType    = $userType
-            Stamps      = (Get-UserSessionStamps -UserObject $content)
-            Detail      = 'User found'
-            Attempts    = $response.Attempts
+            Ok       = $false
+            Attempts = $response.Attempts
+            Error    = $response.Error
+            ById     = @{}
         }
     }
 
-    $status = switch ($response.StatusCode) {
+    $byId = @{}
+    foreach ($item in (Get-GraphBatchResponseItems -Content $response.Content)) {
+        $id = [string](Get-GraphObjectProperty -Object $item -Name 'id')
+        if (-not [string]::IsNullOrWhiteSpace($id)) {
+            $byId[$id] = $item
+        }
+    }
+    return [pscustomobject]@{
+        Ok       = $true
+        Attempts = $response.Attempts
+        Error    = $null
+        ById     = $byId
+    }
+}
+
+function Get-BatchItemStatusCode {
+    param($Item)
+    if ($null -eq $Item) { return 0 }
+    $raw = Get-GraphObjectProperty -Object $Item -Name 'status'
+    $n = 0
+    if ([int]::TryParse([string]$raw, [ref]$n)) { return $n }
+    return 0
+}
+
+function Get-BatchItemErrorMessage {
+    param($Item)
+    $body = Get-GraphObjectProperty -Object $Item -Name 'body'
+    $err = Get-GraphObjectProperty -Object $body -Name 'error'
+    $msg = Get-GraphObjectProperty -Object $err -Name 'message'
+    if (-not [string]::IsNullOrWhiteSpace([string]$msg)) { return [string]$msg }
+    $code = Get-GraphObjectProperty -Object $err -Name 'code'
+    if (-not [string]::IsNullOrWhiteSpace([string]$code)) { return [string]$code }
+    return 'Graph batch item failed'
+}
+
+function ConvertTo-GraphUserLookup {
+    param(
+        $Body,
+        [int]$StatusCode,
+        [int]$Attempts = 1,
+        [string]$ErrorMessage = $null
+    )
+    if ($StatusCode -ge 200 -and $StatusCode -lt 300) {
+        return [pscustomobject]@{
+            Status      = 'Found'
+            Id          = [string](Get-GraphObjectProperty -Object $Body -Name 'id')
+            DisplayName = [string](Get-GraphObjectProperty -Object $Body -Name 'displayName')
+            UserType    = [string](Get-GraphObjectProperty -Object $Body -Name 'userType')
+            Stamps      = (Get-UserSessionStamps -UserObject $Body)
+            Detail      = 'User found'
+            Attempts    = $Attempts
+        }
+    }
+    $status = switch ($StatusCode) {
         404     { 'NotFound' }
         403     { 'AccessDenied' }
         401     { 'AccessDenied' }
         default { 'Failed' }
     }
+    if ([string]::IsNullOrWhiteSpace($ErrorMessage)) { $ErrorMessage = "HTTP $StatusCode" }
     return [pscustomobject]@{
         Status      = $status
         Id          = $null
         DisplayName = $null
         UserType    = $null
         Stamps      = (New-SessionStampSet)
-        Detail      = $response.Error
-        Attempts    = $response.Attempts
+        Detail      = $ErrorMessage
+        Attempts    = $Attempts
     }
+}
+
+function Resolve-GraphUser {
+    param([string]$Upn)
+
+    $select = 'id,displayName,userPrincipalName,accountEnabled,userType,signInSessionsValidFromDateTime,refreshTokensValidFromDateTime'
+    $uri = '{0}?{1}' -f (Get-GraphUserPathUri -UserIdOrUpn $Upn), ('$select=' + $select)
+    $response = Invoke-GraphApi -Method GET -Uri $uri
+    if ($response.Ok) {
+        return ConvertTo-GraphUserLookup -Body $response.Content -StatusCode 200 -Attempts $response.Attempts
+    }
+    return ConvertTo-GraphUserLookup -Body $null -StatusCode $response.StatusCode -Attempts $response.Attempts -ErrorMessage $response.Error
 }
 
 function Invoke-RevokeSession {
@@ -863,8 +971,8 @@ function Confirm-RevokedSignInSession {
         [string]$Upn,
         [string]$UserId,
         $BeforeStamps,
-        [int]$MaxAttempts = 3,
-        [int]$DelaySeconds = 2
+        [int]$MaxAttempts = 2,
+        [int]$DelaySeconds = 1
     )
 
     if ($null -eq $BeforeStamps) { $BeforeStamps = New-SessionStampSet }
@@ -918,6 +1026,319 @@ function Confirm-RevokedSignInSession {
         RefreshTokensValidFrom = $after.RefreshTokensValidFrom
         Attempts               = $MaxAttempts
     }
+}
+
+$script:GraphUserSelect = 'id,displayName,userPrincipalName,accountEnabled,userType,signInSessionsValidFromDateTime,refreshTokensValidFromDateTime'
+$script:GraphStampSelect = 'id,signInSessionsValidFromDateTime,refreshTokensValidFromDateTime'
+$script:GraphBatchSize = 20
+
+function New-ProcessedUserResult {
+    param(
+        [string]$Upn,
+        [string]$DisplayName = $null,
+        [string]$Status,
+        [string]$Verification = 'Skipped',
+        [string]$VerificationDetail = 'Verification not run',
+        $StampBefore = $null,
+        $StampAfter = $null,
+        [string]$Detail,
+        [int]$Attempts = 1,
+        [bool]$DryRun = $false
+    )
+    return [pscustomobject]@{
+        UserPrincipalName       = $Upn
+        DisplayName             = $DisplayName
+        Status                  = $Status
+        Verification            = $Verification
+        VerificationDetail      = $VerificationDetail
+        SessionsValidFromBefore = (Format-UtcStamp $StampBefore)
+        SessionsValidFromAfter  = (Format-UtcStamp $StampAfter)
+        Detail                  = $Detail
+        Attempts                = $Attempts
+        Mode                    = $(if ($DryRun) { 'DryRun' } else { 'Live' })
+        Timestamp               = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    }
+}
+
+function Invoke-RevokeUserSequential {
+    param(
+        [string]$Upn,
+        [bool]$DryRun,
+        [bool]$VerifyRevoke
+    )
+
+    $lookup = Resolve-GraphUser -Upn $Upn
+    $guestNote = $null
+    if ((Test-IsGuestUpn $Upn) -or ($lookup.UserType -eq 'Guest')) {
+        $guestNote = 'Guest/B2B: Graph does not revoke home-tenant sessions from this tenant.'
+    }
+    $stampBefore = $null
+    if ($null -ne $lookup.Stamps) { $stampBefore = $lookup.Stamps.SessionsValidFrom }
+
+    $verification = 'Skipped'
+    $verifyDetail = 'Verification not run'
+    $stampAfter = $null
+    $status = $lookup.Status
+    $detail = $lookup.Detail
+    $attempts = $lookup.Attempts
+
+    if ($DryRun) {
+        if ($lookup.Status -eq 'Found') {
+            $status = 'WouldRevoke'
+            $detail = 'User found (dry run, no change made)'
+            if ($guestNote) { $detail = $detail + ' ' + $guestNote }
+        }
+    } elseif ($lookup.Status -ne 'NotFound') {
+        $userId = $null
+        if ($lookup.Status -eq 'Found') { $userId = $lookup.Id }
+        $outcome = Invoke-RevokeSession -Upn $Upn -UserId $userId
+        $status = $outcome.Status
+        $detail = $outcome.Detail
+        $attempts = $outcome.Attempts
+        if ($guestNote -and $status -eq 'Revoked') { $detail = $detail + ' ' + $guestNote }
+        if ($VerifyRevoke -and $status -eq 'Revoked') {
+            $check = Confirm-RevokedSignInSession -Upn $Upn -UserId $userId -BeforeStamps $lookup.Stamps
+            $verification = $check.Status
+            $verifyDetail = $check.Detail
+            $stampAfter = $check.SessionsValidFrom
+            if ($verification -eq 'Verified') {
+                $detail = $detail + " Verified: $verifyDetail."
+            } elseif ($verification -eq 'NotVerified') {
+                $detail = $detail + " Not verified: $verifyDetail."
+            } else {
+                $detail = $detail + " Verification check failed: $verifyDetail."
+            }
+        }
+    }
+
+    return New-ProcessedUserResult -Upn $Upn -DisplayName $lookup.DisplayName -Status $status `
+        -Verification $verification -VerificationDetail $verifyDetail `
+        -StampBefore $stampBefore -StampAfter $stampAfter -Detail $detail `
+        -Attempts $attempts -DryRun $DryRun
+}
+
+function Update-ChunkVerification {
+    param(
+        [int[]]$Indexes,
+        [object[]]$Results,
+        $Lookups,
+        [string[]]$Upns,
+        [int]$Attempt
+    )
+    $still = New-Object System.Collections.Generic.List[int]
+    $vReqs = New-Object System.Collections.Generic.List[object]
+    foreach ($i in @($Indexes)) {
+        $lookup = $Lookups[$i]
+        $target = $Upns[$i]
+        if ($lookup.Status -eq 'Found' -and -not [string]::IsNullOrWhiteSpace($lookup.Id)) {
+            $target = $lookup.Id
+        }
+        $vReqs.Add(@{
+            id     = "v$i"
+            method = 'GET'
+            url    = (Get-GraphUserRelativePath -UserIdOrUpn $target -Select $script:GraphStampSelect)
+        })
+    }
+    $vBatch = Invoke-GraphBatch -Requests @($vReqs.ToArray())
+    if (-not $vBatch.Ok) {
+        foreach ($i in @($Indexes)) {
+            $Results[$i].Verification = 'CheckFailed'
+            $Results[$i].VerificationDetail = $vBatch.Error
+            $Results[$i].Detail = $Results[$i].Detail + " Verification check failed: $($vBatch.Error)."
+        }
+        return @()
+    }
+    foreach ($i in @($Indexes)) {
+        $item = $null
+        if ($vBatch.ById.ContainsKey("v$i")) { $item = $vBatch.ById["v$i"] }
+        $code = Get-BatchItemStatusCode -Item $item
+        if ($code -lt 200 -or $code -ge 300) {
+            $Results[$i].Verification = 'CheckFailed'
+            $Results[$i].VerificationDetail = (Get-BatchItemErrorMessage -Item $item)
+            $Results[$i].Detail = $Results[$i].Detail + " Verification check failed: $($Results[$i].VerificationDetail)."
+            $still.Add($i)
+            continue
+        }
+        $after = Get-UserSessionStamps -UserObject (Get-GraphObjectProperty -Object $item -Name 'body')
+        $check = Test-SessionRevokeEvidence -Before $Lookups[$i].Stamps -After $after -NowUtc ([datetime]::UtcNow)
+        $Results[$i].SessionsValidFromAfter = (Format-UtcStamp $after.SessionsValidFrom)
+        if ($check.Verified) {
+            $Results[$i].Verification = 'Verified'
+            $Results[$i].VerificationDetail = $check.Reason
+            $Results[$i].Detail = $Results[$i].Detail + " Verified: $($check.Reason)."
+        } else {
+            $Results[$i].Verification = 'NotVerified'
+            $Results[$i].VerificationDetail = $check.Reason
+            if ($Attempt -ge 2) {
+                $Results[$i].Detail = $Results[$i].Detail + " Not verified: $($check.Reason)."
+            }
+            $still.Add($i)
+        }
+    }
+    return @($still.ToArray())
+}
+
+function Invoke-RevokeUserChunk {
+    param(
+        [string[]]$Upns,
+        [bool]$DryRun,
+        [bool]$VerifyRevoke
+    )
+
+    $upns = @($Upns)
+    $lookupSelect = $script:GraphUserSelect
+    $requests = New-Object System.Collections.Generic.List[object]
+    for ($i = 0; $i -lt $upns.Count; $i++) {
+        $requests.Add(@{
+            id     = "u$i"
+            method = 'GET'
+            url    = (Get-GraphUserRelativePath -UserIdOrUpn $upns[$i] -Select $lookupSelect)
+        })
+    }
+
+    $batch = Invoke-GraphBatch -Requests @($requests.ToArray())
+    if (-not $batch.Ok) {
+        Write-Warn2 "Graph batch lookup failed ($($batch.Error)). Falling back to per-user calls for this group of $($upns.Count)."
+        $fallback = New-Object System.Collections.Generic.List[object]
+        foreach ($upn in $upns) {
+            $fallback.Add((Invoke-RevokeUserSequential -Upn $upn -DryRun $DryRun -VerifyRevoke $VerifyRevoke))
+        }
+        return @($fallback.ToArray())
+    }
+
+    $lookups = New-Object 'System.Collections.Generic.List[object]'
+    for ($i = 0; $i -lt $upns.Count; $i++) {
+        $item = $null
+        if ($batch.ById.ContainsKey("u$i")) { $item = $batch.ById["u$i"] }
+        $code = Get-BatchItemStatusCode -Item $item
+        $body = Get-GraphObjectProperty -Object $item -Name 'body'
+        $err = $null
+        if ($code -ge 400) { $err = Get-BatchItemErrorMessage -Item $item }
+        $lookups.Add((ConvertTo-GraphUserLookup -Body $body -StatusCode $code -Attempts $batch.Attempts -ErrorMessage $err))
+    }
+
+    if ($DryRun) {
+        $out = New-Object System.Collections.Generic.List[object]
+        for ($i = 0; $i -lt $upns.Count; $i++) {
+            $upn = $upns[$i]
+            $lookup = $lookups[$i]
+            $guestNote = $null
+            if ((Test-IsGuestUpn $upn) -or ($lookup.UserType -eq 'Guest')) {
+                $guestNote = 'Guest/B2B: Graph does not revoke home-tenant sessions from this tenant.'
+            }
+            $stampBefore = $null
+            if ($null -ne $lookup.Stamps) { $stampBefore = $lookup.Stamps.SessionsValidFrom }
+            if ($lookup.Status -eq 'Found') {
+                $detail = 'User found (dry run, no change made)'
+                if ($guestNote) { $detail = $detail + ' ' + $guestNote }
+                $out.Add((New-ProcessedUserResult -Upn $upn -DisplayName $lookup.DisplayName -Status 'WouldRevoke' `
+                    -StampBefore $stampBefore -Detail $detail -Attempts $lookup.Attempts -DryRun $true))
+            } else {
+                $out.Add((New-ProcessedUserResult -Upn $upn -DisplayName $lookup.DisplayName -Status $lookup.Status `
+                    -StampBefore $stampBefore -Detail $lookup.Detail -Attempts $lookup.Attempts -DryRun $true))
+            }
+        }
+        return @($out.ToArray())
+    }
+
+    $revokeReqs = New-Object System.Collections.Generic.List[object]
+    for ($i = 0; $i -lt $upns.Count; $i++) {
+        $lookup = $lookups[$i]
+        if ($lookup.Status -eq 'NotFound') { continue }
+        $target = $upns[$i]
+        if ($lookup.Status -eq 'Found' -and -not [string]::IsNullOrWhiteSpace($lookup.Id)) {
+            $target = $lookup.Id
+        }
+        $revokeReqs.Add(@{
+            id      = "r$i"
+            method  = 'POST'
+            url     = (Get-GraphUserRelativePath -UserIdOrUpn $target -Revoke)
+            headers = @{ 'Content-Type' = 'application/json' }
+            body    = @{}
+        })
+    }
+
+    $revokeById = @{}
+    $revokeAttempts = 1
+    if ($revokeReqs.Count -gt 0) {
+        $revokeBatch = Invoke-GraphBatch -Requests @($revokeReqs.ToArray())
+        $revokeAttempts = $revokeBatch.Attempts
+        if (-not $revokeBatch.Ok) {
+            Write-Warn2 "Graph batch revoke failed ($($revokeBatch.Error)). Falling back to per-user calls for this group."
+            $fallback = New-Object System.Collections.Generic.List[object]
+            foreach ($upn in $upns) {
+                $fallback.Add((Invoke-RevokeUserSequential -Upn $upn -DryRun $false -VerifyRevoke $VerifyRevoke))
+            }
+            return @($fallback.ToArray())
+        }
+        $revokeById = $revokeBatch.ById
+    }
+
+    $pendingVerify = New-Object System.Collections.Generic.List[int]
+    $results = New-Object object[] $upns.Count
+    for ($i = 0; $i -lt $upns.Count; $i++) {
+        $upn = $upns[$i]
+        $lookup = $lookups[$i]
+        $guestNote = $null
+        if ((Test-IsGuestUpn $upn) -or ($lookup.UserType -eq 'Guest')) {
+            $guestNote = 'Guest/B2B: Graph does not revoke home-tenant sessions from this tenant.'
+        }
+        $stampBefore = $null
+        if ($null -ne $lookup.Stamps) { $stampBefore = $lookup.Stamps.SessionsValidFrom }
+
+        if ($lookup.Status -eq 'NotFound') {
+            $results[$i] = New-ProcessedUserResult -Upn $upn -DisplayName $lookup.DisplayName -Status 'NotFound' `
+                -StampBefore $stampBefore -Detail $lookup.Detail -Attempts $lookup.Attempts
+            continue
+        }
+
+        $item = $null
+        if ($revokeById.ContainsKey("r$i")) { $item = $revokeById["r$i"] }
+        $code = Get-BatchItemStatusCode -Item $item
+        $body = Get-GraphObjectProperty -Object $item -Name 'body'
+        $status = 'Failed'
+        $detail = Get-BatchItemErrorMessage -Item $item
+        if ($code -ge 200 -and $code -lt 300) {
+            $flag = Get-GraphBooleanValue -Response $body
+            if ($false -eq $flag) {
+                $status = 'Failed'
+                $detail = 'Graph returned value=false (sessions were not revoked)'
+            } else {
+                $status = 'Revoked'
+                $detail = 'Sign-in sessions revoked'
+            }
+        } else {
+            $status = switch ($code) {
+                404     { 'NotFound' }
+                403     { 'AccessDenied' }
+                401     { 'AccessDenied' }
+                default { 'Failed' }
+            }
+        }
+        if ($guestNote -and $status -eq 'Revoked') { $detail = $detail + ' ' + $guestNote }
+
+        $verification = 'Skipped'
+        $verifyDetail = 'Verification not run'
+        $stampAfter = $null
+        if ($VerifyRevoke -and $status -eq 'Revoked') {
+            $pendingVerify.Add($i)
+        }
+
+        $results[$i] = New-ProcessedUserResult -Upn $upn -DisplayName $lookup.DisplayName -Status $status `
+            -Verification $verification -VerificationDetail $verifyDetail `
+            -StampBefore $stampBefore -StampAfter $stampAfter -Detail $detail `
+            -Attempts ([Math]::Max($lookup.Attempts, $revokeAttempts))
+    }
+
+    if ($VerifyRevoke -and $pendingVerify.Count -gt 0) {
+        $remaining = Update-ChunkVerification -Indexes @($pendingVerify.ToArray()) -Results $results -Lookups $lookups -Upns $upns -Attempt 1
+        if (@($remaining).Count -gt 0) {
+            Start-Sleep -Seconds 1
+            $null = Update-ChunkVerification -Indexes @($remaining) -Results $results -Lookups $lookups -Upns $upns -Attempt 2
+        }
+    }
+
+    return @($results)
 }
 
 $script:DeviceLoginUrl = 'https://microsoft.com/devicelogin'
@@ -1356,6 +1777,15 @@ function Invoke-SelfTest {
     Assert-True 'Device code parsed from Graph message' ((Get-DeviceCodeFromMessage -Text $sampleMsg) -eq 'LK6RW4ZSN')
     Assert-True 'Device code parser ignores empty text' ($null -eq (Get-DeviceCodeFromMessage -Text ''))
 
+    $oneChunk = Split-IntoChunks -Items @('a','b','c') -Size 20
+    Assert-True 'Single chunk is not unwrapped' ($oneChunk.Count -eq 1 -and @($oneChunk[0]).Count -eq 3)
+    $twoChunks = Split-IntoChunks -Items @(1..25) -Size 20
+    Assert-True '25 items split into 2 chunks' ($twoChunks.Count -eq 2 -and @($twoChunks[0]).Count -eq 20 -and @($twoChunks[1]).Count -eq 5)
+    $rel = Get-GraphUserRelativePath -UserIdOrUpn 'first.user@contoso.com' -Select 'id,displayName'
+    Assert-True 'Batch path keeps @ and uses $select' ($rel -eq '/users/first.user@contoso.com?$select=id,displayName')
+    $relRevoke = Get-GraphUserRelativePath -UserIdOrUpn 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' -Revoke
+    Assert-True 'Batch revoke path uses object id' ($relRevoke -eq '/users/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/revokeSignInSessions')
+
     Write-Host ''
     Write-Info ("Passed: {0}  Failed: {1}" -f $script:SelfPassed, $script:SelfFailed)
     return $script:SelfFailed
@@ -1486,7 +1916,7 @@ function Start-RevokeM365Sessions {
         }
         $verifyRevoke = Read-YesNo -Prompt 'Verify each revocation by re-reading signInSessionsValidFromDateTime from Graph?' -Default $true
         if ($verifyRevoke) {
-            Write-Info 'After each revoke the script will re-read the user and confirm the session-validity timestamp moved forward.'
+            Write-Info 'After each batch of revokes the script will re-read users and confirm the session-validity timestamp moved forward.'
         }
     }
 
@@ -1515,108 +1945,34 @@ function Start-RevokeM365Sessions {
     }
 
     # --- Step 5: process users ---------------------------------------------------
-    Write-Info ("Step 5 of 5: Processing {0} user(s){1}..." -f $valid.Count, $(if ($dryRun) { ' (DRY RUN)' } else { '' }))
+    Write-Info ("Step 5 of 5: Processing {0} user(s){1} in batches of {2}..." -f $valid.Count, $(if ($dryRun) { ' (DRY RUN)' } else { '' }), $script:GraphBatchSize)
 
     $results   = New-Object System.Collections.Generic.List[object]
     $total     = $valid.Count
     $index     = 0
     $startTime = Get-Date
+    $chunks    = Split-IntoChunks -Items @($valid) -Size $script:GraphBatchSize
 
-    foreach ($upn in $valid) {
-        $index++
-        $pct = [int](($index / $total) * 100)
-        Write-Progress -Activity 'Revoking sign-in sessions' -Status "$index of $total : $upn" -PercentComplete $pct
-
-        $lookup = Resolve-GraphUser -Upn $upn
-        $displayName = $lookup.DisplayName
-        $guestNote = $null
-        if ((Test-IsGuestUpn $upn) -or ($lookup.UserType -eq 'Guest')) {
-            $guestNote = 'Guest/B2B: Graph does not revoke home-tenant sessions from this tenant.'
-        }
-
-        $verification = 'Skipped'
-        $verifyDetail = 'Verification not run'
-        $stampBefore = $null
-        $stampAfter = $null
-        if ($null -ne $lookup.Stamps) {
-            $stampBefore = $lookup.Stamps.SessionsValidFrom
-        }
-
-        if ($dryRun) {
-            if ($lookup.Status -eq 'Found') {
-                $detail = 'User found (dry run, no change made)'
-                if ($guestNote) { $detail = $detail + ' ' + $guestNote }
-                $outcome = [pscustomobject]@{ Status = 'WouldRevoke'; Detail = $detail; Attempts = $lookup.Attempts }
-            } else {
-                $outcome = [pscustomobject]@{ Status = $lookup.Status; Detail = $lookup.Detail; Attempts = $lookup.Attempts }
-            }
-        } else {
-            if ($lookup.Status -eq 'NotFound') {
-                $outcome = [pscustomobject]@{ Status = 'NotFound'; Detail = $lookup.Detail; Attempts = $lookup.Attempts }
-            } else {
-                $userId = $null
-                if ($lookup.Status -eq 'Found') { $userId = $lookup.Id }
-                $outcome = Invoke-RevokeSession -Upn $upn -UserId $userId
-                if ($guestNote -and $outcome.Status -eq 'Revoked') {
-                    $outcome = [pscustomobject]@{
-                        Status   = $outcome.Status
-                        Detail   = $outcome.Detail + ' ' + $guestNote
-                        Attempts = $outcome.Attempts
-                    }
+    foreach ($chunk in $chunks) {
+        $chunkUpns = @($chunk)
+        $chunkResults = @(Invoke-RevokeUserChunk -Upns $chunkUpns -DryRun $dryRun -VerifyRevoke $verifyRevoke)
+        foreach ($row in $chunkResults) {
+            $index++
+            $pct = [int](($index / $total) * 100)
+            Write-Progress -Activity 'Revoking sign-in sessions' -Status "$index of $total : $($row.UserPrincipalName)" -PercentComplete $pct
+            switch ($row.Status) {
+                'Revoked' {
+                    if ($row.Verification -eq 'Verified') { Write-Ok "$($row.UserPrincipalName) (verified)" }
+                    elseif ($row.Verification -eq 'NotVerified') { Write-Warn2 "$($row.UserPrincipalName) - revoked, but session timestamp did not advance" }
+                    elseif ($row.Verification -eq 'CheckFailed') { Write-Warn2 "$($row.UserPrincipalName) - revoked, but verification GET failed" }
+                    else { Write-Ok "$($row.UserPrincipalName)" }
                 }
-                if ($verifyRevoke -and $outcome.Status -eq 'Revoked') {
-                    $check = Confirm-RevokedSignInSession -Upn $upn -UserId $userId -BeforeStamps $lookup.Stamps
-                    $verification = $check.Status
-                    $verifyDetail = $check.Detail
-                    $stampAfter = $check.SessionsValidFrom
-                    if ($verification -eq 'Verified') {
-                        $outcome = [pscustomobject]@{
-                            Status   = $outcome.Status
-                            Detail   = $outcome.Detail + " Verified: $verifyDetail."
-                            Attempts = $outcome.Attempts
-                        }
-                    } elseif ($verification -eq 'NotVerified') {
-                        $outcome = [pscustomobject]@{
-                            Status   = $outcome.Status
-                            Detail   = $outcome.Detail + " Not verified: $verifyDetail."
-                            Attempts = $outcome.Attempts
-                        }
-                    } else {
-                        $outcome = [pscustomobject]@{
-                            Status   = $outcome.Status
-                            Detail   = $outcome.Detail + " Verification check failed: $verifyDetail."
-                            Attempts = $outcome.Attempts
-                        }
-                    }
-                }
+                'WouldRevoke' { Write-Ok    "$($row.UserPrincipalName) (would revoke)" }
+                'NotFound'    { Write-Warn2 "$($row.UserPrincipalName) - user not found" }
+                default       { Write-Err2  "$($row.UserPrincipalName) - $($row.Status): $($row.Detail)" }
             }
+            $results.Add($row)
         }
-
-        switch ($outcome.Status) {
-            'Revoked' {
-                if ($verification -eq 'Verified') { Write-Ok "$upn (verified)" }
-                elseif ($verification -eq 'NotVerified') { Write-Warn2 "$upn - revoked, but session timestamp did not advance" }
-                elseif ($verification -eq 'CheckFailed') { Write-Warn2 "$upn - revoked, but verification GET failed" }
-                else { Write-Ok "$upn" }
-            }
-            'WouldRevoke' { Write-Ok    "$upn (would revoke)" }
-            'NotFound'    { Write-Warn2 "$upn - user not found" }
-            default       { Write-Err2  "$upn - $($outcome.Status): $($outcome.Detail)" }
-        }
-
-        $results.Add([pscustomobject]@{
-            UserPrincipalName          = $upn
-            DisplayName                = $displayName
-            Status                     = $outcome.Status
-            Verification               = $verification
-            VerificationDetail         = $verifyDetail
-            SessionsValidFromBefore    = (Format-UtcStamp $stampBefore)
-            SessionsValidFromAfter     = (Format-UtcStamp $stampAfter)
-            Detail                     = $outcome.Detail
-            Attempts                   = $outcome.Attempts
-            Mode                       = $(if ($dryRun) { 'DryRun' } else { 'Live' })
-            Timestamp                  = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-        })
     }
 
     Write-Progress -Activity 'Revoking sign-in sessions' -Completed
