@@ -1,0 +1,11 @@
+Distinguished name,Object guid,Object class,Identity,Permissions,Applies to,Attribute,Ignored
+"CN=Computers,DC=contoso,DC=com",00000000-0000-0000-0000-000000000001,Container,CONTOSO\helpdesk,GenericAll,All descendant computer objects,All Objects,FALSE
+"CN=Users,DC=contoso,DC=com",00000000-0000-0000-0000-000000000002,Container,S-1-5-21-1000-2000-3000-1111,WriteProperty,All descendant user objects,All Objects,FALSE
+"CN=Users,DC=contoso,DC=com",00000000-0000-0000-0000-000000000002,Container,S-1-5-21-1000-2000-3000-1111,WriteProperty,All descendant user objects,UserPrincipalName (28630ebb-41d5-11d1-a9c1-0000f80367c1),FALSE
+"OU=Workstations,DC=contoso,DC=com",00000000-0000-0000-0000-000000000003,OrganizationalUnit,NT AUTHORITY\Authenticated Users,WriteProperty,All descendant user objects,All Objects,FALSE
+"CN=APP01,OU=Servers,DC=contoso,DC=com",00000000-0000-0000-0000-000000000004,Computer,CONTOSO\APP01$,GenericAll,This object only,All Properties,FALSE
+"CN=APP01,OU=Servers,DC=contoso,DC=com",00000000-0000-0000-0000-000000000004,Computer,CONTOSO\Exchange Trusted Subsystem,WriteProperty,This object and all descendant objects,Public Information property set (e48d0154-bcf8-11d1-8702-00c04fb96050),FALSE
+"OU=Clients,DC=contoso,DC=com",00000000-0000-0000-0000-000000000005,OrganizationalUnit,CONTOSO\helpdesk,CreateChild,This object and all descendant objects,Computer (bf967a86-0de6-11d0-a285-00aa003049e2),FALSE
+"CN=Users,DC=contoso,DC=com",00000000-0000-0000-0000-000000000002,Container,CONTOSO\svc-provision,CreateChild,This object only,User (bf967aba-0de6-11d0-a285-00aa003049e2),FALSE
+"DC=contoso,DC=com",00000000-0000-0000-0000-000000000006,DomainDNS,CONTOSO\Role_AccessControl_Elevated,GenericAll,All descendant user objects,All Objects,FALSE
+"CN=O'Shea\, Mike,OU=Users,DC=contoso,DC=com",00000000-0000-0000-0000-000000000007,User,NT AUTHORITY\SELF,GenericAll,This object only,All Properties,FALSE
