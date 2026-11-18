@@ -1,0 +1,2312 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    GPO Drive Mapping Validator & Manager - Full-Featured WPF GUI
+
+.DESCRIPTION
+    Modern dark-themed WPF GUI for validating, testing, and managing Group Policy
+    Preference (GPP) drive mappings with comprehensive Item-Level Targeting (ILT)
+    filter evaluation, user simulation, conflict detection, and GPO comparison.
+
+    Architecture based on proven WPF patterns from DHCP-Manager-v2-FULL.ps1 by Anthony Blake.
+
+.NOTES
+    Requires: PowerShell 5.1+ on Windows Server 2016/2019/2022 or Windows 10/11
+              RSAT ActiveDirectory module (for live AD queries)
+              RSAT GroupPolicy module (for GPO enumeration)
+    
+    Version: 2.0
+    Author: Generated from validated reference architecture
+#>
+
+[CmdletBinding()]
+param()
+
+$ErrorActionPreference = 'Stop'
+$script:Window = $null
+$script:LoadedGpo = $null
+$script:CurrentDomain = $env:USERDNSDOMAIN
+$script:MappingsData = New-Object System.Collections.ObjectModel.ObservableCollection[object]
+$script:ActionLogEntries = New-Object System.Collections.ObjectModel.ObservableCollection[object]
+$script:ValidationResults = @()
+$script:ConflictData = @()
+$script:CsvData = $null
+$script:CsvHeaders = $null
+$script:SelectedCsvColumn = $null
+$script:ValidationInputText = ""
+
+#region Assembly Loading
+try {
+    Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
+    Add-Type -AssemblyName PresentationCore -ErrorAction Stop
+    Add-Type -AssemblyName WindowsBase -ErrorAction Stop
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+}
+catch {
+    [System.Windows.Forms.MessageBox]::Show(
+        "Failed to load required WPF assemblies: $($_.Exception.Message)",
+        "Fatal Error",
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error
+    )
+    exit 1
+}
+#endregion
+
+#region Module Validation
+function Test-RequiredModules {
+    $modules = @('ActiveDirectory', 'GroupPolicy')
+    $missing = @()
+    
+    foreach ($mod in $modules) {
+        if (-not (Get-Module -ListAvailable -Name $mod)) {
+            $missing += $mod
+        }
+    }
+    
+    if ($missing.Count -gt 0) {
+        $msg = "Required RSAT modules not found: $($missing -join ', ')`n`n" +
+               "Install RSAT tools for Windows Server or Windows 10/11 to use this application."
+        [System.Windows.Forms.MessageBox]::Show($msg, "Missing Dependencies", 
+            [System.Windows.Forms.MessageBoxButtons]::OK, 
+            [System.Windows.Forms.MessageBoxIcon]::Warning)
+        return $false
+    }
+    
+    return $true
+}
+
+if (-not (Test-RequiredModules)) {
+    exit 1
+}
+
+try {
+    Import-Module ActiveDirectory -ErrorAction Stop
+    Import-Module GroupPolicy -ErrorAction Stop
+}
+catch {
+    [System.Windows.Forms.MessageBox]::Show(
+        "Failed to import required modules: $($_.Exception.Message)",
+        "Module Error",
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error
+    )
+    exit 1
+}
+#endregion
+
+#region XAML Definition
+$xaml = @'
+<Window
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="GPO Drive Mapping Validator &amp; Manager v2.0"
+    WindowStartupLocation="CenterScreen"
+    Width="1600" Height="900"
+    MinWidth="1200" MinHeight="700"
+    ResizeMode="CanResizeWithGrip"
+    Background="#1A1D23">
+
+    <Window.Resources>
+        <!-- Color Palette (Dark Theme) -->
+        <SolidColorBrush x:Key="BgDeep" Color="#1A1D23"/>
+        <SolidColorBrush x:Key="BgPanel" Color="#22262E"/>
+        <SolidColorBrush x:Key="BgCard" Color="#2A2F3A"/>
+        <SolidColorBrush x:Key="BorderBrush" Color="#3A3F4A"/>
+        <SolidColorBrush x:Key="Accent" Color="#2196F3"/>
+        <SolidColorBrush x:Key="AccentHover" Color="#42A5F5"/>
+        <SolidColorBrush x:Key="Success" Color="#4CAF50"/>
+        <SolidColorBrush x:Key="Warning" Color="#FF9800"/>
+        <SolidColorBrush x:Key="Danger" Color="#F44336"/>
+        <SolidColorBrush x:Key="TextPrimary" Color="#E8EAF0"/>
+        <SolidColorBrush x:Key="TextSecond" Color="#9AA3B2"/>
+
+        <!-- Button Style -->
+        <Style TargetType="Button">
+            <Setter Property="Background" Value="{StaticResource Accent}"/>
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="12,6"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="FontWeight" Value="Medium"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}"
+                                CornerRadius="4"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="{StaticResource AccentHover}"/>
+                </Trigger>
+                <Trigger Property="IsEnabled" Value="False">
+                    <Setter Property="Opacity" Value="0.5"/>
+                    <Setter Property="Cursor" Value="Arrow"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+
+        <!-- TextBox Style -->
+        <Style TargetType="TextBox">
+            <Setter Property="Background" Value="{StaticResource BgPanel}"/>
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
+            <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Padding" Value="8,6"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="CaretBrush" Value="{StaticResource Accent}"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TextBox">
+                        <Border Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="4">
+                            <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Style.Triggers>
+                <Trigger Property="IsFocused" Value="True">
+                    <Setter Property="BorderBrush" Value="{StaticResource Accent}"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+
+        <!-- ComboBox Style -->
+        <Style TargetType="ComboBox">
+            <Setter Property="Background" Value="{StaticResource BgPanel}"/>
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
+            <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Padding" Value="8,6"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBox">
+                        <Grid>
+                            <ToggleButton Name="ToggleButton" 
+                                        Background="{TemplateBinding Background}"
+                                        BorderBrush="{TemplateBinding BorderBrush}"
+                                        BorderThickness="{TemplateBinding BorderThickness}"
+                                        Focusable="False"
+                                        IsChecked="{Binding Path=IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"
+                                        ClickMode="Press">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition/>
+                                        <ColumnDefinition Width="20"/>
+                                    </Grid.ColumnDefinitions>
+                                    <ContentPresenter Grid.Column="0"
+                                                    Name="ContentSite"
+                                                    Margin="8,6"
+                                                    VerticalAlignment="Center"
+                                                    HorizontalAlignment="Left"
+                                                    Content="{TemplateBinding SelectionBoxItem}"
+                                                    ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                                                    ContentTemplateSelector="{TemplateBinding ItemTemplateSelector}"
+                                                    IsHitTestVisible="False">
+                                        <ContentPresenter.Resources>
+                                            <Style TargetType="TextBlock">
+                                                <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
+                                            </Style>
+                                        </ContentPresenter.Resources>
+                                    </ContentPresenter>
+                                    <Path Grid.Column="1"
+                                        HorizontalAlignment="Center"
+                                        VerticalAlignment="Center"
+                                        Data="M 0 0 L 4 4 L 8 0 Z"
+                                        Fill="{StaticResource TextSecond}"/>
+                                </Grid>
+                            </ToggleButton>
+                            <Popup Name="Popup"
+                                Placement="Bottom"
+                                IsOpen="{TemplateBinding IsDropDownOpen}"
+                                AllowsTransparency="True"
+                                Focusable="False"
+                                PopupAnimation="Slide">
+                                <Grid Name="DropDown"
+                                    SnapsToDevicePixels="True"
+                                    MinWidth="{TemplateBinding ActualWidth}"
+                                    MaxHeight="{TemplateBinding MaxDropDownHeight}">
+                                    <Border Name="DropDownBorder"
+                                            Background="{StaticResource BgPanel}"
+                                            BorderBrush="{StaticResource BorderBrush}"
+                                            BorderThickness="1"
+                                            CornerRadius="4"
+                                            Margin="0,2,0,0">
+                                        <ScrollViewer Margin="0" SnapsToDevicePixels="True">
+                                            <StackPanel IsItemsHost="True" KeyboardNavigation.DirectionalNavigation="Contained"/>
+                                        </ScrollViewer>
+                                    </Border>
+                                </Grid>
+                            </Popup>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        
+        <!-- ComboBoxItem Style (Dropdown Items) -->
+        <Style TargetType="ComboBoxItem">
+            <Setter Property="Background" Value="{StaticResource BgPanel}"/>
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
+            <Setter Property="Padding" Value="8,6"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBoxItem">
+                        <Border Name="Border" 
+                                Background="{TemplateBinding Background}"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter>
+                                <ContentPresenter.Resources>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
+                                    </Style>
+                                </ContentPresenter.Resources>
+                            </ContentPresenter>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsHighlighted" Value="True">
+                                <Setter TargetName="Border" Property="Background" Value="{StaticResource Accent}"/>
+                            </Trigger>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="Border" Property="Background" Value="{StaticResource Accent}"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        
+        <!-- Popup Style for ComboBox Dropdown -->
+        <Style x:Key="ComboBoxPopupStyle" TargetType="Popup">
+            <Setter Property="AllowsTransparency" Value="True"/>
+        </Style>
+
+        <!-- DataGrid Style -->
+        <Style TargetType="DataGrid">
+            <Setter Property="Background" Value="{StaticResource BgCard}"/>
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
+            <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="GridLinesVisibility" Value="None"/>
+            <Setter Property="HeadersVisibility" Value="Column"/>
+            <Setter Property="AutoGenerateColumns" Value="False"/>
+            <Setter Property="CanUserAddRows" Value="False"/>
+            <Setter Property="CanUserDeleteRows" Value="False"/>
+            <Setter Property="SelectionMode" Value="Single"/>
+            <Setter Property="RowBackground" Value="{StaticResource BgCard}"/>
+            <Setter Property="AlternatingRowBackground" Value="#252A35"/>
+            <Setter Property="HorizontalGridLinesBrush" Value="{StaticResource BorderBrush}"/>
+            <Setter Property="VerticalGridLinesBrush" Value="{StaticResource BorderBrush}"/>
+        </Style>
+
+        <Style TargetType="DataGridColumnHeader">
+            <Setter Property="Background" Value="{StaticResource BgPanel}"/>
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
+            <Setter Property="Padding" Value="10,8"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}"/>
+            <Setter Property="BorderThickness" Value="0,0,1,1"/>
+        </Style>
+
+        <Style TargetType="DataGridCell">
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="8,6"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="DataGridCell">
+                        <Border Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter VerticalAlignment="Center"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Style.Triggers>
+                <Trigger Property="IsSelected" Value="True">
+                    <Setter Property="Background" Value="#1565C0"/>
+                    <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style x:Key="DataGridRowStyle" TargetType="DataGridRow">
+            <Setter Property="Background" Value="{StaticResource BgCard}"/>
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="#2D3340"/>
+                </Trigger>
+                <Trigger Property="IsSelected" Value="True">
+                    <Setter Property="Background" Value="#1565C0"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+
+        <!-- TabControl Style -->
+        <Style TargetType="TabControl">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+        </Style>
+
+        <Style TargetType="TabItem">
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TabItem">
+                        <Border Name="Border" 
+                                Background="{StaticResource BgPanel}"
+                                BorderThickness="0,0,1,0"
+                                BorderBrush="{StaticResource BorderBrush}"
+                                Padding="16,10"
+                                Margin="0,0,2,0">
+                            <ContentPresenter ContentSource="Header"
+                                            VerticalAlignment="Center"
+                                            HorizontalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="Border" Property="Background" Value="{StaticResource Accent}"/>
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Border" Property="Background" Value="{StaticResource AccentHover}"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="FontWeight" Value="Medium"/>
+        </Style>
+
+        <!-- TextBlock Default Style -->
+        <Style TargetType="TextBlock">
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
+            <Setter Property="FontSize" Value="13"/>
+        </Style>
+
+        <!-- Label Style -->
+        <Style TargetType="Label">
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
+            <Setter Property="FontSize" Value="13"/>
+        </Style>
+
+        <!-- CheckBox Style -->
+        <Style TargetType="CheckBox">
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
+            <Setter Property="FontSize" Value="13"/>
+        </Style>
+    </Window.Resources>
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="60"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="32"/>
+        </Grid.RowDefinitions>
+
+        <!-- TOP TOOLBAR -->
+        <Border Grid.Row="0" Background="{StaticResource BgPanel}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1">
+            <Grid Margin="16,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock Text="GPO Drive Mapping Validator" FontSize="18" FontWeight="Bold" 
+                               Foreground="{StaticResource Accent}" VerticalAlignment="Center"/>
+                </StackPanel>
+
+                <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center" HorizontalAlignment="Right">
+                    <Label Content="Domain:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                    <ComboBox x:Name="ComboDomain" Width="200" VerticalAlignment="Center" Margin="0,0,16,0"/>
+                    
+                    <Label Content="GPO:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                    <ComboBox x:Name="ComboGpo" Width="300" VerticalAlignment="Center" Margin="0,0,16,0" IsEnabled="False"/>
+                    
+                    <Button x:Name="BtnLoadGpo" Content="Load GPO" Width="100" Margin="0,0,8,0"/>
+                    <Button x:Name="BtnRefresh" Content="🔄 Refresh" Width="90"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- MAIN CONTENT AREA -->
+        <TabControl Grid.Row="1" Margin="0" x:Name="MainTabs">
+            
+            <!-- TAB 1: Drive Mappings -->
+            <TabItem Header="📁 Drive Mappings">
+                <Grid Background="{StaticResource BgDeep}">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+
+                    <Border Grid.Row="0" Background="{StaticResource BgPanel}" Padding="16" Margin="8,8,8,0" CornerRadius="6">
+                        <StackPanel>
+                            <TextBlock Text="Current GPO Drive Mappings" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,12"/>
+                            <TextBlock x:Name="TxtGpoInfo" Text="No GPO loaded. Select a GPO from the toolbar above." 
+                                       Foreground="{StaticResource TextSecond}" TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </Border>
+
+                    <DataGrid Grid.Row="1" x:Name="GridMappings" Margin="8" ItemsSource="{Binding}" RowStyle="{StaticResource DataGridRowStyle}">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="Drive Letter" Binding="{Binding DriveLetter}" Width="100"/>
+                            <DataGridTextColumn Header="Path" Binding="{Binding Path}" Width="300"/>
+                            <DataGridTextColumn Header="Label" Binding="{Binding Label}" Width="150"/>
+                            <DataGridTextColumn Header="Action" Binding="{Binding Action}" Width="80"/>
+                            <DataGridTextColumn Header="State" Binding="{Binding State}" Width="100"/>
+                            <DataGridTextColumn Header="Has Filters" Binding="{Binding HasFilters}" Width="100"/>
+                            <DataGridTextColumn Header="Filter Summary" Binding="{Binding FilterSummary}" Width="*"/>
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </Grid>
+            </TabItem>
+
+            <!-- TAB 2: User Validation -->
+            <TabItem Header="👤 User Validation">
+                <Grid Background="{StaticResource BgDeep}">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+
+                    <Border Grid.Row="0" Background="{StaticResource BgPanel}" Padding="16" Margin="8,8,8,0" CornerRadius="6">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+
+                            <TextBlock Grid.Row="0" Text="Test Drive Mappings Against Users" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,16"/>
+                            
+                            <Grid Grid.Row="1">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                </Grid.RowDefinitions>
+
+                                <Label Grid.Row="0" Grid.Column="0" Content="Test Mode:" VerticalAlignment="Center" Margin="0,0,8,8"/>
+                                <ComboBox Grid.Row="0" Grid.Column="1" x:Name="ComboValidationMode" Margin="0,0,16,8" 
+                                          Grid.ColumnSpan="3">
+                                    <ComboBoxItem Content="Single User (sAMAccountName)" IsSelected="True"/>
+                                    <ComboBoxItem Content="All Users in OU (Distinguished Name)"/>
+                                    <ComboBoxItem Content="User List (comma-separated sAMAccountNames)"/>
+                                    <ComboBoxItem Content="User List from CSV File"/>
+                                </ComboBox>
+
+                                <Label Grid.Row="1" Grid.Column="0" Content="Input:" VerticalAlignment="Center" Margin="0,0,8,8"/>
+                                <TextBox Grid.Row="1" Grid.Column="1" x:Name="TxtValidationInput" Margin="0,0,8,8" 
+                                         TextWrapping="Wrap" AcceptsReturn="False"/>
+                                <Button Grid.Row="1" Grid.Column="2" x:Name="BtnLoadUser" Content="🔍 Load User" Width="100" Margin="0,0,8,8"/>
+                                <Button Grid.Row="1" Grid.Column="3" x:Name="BtnRunValidation" Content="▶ Validate" Width="120" Margin="0,0,0,8"/>
+                                
+                                <!-- CSV Import Row (Hidden by default) -->
+                                <Label Grid.Row="2" Grid.Column="0" x:Name="LblCsvFile" Content="CSV File:" VerticalAlignment="Center" Margin="0,0,8,0" Visibility="Collapsed"/>
+                                <TextBox Grid.Row="2" Grid.Column="1" x:Name="TxtCsvPath" Margin="0,0,8,0" IsReadOnly="True" Visibility="Collapsed"/>
+                                <Button Grid.Row="2" Grid.Column="2" x:Name="BtnBrowseCsv" Content="📁 Browse" Width="100" Margin="0,0,8,0" Visibility="Collapsed"/>
+                                <Button Grid.Row="2" Grid.Column="3" x:Name="BtnSelectCsvColumn" Content="Select Column" Width="120" Visibility="Collapsed"/>
+                            </Grid>
+                        </Grid>
+                    </Border>
+
+                    <TabControl Grid.Row="1" Margin="8" x:Name="ValidationTabs">
+                        <TabItem Header="Results Summary">
+                            <DataGrid x:Name="GridValidationResults" ItemsSource="{Binding}">
+                                <DataGrid.Columns>
+                                    <DataGridTextColumn Header="User" Binding="{Binding Subject}" Width="150"/>
+                                    <DataGridTextColumn Header="Drive Letter" Binding="{Binding DriveLetter}" Width="100"/>
+                                    <DataGridTextColumn Header="Path" Binding="{Binding Path}" Width="250"/>
+                                    <DataGridTextColumn Header="Label" Binding="{Binding Label}" Width="120"/>
+                                    <DataGridTextColumn Header="Applies" Binding="{Binding Applies}" Width="80"/>
+                                    <DataGridCheckBoxColumn Header="Disabled" Binding="{Binding IsDisabled}" Width="80"/>
+                                </DataGrid.Columns>
+                            </DataGrid>
+                        </TabItem>
+                        
+                        <TabItem Header="Filter Trace">
+                            <ScrollViewer VerticalScrollBarVisibility="Auto">
+                                <TextBox x:Name="TxtFilterTrace" IsReadOnly="True" TextWrapping="Wrap" 
+                                         FontFamily="Consolas" FontSize="11" Background="{StaticResource BgCard}"
+                                         BorderThickness="0" Padding="12" VerticalScrollBarVisibility="Auto"/>
+                            </ScrollViewer>
+                        </TabItem>
+                        
+                        <TabItem Header="Conflicts">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="*"/>
+                                </Grid.RowDefinitions>
+                                
+                                <Border Grid.Row="0" Background="{StaticResource BgPanel}" Padding="12" Margin="8">
+                                    <TextBlock x:Name="TxtConflictSummary" Text="No conflicts detected." 
+                                               Foreground="{StaticResource Success}" FontWeight="SemiBold"/>
+                                </Border>
+                                
+                                <DataGrid Grid.Row="1" x:Name="GridConflicts" Margin="8" ItemsSource="{Binding}">
+                                    <DataGrid.Columns>
+                                        <DataGridTextColumn Header="User" Binding="{Binding User}" Width="150"/>
+                                        <DataGridTextColumn Header="Drive Letter" Binding="{Binding DriveLetter}" Width="100"/>
+                                        <DataGridTextColumn Header="Conflicting Paths" Binding="{Binding Paths}" Width="*"/>
+                                    </DataGrid.Columns>
+                                </DataGrid>
+                            </Grid>
+                        </TabItem>
+
+                        <TabItem Header="Warnings">
+                            <ScrollViewer VerticalScrollBarVisibility="Auto">
+                                <StackPanel x:Name="PanelWarnings" Margin="12">
+                                    <TextBlock Text="No warnings." Foreground="{StaticResource Success}"/>
+                                </StackPanel>
+                            </ScrollViewer>
+                        </TabItem>
+                    </TabControl>
+                </Grid>
+            </TabItem>
+
+            <!-- TAB 3: Filter Inspector -->
+            <TabItem Header="🔍 Filter Inspector">
+                <Grid Background="{StaticResource BgDeep}">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+
+                    <Border Grid.Row="0" Background="{StaticResource BgPanel}" Padding="16" Margin="8,8,8,0" CornerRadius="6">
+                        <StackPanel>
+                            <TextBlock Text="Item-Level Targeting (ILT) Filter Inspector" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,8"/>
+                            <TextBlock Text="Select a drive mapping from the grid below to view its detailed filter tree structure." 
+                                       Foreground="{StaticResource TextSecond}" TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </Border>
+
+                    <Grid Grid.Row="1" Margin="8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="2*"/>
+                        </Grid.ColumnDefinitions>
+
+                        <DataGrid Grid.Column="0" x:Name="GridFilterInspectorDrives" Margin="0,0,4,0">
+                            <DataGrid.Columns>
+                                <DataGridTextColumn Header="Drive" Binding="{Binding DriveLetter}" Width="60"/>
+                                <DataGridTextColumn Header="Path" Binding="{Binding Path}" Width="*"/>
+                            </DataGrid.Columns>
+                        </DataGrid>
+
+                        <Border Grid.Column="1" Background="{StaticResource BgCard}" CornerRadius="6" Padding="12" Margin="4,0,0,0">
+                            <ScrollViewer VerticalScrollBarVisibility="Auto">
+                                <TextBox x:Name="TxtFilterInspectorDetail" IsReadOnly="True" TextWrapping="Wrap"
+                                         FontFamily="Consolas" FontSize="11" Background="Transparent" 
+                                         BorderThickness="0" Foreground="{StaticResource TextPrimary}"/>
+                            </ScrollViewer>
+                        </Border>
+                    </Grid>
+                </Grid>
+            </TabItem>
+
+            <!-- TAB 4: GPO Comparison -->
+            <TabItem Header="⚖ GPO Comparison">
+                <Grid Background="{StaticResource BgDeep}">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+
+                    <Border Grid.Row="0" Background="{StaticResource BgPanel}" Padding="16" Margin="8,8,8,0" CornerRadius="6">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+
+                            <TextBlock Grid.Row="0" Text="Compare Drive Mappings Across GPOs" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,12"/>
+                            
+                            <Grid Grid.Row="1">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+
+                                <Label Grid.Column="0" Content="Compare with GPO:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                <ComboBox Grid.Column="1" x:Name="ComboCompareGpo" Margin="0,0,16,0"/>
+                                <Button Grid.Column="2" x:Name="BtnCompare" Content="Compare" Width="100"/>
+                            </Grid>
+                        </Grid>
+                    </Border>
+
+                    <DataGrid Grid.Row="1" x:Name="GridComparison" Margin="8">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="Drive Letter" Binding="{Binding DriveLetter}" Width="100"/>
+                            <DataGridTextColumn Header="Current GPO Path" Binding="{Binding CurrentPath}" Width="*"/>
+                            <DataGridTextColumn Header="Compare GPO Path" Binding="{Binding ComparePath}" Width="*"/>
+                            <DataGridTextColumn Header="Status" Binding="{Binding Status}" Width="120"/>
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </Grid>
+            </TabItem>
+
+            <!-- TAB 5: Add Mapping Simulator -->
+            <TabItem Header="➕ Add Mapping Simulator">
+                <Grid Background="{StaticResource BgDeep}">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto">
+                        <StackPanel Margin="16">
+                            <Border Background="{StaticResource BgPanel}" Padding="16" CornerRadius="6" Margin="0,0,0,16">
+                                <StackPanel>
+                                    <TextBlock Text="Add New Drive Mapping (Simulation)" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,16"/>
+                                    <TextBlock Text="Simulate adding a new drive mapping to the current GPO and test for conflicts." 
+                                               Foreground="{StaticResource TextSecond}" TextWrapping="Wrap" Margin="0,0,0,16"/>
+
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="150"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
+                                        </Grid.RowDefinitions>
+
+                                        <Label Grid.Row="0" Grid.Column="0" Content="Drive Letter:" Margin="0,0,0,12"/>
+                                        <TextBox Grid.Row="0" Grid.Column="1" x:Name="TxtNewDriveLetter" Margin="0,0,0,12" MaxLength="2"/>
+
+                                        <Label Grid.Row="1" Grid.Column="0" Content="UNC Path:" Margin="0,0,0,12"/>
+                                        <TextBox Grid.Row="1" Grid.Column="1" x:Name="TxtNewPath" Margin="0,0,0,12"/>
+
+                                        <Label Grid.Row="2" Grid.Column="0" Content="Label:" Margin="0,0,0,12"/>
+                                        <TextBox Grid.Row="2" Grid.Column="1" x:Name="TxtNewLabel" Margin="0,0,0,12"/>
+
+                                        <Label Grid.Row="3" Grid.Column="0" Content="Action:" Margin="0,0,0,12"/>
+                                        <ComboBox Grid.Row="3" Grid.Column="1" x:Name="ComboNewAction" Margin="0,0,0,12">
+                                            <ComboBoxItem Content="Create" IsSelected="True"/>
+                                            <ComboBoxItem Content="Update"/>
+                                            <ComboBoxItem Content="Replace"/>
+                                            <ComboBoxItem Content="Delete"/>
+                                        </ComboBox>
+
+                                        <Label Grid.Row="4" Grid.Column="0" Content="Target Users:" Margin="0,0,0,12"/>
+                                        <TextBox Grid.Row="4" Grid.Column="1" x:Name="TxtNewTargetUsers" Margin="0,0,0,12" 
+                                                 TextWrapping="Wrap" Height="60" AcceptsReturn="True"
+                                                 ToolTip="Enter comma-separated sAMAccountNames to test this new mapping"/>
+                                    </Grid>
+
+                                    <Button x:Name="BtnSimulateAdd" Content="Simulate &amp; Test for Conflicts" 
+                                            Width="250" HorizontalAlignment="Left" Margin="0,8,0,0"/>
+                                </StackPanel>
+                            </Border>
+
+                            <Border Background="{StaticResource BgCard}" Padding="16" CornerRadius="6">
+                                <StackPanel>
+                                    <TextBlock Text="Simulation Results" FontSize="14" FontWeight="SemiBold" Margin="0,0,0,12"/>
+                                    <TextBox x:Name="TxtSimulationResults" IsReadOnly="True" TextWrapping="Wrap" 
+                                             FontFamily="Consolas" FontSize="11" Background="Transparent" 
+                                             BorderThickness="0" MinHeight="200" VerticalScrollBarVisibility="Auto"/>
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
+                    </ScrollViewer>
+                </Grid>
+            </TabItem>
+
+            <!-- TAB 6: Action Log -->
+            <TabItem Header="📋 Action Log">
+                <Grid Background="{StaticResource BgDeep}">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+
+                    <Border Grid.Row="0" Background="{StaticResource BgPanel}" Padding="12" Margin="8,8,8,0">
+                        <Grid>
+                            <TextBlock Text="Application Activity Log" FontSize="14" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                            <Button x:Name="BtnClearLog" Content="Clear Log" Width="100" HorizontalAlignment="Right"/>
+                        </Grid>
+                    </Border>
+
+                    <DataGrid Grid.Row="1" x:Name="GridActionLog" Margin="8" ItemsSource="{Binding}" AutoGenerateColumns="False">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="Timestamp" Binding="{Binding Timestamp}" Width="160"/>
+                            <DataGridTextColumn Header="Level" Binding="{Binding Level}" Width="80"/>
+                            <DataGridTextColumn Header="Message" Binding="{Binding Message}" Width="*"/>
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </Grid>
+            </TabItem>
+
+        </TabControl>
+
+        <!-- STATUS BAR -->
+        <Border Grid.Row="2" Background="{StaticResource BgPanel}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0">
+            <Grid Margin="12,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+
+                <TextBlock Grid.Column="0" x:Name="TxtStatusLeft" Text="Ready" VerticalAlignment="Center" 
+                           Foreground="{StaticResource Success}" FontSize="12"/>
+                
+                <TextBlock Grid.Column="2" x:Name="TxtStatusRight" VerticalAlignment="Center" 
+                           Foreground="{StaticResource TextSecond}" FontSize="11"/>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>
+'@
+#endregion
+
+#region Action Log Functions
+function Write-ActionLog {
+    param(
+        [string]$Message,
+        [ValidateSet('INFO', 'SUCCESS', 'WARNING', 'ERROR')]
+        [string]$Level = 'INFO'
+    )
+    
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $entry = [pscustomobject]@{
+        Timestamp = $timestamp
+        Level = $Level
+        Message = $Message
+    }
+    
+    $color = switch ($Level) {
+        'SUCCESS' { 'Green' }
+        'WARNING' { 'Yellow' }
+        'ERROR' { 'Red' }
+        default { 'Gray' }
+    }
+    
+    Write-Host "[$timestamp] $Level : $Message" -ForegroundColor $color
+    
+    if ($null -ne $script:Window) {
+        try {
+            if ($script:Window.Dispatcher.CheckAccess()) {
+                $script:ActionLogEntries.Add($entry)
+            } else {
+                $script:Window.Dispatcher.Invoke([action]{
+                    $script:ActionLogEntries.Add($entry)
+                })
+            }
+        } catch {
+            # Silently fail if window is not ready
+        }
+    }
+}
+
+function Update-StatusBar {
+    param([string]$Message, [string]$Color = 'Success')
+    
+    if ($null -eq $script:Window) { return }
+    
+    try {
+        $updateAction = {
+            $statusText = $script:Window.FindName('TxtStatusLeft')
+            if ($null -eq $statusText) { return }
+            
+            $statusText.Text = $Message
+            
+            $brush = switch ($Color) {
+                'Success' { $script:Window.Resources['Success'] }
+                'Warning' { $script:Window.Resources['Warning'] }
+                'Error' { $script:Window.Resources['Danger'] }
+                default { $script:Window.Resources['Accent'] }
+            }
+            
+            $statusText.Foreground = $brush
+        }
+        
+        if ($script:Window.Dispatcher.CheckAccess()) {
+            & $updateAction
+        } else {
+            $script:Window.Dispatcher.Invoke([action]$updateAction)
+        }
+    } catch {
+        # Silently fail if window is not ready
+    }
+}
+#endregion
+
+#region Core GPO Functions
+function Load-AvailableDomains {
+    try {
+        Write-ActionLog "Loading available domains..." "INFO"
+        
+        $comboDomain = $script:Window.FindName('ComboDomain')
+        $comboDomain.Items.Clear()
+        
+        try {
+            $forest = [System.DirectoryServices.ActiveDirectory.Forest]::GetCurrentForest()
+            $domains = $forest.Domains | Select-Object -ExpandProperty Name | Sort-Object
+            
+            foreach ($domain in $domains) {
+                $comboDomain.Items.Add($domain) | Out-Null
+            }
+            
+            if ($script:CurrentDomain -and $domains -contains $script:CurrentDomain) {
+                $comboDomain.SelectedItem = $script:CurrentDomain
+            } elseif ($comboDomain.Items.Count -gt 0) {
+                $comboDomain.SelectedIndex = 0
+            }
+            
+            Write-ActionLog "Loaded $($comboDomain.Items.Count) domain(s)" "SUCCESS"
+        }
+        catch {
+            $comboDomain.Items.Add($script:CurrentDomain) | Out-Null
+            $comboDomain.SelectedIndex = 0
+            Write-ActionLog "Using current domain only: $script:CurrentDomain" "WARNING"
+        }
+    }
+    catch {
+        Write-ActionLog "Failed to load domains: $($_.Exception.Message)" "ERROR"
+        [System.Windows.MessageBox]::Show("Failed to load domains: $($_.Exception.Message)", 
+            "Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+    }
+}
+
+function Load-AvailableGpos {
+    param([string]$DomainName)
+    
+    try {
+        Write-ActionLog "Loading GPOs from domain: $DomainName" "INFO"
+        Update-StatusBar "Loading GPOs..." "Warning"
+        
+        $comboGpo = $script:Window.FindName('ComboGpo')
+        $comboGpo.Items.Clear()
+        
+        $gpos = Get-GPO -All -Domain $DomainName -ErrorAction Stop | 
+                Where-Object { Test-GpoHasDriveMappings -GpoId $_.Id -Domain $DomainName } |
+                Sort-Object DisplayName
+        
+        foreach ($gpo in $gpos) {
+            $item = [pscustomobject]@{
+                DisplayName = $gpo.DisplayName
+                Id = $gpo.Id
+                Domain = $DomainName
+            }
+            $comboGpo.Items.Add($item) | Out-Null
+        }
+        
+        $comboGpo.DisplayMemberPath = 'DisplayName'
+        $comboGpo.IsEnabled = $comboGpo.Items.Count -gt 0
+        
+        if ($comboGpo.Items.Count -eq 0) {
+            Write-ActionLog "No GPOs with drive mappings found in domain $DomainName" "WARNING"
+            Update-StatusBar "No GPOs with drive mappings found" "Warning"
+        } else {
+            Write-ActionLog "Loaded $($comboGpo.Items.Count) GPO(s) with drive mappings" "SUCCESS"
+            Update-StatusBar "Ready - $($comboGpo.Items.Count) GPO(s) available" "Success"
+        }
+    }
+    catch {
+        Write-ActionLog "Failed to load GPOs: $($_.Exception.Message)" "ERROR"
+        Update-StatusBar "Failed to load GPOs" "Error"
+        [System.Windows.MessageBox]::Show("Failed to load GPOs from domain $DomainName`n`n$($_.Exception.Message)", 
+            "Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+    }
+}
+
+function Test-GpoHasDriveMappings {
+    param([guid]$GpoId, [string]$Domain)
+    
+    $guid = $GpoId.ToString('B')
+    $path = "\\$Domain\SysVol\$Domain\Policies\$guid\User\Preferences\Drives\Drives.xml"
+    
+    return Test-Path $path
+}
+
+function Load-GpoDriveMappings {
+    param([object]$GpoItem)
+    
+    try {
+        Write-ActionLog "Loading drive mappings from GPO: $($GpoItem.DisplayName)" "INFO"
+        Update-StatusBar "Loading GPO mappings..." "Warning"
+        
+        $guid = $GpoItem.Id.ToString('B')
+        $domain = $GpoItem.Domain
+        $xmlPath = "\\$domain\SysVol\$domain\Policies\$guid\User\Preferences\Drives\Drives.xml"
+        
+        if (-not (Test-Path $xmlPath)) {
+            throw "Drives.xml not found at: $xmlPath"
+        }
+        
+        [xml]$drivesXml = Get-Content -Path $xmlPath -Raw -ErrorAction Stop
+        $driveNodes = $drivesXml.SelectNodes('//Drive')
+        
+        $script:LoadedGpo = @{
+            DisplayName = $GpoItem.DisplayName
+            Id = $GpoItem.Id
+            Domain = $domain
+            XmlPath = $xmlPath
+            Xml = $drivesXml
+        }
+        
+        $script:MappingsData.Clear()
+        
+        foreach ($driveNode in $driveNodes) {
+            $props = $driveNode.SelectSingleNode('Properties')
+            if (-not $props) { continue }
+            
+            $filtersNode = $driveNode.SelectSingleNode('Filters')
+            $hasFilters = ($null -ne $filtersNode -and $filtersNode.ChildNodes.Count -gt 0)
+            
+            $filterSummary = if ($hasFilters) {
+                Get-FilterSummary -FiltersNode $filtersNode
+            } else {
+                "No filters (applies to all)"
+            }
+            
+            $isDisabled = $driveNode.GetAttribute('disabled') -eq '1'
+            $state = if ($isDisabled) { "Disabled" } else { "Enabled" }
+            
+            $mapping = [pscustomobject]@{
+                DriveLetter = $props.letter
+                Path = $props.path
+                Label = $props.label
+                Action = $props.action
+                State = $state
+                HasFilters = if ($hasFilters) { "Yes" } else { "No" }
+                FilterSummary = $filterSummary
+                XmlNode = $driveNode
+            }
+            
+            $script:MappingsData.Add($mapping)
+        }
+        
+        Update-GpoInfoDisplay
+        
+        $gridMappings = $script:Window.FindName('GridMappings')
+        $gridMappings.ItemsSource = $script:MappingsData
+        
+        $gridFilterInspector = $script:Window.FindName('GridFilterInspectorDrives')
+        $gridFilterInspector.ItemsSource = $script:MappingsData
+        
+        Load-ComparisonGpoList
+        
+        Write-ActionLog "Loaded $($script:MappingsData.Count) drive mapping(s) from GPO: $($GpoItem.DisplayName)" "SUCCESS"
+        Update-StatusBar "GPO loaded - $($script:MappingsData.Count) mapping(s) found" "Success"
+    }
+    catch {
+        Write-ActionLog "Failed to load GPO: $($_.Exception.Message)" "ERROR"
+        Update-StatusBar "Failed to load GPO" "Error"
+        [System.Windows.MessageBox]::Show("Failed to load GPO drive mappings:`n`n$($_.Exception.Message)", 
+            "Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+    }
+}
+
+function Get-FilterSummary {
+    param([System.Xml.XmlElement]$FiltersNode)
+    
+    $filters = @()
+    
+    foreach ($child in $FiltersNode.ChildNodes) {
+        if ($child -isnot [System.Xml.XmlElement]) { continue }
+        
+        $type = $child.LocalName -replace '^Filter', ''
+        $name = $child.GetAttribute('name')
+        
+        if ($name) {
+            $filters += "$type`: $name"
+        } else {
+            $filters += $type
+        }
+    }
+    
+    if ($filters.Count -eq 0) { return "Empty filter block" }
+    return ($filters -join '; ')
+}
+
+function Update-GpoInfoDisplay {
+    $txtGpoInfo = $script:Window.FindName('TxtGpoInfo')
+    
+    if ($null -eq $script:LoadedGpo) {
+        $txtGpoInfo.Text = "No GPO loaded."
+        return
+    }
+    
+    $info = "GPO: $($script:LoadedGpo.DisplayName)`n" +
+            "Domain: $($script:LoadedGpo.Domain)`n" +
+            "GUID: $($script:LoadedGpo.Id)`n" +
+            "XML Path: $($script:LoadedGpo.XmlPath)"
+    
+    $txtGpoInfo.Text = $info
+}
+
+function Load-ComparisonGpoList {
+    if ($null -eq $script:LoadedGpo) { return }
+    
+    $comboCompare = $script:Window.FindName('ComboCompareGpo')
+    $comboCompare.Items.Clear()
+    
+    try {
+        $gpos = Get-GPO -All -Domain $script:LoadedGpo.Domain -ErrorAction Stop | 
+                Where-Object { $_.Id -ne $script:LoadedGpo.Id -and (Test-GpoHasDriveMappings -GpoId $_.Id -Domain $script:LoadedGpo.Domain) } |
+                Sort-Object DisplayName
+        
+        foreach ($gpo in $gpos) {
+            $item = [pscustomobject]@{
+                DisplayName = $gpo.DisplayName
+                Id = $gpo.Id
+                Domain = $script:LoadedGpo.Domain
+            }
+            $comboCompare.Items.Add($item) | Out-Null
+        }
+        
+        $comboCompare.DisplayMemberPath = 'DisplayName'
+    }
+    catch {
+        Write-ActionLog "Failed to load comparison GPO list: $($_.Exception.Message)" "WARNING"
+    }
+}
+#endregion
+
+#region Validation Engine (Integrated - Self-Contained)
+
+# Test Subject Class
+class TestSubject {
+    [string]$Label
+    [string]$SamAccountName
+    [string]$DistinguishedName
+    [string[]]$MemberOfGroupDNs
+    [string]$ComputerName
+    [string[]]$ComputerMemberOfGroupDNs
+    [string]$Site
+    [bool]$IsSimulated
+}
+
+# Helper function: Test if DN is under OU
+function Test-DnUnderOu {
+    param([string]$Dn, [string]$OuDn, [bool]$IncludeSubOus)
+
+    if (-not $Dn -or -not $OuDn) { return $false }
+    if ($Dn -eq $OuDn) { return $true }
+
+    if ($IncludeSubOus) {
+        return $Dn.ToLower().EndsWith(",$($OuDn.ToLower())")
+    }
+    else {
+        $firstComma = $Dn.IndexOf(',')
+        if ($firstComma -lt 0) { return $false }
+        $parentOfDn = $Dn.Substring($firstComma + 1)
+        return $parentOfDn.ToLower() -eq $OuDn.ToLower()
+    }
+}
+
+# Helper function: Test group membership
+function Test-GroupMembership {
+    param([string[]]$MemberOfDns, [string]$GroupIdentity)
+
+    if (-not $MemberOfDns -or -not $GroupIdentity) { return $false }
+    
+    foreach ($dn in $MemberOfDns) {
+        if ($dn -ieq $GroupIdentity) { return $true }
+        
+        if ($dn -match '^CN=([^,]+)' -and $GroupIdentity -match '^CN=([^,]+)') {
+            $dnCN = $matches[1]
+            $groupCN = if ($GroupIdentity -match '^CN=([^,]+)') { $matches[1] } else { $GroupIdentity }
+            if ($dnCN -ieq $groupCN) { return $true }
+        }
+        
+        if ($GroupIdentity -match '\\') {
+            $groupNameOnly = ($GroupIdentity -split '\\')[-1]
+            if ($dn -match "^CN=$([regex]::Escape($groupNameOnly)),") { return $true }
+        }
+    }
+    
+    return $false
+}
+
+# Resolve live AD user
+function Resolve-LiveAdUser {
+    param([string]$SamAccountName, [hashtable]$ComputerOverride, [ref]$Warnings)
+
+    try {
+        $u = Get-ADUser -Identity $SamAccountName -Properties MemberOf, DistinguishedName, primaryGroupID -ErrorAction Stop
+        $groupDns = @($u.MemberOf)
+
+        # Include primary group
+        try {
+            $primaryGroupID = $u.primaryGroupID
+            $domainObj = Get-ADDomain -Server $script:LoadedGpo.Domain -ErrorAction Stop
+            $domainSid = $domainObj.DomainSID.Value
+            $primaryGroupSid = "$domainSid-$primaryGroupID"
+            $primaryGroup = Get-ADGroup -Identity $primaryGroupSid -ErrorAction SilentlyContinue
+            if ($primaryGroup) { 
+                $groupDns += $primaryGroup.DistinguishedName 
+            }
+        } 
+        catch { }
+
+        $subj = [TestSubject]::new()
+        $subj.Label = $SamAccountName
+        $subj.SamAccountName = $SamAccountName
+        $subj.DistinguishedName = $u.DistinguishedName
+        $subj.MemberOfGroupDNs = $groupDns
+        $subj.IsSimulated = $false
+
+        if ($ComputerOverride.ContainsKey($SamAccountName)) {
+            $compName = $ComputerOverride[$SamAccountName]
+            $subj.ComputerName = $compName
+            try {
+                $comp = Get-ADComputer -Identity $compName -Properties MemberOf -ErrorAction Stop
+                $subj.ComputerMemberOfGroupDNs = @($comp.MemberOf)
+            } 
+            catch {
+                $Warnings.Value.Add("Could not resolve computer '$compName' for user '$SamAccountName'")
+            }
+        }
+
+        return $subj
+    }
+    catch {
+        throw "Failed to resolve AD user '$SamAccountName': $($_.Exception.Message)"
+    }
+}
+
+# Filter node evaluator
+function Invoke-FilterNode {
+    param(
+        [System.Xml.XmlElement]$Node,
+        [TestSubject]$Subject,
+        [System.Collections.Generic.List[string]]$Trace,
+        [ref]$Warnings,
+        [int]$Depth = 0
+    )
+
+    $indent = ('  ' * $Depth)
+    $isNot = ($Node.GetAttribute('not') -eq '1')
+    $raw = $null
+
+    switch ($Node.LocalName) {
+
+        'FilterCollection' {
+            $raw = Invoke-FilterTree -Node $Node -Subject $Subject -Trace $Trace -Warnings $Warnings -Depth ($Depth + 1)
+        }
+
+        'FilterGroup' {
+            $groupName = $Node.GetAttribute('name')
+            $userMatch = Test-GroupMembership -MemberOfDns $Subject.MemberOfGroupDNs -GroupIdentity $groupName
+            $compMatch = Test-GroupMembership -MemberOfDns $Subject.ComputerMemberOfGroupDNs -GroupIdentity $groupName
+            $raw = $userMatch -or $compMatch
+            $Trace.Add("$indent FilterGroup '$groupName' -> user:$userMatch computer:$compMatch")
+        }
+
+        'FilterUser' {
+            $target = $Node.GetAttribute('name')
+            $raw = ($Subject.SamAccountName -and $target -match [regex]::Escape($Subject.SamAccountName)) `
+                   -or ($Subject.DistinguishedName -ieq $target)
+            $Trace.Add("$indent FilterUser '$target' -> $raw")
+        }
+
+        'FilterComputer' {
+            $target = $Node.GetAttribute('name')
+            if (-not $Subject.ComputerName) {
+                $raw = $false
+                $Warnings.Value.Add("FilterComputer '$target': no ComputerName for '$($Subject.Label)'")
+            } else {
+                $raw = ($Subject.ComputerName -ieq $target) -or ($target -match [regex]::Escape($Subject.ComputerName))
+            }
+            $Trace.Add("$indent FilterComputer '$target' -> $raw")
+        }
+
+        'FilterOrgUnit' {
+            $ouDn = $Node.GetAttribute('name')
+            $includeSub = $true
+            $raw = Test-DnUnderOu -Dn $Subject.DistinguishedName -OuDn $ouDn -IncludeSubOus $includeSub
+            $Trace.Add("$indent FilterOrgUnit '$ouDn' -> $raw")
+        }
+
+        'FilterSite' {
+            $siteName = $Node.GetAttribute('name')
+            if (-not $Subject.Site) {
+                $raw = $false
+                $Warnings.Value.Add("FilterSite '$siteName': no Site for '$($Subject.Label)'")
+            } else {
+                $raw = ($Subject.Site -ieq $siteName)
+            }
+            $Trace.Add("$indent FilterSite '$siteName' -> $raw")
+        }
+
+        'FilterLdapQuery' {
+            $filterText = $Node.GetAttribute('filter')
+            if ($Subject.IsSimulated) {
+                $raw = $false
+                $Warnings.Value.Add("FilterLdapQuery: cannot verify for simulated user '$($Subject.Label)'")
+            } else {
+                try {
+                    $match = Get-ADObject -LDAPFilter $filterText -SearchBase $Subject.DistinguishedName -SearchScope Base -ErrorAction Stop
+                    $raw = [bool]$match
+                } catch {
+                    $raw = $false
+                    $Warnings.Value.Add("FilterLdapQuery '$filterText' error: $($_.Exception.Message)")
+                }
+            }
+            $Trace.Add("$indent FilterLdapQuery '$filterText' -> $raw")
+        }
+
+        default {
+            $raw = $false
+            $Warnings.Value.Add("Unsupported filter type '<$($Node.LocalName)>'")
+            $Trace.Add("$indent [UNSUPPORTED] <$($Node.LocalName)> -> FALSE")
+        }
+    }
+
+    $final = if ($isNot) { -not $raw } else { $raw }
+    if ($isNot) { $Trace.Add("$indent  (NOT applied -> $final)") }
+    return $final
+}
+
+# Filter tree evaluator
+function Invoke-FilterTree {
+    param(
+        [System.Xml.XmlElement]$Node,
+        [TestSubject]$Subject,
+        [System.Collections.Generic.List[string]]$Trace,
+        [ref]$Warnings,
+        [int]$Depth = 0
+    )
+
+    $children = @($Node.ChildNodes | Where-Object { $_ -is [System.Xml.XmlElement] })
+    if ($children.Count -eq 0) { return $true }
+
+    $result = $null
+    foreach ($child in $children) {
+        $value = Invoke-FilterNode -Node $child -Subject $Subject -Trace $Trace -Warnings $Warnings -Depth $Depth
+        $boolOp = $child.GetAttribute('bool')
+
+        if ($null -eq $result) {
+            $result = $value
+        }
+        elseif ($boolOp -ieq 'OR') {
+            $result = $result -or $value
+        }
+        else {
+            $result = $result -and $value
+        }
+    }
+    return [bool]$result
+}
+
+# Main validation function
+function Invoke-UserValidation {
+    param(
+        [string]$Mode,
+        [string]$Input
+    )
+    
+    if ($null -eq $script:LoadedGpo) {
+        [System.Windows.MessageBox]::Show("No GPO loaded. Please load a GPO first.", 
+            "Validation Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+        return
+    }
+    
+    # Trim input
+    $Input = $Input.Trim()
+    
+    if ([string]::IsNullOrWhiteSpace($Input)) {
+        [System.Windows.MessageBox]::Show("Please enter validation input.`n`nFor 'Single User' mode: Enter sAMAccountName (e.g., jdoe)`nFor 'All Users in OU' mode: Enter full OU DN`nFor 'User List' mode: Enter comma-separated user names", 
+            "Validation Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+        return
+    }
+    
+    try {
+        Write-ActionLog "Starting user validation (Mode: $Mode, Input: $Input)" "INFO"
+        Update-StatusBar "Running validation..." "Warning"
+        
+        $warnings = New-Object System.Collections.Generic.List[string]
+        $subjects = New-Object System.Collections.Generic.List[TestSubject]
+        $computerOverride = @{}
+        
+        # Build subject list based on mode
+        switch -Regex ($Mode) {
+            'Single User' {
+                $subjects.Add((Resolve-LiveAdUser -SamAccountName $Input.Trim() -ComputerOverride $computerOverride -Warnings ([ref]$warnings)))
+            }
+            'All Users in OU' {
+                $ouUsers = Get-ADUser -SearchBase $Input.Trim() -Filter * -Properties MemberOf, DistinguishedName, primaryGroupID -ErrorAction Stop
+                foreach ($u in $ouUsers) {
+                    $groupDns = @($u.MemberOf)
+                    
+                    try {
+                        $primaryGroupID = $u.primaryGroupID
+                        $domainObj = Get-ADDomain -Server $script:LoadedGpo.Domain -ErrorAction Stop
+                        $domainSid = $domainObj.DomainSID.Value
+                        $primaryGroupSid = "$domainSid-$primaryGroupID"
+                        $primaryGroup = Get-ADGroup -Identity $primaryGroupSid -ErrorAction SilentlyContinue
+                        if ($primaryGroup) { 
+                            $groupDns += $primaryGroup.DistinguishedName 
+                        }
+                    } catch { }
+                    
+                    $subj = [TestSubject]::new()
+                    $subj.Label = $u.SamAccountName
+                    $subj.SamAccountName = $u.SamAccountName
+                    $subj.DistinguishedName = $u.DistinguishedName
+                    $subj.MemberOfGroupDNs = $groupDns
+                    $subj.IsSimulated = $false
+                    $subjects.Add($subj)
+                }
+            }
+            'User List' {
+                $users = $Input -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+                foreach ($userName in $users) {
+                    try {
+                        $subjects.Add((Resolve-LiveAdUser -SamAccountName $userName -ComputerOverride $computerOverride -Warnings ([ref]$warnings)))
+                    } catch {
+                        $warnings.Add("Failed to resolve user '$userName': $($_.Exception.Message)")
+                    }
+                }
+            }
+        }
+        
+        if ($subjects.Count -eq 0) {
+            throw "No valid users found to validate"
+        }
+        
+        # Evaluate each drive against each subject
+        $results = New-Object System.Collections.Generic.List[object]
+        $driveNodes = $script:LoadedGpo.Xml.SelectNodes('//Drive')
+        
+        foreach ($driveNode in $driveNodes) {
+            $props = $driveNode.SelectSingleNode('Properties')
+            if (-not $props) { continue }
+            
+            $letter = $props.letter
+            $path = $props.path
+            $label = $props.label
+            $action = $props.action
+            
+            $isDisabled = $driveNode.GetAttribute('disabled') -eq '1'
+            $filtersNode = $driveNode.SelectSingleNode('Filters')
+            
+            foreach ($subject in $subjects) {
+                $trace = New-Object System.Collections.Generic.List[string]
+                $trace.Add("Drive $letter ($path) evaluated for '$($subject.Label)':")
+
+                if ($isDisabled) {
+                    $applies = $false
+                    $trace.Add("  Mapping is DISABLED in GPO")
+                }
+                elseif ($null -eq $filtersNode -or $filtersNode.ChildNodes.Count -eq 0) {
+                    $applies = $true
+                    $trace.Add("  No filters -> applies to ALL users")
+                }
+                else {
+                    $applies = Invoke-FilterTree -Node $filtersNode -Subject $subject -Trace $trace -Warnings ([ref]$warnings) -Depth 1
+                }
+
+                $results.Add([pscustomobject]@{
+                    Subject      = $subject.Label
+                    DriveLetter  = $letter
+                    Path         = $path
+                    Label        = $label
+                    Action       = $action
+                    Applies      = $applies
+                    IsDisabled   = $isDisabled
+                    Trace        = ($trace -join "`n")
+                })
+            }
+        }
+        
+        $script:ValidationResults = $results
+        $script:ConflictData = @()
+        
+        # Update Results Summary grid
+        $gridResults = $script:Window.FindName('GridValidationResults')
+        $gridResults.ItemsSource = $script:ValidationResults
+        
+        # Update Filter Trace
+        $txtTrace = $script:Window.FindName('TxtFilterTrace')
+        $traceText = ($script:ValidationResults | ForEach-Object { $_.Trace }) -join "`n`n========================================`n`n"
+        $txtTrace.Text = $traceText
+        
+        # Detect conflicts
+        $conflicts = $results | Where-Object { $_.Applies -and -not $_.IsDisabled } | 
+            Group-Object Subject, DriveLetter | Where-Object { $_.Count -gt 1 }
+            
+        if ($conflicts.Count -gt 0) {
+            foreach ($conflict in $conflicts) {
+                $parts = $conflict.Name -split ', '
+                $user = $parts[0]
+                $letter = $parts[1]
+                $paths = ($conflict.Group | ForEach-Object { $_.Path }) -join ' | '
+                
+                $script:ConflictData += [pscustomobject]@{
+                    User = $user
+                    DriveLetter = $letter
+                    Paths = $paths
+                }
+            }
+            
+            $txtConflictSummary = $script:Window.FindName('TxtConflictSummary')
+            $txtConflictSummary.Text = "⚠ $($conflicts.Count) conflict(s) detected!"
+            $txtConflictSummary.Foreground = $script:Window.Resources['Danger']
+            
+            Write-ActionLog "Validation complete - $($conflicts.Count) conflict(s) detected" "WARNING"
+        } else {
+            $txtConflictSummary = $script:Window.FindName('TxtConflictSummary')
+            $txtConflictSummary.Text = "✓ No conflicts detected."
+            $txtConflictSummary.Foreground = $script:Window.Resources['Success']
+            
+            Write-ActionLog "Validation complete - No conflicts detected" "SUCCESS"
+        }
+        
+        $gridConflicts = $script:Window.FindName('GridConflicts')
+        $gridConflicts.ItemsSource = $script:ConflictData
+        
+        # Display warnings
+        $panelWarnings = $script:Window.FindName('PanelWarnings')
+        $panelWarnings.Children.Clear()
+        
+        if ($warnings.Count -gt 0) {
+            $uniqueWarnings = $warnings | Sort-Object -Unique
+            foreach ($warning in $uniqueWarnings) {
+                $tb = New-Object System.Windows.Controls.TextBlock
+                $tb.Text = "⚠ $warning"
+                $tb.Foreground = $script:Window.Resources['Warning']
+                $tb.TextWrapping = [System.Windows.TextWrapping]::Wrap
+                $tb.Margin = New-Object System.Windows.Thickness(0, 0, 0, 8)
+                $panelWarnings.Children.Add($tb) | Out-Null
+            }
+        } else {
+            $tb = New-Object System.Windows.Controls.TextBlock
+            $tb.Text = "✓ No warnings."
+            $tb.Foreground = $script:Window.Resources['Success']
+            $panelWarnings.Children.Add($tb) | Out-Null
+        }
+        
+        $validationTabs = $script:Window.FindName('ValidationTabs')
+        $validationTabs.SelectedIndex = 0
+        
+        Update-StatusBar "Validation complete - $($script:ValidationResults.Count) result(s)" "Success"
+    }
+    catch {
+        Write-ActionLog "Validation failed: $($_.Exception.Message)" "ERROR"
+        Update-StatusBar "Validation failed" "Error"
+        [System.Windows.MessageBox]::Show("Validation failed:`n`n$($_.Exception.Message)", 
+            "Validation Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+    }
+}
+#endregion
+
+#region GPO Comparison
+function Invoke-GpoComparison {
+    param([object]$CompareGpoItem)
+    
+    if ($null -eq $script:LoadedGpo) {
+        [System.Windows.MessageBox]::Show("No GPO loaded. Please load a GPO first.", 
+            "Comparison Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+        return
+    }
+    
+    if ($null -eq $CompareGpoItem) {
+        [System.Windows.MessageBox]::Show("Please select a GPO to compare with.", 
+            "Comparison Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+        return
+    }
+    
+    try {
+        Write-ActionLog "Comparing GPOs: $($script:LoadedGpo.DisplayName) vs $($CompareGpoItem.DisplayName)" "INFO"
+        Update-StatusBar "Comparing GPOs..." "Warning"
+        
+        $guid = $CompareGpoItem.Id.ToString('B')
+        $domain = $CompareGpoItem.Domain
+        $xmlPath = "\\$domain\SysVol\$domain\Policies\$guid\User\Preferences\Drives\Drives.xml"
+        
+        if (-not (Test-Path $xmlPath)) {
+            throw "Drives.xml not found for comparison GPO at: $xmlPath"
+        }
+        
+        [xml]$compareXml = Get-Content -Path $xmlPath -Raw -ErrorAction Stop
+        $compareNodes = $compareXml.SelectNodes('//Drive')
+        
+        $compareMappings = @{}
+        foreach ($node in $compareNodes) {
+            $props = $node.SelectSingleNode('Properties')
+            if ($props) {
+                $compareMappings[$props.letter] = $props.path
+            }
+        }
+        
+        $comparisonData = New-Object System.Collections.ObjectModel.ObservableCollection[object]
+        
+        $allLetters = @($script:MappingsData.DriveLetter) + @($compareMappings.Keys) | Select-Object -Unique | Sort-Object
+        
+        foreach ($letter in $allLetters) {
+            $currentPath = ($script:MappingsData | Where-Object { $_.DriveLetter -eq $letter }).Path
+            $comparePath = $compareMappings[$letter]
+            
+            $status = if ($currentPath -and $comparePath) {
+                if ($currentPath -eq $comparePath) { "Same" } else { "Different" }
+            } elseif ($currentPath) {
+                "Only in Current"
+            } else {
+                "Only in Compare"
+            }
+            
+            $comparisonData.Add([pscustomobject]@{
+                DriveLetter = $letter
+                CurrentPath = $currentPath
+                ComparePath = $comparePath
+                Status = $status
+            })
+        }
+        
+        $gridComparison = $script:Window.FindName('GridComparison')
+        $gridComparison.ItemsSource = $comparisonData
+        
+        Write-ActionLog "Comparison complete - $($comparisonData.Count) drive letter(s) analyzed" "SUCCESS"
+        Update-StatusBar "Comparison complete" "Success"
+    }
+    catch {
+        Write-ActionLog "Comparison failed: $($_.Exception.Message)" "ERROR"
+        Update-StatusBar "Comparison failed" "Error"
+        [System.Windows.MessageBox]::Show("GPO comparison failed:`n`n$($_.Exception.Message)", 
+            "Comparison Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+    }
+}
+#endregion
+
+#region Add Mapping Simulator
+function Invoke-AddMappingSimulation {
+    param(
+        [string]$DriveLetter,
+        [string]$Path,
+        [string]$Label,
+        [string]$Action,
+        [string]$TargetUsers
+    )
+    
+    if ($null -eq $script:LoadedGpo) {
+        [System.Windows.MessageBox]::Show("No GPO loaded. Please load a GPO first.", 
+            "Simulation Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+        return
+    }
+    
+    if ([string]::IsNullOrWhiteSpace($DriveLetter) -or [string]::IsNullOrWhiteSpace($Path)) {
+        [System.Windows.MessageBox]::Show("Drive Letter and Path are required.", 
+            "Simulation Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+        return
+    }
+    
+    try {
+        Write-ActionLog "Simulating new mapping: $DriveLetter -> $Path" "INFO"
+        Update-StatusBar "Running simulation..." "Warning"
+        
+        $results = New-Object System.Text.StringBuilder
+        $results.AppendLine("=== ADD MAPPING SIMULATION ===") | Out-Null
+        $results.AppendLine("Drive Letter: $DriveLetter") | Out-Null
+        $results.AppendLine("Path: $Path") | Out-Null
+        $results.AppendLine("Label: $Label") | Out-Null
+        $results.AppendLine("Action: $Action") | Out-Null
+        $results.AppendLine("") | Out-Null
+        
+        $existingMapping = $script:MappingsData | Where-Object { $_.DriveLetter -eq $DriveLetter }
+        
+        if ($existingMapping) {
+            $results.AppendLine("⚠ WARNING: Drive letter $DriveLetter already exists in this GPO:") | Out-Null
+            $results.AppendLine("   Current Path: $($existingMapping.Path)") | Out-Null
+            $results.AppendLine("   Current Label: $($existingMapping.Label)") | Out-Null
+            $results.AppendLine("   Current State: $($existingMapping.State)") | Out-Null
+            $results.AppendLine("") | Out-Null
+        }
+        
+        if (-not [string]::IsNullOrWhiteSpace($TargetUsers)) {
+            $results.AppendLine("=== CONFLICT TESTING ===") | Out-Null
+            
+            $users = $TargetUsers -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+            $results.AppendLine("Testing against users: $($users -join ', ')") | Out-Null
+            $results.AppendLine("") | Out-Null
+            
+            # Use integrated validation engine
+            try {
+                $warnings = New-Object System.Collections.Generic.List[string]
+                $subjects = New-Object System.Collections.Generic.List[TestSubject]
+                $computerOverride = @{}
+                
+                foreach ($userName in $users) {
+                    try {
+                        $subjects.Add((Resolve-LiveAdUser -SamAccountName $userName -ComputerOverride $computerOverride -Warnings ([ref]$warnings)))
+                    } catch {
+                        $results.AppendLine("⚠ Failed to resolve user '$userName': $($_.Exception.Message)") | Out-Null
+                    }
+                }
+                
+                if ($subjects.Count -gt 0) {
+                    # Evaluate existing mappings for conflict detection
+                    $driveNodes = $script:LoadedGpo.Xml.SelectNodes('//Drive')
+                    $conflictsDetected = $false
+                    
+                    foreach ($driveNode in $driveNodes) {
+                        $props = $driveNode.SelectSingleNode('Properties')
+                        if (-not $props) { continue }
+                        
+                        $letter = $props.letter
+                        if ($letter -ne $DriveLetter) { continue }
+                        
+                        $isDisabled = $driveNode.GetAttribute('disabled') -eq '1'
+                        if ($isDisabled) { continue }
+                        
+                        $filtersNode = $driveNode.SelectSingleNode('Filters')
+                        
+                        foreach ($subject in $subjects) {
+                            $trace = New-Object System.Collections.Generic.List[string]
+                            $applies = $false
+                            
+                            if ($null -eq $filtersNode -or $filtersNode.ChildNodes.Count -eq 0) {
+                                $applies = $true
+                            } else {
+                                $applies = Invoke-FilterTree -Node $filtersNode -Subject $subject -Trace $trace -Warnings ([ref]$warnings) -Depth 0
+                            }
+                            
+                            if ($applies) {
+                                if (-not $conflictsDetected) {
+                                    $results.AppendLine("⚠ POTENTIAL CONFLICTS DETECTED:") | Out-Null
+                                    $results.AppendLine("The following users already receive drive $DriveLetter from existing mappings:") | Out-Null
+                                    $conflictsDetected = $true
+                                }
+                                $results.AppendLine("   - $($subject.Label): $($props.path)") | Out-Null
+                            }
+                        }
+                    }
+                    
+                    if (-not $conflictsDetected) {
+                        $results.AppendLine("✓ No conflicts detected for the specified users.") | Out-Null
+                        $results.AppendLine("The new mapping can be safely added.") | Out-Null
+                    } else {
+                        $results.AppendLine("") | Out-Null
+                        $results.AppendLine("Adding this new mapping will create a drive letter conflict!") | Out-Null
+                    }
+                } else {
+                    $results.AppendLine("⚠ No valid users found for testing.") | Out-Null
+                }
+            } catch {
+                $results.AppendLine("⚠ Conflict testing failed: $($_.Exception.Message)") | Out-Null
+            }
+        } else {
+            $results.AppendLine("ℹ No target users specified - skipping conflict testing.") | Out-Null
+            $results.AppendLine("Enter user names to test for conflicts.") | Out-Null
+        }
+        
+        $txtResults = $script:Window.FindName('TxtSimulationResults')
+        $txtResults.Text = $results.ToString()
+        
+        Write-ActionLog "Simulation complete" "SUCCESS"
+        Update-StatusBar "Simulation complete" "Success"
+    }
+    catch {
+        Write-ActionLog "Simulation failed: $($_.Exception.Message)" "ERROR"
+        Update-StatusBar "Simulation failed" "Error"
+        [System.Windows.MessageBox]::Show("Simulation failed:`n`n$($_.Exception.Message)", 
+            "Simulation Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+    }
+}
+#endregion
+
+#region Event Handlers
+#region Event Handlers
+function Format-FilterTreeForDisplay {
+    param(
+        [System.Xml.XmlElement]$Node,
+        [System.Text.StringBuilder]$StringBuilder,
+        [int]$Depth
+    )
+    
+    $indent = '  ' * $Depth
+    
+    foreach ($child in $Node.ChildNodes) {
+        if ($child -isnot [System.Xml.XmlElement]) { continue }
+        
+        $type = $child.LocalName -replace '^Filter', ''
+        $name = $child.GetAttribute('name')
+        $bool = $child.GetAttribute('bool')
+        $not = $child.GetAttribute('not')
+        
+        $line = "$indent[$type]"
+        if ($name) { $line += " '$name'" }
+        if ($bool) { $line += " (bool=$bool)" }
+        if ($not -eq '1') { $line += " [NOT]" }
+        
+        $StringBuilder.AppendLine($line) | Out-Null
+        
+        if ($child.LocalName -eq 'FilterCollection') {
+            Format-FilterTreeForDisplay -Node $child -StringBuilder $StringBuilder -Depth ($Depth + 1)
+        }
+    }
+}
+
+function Initialize-EventHandlers {
+    $comboDomain = $script:Window.FindName('ComboDomain')
+    $comboDomain.add_SelectionChanged({
+        if ($comboDomain.SelectedItem) {
+            $script:CurrentDomain = $comboDomain.SelectedItem
+            Load-AvailableGpos -DomainName $script:CurrentDomain
+        }
+    })
+    
+    $btnLoadGpo = $script:Window.FindName('BtnLoadGpo')
+    $btnLoadGpo.add_Click({
+        $comboGpo = $script:Window.FindName('ComboGpo')
+        if ($comboGpo.SelectedItem) {
+            Load-GpoDriveMappings -GpoItem $comboGpo.SelectedItem
+        } else {
+            [System.Windows.MessageBox]::Show("Please select a GPO to load.", 
+                "No Selection", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+        }
+    })
+    
+    $btnRefresh = $script:Window.FindName('BtnRefresh')
+    $btnRefresh.add_Click({
+        Load-AvailableDomains
+        if ($script:CurrentDomain) {
+            Load-AvailableGpos -DomainName $script:CurrentDomain
+        }
+    })
+    
+    # Add double-click handler for Drive Mappings grid - using PreviewMouseDoubleClick for more reliable row detection
+    $gridMappings = $script:Window.FindName('GridMappings')
+    if ($null -ne $gridMappings) {
+        $gridMappings.add_PreviewMouseDoubleClick({
+            param($sender, $e)
+            try {
+                # Get the clicked element
+                $clickedElement = $e.OriginalSource
+                
+                # Walk up the visual tree to find if we clicked on a DataGridRow
+                $row = $null
+                $current = $clickedElement
+                while ($null -ne $current -and $null -eq $row) {
+                    if ($current -is [System.Windows.Controls.DataGridRow]) {
+                        $row = $current
+                        break
+                    }
+                    if ($current -is [System.Windows.FrameworkElement]) {
+                        $current = [System.Windows.Media.VisualTreeHelper]::GetParent($current)
+                    } else {
+                        break
+                    }
+                }
+                
+                # If we didn't find a row or no item is selected, return
+                if ($null -eq $row -or $null -eq $gridMappings.SelectedItem) {
+                    return
+                }
+                
+                $selectedMapping = $gridMappings.SelectedItem
+                
+                Write-ActionLog "Double-clicked on mapping: $($selectedMapping.DriveLetter) -> $($selectedMapping.Path)" "INFO"
+                
+                # Build detailed information
+                $details = New-Object System.Text.StringBuilder
+                $details.AppendLine("=== DRIVE MAPPING DETAILS ===") | Out-Null
+                $details.AppendLine("") | Out-Null
+                $details.AppendLine("Drive Letter: $($selectedMapping.DriveLetter)") | Out-Null
+                $details.AppendLine("Path: $($selectedMapping.Path)") | Out-Null
+                $details.AppendLine("Label: $($selectedMapping.Label)") | Out-Null
+                $details.AppendLine("Action: $($selectedMapping.Action)") | Out-Null
+                $details.AppendLine("State: $($selectedMapping.State)") | Out-Null
+                $details.AppendLine("") | Out-Null
+                $details.AppendLine("=== ITEM-LEVEL TARGETING ===") | Out-Null
+                $details.AppendLine("") | Out-Null
+                
+                if ($selectedMapping.HasFilters -eq "Yes") {
+                    $details.AppendLine("Has Filters: Yes") | Out-Null
+                    $details.AppendLine("") | Out-Null
+                    $details.AppendLine("Filter Summary:") | Out-Null
+                    $details.AppendLine($selectedMapping.FilterSummary) | Out-Null
+                    $details.AppendLine("") | Out-Null
+                    $details.AppendLine("=== DETAILED FILTER TREE ===") | Out-Null
+                    $details.AppendLine("") | Out-Null
+                    
+                    # Get XML node for detailed filter tree
+                    if ($null -ne $selectedMapping.XmlNode) {
+                        $filtersNode = $selectedMapping.XmlNode.SelectSingleNode('Filters')
+                        if ($null -ne $filtersNode) {
+                            Format-FilterTreeForDisplay -Node $filtersNode -StringBuilder $details -Depth 0
+                        }
+                    }
+                } else {
+                    $details.AppendLine("Has Filters: No") | Out-Null
+                    $details.AppendLine("This mapping applies to ALL users (no targeting restrictions)") | Out-Null
+                }
+                
+                $details.AppendLine("") | Out-Null
+                $details.AppendLine("=== GPO INFORMATION ===") | Out-Null
+                $details.AppendLine("") | Out-Null
+                $details.AppendLine("GPO: $($script:LoadedGpo.DisplayName)") | Out-Null
+                $details.AppendLine("Domain: $($script:LoadedGpo.Domain)") | Out-Null
+                $details.AppendLine("XML Path: $($script:LoadedGpo.XmlPath)") | Out-Null
+                
+                # Show in a scrollable window
+                $detailWindow = New-Object System.Windows.Window
+                $detailWindow.Title = "Drive Mapping Details - $($selectedMapping.DriveLetter)"
+                $detailWindow.Width = 800
+                $detailWindow.Height = 600
+                $detailWindow.WindowStartupLocation = 'CenterOwner'
+                $detailWindow.Owner = $script:Window
+                $detailWindow.Background = $script:Window.Resources['BgDeep']
+                
+                $scrollViewer = New-Object System.Windows.Controls.ScrollViewer
+                $scrollViewer.VerticalScrollBarVisibility = 'Auto'
+                $scrollViewer.Margin = New-Object System.Windows.Thickness(10)
+                
+                $textBox = New-Object System.Windows.Controls.TextBox
+                $textBox.Text = $details.ToString()
+                $textBox.IsReadOnly = $true
+                $textBox.TextWrapping = [System.Windows.TextWrapping]::Wrap
+                $textBox.FontFamily = New-Object System.Windows.Media.FontFamily("Consolas")
+                $textBox.FontSize = 12
+                $textBox.Background = $script:Window.Resources['BgCard']
+                $textBox.Foreground = $script:Window.Resources['TextPrimary']
+                $textBox.BorderThickness = 0
+                $textBox.Padding = New-Object System.Windows.Thickness(10)
+                
+                $scrollViewer.Content = $textBox
+                $detailWindow.Content = $scrollViewer
+                
+                $detailWindow.ShowDialog() | Out-Null
+                
+            } catch {
+                Write-ActionLog "Drive mapping double-click error: $($_.Exception.Message)" "ERROR"
+            }
+        })
+    }
+    
+    $btnRunValidation = $script:Window.FindName('BtnRunValidation')
+    $txtValidationInput = $script:Window.FindName('TxtValidationInput')
+    
+    $btnRunValidation.add_Click({
+        try {
+            $comboMode = $script:Window.FindName('ComboValidationMode')
+            
+            if ($null -eq $comboMode) {
+                [System.Windows.MessageBox]::Show("Could not find validation mode control.", 
+                    "Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+                return
+            }
+            
+            $mode = $comboMode.SelectedItem.Content
+            
+            # Use the script-scoped variable captured from TextChanged event
+            $input = $script:ValidationInputText
+            
+            # Debug logging
+            Write-ActionLog "Validation button clicked - Mode: $mode, Input: '$input', Length: $($input.Length)" "INFO"
+            
+            # Trim and check for empty
+            $input = $input.Trim()
+            
+            if ([string]::IsNullOrWhiteSpace($input)) {
+                [System.Windows.MessageBox]::Show("Please enter validation input in the Input field.`n`nFor 'Single User' mode: Enter sAMAccountName (e.g., jdoe)`nFor 'All Users in OU' mode: Enter full OU DN`nFor 'User List' mode: Enter comma-separated user names", 
+                    "Validation Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+                return
+            }
+            
+            Invoke-UserValidation -Mode $mode -Input $input
+        } catch {
+            Write-ActionLog "Validation button error: $($_.Exception.Message)" "ERROR"
+            [System.Windows.MessageBox]::Show("Error: $($_.Exception.Message)", 
+                "Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+        }
+    })
+    
+    # Add Enter key support for validation input
+    $txtValidationInput = $script:Window.FindName('TxtValidationInput')
+    $btnRunValidation = $script:Window.FindName('BtnRunValidation')
+    if ($null -ne $txtValidationInput -and $null -ne $btnRunValidation) {
+        $txtValidationInput.add_KeyDown({
+            param($sender, $e)
+            try {
+                if ($e.Key -eq [System.Windows.Input.Key]::Enter) {
+                    $btn = $script:Window.FindName('BtnRunValidation')
+                    if ($null -ne $btn) {
+                        $btn.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)))
+                    }
+                }
+            } catch {
+                # Ignore Enter key errors
+            }
+        })
+        
+        # Capture TextBox input into script variable via TextChanged event
+        $txtValidationInput.add_TextChanged({
+            param($sender, $e)
+            try {
+                $script:ValidationInputText = $sender.Text
+            } catch {
+                # Ignore text change errors
+            }
+        })
+    }
+    
+    # Load User button - pre-validate user exists
+    $btnLoadUser = $script:Window.FindName('BtnLoadUser')
+    if ($null -ne $btnLoadUser) {
+        $btnLoadUser.add_Click({
+            try {
+                # Use the script-scoped variable captured from TextChanged event
+                $input = $script:ValidationInputText.Trim()
+                
+                if ([string]::IsNullOrWhiteSpace($input)) {
+                    [System.Windows.MessageBox]::Show("Please enter a username first.", 
+                        "Load User", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+                    return
+                }
+                
+                Write-ActionLog "Loading user: $input" "INFO"
+                
+                try {
+                    $user = Get-ADUser -Identity $input -Properties DisplayName, MemberOf, DistinguishedName -ErrorAction Stop
+                    
+                    $groupCount = if ($user.MemberOf) { $user.MemberOf.Count } else { 0 }
+                    
+                    $message = "User found successfully!`n`n" +
+                               "Display Name: $($user.DisplayName)`n" +
+                               "sAMAccountName: $($user.SamAccountName)`n" +
+                               "Distinguished Name:`n$($user.DistinguishedName)`n`n" +
+                               "Member of $groupCount group(s)"
+                    
+                    [System.Windows.MessageBox]::Show($message, 
+                        "User Loaded", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+                    
+                    Write-ActionLog "User loaded: $($user.SamAccountName) ($($user.DisplayName))" "SUCCESS"
+                } catch {
+                    [System.Windows.MessageBox]::Show("User not found: $input`n`nError: $($_.Exception.Message)", 
+                        "User Not Found", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+                    Write-ActionLog "Failed to load user '$input': $($_.Exception.Message)" "ERROR"
+                }
+            } catch {
+                Write-ActionLog "Load user error: $($_.Exception.Message)" "ERROR"
+                [System.Windows.MessageBox]::Show("Error: $($_.Exception.Message)", 
+                    "Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+            }
+        })
+    }
+    
+    # Mode selection change handler
+    $comboValidationMode = $script:Window.FindName('ComboValidationMode')
+    if ($null -ne $comboValidationMode) {
+        $comboValidationMode.add_SelectionChanged({
+            try {
+                $mode = $comboValidationMode.SelectedItem.Content
+                
+                $lblCsv = $script:Window.FindName('LblCsvFile')
+                $txtCsv = $script:Window.FindName('TxtCsvPath')
+                $btnBrowse = $script:Window.FindName('BtnBrowseCsv')
+                $btnSelect = $script:Window.FindName('BtnSelectCsvColumn')
+                
+                if ($mode -match 'CSV') {
+                    # Show CSV controls
+                    if ($null -ne $lblCsv) { $lblCsv.Visibility = [System.Windows.Visibility]::Visible }
+                    if ($null -ne $txtCsv) { $txtCsv.Visibility = [System.Windows.Visibility]::Visible }
+                    if ($null -ne $btnBrowse) { $btnBrowse.Visibility = [System.Windows.Visibility]::Visible }
+                    if ($null -ne $btnSelect) { $btnSelect.Visibility = [System.Windows.Visibility]::Visible }
+                } else {
+                    # Hide CSV controls
+                    if ($null -ne $lblCsv) { $lblCsv.Visibility = [System.Windows.Visibility]::Collapsed }
+                    if ($null -ne $txtCsv) { $txtCsv.Visibility = [System.Windows.Visibility]::Collapsed }
+                    if ($null -ne $btnBrowse) { $btnBrowse.Visibility = [System.Windows.Visibility]::Collapsed }
+                    if ($null -ne $btnSelect) { $btnSelect.Visibility = [System.Windows.Visibility]::Collapsed }
+                }
+            } catch {
+                # Ignore mode change errors
+            }
+        })
+    }
+    
+    # CSV Browse button
+    $btnBrowseCsv = $script:Window.FindName('BtnBrowseCsv')
+    if ($null -ne $btnBrowseCsv) {
+        $btnBrowseCsv.add_Click({
+            try {
+                $openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
+                $openFileDialog.Filter = "CSV Files (*.csv)|*.csv|All Files (*.*)|*.*"
+                $openFileDialog.Title = "Select CSV File"
+                
+                if ($openFileDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+                    $txtCsvPath = $script:Window.FindName('TxtCsvPath')
+                    $txtCsvPath.Text = $openFileDialog.FileName
+                    
+                    Write-ActionLog "CSV file selected: $($openFileDialog.FileName)" "INFO"
+                    
+                    # Auto-detect headers
+                    try {
+                        $csvData = Import-Csv -Path $openFileDialog.FileName -ErrorAction Stop
+                        $headers = $csvData[0].PSObject.Properties.Name
+                        
+                        $script:CsvData = $csvData
+                        $script:CsvHeaders = $headers
+                        
+                        Write-ActionLog "CSV loaded: $($csvData.Count) rows, $($headers.Count) columns" "SUCCESS"
+                    } catch {
+                        Write-ActionLog "Failed to read CSV: $($_.Exception.Message)" "ERROR"
+                        [System.Windows.MessageBox]::Show("Failed to read CSV file:`n`n$($_.Exception.Message)", 
+                            "CSV Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+                    }
+                }
+            } catch {
+                Write-ActionLog "CSV browse error: $($_.Exception.Message)" "ERROR"
+            }
+        })
+    }
+    
+    # CSV column selector
+    $btnSelectCsvColumn = $script:Window.FindName('BtnSelectCsvColumn')
+    if ($null -ne $btnSelectCsvColumn) {
+        $btnSelectCsvColumn.add_Click({
+            try {
+                if ($null -eq $script:CsvData -or $null -eq $script:CsvHeaders) {
+                    [System.Windows.MessageBox]::Show("Please select a CSV file first using the Browse button.", 
+                        "No CSV Loaded", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+                    return
+                }
+                
+                # Show column selection dialog
+                $columnDialog = New-Object System.Windows.Window
+                $columnDialog.Title = "Select Username Column"
+                $columnDialog.Width = 400
+                $columnDialog.Height = 300
+                $columnDialog.WindowStartupLocation = 'CenterOwner'
+                $columnDialog.Owner = $script:Window
+                $columnDialog.Background = $script:Window.Resources['BgPanel']
+                
+                $grid = New-Object System.Windows.Controls.Grid
+                $grid.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition))
+                $grid.RowDefinitions[0].Height = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+                $grid.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition))
+                $grid.RowDefinitions[1].Height = [System.Windows.GridLength]::new(40)
+                
+                $listBox = New-Object System.Windows.Controls.ListBox
+                $listBox.Margin = New-Object System.Windows.Thickness(10)
+                $listBox.Background = $script:Window.Resources['BgCard']
+                $listBox.Foreground = $script:Window.Resources['TextPrimary']
+                
+                foreach ($header in $script:CsvHeaders) {
+                    $item = New-Object System.Windows.Controls.ListBoxItem
+                    $item.Content = $header
+                    $item.Foreground = $script:Window.Resources['TextPrimary']
+                    $listBox.Items.Add($item) | Out-Null
+                }
+                
+                [System.Windows.Controls.Grid]::SetRow($listBox, 0)
+                $grid.Children.Add($listBox) | Out-Null
+                
+                $btnOk = New-Object System.Windows.Controls.Button
+                $btnOk.Content = "OK"
+                $btnOk.Width = 100
+                $btnOk.Margin = New-Object System.Windows.Thickness(10)
+                $btnOk.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Center
+                $btnOk.add_Click({
+                    if ($null -ne $listBox.SelectedItem) {
+                        $script:SelectedCsvColumn = $listBox.SelectedItem.Content
+                        
+                        # Extract usernames from selected column
+                        $usernames = $script:CsvData | ForEach-Object { $_.$script:SelectedCsvColumn } | Where-Object { $_ }
+                        $txtValidationInput = $script:Window.FindName('TxtValidationInput')
+                        $txtValidationInput.Text = ($usernames -join ', ')
+                        
+                        Write-ActionLog "CSV column selected: $script:SelectedCsvColumn ($($usernames.Count) users)" "SUCCESS"
+                        
+                        $columnDialog.DialogResult = $true
+                        $columnDialog.Close()
+                    }
+                })
+                
+                [System.Windows.Controls.Grid]::SetRow($btnOk, 1)
+                $grid.Children.Add($btnOk) | Out-Null
+                
+                $columnDialog.Content = $grid
+                $columnDialog.ShowDialog() | Out-Null
+                
+            } catch {
+                Write-ActionLog "CSV column selection error: $($_.Exception.Message)" "ERROR"
+                [System.Windows.MessageBox]::Show("Error: $($_.Exception.Message)", 
+                    "Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+            }
+        })
+    }
+    
+    $btnCompare = $script:Window.FindName('BtnCompare')
+    $btnCompare.add_Click({
+        $comboCompare = $script:Window.FindName('ComboCompareGpo')
+        if ($comboCompare.SelectedItem) {
+            Invoke-GpoComparison -CompareGpoItem $comboCompare.SelectedItem
+        }
+    })
+    
+    $btnSimulateAdd = $script:Window.FindName('BtnSimulateAdd')
+    $btnSimulateAdd.add_Click({
+        $letter = $script:Window.FindName('TxtNewDriveLetter').Text
+        $path = $script:Window.FindName('TxtNewPath').Text
+        $label = $script:Window.FindName('TxtNewLabel').Text
+        $action = $script:Window.FindName('ComboNewAction').SelectedItem.Content
+        $users = $script:Window.FindName('TxtNewTargetUsers').Text
+        
+        Invoke-AddMappingSimulation -DriveLetter $letter -Path $path -Label $label -Action $action -TargetUsers $users
+    })
+    
+    $btnClearLog = $script:Window.FindName('BtnClearLog')
+    $btnClearLog.add_Click({
+        $script:ActionLogEntries.Clear()
+        Write-ActionLog "Log cleared" "INFO"
+    })
+    
+    $gridFilterInspector = $script:Window.FindName('GridFilterInspectorDrives')
+    $gridFilterInspector.add_SelectionChanged({
+        if ($gridFilterInspector.SelectedItem) {
+            $mapping = $gridFilterInspector.SelectedItem
+            $filtersNode = $mapping.XmlNode.SelectSingleNode('Filters')
+            
+            $txtDetail = $script:Window.FindName('TxtFilterInspectorDetail')
+            
+            if ($null -eq $filtersNode -or $filtersNode.ChildNodes.Count -eq 0) {
+                $txtDetail.Text = "No Item-Level Targeting filters configured for this drive mapping.`n`n" +
+                                  "This mapping applies to ALL users."
+            } else {
+                $sb = New-Object System.Text.StringBuilder
+                $sb.AppendLine("Drive: $($mapping.DriveLetter)") | Out-Null
+                $sb.AppendLine("Path: $($mapping.Path)") | Out-Null
+                $sb.AppendLine("") | Out-Null
+                $sb.AppendLine("=== FILTER TREE ===") | Out-Null
+                $sb.AppendLine("") | Out-Null
+                
+                Format-FilterTreeRecursive -Node $filtersNode -StringBuilder $sb -Depth 0
+                
+                $txtDetail.Text = $sb.ToString()
+            }
+        }
+    })
+}
+
+function Format-FilterTreeRecursive {
+    param(
+        [System.Xml.XmlElement]$Node,
+        [System.Text.StringBuilder]$StringBuilder,
+        [int]$Depth
+    )
+    
+    $indent = '  ' * $Depth
+    
+    foreach ($child in $Node.ChildNodes) {
+        if ($child -isnot [System.Xml.XmlElement]) { continue }
+        
+        $type = $child.LocalName -replace '^Filter', ''
+        $name = $child.GetAttribute('name')
+        $bool = $child.GetAttribute('bool')
+        $not = $child.GetAttribute('not')
+        
+        $line = "$indent[$type]"
+        if ($name) { $line += " '$name'" }
+        if ($bool) { $line += " (bool=$bool)" }
+        if ($not -eq '1') { $line += " [NOT]" }
+        
+        $StringBuilder.AppendLine($line) | Out-Null
+        
+        if ($child.LocalName -eq 'FilterCollection') {
+            Format-FilterTreeRecursive -Node $child -StringBuilder $StringBuilder -Depth ($Depth + 1)
+        }
+    }
+}
+#endregion
+
+#region Main Window Initialization
+try {
+    Write-Host "Initializing GPO Drive Mapping Validator & Manager..." -ForegroundColor Cyan
+    
+    $reader = New-Object System.Xml.XmlNodeReader([xml]$xaml)
+    $script:Window = [Windows.Markup.XamlReader]::Load($reader)
+    
+    if ($null -eq $script:Window) {
+        throw "Failed to create window from XAML"
+    }
+    
+    $gridActionLog = $script:Window.FindName('GridActionLog')
+    $gridActionLog.ItemsSource = $script:ActionLogEntries
+    
+    Initialize-EventHandlers
+    
+    $script:Window.add_Loaded({
+        # Start clock timer
+        $txtStatusRight = $script:Window.FindName('TxtStatusRight')
+        if ($null -ne $txtStatusRight) {
+            $timer = New-Object System.Windows.Threading.DispatcherTimer
+            $timer.Interval = [TimeSpan]::FromSeconds(1)
+            $timer.Add_Tick({
+                try {
+                    $txtStatusRight.Text = Get-Date -Format 'HH:mm:ss'
+                } catch {
+                    # Ignore timer errors
+                }
+            })
+            $timer.Start()
+        }
+        
+        # Defer all data loading to background priority
+        $script:Window.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background, [action]{
+            try {
+                Write-ActionLog "Application started" "SUCCESS"
+                Update-StatusBar "Initializing..." "Warning"
+                
+                Load-AvailableDomains
+                if ($script:CurrentDomain) {
+                    Load-AvailableGpos -DomainName $script:CurrentDomain
+                }
+                
+                Update-StatusBar "Ready" "Success"
+            } catch {
+                Write-ActionLog "Error during initialization: $($_.Exception.Message)" "ERROR"
+                Update-StatusBar "Initialization error" "Error"
+            }
+        })
+    })
+    
+    $script:Window.add_Closing({
+        try {
+            Write-ActionLog "Application closing" "INFO"
+        } catch {
+            # Ignore errors during shutdown
+        }
+    })
+    
+    Write-Host "Launching UI..." -ForegroundColor Cyan
+    [void]$script:Window.ShowDialog()
+}
+catch {
+    $errorMsg = "Fatal error during initialization: $($_.Exception.Message)`n`nStack Trace:`n$($_.ScriptStackTrace)"
+    Write-Host $errorMsg -ForegroundColor Red
+    
+    [System.Windows.Forms.MessageBox]::Show(
+        $errorMsg,
+        "Fatal Error",
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error
+    )
+    
+    exit 1
+}
+#endregion
