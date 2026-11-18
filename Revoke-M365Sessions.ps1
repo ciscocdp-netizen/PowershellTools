@@ -26,8 +26,8 @@
       powershell.exe -File (MTA would throw or hide the dialog).
     - Sets ShowHelp on WinForms dialogs and uses a real owner form so the picker
       is not stuck behind the console.
-    - Sends -Body @{} on POST; Invoke-MgGraphRequest requires a body for POST
-      and Graph expects Content-Type: application/json.
+    - Sends an empty JSON object on POST revoke; Graph expects
+      Content-Type: application/json.
     - Uses [Math]::Min with doubles so retry back-off does not crash on
       Windows PowerShell 5.1 (int vs double overload failure).
     - Reads CSVs as UTF-8, strips a UTF-8 BOM from headers, and honours Excel
@@ -36,20 +36,18 @@
       delimiter appears 0 or 1 times in the header (typical CSVs).
     - Resolves each user first, then revokes by object id (UPN %40 encoding
       can 404). Falls back to POST-by-UPN if the account cannot be read.
-    - Signs in to Graph once per run (combined revoke/read scopes). An existing
-      session is reused; incomplete Get-MgContext scope lists do not trigger
-      another login. Disconnect at the end defaults to No.
-    - Graph sign-in: lowers ErrorActionPreference during Connect-MgGraph (Stop
-      breaks MSAL), does not hide output, offers device code as the default
-      (WAM/browser popups often fail from powershell.exe), and falls back to
-      device code if interactive sign-in fails. Disables the Windows broker
-      (WAM) so a device-code token is not refreshed through extra login prompts.
+    - Signs in once with the OAuth device-code flow, stores the access and
+      refresh tokens in memory, and sends Bearer tokens on Graph HTTP calls.
+      Invoke-MgGraphRequest is not used: that cmdlet asks WAM for a new login
+      after every batch. Token refresh is a silent HTTP POST (no prompt).
+    - Disconnect at the end defaults to No and only clears this script's
+      in-memory tokens.
     - Treats Graph { "value": false } as a failure, honours Retry-After, and
       warns that guest/#EXT# users cannot be revoked in the resource tenant.
 
 .REQUIREMENTS
-    - Windows PowerShell 5.1 or PowerShell 7+ on Windows
-    - Microsoft.Graph.Authentication module (installed automatically if missing)
+    - Windows PowerShell 5.1 or PowerShell 7+ on Windows, with outbound HTTPS
+      to login.microsoftonline.com and graph.microsoft.com.
     - An admin account able to consent to / use the delegated permission
       User.RevokeSessions.All (or User.ReadWrite.All).
       Roles that can do this include User Administrator, Privileged Authentication
@@ -70,14 +68,10 @@
     Interactive Windows (WAM) sign-in needs a parent window handle. Hosts such
     as PowerShell ISE, VS Code, Cursor, and many embedded terminals have none,
     which produces: "A window handle must be configured." This script therefore
-    signs in with device code and opens https://microsoft.com/devicelogin in
-    your default browser. Enter the code printed in the console, then complete
-    MFA / admin consent in that browser tab. The Graph cmdlet writes that code
-    to the pipeline (not the host) and can hang if a WinForms dialog left a
-    synchronization context on the thread; this script prints the code to the
-    host and clears that context first. After that first sign-in, Graph calls
-    reuse the same process session. WAM is disabled so token refresh does not
-    open more Microsoft login windows.
+    signs in with OAuth device code (not Connect-MgGraph) and opens
+    https://microsoft.com/devicelogin in your default browser. Enter the code
+    printed in the console, then complete MFA / admin consent in that browser
+    tab. Later Graph batches reuse the access token and refresh it silently.
 
 .PARAMETER SelfTest
     Run built-in regression tests for helpers (CSV, UPN, retry math, Graph URI,
@@ -249,10 +243,16 @@ function Get-RetryAfterSeconds {
                     $raw = $Headers[$key]
                     break
                 }
+            } catch { }
+            try {
                 if ($null -ne $Headers.PSObject.Properties[$key]) {
                     $raw = $Headers.$key
                     break
                 }
+            } catch { }
+            try {
+                $raw = $Headers[$key]
+                if ($null -ne $raw) { break }
             } catch { }
         }
     }
@@ -704,39 +704,12 @@ function Disable-GraphInteractiveBroker {
     }
 }
 
-function Initialize-GraphAuthModule {
-    $moduleName = 'Microsoft.Graph.Authentication'
+function Initialize-GraphHttp {
     Disable-GraphInteractiveBroker
-    if (-not (Get-Module -ListAvailable -Name $moduleName)) {
-        Write-Warn2 "$moduleName module is not installed."
-        if (-not (Read-YesNo -Prompt "Install it now for the current user from the PowerShell Gallery?" -Default $true)) {
-            throw "The $moduleName module is required. Aborting."
-        }
-
-        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-
-        try {
-            if (-not (Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue)) {
-                Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope CurrentUser -Force | Out-Null
-            }
-        } catch {
-            Write-Warn2 "NuGet package provider install skipped: $($_.Exception.Message)"
-        }
-
-        $repo = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
-        if ($null -ne $repo -and $repo.InstallationPolicy -ne 'Trusted') {
-            try {
-                Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-            } catch {
-                Write-Warn2 "Could not mark PSGallery as trusted; Install-Module -Force will be used."
-            }
-        }
-
-        Install-Module -Name $moduleName -Scope CurrentUser -Repository PSGallery -Force -AllowClobber -Confirm:$false
-        Write-Ok "$moduleName installed."
-    }
-    Import-Module $moduleName -ErrorAction Stop
-    Disable-GraphInteractiveBroker
+    try {
+        [Net.ServicePointManager]::SecurityProtocol =
+            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    } catch { }
 }
 
 function Get-NormalizedGraphScopeSet {
@@ -777,6 +750,279 @@ function Test-GraphScopesSufficient {
     return ($canRevoke -and $canRead)
 }
 
+# Microsoft Graph PowerShell public client (same app Connect-MgGraph uses).
+$script:GraphPublicClientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
+$script:GraphOAuthScopeString = 'https://graph.microsoft.com/User.RevokeSessions.All https://graph.microsoft.com/User.Read.All https://graph.microsoft.com/User.ReadWrite.All offline_access openid profile'
+$script:DeviceLoginUrl = 'https://microsoft.com/devicelogin'
+$script:GraphAccessToken = $null
+$script:GraphRefreshToken = $null
+$script:GraphTokenExpiresOn = [datetime]::MinValue
+$script:GraphTokenAccount = $null
+$script:GraphTokenTenant = $null
+$script:GraphTokenScopes = @()
+$script:GraphOAuthTenant = 'organizations'
+
+function ConvertTo-JsonForGraph {
+    param($Object, [int]$Depth = 12)
+    if ($null -eq $Object) { return '{}' }
+    if ($PSVersionTable.PSVersion.Major -ge 6) {
+        return ($Object | ConvertTo-Json -Depth $Depth -Compress)
+    }
+    if (-not ('System.Web.Script.Serialization.JavaScriptSerializer' -as [type])) {
+        Add-Type -AssemblyName System.Web.Extensions
+    }
+    $ser = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+    $ser.MaxJsonLength = [int]::MaxValue
+    $ser.RecursionLimit = [Math]::Max(100, $Depth)
+    return $ser.Serialize($Object)
+}
+
+function ConvertFrom-JsonObject {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    return ($Text | ConvertFrom-Json)
+}
+
+function ConvertFrom-JwtPayload {
+    param([string]$Jwt)
+    if ([string]::IsNullOrWhiteSpace($Jwt)) { return $null }
+    $parts = @($Jwt.Split('.'))
+    if ($parts.Count -lt 2) { return $null }
+    $payload = $parts[1].Replace('-', '+').Replace('_', '/')
+    switch ($payload.Length % 4) {
+        2 { $payload += '==' }
+        3 { $payload += '=' }
+    }
+    try {
+        $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload))
+        return (ConvertFrom-JsonObject -Text $json)
+    } catch {
+        return $null
+    }
+}
+
+function Get-WebExceptionBody {
+    param($ErrorRecord)
+    if ($null -eq $ErrorRecord) { return '' }
+    try {
+        if ($null -ne $ErrorRecord.ErrorDetails -and -not [string]::IsNullOrWhiteSpace([string]$ErrorRecord.ErrorDetails.Message)) {
+            return [string]$ErrorRecord.ErrorDetails.Message
+        }
+    } catch { }
+    try {
+        $resp = $ErrorRecord.Exception.Response
+        if ($null -eq $resp) { return '' }
+        if ($null -ne $resp.PSObject.Properties['Content'] -and $null -ne $resp.Content) {
+            $task = $resp.Content.ReadAsStringAsync()
+            return [string]$task.GetAwaiter().GetResult()
+        }
+        $stream = $resp.GetResponseStream()
+        if ($null -eq $stream) { return '' }
+        $reader = New-Object System.IO.StreamReader($stream)
+        try { return [string]$reader.ReadToEnd() } finally { $reader.Dispose() }
+    } catch {
+        return ''
+    }
+}
+
+function Invoke-WebRequestRaw {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Method,
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+        [hashtable]$Headers,
+        $Body,
+        [string]$ContentType,
+        [int]$TimeoutSec = 300
+    )
+
+    $params = @{
+        Method          = $Method
+        Uri             = $Uri
+        UseBasicParsing = $true
+        TimeoutSec      = $TimeoutSec
+        ErrorAction     = 'Stop'
+    }
+    if ($Headers -and $Headers.Count -gt 0) { $params['Headers'] = $Headers }
+    if ($PSBoundParameters.ContainsKey('Body')) { $params['Body'] = $Body }
+    if (-not [string]::IsNullOrWhiteSpace($ContentType)) { $params['ContentType'] = $ContentType }
+    $cmd = Get-Command Invoke-WebRequest -ErrorAction Stop
+    if ($cmd.Parameters.ContainsKey('SkipHttpErrorCheck')) {
+        $params['SkipHttpErrorCheck'] = $true
+    }
+
+    try {
+        $response = Invoke-WebRequest @params
+        return [pscustomobject]@{
+            StatusCode = [int]$response.StatusCode
+            Content    = [string]$response.Content
+            Headers    = $response.Headers
+            Error      = $null
+        }
+    } catch {
+        $code = Get-HttpStatusCode -ErrorRecord $_
+        $text = Get-WebExceptionBody -ErrorRecord $_
+        if ($code -lt 1) { $code = 0 }
+        return [pscustomobject]@{
+            StatusCode = $code
+            Content    = $text
+            Headers    = $(if ($_.Exception.Response) { $_.Exception.Response.Headers } else { $null })
+            Error      = $_.Exception.Message
+        }
+    }
+}
+
+function ConvertTo-FormUrlEncoded {
+    param([hashtable]$Fields)
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($key in $Fields.Keys) {
+        $parts.Add(('{0}={1}' -f [Uri]::EscapeDataString([string]$key), [Uri]::EscapeDataString([string]$Fields[$key])))
+    }
+    return [string]::Join('&', $parts.ToArray())
+}
+
+function Get-OAuthErrorCode {
+    param($Object)
+    $code = [string](Get-GraphObjectProperty -Object $Object -Name 'error')
+    if (-not [string]::IsNullOrWhiteSpace($code)) { return $code }
+    return ''
+}
+
+function Invoke-OAuthFormPost {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Fields
+    )
+    $body = ConvertTo-FormUrlEncoded -Fields $Fields
+    $raw = Invoke-WebRequestRaw -Method POST -Uri $Uri -Body $body -ContentType 'application/x-www-form-urlencoded'
+    $json = $null
+    try { $json = ConvertFrom-JsonObject -Text $raw.Content } catch { $json = $null }
+    $oauthError = Get-OAuthErrorCode -Object $json
+    if ($raw.StatusCode -ge 200 -and $raw.StatusCode -lt 300 -and [string]::IsNullOrWhiteSpace($oauthError)) {
+        return [pscustomobject]@{ Ok = $true; StatusCode = $raw.StatusCode; Content = $json; Error = $null; ErrorCode = '' }
+    }
+    $detail = $oauthError
+    $desc = [string](Get-GraphObjectProperty -Object $json -Name 'error_description')
+    if (-not [string]::IsNullOrWhiteSpace($desc)) {
+        if ([string]::IsNullOrWhiteSpace($detail)) { $detail = $desc } else { $detail = '{0}: {1}' -f $detail, $desc }
+    }
+    if ([string]::IsNullOrWhiteSpace($detail)) { $detail = $raw.Error }
+    if ([string]::IsNullOrWhiteSpace($detail)) { $detail = "OAuth HTTP $($raw.StatusCode)" }
+    return [pscustomobject]@{
+        Ok         = $false
+        StatusCode = $raw.StatusCode
+        Content    = $json
+        Error      = $detail
+        ErrorCode  = $oauthError
+    }
+}
+
+function Get-GraphOAuthAuthority {
+    param([string]$Tenant)
+    $id = 'organizations'
+    if (-not [string]::IsNullOrWhiteSpace($Tenant)) { $id = $Tenant.Trim() }
+    return "https://login.microsoftonline.com/$id/oauth2/v2.0"
+}
+
+function Test-GraphAccessTokenFresh {
+    param([int]$SkewSeconds = 180)
+    if ([string]::IsNullOrWhiteSpace([string]$script:GraphAccessToken)) { return $false }
+    if ($null -eq $script:GraphTokenExpiresOn) { return $false }
+    return ([datetime]::UtcNow.AddSeconds($SkewSeconds) -lt $script:GraphTokenExpiresOn.ToUniversalTime())
+}
+
+function Clear-GraphTokenCache {
+    $script:GraphAccessToken = $null
+    $script:GraphRefreshToken = $null
+    $script:GraphTokenExpiresOn = [datetime]::MinValue
+    $script:GraphTokenAccount = $null
+    $script:GraphTokenTenant = $null
+    $script:GraphTokenScopes = @()
+}
+
+function Set-GraphTokenFromOAuthResponse {
+    param($Response)
+    $access = [string](Get-GraphObjectProperty -Object $Response -Name 'access_token')
+    if ([string]::IsNullOrWhiteSpace($access)) {
+        throw 'Token response did not include access_token.'
+    }
+    $script:GraphAccessToken = $access
+    $refresh = [string](Get-GraphObjectProperty -Object $Response -Name 'refresh_token')
+    if (-not [string]::IsNullOrWhiteSpace($refresh)) {
+        $script:GraphRefreshToken = $refresh
+    }
+    $expiresIn = 3600
+    $rawExpires = Get-GraphObjectProperty -Object $Response -Name 'expires_in'
+    if ($null -ne $rawExpires) {
+        $parsed = 0
+        if ([int]::TryParse([string]$rawExpires, [ref]$parsed) -and $parsed -gt 0) {
+            $expiresIn = $parsed
+        }
+    }
+    $script:GraphTokenExpiresOn = [datetime]::UtcNow.AddSeconds([Math]::Max(60, $expiresIn))
+    $scopeText = [string](Get-GraphObjectProperty -Object $Response -Name 'scope')
+    if ([string]::IsNullOrWhiteSpace($scopeText)) { $scopeText = $script:GraphOAuthScopeString }
+    $script:GraphTokenScopes = @(@($scopeText -split '\s+') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+
+    $jwt = ConvertFrom-JwtPayload -Jwt $access
+    $account = [string](Get-GraphObjectProperty -Object $jwt -Name 'upn')
+    if ([string]::IsNullOrWhiteSpace($account)) {
+        $account = [string](Get-GraphObjectProperty -Object $jwt -Name 'preferred_username')
+    }
+    if ([string]::IsNullOrWhiteSpace($account)) {
+        $account = [string](Get-GraphObjectProperty -Object $jwt -Name 'unique_name')
+    }
+    if (-not [string]::IsNullOrWhiteSpace($account)) { $script:GraphTokenAccount = $account }
+    $tid = [string](Get-GraphObjectProperty -Object $jwt -Name 'tid')
+    if (-not [string]::IsNullOrWhiteSpace($tid)) { $script:GraphTokenTenant = $tid }
+}
+
+function Update-GraphTokenFromRefresh {
+    if ([string]::IsNullOrWhiteSpace([string]$script:GraphRefreshToken)) { return $false }
+    $uri = (Get-GraphOAuthAuthority -Tenant $script:GraphOAuthTenant) + '/token'
+    $result = Invoke-OAuthFormPost -Uri $uri -Fields @{
+        client_id     = $script:GraphPublicClientId
+        grant_type    = 'refresh_token'
+        refresh_token = $script:GraphRefreshToken
+        scope         = $script:GraphOAuthScopeString
+    }
+    if (-not $result.Ok) {
+        Write-Warn2 ("Silent Graph token refresh failed: {0}" -f $result.Error)
+        return $false
+    }
+    Set-GraphTokenFromOAuthResponse -Response $result.Content
+    return $true
+}
+
+function Get-GraphAccessToken {
+    param([switch]$ForceRefresh)
+    if ($ForceRefresh) {
+        if (Update-GraphTokenFromRefresh) { return $script:GraphAccessToken }
+        throw 'The Microsoft Graph access token could not be refreshed silently. Re-run the script to sign in once.'
+    }
+    if (Test-GraphAccessTokenFresh) { return $script:GraphAccessToken }
+    if (Update-GraphTokenFromRefresh) { return $script:GraphAccessToken }
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:GraphAccessToken)) {
+        return $script:GraphAccessToken
+    }
+    throw 'No Microsoft Graph access token is available. Sign in first.'
+}
+
+function Get-CurrentGraphContext {
+    if ([string]::IsNullOrWhiteSpace([string]$script:GraphAccessToken)) { return $null }
+    $account = $script:GraphTokenAccount
+    if ([string]::IsNullOrWhiteSpace($account)) { $account = '(signed-in Graph session)' }
+    return [pscustomobject]@{
+        Account  = $account
+        TenantId = $script:GraphTokenTenant
+        Scopes   = @($script:GraphTokenScopes)
+        AuthType = 'DeviceCode'
+    }
+}
+
 function Invoke-GraphApi {
     param(
         [Parameter(Mandatory = $true)]
@@ -788,71 +1034,88 @@ function Invoke-GraphApi {
         [int]$MaxRetries = 5
     )
 
-    $cmd = Get-Command Invoke-MgGraphRequest -ErrorAction Stop
     $attempt = 0
+    $didRefreshOn401 = $false
 
     while ($true) {
         $attempt++
-        $statusCode = 0
-        $responseHeaders = $null
-        try {
-            $params = @{
-                Method      = $Method
-                Uri         = $Uri
-                ErrorAction = 'Stop'
-            }
-            if ($Method -eq 'POST') {
-                if ($PSBoundParameters.ContainsKey('Body')) {
-                    $params['Body'] = $Body
-                } else {
-                    $params['Body'] = @{}
-                }
-                if ($cmd.Parameters.ContainsKey('ContentType')) {
-                    $params['ContentType'] = 'application/json'
-                }
-            }
-            if ($cmd.Parameters.ContainsKey('StatusCodeVariable')) {
-                $params['StatusCodeVariable'] = 'statusCode'
-            }
-            if ($cmd.Parameters.ContainsKey('ResponseHeadersVariable')) {
-                $params['ResponseHeadersVariable'] = 'responseHeaders'
-            }
+        $token = Get-GraphAccessToken
+        $headers = @{
+            Authorization = "Bearer $token"
+            Accept        = 'application/json'
+        }
 
-            $result = Invoke-MgGraphRequest @params
-            if ($statusCode -ge 400) {
-                throw "Graph request failed with HTTP $statusCode for $Uri"
-            }
+        $rawBody = $null
+        $contentType = $null
+        if ($Method -eq 'POST') {
+            $payload = @{}
+            if ($PSBoundParameters.ContainsKey('Body')) { $payload = $Body }
+            $json = ConvertTo-JsonForGraph -Object $payload
+            $rawBody = [System.Text.Encoding]::UTF8.GetBytes($json)
+            $contentType = 'application/json; charset=utf-8'
+        }
 
-            $okCode = $statusCode
-            if ($okCode -lt 1) { $okCode = 200 }
+        $raw = $null
+        if ($Method -eq 'POST') {
+            $raw = Invoke-WebRequestRaw -Method $Method -Uri $Uri -Headers $headers -Body $rawBody -ContentType $contentType
+        } else {
+            $raw = Invoke-WebRequestRaw -Method $Method -Uri $Uri -Headers $headers
+        }
+
+        $code = [int]$raw.StatusCode
+        if ($code -eq 401 -and -not $didRefreshOn401) {
+            $didRefreshOn401 = $true
+            Write-Warn2 'Graph returned 401. Refreshing the access token silently (no login prompt)...'
+            try {
+                $null = Get-GraphAccessToken -ForceRefresh
+                continue
+            } catch {
+                return [pscustomobject]@{
+                    Ok         = $false
+                    StatusCode = 401
+                    Content    = $null
+                    Headers    = $raw.Headers
+                    Attempts   = $attempt
+                    Error      = $_.Exception.Message
+                }
+            }
+        }
+
+        if ($code -ge 200 -and $code -lt 300) {
+            $parsed = $null
+            try { $parsed = ConvertFrom-JsonObject -Text $raw.Content } catch { $parsed = $raw.Content }
             return [pscustomobject]@{
                 Ok         = $true
-                StatusCode = $okCode
-                Content    = $result
-                Headers    = $responseHeaders
+                StatusCode = $code
+                Content    = $parsed
+                Headers    = $raw.Headers
                 Attempts   = $attempt
                 Error      = $null
             }
-        } catch {
-            $code = $statusCode
-            if ($code -lt 400) { $code = Get-HttpStatusCode -ErrorRecord $_ }
-            $retryAfter = Get-RetryAfterSeconds -Headers $responseHeaders -ErrorRecord $_
-            if (($code -eq 429 -or $code -eq 503 -or $code -eq 504) -and $attempt -lt $MaxRetries) {
-                $wait = Get-RetryWaitSeconds -Attempt $attempt -RetryAfterSeconds $retryAfter
-                Write-Warn2 "Throttled/unavailable (HTTP $code). Retrying in $wait s (attempt $attempt of $MaxRetries)..."
-                Start-Sleep -Seconds $wait
-                continue
-            }
+        }
 
-            $message = $_.Exception.Message
-            return [pscustomobject]@{
-                Ok         = $false
-                StatusCode = $code
-                Content    = $null
-                Headers    = $responseHeaders
-                Attempts   = $attempt
-                Error      = $message
-            }
+        $retryAfter = Get-RetryAfterSeconds -Headers $raw.Headers -ErrorRecord $null
+        if (($code -eq 429 -or $code -eq 503 -or $code -eq 504) -and $attempt -lt $MaxRetries) {
+            $wait = Get-RetryWaitSeconds -Attempt $attempt -RetryAfterSeconds $retryAfter
+            Write-Warn2 "Throttled/unavailable (HTTP $code). Retrying in $wait s (attempt $attempt of $MaxRetries)..."
+            Start-Sleep -Seconds $wait
+            continue
+        }
+
+        $message = $raw.Error
+        $errObj = $null
+        try { $errObj = ConvertFrom-JsonObject -Text $raw.Content } catch { $errObj = $null }
+        $graphMsg = [string](Get-GraphObjectProperty -Object (Get-GraphObjectProperty -Object $errObj -Name 'error') -Name 'message')
+        if (-not [string]::IsNullOrWhiteSpace($graphMsg)) { $message = $graphMsg }
+        if ([string]::IsNullOrWhiteSpace($message)) { $message = "Graph request failed with HTTP $code for $Uri" }
+
+        return [pscustomobject]@{
+            Ok         = $false
+            StatusCode = $code
+            Content    = $errObj
+            Headers    = $raw.Headers
+            Attempts   = $attempt
+            Error      = $message
         }
     }
 }
@@ -1385,8 +1648,6 @@ function Invoke-RevokeUserChunk {
     return @($results)
 }
 
-$script:DeviceLoginUrl = 'https://microsoft.com/devicelogin'
-
 function Get-GraphDeviceCodeParameterName {
     $cmd = Get-Command Connect-MgGraph -ErrorAction Stop
     foreach ($name in @('UseDeviceCode', 'UseDeviceAuthentication')) {
@@ -1489,90 +1750,105 @@ function Write-GraphConnectOutput {
     }
 }
 
-function Invoke-GraphSignIn {
-    param(
-        [Parameter(Mandatory = $true)]
-        [hashtable]$ConnectParams,
-        [Parameter(Mandatory = $true)]
-        [ValidateSet('DeviceCode', 'Browser')]
-        [string]$Method
-    )
-
-    $connectCmd = Get-Command Connect-MgGraph -ErrorAction Stop
-    $params = @{}
-    foreach ($key in $ConnectParams.Keys) { $params[$key] = $ConnectParams[$key] }
-
-    if ($connectCmd.Parameters.ContainsKey('ClientTimeout') -and -not $params.ContainsKey('ClientTimeout')) {
-        $params['ClientTimeout'] = 300
-    }
-
-    if ($Method -eq 'Browser' -and -not (Test-WamParentWindowAvailable)) {
-        Write-Warn2 'Windows Web Account Manager cannot show a login prompt here (no parent window handle).'
-        Write-Warn2 'This is expected in ISE, VS Code, Cursor, and many embedded terminals.'
-        Write-Warn2 'Opening a browser for device-code sign-in instead.'
-        $Method = 'DeviceCode'
-    }
+function Invoke-GraphDeviceCodeSignIn {
+    param([string]$Tenant)
 
     Reset-UiSynchronizationContext
-    Disable-GraphInteractiveBroker
+    Initialize-GraphHttp
 
-    if ($Method -eq 'DeviceCode') {
-        $deviceParam = Get-GraphDeviceCodeParameterName
-        if ([string]::IsNullOrWhiteSpace($deviceParam)) {
-            throw 'This Microsoft.Graph.Authentication version does not support -UseDeviceCode. Update the module.'
-        }
-        $params[$deviceParam] = $true
-        if ($params.ContainsKey('NoWelcome')) { $params.Remove('NoWelcome') }
-        Write-Host ''
-        Write-Host 'DEVICE CODE SIGN-IN' -ForegroundColor Cyan
-        Write-Host 'A browser window will open. The next lines from Microsoft Graph contain the code.' -ForegroundColor White
-        Write-Host ("If no browser opens, go to {0} yourself." -f $script:DeviceLoginUrl) -ForegroundColor Yellow
-        Write-Host ''
-        [void](Open-UrlInBrowser -Url $script:DeviceLoginUrl)
-        Write-Host 'Requesting a device code from Microsoft. This can take several seconds...' -ForegroundColor Gray
-        Write-Host ''
+    if (-not [string]::IsNullOrWhiteSpace($Tenant)) {
+        $script:GraphOAuthTenant = $Tenant.Trim()
     } else {
-        Write-Host ''
-        Write-Host 'Trying Windows Web Account Manager. If nothing appears, the script will open a browser instead.' -ForegroundColor Cyan
-        Write-Host ''
+        $script:GraphOAuthTenant = 'organizations'
     }
 
-    # MSAL / Azure.Identity emit non-terminating errors during interactive auth.
-    # With $ErrorActionPreference = 'Stop' those become terminating and the
-    # browser/WAM flow dies before a token is issued.
-    $prevEap  = $ErrorActionPreference
-    $prevWarn = $WarningPreference
-    $prevInfo = $InformationPreference
-    $prevVerbose = $VerbosePreference
-    $ErrorActionPreference  = 'Continue'
-    $WarningPreference      = 'Continue'
-    $InformationPreference  = 'Continue'
-    $VerbosePreference      = 'Continue'
-    $errorCountBefore = $Error.Count
-    try {
-        # Device code is written to the success pipeline, NOT Write-Host.
-        # This function is assigned to a variable by the caller, so we must
-        # write it to the host here or the code stays hidden until login ends.
-        Connect-MgGraph @params -Verbose *>&1 | ForEach-Object { Write-GraphConnectOutput $_ }
-    } catch {
-        throw
-    } finally {
-        $ErrorActionPreference  = $prevEap
-        $WarningPreference      = $prevWarn
-        $InformationPreference  = $prevInfo
-        $VerbosePreference      = $prevVerbose
+    $authority = Get-GraphOAuthAuthority -Tenant $script:GraphOAuthTenant
+    Write-Host ''
+    Write-Host 'DEVICE CODE SIGN-IN' -ForegroundColor Cyan
+    Write-Host 'A browser window will open. Sign in there with the code printed below.' -ForegroundColor White
+    Write-Host ("If no browser opens, go to {0} yourself." -f $script:DeviceLoginUrl) -ForegroundColor Yellow
+    Write-Host ''
+
+    $start = Invoke-OAuthFormPost -Uri ($authority + '/devicecode') -Fields @{
+        client_id = $script:GraphPublicClientId
+        scope     = $script:GraphOAuthScopeString
+    }
+    if (-not $start.Ok) {
+        throw "Could not start device-code sign-in: $($start.Error)"
     }
 
-    $ctx = $null
-    try { $ctx = Get-MgContext } catch { $ctx = $null }
-    if ($null -eq $ctx) {
-        $detail = 'Sign-in did not create a Microsoft Graph session.'
-        if ($Error.Count -gt $errorCountBefore) {
-            try { $detail = [string]$Error[0].Exception.Message } catch { }
+    $dc = $start.Content
+    $userCode = [string](Get-GraphObjectProperty -Object $dc -Name 'user_code')
+    $deviceCode = [string](Get-GraphObjectProperty -Object $dc -Name 'device_code')
+    $message = [string](Get-GraphObjectProperty -Object $dc -Name 'message')
+    $verifyUrl = [string](Get-GraphObjectProperty -Object $dc -Name 'verification_uri')
+    $verifyComplete = [string](Get-GraphObjectProperty -Object $dc -Name 'verification_uri_complete')
+    if ([string]::IsNullOrWhiteSpace($verifyUrl)) { $verifyUrl = $script:DeviceLoginUrl }
+    $interval = 5
+    $rawInterval = Get-GraphObjectProperty -Object $dc -Name 'interval'
+    if ($null -ne $rawInterval) {
+        $parsedInterval = 0
+        if ([int]::TryParse([string]$rawInterval, [ref]$parsedInterval) -and $parsedInterval -gt 0) {
+            $interval = $parsedInterval
         }
-        throw $detail
     }
-    return $ctx
+    $expiresIn = 900
+    $rawExpires = Get-GraphObjectProperty -Object $dc -Name 'expires_in'
+    if ($null -ne $rawExpires) {
+        $parsedExpires = 0
+        if ([int]::TryParse([string]$rawExpires, [ref]$parsedExpires) -and $parsedExpires -gt 0) {
+            $expiresIn = $parsedExpires
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($deviceCode)) {
+        throw 'Microsoft did not return a device_code.'
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($message)) {
+        Write-Host $message -ForegroundColor White
+    }
+    if (-not [string]::IsNullOrWhiteSpace($userCode)) {
+        Write-Host ''
+        Write-Host ('Your device code is: {0}' -f $userCode) -ForegroundColor Green
+        Write-Host ("Enter it at {0}" -f $verifyUrl) -ForegroundColor Green
+        Write-Host ''
+    }
+
+    $openUrl = $verifyUrl
+    if (-not [string]::IsNullOrWhiteSpace($verifyComplete)) { $openUrl = $verifyComplete }
+    [void](Open-UrlInBrowser -Url $openUrl)
+
+    $deadline = [datetime]::UtcNow.AddSeconds($expiresIn)
+    $tokenUri = $authority + '/token'
+    Write-Host 'Waiting for you to complete sign-in in the browser...' -ForegroundColor Gray
+    while ([datetime]::UtcNow -lt $deadline) {
+        Start-Sleep -Seconds $interval
+        $poll = Invoke-OAuthFormPost -Uri $tokenUri -Fields @{
+            client_id   = $script:GraphPublicClientId
+            grant_type  = 'urn:ietf:params:oauth:grant-type:device_code'
+            device_code = $deviceCode
+        }
+        if ($poll.Ok) {
+            Set-GraphTokenFromOAuthResponse -Response $poll.Content
+            $ctx = Get-CurrentGraphContext
+            Write-Ok ("Signed in as {0}" -f $ctx.Account)
+            return $ctx
+        }
+        $code = [string]$poll.ErrorCode
+        if ($code -eq 'authorization_pending') { continue }
+        if ($code -eq 'slow_down') {
+            $interval += 5
+            continue
+        }
+        if ($code -eq 'expired_token') {
+            throw 'The device code expired before sign-in completed. Re-run the script.'
+        }
+        if ($code -eq 'authorization_declined') {
+            throw 'Sign-in was declined in the browser.'
+        }
+        throw "Device-code sign-in failed: $($poll.Error)"
+    }
+    throw 'Timed out waiting for device-code sign-in. Re-run the script.'
 }
 
 function Connect-RevokeGraphSession {
@@ -1582,56 +1858,34 @@ function Connect-RevokeGraphSession {
         [string]$AuthMethod = 'DeviceCode'
     )
 
-    Initialize-GraphAuthModule
+    Initialize-GraphHttp
 
-    if ($AuthMethod -eq 'Browser' -and -not (Test-WamParentWindowAvailable)) {
-        Write-Warn2 'Skipping Windows account picker: this host has no window handle for WAM.'
-        $AuthMethod = 'DeviceCode'
+    if ($AuthMethod -eq 'Browser') {
+        Write-Warn2 'Windows account picker / WAM re-prompts on every Graph batch in ISE, VS Code, and Cursor.'
+        Write-Warn2 'Using device-code sign-in instead so later batches reuse a Bearer token with no extra login.'
     }
 
-    $ctx = $null
-    try { $ctx = Get-MgContext } catch { $ctx = $null }
-    if ($null -ne $ctx) {
-        $tenantOk = [string]::IsNullOrWhiteSpace($Tenant) -or ($ctx.TenantId -eq $Tenant) -or ([string]$ctx.TenantId -ieq $Tenant)
+    $ctx = Get-CurrentGraphContext
+    if ($null -ne $ctx -and (Test-GraphAccessTokenFresh)) {
+        $tenantOk = [string]::IsNullOrWhiteSpace($Tenant) -or [string]::IsNullOrWhiteSpace([string]$ctx.TenantId) -or ($ctx.TenantId -eq $Tenant) -or ([string]$ctx.TenantId -ieq $Tenant)
         if ($tenantOk) {
-            $who = [string]$ctx.Account
-            if ([string]::IsNullOrWhiteSpace($who)) { $who = 'the current Graph session' }
-            Write-Info ("Reusing Graph session as {0}. Sign-in will not be requested again." -f $who)
+            Write-Info ("Reusing Graph session as {0}. Sign-in will not be requested again." -f $ctx.Account)
             return $ctx
         }
-        Write-Warn2 "Existing Graph session is for a different tenant. Signing in again for the tenant you entered."
-        try { Disconnect-MgGraph | Out-Null } catch { }
+        Write-Warn2 'Existing Graph session is for a different tenant. Signing in again for the tenant you entered.'
+        Clear-GraphTokenCache
     }
 
-    $connectCmd = Get-Command Connect-MgGraph
-    # One consent screen / one device code. Retrying extra scope sets was causing
-    # repeated Microsoft login prompts after the first sign-in succeeded.
-    $scopes = @('User.RevokeSessions.All', 'User.Read.All', 'User.ReadWrite.All')
-    $connectParams = @{
-        Scopes = $scopes
+    Write-Info 'Requesting Graph scopes (single device-code sign-in): User.RevokeSessions.All, User.Read.All, User.ReadWrite.All'
+    $ctx = Invoke-GraphDeviceCodeSignIn -Tenant $Tenant
+    if ($null -eq $ctx) { throw 'No Microsoft Graph context after sign-in.' }
+    if (-not (Test-GraphScopesSufficient -CurrentScopes @($ctx.Scopes))) {
+        $granted = '(none reported)'
+        if ($ctx.Scopes) { $granted = ($ctx.Scopes -join ', ') }
+        Write-Warn2 "Sign-in succeeded, but the token did not list the usual revoke/read scopes. Granted: $granted"
+        Write-Warn2 'Continuing with this session instead of asking you to sign in again. Graph will return 403 if the account cannot revoke sessions.'
     }
-    if (-not [string]::IsNullOrWhiteSpace($Tenant)) { $connectParams['TenantId'] = $Tenant.Trim() }
-    if ($connectCmd.Parameters.ContainsKey('ContextScope')) { $connectParams['ContextScope'] = 'Process' }
-
-    try {
-        Write-Info ("Requesting Graph scopes (single sign-in): {0}" -f ($scopes -join ', '))
-        $ctx = Invoke-GraphSignIn -ConnectParams $connectParams -Method $AuthMethod
-        if ($null -eq $ctx) { throw 'No Microsoft Graph context after sign-in.' }
-        if (-not (Test-GraphScopesSufficient -CurrentScopes @($ctx.Scopes))) {
-            $granted = '(none reported)'
-            if ($ctx.Scopes) { $granted = ($ctx.Scopes -join ', ') }
-            Write-Warn2 "Sign-in succeeded, but Get-MgContext did not list the usual revoke/read scopes. Granted: $granted"
-            Write-Warn2 'Continuing with this session instead of asking you to sign in again. Graph will return 403 if the account cannot revoke sessions.'
-        }
-        return $ctx
-    } catch {
-        if ($AuthMethod -eq 'Browser') {
-            Write-Warn2 ("Interactive / WAM sign-in failed: {0}" -f $_.Exception.Message)
-            Write-Warn2 'Falling back to device-code sign-in (this is the only extra sign-in attempt).'
-            return (Connect-RevokeGraphSession -Tenant $Tenant -AuthMethod DeviceCode)
-        }
-        throw
-    }
+    return $ctx
 }
 
 function Invoke-SelfTest {
@@ -1743,6 +1997,30 @@ function Invoke-SelfTest {
     Assert-True 'Revoke-only is not sufficient for lookup' (-not (Test-GraphScopesSufficient -CurrentScopes @('User.RevokeSessions.All')))
     Assert-True 'Empty scopes are not sufficient' (-not (Test-GraphScopesSufficient -CurrentScopes @()))
     Assert-True 'Prefixed Graph scopes are sufficient' (Test-GraphScopesSufficient -CurrentScopes @('https://graph.microsoft.com/User.ReadWrite.All'))
+
+    $oneReqJson = ConvertTo-JsonForGraph -Object @{ requests = @(@{ id = 'u0'; method = 'GET'; url = '/users/a' }) }
+    Assert-True 'Single batch request stays a JSON array' ($oneReqJson -match '"requests"\s*:\s*\[')
+    $form = ConvertTo-FormUrlEncoded -Fields @{ client_id = 'abc'; scope = 'a b' }
+    Assert-True 'Form body encodes spaces in scope' ($form -match 'scope=a%20b' -and $form -match 'client_id=abc')
+    $jwtPayload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{"upn":"admin@contoso.com","tid":"tenant-guid"}')).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+    $jwt = ConvertFrom-JwtPayload -Jwt ('hdr.' + $jwtPayload + '.sig')
+    Assert-True 'JWT payload upn is parsed' (([string](Get-GraphObjectProperty -Object $jwt -Name 'upn')) -eq 'admin@contoso.com')
+    $prevToken = $script:GraphAccessToken
+    $prevExp = $script:GraphTokenExpiresOn
+    try {
+        $script:GraphAccessToken = 'token-value'
+        $script:GraphTokenExpiresOn = [datetime]::UtcNow.AddMinutes(10)
+        Assert-True 'Access token with 10 minutes left is fresh' (Test-GraphAccessTokenFresh)
+        $script:GraphTokenExpiresOn = [datetime]::UtcNow.AddSeconds(30)
+        Assert-True 'Access token near expiry is not treated as fresh' (-not (Test-GraphAccessTokenFresh))
+        Clear-GraphTokenCache
+        $noTokenMsg = ''
+        try { $null = Get-GraphAccessToken } catch { $noTokenMsg = $_.Exception.Message }
+        Assert-True 'Missing token does not start an interactive login' ($noTokenMsg -match 'access token')
+    } finally {
+        $script:GraphAccessToken = $prevToken
+        $script:GraphTokenExpiresOn = $prevExp
+    }
 
     $col = Get-UpnColumn -Headers @('DisplayName', 'UserPrincipalName', 'Department') -NoPrompt
     Assert-True 'UPN column auto-detects UserPrincipalName' ($col -eq 'UserPrincipalName')
@@ -1955,23 +2233,20 @@ function Start-RevokeM365Sessions {
 
     # --- Step 4: connect to Graph ------------------------------------------------
     Write-Info 'Step 4 of 5: Connecting to Microsoft Graph...'
-    try { Initialize-GraphAuthModule } catch {
-        Write-Err2 "Could not load Microsoft Graph: $($_.Exception.Message)"
+    try { Initialize-GraphHttp } catch {
+        Write-Err2 "Could not prepare Graph HTTP: $($_.Exception.Message)"
         return
     }
 
-    $existing = $null
-    try { $existing = Get-MgContext } catch { $existing = $null }
+    $existing = Get-CurrentGraphContext
     $authMethod = 'DeviceCode'
     $tenant = ''
-    if ($null -ne $existing) {
-        $who = [string]$existing.Account
-        if ([string]::IsNullOrWhiteSpace($who)) { $who = 'the current Graph session' }
-        Write-Info ("Already signed in as {0}. Skipping Microsoft login." -f $who)
+    if ($null -ne $existing -and (Test-GraphAccessTokenFresh)) {
+        Write-Info ("Already signed in as {0}. Skipping Microsoft login." -f $existing.Account)
     } else {
         $authIndex = Read-Choice -Title 'How do you want to sign in to Microsoft Graph?' -Options @(
-            'Open a browser and sign in with a device code (recommended; works in ISE, VS Code, Cursor)',
-            'Windows account picker (WAM; fails here with "window handle must be configured")',
+            'Open a browser and sign in with a device code (recommended; one login for the whole run)',
+            'Windows account picker (not used: WAM re-prompts after every batch)',
             'Cancel'
         )
         if ($authIndex -eq 2) { Write-Warn2 'Cancelled by user.'; return }
@@ -1985,7 +2260,7 @@ function Start-RevokeM365Sessions {
         if ($ctx.Scopes) {
             Write-Info ("Granted scopes: {0}" -f ($ctx.Scopes -join ', '))
         }
-        Write-Info 'This Graph session is kept for the rest of the run. Microsoft login will not be requested again unless this token is for a different tenant.'
+        Write-Info 'Graph batches use this access token. Microsoft login will not open again; expiry is refreshed silently.'
     } catch {
         Write-Err2 "Could not connect to Microsoft Graph: $($_.Exception.Message)"
         Write-Err2 'If a browser window never opened, re-run and choose device-code sign-in.'
@@ -2075,7 +2350,7 @@ function Start-RevokeM365Sessions {
     }
 
     if (Read-YesNo -Prompt 'Disconnect from Microsoft Graph?' -Default $false) {
-        try { Disconnect-MgGraph | Out-Null } catch { }
+        Clear-GraphTokenCache
         Write-Ok 'Disconnected.'
     }
 
