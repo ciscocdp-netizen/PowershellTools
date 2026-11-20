@@ -307,6 +307,16 @@ $planFallback = @(New-BulkUpdatePlan -Rows @(
 Assert-Equal -Expected 'Ready' -Actual $planFallback[0].Status -Name 'Missing Value uses fallback'
 Assert-Equal -Expected 'CAExempt' -Actual $planFallback[0].NewValue -Name 'Fallback value is applied'
 
+# --- PS 5.1 pscustomobject / Generic.List helper ---
+$listUsers = New-Object System.Collections.Generic.List[object]
+$listUsers.Add('jane.doe@contoso.com')
+$listUsers.Add('alex.smith@contoso.com')
+$listMissing = New-Object System.Collections.Generic.List[string]
+$fromList = New-PsObjectFromHashtable @{ Users = $listUsers; Missing = $listMissing }
+Assert-Equal -Expected 2 -Actual @($fromList.Users).Count -Name 'New-PsObjectFromHashtable accepts Generic.List users'
+Assert-Equal -Expected 0 -Actual @($fromList.Missing).Count -Name 'New-PsObjectFromHashtable accepts empty Generic.List'
+Assert-Equal -Expected 'jane.doe@contoso.com' -Actual @($fromList.Users)[0] -Name 'New-PsObjectFromHashtable preserves list items'
+
 # --- User search / bulk CSV from users ---
 Assert-Equal -Expected 0 -Actual @(Split-UserSearchTokens '').Count -Name 'Split-UserSearchTokens empty'
 $split = @(Split-UserSearchTokens "jane.doe@contoso.com, alex.smith@contoso.com;`nJane Doe")

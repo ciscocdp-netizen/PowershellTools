@@ -229,6 +229,38 @@ function Test-LooksLikeGuid {
     return [bool](ConvertTo-CanonicalGuid $Value)
 }
 
+function ConvertTo-ObjectArray {
+    param($Value)
+    $list = New-Object System.Collections.Generic.List[object]
+    if ($null -eq $Value) { return ,$list.ToArray() }
+    if ($Value -is [string] -or $Value -is [System.Collections.IDictionary]) {
+        $list.Add($Value)
+        return ,$list.ToArray()
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        foreach ($item in $Value) { $list.Add($item) }
+        return ,$list.ToArray()
+    }
+    $list.Add($Value)
+    return ,$list.ToArray()
+}
+
+function New-PsObjectFromHashtable {
+    param([hashtable]$Property)
+    # Windows PowerShell 5.1 throws "Argument types do not match" if [pscustomobject]@{ }
+    # is given a Generic.List or certain nested objects. Add-Member avoids that.
+    $object = New-Object PSObject
+    foreach ($key in $Property.Keys) {
+        $value = $Property[$key]
+        if ($null -ne $value -and $value -is [System.Collections.IList] -and -not ($value -is [System.Array]) -and -not ($value -is [string])) {
+            $value = ConvertTo-ObjectArray $value
+            if ($null -eq $value) { $value = [object[]]::new(0) }
+        }
+        Add-Member -InputObject $object -NotePropertyName ([string]$key) -NotePropertyValue $value
+    }
+    return $object
+}
+
 #endregion
 
 #region Settings
@@ -658,7 +690,7 @@ function ConvertTo-DeviceRecord {
     $objectId = ConvertTo-CanonicalGuid (Get-GraphProperty $Item 'id')
     if (-not $objectId) { $objectId = [string](Get-GraphProperty $Item 'id') }
 
-    $record = [pscustomobject]@{
+    $record = New-PsObjectFromHashtable @{
         DisplayName             = [string](Get-GraphProperty $Item 'displayName')
         DeviceId                = [string]$deviceId
         ObjectId                = [string]$objectId
@@ -816,13 +848,13 @@ function ConvertTo-UserRecord {
     param($Item)
     $objectId = ConvertTo-CanonicalGuid (Get-GraphProperty $Item 'id')
     if (-not $objectId) { $objectId = [string](Get-GraphProperty $Item 'id') }
-    [pscustomobject]@{
-        ObjectId          = [string]$objectId
-        DisplayName       = [string](Get-GraphProperty $Item 'displayName')
-        UserPrincipalName = [string](Get-GraphProperty $Item 'userPrincipalName')
-        Mail              = [string](Get-GraphProperty $Item 'mail')
-        Enabled           = Get-GraphProperty $Item 'accountEnabled'
-    }
+    return (New-PsObjectFromHashtable @{
+            ObjectId          = [string]$objectId
+            DisplayName       = [string](Get-GraphProperty $Item 'displayName')
+            UserPrincipalName = [string](Get-GraphProperty $Item 'userPrincipalName')
+            Mail              = [string](Get-GraphProperty $Item 'mail')
+            Enabled           = Get-GraphProperty $Item 'accountEnabled'
+        })
 }
 
 function Split-UserSearchTokens {
@@ -956,11 +988,11 @@ function Get-UserRelatedWindowsDevices {
                 catch { }
             }
             if ($record.OperatingSystem -notlike 'Windows*') { continue }
-            $pairs.Add([pscustomobject]@{
-                    Device       = $record
-                    User         = $User
-                    Relationship = $endpoint.Name
-                })
+            $pairs.Add((New-PsObjectFromHashtable @{
+                        Device       = $record
+                        User         = $User
+                        Relationship = $endpoint.Name
+                    }))
         }
     }
 
@@ -1170,21 +1202,21 @@ function New-UserDeviceBulkRow {
     )
     if ($Action -eq 'Clear') { $Value = '' }
     elseif ($null -eq $Value) { $Value = '' }
-    [pscustomobject]@{
-        DeviceId                   = $Device.DeviceId
-        ObjectId                   = $Device.ObjectId
-        DisplayName                = $Device.DisplayName
-        Value                      = [string]$Value
-        Action                     = $Action
-        UserPrincipalName          = if ($User) { [string]$User.UserPrincipalName } else { '' }
-        UserDisplayName            = if ($User) { [string]$User.DisplayName } else { '' }
-        UserObjectId               = if ($User) { [string]$User.ObjectId } else { '' }
-        Relationship               = $Relationship
-        JoinType                   = $Device.JoinType
-        OperatingSystem            = $Device.OperatingSystem
-        CurrentExtensionAttribute1 = $Device.ExtensionAttribute1
-        Eligible                   = [bool]$Device.Eligible
-    }
+    return (New-PsObjectFromHashtable @{
+            DeviceId                   = $Device.DeviceId
+            ObjectId                   = $Device.ObjectId
+            DisplayName                = $Device.DisplayName
+            Value                      = [string]$Value
+            Action                     = $Action
+            UserPrincipalName          = if ($User) { [string]$User.UserPrincipalName } else { '' }
+            UserDisplayName            = if ($User) { [string]$User.DisplayName } else { '' }
+            UserObjectId               = if ($User) { [string]$User.ObjectId } else { '' }
+            Relationship               = $Relationship
+            JoinType                   = $Device.JoinType
+            OperatingSystem            = $Device.OperatingSystem
+            CurrentExtensionAttribute1 = $Device.ExtensionAttribute1
+            Eligible                   = [bool]$Device.Eligible
+        })
 }
 
 function Merge-UserDeviceBulkRows {
@@ -1368,17 +1400,17 @@ function New-BulkUpdatePlan {
         }
         if ($status -eq 'Ready' -or $status -eq 'NoChange') { $newDisplay = Format-Value $newValue }
 
-        $plan.Add([pscustomobject]@{
-                Row         = $rowNumber
-                Identifier  = $identifier
-                DisplayName = $displayName
-                Current     = $currentValue
-                New         = $newDisplay
-                Status      = $status
-                Note        = $note
-                Device      = $device
-                NewValue    = $newValue
-            })
+        $plan.Add((New-PsObjectFromHashtable @{
+                    Row         = $rowNumber
+                    Identifier  = $identifier
+                    DisplayName = $displayName
+                    Current     = $currentValue
+                    New         = $newDisplay
+                    Status      = $status
+                    Note        = $note
+                    Device      = $device
+                    NewValue    = $newValue
+                }))
     }
 
     return $plan.ToArray()
@@ -1976,10 +2008,10 @@ function Resolve-UsersFromTokens {
         Write-Host ("  {0} <{1}>" -f $user.DisplayName, $user.UserPrincipalName) -ForegroundColor Green
     }
 
-    return [pscustomobject]@{
-        Users   = @($resolved)
-        Missing = @($missing)
-    }
+    return (New-PsObjectFromHashtable @{
+            Users   = $resolved.ToArray()
+            Missing = $missing.ToArray()
+        })
 }
 
 function Invoke-UserDeviceCsvExport {
