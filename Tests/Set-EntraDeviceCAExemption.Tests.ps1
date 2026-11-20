@@ -80,6 +80,7 @@ Assert-True ($null -ne (Get-ValueValidationError ('x' * 1025))) 'Overlong value 
 # --- GUIDs ---
 Assert-Equal -Expected '1a2b3c4d-1111-2222-3333-444455556666' -Actual (ConvertTo-CanonicalGuid '{1A2B3C4D-1111-2222-3333-444455556666}') -Name 'GUID braces and case are normalised'
 Assert-Equal -Expected $null -Actual (ConvertTo-CanonicalGuid 'KIOSK-01') -Name 'Non-GUID returns null'
+Assert-Equal -Expected 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' -Actual (ConvertTo-CanonicalGuid ([guid]'AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA')) -Name 'ConvertTo-CanonicalGuid accepts Guid objects'
 Assert-True (Test-LooksLikeGuid 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb') 'Test-LooksLikeGuid accepts a GUID'
 
 # --- Join types / eligibility ---
@@ -127,6 +128,13 @@ $fromHt = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -ExtensionAttribute1 
 Assert-Equal -Expected 'KIOSK-01' -Actual $fromHt.DisplayName -Name 'ConvertTo-DeviceRecord hashtable displayName'
 Assert-Equal -Expected 'CAExempt' -Actual $fromHt.ExtensionAttribute1 -Name 'ConvertTo-DeviceRecord hashtable extensionAttribute1'
 Assert-Equal -Expected 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb' -Actual $fromHt.DeviceId -Name 'ConvertTo-DeviceRecord canonical deviceId'
+
+$guidHt = New-GraphDeviceHashtable
+$guidHt['deviceId'] = [guid]'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+$guidHt['id'] = [guid]'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+$fromGuidIds = ConvertTo-DeviceRecord $guidHt
+Assert-Equal -Expected 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb' -Actual $fromGuidIds.DeviceId -Name 'ConvertTo-DeviceRecord accepts Guid-typed deviceId'
+Assert-Equal -Expected 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' -Actual $fromGuidIds.ObjectId -Name 'ConvertTo-DeviceRecord accepts Guid-typed id'
 
 $psItem = [pscustomobject]@{
     id                            = 'AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA'
@@ -317,6 +325,13 @@ Assert-Equal -Expected 2 -Actual @($fromList.Users).Count -Name 'New-PsObjectFro
 Assert-Equal -Expected 0 -Actual @($fromList.Missing).Count -Name 'New-PsObjectFromHashtable accepts empty Generic.List'
 Assert-Equal -Expected 'jane.doe@contoso.com' -Actual @($fromList.Users)[0] -Name 'New-PsObjectFromHashtable preserves list items'
 
+$nestedInner = New-ToolObject @('Name', 'KIOSK-01')
+$nestedOuter = New-ToolObject @('Device', $nestedInner, 'Relationship', 'Registered')
+Assert-Equal -Expected 'KIOSK-01' -Actual $nestedOuter.Device.Name -Name 'New-ToolObject can nest PSCustomObject values'
+Assert-Equal -Expected 'Registered' -Actual $nestedOuter.Relationship -Name 'New-ToolObject keeps sibling properties'
+Assert-Equal -Expected $true -Actual (ConvertTo-PlainValue $true) -Name 'ConvertTo-PlainValue leaves bools'
+Assert-Equal -Expected 'Windows' -Actual (ConvertTo-PlainValue 'Windows') -Name 'ConvertTo-PlainValue leaves strings'
+
 # --- User search / bulk CSV from users ---
 Assert-Equal -Expected 0 -Actual @(Split-UserSearchTokens '').Count -Name 'Split-UserSearchTokens empty'
 $split = @(Split-UserSearchTokens "jane.doe@contoso.com, alex.smith@contoso.com;`nJane Doe")
@@ -350,6 +365,10 @@ Assert-Equal -Expected 'UserObjectId' -Actual $userMap['ObjectId'] -Name 'User C
 
 $userCsvRow = [pscustomobject]@{ UPN = 'jane.doe@contoso.com'; Email = ''; FullName = ''; UserObjectId = '' }
 Assert-Equal -Expected 'jane.doe@contoso.com' -Actual (Get-UserRowSearchToken $userCsvRow $userMap) -Name 'User CSV row prefers UPN'
+
+$pair = New-ToolObject @('Device', $devA, 'User', $userRec, 'Relationship', 'Registered')
+Assert-Equal -Expected $devA.DeviceId -Actual $pair.Device.DeviceId -Name 'User/device pair can nest PSCustomObject Device'
+Assert-Equal -Expected 'jane.doe@contoso.com' -Actual $pair.User.UserPrincipalName -Name 'User/device pair can nest PSCustomObject User'
 
 $bulkRow = New-UserDeviceBulkRow -Device $devA -User $userRec -Relationship 'Registered' -Value 'CAExempt' -Action 'Set'
 Assert-Equal -Expected $devA.DeviceId -Actual $bulkRow.DeviceId -Name 'User bulk row DeviceId'

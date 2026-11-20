@@ -214,9 +214,11 @@ function Test-GridViewAvailable {
 }
 
 function ConvertTo-CanonicalGuid {
-    param([AllowNull()][string]$Value)
-    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
-    $trimmed = $Value.Trim().Trim('"').Trim('{}')
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    $text = [string](ConvertTo-PlainValue $Value)
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    $trimmed = $text.Trim().Trim('"').Trim('{}')
     $guid = [guid]::Empty
     if ([guid]::TryParse($trimmed, [ref]$guid)) {
         return $guid.ToString()
@@ -245,20 +247,70 @@ function ConvertTo-ObjectArray {
     return ,$list.ToArray()
 }
 
-function New-PsObjectFromHashtable {
-    param([hashtable]$Property)
-    # Windows PowerShell 5.1 throws "Argument types do not match" if [pscustomobject]@{ }
-    # is given a Generic.List or certain nested objects. Add-Member avoids that.
+function ConvertTo-PlainValue {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+
+    $typeName = $Value.GetType().FullName
+    if ($typeName -eq 'Newtonsoft.Json.Linq.JValue') {
+        try { return ConvertTo-PlainValue $Value.Value } catch { }
+        try { return [string]$Value } catch { return $null }
+    }
+
+    if ($typeName -eq 'System.Text.Json.JsonElement') {
+        try {
+            switch ($Value.ValueKind.ToString()) {
+                'String' { return $Value.GetString() }
+                'Number' {
+                    try { return $Value.GetInt64() } catch { return $Value.GetDouble() }
+                }
+                'True' { return $true }
+                'False' { return $false }
+                'Null' { return $null }
+                default { return $Value }
+            }
+        }
+        catch {
+            return [string]$Value
+        }
+    }
+
+    if ($Value -is [datetimeoffset]) { return $Value.UtcDateTime }
+    if ($Value -is [bool] -or $Value -is [string] -or $Value -is [byte] -or $Value -is [int16] -or $Value -is [uint16] -or $Value -is [int] -or $Value -is [uint32] -or $Value -is [long] -or $Value -is [uint64] -or $Value -is [double] -or $Value -is [decimal] -or $Value -is [guid] -or $Value -is [datetime]) {
+        return $Value
+    }
+
+    return $Value
+}
+
+function New-ToolObject {
+    param([AllowEmptyCollection()][object[]]$Properties)
+    # Windows PowerShell 5.1 throws "Argument types do not match" when a hashtable
+    # or [pscustomobject]@{ } holds a Generic.List, PSCustomObject, or Graph JValue.
+    # Building with Add-Member from a pair array avoids that.
     $object = New-Object PSObject
-    foreach ($key in $Property.Keys) {
-        $value = $Property[$key]
+    if ($null -eq $Properties) { return $object }
+    for ($i = 0; $i -lt $Properties.Count; $i += 2) {
+        $name = [string]$Properties[$i]
+        $value = $null
+        if (($i + 1) -lt $Properties.Count) { $value = $Properties[$i + 1] }
         if ($null -ne $value -and $value -is [System.Collections.IList] -and -not ($value -is [System.Array]) -and -not ($value -is [string])) {
             $value = ConvertTo-ObjectArray $value
             if ($null -eq $value) { $value = [object[]]::new(0) }
         }
-        Add-Member -InputObject $object -NotePropertyName ([string]$key) -NotePropertyValue $value
+        Add-Member -InputObject $object -NotePropertyName $name -NotePropertyValue $value
     }
     return $object
+}
+
+function New-PsObjectFromHashtable {
+    param($Property)
+    $pairs = New-Object System.Collections.Generic.List[object]
+    foreach ($key in $Property.Keys) {
+        $pairs.Add([string]$key)
+        $pairs.Add($Property[$key])
+    }
+    return (New-ToolObject -Properties $pairs.ToArray())
 }
 
 #endregion
@@ -324,18 +376,26 @@ function Get-GraphProperty {
     param($Object, [string]$Name)
     if ($null -eq $Object -or [string]::IsNullOrEmpty($Name)) { return $null }
 
+    $found = $null
     if ($Object -is [System.Collections.IDictionary]) {
         foreach ($key in $Object.Keys) {
             if ([string]::Equals([string]$key, $Name, [System.StringComparison]::OrdinalIgnoreCase)) {
-                return $Object[$key]
+                $found = $Object[$key]
+                break
             }
         }
-        return $null
+    }
+    else {
+        $prop = $Object.PSObject.Properties[$Name]
+        if ($prop) { $found = $prop.Value }
     }
 
-    $prop = $Object.PSObject.Properties[$Name]
-    if ($prop) { return $prop.Value }
-    return $null
+    if ($null -eq $found) { return $null }
+    $found = ConvertTo-PlainValue $found
+    if ($null -eq $found) { return $null }
+    if ($found -is [System.Collections.IDictionary]) { return $found }
+    if ($found -is [System.Collections.IEnumerable] -and -not ($found -is [string])) { return $found }
+    return $found
 }
 
 function Get-GraphCollection {
@@ -640,7 +700,13 @@ function Invoke-GraphGetAll {
                 $items.Add($item)
             }
             Write-Progress -Activity $Activity -Status "$($items.Count) retrieved"
-            $next = Get-GraphProperty $response '@odata.nextLink'
+            $nextLink = Get-GraphProperty $response '@odata.nextLink'
+            if ($null -eq $nextLink -or [string]::IsNullOrWhiteSpace([string]$nextLink)) {
+                $next = $null
+            }
+            else {
+                $next = [string]$nextLink
+            }
         }
     }
     finally {
@@ -690,21 +756,21 @@ function ConvertTo-DeviceRecord {
     $objectId = ConvertTo-CanonicalGuid (Get-GraphProperty $Item 'id')
     if (-not $objectId) { $objectId = [string](Get-GraphProperty $Item 'id') }
 
-    $record = New-PsObjectFromHashtable @{
-        DisplayName             = [string](Get-GraphProperty $Item 'displayName')
-        DeviceId                = [string]$deviceId
-        ObjectId                = [string]$objectId
-        OperatingSystem         = $os
-        OSVersion               = [string](Get-GraphProperty $Item 'operatingSystemVersion')
-        TrustType               = $trust
-        JoinType                = Get-JoinTypeLabel $trust
-        Enabled                 = Get-GraphProperty $Item 'accountEnabled'
-        LastSignIn              = Get-GraphProperty $Item 'approximateLastSignInDateTime'
-        LastSignInDisplay       = Format-DateTimeDisplay (Get-GraphProperty $Item 'approximateLastSignInDateTime')
-        ExtensionAttribute1     = $extensionAttribute1
-        IsManagementRestricted  = Get-GraphProperty $Item 'isManagementRestricted'
-        Eligible                = $false
-    }
+    $record = New-ToolObject @(
+        'DisplayName', [string](Get-GraphProperty $Item 'displayName')
+        'DeviceId', [string]$deviceId
+        'ObjectId', [string]$objectId
+        'OperatingSystem', $os
+        'OSVersion', [string](Get-GraphProperty $Item 'operatingSystemVersion')
+        'TrustType', $trust
+        'JoinType', (Get-JoinTypeLabel $trust)
+        'Enabled', (ConvertTo-PlainValue (Get-GraphProperty $Item 'accountEnabled'))
+        'LastSignIn', (ConvertTo-PlainValue (Get-GraphProperty $Item 'approximateLastSignInDateTime'))
+        'LastSignInDisplay', (Format-DateTimeDisplay (Get-GraphProperty $Item 'approximateLastSignInDateTime'))
+        'ExtensionAttribute1', (ConvertTo-PlainValue $extensionAttribute1)
+        'IsManagementRestricted', (ConvertTo-PlainValue (Get-GraphProperty $Item 'isManagementRestricted'))
+        'Eligible', $false
+    )
     $record.Eligible = Test-DeviceEligible $record
     return $record
 }
@@ -712,7 +778,7 @@ function ConvertTo-DeviceRecord {
 function ConvertTo-DeviceRecords {
     param($Items)
     $records = New-Object System.Collections.Generic.List[object]
-    if ($null -eq $Items) { return $records.ToArray() }
+    if ($null -eq $Items) { return ,$records.ToArray() }
 
     $list = New-Object System.Collections.Generic.List[object]
     # Hashtables are IEnumerable (keys). Treat a Graph entity as a single item.
@@ -727,9 +793,10 @@ function ConvertTo-DeviceRecords {
     }
 
     foreach ($item in $list) {
+        if ($null -eq $item) { continue }
         $records.Add((ConvertTo-DeviceRecord $item))
     }
-    return $records.ToArray()
+    return ,$records.ToArray()
 }
 
 function New-GraphDeviceListUri {
@@ -848,13 +915,13 @@ function ConvertTo-UserRecord {
     param($Item)
     $objectId = ConvertTo-CanonicalGuid (Get-GraphProperty $Item 'id')
     if (-not $objectId) { $objectId = [string](Get-GraphProperty $Item 'id') }
-    return (New-PsObjectFromHashtable @{
-            ObjectId          = [string]$objectId
-            DisplayName       = [string](Get-GraphProperty $Item 'displayName')
-            UserPrincipalName = [string](Get-GraphProperty $Item 'userPrincipalName')
-            Mail              = [string](Get-GraphProperty $Item 'mail')
-            Enabled           = Get-GraphProperty $Item 'accountEnabled'
-        })
+    return (New-ToolObject @(
+            'ObjectId', [string]$objectId
+            'DisplayName', [string](Get-GraphProperty $Item 'displayName')
+            'UserPrincipalName', [string](Get-GraphProperty $Item 'userPrincipalName')
+            'Mail', [string](Get-GraphProperty $Item 'mail')
+            'Enabled', (ConvertTo-PlainValue (Get-GraphProperty $Item 'accountEnabled'))
+        ))
 }
 
 function Split-UserSearchTokens {
@@ -988,11 +1055,11 @@ function Get-UserRelatedWindowsDevices {
                 catch { }
             }
             if ($record.OperatingSystem -notlike 'Windows*') { continue }
-            $pairs.Add((New-PsObjectFromHashtable @{
-                        Device       = $record
-                        User         = $User
-                        Relationship = $endpoint.Name
-                    }))
+            $pairs.Add((New-ToolObject @(
+                        'Device', $record
+                        'User', $User
+                        'Relationship', $endpoint.Name
+                    )))
         }
     }
 
@@ -1202,21 +1269,21 @@ function New-UserDeviceBulkRow {
     )
     if ($Action -eq 'Clear') { $Value = '' }
     elseif ($null -eq $Value) { $Value = '' }
-    return (New-PsObjectFromHashtable @{
-            DeviceId                   = $Device.DeviceId
-            ObjectId                   = $Device.ObjectId
-            DisplayName                = $Device.DisplayName
-            Value                      = [string]$Value
-            Action                     = $Action
-            UserPrincipalName          = if ($User) { [string]$User.UserPrincipalName } else { '' }
-            UserDisplayName            = if ($User) { [string]$User.DisplayName } else { '' }
-            UserObjectId               = if ($User) { [string]$User.ObjectId } else { '' }
-            Relationship               = $Relationship
-            JoinType                   = $Device.JoinType
-            OperatingSystem            = $Device.OperatingSystem
-            CurrentExtensionAttribute1 = $Device.ExtensionAttribute1
-            Eligible                   = [bool]$Device.Eligible
-        })
+    return (New-ToolObject @(
+            'DeviceId', $Device.DeviceId
+            'ObjectId', $Device.ObjectId
+            'DisplayName', $Device.DisplayName
+            'Value', [string]$Value
+            'Action', $Action
+            'UserPrincipalName', $(if ($User) { [string]$User.UserPrincipalName } else { '' })
+            'UserDisplayName', $(if ($User) { [string]$User.DisplayName } else { '' })
+            'UserObjectId', $(if ($User) { [string]$User.ObjectId } else { '' })
+            'Relationship', $Relationship
+            'JoinType', $Device.JoinType
+            'OperatingSystem', $Device.OperatingSystem
+            'CurrentExtensionAttribute1', $Device.ExtensionAttribute1
+            'Eligible', [bool]$Device.Eligible
+        ))
 }
 
 function Merge-UserDeviceBulkRows {
@@ -1400,17 +1467,17 @@ function New-BulkUpdatePlan {
         }
         if ($status -eq 'Ready' -or $status -eq 'NoChange') { $newDisplay = Format-Value $newValue }
 
-        $plan.Add((New-PsObjectFromHashtable @{
-                    Row         = $rowNumber
-                    Identifier  = $identifier
-                    DisplayName = $displayName
-                    Current     = $currentValue
-                    New         = $newDisplay
-                    Status      = $status
-                    Note        = $note
-                    Device      = $device
-                    NewValue    = $newValue
-                }))
+        $plan.Add((New-ToolObject @(
+                    'Row', $rowNumber
+                    'Identifier', $identifier
+                    'DisplayName', $displayName
+                    'Current', $currentValue
+                    'New', $newDisplay
+                    'Status', $status
+                    'Note', $note
+                    'Device', $device
+                    'NewValue', $newValue
+                )))
     }
 
     return $plan.ToArray()
@@ -2008,10 +2075,10 @@ function Resolve-UsersFromTokens {
         Write-Host ("  {0} <{1}>" -f $user.DisplayName, $user.UserPrincipalName) -ForegroundColor Green
     }
 
-    return (New-PsObjectFromHashtable @{
-            Users   = $resolved.ToArray()
-            Missing = $missing.ToArray()
-        })
+    return (New-ToolObject @(
+            'Users', $resolved.ToArray()
+            'Missing', $missing.ToArray()
+        ))
 }
 
 function Invoke-UserDeviceCsvExport {
