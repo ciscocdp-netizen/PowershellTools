@@ -1,5 +1,6 @@
 CAExemption.settings.json
 CAExemption-Log_*.csv
 CAExemption-Preview_*.csv
+CAExemption-UserDevices_*.csv
 EntraRegisteredDevices_*.csv
 *.tmp

@@ -11,10 +11,11 @@
       1. List Windows Entra registered devices and their current extensionAttribute1
       2. Update a single device (search by name, Device ID or Object ID)
       3. Bulk update many devices from a CSV, with a full preview before any change
-      4. Export a CSV template
-      5. Settings: default value, dry-run mode, audit log path, registered-only filter
-      6. Connect or switch tenant
-      7. Conditional Access filter help
+      4. Find Windows devices by user and export a bulk-update CSV
+      5. Export a CSV template
+      6. Settings: default value, dry-run mode, audit log path, registered-only filter
+      7. Connect or switch tenant
+      8. Conditional Access filter help
 
     Every change (or dry-run) is written to a CSV audit log.
 
@@ -45,7 +46,7 @@
 .NOTES
     Requirements
       - Module: Microsoft.Graph.Authentication (the script offers to install it)
-      - Delegated Graph permission: Device.ReadWrite.All (admin consent required)
+      - Delegated Graph permissions: Device.ReadWrite.All and User.Read.All (admin consent required)
       - Entra role: Cloud Device Administrator, Intune Administrator or Global Administrator
       - Windows PowerShell 5.1 needs .NET Framework 4.7.2 or later for the Graph SDK
 
@@ -61,6 +62,13 @@
         1a2b3c4d-1111-2222-3333-444455556666,,,CAExempt,Set
         ,,KIOSK-02,CAExempt,Set
         ,,KIOSK-03,,Clear
+
+    User-to-device CSV (menu option 4)
+      Look up users by UPN, mail, display name or object ID, or import a user list
+      with those columns (aliases such as UPN / Email are accepted). The export
+      includes DeviceId, ObjectId, DisplayName, Value and Action so it can be
+      applied immediately with menu option 3. Extra columns (user, relationship,
+      join type) are for review and are ignored by bulk update.
 
     Conditional Access usage
       Conditions > Filter for devices > Exclude filtered devices:
@@ -85,9 +93,12 @@ param(
 
 $script:Root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $script:SettingsFile = if ($SettingsPath) { $SettingsPath } else { Join-Path $script:Root 'CAExemption.settings.json' }
-$script:RequiredScope = 'Device.ReadWrite.All'
-$script:GraphBase     = 'https://graph.microsoft.com/v1.0/devices'
-$script:SelectFields  = 'id,deviceId,displayName,trustType,operatingSystem,operatingSystemVersion,accountEnabled,approximateLastSignInDateTime,extensionAttributes,isManagementRestricted'
+$script:RequiredScope  = 'Device.ReadWrite.All'
+$script:RequiredScopes = @('Device.ReadWrite.All', 'User.Read.All')
+$script:GraphBase      = 'https://graph.microsoft.com/v1.0/devices'
+$script:GraphUsersBase = 'https://graph.microsoft.com/v1.0/users'
+$script:SelectFields     = 'id,deviceId,displayName,trustType,operatingSystem,operatingSystemVersion,accountEnabled,approximateLastSignInDateTime,extensionAttributes,isManagementRestricted'
+$script:UserSelectFields = 'id,displayName,userPrincipalName,mail,accountEnabled'
 $script:GuidPattern   = '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
 $script:MaxValueLength = 1024
 $script:CsvColumnAliases = @{
@@ -96,6 +107,12 @@ $script:CsvColumnAliases = @{
     DisplayName = @('DisplayName', 'Display Name', 'DeviceName', 'Device Name', 'Name', 'ComputerName', 'Computer')
     Value       = @('Value', 'ExtensionAttribute1', 'extensionAttribute1', 'Attribute', 'NewValue', 'EA1')
     Action      = @('Action', 'Operation')
+}
+$script:UserCsvColumnAliases = @{
+    ObjectId          = @('ObjectId', 'Object ID', 'Object_Id', 'UserObjectId', 'UserId', 'id')
+    UserPrincipalName = @('UserPrincipalName', 'UPN', 'User', 'UserName', 'SamAccountName')
+    Mail              = @('Mail', 'Email', 'EmailAddress', 'E-mail')
+    DisplayName       = @('DisplayName', 'Display Name', 'Name', 'FullName')
 }
 
 $script:Settings = @{
@@ -478,7 +495,11 @@ function Initialize-GraphModule {
 
 function Test-GraphConnection {
     $context = Get-MgContext
-    return (Test-HasGraphScope $context)
+    if ($null -eq $context) { return $false }
+    foreach ($scope in $script:RequiredScopes) {
+        if (-not (Test-HasGraphScope $context $scope)) { return $false }
+    }
+    return $true
 }
 
 function Connect-Graph {
@@ -504,7 +525,7 @@ function Connect-Graph {
         if ($method -eq '2') { $useDevice = $true }
     }
 
-    $params = @{ Scopes = @($script:RequiredScope) }
+    $params = @{ Scopes = @($script:RequiredScopes) }
     if ($Tenant) { $params['TenantId'] = $Tenant }
     if ($connectCommand.Parameters.ContainsKey('NoWelcome')) { $params['NoWelcome'] = $true }
     if ($useDevice -and $connectCommand.Parameters.ContainsKey('UseDeviceCode')) {
@@ -523,7 +544,7 @@ function Connect-Graph {
     }
 
     if (-not (Test-GraphConnection)) {
-        Write-Host "Signed in, but $($script:RequiredScope) was not granted. An administrator may need to consent." -ForegroundColor Red
+        Write-Host ("Signed in, but these permissions were not granted: {0}. An administrator may need to consent." -f ($script:RequiredScopes -join ', ')) -ForegroundColor Red
         return $false
     }
 
@@ -791,6 +812,161 @@ function Find-Devices {
     return @($output | Sort-Object DisplayName)
 }
 
+function ConvertTo-UserRecord {
+    param($Item)
+    $objectId = ConvertTo-CanonicalGuid (Get-GraphProperty $Item 'id')
+    if (-not $objectId) { $objectId = [string](Get-GraphProperty $Item 'id') }
+    [pscustomobject]@{
+        ObjectId          = [string]$objectId
+        DisplayName       = [string](Get-GraphProperty $Item 'displayName')
+        UserPrincipalName = [string](Get-GraphProperty $Item 'userPrincipalName')
+        Mail              = [string](Get-GraphProperty $Item 'mail')
+        Enabled           = Get-GraphProperty $Item 'accountEnabled'
+    }
+}
+
+function Split-UserSearchTokens {
+    param([AllowNull()][string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
+    $tokens = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+    foreach ($part in @($Text -split '[,\r\n;\t]+')) {
+        $token = $part.Trim().Trim('"').Trim("'")
+        if (-not $token) { continue }
+        $key = $token.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        $tokens.Add($token)
+    }
+    return @($tokens)
+}
+
+function New-GraphUserListUri {
+    param([string]$Filter, [hashtable]$ExtraQuery)
+    $query = New-Object System.Collections.Generic.List[string]
+    if ($Filter) {
+        $query.Add(('$filter={0}' -f [uri]::EscapeDataString($Filter)))
+    }
+    $query.Add(('$select={0}' -f $script:UserSelectFields))
+    $query.Add('$top=999')
+    if ($ExtraQuery) {
+        foreach ($key in $ExtraQuery.Keys) {
+            $query.Add(('{0}={1}' -f $key, $ExtraQuery[$key]))
+        }
+    }
+    return ('{0}?{1}' -f $script:GraphUsersBase, ($query -join '&'))
+}
+
+function Find-Users {
+    param([string]$Search)
+
+    $search = if ($null -eq $Search) { '' } else { $Search.Trim() }
+    if (-not $search) { return @() }
+
+    $guid = ConvertTo-CanonicalGuid $search
+    if ($guid) {
+        try {
+            $single = Invoke-GraphRequestWithRetry -Method GET -Uri ('{0}/{1}?$select={2}' -f $script:GraphUsersBase, $guid, $script:UserSelectFields)
+            if ($single) { return @(ConvertTo-UserRecord $single) }
+        }
+        catch {
+            $status = Get-GraphExceptionStatusCode $_
+            if ($status -ne 404 -and (Get-GraphErrorMessage $_) -notmatch 'NotFound|does not exist') { throw }
+        }
+        return @()
+    }
+
+    $escaped = $search.Replace("'", "''")
+    if ($search -match '@') {
+        $filter = "userPrincipalName eq '$escaped' or mail eq '$escaped'"
+    }
+    else {
+        $filter = "startswith(displayName,'$escaped') or startswith(userPrincipalName,'$escaped') or startswith(mail,'$escaped')"
+    }
+
+    $raw = @()
+    try {
+        $raw = @(Invoke-GraphGetAll -Uri (New-GraphUserListUri -Filter $filter) -Activity 'Searching users in Entra ID')
+    }
+    catch {
+        $status = Get-GraphExceptionStatusCode $_
+        if ($status -notin 400, 0) { throw }
+    }
+
+    if ($raw.Count -eq 0) {
+        try {
+            $searchUri = New-GraphUserListUri -Filter $null -ExtraQuery @{
+                '$search' = [uri]::EscapeDataString(('"{0}"' -f $escaped))
+                '$count'  = 'true'
+            }
+            $raw = @(Invoke-GraphGetAll -Uri $searchUri -Headers @{ ConsistencyLevel = 'eventual' } -Activity 'Searching users in Entra ID')
+        }
+        catch {
+            $status = Get-GraphExceptionStatusCode $_
+            if ($status -notin 400, 0) { throw }
+        }
+    }
+
+    $users = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    foreach ($item in $raw) {
+        $user = ConvertTo-UserRecord $item
+        if ($user.ObjectId -and $seen.ContainsKey($user.ObjectId)) { continue }
+        if ($user.ObjectId) { $seen[$user.ObjectId] = $true }
+        $users.Add($user)
+    }
+    return @($users | Sort-Object DisplayName, UserPrincipalName)
+}
+
+function Get-UserRelatedWindowsDevices {
+    param($User)
+
+    $pairs = New-Object System.Collections.Generic.List[object]
+    $endpoints = @(
+        @{ Name = 'Registered'; Path = 'registeredDevices' }
+        @{ Name = 'Owned';      Path = 'ownedDevices' }
+    )
+
+    foreach ($endpoint in $endpoints) {
+        $uri = '{0}/{1}/{2}?$select={3}&$top=999' -f $script:GraphUsersBase, $User.ObjectId, $endpoint.Path, $script:SelectFields
+        $raw = @()
+        try {
+            $raw = @(Invoke-GraphGetAll -Uri $uri -Activity ('Retrieving {0} devices for {1}' -f $endpoint.Name.ToLower(), $User.UserPrincipalName))
+        }
+        catch {
+            $status = Get-GraphExceptionStatusCode $_
+            if ($status -eq 400) {
+                $fallback = '{0}/{1}/{2}?$top=999' -f $script:GraphUsersBase, $User.ObjectId, $endpoint.Path
+                $raw = @(Invoke-GraphGetAll -Uri $fallback -Activity ('Retrieving {0} devices for {1}' -f $endpoint.Name.ToLower(), $User.UserPrincipalName))
+            }
+            elseif ($status -eq 404) {
+                continue
+            }
+            else {
+                throw
+            }
+        }
+
+        foreach ($record in @(ConvertTo-DeviceRecords $raw)) {
+            if ([string]::IsNullOrWhiteSpace($record.OperatingSystem) -and $record.ObjectId) {
+                try {
+                    $full = Invoke-GraphRequestWithRetry -Method GET -Uri ('{0}/{1}?$select={2}' -f $script:GraphBase, $record.ObjectId, $script:SelectFields)
+                    if ($full) { $record = ConvertTo-DeviceRecord $full }
+                }
+                catch { }
+            }
+            if ($record.OperatingSystem -notlike 'Windows*') { continue }
+            $pairs.Add([pscustomobject]@{
+                    Device       = $record
+                    User         = $User
+                    Relationship = $endpoint.Name
+                })
+        }
+    }
+
+    return @($pairs)
+}
+
 function Write-AuditLog {
     param($Entry)
     try {
@@ -952,6 +1128,90 @@ function Get-RowAction {
     if ($action -match '^(clear|remove|delete)$') { return 'Clear' }
     if ($action -eq '' -or $action -match '^(set|add|modify|update)$') { return 'Set' }
     return 'Invalid'
+}
+
+function Resolve-UserCsvColumnMap {
+    param($Headers)
+    $map = @{}
+    $headerList = @(
+        $Headers | ForEach-Object {
+            if ($_ -is [System.Management.Automation.PSPropertyInfo]) { $_.Name }
+            else { [string]$_ }
+        } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    foreach ($canonical in @('ObjectId', 'UserPrincipalName', 'Mail', 'DisplayName')) {
+        foreach ($alias in $script:UserCsvColumnAliases[$canonical]) {
+            $match = $headerList | Where-Object { [string]::Equals($_.Trim(), $alias.Trim(), [System.StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+            if ($match) {
+                $map[$canonical] = $match
+                break
+            }
+        }
+    }
+    return $map
+}
+
+function Get-UserRowSearchToken {
+    param($Row, $ColumnMap)
+    foreach ($name in @('ObjectId', 'UserPrincipalName', 'Mail', 'DisplayName')) {
+        $value = Get-MappedRowField $Row $ColumnMap $name
+        if ($value) { return $value }
+    }
+    return ''
+}
+
+function New-UserDeviceBulkRow {
+    param(
+        $Device,
+        $User,
+        [string]$Relationship = 'Registered',
+        $Value,
+        [string]$Action = 'Set'
+    )
+    if ($Action -eq 'Clear') { $Value = '' }
+    elseif ($null -eq $Value) { $Value = '' }
+    [pscustomobject]@{
+        DeviceId                   = $Device.DeviceId
+        ObjectId                   = $Device.ObjectId
+        DisplayName                = $Device.DisplayName
+        Value                      = [string]$Value
+        Action                     = $Action
+        UserPrincipalName          = if ($User) { [string]$User.UserPrincipalName } else { '' }
+        UserDisplayName            = if ($User) { [string]$User.DisplayName } else { '' }
+        UserObjectId               = if ($User) { [string]$User.ObjectId } else { '' }
+        Relationship               = $Relationship
+        JoinType                   = $Device.JoinType
+        OperatingSystem            = $Device.OperatingSystem
+        CurrentExtensionAttribute1 = $Device.ExtensionAttribute1
+        Eligible                   = [bool]$Device.Eligible
+    }
+}
+
+function Merge-UserDeviceBulkRows {
+    param([object[]]$Rows)
+    $byKey = [ordered]@{}
+    foreach ($row in @($Rows)) {
+        $key = if ($row.ObjectId) { [string]$row.ObjectId } elseif ($row.DeviceId) { [string]$row.DeviceId } else { [guid]::NewGuid().ToString() }
+        if ($byKey.Contains($key)) {
+            $existing = $byKey[$key]
+            $relParts = New-Object System.Collections.Generic.List[string]
+            foreach ($part in @(($existing.Relationship -split ',') + ($row.Relationship -split ','))) {
+                $piece = ([string]$part).Trim()
+                if ($piece -and -not $relParts.Contains($piece)) { $relParts.Add($piece) }
+            }
+            $existing.Relationship = ($relParts -join ', ')
+
+            if ($row.UserPrincipalName -and $existing.UserPrincipalName -notlike ('*{0}*' -f $row.UserPrincipalName)) {
+                $existing.UserPrincipalName = @($existing.UserPrincipalName, $row.UserPrincipalName) -join '; '
+                $existing.UserDisplayName = @($existing.UserDisplayName, $row.UserDisplayName) -join '; '
+                $existing.UserObjectId = @($existing.UserObjectId, $row.UserObjectId) -join '; '
+            }
+        }
+        else {
+            $byKey[$key] = $row
+        }
+    }
+    return @($byKey.Values)
 }
 
 function New-DeviceIndex {
@@ -1210,6 +1470,48 @@ function Select-DeviceFromList {
     }
 }
 
+function Select-UserFromList {
+    param([object[]]$Users)
+
+    $pageSize = 30
+    $page = 0
+    $total = $Users.Count
+    $pageCount = [Math]::Max(1, [int][Math]::Ceiling($total / $pageSize))
+
+    while ($true) {
+        $start = $page * $pageSize
+        $shown = @($Users | Select-Object -Skip $start -First $pageSize)
+
+        Write-Host ''
+        Write-Host ('{0,4}  {1,-32} {2,-36} {3}' -f '#', 'Name', 'UPN', 'Enabled') -ForegroundColor Cyan
+        for ($i = 0; $i -lt $shown.Count; $i++) {
+            $u = $shown[$i]
+            $line = '{0,4}) {1,-32} {2,-36} {3}' -f ($start + $i + 1), (Limit-Text $u.DisplayName 32), (Limit-Text $u.UserPrincipalName 36), $u.Enabled
+            Write-Host $line
+        }
+        if ($pageCount -gt 1) {
+            Write-Host "      Page $($page + 1) of $pageCount. N=next, P=previous." -ForegroundColor Yellow
+        }
+
+        $pick = ([string](Read-Host 'Select a number (Enter to skip this user)')).Trim()
+        if (-not $pick) { return $null }
+        if ($pick -match '^(N|NEXT)$') {
+            if ($page -lt $pageCount - 1) { $page++ }
+            continue
+        }
+        if ($pick -match '^(P|PREV|PREVIOUS)$') {
+            if ($page -gt 0) { $page-- }
+            continue
+        }
+
+        $number = 0
+        if ([int]::TryParse($pick, [ref]$number) -and $number -ge 1 -and $number -le $total) {
+            return $Users[$number - 1]
+        }
+        Write-Host 'Invalid selection.' -ForegroundColor Yellow
+    }
+}
+
 #endregion
 
 #region Menu actions
@@ -1416,10 +1718,12 @@ function Select-CsvPath {
 }
 
 function Invoke-BulkUpdate {
+    param([string]$Path)
+
     Write-Title 'Bulk update from CSV'
 
-    $path = Select-CsvPath
-    if (-not $path) { return }
+    if (-not $Path) { $Path = Select-CsvPath }
+    if (-not $Path) { return }
 
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         Write-Host "File not found: $path" -ForegroundColor Red
@@ -1620,6 +1924,261 @@ function Invoke-BulkUpdate {
     }
 }
 
+function Read-UserSearchTokens {
+    Write-Host 'Enter users as UPN, email, display name or object ID.'
+    Write-Host 'Separate with commas or semicolons. Enter a blank line when finished.'
+    $lines = New-Object System.Collections.Generic.List[string]
+    while ($true) {
+        $line = ([string](Read-Host '>')).Trim()
+        if (-not $line) { break }
+        $lines.Add($line)
+    }
+    return @(Split-UserSearchTokens ($lines -join ','))
+}
+
+function Resolve-UsersFromTokens {
+    param([string[]]$Tokens)
+
+    $resolved = New-Object System.Collections.Generic.List[object]
+    $missing = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+
+    foreach ($token in @($Tokens)) {
+        if ([string]::IsNullOrWhiteSpace($token)) { continue }
+        try {
+            $matches = @(Find-Users $token)
+        }
+        catch {
+            Write-Host "Lookup failed for '$token': $(Get-GraphErrorMessage $_)" -ForegroundColor Red
+            $missing.Add($token)
+            continue
+        }
+
+        if ($matches.Count -eq 0) {
+            Write-Host "No user found for '$token'." -ForegroundColor Yellow
+            $missing.Add($token)
+            continue
+        }
+
+        $user = $null
+        if ($matches.Count -eq 1) {
+            $user = $matches[0]
+        }
+        else {
+            Write-Host "'$token' matched $($matches.Count) users. Choose one, or skip." -ForegroundColor Yellow
+            $user = Select-UserFromList $matches
+        }
+
+        if ($null -eq $user) { continue }
+        if ($user.ObjectId -and $seen.ContainsKey($user.ObjectId)) { continue }
+        if ($user.ObjectId) { $seen[$user.ObjectId] = $true }
+        $resolved.Add($user)
+        Write-Host ("  {0} <{1}>" -f $user.DisplayName, $user.UserPrincipalName) -ForegroundColor Green
+    }
+
+    return [pscustomobject]@{
+        Users   = @($resolved)
+        Missing = @($missing)
+    }
+}
+
+function Invoke-UserDeviceCsvExport {
+    Write-Title 'Find Windows devices by user'
+
+    Write-Host 'Look up users, collect their Windows registered/owned devices,'
+    Write-Host 'and export a CSV that menu option 3 can apply directly.'
+    Write-Host ''
+    Write-Host '  1) Type users (UPN, email, name or object ID)'
+    Write-Host '  2) Load users from a CSV'
+    Write-Host '  3) Export a user-list CSV template'
+    Write-Host '  0) Cancel'
+
+    $tokens = @()
+    switch (Read-Choice 'Choose') {
+        '1' { $tokens = @(Read-UserSearchTokens) }
+        '2' {
+            $userCsvPath = Select-CsvPath
+            if (-not $userCsvPath) { return }
+            if (-not (Test-Path -LiteralPath $userCsvPath -PathType Leaf)) {
+                Write-Host "File not found: $userCsvPath" -ForegroundColor Red
+                Wait-ForKey
+                return
+            }
+            try {
+                $userRows = @(Import-DeviceCsv -Path $userCsvPath)
+            }
+            catch {
+                Write-Host "Could not read CSV: $($_.Exception.Message)" -ForegroundColor Red
+                Wait-ForKey
+                return
+            }
+            if ($userRows.Count -eq 0) {
+                Write-Host 'The CSV has no data rows.' -ForegroundColor Yellow
+                Wait-ForKey
+                return
+            }
+            $headers = @($userRows[0].PSObject.Properties | ForEach-Object { $_.Name })
+            $userMap = Resolve-UserCsvColumnMap $headers
+            if ($userMap.Count -eq 0) {
+                Write-Host 'The CSV needs a UserPrincipalName, Mail, DisplayName or ObjectId column (or an alias such as UPN / Email).' -ForegroundColor Red
+                Write-Host "Columns found: $($headers -join ', ')" -ForegroundColor Red
+                Wait-ForKey
+                return
+            }
+            foreach ($row in $userRows) {
+                $token = Get-UserRowSearchToken $row $userMap
+                if ($token) { $tokens += $token }
+            }
+            Write-Host "Loaded $($tokens.Count) user identifier(s) from $userCsvPath" -ForegroundColor Green
+        }
+        '3' {
+            $defaultPath = Join-Path $script:Root 'CAExemption-Users-Template.csv'
+            $path = ([string](Read-Host "Save template to [$defaultPath]")).Trim().Trim('"')
+            if (-not $path) { $path = $defaultPath }
+            $template = @(
+                [pscustomobject]@{ UserPrincipalName = 'jane.doe@contoso.com'; DisplayName = ''; ObjectId = ''; Mail = '' }
+                [pscustomobject]@{ UserPrincipalName = ''; DisplayName = 'Alex Smith'; ObjectId = ''; Mail = '' }
+            )
+            try {
+                $folder = Split-Path -Parent $path
+                if ($folder -and -not (Test-Path -LiteralPath $folder)) {
+                    New-Item -ItemType Directory -Path $folder -Force | Out-Null
+                }
+                $template | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+                Write-Host "Template saved to $path" -ForegroundColor Green
+            }
+            catch {
+                Write-Host "Could not save template: $($_.Exception.Message)" -ForegroundColor Red
+            }
+            Wait-ForKey
+            return
+        }
+        default { return }
+    }
+
+    $tokens = @(Split-UserSearchTokens ($tokens -join ','))
+    if ($tokens.Count -eq 0) {
+        Write-Host 'No users were entered.' -ForegroundColor Yellow
+        Wait-ForKey
+        return
+    }
+
+    Write-Host ''
+    Write-Host "Resolving $($tokens.Count) user identifier(s)..."
+    $resolved = Resolve-UsersFromTokens -Tokens $tokens
+    if ($resolved.Users.Count -eq 0) {
+        Write-Host 'No users were resolved.' -ForegroundColor Yellow
+        Wait-ForKey
+        return
+    }
+    if ($resolved.Missing.Count -gt 0) {
+        Write-Host ("Not found: {0}" -f ($resolved.Missing -join ', ')) -ForegroundColor Yellow
+    }
+
+    Write-Host ''
+    Write-Host "Retrieving Windows devices registered to or owned by $($resolved.Users.Count) user(s)..."
+    $pairs = New-Object System.Collections.Generic.List[object]
+    foreach ($user in @($resolved.Users)) {
+        try {
+            foreach ($pair in @(Get-UserRelatedWindowsDevices $user)) {
+                $pairs.Add($pair)
+            }
+        }
+        catch {
+            Write-Host "Failed to get devices for $($user.UserPrincipalName): $(Get-GraphErrorMessage $_)" -ForegroundColor Red
+        }
+    }
+
+    if ($pairs.Count -eq 0) {
+        Write-Host 'No Windows devices were found for those users.' -ForegroundColor Yellow
+        Wait-ForKey
+        return
+    }
+
+    $choice = Read-ValueChoice 'What should the exported CSV set extensionAttribute1 to?'
+    if ($null -eq $choice) {
+        Write-Host 'Cancelled.' -ForegroundColor Yellow
+        Wait-ForKey
+        return
+    }
+    $exportAction = if ([string]::IsNullOrEmpty($choice.Value)) { 'Clear' } else { 'Set' }
+
+    $rawRows = @(
+        $pairs | ForEach-Object {
+            New-UserDeviceBulkRow -Device $_.Device -User $_.User -Relationship $_.Relationship -Value $choice.Value -Action $exportAction
+        }
+    )
+    $rows = @(Merge-UserDeviceBulkRows $rawRows)
+    $eligible = @($rows | Where-Object { $_.Eligible })
+    $ineligible = @($rows | Where-Object { -not $_.Eligible })
+
+    Write-Host ''
+    Write-Host "Found $($rows.Count) Windows device(s) for $($resolved.Users.Count) user(s)." -ForegroundColor Green
+    Write-Host "  $($eligible.Count) are eligible to change with the current device scope."
+    if ($ineligible.Count -gt 0) {
+        Write-Host "  $($ineligible.Count) are Windows but not eligible (join type / settings)." -ForegroundColor Yellow
+    }
+
+    $exportRows = $eligible
+    if ($ineligible.Count -gt 0 -and (Read-YesNo 'Include ineligible Windows devices in the CSV as well?' $false)) {
+        $exportRows = $rows
+    }
+    if ($exportRows.Count -eq 0) {
+        Write-Host 'Nothing to export. Turn off "Registered only" in Settings if you want Entra joined / hybrid devices included.' -ForegroundColor Yellow
+        Wait-ForKey
+        return
+    }
+
+    $previewColumns = 'DisplayName', 'DeviceId', 'UserPrincipalName', 'Relationship', 'JoinType', 'CurrentExtensionAttribute1', 'Value', 'Action', 'Eligible'
+    while ($true) {
+        Write-Title 'User device CSV preview'
+        $exportRows | Select-Object -Property $previewColumns | Format-Table -AutoSize -Wrap | Out-Host
+
+        Write-Host "  1) Export $($exportRows.Count) row(s) for bulk update"
+        if (Test-GridViewAvailable) { Write-Host '  2) Open preview in grid view' }
+        Write-Host '  0) Cancel'
+
+        switch (Read-Choice) {
+            '1' {
+                $defaultPath = Join-Path $script:Root ('CAExemption-UserDevices_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+                $path = ([string](Read-Host "Save to [$defaultPath]")).Trim().Trim('"')
+                if (-not $path) { $path = $defaultPath }
+                try {
+                    $folder = Split-Path -Parent $path
+                    if ($folder -and -not (Test-Path -LiteralPath $folder)) {
+                        New-Item -ItemType Directory -Path $folder -Force | Out-Null
+                    }
+                    $exportRows | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+                    Write-Host "Exported to $path" -ForegroundColor Green
+                    Write-Host 'Columns DeviceId, ObjectId, DisplayName, Value and Action can be fed straight into bulk update.'
+                }
+                catch {
+                    Write-Host "Export failed: $($_.Exception.Message)" -ForegroundColor Red
+                    Wait-ForKey
+                    return
+                }
+                if (Read-YesNo 'Run bulk update from this CSV now?' $true) {
+                    Invoke-BulkUpdate -Path $path
+                }
+                else {
+                    Wait-ForKey
+                }
+                return
+            }
+            '2' {
+                if (Test-GridViewAvailable) {
+                    $exportRows | Select-Object -Property $previewColumns | Out-GridView -Title 'Windows devices by user'
+                }
+                else {
+                    Write-Host 'Out-GridView is not available in this session.' -ForegroundColor Yellow
+                }
+            }
+            '0' { return }
+            default { Write-Host 'Invalid choice.' -ForegroundColor Yellow }
+        }
+    }
+}
+
 function Export-CsvTemplate {
     Write-Title 'Export CSV template'
 
@@ -1665,7 +2224,7 @@ function Show-ConditionalAccessHelp {
     Write-Host '  - Graph trustType Workplace = CA trustType AzureADRegistered (Entra registered / workplace join).'
     Write-Host '  - Graph AzureAd = CA AzureADJoined. Graph ServerAd = CA ServerADJoined.'
     Write-Host '  - extensionAttribute1 lives in the cloud. It is not synced from on-premises Active Directory.'
-    Write-Host "  - Required Graph permission: $($script:RequiredScope)"
+    Write-Host ("  - Required Graph permissions: {0}" -f ($script:RequiredScopes -join ', '))
     Write-Host '  - Entra roles that can write device attributes: Cloud Device Administrator, Intune Administrator, Global Administrator.'
     Wait-ForKey
 }
@@ -1753,10 +2312,11 @@ function Show-MainMenu {
         Write-Host '  1) List Windows devices'
         Write-Host '  2) Add, modify or clear the value on one device'
         Write-Host '  3) Bulk update devices from a CSV'
-        Write-Host '  4) Export a CSV template'
-        Write-Host '  5) Settings (default value, dry-run, log path, device scope)'
-        Write-Host '  6) Connect or switch tenant'
-        Write-Host '  7) Conditional Access filter help'
+        Write-Host '  4) Find Windows devices by user and export a bulk-update CSV'
+        Write-Host '  5) Export a CSV template'
+        Write-Host '  6) Settings (default value, dry-run, log path, device scope)'
+        Write-Host '  7) Connect or switch tenant'
+        Write-Host '  8) Conditional Access filter help'
         Write-Host '  Q) Quit'
         Write-Host ''
 
@@ -1764,10 +2324,11 @@ function Show-MainMenu {
             '1' { if (Connect-Graph) { Show-DeviceList } else { Wait-ForKey } }
             '2' { if (Connect-Graph) { Invoke-SingleDeviceUpdate } else { Wait-ForKey } }
             '3' { if (Connect-Graph) { Invoke-BulkUpdate } else { Wait-ForKey } }
-            '4' { Export-CsvTemplate }
-            '5' { Show-SettingsMenu }
-            '6' { [void](Connect-Graph -Reconnect); Wait-ForKey }
-            '7' { Show-ConditionalAccessHelp }
+            '4' { if (Connect-Graph) { Invoke-UserDeviceCsvExport } else { Wait-ForKey } }
+            '5' { Export-CsvTemplate }
+            '6' { Show-SettingsMenu }
+            '7' { [void](Connect-Graph -Reconnect); Wait-ForKey }
+            '8' { Show-ConditionalAccessHelp }
             'Q' { return }
             default { Write-Host 'Invalid choice.' -ForegroundColor Yellow; Start-Sleep -Milliseconds 600 }
         }

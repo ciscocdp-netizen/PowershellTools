@@ -307,6 +307,63 @@ $planFallback = @(New-BulkUpdatePlan -Rows @(
 Assert-Equal -Expected 'Ready' -Actual $planFallback[0].Status -Name 'Missing Value uses fallback'
 Assert-Equal -Expected 'CAExempt' -Actual $planFallback[0].NewValue -Name 'Fallback value is applied'
 
+# --- User search / bulk CSV from users ---
+Assert-Equal -Expected 0 -Actual @(Split-UserSearchTokens '').Count -Name 'Split-UserSearchTokens empty'
+$split = @(Split-UserSearchTokens "jane.doe@contoso.com, alex.smith@contoso.com;`nJane Doe")
+Assert-Equal -Expected 3 -Actual $split.Count -Name 'Split-UserSearchTokens splits comma, semicolon and newline'
+Assert-Equal -Expected 'jane.doe@contoso.com' -Actual $split[0] -Name 'Split-UserSearchTokens first token'
+$deduped = @(Split-UserSearchTokens "Jane.Doe@contoso.com, jane.doe@contoso.com")
+Assert-Equal -Expected 1 -Actual $deduped.Count -Name 'Split-UserSearchTokens de-duplicates case-insensitively'
+
+$userHt = @{
+    id                = 'AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA'
+    displayName       = 'Jane Doe'
+    userPrincipalName = 'jane.doe@contoso.com'
+    mail              = 'jane.doe@contoso.com'
+    accountEnabled    = $true
+}
+$userRec = ConvertTo-UserRecord $userHt
+Assert-Equal -Expected 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' -Actual $userRec.ObjectId -Name 'ConvertTo-UserRecord canonical object id'
+Assert-Equal -Expected 'Jane Doe' -Actual $userRec.DisplayName -Name 'ConvertTo-UserRecord display name'
+Assert-Equal -Expected 'jane.doe@contoso.com' -Actual $userRec.UserPrincipalName -Name 'ConvertTo-UserRecord UPN'
+
+$userUri = New-GraphUserListUri -Filter "userPrincipalName eq 'jane.doe@contoso.com'"
+Assert-True ($userUri -match [regex]::Escape('$filter=')) 'User URI contains $filter'
+Assert-True ($userUri -match 'users\?') 'User URI targets /users'
+Assert-True ($userUri -notmatch '`\$filter') 'User URI has no backtick before $filter'
+
+$userMap = Resolve-UserCsvColumnMap @('UPN', 'Email', 'FullName', 'UserObjectId')
+Assert-Equal -Expected 'UPN' -Actual $userMap['UserPrincipalName'] -Name 'User CSV alias UPN'
+Assert-Equal -Expected 'Email' -Actual $userMap['Mail'] -Name 'User CSV alias Email'
+Assert-Equal -Expected 'FullName' -Actual $userMap['DisplayName'] -Name 'User CSV alias FullName'
+Assert-Equal -Expected 'UserObjectId' -Actual $userMap['ObjectId'] -Name 'User CSV alias UserObjectId'
+
+$userCsvRow = [pscustomobject]@{ UPN = 'jane.doe@contoso.com'; Email = ''; FullName = ''; UserObjectId = '' }
+Assert-Equal -Expected 'jane.doe@contoso.com' -Actual (Get-UserRowSearchToken $userCsvRow $userMap) -Name 'User CSV row prefers UPN'
+
+$bulkRow = New-UserDeviceBulkRow -Device $devA -User $userRec -Relationship 'Registered' -Value 'CAExempt' -Action 'Set'
+Assert-Equal -Expected $devA.DeviceId -Actual $bulkRow.DeviceId -Name 'User bulk row DeviceId'
+Assert-Equal -Expected 'Set' -Actual $bulkRow.Action -Name 'User bulk row Action'
+Assert-Equal -Expected 'CAExempt' -Actual $bulkRow.Value -Name 'User bulk row Value'
+Assert-Equal -Expected 'jane.doe@contoso.com' -Actual $bulkRow.UserPrincipalName -Name 'User bulk row UPN'
+
+$clearRow = New-UserDeviceBulkRow -Device $devA -User $userRec -Relationship 'Owned' -Value 'ignored' -Action 'Clear'
+Assert-Equal -Expected '' -Actual $clearRow.Value -Name 'Clear bulk row blanks Value'
+
+$otherUser = [pscustomobject]@{ ObjectId = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'; DisplayName = 'Alex Smith'; UserPrincipalName = 'alex.smith@contoso.com'; Mail = ''; Enabled = $true }
+$merged = @(Merge-UserDeviceBulkRows @(
+        (New-UserDeviceBulkRow -Device $devA -User $userRec -Relationship 'Registered' -Value 'CAExempt' -Action 'Set'),
+        (New-UserDeviceBulkRow -Device $devA -User $userRec -Relationship 'Owned' -Value 'CAExempt' -Action 'Set'),
+        (New-UserDeviceBulkRow -Device $devB -User $otherUser -Relationship 'Registered' -Value 'CAExempt' -Action 'Set')
+    ))
+Assert-Equal -Expected 2 -Actual $merged.Count -Name 'Merge-UserDeviceBulkRows de-duplicates the same device'
+$mergedA = @($merged | Where-Object { $_.DeviceId -eq $devA.DeviceId })[0]
+Assert-True ($mergedA.Relationship -match 'Registered') 'Merged relationship keeps Registered'
+Assert-True ($mergedA.Relationship -match 'Owned') 'Merged relationship keeps Owned'
+
+$userExportPlan = @(New-BulkUpdatePlan -Rows @($bulkRow) -DeviceIndex $index -FallbackValue 'CAExempt' -SkipMissing $false)
+Assert-Equal -Expected 'Ready' -Actual $userExportPlan[0].Status -Name 'User-exported bulk CSV is ready for bulk update'
+
 Write-Host ''
 Write-Host ("Passed: {0}  Failed: {1}" -f $script:Passed, $script:Failed) -ForegroundColor $(if ($script:Failed -eq 0) { 'Green' } else { 'Red' })
 if ($script:Failed -gt 0) { exit 1 }

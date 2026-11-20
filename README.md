@@ -10,9 +10,11 @@ Windows administration scripts for Microsoft Entra ID, Active Directory, DHCP, a
 .\Set-EntraDeviceCAExemption.ps1
 ```
 
-Requirements: `Microsoft.Graph.Authentication`, delegated `Device.ReadWrite.All`, and an Entra role that can write device objects (Cloud Device Administrator, Intune Administrator, or Global Administrator).
+Requirements: `Microsoft.Graph.Authentication`, delegated `Device.ReadWrite.All` and `User.Read.All`, and an Entra role that can write device objects (Cloud Device Administrator, Intune Administrator, or Global Administrator).
 
 CSV bulk updates accept `DeviceId`, `ObjectId`, or `DisplayName`, plus optional `Value` and `Action` (`Set` or `Clear`). Headers such as `Device ID`, `Name`, and `Operation` are accepted. Comma, semicolon, and tab delimited files are detected automatically.
+
+Menu option 4 looks up Windows devices registered to or owned by one or more users (typed, or a user CSV) and writes a bulk-update CSV with `DeviceId`, `ObjectId`, `DisplayName`, `Value`, and `Action` already filled.
 
 Helper tests (no Graph sign-in required):
 
