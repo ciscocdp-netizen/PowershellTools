@@ -83,8 +83,20 @@ Assert-Equal -Expected $null -Actual (ConvertTo-CanonicalGuid 'KIOSK-01') -Name 
 Assert-Equal -Expected 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' -Actual (ConvertTo-CanonicalGuid ([guid]'AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA')) -Name 'ConvertTo-CanonicalGuid accepts Guid objects'
 Assert-True (Test-LooksLikeGuid 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb') 'Test-LooksLikeGuid accepts a GUID'
 
+# --- Graph 5.1 output type ---
+Assert-Equal -Expected 'PSObject' -Actual (Get-PreferredGraphOutputType @('HashTable', 'PSObject', 'Json')) -Name 'Graph output prefers PSObject over HashTable'
+Assert-Equal -Expected 'Json' -Actual (Get-PreferredGraphOutputType @('HashTable', 'Json')) -Name 'Graph output falls back to Json'
+Assert-Equal -Expected 'PSObject' -Actual (Get-PreferredGraphOutputType @()) -Name 'Graph output defaults to PSObject'
+Assert-Equal -Expected $null -Actual (Get-PreferredGraphOutputType @('HashTable')) -Name 'Graph output skips HashTable-only'
+try { throw 'Argument types do not match' } catch {
+    Assert-True (Test-ArgumentTypesMismatch $_) 'Detects Argument types do not match'
+    Assert-True ((Format-CaughtError $_) -like 'Argument types do not match*') 'Format-CaughtError keeps the mismatch message'
+}
+Assert-True (-not (Test-ArgumentTypesMismatch (New-Object System.Management.Automation.ErrorRecord ([Exception]'nope'), 'x', 'NotSpecified', $null))) 'Other errors are not treated as type mismatch'
+
 # --- Join types / eligibility ---
 Assert-Equal -Expected 'Entra registered' -Actual (Get-JoinTypeLabel 'Workplace') -Name 'Workplace label'
+Assert-Equal -Expected 'Unknown' -Actual (Get-JoinTypeLabel $null) -Name 'Get-JoinTypeLabel null is Unknown'
 Assert-Equal -Expected 'Entra joined' -Actual (Get-JoinTypeLabel 'AzureAd') -Name 'AzureAd label'
 Assert-Equal -Expected 'Hybrid joined' -Actual (Get-JoinTypeLabel 'ServerAd') -Name 'ServerAd label'
 Assert-Equal -Expected 'Unknown' -Actual (Get-JoinTypeLabel '') -Name 'Empty trustType label'

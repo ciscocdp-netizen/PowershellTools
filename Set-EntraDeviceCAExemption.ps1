@@ -91,6 +91,7 @@ param(
     [string]$SettingsPath
 )
 
+$script:ToolVersion    = '1.0.3'
 $script:Root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $script:SettingsFile = if ($SettingsPath) { $SettingsPath } else { Join-Path $script:Root 'CAExemption.settings.json' }
 $script:RequiredScope  = 'Device.ReadWrite.All'
@@ -283,6 +284,23 @@ function ConvertTo-PlainValue {
     return $Value
 }
 
+function Add-ToolProperty {
+    param($Object, [string]$Name, $Value)
+    if ($null -eq $Object) { return $Object }
+    if ($null -ne $Value -and $Value -is [System.Collections.IList] -and -not ($Value -is [System.Array]) -and -not ($Value -is [string])) {
+        $Value = ConvertTo-ObjectArray $Value
+        if ($null -eq $Value) { $Value = [object[]]::new(0) }
+    }
+    $existing = $Object.PSObject.Properties[$Name]
+    if ($existing) {
+        $existing.Value = $Value
+    }
+    else {
+        Add-Member -InputObject $Object -NotePropertyName $Name -NotePropertyValue $Value
+    }
+    return $Object
+}
+
 function New-ToolObject {
     param([AllowEmptyCollection()][object[]]$Properties)
     # Windows PowerShell 5.1 throws "Argument types do not match" when a hashtable
@@ -294,11 +312,7 @@ function New-ToolObject {
         $name = [string]$Properties[$i]
         $value = $null
         if (($i + 1) -lt $Properties.Count) { $value = $Properties[$i + 1] }
-        if ($null -ne $value -and $value -is [System.Collections.IList] -and -not ($value -is [System.Array]) -and -not ($value -is [string])) {
-            $value = ConvertTo-ObjectArray $value
-            if ($null -eq $value) { $value = [object[]]::new(0) }
-        }
-        Add-Member -InputObject $object -NotePropertyName $name -NotePropertyValue $value
+        [void](Add-ToolProperty $object $name $value)
     }
     return $object
 }
@@ -505,6 +519,37 @@ function Get-GraphErrorMessage {
     return $message
 }
 
+function Format-CaughtError {
+    param($ErrorRecord)
+    $message = Get-GraphErrorMessage $ErrorRecord
+    $line = 0
+    try { $line = [int]$ErrorRecord.InvocationInfo.ScriptLineNumber } catch { }
+    if ($line -gt 0) {
+        return ('{0}  [line {1}]' -f $message, $line)
+    }
+    return $message
+}
+
+function Test-ArgumentTypesMismatch {
+    param($ErrorRecord)
+    $message = [string]$ErrorRecord.Exception.Message
+    return ($message -like '*Argument types do not match*')
+}
+
+function Get-PreferredGraphOutputType {
+    param([string[]]$ValidValues)
+    $candidates = @('PSObject', 'Json')
+    if ($null -eq $ValidValues -or $ValidValues.Count -eq 0) { return $candidates[0] }
+    foreach ($candidate in $candidates) {
+        foreach ($value in $ValidValues) {
+            if ([string]::Equals([string]$value, $candidate, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $candidate
+            }
+        }
+    }
+    return $null
+}
+
 function Get-RetryDelaySeconds {
     param($ErrorRecord, [int]$Attempt)
     $delay = [Math]::Min(60, [int][Math]::Pow(2, [Math]::Max(1, $Attempt)))
@@ -663,13 +708,37 @@ function Invoke-GraphRequestWithRetry {
     if ($null -ne $Body) { $params['Body'] = $Body }
     if ($ContentType) { $params['ContentType'] = $ContentType }
     if ($Headers) { $params['Headers'] = $Headers }
-    if ($command.Parameters.ContainsKey('OutputType')) { $params['OutputType'] = 'HashTable' }
+
+    # Windows PowerShell 5.1 cannot put nested PSCustomObjects/arrays into a Hashtable.
+    # Device payloads include extensionAttributes and physicalIds, so HashTable output throws
+    # "Argument types do not match". Prefer PSObject (or JSON parsed to objects).
+    $validOutputTypes = @()
+    if ($command.Parameters.ContainsKey('OutputType')) {
+        foreach ($attr in $command.Parameters['OutputType'].Attributes) {
+            if ($attr -is [System.Management.Automation.ValidateSetAttribute]) {
+                $validOutputTypes = @($attr.ValidValues)
+            }
+        }
+        $outputType = Get-PreferredGraphOutputType $validOutputTypes
+        if ($outputType) { $params['OutputType'] = $outputType }
+    }
 
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         try {
-            return Invoke-MgGraphRequest @params -ErrorAction Stop
+            $result = Invoke-MgGraphRequest @params -ErrorAction Stop
+            if ($result -is [string]) {
+                $text = $result.Trim()
+                if ($text.StartsWith('{') -or $text.StartsWith('[')) {
+                    try { return ($result | ConvertFrom-Json) } catch { return $result }
+                }
+            }
+            return $result
         }
         catch {
+            if ($params.ContainsKey('OutputType') -and (Test-ArgumentTypesMismatch $_)) {
+                $params.Remove('OutputType')
+                continue
+            }
             $status = Get-GraphExceptionStatusCode $_
             if ($status -in 429, 503, 504 -and $attempt -lt $MaxAttempts) {
                 $wait = Get-RetryDelaySeconds $_ $attempt
@@ -716,7 +785,8 @@ function Invoke-GraphGetAll {
 }
 
 function Get-JoinTypeLabel {
-    param([string]$TrustType)
+    param($TrustType)
+    $TrustType = [string](ConvertTo-PlainValue $TrustType)
     switch ($TrustType) {
         'Workplace' { return 'Entra registered' }
         'AzureAd'   { return 'Entra joined' }
@@ -756,21 +826,20 @@ function ConvertTo-DeviceRecord {
     $objectId = ConvertTo-CanonicalGuid (Get-GraphProperty $Item 'id')
     if (-not $objectId) { $objectId = [string](Get-GraphProperty $Item 'id') }
 
-    $record = New-ToolObject @(
-        'DisplayName', [string](Get-GraphProperty $Item 'displayName')
-        'DeviceId', [string]$deviceId
-        'ObjectId', [string]$objectId
-        'OperatingSystem', $os
-        'OSVersion', [string](Get-GraphProperty $Item 'operatingSystemVersion')
-        'TrustType', $trust
-        'JoinType', (Get-JoinTypeLabel $trust)
-        'Enabled', (ConvertTo-PlainValue (Get-GraphProperty $Item 'accountEnabled'))
-        'LastSignIn', (ConvertTo-PlainValue (Get-GraphProperty $Item 'approximateLastSignInDateTime'))
-        'LastSignInDisplay', (Format-DateTimeDisplay (Get-GraphProperty $Item 'approximateLastSignInDateTime'))
-        'ExtensionAttribute1', (ConvertTo-PlainValue $extensionAttribute1)
-        'IsManagementRestricted', (ConvertTo-PlainValue (Get-GraphProperty $Item 'isManagementRestricted'))
-        'Eligible', $false
-    )
+    $record = New-Object PSObject
+    [void](Add-ToolProperty $record 'DisplayName' ([string](Get-GraphProperty $Item 'displayName')))
+    [void](Add-ToolProperty $record 'DeviceId' ([string]$deviceId))
+    [void](Add-ToolProperty $record 'ObjectId' ([string]$objectId))
+    [void](Add-ToolProperty $record 'OperatingSystem' $os)
+    [void](Add-ToolProperty $record 'OSVersion' ([string](Get-GraphProperty $Item 'operatingSystemVersion')))
+    [void](Add-ToolProperty $record 'TrustType' $trust)
+    [void](Add-ToolProperty $record 'JoinType' (Get-JoinTypeLabel $trust))
+    [void](Add-ToolProperty $record 'Enabled' (ConvertTo-PlainValue (Get-GraphProperty $Item 'accountEnabled')))
+    [void](Add-ToolProperty $record 'LastSignIn' (ConvertTo-PlainValue (Get-GraphProperty $Item 'approximateLastSignInDateTime')))
+    [void](Add-ToolProperty $record 'LastSignInDisplay' (Format-DateTimeDisplay (Get-GraphProperty $Item 'approximateLastSignInDateTime')))
+    [void](Add-ToolProperty $record 'ExtensionAttribute1' (ConvertTo-PlainValue $extensionAttribute1))
+    [void](Add-ToolProperty $record 'IsManagementRestricted' (ConvertTo-PlainValue (Get-GraphProperty $Item 'isManagementRestricted')))
+    [void](Add-ToolProperty $record 'Eligible' $false)
     $record.Eligible = Test-DeviceEligible $record
     return $record
 }
@@ -915,13 +984,13 @@ function ConvertTo-UserRecord {
     param($Item)
     $objectId = ConvertTo-CanonicalGuid (Get-GraphProperty $Item 'id')
     if (-not $objectId) { $objectId = [string](Get-GraphProperty $Item 'id') }
-    return (New-ToolObject @(
-            'ObjectId', [string]$objectId
-            'DisplayName', [string](Get-GraphProperty $Item 'displayName')
-            'UserPrincipalName', [string](Get-GraphProperty $Item 'userPrincipalName')
-            'Mail', [string](Get-GraphProperty $Item 'mail')
-            'Enabled', (ConvertTo-PlainValue (Get-GraphProperty $Item 'accountEnabled'))
-        ))
+    $record = New-Object PSObject
+    [void](Add-ToolProperty $record 'ObjectId' ([string]$objectId))
+    [void](Add-ToolProperty $record 'DisplayName' ([string](Get-GraphProperty $Item 'displayName')))
+    [void](Add-ToolProperty $record 'UserPrincipalName' ([string](Get-GraphProperty $Item 'userPrincipalName')))
+    [void](Add-ToolProperty $record 'Mail' ([string](Get-GraphProperty $Item 'mail')))
+    [void](Add-ToolProperty $record 'Enabled' (ConvertTo-PlainValue (Get-GraphProperty $Item 'accountEnabled')))
+    return $record
 }
 
 function Split-UserSearchTokens {
@@ -1034,7 +1103,7 @@ function Get-UserRelatedWindowsDevices {
         }
         catch {
             $status = Get-GraphExceptionStatusCode $_
-            if ($status -eq 400) {
+            if ($status -eq 400 -or (Test-ArgumentTypesMismatch $_)) {
                 $fallback = '{0}/{1}/{2}?$top=999' -f $script:GraphUsersBase, $User.ObjectId, $endpoint.Path
                 $raw = @(Invoke-GraphGetAll -Uri $fallback -Activity ('Retrieving {0} devices for {1}' -f $endpoint.Name.ToLower(), $User.UserPrincipalName))
             }
@@ -1046,7 +1115,15 @@ function Get-UserRelatedWindowsDevices {
             }
         }
 
-        foreach ($record in @(ConvertTo-DeviceRecords $raw)) {
+        foreach ($item in @($raw)) {
+            $record = $null
+            try {
+                $record = ConvertTo-DeviceRecord $item
+            }
+            catch {
+                Write-Host ("  Skipping a {0} device for {1}: {2}" -f $endpoint.Name.ToLower(), $User.UserPrincipalName, (Format-CaughtError $_)) -ForegroundColor Yellow
+                continue
+            }
             if ([string]::IsNullOrWhiteSpace($record.OperatingSystem) -and $record.ObjectId) {
                 try {
                     $full = Invoke-GraphRequestWithRetry -Method GET -Uri ('{0}/{1}?$select={2}' -f $script:GraphBase, $record.ObjectId, $script:SelectFields)
@@ -1055,11 +1132,11 @@ function Get-UserRelatedWindowsDevices {
                 catch { }
             }
             if ($record.OperatingSystem -notlike 'Windows*') { continue }
-            $pairs.Add((New-ToolObject @(
-                        'Device', $record
-                        'User', $User
-                        'Relationship', $endpoint.Name
-                    )))
+            $pair = New-Object PSObject
+            [void](Add-ToolProperty $pair 'Device' $record)
+            [void](Add-ToolProperty $pair 'User' $User)
+            [void](Add-ToolProperty $pair 'Relationship' $endpoint.Name)
+            $pairs.Add($pair)
         }
     }
 
@@ -2184,7 +2261,7 @@ function Invoke-UserDeviceCsvExport {
             }
         }
         catch {
-            Write-Host "Failed to get devices for $($user.UserPrincipalName): $(Get-GraphErrorMessage $_)" -ForegroundColor Red
+            Write-Host "Failed to get devices for $($user.UserPrincipalName): $(Format-CaughtError $_)" -ForegroundColor Red
         }
     }
 
@@ -2390,6 +2467,7 @@ function Show-MainMenu {
 
         $context = $null
         try { $context = Get-MgContext } catch { }
+        Write-Host "  Tool version  : $($script:ToolVersion)"
         if ($context) {
             Write-Host "  Signed in     : $($context.Account)"
             Write-Host "  Tenant        : $($context.TenantId)"
