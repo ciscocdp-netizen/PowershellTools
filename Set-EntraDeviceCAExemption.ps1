@@ -91,7 +91,7 @@ param(
     [string]$SettingsPath
 )
 
-$script:ToolVersion    = '1.0.3'
+$script:ToolVersion    = '1.0.4'
 $script:Root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $script:SettingsFile = if ($SettingsPath) { $SettingsPath } else { Join-Path $script:Root 'CAExemption.settings.json' }
 $script:RequiredScope  = 'Device.ReadWrite.All'
@@ -781,7 +781,7 @@ function Invoke-GraphGetAll {
     finally {
         Write-Progress -Activity $Activity -Completed
     }
-    return $items.ToArray()
+    return (ConvertTo-ObjectArray $items)
 }
 
 function Get-JoinTypeLabel {
@@ -902,8 +902,8 @@ function Get-WindowsRegisteredDevices {
         try {
             $uri = New-GraphDeviceListUri -Filter $filter
             $raw = Invoke-GraphGetAll -Uri $uri -Activity 'Retrieving Windows devices from Entra ID'
-            $records = @(ConvertTo-DeviceRecords $raw | Where-Object { $_.Eligible } | Sort-Object DisplayName)
-            return @($records)
+            $records = ConvertTo-ObjectArray (ConvertTo-DeviceRecords $raw | Where-Object { $_.Eligible } | Sort-Object DisplayName)
+            return $records
         }
         catch {
             $lastError = $_
@@ -1115,7 +1115,7 @@ function Get-UserRelatedWindowsDevices {
             }
         }
 
-        foreach ($item in @($raw)) {
+        foreach ($item in (ConvertTo-ObjectArray $raw)) {
             $record = $null
             try {
                 $record = ConvertTo-DeviceRecord $item
@@ -1140,7 +1140,9 @@ function Get-UserRelatedWindowsDevices {
         }
     }
 
-    return @($pairs)
+    # Windows PowerShell 5.1 throws "Argument types do not match" for @($genericList)
+    # when the list holds PSCustomObjects with nested objects (Device/User).
+    return (ConvertTo-ObjectArray $pairs)
 }
 
 function Write-AuditLog {
@@ -1387,7 +1389,7 @@ function Merge-UserDeviceBulkRows {
             $byKey[$key] = $row
         }
     }
-    return @($byKey.Values)
+    return (ConvertTo-ObjectArray $byKey.Values)
 }
 
 function New-DeviceIndex {
@@ -2254,9 +2256,9 @@ function Invoke-UserDeviceCsvExport {
     Write-Host ''
     Write-Host "Retrieving Windows devices registered to or owned by $($resolved.Users.Count) user(s)..."
     $pairs = New-Object System.Collections.Generic.List[object]
-    foreach ($user in @($resolved.Users)) {
+    foreach ($user in (ConvertTo-ObjectArray $resolved.Users)) {
         try {
-            foreach ($pair in @(Get-UserRelatedWindowsDevices $user)) {
+            foreach ($pair in (ConvertTo-ObjectArray (Get-UserRelatedWindowsDevices $user))) {
                 $pairs.Add($pair)
             }
         }
@@ -2279,14 +2281,13 @@ function Invoke-UserDeviceCsvExport {
     }
     $exportAction = if ([string]::IsNullOrEmpty($choice.Value)) { 'Clear' } else { 'Set' }
 
-    $rawRows = @(
-        $pairs | ForEach-Object {
-            New-UserDeviceBulkRow -Device $_.Device -User $_.User -Relationship $_.Relationship -Value $choice.Value -Action $exportAction
-        }
-    )
-    $rows = @(Merge-UserDeviceBulkRows $rawRows)
-    $eligible = @($rows | Where-Object { $_.Eligible })
-    $ineligible = @($rows | Where-Object { -not $_.Eligible })
+    $rawRows = New-Object System.Collections.Generic.List[object]
+    foreach ($pair in (ConvertTo-ObjectArray $pairs)) {
+        $rawRows.Add((New-UserDeviceBulkRow -Device $pair.Device -User $pair.User -Relationship $pair.Relationship -Value $choice.Value -Action $exportAction))
+    }
+    $rows = ConvertTo-ObjectArray (Merge-UserDeviceBulkRows (ConvertTo-ObjectArray $rawRows))
+    $eligible = ConvertTo-ObjectArray ($rows | Where-Object { $_.Eligible })
+    $ineligible = ConvertTo-ObjectArray ($rows | Where-Object { -not $_.Eligible })
 
     Write-Host ''
     Write-Host "Found $($rows.Count) Windows device(s) for $($resolved.Users.Count) user(s)." -ForegroundColor Green

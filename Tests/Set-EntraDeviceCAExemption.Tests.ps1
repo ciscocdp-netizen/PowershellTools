@@ -339,6 +339,11 @@ Assert-Equal -Expected 'jane.doe@contoso.com' -Actual @($fromList.Users)[0] -Nam
 
 $nestedInner = New-ToolObject @('Name', 'KIOSK-01')
 $nestedOuter = New-ToolObject @('Device', $nestedInner, 'Relationship', 'Registered')
+$nestedList = New-Object System.Collections.Generic.List[object]
+$nestedList.Add($nestedOuter)
+$nestedArr = ConvertTo-ObjectArray $nestedList
+Assert-Equal -Expected 1 -Actual $nestedArr.Count -Name 'ConvertTo-ObjectArray preserves Generic.List of nested objects'
+Assert-Equal -Expected 'KIOSK-01' -Actual $nestedArr[0].Device.Name -Name 'ConvertTo-ObjectArray keeps nested PSCustomObject properties'
 Assert-Equal -Expected 'KIOSK-01' -Actual $nestedOuter.Device.Name -Name 'New-ToolObject can nest PSCustomObject values'
 Assert-Equal -Expected 'Registered' -Actual $nestedOuter.Relationship -Name 'New-ToolObject keeps sibling properties'
 Assert-Equal -Expected $true -Actual (ConvertTo-PlainValue $true) -Name 'ConvertTo-PlainValue leaves bools'
