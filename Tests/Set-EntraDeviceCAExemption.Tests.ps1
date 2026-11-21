@@ -88,6 +88,10 @@ Assert-Equal -Expected 'PSObject' -Actual (Get-PreferredGraphOutputType @('HashT
 Assert-Equal -Expected 'Json' -Actual (Get-PreferredGraphOutputType @('HashTable', 'Json')) -Name 'Graph output falls back to Json'
 Assert-Equal -Expected 'PSObject' -Actual (Get-PreferredGraphOutputType @()) -Name 'Graph output defaults to PSObject'
 Assert-Equal -Expected $null -Actual (Get-PreferredGraphOutputType @('HashTable')) -Name 'Graph output skips HashTable-only'
+Assert-Equal -Expected 'HttpResponseMessage' -Actual (Get-PreferredGraphOutputType -ValidValues @('PSObject', 'HttpResponseMessage', 'HashTable') -EmptyBody) -Name 'Empty-body Graph calls prefer HttpResponseMessage'
+Assert-Equal -Expected $null -Actual (Get-PreferredGraphOutputType -ValidValues @('PSObject', 'HashTable') -EmptyBody) -Name 'Empty-body Graph calls omit PSObject/HashTable'
+Assert-True (Test-GraphReadMethod 'GET') 'GET is a read method'
+Assert-True (-not (Test-GraphReadMethod 'PATCH')) 'PATCH is not a read method'
 try { throw 'Argument types do not match' } catch {
     Assert-True (Test-ArgumentTypesMismatch $_) 'Detects Argument types do not match'
     Assert-True ((Format-CaughtError $_) -like 'Argument types do not match*') 'Format-CaughtError keeps the mismatch message'

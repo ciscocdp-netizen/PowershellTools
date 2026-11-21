@@ -91,7 +91,7 @@ param(
     [string]$SettingsPath
 )
 
-$script:ToolVersion    = '1.0.5'
+$script:ToolVersion    = '1.0.6'
 $script:Root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $script:SettingsFile = if ($SettingsPath) { $SettingsPath } else { Join-Path $script:Root 'CAExemption.settings.json' }
 $script:RequiredScope  = 'Device.ReadWrite.All'
@@ -536,10 +536,18 @@ function Test-ArgumentTypesMismatch {
     return ($message -like '*Argument types do not match*')
 }
 
+function Test-GraphReadMethod {
+    param([string]$Method)
+    return [string]::Equals($Method, 'GET', [System.StringComparison]::OrdinalIgnoreCase)
+}
+
 function Get-PreferredGraphOutputType {
-    param([string[]]$ValidValues)
-    $candidates = @('PSObject', 'Json')
-    if ($null -eq $ValidValues -or $ValidValues.Count -eq 0) { return $candidates[0] }
+    param([string[]]$ValidValues, [switch]$EmptyBody)
+    $candidates = if ($EmptyBody) { @('HttpResponseMessage') } else { @('PSObject', 'Json') }
+    if ($null -eq $ValidValues -or $ValidValues.Count -eq 0) {
+        if ($EmptyBody) { return $null }
+        return $candidates[0]
+    }
     foreach ($candidate in $candidates) {
         foreach ($value in $ValidValues) {
             if ([string]::Equals([string]$value, $candidate, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -631,8 +639,13 @@ function Initialize-GraphModule {
 }
 
 function Test-GraphConnection {
-    $context = Get-MgContext
+    $context = $null
+    try { $context = Get-MgContext } catch { return $false }
     if ($null -eq $context) { return $false }
+    if (-not $context.Account -and -not $context.TenantId) { return $false }
+    $scopes = @($context.Scopes | Where-Object { $_ })
+    # Some Graph SDK versions drop Scopes after a 204 PATCH; the token can still be valid.
+    if ($scopes.Count -eq 0) { return $true }
     foreach ($scope in $script:RequiredScopes) {
         if (-not (Test-HasGraphScope $context $scope)) { return $false }
     }
@@ -665,13 +678,18 @@ function Connect-Graph {
     $params = @{ Scopes = @($script:RequiredScopes) }
     if ($Tenant) { $params['TenantId'] = $Tenant }
     if ($connectCommand.Parameters.ContainsKey('NoWelcome')) { $params['NoWelcome'] = $true }
+    if ($connectCommand.Parameters.ContainsKey('ContextScope')) { $params['ContextScope'] = 'Process' }
     if ($useDevice -and $connectCommand.Parameters.ContainsKey('UseDeviceCode')) {
         $params['UseDeviceCode'] = $true
     }
 
     try {
-        if (Get-MgContext) {
-            try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { }
+        if ($Reconnect) {
+            $existing = $null
+            try { $existing = Get-MgContext } catch { }
+            if ($existing) {
+                try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { }
+            }
         }
         Connect-MgGraph @params | Out-Null
     }
@@ -719,7 +737,7 @@ function Invoke-GraphRequestWithRetry {
                 $validOutputTypes = @($attr.ValidValues)
             }
         }
-        $outputType = Get-PreferredGraphOutputType $validOutputTypes
+        $outputType = Get-PreferredGraphOutputType -ValidValues $validOutputTypes -EmptyBody:(-not (Test-GraphReadMethod $Method))
         if ($outputType) { $params['OutputType'] = $outputType }
     }
 
@@ -2117,6 +2135,7 @@ function Invoke-BulkUpdate {
                 try {
                     foreach ($item in $ready) {
                         $indexNo++
+                        Write-Host ("  Updating {0}/{1}: {2}" -f $indexNo, $ready.Count, $item.DisplayName)
                         Write-Progress -Activity 'Updating extensionAttribute1' -Status "$indexNo of $($ready.Count): $($item.DisplayName)" -PercentComplete ([int](($indexNo / $ready.Count) * 100))
                         $results.Add((Set-DeviceExtensionAttribute -Device $item.Device -NewValue $item.NewValue -Source $source))
                     }
