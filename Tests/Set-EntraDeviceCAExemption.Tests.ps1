@@ -410,6 +410,15 @@ Assert-True ($mergedA.Relationship -match 'Owned') 'Merged relationship keeps Ow
 $userExportPlan = @(New-BulkUpdatePlan -Rows @($bulkRow) -DeviceIndex $index -FallbackValue 'CAExempt' -SkipMissing $false)
 Assert-Equal -Expected 'Ready' -Actual $userExportPlan[0].Status -Name 'User-exported bulk CSV is ready for bulk update'
 
+$bulkHeaders = @($bulkRow.PSObject.Properties | ForEach-Object { $_.Name })
+$bulkMap = Resolve-CsvColumnMap $bulkHeaders
+$dupRow = New-UserDeviceBulkRow -Device $devA -User $userRec -Relationship 'Owned' -Value 'CAExempt' -Action 'Set'
+$nameOnly = [pscustomobject]@{ DeviceId = ''; ObjectId = ''; DisplayName = 'KIOSK-02'; Value = 'CAExempt'; Action = 'Set' }
+$targets = Get-BulkCsvLookupTargets -Rows @($bulkRow, $dupRow, $nameOnly) -ColumnMap $bulkMap
+Assert-Equal -Expected 2 -Actual @($targets).Count -Name 'Bulk CSV lookup de-duplicates DeviceId and keeps a name-only row'
+Assert-Equal -Expected $devA.DeviceId -Actual $targets[0].Search -Name 'Bulk CSV lookup prefers DeviceId'
+Assert-Equal -Expected 'KIOSK-02' -Actual $targets[1].Search -Name 'Bulk CSV lookup uses DisplayName when no GUID'
+
 Write-Host ''
 Write-Host ("Passed: {0}  Failed: {1}" -f $script:Passed, $script:Failed) -ForegroundColor $(if ($script:Failed -eq 0) { 'Green' } else { 'Red' })
 if ($script:Failed -gt 0) { exit 1 }

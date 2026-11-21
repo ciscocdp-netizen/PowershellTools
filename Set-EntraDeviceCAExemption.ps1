@@ -91,7 +91,7 @@ param(
     [string]$SettingsPath
 )
 
-$script:ToolVersion    = '1.0.4'
+$script:ToolVersion    = '1.0.5'
 $script:Root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $script:SettingsFile = if ($SettingsPath) { $SettingsPath } else { Join-Path $script:Root 'CAExemption.settings.json' }
 $script:RequiredScope  = 'Device.ReadWrite.All'
@@ -755,13 +755,28 @@ function Invoke-GraphGetAll {
     param(
         [string]$Uri,
         [string]$Activity = 'Retrieving devices from Entra ID',
-        [hashtable]$Headers
+        [hashtable]$Headers,
+        [switch]$ShowHostProgress
     )
 
     $items = New-Object System.Collections.Generic.List[object]
     $next = $Uri
+    $seenUris = @{}
+    $page = 0
     try {
         while ($next) {
+            $pageKey = [string]$next
+            if ($seenUris.ContainsKey($pageKey)) {
+                Write-Host '  Stopped pagination because Microsoft Graph repeated a page link.' -ForegroundColor Yellow
+                break
+            }
+            $seenUris[$pageKey] = $true
+            $page++
+            if ($page -gt 500) {
+                Write-Host '  Stopped pagination after 500 Graph pages.' -ForegroundColor Yellow
+                break
+            }
+
             $request = @{ Method = 'GET'; Uri = $next }
             if ($Headers) { $request['Headers'] = $Headers }
             $response = Invoke-GraphRequestWithRetry @request
@@ -769,6 +784,9 @@ function Invoke-GraphGetAll {
                 $items.Add($item)
             }
             Write-Progress -Activity $Activity -Status "$($items.Count) retrieved"
+            if ($ShowHostProgress) {
+                Write-Host ("  {0}: {1} retrieved (page {2})..." -f $Activity, $items.Count, $page)
+            }
             $nextLink = Get-GraphProperty $response '@odata.nextLink'
             if ($null -eq $nextLink -or [string]::IsNullOrWhiteSpace([string]$nextLink)) {
                 $next = $null
@@ -901,7 +919,7 @@ function Get-WindowsRegisteredDevices {
     foreach ($filter in $filters) {
         try {
             $uri = New-GraphDeviceListUri -Filter $filter
-            $raw = Invoke-GraphGetAll -Uri $uri -Activity 'Retrieving Windows devices from Entra ID'
+            $raw = Invoke-GraphGetAll -Uri $uri -Activity 'Retrieving Windows devices from Entra ID' -ShowHostProgress
             $records = ConvertTo-ObjectArray (ConvertTo-DeviceRecords $raw | Where-Object { $_.Eligible } | Sort-Object DisplayName)
             return $records
         }
@@ -1300,6 +1318,61 @@ function Get-MappedRowField {
     return Get-RowField $Row $ColumnMap[$CanonicalName]
 }
 
+function Get-BulkCsvLookupTargets {
+    param($Rows, $ColumnMap)
+    $targets = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    foreach ($row in (ConvertTo-ObjectArray $Rows)) {
+        $deviceId = ConvertTo-CanonicalGuid (Get-MappedRowField $row $ColumnMap 'DeviceId')
+        if (-not $deviceId) { $deviceId = '' }
+        $objectId = ConvertTo-CanonicalGuid (Get-MappedRowField $row $ColumnMap 'ObjectId')
+        if (-not $objectId) { $objectId = '' }
+        $name = [string](Get-MappedRowField $row $ColumnMap 'DisplayName')
+        $search = if ($deviceId) { $deviceId } elseif ($objectId) { $objectId } elseif ($name) { $name } else { $null }
+        if (-not $search) { continue }
+        $key = $search.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        $target = New-Object PSObject
+        [void](Add-ToolProperty $target 'Search' $search)
+        [void](Add-ToolProperty $target 'DeviceId' $deviceId)
+        [void](Add-ToolProperty $target 'ObjectId' $objectId)
+        [void](Add-ToolProperty $target 'DisplayName' $name)
+        $targets.Add($target)
+    }
+    return (ConvertTo-ObjectArray $targets)
+}
+
+function Get-DevicesForBulkRows {
+    param($Rows, $ColumnMap)
+    $devices = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    $targets = Get-BulkCsvLookupTargets -Rows $Rows -ColumnMap $ColumnMap
+    $total = @($targets).Count
+    $n = 0
+    foreach ($target in $targets) {
+        $n++
+        $label = $target.DisplayName
+        if (-not $label) { $label = $target.Search }
+        Write-Host ("  {0}/{1}  {2}" -f $n, $total, $label)
+        try {
+            $found = ConvertTo-ObjectArray (Find-Devices $target.Search)
+        }
+        catch {
+            Write-Host ("    Lookup failed: {0}" -f (Format-CaughtError $_)) -ForegroundColor Yellow
+            continue
+        }
+        foreach ($record in $found) {
+            $id = [string]$record.ObjectId
+            if (-not $id) { $id = [string]$record.DeviceId }
+            if ($id -and $seen.ContainsKey($id)) { continue }
+            if ($id) { $seen[$id] = $true }
+            $devices.Add($record)
+        }
+    }
+    return (ConvertTo-ObjectArray $devices)
+}
+
 function Get-RowAction {
     param($Row, $ColumnMap)
     $action = if ($ColumnMap) { Get-MappedRowField $Row $ColumnMap 'Action' } else { Get-RowField $Row 'Action' }
@@ -1559,7 +1632,7 @@ function New-BulkUpdatePlan {
                 )))
     }
 
-    return $plan.ToArray()
+    return (ConvertTo-ObjectArray $plan)
 }
 
 #endregion
@@ -1698,7 +1771,8 @@ function Show-DeviceList {
     Write-Title 'Windows Entra devices'
 
     try {
-        $devices = @(Get-WindowsRegisteredDevices)
+        Write-Host 'Large tenants can take a few minutes. A count is printed after each Graph page.' -ForegroundColor DarkGray
+        $devices = ConvertTo-ObjectArray (Get-WindowsRegisteredDevices)
     }
     catch {
         Write-Host "Failed to retrieve devices: $(Get-GraphErrorMessage $_)" -ForegroundColor Red
@@ -1970,16 +2044,16 @@ function Invoke-BulkUpdate {
     }
 
     Write-Host ''
-    $scopeText = if ($script:Settings.RegisteredOnly) { 'Windows Entra registered' } else { 'Windows' }
-    Write-Host "Retrieving $scopeText devices from Entra ID..."
+    Write-Host "Looking up $($rows.Count) CSV device(s) in Entra ID..."
     try {
-        $devices = @(Get-WindowsRegisteredDevices)
+        $devices = ConvertTo-ObjectArray (Get-DevicesForBulkRows -Rows $rows -ColumnMap $columnMap)
     }
     catch {
-        Write-Host "Failed to retrieve devices: $(Get-GraphErrorMessage $_)" -ForegroundColor Red
+        Write-Host "Failed to retrieve devices: $(Format-CaughtError $_)" -ForegroundColor Red
         Wait-ForKey
         return
     }
+    Write-Host ("Found {0} matching Entra device(s)." -f @($devices).Count) -ForegroundColor Green
 
     $index = New-DeviceIndex $devices
     $lookup = {
@@ -2003,7 +2077,7 @@ function Invoke-BulkUpdate {
         return $null
     }
 
-    $plan = @(New-BulkUpdatePlan -Rows $rows -DeviceIndex $index -ColumnMap $columnMap -FallbackValue $fallbackValue -SkipMissing $skipMissing -LookupMissingDevice $lookup)
+    $plan = ConvertTo-ObjectArray (New-BulkUpdatePlan -Rows $rows -DeviceIndex $index -ColumnMap $columnMap -FallbackValue $fallbackValue -SkipMissing $skipMissing -LookupMissingDevice $lookup)
     $planColumns = 'Row', 'Identifier', 'DisplayName', 'Current', 'New', 'Status', 'Note'
     $ready = @($plan | Where-Object { $_.Status -eq 'Ready' })
 
