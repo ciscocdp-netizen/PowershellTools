@@ -5,8 +5,8 @@
 
 .DESCRIPTION
     Windows PowerShell 5.1 GUI (no external DLLs). Exchange Online lists and restores items.
-    Microsoft Graph is optional and is called with plain REST so it does not load MSAL beside
-    ExchangeOnlineManagement. Remote work runs on one reused background runspace.
+    Sign in opens the normal Microsoft window for Exchange Online and the Microsoft Graph
+    PowerShell module. Remote work runs on one reused background runspace.
 
 .PARAMETER SelfTest
     Run the built-in logic checks and exit. No mailbox is contacted and no window is opened.
@@ -23,7 +23,7 @@ Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
 $script:AppName    = 'Mailbox Recovery Console'
-$script:AppVersion = '1.1.0'
+$script:AppVersion = '1.2.0'
 
 #region ---------- Shared helpers (also loaded into the worker runspace) ----------
 $script:SharedFunctions = {
@@ -209,6 +209,16 @@ $script:SharedFunctions = {
         return $Message
     }
 
+    function global:Get-GraphModuleEnvironment {
+        param([string]$CloudKey)
+        switch ($CloudKey) {
+            'GCCHigh' { return 'USGov' }
+            'DoD' { return 'USGovDoD' }
+            'China' { return 'China' }
+            default { return 'Global' }
+        }
+    }
+
     function global:Get-RetryAfterSeconds {
         param($Value, [int]$Default = 5, [int]$Max = 60)
         $text = [string]$Value
@@ -327,6 +337,10 @@ function Invoke-MrcSelfTest {
     Assert-Equal 'odata quote' (Get-ODataLiteral "O'Brien") "'O''Brien'"
     Assert-Equal 'exchange path' (ConvertTo-ExchangeFolderPath 'Inbox/Sub Folder/') 'Inbox\Sub Folder'
     Assert-Equal 'graph path' (ConvertTo-GraphFolderPath '\Inbox\Sub Folder\') 'Inbox/Sub Folder'
+    Assert-Equal 'graph env commercial' (Get-GraphModuleEnvironment 'Commercial') 'Global'
+    Assert-Equal 'graph env gcch' (Get-GraphModuleEnvironment 'GCCHigh') 'USGov'
+    Assert-Equal 'graph env dod' (Get-GraphModuleEnvironment 'DoD') 'USGovDoD'
+    Assert-Equal 'graph env china' (Get-GraphModuleEnvironment 'China') 'China'
     Assert-Equal 'well known inbox' (Get-WellKnownFolderId 'Inbox') 'inbox'
     Assert-True 'localized inbox is not aliased' (-not (Get-WellKnownFolderId 'Posteingang'))
     Assert-True 'folder path accepts inbox' (Test-FolderPathSafe 'Inbox/Recovered')
@@ -372,6 +386,13 @@ function Invoke-MrcSelfTest {
     }
     if ($script:WS_Init) {
         Assert-True 'init worker boots first' ($script:WS_Init.ToString() -match '(?s)^\s*\$ErrorActionPreference\s*=\s*''Stop''')
+    }
+    if ($script:WS_SignIn) {
+        $signText = $script:WS_SignIn.ToString()
+        Assert-True 'sign-in worker keeps param first' ($signText -match '(?s)^\s*param\(')
+        Assert-True 'sign-in worker boots after param' ($signText -match '(?s)param\(.*?\)\s*\$ErrorActionPreference\s*=\s*''Stop''')
+        Assert-True 'sign-in uses the graph module' ($signText -match 'Connect-MgGraph')
+        Assert-True 'sign-in uses exchange online' ($signText -match 'Connect-ExchangeOnline')
     }
 
     $shareError = ''
@@ -590,14 +611,53 @@ function global:Get-GraphAccessToken {
             if (-not $a.RefreshToken) { throw 'The Graph session has expired. Reconnect Microsoft Graph.' }
             $r = Request-GraphToken -TenantId $a.TenantId -Body @{ client_id = $a.ClientId; grant_type = 'refresh_token'; refresh_token = $a.RefreshToken; scope = $a.Scope }
         }
+        'Module' { throw 'This Graph session is held by the Microsoft Graph module. Sign in again if the call failed.' }
         default { throw "Unknown Graph auth mode '$($a.Mode)'." }
     }
     Set-GraphTokenResult $r
     return [string]$global:GraphAuth.AccessToken
 }
 
+function global:Invoke-GraphModule {
+    param([string]$Method = 'GET', [string]$Path, $Body, [hashtable]$Headers)
+    $cmd = Get-Command Invoke-MgGraphRequest -ErrorAction SilentlyContinue
+    if (-not $cmd) { throw 'The Microsoft Graph module is not loaded. Sign in again.' }
+    $uri = if ($Path -match '^https://') { $Path } else { $global:GraphBase.TrimEnd('/') + '/' + $Path.TrimStart('/') }
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        $p = @{ Method = $Method; Uri = $uri; ErrorAction = 'Stop' }
+        if ($cmd.Parameters.ContainsKey('OutputType')) { $p.OutputType = 'PSObject' }
+        if ($Headers) { $p.Headers = $Headers }
+        if ($null -ne $Body) {
+            $p.Body = ConvertTo-JsonBody -Value $Body
+            if ($cmd.Parameters.ContainsKey('ContentType')) { $p.ContentType = 'application/json' }
+        }
+        try { return Invoke-MgGraphRequest @p }
+        catch {
+            $status = 0
+            $text = Get-WebErrorText $_
+            if ($text -match '\b(429|503|504)\b') { try { $status = [int]$Matches[1] } catch { } }
+            try { if (-not $status -and $_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode } } catch { }
+            if (($status -eq 429 -or $status -eq 503 -or $status -eq 504) -and $attempt -lt 5) {
+                $wait = 5
+                try { $wait = Get-RetryAfterSeconds $_.Exception.Response.Headers['Retry-After'] } catch { }
+                Start-Sleep -Seconds $wait
+                continue
+            }
+            $extra = ''
+            if ($status -eq 403) { $extra = ' Access was denied. The signed-in account needs Full Access to the mailbox, and the Graph sign-in needs Mail.ReadWrite.Shared.' }
+            elseif ($status -eq 404) { $extra = ' The object was not found in Microsoft Graph.' }
+            throw "Graph $Method failed ($status): $text$extra"
+        }
+    }
+}
+
 function global:Invoke-Graph {
     param([string]$Method = 'GET', [string]$Path, $Body, [hashtable]$Headers)
+    if ($global:GraphAuth -and [string]$global:GraphAuth.Mode -eq 'Module') {
+        return (Invoke-GraphModule -Method $Method -Path $Path -Body $Body -Headers $Headers)
+    }
     $uri = if ($Path -match '^https://') { $Path } else { $global:GraphBase.TrimEnd('/') + '/' + $Path.TrimStart('/') }
     $attempt = 0
     $refreshed = $false
@@ -840,10 +900,13 @@ function global:Find-GraphMessagesByInternetId {
 }
 
 $exo = Get-Module -ListAvailable -Name ExchangeOnlineManagement | Sort-Object Version -Descending | Select-Object -First 1
+$graphModule = Get-Module -ListAvailable -Name Microsoft.Graph.Authentication | Sort-Object Version -Descending | Select-Object -First 1
 [pscustomobject]@{
-    PSVersion    = $PSVersionTable.PSVersion.ToString()
-    ExoInstalled = [bool]$exo
-    ExoVersion   = if ($exo) { $exo.Version.ToString() } else { '' }
+    PSVersion      = $PSVersionTable.PSVersion.ToString()
+    ExoInstalled   = [bool]$exo
+    ExoVersion     = if ($exo) { $exo.Version.ToString() } else { '' }
+    GraphInstalled = [bool]$graphModule
+    GraphVersion   = if ($graphModule) { $graphModule.Version.ToString() } else { '' }
 }
 '@
 
@@ -891,8 +954,123 @@ if (Get-Command Get-ConnectionInformation -ErrorAction SilentlyContinue) {
 }
 '@
 
+$script:WS_InstallModules = New-MrcWorker @'
+param([bool]$Exchange, [bool]$Graph)
+if (-not (Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue)) {
+    try { Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser -Confirm:$false | Out-Null }
+    catch { Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Confirm:$false | Out-Null }
+}
+try { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop } catch { }
+$names = @()
+if ($Exchange) { $names += 'ExchangeOnlineManagement' }
+if ($Graph) { $names += 'Microsoft.Graph.Authentication' }
+foreach ($name in $names) {
+    Install-Module -Name $name -Scope CurrentUser -Force -AllowClobber -Repository PSGallery -Confirm:$false | Out-Null
+}
+$env:PSModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('PSModulePath', 'User')
+$installed = @{}
+foreach ($name in $names) {
+    $m = Get-Module -ListAvailable -Name $name | Sort-Object Version -Descending | Select-Object -First 1
+    if (-not $m) { throw "$name was not found after installation." }
+    if ($m.PowerShellVersion -and $m.PowerShellVersion -gt $PSVersionTable.PSVersion) {
+        throw "Installed $name $($m.Version) requires PowerShell $($m.PowerShellVersion). This console runs on Windows PowerShell $($PSVersionTable.PSVersion)."
+    }
+    $installed[$name] = $m.Version.ToString()
+}
+[pscustomobject]$installed
+'@
+
+$script:WS_SignIn = New-MrcWorker @'
+param([string]$Upn, [bool]$ConnectExo, [bool]$ConnectGraph, [string]$ExchangeEnvironment, [string]$GraphEnvironment, [string]$LoginBase, [string]$GraphBase)
+$WarningPreference = 'SilentlyContinue'
+$InformationPreference = 'SilentlyContinue'
+$result = [ordered]@{
+    ExoConnected = $false; ExoIdentity = ''; ExoOrganization = ''; ExoVersion = ''; HasGet = $false; HasRestore = $false; ExoError = ''
+    GraphConnected = $false; GraphIdentity = ''; GraphPermissions = ''; HasMail = $false; HasMailWrite = $false; GraphVersion = ''; GraphError = ''
+}
+if ($LoginBase) { $global:LoginBase = $LoginBase }
+if ($GraphBase) { $global:GraphBase = $GraphBase }
+
+if ($ConnectGraph) {
+    try {
+        if (-not (Get-Module Microsoft.Graph.Authentication)) { Import-Module Microsoft.Graph.Authentication -ErrorAction Stop }
+        $cmd = Get-Command Connect-MgGraph -ErrorAction Stop
+        $scopes = @('Mail.ReadWrite.Shared', 'User.Read')
+        $gp = @{ Scopes = $scopes; ErrorAction = 'Stop' }
+        if ($cmd.Parameters.ContainsKey('NoWelcome')) { $gp.NoWelcome = $true }
+        if ($GraphEnvironment -and $cmd.Parameters.ContainsKey('Environment')) { $gp.Environment = $GraphEnvironment }
+        if ($cmd.Parameters.ContainsKey('ContextScope')) { $gp.ContextScope = 'Process' }
+        if ($Upn -match '@([^@\s]+)$' -and $cmd.Parameters.ContainsKey('TenantId')) { $gp.TenantId = $Matches[1] }
+        Connect-MgGraph @gp | Out-Null
+        $ctx = $null
+        if (Get-Command Get-MgContext -ErrorAction SilentlyContinue) { $ctx = Get-MgContext }
+        $global:GraphAuth = @{
+            Mode = 'Module'; AccessToken = $null; ExpiresOn = [datetime]::MaxValue; RefreshToken = $null
+            Scope = ($scopes -join ' '); TenantId = ''; ClientId = ''
+        }
+        $global:GraphRootIds = @{}
+        $scopeNames = @($scopes)
+        $account = ''
+        if ($ctx) {
+            if ($ctx.Account) { $account = [string]$ctx.Account }
+            if ($ctx.TenantId) { $global:GraphAuth.TenantId = [string]$ctx.TenantId }
+            if ($ctx.ClientId) { $global:GraphAuth.ClientId = [string]$ctx.ClientId }
+            if ($ctx.Scopes) { $scopeNames = @($ctx.Scopes | ForEach-Object { [string]$_ } | Where-Object { $_ }) }
+        }
+        if (-not $account) {
+            try {
+                $me = Invoke-Graph -Path '/me?$select=userPrincipalName'
+                if ($me.userPrincipalName) { $account = [string]$me.userPrincipalName }
+            } catch { }
+        }
+        $result.GraphConnected = $true
+        $result.GraphIdentity = if ($account) { $account } else { 'Signed in' }
+        $result.GraphPermissions = ($scopeNames -join ' ')
+        $result.HasMail = [bool]($scopeNames | Where-Object { $_ -match '(^|/)Mail\.Read' })
+        $result.HasMailWrite = [bool]($scopeNames | Where-Object { $_ -match '(^|/)Mail\.ReadWrite' })
+        $loaded = Get-Module Microsoft.Graph.Authentication | Select-Object -First 1
+        if ($loaded) { $result.GraphVersion = $loaded.Version.ToString() }
+    } catch {
+        $result.GraphError = Add-ErrorHint (Get-WebErrorText $_)
+        $global:GraphAuth = $null
+    }
+}
+
+if ($ConnectExo) {
+    try {
+        if (-not (Get-Module ExchangeOnlineManagement)) { Import-Module ExchangeOnlineManagement -ErrorAction Stop }
+        $cmd = Get-Command Connect-ExchangeOnline -ErrorAction Stop
+        $p = @{ ShowBanner = $false; ErrorAction = 'Stop' }
+        if ($Upn) { $p.UserPrincipalName = $Upn }
+        if ($cmd.Parameters.ContainsKey('DisableWAM')) { $p.DisableWAM = $true }
+        if ($ExchangeEnvironment -and $cmd.Parameters.ContainsKey('ExchangeEnvironmentName')) { $p.ExchangeEnvironmentName = $ExchangeEnvironment }
+        Connect-ExchangeOnline @p | Out-Null
+        $info = $null
+        if (Get-Command Get-ConnectionInformation -ErrorAction SilentlyContinue) {
+            $info = Get-ConnectionInformation | Where-Object { $_.State -eq 'Connected' } | Select-Object -Last 1
+        }
+        $result.ExoConnected = $true
+        $result.ExoIdentity = if ($info -and $info.UserPrincipalName) { [string]$info.UserPrincipalName } elseif ($Upn) { $Upn } else { 'Signed in' }
+        $result.ExoOrganization = if ($info -and $info.Organization) { [string]$info.Organization } else { '' }
+        $result.HasGet = [bool](Get-Command Get-RecoverableItems -ErrorAction SilentlyContinue)
+        $result.HasRestore = [bool](Get-Command Restore-RecoverableItems -ErrorAction SilentlyContinue)
+        $result.ExoVersion = (Get-Module ExchangeOnlineManagement).Version.ToString()
+    } catch {
+        $result.ExoError = Add-ErrorHint (Get-WebErrorText $_)
+    }
+}
+
+if (-not $result.ExoConnected -and -not $result.GraphConnected) {
+    $why = @($result.ExoError, $result.GraphError | Where-Object { $_ })
+    if ($why.Count -eq 0) { $why = @('Sign-in was cancelled.') }
+    throw ($why -join ' | ')
+}
+[pscustomobject]$result
+'@
+
 $script:WS_DisconnectAll = New-MrcWorker @'
 try { if (Get-Command Disconnect-ExchangeOnline -ErrorAction SilentlyContinue) { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } } catch { }
+try { if (Get-Module Microsoft.Graph.Authentication) { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } } catch { }
 $global:GraphAuth = $null
 $global:GraphRootIds = @{}
 $global:PendingDevice = $null
@@ -1280,7 +1458,9 @@ function Get-AppSettings {
         Organization    = ''
         ExoAppId        = ''
         ExoThumbprint   = ''
-        GraphMethod     = 'DeviceCode'
+        GraphMethod     = 'Interactive'
+        SignInExo       = 'True'
+        SignInGraph     = 'True'
         TenantId        = ''
         GraphClientId   = $script:DefaultGraphClientId
         GraphThumbprint = ''
@@ -1476,7 +1656,7 @@ $script:CurrentJob = $null
 $script:InJobTick = $false
 $script:State = @{
     ExoConnected = $false; ExoIdentity = ''; ExoVersion = ''; CanRestore = $false; ExoInstalled = $false
-    GraphConnected = $false; GraphIdentity = ''; GraphCanWrite = $false
+    GraphConnected = $false; GraphIdentity = ''; GraphCanWrite = $false; GraphInstalled = $false; GraphVersion = ''
     Mailbox = $null; AllItems = @(); SelectedData = $null; Batch = $null; HasSearched = $false
 }
 
@@ -1851,6 +2031,73 @@ function Show-GraphConnectDialog {
     $dlg.Dispose()
     return $r
 }
+
+function Show-SignInDialog {
+    $s = $script:Settings
+    $dlg = New-DialogForm 'Sign in to Office 365' 560 318
+    $intro = New-Object System.Windows.Forms.Label
+    $intro.Text = 'A browser window opens for each service you select. Sign in with the admin account that can manage the mailbox. The console stays open while you do.'
+    $intro.Location = New-Object System.Drawing.Point(16, 12); $intro.Size = New-Object System.Drawing.Size(528, 48)
+    $intro.ForeColor = [System.Drawing.Color]::FromArgb(71, 85, 105)
+    $dlg.Controls.Add($intro)
+    $txtUpn = Add-DialogRow $dlg 'Account (optional):' 68
+    $txtUpn.Text = $s.AdminUpn
+    $chkExo = New-Object System.Windows.Forms.CheckBox
+    $chkExo.Text = 'Exchange Online  —  find and restore mailbox items'
+    $chkExo.Location = New-Object System.Drawing.Point(16, 108); $chkExo.Size = New-Object System.Drawing.Size(520, 22); $chkExo.Checked = (Get-SettingFlag 'SignInExo' $true)
+    $chkGraph = New-Object System.Windows.Forms.CheckBox
+    $chkGraph.Text = 'Microsoft Graph  —  preview, exact folder, and verification'
+    $chkGraph.Location = New-Object System.Drawing.Point(16, 134); $chkGraph.Size = New-Object System.Drawing.Size(520, 22); $chkGraph.Checked = (Get-SettingFlag 'SignInGraph' $true)
+    $dlg.Controls.AddRange(@($chkExo, $chkGraph))
+    Add-DialogNote $dlg ("Cloud: $($script:cboCloud.Text). Pick the cloud on the main window before you sign in. Leave the account blank to choose it in the Microsoft window. Graph needs Full Access to the mailbox you restore.") 166 62
+    Add-DialogButtons $dlg 'Sign in' 246
+    $adv = New-Object System.Windows.Forms.Button
+    $adv.Text = 'Advanced'; $adv.Size = New-Object System.Drawing.Size(110, 30); $adv.Location = New-Object System.Drawing.Point(16, 246)
+    $adv.DialogResult = 'Ignore'
+    $dlg.Controls.Add($adv)
+    while ($true) {
+        $answer = $dlg.ShowDialog($script:Form)
+        if ($answer -eq 'Ignore') { $dlg.Dispose(); return 'Advanced' }
+        if ($answer -ne 'OK') { $dlg.Dispose(); return $null }
+        $upn = $txtUpn.Text.Trim()
+        if (-not $chkExo.Checked -and -not $chkGraph.Checked) { Show-Message 'Select Exchange Online, Microsoft Graph, or both.' 'Sign in' 'OK' 'Warning' | Out-Null; continue }
+        if ($upn -and $upn -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { Show-Message 'Enter the account as an email address, or leave it blank.' 'Sign in' 'OK' 'Warning' | Out-Null; continue }
+        break
+    }
+    $cloud = Get-SelectedCloud
+    $r = @{
+        Upn = $txtUpn.Text.Trim()
+        ConnectExo = [bool]$chkExo.Checked
+        ConnectGraph = [bool]$chkGraph.Checked
+        ExchangeEnvironment = [string]$cloud.ExoEnvironment
+        GraphEnvironment = Get-GraphModuleEnvironment (Get-SelectedCloudKey)
+        LoginBase = [string]$cloud.Login
+        GraphBase = [string]$cloud.Graph
+    }
+    $s.AdminUpn = $r.Upn
+    $s.SignInExo = [string]$r.ConnectExo
+    $s.SignInGraph = [string]$r.ConnectGraph
+    $s.GraphMethod = 'Interactive'
+    $s.ExoMethod = 'Interactive'
+    Save-AppSettings
+    $dlg.Dispose()
+    return $r
+}
+
+function Show-AdvancedSignIn {
+    $dlg = New-DialogForm 'Advanced sign-in' 460 168
+    $rbExo = New-Object System.Windows.Forms.RadioButton
+    $rbExo.Text = 'Exchange Online (interactive or certificate)'; $rbExo.Location = New-Object System.Drawing.Point(16, 16); $rbExo.Size = New-Object System.Drawing.Size(420, 22); $rbExo.Checked = $true
+    $rbGraph = New-Object System.Windows.Forms.RadioButton
+    $rbGraph.Text = 'Microsoft Graph (device code, certificate, or secret)'; $rbGraph.Location = New-Object System.Drawing.Point(16, 44); $rbGraph.Size = New-Object System.Drawing.Size(420, 22)
+    $dlg.Controls.AddRange(@($rbExo, $rbGraph))
+    Add-DialogButtons $dlg 'Continue' 96
+    $ok = $dlg.ShowDialog($script:Form)
+    $graph = [bool]$rbGraph.Checked
+    $dlg.Dispose()
+    if ($ok -ne 'OK') { return }
+    if ($graph) { Invoke-ConnectGraph } else { Invoke-ConnectExo }
+}
 #endregion
 
 #region ---------- Main window ----------
@@ -1935,8 +2182,8 @@ $menu = New-Object System.Windows.Forms.MenuStrip
 $miFile = $menu.Items.Add('File')
 $miEdit = $menu.Items.Add('Edit')
 $miHelp = $menu.Items.Add('Help')
-$script:miConnectExo = $miFile.DropDownItems.Add('Connect Exchange Online')
-$script:miConnectGraph = $miFile.DropDownItems.Add('Connect Microsoft Graph')
+$script:miConnectExo = $miFile.DropDownItems.Add('Sign in...')
+$script:miConnectGraph = $miFile.DropDownItems.Add('Advanced sign-in...')
 $script:miDisconnect = $miFile.DropDownItems.Add('Disconnect')
 [void]$miFile.DropDownItems.Add('-')
 $script:miExport = $miFile.DropDownItems.Add('Export results')
@@ -1965,10 +2212,10 @@ $banner.Controls.AddRange(@($lblTitle, $lblSub))
 
 $grpConnect = New-Group '1. Connect' 'Top' 64
 $flowConnect = New-Flow
-$script:btnConnectExo = New-Button 'Connect Exchange Online' 176 -Primary
-$script:lblExo = New-StatusLabel 'Exchange Online: not connected' 230
-$script:btnConnectGraph = New-Button 'Connect Microsoft Graph' 176
-$script:lblGraph = New-StatusLabel 'Graph: not connected (optional)' 210
+$script:btnConnectExo = New-Button 'Sign in' 96 -Primary
+$script:lblExo = New-StatusLabel 'Exchange Online: not connected' 250
+$script:lblGraph = New-StatusLabel 'Graph: not connected' 230
+$script:btnConnectGraph = New-Button 'Advanced' 90
 $script:cboCloud = New-Object System.Windows.Forms.ComboBox
 $cboCloud.DropDownStyle = 'DropDownList'; $cboCloud.Width = 170; $cboCloud.Margin = New-Object System.Windows.Forms.Padding(3, 6, 3, 3)
 $script:CloudIndex = @($script:Clouds.Keys)
@@ -1980,7 +2227,7 @@ foreach ($key in $script:CloudIndex) {
 }
 $cboCloud.SelectedIndex = $cloudPick
 $script:btnDisconnect = New-Button 'Disconnect' 96
-$flowConnect.Controls.AddRange(@($btnConnectExo, $lblExo, $btnConnectGraph, $lblGraph, (New-FlowLabel 'Cloud:'), $cboCloud, $btnDisconnect))
+$flowConnect.Controls.AddRange(@($btnConnectExo, $lblExo, $lblGraph, $btnConnectGraph, (New-FlowLabel 'Cloud:'), $cboCloud, $btnDisconnect))
 $grpConnect.Controls.Add($flowConnect)
 
 $grpTarget = New-Group '2. Target mailbox' 'Top' 64
@@ -2172,6 +2419,8 @@ $tip.SetToolTip($chkVerify, 'After each restore, confirm the item by internet me
 $tip.SetToolTip($cboFolder, 'Folder path relative to the mailbox root. Load folders fills this list from the mailbox.')
 $tip.SetToolTip($txtEntryId, 'When set, search ignores subject, type and dates and looks up this EntryID directly.')
 $tip.SetToolTip($cboCloud, 'Exchange Online and Microsoft Graph both use this cloud. Commercial and GCC share the public endpoints.')
+$tip.SetToolTip($btnConnectExo, 'Opens the Microsoft sign-in window for Exchange Online and the Microsoft Graph module.')
+$tip.SetToolTip($btnConnectGraph, 'Certificate, client secret, or device-code sign-in.')
 $tip.SetToolTip($chkPlain, 'Show the message as text instead of sanitized HTML.')
 $tip.SetToolTip($chkRemote, 'HTML preview blocks remote images unless this is ticked.')
 $script:LoadingSettings = $false
@@ -2333,6 +2582,118 @@ $script:OnGraphFailed = {
     Update-GraphMoveState
 }
 
+function Test-ModulePresent([string]$Name) {
+    return [bool](Get-Module -ListAvailable -Name $Name | Select-Object -First 1)
+}
+function Apply-SignInResult {
+    param($Result, $Job)
+    $asked = $Job.Context
+    $parts = New-Object System.Collections.Generic.List[string]
+    $warn = $false
+    if ($asked.ConnectExo) {
+        if ($Result.ExoConnected) {
+            $script:State.ExoConnected = $true
+            $script:State.ExoIdentity = [string]$Result.ExoIdentity
+            $script:State.ExoVersion = [string]$Result.ExoVersion
+            $script:State.CanRestore = [bool]$Result.HasRestore
+            $script:State.ExoInstalled = $true
+            if (-not $Result.HasGet -or -not $Result.HasRestore) {
+                $warn = $true
+                Set-StatusLabel $script:lblExo 'Warning' "Exchange Online: $($Result.ExoIdentity) (missing role)"
+                $parts.Add("Exchange Online signed in as $($Result.ExoIdentity), but Get-RecoverableItems or Restore-RecoverableItems is not available. Assign the Mailbox Import Export role and sign in again.")
+            } else {
+                $org = if ($Result.ExoOrganization) { " ($($Result.ExoOrganization))" } else { '' }
+                Set-StatusLabel $script:lblExo 'Success' "Exchange Online: $($Result.ExoIdentity)"
+                $parts.Add("Exchange Online signed in as $($Result.ExoIdentity)$org. Recovery cmdlets are available.")
+            }
+        } else {
+            $warn = $true
+            $script:State.ExoConnected = $false
+            $script:State.CanRestore = $false
+            Set-StatusLabel $script:lblExo 'Failed' 'Exchange Online: sign-in failed'
+            $parts.Add("Exchange Online: $($Result.ExoError)")
+        }
+    }
+    if ($asked.ConnectGraph) {
+        if ($Result.GraphConnected) {
+            $script:State.GraphConnected = $true
+            $script:State.GraphIdentity = [string]$Result.GraphIdentity
+            $script:State.GraphCanWrite = [bool]$Result.HasMailWrite
+            $script:State.GraphInstalled = $true
+            $script:State.GraphVersion = [string]$Result.GraphVersion
+            $perm = if ($Result.GraphPermissions) { [string]$Result.GraphPermissions } else { '(none reported)' }
+            if (-not $Result.HasMail) {
+                $warn = $true
+                Set-StatusLabel $script:lblGraph 'Warning' "Graph: $($Result.GraphIdentity) (no Mail permission)"
+                $parts.Add("Microsoft Graph signed in as $($Result.GraphIdentity) but the token has no Mail permission. Permissions: $perm")
+            } else {
+                Set-StatusLabel $script:lblGraph 'Success' "Graph: $($Result.GraphIdentity)"
+                $parts.Add("Microsoft Graph signed in as $($Result.GraphIdentity). Permissions: $perm")
+            }
+        } else {
+            $warn = $true
+            $script:State.GraphConnected = $false
+            $script:State.GraphCanWrite = $false
+            Set-StatusLabel $script:lblGraph 'Failed' 'Graph: sign-in failed'
+            $parts.Add("Microsoft Graph: $($Result.GraphError)")
+        }
+    }
+    $kind = if ($warn) { 'Warning' } else { 'Success' }
+    Set-Activity $Job.Activity $kind ($parts -join ' ')
+    Update-GraphMoveState
+    Update-BusyState
+    if ($script:State.GraphConnected -and $script:State.SelectedData) { Show-SelectedItem }
+}
+function Start-InteractiveSignIn($Choice) {
+    $which = @()
+    if ($Choice.ConnectExo) { $which += 'Exchange Online' }
+    if ($Choice.ConnectGraph) { $which += 'Microsoft Graph' }
+    if ($Choice.ConnectExo) { Set-StatusLabel $script:lblExo 'Running' 'Exchange Online: waiting for sign-in...' }
+    if ($Choice.ConnectGraph) { Set-StatusLabel $script:lblGraph 'Running' 'Graph: waiting for sign-in...' }
+    Add-Job -Name ("Sign in to " + ($which -join ' and ')) -Script $script:WS_SignIn -Parameters $Choice -Context $Choice -OnStart {
+        param($job)
+        if ($job.Activity) {
+            $both = $job.Context.ConnectExo -and $job.Context.ConnectGraph
+            $job.Activity.SubItems[4].Text = if ($both) { 'Complete each Microsoft sign-in window. Graph opens first, then Exchange Online. This console stays open.' } else { 'Complete the Microsoft sign-in window. This console stays open.' }
+        }
+    } -OnSuccess {
+        param($r, $job)
+        Apply-SignInResult $r $job
+    } -OnFailure {
+        param($err, $job)
+        $asked = $job.Context
+        if ($asked.ConnectExo -and -not $script:State.ExoConnected) { Set-StatusLabel $script:lblExo 'Failed' 'Exchange Online: sign-in failed' }
+        if ($asked.ConnectGraph) {
+            $script:State.GraphConnected = $false
+            $script:State.GraphCanWrite = $false
+            Set-StatusLabel $script:lblGraph 'Failed' 'Graph: sign-in failed'
+            Update-GraphMoveState
+        }
+    }
+}
+function Invoke-SignIn {
+    $choice = Show-SignInDialog
+    if ($choice -eq 'Advanced') { Show-AdvancedSignIn; return }
+    if (-not $choice) { return }
+    $missing = @()
+    if ($choice.ConnectExo -and -not $script:State.ExoInstalled -and -not (Test-ModulePresent 'ExchangeOnlineManagement')) { $missing += 'ExchangeOnlineManagement' }
+    if ($choice.ConnectGraph -and -not $script:State.GraphInstalled -and -not (Test-ModulePresent 'Microsoft.Graph.Authentication')) { $missing += 'Microsoft.Graph.Authentication' }
+    if ($missing.Count) {
+        $ans = Show-Message ("These PowerShell modules are not installed for the current user:`r`n`r`n  " + ($missing -join "`r`n  ") + "`r`n`r`nInstall them from the PowerShell Gallery, then open the Microsoft sign-in window?") $script:AppName 'YesNo' 'Question'
+        if ($ans -ne 'Yes') { return }
+        Add-Job -Name 'Install Office 365 sign-in modules' -Script $script:WS_InstallModules -Parameters @{ Exchange = [bool]($missing -contains 'ExchangeOnlineManagement'); Graph = [bool]($missing -contains 'Microsoft.Graph.Authentication') } -Context $choice -OnSuccess {
+            param($r, $job)
+            if ($job.Parameters.Exchange) { $script:State.ExoInstalled = $true }
+            if ($job.Parameters.Graph) { $script:State.GraphInstalled = $true; if ($r.PSObject.Properties['Microsoft.Graph.Authentication']) { $script:State.GraphVersion = [string]$r.'Microsoft.Graph.Authentication' } }
+            $versions = @()
+            foreach ($p in $r.PSObject.Properties) { $versions += "$($p.Name) $($p.Value)" }
+            Set-Activity $job.Activity 'Success' ("Installed " + ($versions -join ', ') + '. Opening sign-in.')
+            Start-InteractiveSignIn $job.Context
+        }
+        return
+    }
+    Start-InteractiveSignIn $choice
+}
 function Invoke-ConnectExo {
     if (-not $script:State.ExoInstalled) {
         $found = Get-Module -ListAvailable -Name ExchangeOnlineManagement | Select-Object -First 1
@@ -2400,7 +2761,7 @@ function Invoke-DisconnectAll {
         param($r, $job)
         $script:State.ExoConnected = $false; $script:State.GraphConnected = $false; $script:State.CanRestore = $false; $script:State.GraphCanWrite = $false
         Set-StatusLabel $script:lblExo 'Disconnected' 'Exchange Online: not connected'
-        Set-StatusLabel $script:lblGraph 'Disconnected' 'Graph: not connected (optional)'
+        Set-StatusLabel $script:lblGraph 'Disconnected' 'Graph: not connected'
         Set-Activity $job.Activity 'Success' 'All sessions closed.'
         Update-GraphMoveState
         Update-BusyState
@@ -2830,10 +3191,10 @@ Exchange Online
   Restoring from DiscoveryHolds or Purges copies the item back. The held copy stays while the hold is active.
 
 Microsoft Graph (optional: preview, exact-folder move, verification)
-  Delegated device code: the signed-in admin needs Full Access to the mailbox.
-  App-only certificate or secret: Mail.ReadWrite and User.Read.All application permissions, with admin consent.
-  Scope app-only access with an Application Access Policy or RBAC for Applications.
-  The built-in Microsoft Graph Command Line Tools client is only a convenience. Register your own public client if the tenant blocks it.
+  Sign in uses the Microsoft.Graph.Authentication module and the normal Microsoft window.
+  The signed-in admin needs Full Access to the mailbox. Scopes: Mail.ReadWrite.Shared and User.Read.
+  Advanced sign-in still supports device code, a certificate, or a client secret.
+  App-only needs Mail.ReadWrite and User.Read.All with admin consent, scoped by an application access policy.
 
 Cloud
   Choose Commercial and GCC, GCC High, DoD, or China before connecting. Both Exchange and Graph use that choice.
@@ -2883,8 +3244,8 @@ try {
     })
 } catch { }
 
-$btnConnectExo.Add_Click({ Invoke-Safe { Invoke-ConnectExo } 'Connect Exchange Online' })
-$btnConnectGraph.Add_Click({ Invoke-Safe { Invoke-ConnectGraph } 'Connect Microsoft Graph' })
+$btnConnectExo.Add_Click({ Invoke-Safe { Invoke-SignIn } 'Sign in' })
+$btnConnectGraph.Add_Click({ Invoke-Safe { Show-AdvancedSignIn } 'Advanced sign-in' })
 $btnDisconnect.Add_Click({ Invoke-Safe { Invoke-DisconnectAll } 'Disconnect' })
 $btnResolve.Add_Click({ Invoke-Safe { Invoke-ResolveMailbox } 'Resolve mailbox' })
 $btnHoldDetails.Add_Click({ Invoke-Safe { Show-HoldDetails } 'Hold details' })
@@ -2900,8 +3261,8 @@ $btnCancel.Add_Click({
 })
 $btnCheckAll.Add_Click({ Set-VisibleChecks $true })
 $btnUncheckAll.Add_Click({ Set-VisibleChecks $false })
-$miConnectExo.Add_Click({ Invoke-Safe { Invoke-ConnectExo } 'Connect Exchange Online' })
-$miConnectGraph.Add_Click({ Invoke-Safe { Invoke-ConnectGraph } 'Connect Microsoft Graph' })
+$miConnectExo.Add_Click({ Invoke-Safe { Invoke-SignIn } 'Sign in' })
+$miConnectGraph.Add_Click({ Invoke-Safe { Show-AdvancedSignIn } 'Advanced sign-in' })
 $miDisconnect.Add_Click({ Invoke-Safe { Invoke-DisconnectAll } 'Disconnect' })
 $miExport.Add_Click({ Invoke-Safe { Export-Results } 'Export results' })
 $miOpenLog.Add_Click({ Invoke-Safe { if (Test-Path $script:LogPath) { Start-Process notepad.exe -ArgumentList "`"$script:LogPath`"" } } 'Open log' })
@@ -3050,8 +3411,14 @@ $Form.Add_Shown({
         param($r, $job)
         $script:State.ExoInstalled = [bool]$r.ExoInstalled
         $script:State.ExoVersion = [string]$r.ExoVersion
-        if ($r.ExoInstalled) { Set-Activity $job.Activity 'Success' "PowerShell $($r.PSVersion), ExchangeOnlineManagement v$($r.ExoVersion). Connect to Exchange Online to begin." }
-        else { Set-Activity $job.Activity 'Warning' "PowerShell $($r.PSVersion). ExchangeOnlineManagement is not installed. Connect Exchange Online can install it." }
+        $script:State.GraphInstalled = [bool]$r.GraphInstalled
+        $script:State.GraphVersion = [string]$r.GraphVersion
+        $ready = @()
+        if ($r.ExoInstalled) { $ready += "ExchangeOnlineManagement v$($r.ExoVersion)" }
+        if ($r.GraphInstalled) { $ready += "Microsoft.Graph.Authentication v$($r.GraphVersion)" }
+        if ($ready.Count -eq 2) { Set-Activity $job.Activity 'Success' "PowerShell $($r.PSVersion). $($ready -join ', '). Use Sign in to open the Microsoft window." }
+        elseif ($ready.Count -eq 1) { Set-Activity $job.Activity 'Warning' "PowerShell $($r.PSVersion). Found $($ready[0]). Sign in can install the other module." }
+        else { Set-Activity $job.Activity 'Warning' "PowerShell $($r.PSVersion). Exchange Online and Microsoft Graph modules are not installed. Sign in can install them." }
     } -OnFailure {
         param($err, $job)
         Set-Activity $job.Activity 'Failed' $err
