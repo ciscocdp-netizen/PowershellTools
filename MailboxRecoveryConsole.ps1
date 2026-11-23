@@ -23,7 +23,7 @@ Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
 $script:AppName    = 'Mailbox Recovery Console'
-$script:AppVersion = '1.2.2'
+$script:AppVersion = '1.2.3'
 
 #region ---------- Shared helpers (also loaded into the worker runspace) ----------
 $script:SharedFunctions = {
@@ -383,6 +383,8 @@ function Invoke-MrcSelfTest {
         $searchText = $script:WS_Search.ToString()
         Assert-True 'search worker keeps param first' ($searchText -match '(?s)^\s*param\(')
         Assert-True 'search worker boots after param' ($searchText -match '(?s)param\(.*?\)\s*\$ErrorActionPreference\s*=\s*''Stop''')
+        Assert-True 'blank subject uses a wide date range' ($searchText -match 'Get-Date -Year 1990')
+        Assert-True 'asterisk subject is not a literal filter' ($searchText -match [regex]::Escape("-eq '*'"))
     }
     if ($script:WS_Init) {
         Assert-True 'init worker boots first' ($script:WS_Init.ToString() -match '(?s)^\s*\$ErrorActionPreference\s*=\s*''Stop''')
@@ -1169,6 +1171,10 @@ function New-SearchItem($Item, [string]$Folder) {
     }
 }
 
+$subjectText = if ($Subject) { $Subject.Trim() } else { '' }
+if ($subjectText -eq '*') { $subjectText = '' }
+$openSubject = -not $subjectText
+$usedDefaultDates = $false
 if ($EntryID) {
     try {
         $items = @(Get-RecoverableItems -Identity $Mailbox -EntryID $EntryID -ErrorAction Stop)
@@ -1179,10 +1185,14 @@ if ($EntryID) {
     foreach ($f in @($Folders)) {
         $p = @{ Identity = $Mailbox; SourceFolder = $f; ResultSize = $Max; ErrorAction = 'Stop' }
         if ($ItemType) { $p.FilterItemType = $ItemType }
-        if ($Subject) { $p.SubjectContains = $Subject }
+        if ($subjectText) { $p.SubjectContains = $subjectText }
         if ($Start -or $End) {
-            $p.FilterStartTime = if ($Start) { [datetime]$Start } else { Get-Date -Year 2000 -Month 1 -Day 1 }
+            $p.FilterStartTime = if ($Start) { [datetime]$Start } else { Get-Date -Year 1990 -Month 1 -Day 1 }
             $p.FilterEndTime = if ($End) { [datetime]$End } else { (Get-Date).AddDays(1) }
+        } elseif ($openSubject) {
+            $p.FilterStartTime = Get-Date -Year 1990 -Month 1 -Day 1
+            $p.FilterEndTime = (Get-Date).AddDays(1)
+            $usedDefaultDates = $true
         }
         try { $items = @(Get-RecoverableItems @p) }
         catch { $warnings.Add("$f : $($_.Exception.Message)"); $counts[$f] = -1; continue }
@@ -1192,7 +1202,7 @@ if ($EntryID) {
     }
     if (@($Folders).Count -gt 0 -and $warnings.Count -eq @($Folders).Count) { throw ($warnings -join ' | ') }
 }
-[pscustomobject]@{ Items = $all.ToArray(); Warnings = $warnings.ToArray(); Counts = $counts; Truncated = $truncated.ToArray() }
+[pscustomobject]@{ Items = $all.ToArray(); Warnings = $warnings.ToArray(); Counts = $counts; Truncated = $truncated.ToArray(); OpenSubject = [bool]$openSubject; UsedDefaultDates = [bool]$usedDefaultDates }
 '@
 
 $script:WS_LoadFolders = New-MrcWorker @'
@@ -2363,6 +2373,7 @@ $tip.SetToolTip($rbGraphMove, 'Microsoft Graph moves the item into this exact fo
 $tip.SetToolTip($chkVerify, 'After each restore, confirm the item by internet message ID or subject, or confirm that it left Deletions or Deleted Items.')
 $tip.SetToolTip($cboFolder, 'Folder path relative to the mailbox root. Load folders fills this list from the mailbox.')
 $tip.SetToolTip($txtEntryId, 'When set, search ignores subject, type and dates and looks up this EntryID directly.')
+$tip.SetToolTip($txtSubject, 'Leave this blank, or type *, to search every item. A word matches any subject that contains it. With no subject and no dates, the search covers items modified since 1990-01-01, up to Max / folder.')
 $tip.SetToolTip($btnConnectExo, 'Opens the Microsoft sign-in window for Office 365 and the Microsoft Graph module.')
 $tip.SetToolTip($btnConnectGraph, 'Certificate, client secret, or device-code sign-in.')
 $tip.SetToolTip($chkPlain, 'Show the message as text instead of sanitized HTML.')
@@ -2837,6 +2848,7 @@ function Invoke-Search {
         $msg = "Found $($items.Count) item(s). " + ($breakdown -join ', ')
         $truncated = @($r.Truncated | Where-Object { $_ } | ForEach-Object { Get-LocationName $_ })
         if ($truncated.Count) { $msg += '. Result limit reached for ' + ($truncated -join ', ') + '; more items may exist.' }
+        if ($r.UsedDefaultDates) { $msg += ' Subject was blank, so every item modified since 1990-01-01 was included, up to Max / folder.' }
         $warn = @($r.Warnings | Where-Object { $_ })
         if ($warn.Count -or $truncated.Count) { Set-Activity $job.Activity 'Warning' ($msg + $(if ($warn.Count) { '. Some locations failed: ' + ($warn -join ' | ') } else { '' })) }
         else { Set-Activity $job.Activity 'Success' $msg }
