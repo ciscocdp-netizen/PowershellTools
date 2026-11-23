@@ -23,7 +23,7 @@ Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
 $script:AppName    = 'Mailbox Recovery Console'
-$script:AppVersion = '1.2.1'
+$script:AppVersion = '1.2.2'
 
 #region ---------- Shared helpers (also loaded into the worker runspace) ----------
 $script:SharedFunctions = {
@@ -1653,7 +1653,8 @@ function Add-Activity {
         $lvLevel = switch ($Status) { 'Failed' { 'ERROR' } 'Warning' { 'WARN' } 'Success' { 'SUCCESS' } default { 'INFO' } }
         Write-Log -Level $lvLevel -Message "$Action - $Details"
     }
-    return $lvi
+    # ListViewItem enumerates its subitems, so a bare return hands back those pieces instead of the row.
+    return ,$lvi
 }
 
 function Write-Activity {
@@ -1675,7 +1676,7 @@ function Set-ActivityColor {
 
 function Set-Activity {
     param($Item, [string]$Status, [string]$Details)
-    if (-not $Item) { return }
+    if ($Item -isnot [System.Windows.Forms.ListViewItem]) { return }
     $Item.Text = $Status
     $Item.ImageKey = $Status
     if ($Status -eq 'Running' -and $Item.Tag) { $Item.Tag.Start = Get-Date }
@@ -1730,7 +1731,9 @@ function Start-NextJob {
         $script:CurrentJob = $null
         if ($ps) { try { $ps.Dispose() } catch { } }
         $msg = $_.Exception.Message
-        if ($job -and $job.Activity) { Set-Activity $job.Activity 'Failed' $msg } elseif ($job) { Write-Log 'ERROR' "$($job.Name) - $msg" }
+        try {
+            if ($job -and $job.Activity) { Set-Activity $job.Activity 'Failed' $msg } elseif ($job) { Write-Log 'ERROR' "$($job.Name) - $msg" }
+        } catch { if ($job) { Write-Log 'ERROR' "$($job.Name) - $msg" } }
         if ($job -and $job.OnFailure) { try { & $job.OnFailure $msg $job } catch { Write-Log 'ERROR' $_.Exception.Message } }
     }
 }
