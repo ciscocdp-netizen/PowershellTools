@@ -91,13 +91,16 @@ param(
     [string]$SettingsPath
 )
 
-$script:ToolVersion    = '1.0.6'
+$script:ToolVersion    = '1.1.0'
 $script:Root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $script:SettingsFile = if ($SettingsPath) { $SettingsPath } else { Join-Path $script:Root 'CAExemption.settings.json' }
 $script:RequiredScope  = 'Device.ReadWrite.All'
 $script:RequiredScopes = @('Device.ReadWrite.All', 'User.Read.All')
 $script:GraphBase      = 'https://graph.microsoft.com/v1.0/devices'
 $script:GraphUsersBase = 'https://graph.microsoft.com/v1.0/users'
+$script:GraphBatchUri  = 'https://graph.microsoft.com/v1.0/$batch'
+$script:GraphBatchSize = 20
+$script:PreviewRowLimit = 40
 $script:SelectFields     = 'id,deviceId,displayName,trustType,operatingSystem,operatingSystemVersion,accountEnabled,approximateLastSignInDateTime,extensionAttributes,isManagementRestricted'
 $script:UserSelectFields = 'id,displayName,userPrincipalName,mail,accountEnabled'
 $script:GuidPattern   = '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
@@ -246,6 +249,48 @@ function ConvertTo-ObjectArray {
     }
     $list.Add($Value)
     return ,$list.ToArray()
+}
+
+function Split-ToolChunks {
+    param($Items, [int]$Size = 20)
+    if ($Size -lt 1) { $Size = 20 }
+    $chunks = New-Object System.Collections.Generic.List[object]
+    $current = New-Object System.Collections.Generic.List[object]
+    foreach ($item in (ConvertTo-ObjectArray $Items)) {
+        $current.Add($item)
+        if ($current.Count -ge $Size) {
+            $chunks.Add((ConvertTo-ObjectArray $current))
+            $current = New-Object System.Collections.Generic.List[object]
+        }
+    }
+    if ($current.Count -gt 0) {
+        $chunks.Add((ConvertTo-ObjectArray $current))
+    }
+    return (ConvertTo-ObjectArray $chunks)
+}
+
+function Write-ToolProgressCount {
+    param([string]$Activity, [int]$Done, [int]$Total, [int]$Every = 50)
+    if ($Total -le 0) { return }
+    if ($Every -lt 1) { $Every = 1 }
+    if ($Done -eq $Total -or $Done -eq 1 -or ($Done % $Every) -eq 0) {
+        Write-Host ("  {0}: {1}/{2}" -f $Activity, $Done, $Total)
+    }
+}
+
+function Show-LimitedTable {
+    param($InputObject, [string[]]$Property, [int]$MaxRows = 40)
+    $rows = ConvertTo-ObjectArray $InputObject
+    if ($rows.Count -eq 0) {
+        Write-Host '  (no rows)'
+        return
+    }
+    $view = $rows
+    if ($MaxRows -gt 0 -and $rows.Count -gt $MaxRows) {
+        $view = ConvertTo-ObjectArray $rows[0..($MaxRows - 1)]
+        Write-Host ("Showing {0} of {1} rows. Export to CSV to review the full set." -f $MaxRows, $rows.Count) -ForegroundColor Yellow
+    }
+    $view | Select-Object -Property $Property | Format-Table -AutoSize -Wrap | Out-Host
 }
 
 function ConvertTo-PlainValue {
@@ -715,7 +760,8 @@ function Invoke-GraphRequestWithRetry {
         $Body,
         [string]$ContentType,
         [hashtable]$Headers,
-        [int]$MaxAttempts = 6
+        [int]$MaxAttempts = 6,
+        [switch]$ExpectBody
     )
 
     $command = Get-Command Invoke-MgGraphRequest -ErrorAction Stop
@@ -737,7 +783,9 @@ function Invoke-GraphRequestWithRetry {
                 $validOutputTypes = @($attr.ValidValues)
             }
         }
-        $outputType = Get-PreferredGraphOutputType -ValidValues $validOutputTypes -EmptyBody:(-not (Test-GraphReadMethod $Method))
+        $isBatch = ($Uri.IndexOf('$batch') -ge 0)
+        $emptyBody = -not $ExpectBody -and -not $isBatch -and -not (Test-GraphReadMethod $Method)
+        $outputType = Get-PreferredGraphOutputType -ValidValues $validOutputTypes -EmptyBody:$emptyBody
         if ($outputType) { $params['OutputType'] = $outputType }
     }
 
@@ -767,6 +815,137 @@ function Invoke-GraphRequestWithRetry {
             throw
         }
     }
+}
+
+function ConvertTo-GraphRelativeUrl {
+    param([string]$Uri)
+    $text = [string]$Uri
+    if ([string]::IsNullOrWhiteSpace($text)) { return '/' }
+    $prefixes = @(
+        'https://graph.microsoft.com/v1.0/',
+        'https://graph.microsoft.com/beta/'
+    )
+    foreach ($prefix in $prefixes) {
+        if ($text.Length -ge $prefix.Length -and $text.Substring(0, $prefix.Length).ToLowerInvariant() -eq $prefix.ToLowerInvariant()) {
+            return ('/' + $text.Substring($prefix.Length))
+        }
+    }
+    if ($text.StartsWith('/')) { return $text }
+    return ('/' + $text)
+}
+
+function ConvertTo-GraphPathSegment {
+    param([string]$Value)
+    return [uri]::EscapeDataString([string]$Value)
+}
+
+function New-GraphBatchRequest {
+    param(
+        [Parameter(Mandatory = $true)][string]$Id,
+        [Parameter(Mandatory = $true)][string]$Method,
+        [Parameter(Mandatory = $true)][string]$Url,
+        [string]$BodyJson
+    )
+    $item = New-Object PSObject
+    [void](Add-ToolProperty $item 'Id' $Id)
+    [void](Add-ToolProperty $item 'Method' $Method.ToUpperInvariant())
+    [void](Add-ToolProperty $item 'Url' (ConvertTo-GraphRelativeUrl $Url))
+    [void](Add-ToolProperty $item 'BodyJson' $BodyJson)
+    return $item
+}
+
+function ConvertTo-GraphBatchJson {
+    param($Requests)
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($req in (ConvertTo-ObjectArray $Requests)) {
+        $id = ConvertTo-JsonStringLiteral (Get-GraphProperty $req 'Id')
+        $method = ConvertTo-JsonStringLiteral (Get-GraphProperty $req 'Method')
+        $url = ConvertTo-JsonStringLiteral (Get-GraphProperty $req 'Url')
+        $bodyJson = Get-GraphProperty $req 'BodyJson'
+        $methodText = [string](Get-GraphProperty $req 'Method')
+        $chunk = '{{"id":{0},"method":{1},"url":{2}' -f $id, $method, $url
+        if ($bodyJson -or $methodText -eq 'PATCH' -or $methodText -eq 'POST' -or $methodText -eq 'PUT') {
+            $chunk += ',"headers":{"Content-Type":"application/json"}'
+        }
+        if ($bodyJson) {
+            $chunk += ',"body":' + [string]$bodyJson
+        }
+        $chunk += '}'
+        $parts.Add($chunk)
+    }
+    return ('{{"requests":[{0}]}}' -f ($parts -join ','))
+}
+
+function Get-GraphBatchErrorMessage {
+    param($Response)
+    $body = Get-GraphProperty $Response 'body'
+    $err = Get-GraphProperty $body 'error'
+    $message = Get-GraphProperty $err 'message'
+    if ($message) { return [string]$message }
+    $status = Get-GraphProperty $Response 'status'
+    if ($null -ne $status) { return ('HTTP {0}' -f $status) }
+    return 'Graph batch request failed'
+}
+
+function Invoke-GraphBatch {
+    param(
+        $Requests,
+        [string]$Activity = 'Graph batch'
+    )
+
+    $pending = ConvertTo-ObjectArray $Requests
+    $completed = New-Object System.Collections.Generic.List[object]
+    if ($pending.Count -eq 0) { return (ConvertTo-ObjectArray $completed) }
+
+    $round = 0
+    while ($pending.Count -gt 0 -and $round -lt 6) {
+        $round++
+        $retry = New-Object System.Collections.Generic.List[object]
+        $chunks = Split-ToolChunks $pending $script:GraphBatchSize
+        $finished = $completed.Count
+        foreach ($chunk in $chunks) {
+            $chunkItems = ConvertTo-ObjectArray $chunk
+            $json = ConvertTo-GraphBatchJson $chunkItems
+            $result = Invoke-GraphRequestWithRetry -Method POST -Uri $script:GraphBatchUri -Body $json -ContentType 'application/json' -ExpectBody
+            $byId = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+            foreach ($item in $chunkItems) {
+                $key = [string](Get-GraphProperty $item 'Id')
+                if ($key -and -not $byId.ContainsKey($key)) { $byId.Add($key, $item) }
+            }
+            $seenIds = @{}
+            foreach ($resp in (ConvertTo-ObjectArray (Get-GraphProperty $result 'responses'))) {
+                $id = [string](Get-GraphProperty $resp 'id')
+                $status = 0
+                try { $status = [int](Get-GraphProperty $resp 'status') } catch { }
+                $seenIds[$id] = $true
+                if ($status -in 429, 503, 504) {
+                    if ($id -and $byId.ContainsKey($id)) { $retry.Add($byId[$id]) }
+                    continue
+                }
+                $wrapped = New-Object PSObject
+                [void](Add-ToolProperty $wrapped 'Id' $id)
+                [void](Add-ToolProperty $wrapped 'Status' $status)
+                [void](Add-ToolProperty $wrapped 'Body' (Get-GraphProperty $resp 'body'))
+                if ($id -and $byId.ContainsKey($id)) {
+                    [void](Add-ToolProperty $wrapped 'Request' $byId[$id])
+                }
+                $completed.Add($wrapped)
+            }
+            foreach ($item in $chunkItems) {
+                $key = [string](Get-GraphProperty $item 'Id')
+                if ($key -and -not $seenIds.ContainsKey($key)) { $retry.Add($item) }
+            }
+            $finished = $completed.Count
+            Write-Host ("  {0}: {1} response(s)..." -f $Activity, ($finished + $retry.Count))
+        }
+        if ($retry.Count -eq 0) { break }
+        $wait = [Math]::Min(60, [int][Math]::Pow(2, $round))
+        Write-Host ("  Graph throttled {0} batched request(s). Retrying in {1}s..." -f $retry.Count, $wait) -ForegroundColor Yellow
+        Start-Sleep -Seconds $wait
+        $pending = ConvertTo-ObjectArray $retry
+    }
+
+    return (ConvertTo-ObjectArray $completed)
 }
 
 function Invoke-GraphGetAll {
@@ -1181,18 +1360,180 @@ function Get-UserRelatedWindowsDevices {
     return (ConvertTo-ObjectArray $pairs)
 }
 
-function Write-AuditLog {
-    param($Entry)
+function Convert-UserDeviceBatchBody {
+    param($Body, $User, [string]$Relationship)
+    $pairs = New-Object System.Collections.Generic.List[object]
+    $needsFull = New-Object System.Collections.Generic.List[object]
+    foreach ($item in (Get-GraphCollection $Body)) {
+        $record = $null
+        try { $record = ConvertTo-DeviceRecord $item } catch { continue }
+        if ([string]::IsNullOrWhiteSpace($record.OperatingSystem) -and $record.ObjectId) {
+            $needsFull.Add($record)
+            continue
+        }
+        if ($record.OperatingSystem -notlike 'Windows*') { continue }
+        $pair = New-Object PSObject
+        [void](Add-ToolProperty $pair 'Device' $record)
+        [void](Add-ToolProperty $pair 'User' $User)
+        [void](Add-ToolProperty $pair 'Relationship' $Relationship)
+        $pairs.Add($pair)
+    }
+    $result = New-Object PSObject
+    [void](Add-ToolProperty $result 'Pairs' (ConvertTo-ObjectArray $pairs))
+    [void](Add-ToolProperty $result 'NeedsFull' (ConvertTo-ObjectArray $needsFull))
+    [void](Add-ToolProperty $result 'NextLink' (Get-GraphProperty $Body '@odata.nextLink'))
+    return $result
+}
+
+function Get-UsersRelatedWindowsDevices {
+    param($Users)
+    $userList = ConvertTo-ObjectArray $Users
+    $pairs = New-Object System.Collections.Generic.List[object]
+    if ($userList.Count -eq 0) { return (ConvertTo-ObjectArray $pairs) }
+
+    $endpoints = @(
+        @{ Name = 'Registered'; Path = 'registeredDevices' }
+        @{ Name = 'Owned';      Path = 'ownedDevices' }
+    )
+    $userByKey = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+    foreach ($user in $userList) {
+        $key = [string]$user.ObjectId
+        if ($key -and -not $userByKey.ContainsKey($key)) { $userByKey.Add($key, $user) }
+    }
+
+    $requests = New-Object System.Collections.Generic.List[object]
+    $meta = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+    $n = 0
+    foreach ($user in $userList) {
+        if (-not $user.ObjectId) { continue }
+        foreach ($endpoint in $endpoints) {
+            $n++
+            $id = [string]$n
+            $url = '/users/{0}/{1}?$select={2}&$top=999' -f $user.ObjectId, $endpoint.Path, $script:SelectFields
+            $requests.Add((New-GraphBatchRequest -Id $id -Method GET -Url $url))
+            $info = New-Object PSObject
+            [void](Add-ToolProperty $info 'User' $user)
+            [void](Add-ToolProperty $info 'Relationship' $endpoint.Name)
+            [void](Add-ToolProperty $info 'Path' $endpoint.Path)
+            $meta.Add($id, $info)
+        }
+    }
+
+    Write-Host ("  Batching {0} registered/owned device queries for {1} user(s)..." -f $requests.Count, $userList.Count)
+    $responses = Invoke-GraphBatch -Requests $requests -Activity 'User device lookup'
+    $retryNoSelect = New-Object System.Collections.Generic.List[object]
+    $needsFull = New-Object System.Collections.Generic.List[object]
+    foreach ($resp in $responses) {
+        $id = [string]$resp.Id
+        if (-not $meta.ContainsKey($id)) { continue }
+        $info = $meta[$id]
+        if ($resp.Status -eq 404) { continue }
+        if ($resp.Status -eq 400) {
+            $retryNoSelect.Add($info)
+            continue
+        }
+        if ($resp.Status -lt 200 -or $resp.Status -ge 300) {
+            Write-Host ("  Failed {0} devices for {1}: {2}" -f $info.Relationship.ToLower(), $info.User.UserPrincipalName, (Get-GraphBatchErrorMessage $resp)) -ForegroundColor Yellow
+            continue
+        }
+        $parsed = Convert-UserDeviceBatchBody -Body $resp.Body -User $info.User -Relationship $info.Relationship
+        foreach ($pair in (ConvertTo-ObjectArray $parsed.Pairs)) { $pairs.Add($pair) }
+        foreach ($record in (ConvertTo-ObjectArray $parsed.NeedsFull)) {
+            $hold = New-Object PSObject
+            [void](Add-ToolProperty $hold 'Record' $record)
+            [void](Add-ToolProperty $hold 'User' $info.User)
+            [void](Add-ToolProperty $hold 'Relationship' $info.Relationship)
+            $needsFull.Add($hold)
+        }
+        if ($parsed.NextLink) {
+            try {
+                $more = ConvertTo-ObjectArray (Invoke-GraphGetAll -Uri ([string]$parsed.NextLink) -Activity 'Paging user devices')
+                $page = New-Object PSObject
+                [void](Add-ToolProperty $page 'value' $more)
+                $pageParsed = Convert-UserDeviceBatchBody -Body $page -User $info.User -Relationship $info.Relationship
+                foreach ($pair in (ConvertTo-ObjectArray $pageParsed.Pairs)) { $pairs.Add($pair) }
+            }
+            catch { }
+        }
+    }
+
+    if ($retryNoSelect.Count -gt 0) {
+        $n = 0
+        $fallbackReqs = New-Object System.Collections.Generic.List[object]
+        $fallbackMeta = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+        foreach ($info in $retryNoSelect) {
+            $n++
+            $id = 'r' + $n
+            $url = '/users/{0}/{1}?$top=999' -f $info.User.ObjectId, $info.Path
+            $fallbackReqs.Add((New-GraphBatchRequest -Id $id -Method GET -Url $url))
+            $fallbackMeta.Add($id, $info)
+        }
+        foreach ($resp in (Invoke-GraphBatch -Requests $fallbackReqs -Activity 'User device lookup (fallback)')) {
+            $id = [string]$resp.Id
+            if (-not $fallbackMeta.ContainsKey($id)) { continue }
+            if ($resp.Status -lt 200 -or $resp.Status -ge 300) { continue }
+            $info = $fallbackMeta[$id]
+            $parsed = Convert-UserDeviceBatchBody -Body $resp.Body -User $info.User -Relationship $info.Relationship
+            foreach ($pair in (ConvertTo-ObjectArray $parsed.Pairs)) { $pairs.Add($pair) }
+            foreach ($record in (ConvertTo-ObjectArray $parsed.NeedsFull)) {
+                $hold = New-Object PSObject
+                [void](Add-ToolProperty $hold 'Record' $record)
+                [void](Add-ToolProperty $hold 'User' $info.User)
+                [void](Add-ToolProperty $hold 'Relationship' $info.Relationship)
+                $needsFull.Add($hold)
+            }
+        }
+    }
+
+    if ($needsFull.Count -gt 0) {
+        $n = 0
+        $fullReqs = New-Object System.Collections.Generic.List[object]
+        $fullMeta = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+        foreach ($hold in $needsFull) {
+            if (-not $hold.Record.ObjectId) { continue }
+            $n++
+            $id = 'f' + $n
+            $url = '/devices/{0}?$select={1}' -f $hold.Record.ObjectId, $script:SelectFields
+            $fullReqs.Add((New-GraphBatchRequest -Id $id -Method GET -Url $url))
+            $fullMeta.Add($id, $hold)
+        }
+        foreach ($resp in (Invoke-GraphBatch -Requests $fullReqs -Activity 'Device detail lookup')) {
+            $id = [string]$resp.Id
+            if (-not $fullMeta.ContainsKey($id)) { continue }
+            if ($resp.Status -lt 200 -or $resp.Status -ge 300) { continue }
+            $hold = $fullMeta[$id]
+            try { $record = ConvertTo-DeviceRecord $resp.Body } catch { continue }
+            if ($record.OperatingSystem -notlike 'Windows*') { continue }
+            $pair = New-Object PSObject
+            [void](Add-ToolProperty $pair 'Device' $record)
+            [void](Add-ToolProperty $pair 'User' $hold.User)
+            [void](Add-ToolProperty $pair 'Relationship' $hold.Relationship)
+            $pairs.Add($pair)
+        }
+    }
+
+    return (ConvertTo-ObjectArray $pairs)
+}
+
+function Write-AuditLogs {
+    param($Entries)
+    $rows = ConvertTo-ObjectArray $Entries
+    if ($rows.Count -eq 0) { return }
     try {
         $folder = Split-Path -Parent $script:Settings.LogPath
         if ($folder -and -not (Test-Path -LiteralPath $folder)) {
             New-Item -ItemType Directory -Path $folder -Force | Out-Null
         }
-        $Entry | Export-Csv -Path $script:Settings.LogPath -Append -NoTypeInformation -Encoding UTF8
+        $rows | Export-Csv -Path $script:Settings.LogPath -Append -NoTypeInformation -Encoding UTF8
     }
     catch {
         Write-Host "Could not write audit log: $($_.Exception.Message)" -ForegroundColor Yellow
     }
+}
+
+function Write-AuditLog {
+    param($Entry)
+    Write-AuditLogs $Entry
 }
 
 function Set-DeviceExtensionAttribute {
@@ -1237,21 +1578,103 @@ function Set-DeviceExtensionAttribute {
 
     $context = $null
     try { $context = Get-MgContext } catch { }
-    $entry = [pscustomobject]@{
-        Timestamp     = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-        Source        = $Source
-        Status        = $status
-        Action        = $action
-        DisplayName   = $Device.DisplayName
-        DeviceId      = $Device.DeviceId
-        ObjectId      = $Device.ObjectId
-        PreviousValue = $Device.ExtensionAttribute1
-        NewValue      = $NewValue
-        ChangedBy     = if ($context) { $context.Account } else { '' }
-        Message       = $message
-    }
+    $changedBy = ''
+    if ($context) { $changedBy = [string]$context.Account }
+    $entry = New-DeviceAuditEntry -Device $Device -NewValue $NewValue -Status $status -Action $action -Source $Source -Message $message -ChangedBy $changedBy
     Write-AuditLog $entry
     return $entry
+}
+
+function New-DeviceAuditEntry {
+    param($Device, $NewValue, [string]$Status, [string]$Action, [string]$Source, [string]$Message, [string]$ChangedBy)
+    $entry = New-Object PSObject
+    [void](Add-ToolProperty $entry 'Timestamp' (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+    [void](Add-ToolProperty $entry 'Source' $Source)
+    [void](Add-ToolProperty $entry 'Status' $Status)
+    [void](Add-ToolProperty $entry 'Action' $Action)
+    [void](Add-ToolProperty $entry 'DisplayName' $(if ($Device) { $Device.DisplayName } else { '' }))
+    [void](Add-ToolProperty $entry 'DeviceId' $(if ($Device) { $Device.DeviceId } else { '' }))
+    [void](Add-ToolProperty $entry 'ObjectId' $(if ($Device) { $Device.ObjectId } else { '' }))
+    [void](Add-ToolProperty $entry 'PreviousValue' $(if ($Device) { $Device.ExtensionAttribute1 } else { '' }))
+    [void](Add-ToolProperty $entry 'NewValue' $NewValue)
+    [void](Add-ToolProperty $entry 'ChangedBy' $ChangedBy)
+    [void](Add-ToolProperty $entry 'Message' $Message)
+    return $entry
+}
+
+function Get-DeviceChangeAction {
+    param($Device, $NewValue)
+    if ([string]::IsNullOrEmpty($NewValue)) { return 'Clear' }
+    if ($Device -and [string]::IsNullOrEmpty($Device.ExtensionAttribute1)) { return 'Add' }
+    return 'Modify'
+}
+
+function Invoke-DeviceExtensionAttributeUpdates {
+    param($PlanItems, [string]$Source)
+    $items = ConvertTo-ObjectArray $PlanItems
+    $results = New-Object System.Collections.Generic.List[object]
+    if ($items.Count -eq 0) { return (ConvertTo-ObjectArray $results) }
+
+    $changedBy = ''
+    try {
+        $context = Get-MgContext
+        if ($context) { $changedBy = [string]$context.Account }
+    }
+    catch { }
+
+    if ($script:Settings.DryRun) {
+        foreach ($item in $items) {
+            $action = Get-DeviceChangeAction $item.Device $item.NewValue
+            $results.Add((New-DeviceAuditEntry -Device $item.Device -NewValue $item.NewValue -Status 'DryRun' -Action $action -Source $Source -Message 'No change written (dry-run mode)' -ChangedBy $changedBy))
+        }
+        Write-AuditLogs (ConvertTo-ObjectArray $results)
+        return (ConvertTo-ObjectArray $results)
+    }
+
+    $requests = New-Object System.Collections.Generic.List[object]
+    $meta = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+    $n = 0
+    foreach ($item in $items) {
+        $n++
+        $id = [string]$n
+        $device = $item.Device
+        $url = '/devices/{0}' -f $device.ObjectId
+        $bodyJson = New-ExtensionAttributePatchJson $item.NewValue
+        $requests.Add((New-GraphBatchRequest -Id $id -Method PATCH -Url $url -BodyJson $bodyJson))
+        $meta.Add($id, $item)
+    }
+
+    Write-Host ("  Applying {0} device update(s) in Graph batches of {1}..." -f $requests.Count, $script:GraphBatchSize)
+    $responses = Invoke-GraphBatch -Requests $requests -Activity 'Device updates'
+    $byId = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+    foreach ($resp in $responses) {
+        $id = [string]$resp.Id
+        if ($id -and -not $byId.ContainsKey($id)) { $byId.Add($id, $resp) }
+    }
+
+    foreach ($kv in $meta.GetEnumerator()) {
+        $item = $kv.Value
+        $action = Get-DeviceChangeAction $item.Device $item.NewValue
+        $status = 'Failed'
+        $message = 'No batch response'
+        if ($byId.ContainsKey($kv.Key)) {
+            $resp = $byId[$kv.Key]
+            if ($resp.Status -ge 200 -and $resp.Status -lt 300) {
+                $status = 'Success'
+                $message = ''
+                if ($item.Device.IsManagementRestricted) {
+                    $message = 'Device is in a restricted management administrative unit; the update may be denied.'
+                }
+            }
+            else {
+                $message = Get-GraphBatchErrorMessage $resp
+            }
+        }
+        $results.Add((New-DeviceAuditEntry -Device $item.Device -NewValue $item.NewValue -Status $status -Action $action -Source $Source -Message $message -ChangedBy $changedBy))
+    }
+
+    Write-AuditLogs (ConvertTo-ObjectArray $results)
+    return (ConvertTo-ObjectArray $results)
 }
 
 #endregion
@@ -1361,33 +1784,80 @@ function Get-BulkCsvLookupTargets {
     return (ConvertTo-ObjectArray $targets)
 }
 
+function Add-UniqueDeviceRecord {
+    param($List, $Seen, $Record)
+    if ($null -eq $Record -or $null -eq $List) { return }
+    $id = [string]$Record.ObjectId
+    if (-not $id) { $id = [string]$Record.DeviceId }
+    if ($id -and $Seen -and $Seen.ContainsKey($id)) { return }
+    if ($id -and $Seen) { $Seen[$id] = $true }
+    $List.Add($Record)
+}
+
 function Get-DevicesForBulkRows {
     param($Rows, $ColumnMap)
     $devices = New-Object System.Collections.Generic.List[object]
     $seen = @{}
     $targets = Get-BulkCsvLookupTargets -Rows $Rows -ColumnMap $ColumnMap
-    $total = @($targets).Count
-    $n = 0
+    $byObjectId = New-Object System.Collections.Generic.List[object]
+    $byDeviceId = New-Object System.Collections.Generic.List[object]
+    $byName = New-Object System.Collections.Generic.List[object]
     foreach ($target in $targets) {
-        $n++
-        $label = $target.DisplayName
-        if (-not $label) { $label = $target.Search }
-        Write-Host ("  {0}/{1}  {2}" -f $n, $total, $label)
-        try {
-            $found = ConvertTo-ObjectArray (Find-Devices $target.Search)
+        if ($target.ObjectId) { $byObjectId.Add($target); continue }
+        if ($target.DeviceId) { $byDeviceId.Add($target); continue }
+        $byName.Add($target)
+    }
+
+    if ($byObjectId.Count -gt 0) {
+        $reqs = New-Object System.Collections.Generic.List[object]
+        $n = 0
+        foreach ($target in $byObjectId) {
+            $n++
+            $url = '/devices/{0}?$select={1}' -f $target.ObjectId, $script:SelectFields
+            $reqs.Add((New-GraphBatchRequest -Id ([string]$n) -Method GET -Url $url))
         }
-        catch {
-            Write-Host ("    Lookup failed: {0}" -f (Format-CaughtError $_)) -ForegroundColor Yellow
-            continue
-        }
-        foreach ($record in $found) {
-            $id = [string]$record.ObjectId
-            if (-not $id) { $id = [string]$record.DeviceId }
-            if ($id -and $seen.ContainsKey($id)) { continue }
-            if ($id) { $seen[$id] = $true }
-            $devices.Add($record)
+        Write-Host ("  Looking up {0} device(s) by Object ID..." -f $byObjectId.Count)
+        foreach ($resp in (Invoke-GraphBatch -Requests $reqs -Activity 'Device Object ID lookup')) {
+            if ($resp.Status -lt 200 -or $resp.Status -ge 300) { continue }
+            try { Add-UniqueDeviceRecord $devices $seen (ConvertTo-DeviceRecord $resp.Body) } catch { }
         }
     }
+
+    if ($byDeviceId.Count -gt 0) {
+        $reqs = New-Object System.Collections.Generic.List[object]
+        $n = 0
+        foreach ($target in $byDeviceId) {
+            $n++
+            $filter = "deviceId eq '{0}'" -f $target.DeviceId
+            $url = '/devices?$filter={0}&$select={1}&$top=5' -f [uri]::EscapeDataString($filter), $script:SelectFields
+            $reqs.Add((New-GraphBatchRequest -Id ([string]$n) -Method GET -Url $url))
+        }
+        Write-Host ("  Looking up {0} device(s) by Device ID..." -f $byDeviceId.Count)
+        foreach ($resp in (Invoke-GraphBatch -Requests $reqs -Activity 'Device ID lookup')) {
+            if ($resp.Status -lt 200 -or $resp.Status -ge 300) { continue }
+            foreach ($item in (Get-GraphCollection $resp.Body)) {
+                try { Add-UniqueDeviceRecord $devices $seen (ConvertTo-DeviceRecord $item) } catch { }
+            }
+        }
+    }
+
+    if ($byName.Count -gt 0) {
+        Write-Host ("  Looking up {0} device(s) by name (slower)..." -f $byName.Count)
+        $n = 0
+        foreach ($target in $byName) {
+            $n++
+            Write-ToolProgressCount -Activity 'Name lookup' -Done $n -Total $byName.Count -Every 25
+            try {
+                foreach ($record in (ConvertTo-ObjectArray (Find-Devices $target.Search))) {
+                    Add-UniqueDeviceRecord $devices $seen $record
+                }
+            }
+            catch {
+                Write-Host ("    Lookup failed for '{0}': {1}" -f $target.Search, (Format-CaughtError $_)) -ForegroundColor Yellow
+            }
+        }
+    }
+
     return (ConvertTo-ObjectArray $devices)
 }
 
@@ -2101,7 +2571,7 @@ function Invoke-BulkUpdate {
 
     while ($true) {
         Write-Title 'Preview'
-        $plan | Select-Object -Property $planColumns | Format-Table -AutoSize -Wrap | Out-Host
+        Show-LimitedTable -InputObject $plan -Property $planColumns -MaxRows $script:PreviewRowLimit
 
         Write-Host 'Summary:' -ForegroundColor Cyan
         $plan | Group-Object Status | Sort-Object Name | ForEach-Object {
@@ -2130,15 +2600,9 @@ function Invoke-BulkUpdate {
                 }
 
                 $source  = 'CSV:' + [IO.Path]::GetFileName($path)
-                $results = New-Object System.Collections.Generic.List[object]
-                $indexNo = 0
+                Write-Progress -Activity 'Updating extensionAttribute1' -Status "$($ready.Count) device(s)" -PercentComplete 0
                 try {
-                    foreach ($item in $ready) {
-                        $indexNo++
-                        Write-Host ("  Updating {0}/{1}: {2}" -f $indexNo, $ready.Count, $item.DisplayName)
-                        Write-Progress -Activity 'Updating extensionAttribute1' -Status "$indexNo of $($ready.Count): $($item.DisplayName)" -PercentComplete ([int](($indexNo / $ready.Count) * 100))
-                        $results.Add((Set-DeviceExtensionAttribute -Device $item.Device -NewValue $item.NewValue -Source $source))
-                    }
+                    $results = ConvertTo-ObjectArray (Invoke-DeviceExtensionAttributeUpdates -PlanItems $ready -Source $source)
                 }
                 finally {
                     Write-Progress -Activity 'Updating extensionAttribute1' -Completed
@@ -2213,11 +2677,50 @@ function Resolve-UsersFromTokens {
     $resolved = New-Object System.Collections.Generic.List[object]
     $missing = New-Object System.Collections.Generic.List[string]
     $seen = @{}
-
+    $direct = New-Object System.Collections.Generic.List[object]
+    $names = New-Object System.Collections.Generic.List[string]
     foreach ($token in @($Tokens)) {
         if ([string]::IsNullOrWhiteSpace($token)) { continue }
+        $guid = ConvertTo-CanonicalGuid $token
+        if ($guid -or $token -match '@') { $direct.Add($token); continue }
+        $names.Add($token)
+    }
+
+    if ($direct.Count -gt 0) {
+        $reqs = New-Object System.Collections.Generic.List[object]
+        $tokenById = New-Object 'System.Collections.Generic.Dictionary[string,string]'
+        $n = 0
+        foreach ($token in $direct) {
+            $n++
+            $id = [string]$n
+            $guid = ConvertTo-CanonicalGuid $token
+            $segment = if ($guid) { $guid } else { ConvertTo-GraphPathSegment $token }
+            $url = '/users/{0}?$select={1}' -f $segment, $script:UserSelectFields
+            $reqs.Add((New-GraphBatchRequest -Id $id -Method GET -Url $url))
+            $tokenById.Add($id, [string]$token)
+        }
+        Write-Host ("  Resolving {0} user(s) by UPN/object ID..." -f $direct.Count)
+        foreach ($resp in (Invoke-GraphBatch -Requests $reqs -Activity 'User lookup')) {
+            $token = $null
+            if ($tokenById.ContainsKey([string]$resp.Id)) { $token = $tokenById[[string]$resp.Id] }
+            if ($resp.Status -lt 200 -or $resp.Status -ge 300) {
+                if ($resp.Status -eq 404) {
+                    if ($token) { $missing.Add($token) }
+                }
+                elseif ($token) { $names.Add($token) }
+                continue
+            }
+            try { $user = ConvertTo-UserRecord $resp.Body } catch { if ($token) { $names.Add($token) }; continue }
+            if (-not $user.ObjectId) { if ($token) { $names.Add($token) }; continue }
+            if ($seen.ContainsKey($user.ObjectId)) { continue }
+            $seen[$user.ObjectId] = $true
+            $resolved.Add($user)
+        }
+    }
+
+    foreach ($token in $names) {
         try {
-            $matches = @(Find-Users $token)
+            $matches = ConvertTo-ObjectArray (Find-Users $token)
         }
         catch {
             Write-Host "Lookup failed for '$token': $(Get-GraphErrorMessage $_)" -ForegroundColor Red
@@ -2226,7 +2729,6 @@ function Resolve-UsersFromTokens {
         }
 
         if ($matches.Count -eq 0) {
-            Write-Host "No user found for '$token'." -ForegroundColor Yellow
             $missing.Add($token)
             continue
         }
@@ -2244,7 +2746,21 @@ function Resolve-UsersFromTokens {
         if ($user.ObjectId -and $seen.ContainsKey($user.ObjectId)) { continue }
         if ($user.ObjectId) { $seen[$user.ObjectId] = $true }
         $resolved.Add($user)
-        Write-Host ("  {0} <{1}>" -f $user.DisplayName, $user.UserPrincipalName) -ForegroundColor Green
+    }
+
+    if ($resolved.Count -le 20) {
+        foreach ($user in $resolved) {
+            Write-Host ("  {0} <{1}>" -f $user.DisplayName, $user.UserPrincipalName) -ForegroundColor Green
+        }
+    }
+    else {
+        Write-Host ("  Resolved {0} user(s)." -f $resolved.Count) -ForegroundColor Green
+    }
+    if ($missing.Count -gt 0 -and $missing.Count -le 20) {
+        Write-Host ("  Not found: {0}" -f ($missing.ToArray() -join ', ')) -ForegroundColor Yellow
+    }
+    elseif ($missing.Count -gt 20) {
+        Write-Host ("  Not found: {0} identifier(s)." -f $missing.Count) -ForegroundColor Yellow
     }
 
     return (New-ToolObject @(
@@ -2342,22 +2858,15 @@ function Invoke-UserDeviceCsvExport {
         Wait-ForKey
         return
     }
-    if ($resolved.Missing.Count -gt 0) {
-        Write-Host ("Not found: {0}" -f ($resolved.Missing -join ', ')) -ForegroundColor Yellow
-    }
-
     Write-Host ''
     Write-Host "Retrieving Windows devices registered to or owned by $($resolved.Users.Count) user(s)..."
-    $pairs = New-Object System.Collections.Generic.List[object]
-    foreach ($user in (ConvertTo-ObjectArray $resolved.Users)) {
-        try {
-            foreach ($pair in (ConvertTo-ObjectArray (Get-UserRelatedWindowsDevices $user))) {
-                $pairs.Add($pair)
-            }
-        }
-        catch {
-            Write-Host "Failed to get devices for $($user.UserPrincipalName): $(Format-CaughtError $_)" -ForegroundColor Red
-        }
+    try {
+        $pairs = ConvertTo-ObjectArray (Get-UsersRelatedWindowsDevices -Users $resolved.Users)
+    }
+    catch {
+        Write-Host "Failed to get devices: $(Format-CaughtError $_)" -ForegroundColor Red
+        Wait-ForKey
+        return
     }
 
     if ($pairs.Count -eq 0) {
@@ -2402,7 +2911,7 @@ function Invoke-UserDeviceCsvExport {
     $previewColumns = 'DisplayName', 'DeviceId', 'UserPrincipalName', 'Relationship', 'JoinType', 'CurrentExtensionAttribute1', 'Value', 'Action', 'Eligible'
     while ($true) {
         Write-Title 'User device CSV preview'
-        $exportRows | Select-Object -Property $previewColumns | Format-Table -AutoSize -Wrap | Out-Host
+        Show-LimitedTable -InputObject $exportRows -Property $previewColumns -MaxRows $script:PreviewRowLimit
 
         Write-Host "  1) Export $($exportRows.Count) row(s) for bulk update"
         if (Test-GridViewAvailable) { Write-Host '  2) Open preview in grid view' }

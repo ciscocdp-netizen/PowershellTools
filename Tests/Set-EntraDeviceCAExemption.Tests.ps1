@@ -423,6 +423,21 @@ Assert-Equal -Expected 2 -Actual @($targets).Count -Name 'Bulk CSV lookup de-dup
 Assert-Equal -Expected $devA.DeviceId -Actual $targets[0].Search -Name 'Bulk CSV lookup prefers DeviceId'
 Assert-Equal -Expected 'KIOSK-02' -Actual $targets[1].Search -Name 'Bulk CSV lookup uses DisplayName when no GUID'
 
+$chunks = Split-ToolChunks @(1,2,3,4,5) 2
+Assert-Equal -Expected 3 -Actual @($chunks).Count -Name 'Split-ToolChunks splits into groups of two'
+Assert-Equal -Expected 2 -Actual @($chunks[0]).Count -Name 'Split-ToolChunks first chunk size'
+Assert-Equal -Expected 1 -Actual @($chunks[2]).Count -Name 'Split-ToolChunks remainder chunk size'
+Assert-Equal -Expected '/devices/abc?$select=id' -Actual (ConvertTo-GraphRelativeUrl 'https://graph.microsoft.com/v1.0/devices/abc?$select=id') -Name 'Graph relative URL strips v1.0 prefix'
+Assert-Equal -Expected '/users/u1/registeredDevices' -Actual (ConvertTo-GraphRelativeUrl '/users/u1/registeredDevices') -Name 'Graph relative URL keeps rooted path'
+$patchReq = New-GraphBatchRequest -Id '7' -Method PATCH -Url 'https://graph.microsoft.com/v1.0/devices/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' -BodyJson (New-ExtensionAttributePatchJson 'CAExempt')
+$batchJson = ConvertTo-GraphBatchJson @($patchReq)
+Assert-True ($batchJson -match '"id":"7"') 'Batch JSON includes request id'
+Assert-True ($batchJson -match '"method":"PATCH"') 'Batch JSON includes PATCH method'
+Assert-True ($batchJson -match '/devices/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa') 'Batch JSON uses relative device URL'
+Assert-True ($batchJson -match 'extensionAttribute1') 'Batch JSON includes PATCH body'
+Assert-Equal -Expected 'Clear' -Actual (Get-DeviceChangeAction $devA $null) -Name 'Empty new value is Clear'
+Assert-Equal -Expected 'Add' -Actual (Get-DeviceChangeAction $devA 'CAExempt') -Name 'Empty current value is Add'
+
 Write-Host ''
 Write-Host ("Passed: {0}  Failed: {1}" -f $script:Passed, $script:Failed) -ForegroundColor $(if ($script:Failed -eq 0) { 'Green' } else { 'Red' })
 if ($script:Failed -gt 0) { exit 1 }
