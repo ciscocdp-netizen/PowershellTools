@@ -45,7 +45,8 @@ function New-GraphDeviceHashtable {
         [string]$Os = 'Windows',
         [string]$DeviceId = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
         [string]$ObjectId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
-        $ExtensionAttribute1 = $null
+        $ExtensionAttribute1 = $null,
+        $LastSignIn = '2026-01-15T12:00:00Z'
     )
     $attrs = @{ extensionAttribute1 = $ExtensionAttribute1 }
     return @{
@@ -56,7 +57,7 @@ function New-GraphDeviceHashtable {
         operatingSystem              = $Os
         operatingSystemVersion       = '10.0.19045'
         accountEnabled               = $true
-        approximateLastSignInDateTime = '2026-01-15T12:00:00Z'
+        approximateLastSignInDateTime = $LastSignIn
         extensionAttributes          = $attrs
         isManagementRestricted       = $false
     }
@@ -437,6 +438,48 @@ Assert-True ($batchJson -match '/devices/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa') 
 Assert-True ($batchJson -match 'extensionAttribute1') 'Batch JSON includes PATCH body'
 Assert-Equal -Expected 'Clear' -Actual (Get-DeviceChangeAction $devA $null) -Name 'Empty new value is Clear'
 Assert-Equal -Expected 'Add' -Actual (Get-DeviceChangeAction $devA 'CAExempt') -Name 'Empty current value is Add'
+
+$utc = ConvertTo-UtcDateTime '2026-10-01T12:00:00Z'
+Assert-Equal -Expected 2026 -Actual $utc.Year -Name 'ConvertTo-UtcDateTime parses Graph ISO year'
+Assert-Equal -Expected 'Utc' -Actual ([string]$utc.Kind) -Name 'ConvertTo-UtcDateTime kind is Utc'
+Assert-True ($null -eq (ConvertTo-UtcDateTime '')) 'ConvertTo-UtcDateTime empty is null'
+Assert-Equal -Expected '2026-10-01T12:00:00Z' -Actual (Format-UtcDateTimeIso '2026-10-01T12:00:00Z') -Name 'Format-UtcDateTimeIso round-trips'
+
+$now = [datetime]::SpecifyKind([datetime]'2026-11-24T00:00:00', [DateTimeKind]::Utc)
+$cutoff = Get-ActivityCutoffUtc -Days 90 -UtcNow $now
+Assert-Equal -Expected '2026-08-26T00:00:00Z' -Actual (Format-UtcDateTimeIso $cutoff) -Name '90-day cutoff from 2026-11-24 is 2026-08-26'
+
+$recentDev = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -DisplayName 'RECENT' -DeviceId '11111111-1111-1111-1111-111111111111' -ObjectId '21111111-1111-1111-1111-111111111111' -LastSignIn '2026-10-01T00:00:00Z')
+$staleDev = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -DisplayName 'STALE' -DeviceId '22222222-2222-2222-2222-222222222222' -ObjectId '32222222-2222-2222-2222-222222222222' -LastSignIn '2026-01-01T00:00:00Z')
+$unknownDev = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -DisplayName 'UNKNOWN' -DeviceId '33333333-3333-3333-3333-333333333333' -ObjectId '43333333-3333-3333-3333-333333333333' -LastSignIn '')
+Assert-True (Test-DeviceHasRecentActivity -Device $recentDev -UtcCutoff $cutoff) 'Recent device is inside 90-day window'
+Assert-True (-not (Test-DeviceHasRecentActivity -Device $staleDev -UtcCutoff $cutoff)) 'Stale device is outside 90-day window'
+Assert-True (-not (Test-DeviceHasRecentActivity -Device $unknownDev -UtcCutoff $cutoff)) 'Unknown last sign-in is excluded by default'
+Assert-True (Test-DeviceHasRecentActivity -Device $unknownDev -UtcCutoff $cutoff -IncludeUnknown) 'Unknown last sign-in is included when requested'
+
+$split = Select-DevicesWithRecentActivity -Devices @($recentDev, $staleDev, $unknownDev) -Days 90 -UtcNow $now
+Assert-Equal -Expected 1 -Actual @($split.Active).Count -Name 'Select-DevicesWithRecentActivity keeps one active device'
+Assert-Equal -Expected 'RECENT' -Actual @($split.Active)[0].DisplayName -Name 'Select-DevicesWithRecentActivity active display name'
+Assert-Equal -Expected 1 -Actual @($split.Stale).Count -Name 'Select-DevicesWithRecentActivity counts stale'
+Assert-Equal -Expected 1 -Actual @($split.Unknown).Count -Name 'Select-DevicesWithRecentActivity counts unknown'
+
+$splitUnknown = Select-DevicesWithRecentActivity -Devices @($recentDev, $unknownDev) -Days 90 -UtcNow $now -IncludeUnknown
+Assert-Equal -Expected 2 -Actual @($splitUnknown.Active).Count -Name 'Select-DevicesWithRecentActivity IncludeUnknown adds unknown to Active'
+
+Assert-Equal -Expected 'Device' -Actual (Get-CsvImportKind @('DeviceId', 'ObjectId', 'DisplayName', 'Value', 'Action')) -Name 'Device bulk CSV is Device kind'
+Assert-Equal -Expected 'Device' -Actual (Get-CsvImportKind @('DeviceId', 'UserPrincipalName', 'DisplayName')) -Name 'Option 4 export with DeviceId is Device kind'
+Assert-Equal -Expected 'User' -Actual (Get-CsvImportKind @('UserPrincipalName', 'DisplayName', 'ObjectId', 'Mail')) -Name 'User template CSV is User kind'
+Assert-Equal -Expected 'User' -Actual (Get-CsvImportKind @('UPN', 'Email')) -Name 'UPN/Email aliases are User kind'
+Assert-Equal -Expected 'Device' -Actual (Get-CsvImportKind @('ObjectId', 'DisplayName')) -Name 'ObjectId/DisplayName CSV is Device kind'
+Assert-Equal -Expected 'Unknown' -Actual (Get-CsvImportKind @('Department', 'CostCenter')) -Name 'Unrelated CSV is Unknown kind'
+
+$activityRow = New-UserDeviceBulkRow -Device $recentDev -User $userRec -Relationship 'Registered' -Value 'CAExempt' -Action 'Set'
+Assert-True ($activityRow.LastSignInUtc -like '2026-10-01T00:00:00Z') 'Bulk row includes last sign-in UTC'
+$activityHeaders = @($activityRow.PSObject.Properties | ForEach-Object { $_.Name })
+$activityMap = Resolve-CsvColumnMap $activityHeaders
+$activityIndex = New-DeviceIndex @($recentDev)
+$activityPlan = @(New-BulkUpdatePlan -Rows @($activityRow) -DeviceIndex $activityIndex -ColumnMap $activityMap -FallbackValue 'CAExempt' -SkipMissing $false)
+Assert-Equal -Expected 'Ready' -Actual $activityPlan[0].Status -Name 'Recent-activity export is ready for bulk update'
 
 Write-Host ''
 Write-Host ("Passed: {0}  Failed: {1}" -f $script:Passed, $script:Failed) -ForegroundColor $(if ($script:Failed -eq 0) { 'Green' } else { 'Red' })

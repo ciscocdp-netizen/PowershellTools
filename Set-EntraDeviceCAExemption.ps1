@@ -12,10 +12,11 @@
       2. Update a single device (search by name, Device ID or Object ID)
       3. Bulk update many devices from a CSV, with a full preview before any change
       4. Find Windows devices by user and export a bulk-update CSV
-      5. Export a CSV template
-      6. Settings: default value, dry-run mode, audit log path, registered-only filter
-      7. Connect or switch tenant
-      8. Conditional Access filter help
+      5. Filter a CSV to devices with recent activity and export a bulk-update CSV
+      6. Export a CSV template
+      7. Settings: default value, dry-run mode, audit log path, registered-only filter
+      8. Connect or switch tenant
+      9. Conditional Access filter help
 
     Every change (or dry-run) is written to a CSV audit log.
 
@@ -70,6 +71,13 @@
       applied immediately with menu option 3. Extra columns (user, relationship,
       join type) are for review and are ignored by bulk update.
 
+    Recent-activity CSV (menu option 5)
+      Ingest a device CSV (DeviceId / ObjectId / DisplayName) or a user CSV
+      (UPN / mail / object ID). Devices are looked up in Entra ID and kept when
+      approximateLastSignInDateTime is within the last 90 days (customisable).
+      The export is the same bulk-update format as option 4 and can be applied
+      with menu option 3.
+
     Conditional Access usage
       Conditions > Filter for devices > Exclude filtered devices:
         device.extensionAttribute1 -eq "CAExempt"
@@ -91,7 +99,7 @@ param(
     [string]$SettingsPath
 )
 
-$script:ToolVersion    = '1.1.0'
+$script:ToolVersion    = '1.2.0'
 $script:Root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $script:SettingsFile = if ($SettingsPath) { $SettingsPath } else { Join-Path $script:Root 'CAExemption.settings.json' }
 $script:RequiredScope  = 'Device.ReadWrite.All'
@@ -101,6 +109,7 @@ $script:GraphUsersBase = 'https://graph.microsoft.com/v1.0/users'
 $script:GraphBatchUri  = 'https://graph.microsoft.com/v1.0/$batch'
 $script:GraphBatchSize = 20
 $script:PreviewRowLimit = 40
+$script:DefaultActivityDays = 90
 $script:SelectFields     = 'id,deviceId,displayName,trustType,operatingSystem,operatingSystemVersion,accountEnabled,approximateLastSignInDateTime,extensionAttributes,isManagementRestricted'
 $script:UserSelectFields = 'id,displayName,userPrincipalName,mail,accountEnabled'
 $script:GuidPattern   = '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
@@ -174,16 +183,98 @@ function Format-Value {
     return [string]$Value
 }
 
-function Format-DateTimeDisplay {
+function ConvertTo-UtcDateTime {
     param($Value)
-    if ([string]::IsNullOrEmpty([string]$Value)) { return '' }
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [datetimeoffset]) { return $Value.UtcDateTime }
+    if ($Value -is [datetime]) {
+        if ($Value.Kind -eq [DateTimeKind]::Utc) { return $Value }
+        if ($Value.Kind -eq [DateTimeKind]::Local) { return $Value.ToUniversalTime() }
+        return [datetime]::SpecifyKind($Value, [DateTimeKind]::Utc)
+    }
+    $text = [string](ConvertTo-PlainValue $Value)
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    $parsed = [datetime]::MinValue
+    $styles = [System.Globalization.DateTimeStyles]::AllowWhiteSpaces -bor
+        [System.Globalization.DateTimeStyles]::AssumeUniversal -bor
+        [System.Globalization.DateTimeStyles]::AdjustToUniversal
+    if ([datetime]::TryParse($text, [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) {
+        if ($parsed.Kind -eq [DateTimeKind]::Utc) { return $parsed }
+        return $parsed.ToUniversalTime()
+    }
     try {
-        $dt = [datetime]$Value
-        return $dt.ToLocalTime().ToString('yyyy-MM-dd HH:mm')
+        return ([datetime]$text).ToUniversalTime()
     }
     catch {
-        return [string]$Value
+        return $null
     }
+}
+
+function Format-UtcDateTimeIso {
+    param($Value)
+    $dt = ConvertTo-UtcDateTime $Value
+    if ($null -eq $dt) { return '' }
+    return $dt.ToString('yyyy-MM-ddTHH:mm:ssZ')
+}
+
+function Format-DateTimeDisplay {
+    param($Value)
+    $dt = ConvertTo-UtcDateTime $Value
+    if ($null -eq $dt) {
+        $text = [string]$Value
+        if ([string]::IsNullOrWhiteSpace($text)) { return '' }
+        return $text
+    }
+    return $dt.ToLocalTime().ToString('yyyy-MM-dd HH:mm')
+}
+
+function Get-ActivityCutoffUtc {
+    param([int]$Days = 90, [datetime]$UtcNow = [datetime]::MinValue)
+    if ($Days -lt 1) { $Days = 90 }
+    if ($UtcNow -eq [datetime]::MinValue) { $UtcNow = [datetime]::UtcNow }
+    if ($UtcNow.Kind -eq [DateTimeKind]::Local) { $UtcNow = $UtcNow.ToUniversalTime() }
+    elseif ($UtcNow.Kind -eq [DateTimeKind]::Unspecified) {
+        $UtcNow = [datetime]::SpecifyKind($UtcNow, [DateTimeKind]::Utc)
+    }
+    return $UtcNow.AddDays(-$Days)
+}
+
+function Test-DeviceHasRecentActivity {
+    param($Device, [datetime]$UtcCutoff, [switch]$IncludeUnknown)
+    if ($null -eq $Device) { return $false }
+    $dt = ConvertTo-UtcDateTime $Device.LastSignIn
+    if ($null -eq $dt) { return [bool]$IncludeUnknown }
+    return ($dt -ge $UtcCutoff)
+}
+
+function Select-DevicesWithRecentActivity {
+    param(
+        $Devices,
+        [int]$Days = 90,
+        [datetime]$UtcNow = [datetime]::MinValue,
+        [switch]$IncludeUnknown
+    )
+    $cutoff = Get-ActivityCutoffUtc -Days $Days -UtcNow $UtcNow
+    $active = New-Object System.Collections.Generic.List[object]
+    $stale = New-Object System.Collections.Generic.List[object]
+    $unknown = New-Object System.Collections.Generic.List[object]
+    foreach ($device in (ConvertTo-ObjectArray $Devices)) {
+        $dt = ConvertTo-UtcDateTime $device.LastSignIn
+        if ($null -eq $dt) {
+            $unknown.Add($device)
+            if ($IncludeUnknown) { $active.Add($device) }
+            continue
+        }
+        if ($dt -ge $cutoff) { $active.Add($device) }
+        else { $stale.Add($device) }
+    }
+    return (New-ToolObject @(
+            'Active', (ConvertTo-ObjectArray $active)
+            'Stale', (ConvertTo-ObjectArray $stale)
+            'Unknown', (ConvertTo-ObjectArray $unknown)
+            'CutoffUtc', $cutoff
+            'Days', $Days
+        ))
 }
 
 function Test-SameValue {
@@ -1921,9 +2012,27 @@ function New-UserDeviceBulkRow {
             'Relationship', $Relationship
             'JoinType', $Device.JoinType
             'OperatingSystem', $Device.OperatingSystem
+            'LastSignIn', $Device.LastSignInDisplay
+            'LastSignInUtc', (Format-UtcDateTimeIso $Device.LastSignIn)
             'CurrentExtensionAttribute1', $Device.ExtensionAttribute1
             'Eligible', [bool]$Device.Eligible
         ))
+}
+
+function Get-CsvImportKind {
+    param($Headers)
+    $headerList = @($Headers)
+    $deviceMap = Resolve-CsvColumnMap $headerList
+    $userMap = Resolve-UserCsvColumnMap $headerList
+    $hasDeviceId = $deviceMap.ContainsKey('DeviceId')
+    $hasUpnOrMail = $userMap.ContainsKey('UserPrincipalName') -or $userMap.ContainsKey('Mail')
+    $userObjectHeader = ''
+    if ($userMap.ContainsKey('ObjectId')) { $userObjectHeader = [string]$userMap['ObjectId'] }
+    $hasUserOnlyObjectId = ($userObjectHeader -match 'User')
+    if ($hasDeviceId) { return 'Device' }
+    if ($hasUpnOrMail -or $hasUserOnlyObjectId) { return 'User' }
+    if ($deviceMap.ContainsKey('ObjectId') -or $deviceMap.ContainsKey('DisplayName')) { return 'Device' }
+    return 'Unknown'
 }
 
 function Merge-UserDeviceBulkRows {
@@ -2126,6 +2235,19 @@ function New-BulkUpdatePlan {
 #endregion
 
 #region Shared prompts
+
+function Read-ActivityWindowDays {
+    param([int]$Default = 90)
+    if ($Default -lt 1) { $Default = 90 }
+    $text = ([string](Read-Host ("Include devices with last sign-in in the last N days [{0}]" -f $Default))).Trim()
+    if (-not $text) { return $Default }
+    $days = 0
+    if ([int]::TryParse($text, [ref]$days) -and $days -ge 1 -and $days -le 3650) {
+        return $days
+    }
+    Write-Host ("Using {0} days." -f $Default) -ForegroundColor Yellow
+    return $Default
+}
 
 function Read-ValueChoice {
     param([string]$Heading = 'What do you want to set extensionAttribute1 to?')
@@ -2769,6 +2891,99 @@ function Resolve-UsersFromTokens {
         ))
 }
 
+function ConvertTo-BulkExportRows {
+    param($Pairs, $Devices, $Value, [string]$Action = 'Set')
+    $rawRows = New-Object System.Collections.Generic.List[object]
+    foreach ($pair in (ConvertTo-ObjectArray $Pairs)) {
+        $rawRows.Add((New-UserDeviceBulkRow -Device $pair.Device -User $pair.User -Relationship $pair.Relationship -Value $Value -Action $Action))
+    }
+    foreach ($device in (ConvertTo-ObjectArray $Devices)) {
+        $rawRows.Add((New-UserDeviceBulkRow -Device $device -User $null -Relationship '' -Value $Value -Action $Action))
+    }
+    return (ConvertTo-ObjectArray (Merge-UserDeviceBulkRows (ConvertTo-ObjectArray $rawRows)))
+}
+
+function Select-EligibleBulkExportRows {
+    param($Rows, [string]$EmptyMessage)
+    $all = ConvertTo-ObjectArray $Rows
+    $eligible = ConvertTo-ObjectArray ($all | Where-Object { $_.Eligible })
+    $ineligible = ConvertTo-ObjectArray ($all | Where-Object { -not $_.Eligible })
+    Write-Host "  $($eligible.Count) are eligible to change with the current device scope."
+    if ($ineligible.Count -gt 0) {
+        Write-Host "  $($ineligible.Count) are Windows but not eligible (join type / settings)." -ForegroundColor Yellow
+    }
+    $exportRows = $eligible
+    if ($ineligible.Count -gt 0 -and (Read-YesNo 'Include ineligible Windows devices in the CSV as well?' $false)) {
+        $exportRows = $all
+    }
+    if ($exportRows.Count -eq 0) {
+        if (-not $EmptyMessage) {
+            $EmptyMessage = 'Nothing to export. Turn off "Registered only" in Settings if you want Entra joined / hybrid devices included.'
+        }
+        Write-Host $EmptyMessage -ForegroundColor Yellow
+        Wait-ForKey
+        return @()
+    }
+    return $exportRows
+}
+
+function Invoke-ExportedBulkCsvFlow {
+    param(
+        $Rows,
+        [string]$Title,
+        [string[]]$PreviewColumns,
+        [string]$DefaultFileName
+    )
+    $exportRows = ConvertTo-ObjectArray $Rows
+    while ($true) {
+        Write-Title $Title
+        Show-LimitedTable -InputObject $exportRows -Property $PreviewColumns -MaxRows $script:PreviewRowLimit
+
+        Write-Host "  1) Export $($exportRows.Count) row(s) for bulk update"
+        if (Test-GridViewAvailable) { Write-Host '  2) Open preview in grid view' }
+        Write-Host '  0) Cancel'
+
+        switch (Read-Choice) {
+            '1' {
+                $defaultPath = Join-Path $script:Root $DefaultFileName
+                $path = ([string](Read-Host "Save to [$defaultPath]")).Trim().Trim('"')
+                if (-not $path) { $path = $defaultPath }
+                try {
+                    $folder = Split-Path -Parent $path
+                    if ($folder -and -not (Test-Path -LiteralPath $folder)) {
+                        New-Item -ItemType Directory -Path $folder -Force | Out-Null
+                    }
+                    $exportRows | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+                    Write-Host "Exported to $path" -ForegroundColor Green
+                    Write-Host 'Columns DeviceId, ObjectId, DisplayName, Value and Action can be fed straight into bulk update (menu option 3).'
+                }
+                catch {
+                    Write-Host "Export failed: $($_.Exception.Message)" -ForegroundColor Red
+                    Wait-ForKey
+                    return
+                }
+                if (Read-YesNo 'Run bulk update from this CSV now?' $true) {
+                    Invoke-BulkUpdate -Path $path
+                }
+                else {
+                    Wait-ForKey
+                }
+                return
+            }
+            '2' {
+                if (Test-GridViewAvailable) {
+                    $exportRows | Select-Object -Property $PreviewColumns | Out-GridView -Title $Title
+                }
+                else {
+                    Write-Host 'Out-GridView is not available in this session.' -ForegroundColor Yellow
+                }
+            }
+            '0' { return }
+            default { Write-Host 'Invalid choice.' -ForegroundColor Yellow }
+        }
+    }
+}
+
 function Invoke-UserDeviceCsvExport {
     Write-Title 'Find Windows devices by user'
 
@@ -2883,79 +3098,175 @@ function Invoke-UserDeviceCsvExport {
     }
     $exportAction = if ([string]::IsNullOrEmpty($choice.Value)) { 'Clear' } else { 'Set' }
 
-    $rawRows = New-Object System.Collections.Generic.List[object]
-    foreach ($pair in (ConvertTo-ObjectArray $pairs)) {
-        $rawRows.Add((New-UserDeviceBulkRow -Device $pair.Device -User $pair.User -Relationship $pair.Relationship -Value $choice.Value -Action $exportAction))
-    }
-    $rows = ConvertTo-ObjectArray (Merge-UserDeviceBulkRows (ConvertTo-ObjectArray $rawRows))
-    $eligible = ConvertTo-ObjectArray ($rows | Where-Object { $_.Eligible })
-    $ineligible = ConvertTo-ObjectArray ($rows | Where-Object { -not $_.Eligible })
-
+    $rows = ConvertTo-BulkExportRows -Pairs $pairs -Value $choice.Value -Action $exportAction
     Write-Host ''
     Write-Host "Found $($rows.Count) Windows device(s) for $($resolved.Users.Count) user(s)." -ForegroundColor Green
-    Write-Host "  $($eligible.Count) are eligible to change with the current device scope."
-    if ($ineligible.Count -gt 0) {
-        Write-Host "  $($ineligible.Count) are Windows but not eligible (join type / settings)." -ForegroundColor Yellow
-    }
+    $exportRows = ConvertTo-ObjectArray (Select-EligibleBulkExportRows -Rows $rows)
+    if ($exportRows.Count -eq 0) { return }
 
-    $exportRows = $eligible
-    if ($ineligible.Count -gt 0 -and (Read-YesNo 'Include ineligible Windows devices in the CSV as well?' $false)) {
-        $exportRows = $rows
-    }
-    if ($exportRows.Count -eq 0) {
-        Write-Host 'Nothing to export. Turn off "Registered only" in Settings if you want Entra joined / hybrid devices included.' -ForegroundColor Yellow
+    $previewColumns = 'DisplayName', 'DeviceId', 'UserPrincipalName', 'Relationship', 'JoinType', 'LastSignIn', 'CurrentExtensionAttribute1', 'Value', 'Action', 'Eligible'
+    Invoke-ExportedBulkCsvFlow -Rows $exportRows -Title 'User device CSV preview' -PreviewColumns $previewColumns -DefaultFileName ('CAExemption-UserDevices_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+}
+
+function Invoke-RecentActivityCsvExport {
+    Write-Title 'Filter CSV by last activity'
+
+    Write-Host 'Load a CSV of devices or users, look them up in Entra ID, and keep'
+    Write-Host ("devices whose last sign-in is within the last {0} days (you can change the window)." -f $script:DefaultActivityDays)
+    Write-Host 'The export can be applied with menu option 3 to set extensionAttribute1.'
+    Write-Host ''
+    Write-Host 'Accepted files:'
+    Write-Host '  - Device CSV: DeviceId, ObjectId or DisplayName'
+    Write-Host '  - User CSV: UserPrincipalName, Mail or ObjectId (same as option 4)'
+    Write-Host '  - A previous option 4 export (DeviceId is used)'
+    Write-Host ''
+
+    $path = Select-CsvPath
+    if (-not $path) { return }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        Write-Host "File not found: $path" -ForegroundColor Red
         Wait-ForKey
         return
     }
 
-    $previewColumns = 'DisplayName', 'DeviceId', 'UserPrincipalName', 'Relationship', 'JoinType', 'CurrentExtensionAttribute1', 'Value', 'Action', 'Eligible'
-    while ($true) {
-        Write-Title 'User device CSV preview'
-        Show-LimitedTable -InputObject $exportRows -Property $previewColumns -MaxRows $script:PreviewRowLimit
+    try {
+        $csvRows = @(Import-DeviceCsv -Path $path)
+    }
+    catch {
+        Write-Host "Could not read CSV: $($_.Exception.Message)" -ForegroundColor Red
+        Wait-ForKey
+        return
+    }
+    if ($csvRows.Count -eq 0) {
+        Write-Host 'The CSV has no data rows.' -ForegroundColor Yellow
+        Wait-ForKey
+        return
+    }
 
-        Write-Host "  1) Export $($exportRows.Count) row(s) for bulk update"
-        if (Test-GridViewAvailable) { Write-Host '  2) Open preview in grid view' }
-        Write-Host '  0) Cancel'
+    $headers = @($csvRows[0].PSObject.Properties | ForEach-Object { $_.Name })
+    $kind = Get-CsvImportKind $headers
+    if ($kind -eq 'Unknown') {
+        Write-Host 'The CSV needs device columns (DeviceId, ObjectId, DisplayName) or user columns (UserPrincipalName, Mail, ObjectId).' -ForegroundColor Red
+        Write-Host "Columns found: $($headers -join ', ')" -ForegroundColor Red
+        Wait-ForKey
+        return
+    }
 
-        switch (Read-Choice) {
-            '1' {
-                $defaultPath = Join-Path $script:Root ('CAExemption-UserDevices_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
-                $path = ([string](Read-Host "Save to [$defaultPath]")).Trim().Trim('"')
-                if (-not $path) { $path = $defaultPath }
-                try {
-                    $folder = Split-Path -Parent $path
-                    if ($folder -and -not (Test-Path -LiteralPath $folder)) {
-                        New-Item -ItemType Directory -Path $folder -Force | Out-Null
-                    }
-                    $exportRows | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
-                    Write-Host "Exported to $path" -ForegroundColor Green
-                    Write-Host 'Columns DeviceId, ObjectId, DisplayName, Value and Action can be fed straight into bulk update.'
-                }
-                catch {
-                    Write-Host "Export failed: $($_.Exception.Message)" -ForegroundColor Red
-                    Wait-ForKey
-                    return
-                }
-                if (Read-YesNo 'Run bulk update from this CSV now?' $true) {
-                    Invoke-BulkUpdate -Path $path
-                }
-                else {
-                    Wait-ForKey
-                }
-                return
-            }
-            '2' {
-                if (Test-GridViewAvailable) {
-                    $exportRows | Select-Object -Property $previewColumns | Out-GridView -Title 'Windows devices by user'
-                }
-                else {
-                    Write-Host 'Out-GridView is not available in this session.' -ForegroundColor Yellow
-                }
-            }
-            '0' { return }
-            default { Write-Host 'Invalid choice.' -ForegroundColor Yellow }
+    Write-Host ("Loaded {0} row(s) from {1} ({2} CSV)." -f $csvRows.Count, $path, $kind.ToLower()) -ForegroundColor Green
+    $days = Read-ActivityWindowDays -Default $script:DefaultActivityDays
+    $includeUnknown = Read-YesNo 'Include devices with no last-sign-in timestamp?' $false
+
+    $devices = @()
+    $pairs = @()
+    if ($kind -eq 'User') {
+        $userMap = Resolve-UserCsvColumnMap $headers
+        $tokens = @()
+        foreach ($row in $csvRows) {
+            $token = Get-UserRowSearchToken $row $userMap
+            if ($token) { $tokens += $token }
+        }
+        $tokens = @(Split-UserSearchTokens ($tokens -join ','))
+        if ($tokens.Count -eq 0) {
+            Write-Host 'No user identifiers were found in the CSV.' -ForegroundColor Yellow
+            Wait-ForKey
+            return
+        }
+        Write-Host ''
+        Write-Host "Resolving $($tokens.Count) user identifier(s)..."
+        $resolved = Resolve-UsersFromTokens -Tokens $tokens
+        if ($resolved.Users.Count -eq 0) {
+            Write-Host 'No users were resolved.' -ForegroundColor Yellow
+            Wait-ForKey
+            return
+        }
+        Write-Host ''
+        Write-Host "Retrieving Windows devices for $($resolved.Users.Count) user(s)..."
+        try {
+            $pairs = ConvertTo-ObjectArray (Get-UsersRelatedWindowsDevices -Users $resolved.Users)
+        }
+        catch {
+            Write-Host "Failed to get devices: $(Format-CaughtError $_)" -ForegroundColor Red
+            Wait-ForKey
+            return
+        }
+        $seenDevices = @{}
+        $deviceList = New-Object System.Collections.Generic.List[object]
+        foreach ($pair in $pairs) {
+            $id = [string]$pair.Device.ObjectId
+            if (-not $id) { $id = [string]$pair.Device.DeviceId }
+            if ($id -and $seenDevices.ContainsKey($id)) { continue }
+            if ($id) { $seenDevices[$id] = $true }
+            $deviceList.Add($pair.Device)
+        }
+        $devices = ConvertTo-ObjectArray $deviceList
+    }
+    else {
+        $columnMap = Resolve-CsvColumnMap $headers
+        Write-Host ''
+        Write-Host "Looking up $($csvRows.Count) CSV device(s) in Entra ID..."
+        try {
+            $devices = ConvertTo-ObjectArray (Get-DevicesForBulkRows -Rows $csvRows -ColumnMap $columnMap)
+        }
+        catch {
+            Write-Host "Failed to retrieve devices: $(Format-CaughtError $_)" -ForegroundColor Red
+            Wait-ForKey
+            return
         }
     }
+
+    if (@($devices).Count -eq 0) {
+        Write-Host 'No devices were found for that CSV.' -ForegroundColor Yellow
+        Wait-ForKey
+        return
+    }
+
+    $split = Select-DevicesWithRecentActivity -Devices $devices -Days $days -IncludeUnknown:$includeUnknown
+    Write-Host ''
+    Write-Host ("Looked up {0} device(s). Last sign-in on or after {1:yyyy-MM-dd} UTC ({2} days)." -f @($devices).Count, $split.CutoffUtc, $days) -ForegroundColor Green
+    Write-Host ("  Active : {0}" -f @($split.Active).Count) -ForegroundColor Green
+    Write-Host ("  Stale  : {0}" -f @($split.Stale).Count)
+    Write-Host ("  No sign-in timestamp : {0}" -f @($split.Unknown).Count)
+
+    if (@($split.Active).Count -eq 0) {
+        Write-Host 'No devices had activity in that window.' -ForegroundColor Yellow
+        Wait-ForKey
+        return
+    }
+
+    $choice = Read-ValueChoice 'What should the exported CSV set extensionAttribute1 to?'
+    if ($null -eq $choice) {
+        Write-Host 'Cancelled.' -ForegroundColor Yellow
+        Wait-ForKey
+        return
+    }
+    $exportAction = if ([string]::IsNullOrEmpty($choice.Value)) { 'Clear' } else { 'Set' }
+
+    $exportSourcePairs = @()
+    $exportSourceDevices = @()
+    if ($kind -eq 'User') {
+        $activeIds = @{}
+        foreach ($device in (ConvertTo-ObjectArray $split.Active)) {
+            if ($device.ObjectId) { $activeIds[$device.ObjectId] = $true }
+            elseif ($device.DeviceId) { $activeIds[$device.DeviceId] = $true }
+        }
+        $kept = New-Object System.Collections.Generic.List[object]
+        foreach ($pair in $pairs) {
+            $id = [string]$pair.Device.ObjectId
+            if (-not $id) { $id = [string]$pair.Device.DeviceId }
+            if ($id -and $activeIds.ContainsKey($id)) { $kept.Add($pair) }
+        }
+        $exportSourcePairs = ConvertTo-ObjectArray $kept
+    }
+    else {
+        $exportSourceDevices = ConvertTo-ObjectArray $split.Active
+    }
+
+    $rows = ConvertTo-BulkExportRows -Pairs $exportSourcePairs -Devices $exportSourceDevices -Value $choice.Value -Action $exportAction
+    $exportRows = ConvertTo-ObjectArray (Select-EligibleBulkExportRows -Rows $rows)
+    if ($exportRows.Count -eq 0) { return }
+
+    $previewColumns = 'DisplayName', 'DeviceId', 'LastSignIn', 'JoinType', 'UserPrincipalName', 'CurrentExtensionAttribute1', 'Value', 'Action', 'Eligible'
+    Invoke-ExportedBulkCsvFlow -Rows $exportRows -Title 'Recent-activity CSV preview' -PreviewColumns $previewColumns -DefaultFileName ('CAExemption-RecentActivity_{0}d_{1}.csv' -f $days, (Get-Date -Format 'yyyyMMdd_HHmmss'))
 }
 
 function Export-CsvTemplate {
@@ -3093,10 +3404,11 @@ function Show-MainMenu {
         Write-Host '  2) Add, modify or clear the value on one device'
         Write-Host '  3) Bulk update devices from a CSV'
         Write-Host '  4) Find Windows devices by user and export a bulk-update CSV'
-        Write-Host '  5) Export a CSV template'
-        Write-Host '  6) Settings (default value, dry-run, log path, device scope)'
-        Write-Host '  7) Connect or switch tenant'
-        Write-Host '  8) Conditional Access filter help'
+        Write-Host '  5) Filter a CSV by last activity (90 days) and export a bulk-update CSV'
+        Write-Host '  6) Export a CSV template'
+        Write-Host '  7) Settings (default value, dry-run, log path, device scope)'
+        Write-Host '  8) Connect or switch tenant'
+        Write-Host '  9) Conditional Access filter help'
         Write-Host '  Q) Quit'
         Write-Host ''
 
@@ -3105,10 +3417,11 @@ function Show-MainMenu {
             '2' { if (Connect-Graph) { Invoke-SingleDeviceUpdate } else { Wait-ForKey } }
             '3' { if (Connect-Graph) { Invoke-BulkUpdate } else { Wait-ForKey } }
             '4' { if (Connect-Graph) { Invoke-UserDeviceCsvExport } else { Wait-ForKey } }
-            '5' { Export-CsvTemplate }
-            '6' { Show-SettingsMenu }
-            '7' { [void](Connect-Graph -Reconnect); Wait-ForKey }
-            '8' { Show-ConditionalAccessHelp }
+            '5' { if (Connect-Graph) { Invoke-RecentActivityCsvExport } else { Wait-ForKey } }
+            '6' { Export-CsvTemplate }
+            '7' { Show-SettingsMenu }
+            '8' { [void](Connect-Graph -Reconnect); Wait-ForKey }
+            '9' { Show-ConditionalAccessHelp }
             'Q' { return }
             default { Write-Host 'Invalid choice.' -ForegroundColor Yellow; Start-Sleep -Milliseconds 600 }
         }
