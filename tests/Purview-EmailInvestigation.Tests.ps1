@@ -207,10 +207,48 @@ try {
     Assert-True (Test-Path -LiteralPath (Join-Path $folderA 'RunManifest.json')) 'manifest exists'
 
     $previewItems = Export-PreviewResults -RawResults $previewRaw -OutputFolder $folderA -SearchName 'EmailInvestigation_user_20250710'
-    Assert-Equal $previewItems.Count 2 'preview export returns both rows'
+    Assert-Equal $previewItems.Rows.Count 2 'preview export returns both rows'
     Assert-True (Test-Path -LiteralPath (Join-Path $folderA 'PreviewResults.csv')) 'preview CSV exists'
+    Assert-True (Test-Path -LiteralPath (Join-Path $folderA 'MessageFindings.csv')) 'findings CSV exists'
+    Assert-True (Test-Path -LiteralPath (Join-Path $folderA 'MessageFindings.xlsx')) 'findings workbook exists'
     $previewText = [System.IO.File]::ReadAllText((Join-Path $folderA 'PreviewResults.txt'))
     Assert-True ($previewText.Contains('Hello; world')) 'preview text keeps the subject'
+
+    $noLink = ConvertTo-PreviewItem 'Location: box@contoso.com; Sender: a@contoso.com; Subject: No link; Type: IPM.Note; Size: 10; Received Time: 7/11/2025 1:00:00 PM'
+    Assert-Equal $noLink.Count 1 'a record without a data link is kept'
+    Assert-Equal $noLink[0].Subject 'No link' 'subject is read without a data link'
+    $quoted = ConvertTo-PreviewItem 'Location: box@contoso.com; Sender: a@contoso.com; Subject: Say "hello", friend; Type: IPM.Note; Size: 12; Received Time: 7/11/2025 1:00:00 PM; Data Link: abc'
+    Assert-Equal $quoted[0].Subject 'Say "hello", friend' 'subject keeps quotes and commas'
+
+    $many = New-Object System.Text.StringBuilder
+    for ($i = 1; $i -le 90; $i++) {
+        if ($i -gt 1) { [void]$many.Append(', ') }
+        [void]$many.Append("Location: box@contoso.com; Sender: user@contoso.com; Subject: Finding $i; Type: IPM.Note; Size: 100; Received Time: 7/11/2025 1:00:00 PM; Data Link: link$i")
+    }
+    $parsed = ConvertTo-PreviewItem $many.ToString()
+    Assert-Equal $parsed.Count 90 'ninety preview records are parsed'
+    Assert-Equal $parsed[0].Subject 'Finding 1' 'first finding subject'
+    Assert-Equal $parsed[89].Subject 'Finding 90' 'ninetieth finding subject'
+    $saved = Export-FindingsSpreadsheet -Items $parsed -OutputFolder $folderA -SearchName 'EmailInvestigation_user_20250710' -ReportedItemCount 90
+    Assert-Equal $saved.Count 90 'findings spreadsheet has ninety rows'
+    Assert-True $saved.IsComplete 'ninety rows cover the reported count'
+    $findingsCsv = [System.IO.File]::ReadAllText($saved.CsvPath)
+    Assert-True ($findingsCsv.Contains('Finding 1')) 'findings CSV contains the first subject'
+    Assert-True ($findingsCsv.Contains('Finding 90')) 'findings CSV contains the last subject'
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($saved.WorkbookPath)
+    try {
+        $entry = $zip.GetEntry('xl/worksheets/sheet1.xml')
+        $reader = New-Object System.IO.StreamReader($entry.Open())
+        try { $sheetXml = $reader.ReadToEnd() } finally { $reader.Dispose() }
+    }
+    finally { $zip.Dispose() }
+    Assert-True ($sheetXml.Contains('Finding 1')) 'workbook contains the first subject'
+    Assert-True ($sheetXml.Contains('Finding 90')) 'workbook contains the ninetieth subject'
+    $partial = Export-FindingsSpreadsheet -Items $quoted -OutputFolder $folderA -SearchName 'EmailInvestigation_user_20250710' -ReportedItemCount 90
+    Assert-True (-not $partial.IsComplete) 'a short subject list does not cover ninety matches'
+    $quoteCsv = [System.IO.File]::ReadAllText($partial.CsvPath)
+    Assert-True ($quoteCsv.Contains('Say "hello", friend') -or $quoteCsv.Contains('Say ""hello"", friend')) 'quoted subject is saved in the CSV'
 
     $logPath = Join-Path $folderA 'Investigation.log'
     Add-Utf8Line -Path $logPath -Line 'one'
@@ -378,6 +416,8 @@ Assert-True ($source -match 'sent<\{3\}') 'the query template uses an exclusive 
 Assert-Throws { Start-PurviewInvestigationGui } 'GUI requires Windows' 'requires Windows'
 Assert-True ($source -match 'Start-PurviewInvestigationGui') 'the script launches the GUI'
 Assert-True ($source -match 'New-ComplianceSearch') 'the search is still created with New-ComplianceSearch'
+Assert-True ($source -match 'MessageFindings.xlsx') 'the tool writes a findings workbook'
+Assert-True ($source -notmatch 'New-ComplianceSearchAction[^\r\n]*-Export') 'findings do not use the retired export switch'
 Assert-True ($source -notmatch 'Remove-ComplianceSearchAction -Purge') 'cleanup does not purge messages'
 
 if ($script:Failures -gt 0) {

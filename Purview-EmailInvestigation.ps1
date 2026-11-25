@@ -7,8 +7,10 @@
 .DESCRIPTION
     Searches Exchange Online mailbox content for messages sent by one user
     to selected recipient domains. It creates a compliance search, monitors
-    progress, and writes search statistics. It does not delete, move, export,
-    or modify email messages.
+    progress, and writes search statistics. When the search finds messages,
+    it also writes a spreadsheet with one row per message, including the
+    subject line. It does not delete, move, or modify email messages, and it
+    does not download message bodies.
 
     Run the script on Windows to open the GUI. The search runs on a background
     runspace so the window stays responsive while Microsoft sign-in and the
@@ -25,7 +27,7 @@
     next calendar day because a date-only sent<= bound is midnight.
 #>
 
-$script:AppVersion = '2.0'
+$script:AppVersion = '2.1'
 
 function ConvertTo-KqlPhrase {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
@@ -395,6 +397,20 @@ function ConvertTo-LocationStatistic {
     return ,$list.ToArray()
 }
 
+function Get-LabeledPreviewValue {
+    param(
+        [AllowEmptyString()][string]$Chunk,
+        [Parameter(Mandatory)][string]$Label,
+        [Parameter(Mandatory)][string]$NextPattern
+    )
+
+    $labelPattern = [regex]::Escape($Label).Replace('\ ', '\s+')
+    $match = [regex]::Match($Chunk, "(?is)$labelPattern\s*:\s*(?<Value>.*?)(?=$NextPattern)")
+    if (-not $match.Success) { return '' }
+    $value = $match.Groups['Value'].Value.Trim()
+    return $value.TrimEnd('}', ' ').Trim()
+}
+
 function ConvertTo-PreviewItem {
     param([AllowEmptyString()][string]$Results)
     $list = New-Object System.Collections.Generic.List[object]
@@ -402,18 +418,276 @@ function ConvertTo-PreviewItem {
         return ,$list.ToArray()
     }
 
-    $pattern = '(?i)Location:\s*(?<Location>.*?);\s*Sender:\s*(?<Sender>.*?);\s*Subject:\s*(?<Subject>.*?);\s*Type:\s*(?<Type>.*?);\s*Size:\s*(?<Size>.*?);\s*Received Time:\s*(?<Received>.*?);\s*Data Link:'
-    foreach ($match in [regex]::Matches($Results, $pattern)) {
+    $records = [regex]::Split($Results, '(?i)(?=Location\s*:)')
+    foreach ($chunk in $records) {
+        if ($chunk -notmatch '(?i)Sender\s*:') { continue }
+        $location = Get-LabeledPreviewValue $chunk 'Location' '(?:;|,)\s*Sender\s*:'
+        $location = $location.TrimStart('{').Trim()
+        if ([string]::IsNullOrWhiteSpace($location)) { continue }
         $list.Add([pscustomobject]@{
-            Location = $match.Groups['Location'].Value.Trim()
-            Sender   = $match.Groups['Sender'].Value.Trim()
-            Subject  = $match.Groups['Subject'].Value.Trim()
-            Type     = $match.Groups['Type'].Value.Trim()
-            Size     = $match.Groups['Size'].Value.Trim()
-            Received = $match.Groups['Received'].Value.Trim()
+            Location    = $location
+            Sender      = (Get-LabeledPreviewValue $chunk 'Sender' '(?:;|,)\s*Subject\s*:')
+            Subject     = (Get-LabeledPreviewValue $chunk 'Subject' '(?:;|,)\s*Type\s*:')
+            Type        = (Get-LabeledPreviewValue $chunk 'Type' '(?:;|,)\s*Size\s*:')
+            Size        = (Get-LabeledPreviewValue $chunk 'Size' '(?:;|,)\s*Received\s+Time\s*:')
+            Received    = (Get-LabeledPreviewValue $chunk 'Received Time' '(?:;|,)\s*Data\s+Link\s*:|\z')
+            PreviewLink = (Get-LabeledPreviewValue $chunk 'Data Link' '\z')
         })
     }
     return ,$list.ToArray()
+}
+
+function ConvertTo-SpreadsheetText {
+    param([AllowEmptyString()][string]$Value)
+    $text = [string]$Value
+    if ([string]::IsNullOrEmpty($text)) { return '' }
+    $text = [regex]::Replace($text, '[\x00-\x08\x0B\x0C\x0E-\x1F]', '')
+    return [System.Security.SecurityElement]::Escape($text)
+}
+
+function ConvertTo-ColumnName {
+    param([Parameter(Mandatory)][int]$Index)
+    $name = ''
+    $number = $Index
+    while ($number -gt 0) {
+        $number--
+        $name = [char](65 + ($number % 26)) + $name
+        $number = [math]::Floor($number / 26)
+    }
+    return $name
+}
+
+function Add-ZipTextEntry {
+    param(
+        [Parameter(Mandatory)]$Archive,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Content
+    )
+
+    $entry = $Archive.CreateEntry($Name, [System.IO.Compression.CompressionLevel]::Optimal)
+    $stream = $entry.Open()
+    try {
+        $bytes = (New-Object System.Text.UTF8Encoding $false).GetBytes($Content)
+        $stream.Write($bytes, 0, $bytes.Length)
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function New-FindingsWorksheetXml {
+    param(
+        [Parameter(Mandatory)][string[]]$Headers,
+        [Parameter(Mandatory)][System.Collections.Generic.List[object]]$Rows,
+        [int[]]$Widths
+    )
+
+    $lastColumn = ConvertTo-ColumnName $Headers.Count
+    $lastRow = $Rows.Count + 1
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.AppendLine('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>')
+    [void]$builder.AppendLine('<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">')
+    [void]$builder.AppendLine('<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>')
+    if ($Widths -and $Widths.Count -gt 0) {
+        [void]$builder.AppendLine('<cols>')
+        for ($i = 0; $i -lt $Widths.Count; $i++) {
+            $column = $i + 1
+            [void]$builder.AppendLine("<col min=`"$column`" max=`"$column`" width=`"$($Widths[$i])`" customWidth=`"1`"/>")
+        }
+        [void]$builder.AppendLine('</cols>')
+    }
+    [void]$builder.AppendLine('<sheetData>')
+    [void]$builder.AppendLine('<row r="1">')
+    for ($i = 0; $i -lt $Headers.Count; $i++) {
+        $cell = (ConvertTo-ColumnName ($i + 1)) + '1'
+        $text = ConvertTo-SpreadsheetText $Headers[$i]
+        [void]$builder.AppendLine("<c r=`"$cell`" t=`"inlineStr`" s=`"1`"><is><t>$text</t></is></c>")
+    }
+    [void]$builder.AppendLine('</row>')
+    for ($r = 0; $r -lt $Rows.Count; $r++) {
+        $rowNumber = $r + 2
+        $values = @($Rows[$r])
+        [void]$builder.AppendLine("<row r=`"$rowNumber`">")
+        for ($c = 0; $c -lt $Headers.Count; $c++) {
+            $cell = (ConvertTo-ColumnName ($c + 1)) + $rowNumber
+            $raw = ''
+            if ($c -lt $values.Count -and $null -ne $values[$c]) { $raw = [string]$values[$c] }
+            if ($c -eq 0 -and $raw -match '^\d+$') {
+                [void]$builder.AppendLine("<c r=`"$cell`" t=`"n`"><v>$raw</v></c>")
+            }
+            else {
+                $text = ConvertTo-SpreadsheetText $raw
+                [void]$builder.AppendLine("<c r=`"$cell`" t=`"inlineStr`"><is><t xml:space=`"preserve`">$text</t></is></c>")
+            }
+        }
+        [void]$builder.AppendLine('</row>')
+    }
+    [void]$builder.AppendLine('</sheetData>')
+    if ($Headers.Count -gt 0) {
+        [void]$builder.AppendLine("<autoFilter ref=`"A1:${lastColumn}${lastRow}`"/>")
+    }
+    [void]$builder.AppendLine('</worksheet>')
+    return $builder.ToString()
+}
+
+function Export-FindingsSpreadsheet {
+    param(
+        $Items,
+        [Parameter(Mandatory)][string]$OutputFolder,
+        [AllowEmptyString()][string]$SearchName,
+        [int]$ReportedItemCount = -1
+    )
+
+    if (-not (Test-Path -LiteralPath $OutputFolder)) {
+        New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
+    }
+
+    $table = New-Object System.Collections.Generic.List[object]
+    $sheetRows = New-Object System.Collections.Generic.List[object]
+    $number = 0
+    foreach ($item in $Items) {
+        if ($null -eq $item) { continue }
+        $number++
+        $table.Add([pscustomobject]@{
+            Item       = $number
+            Subject    = [string]$item.Subject
+            Sender     = [string]$item.Sender
+            Received   = [string]$item.Received
+            Mailbox    = [string]$item.Location
+            Type       = [string]$item.Type
+            Size       = [string]$item.Size
+            SearchName = [string]$SearchName
+        })
+        $sheetRows.Add(@(
+            [string]$number,
+            [string]$item.Subject,
+            [string]$item.Sender,
+            [string]$item.Received,
+            [string]$item.Location,
+            [string]$item.Type,
+            [string]$item.Size,
+            [string]$SearchName
+        ))
+    }
+
+    $csvPath = Join-Path $OutputFolder 'MessageFindings.csv'
+    $utf8Bom = New-Object System.Text.UTF8Encoding $true
+    if ($table.Count -gt 0) {
+        $csvLines = @($table | ConvertTo-Csv -NoTypeInformation)
+        [System.IO.File]::WriteAllLines($csvPath, $csvLines, $utf8Bom)
+    }
+    else {
+        $header = 'Item,Subject,Sender,Received,Mailbox,Type,Size,SearchName'
+        [System.IO.File]::WriteAllLines($csvPath, @($header), $utf8Bom)
+    }
+
+    $headers = @('Item', 'Subject', 'Sender', 'Received', 'Mailbox', 'Type', 'Size', 'Search name')
+    $widths = @(8, 56, 36, 24, 36, 16, 14, 42)
+    $findingsXml = New-FindingsWorksheetXml -Headers $headers -Rows $sheetRows -Widths $widths
+
+    $reportedText = if ($ReportedItemCount -ge 0) { [string]$ReportedItemCount } else { 'Not supplied' }
+    $complete = ($ReportedItemCount -lt 0) -or ($table.Count -eq $ReportedItemCount)
+    $coverage = if ($complete) {
+        'Every message reported by the search has a row in this workbook.'
+    }
+    else {
+        'This workbook has fewer rows than the search count. Purview preview can return at most 1,000 items, and at times fewer. The search count remains the total.'
+    }
+    $noteRows = New-Object System.Collections.Generic.List[object]
+    foreach ($line in @(
+        "Search name: $SearchName",
+        "Messages reported by the search: $reportedText",
+        "Rows in this spreadsheet: $($table.Count)",
+        'Each row is one matching message and includes its subject line.',
+        $coverage,
+        'Message bodies were not downloaded. Mailbox messages were not changed.'
+    )) {
+        $noteRows.Add(@($line))
+    }
+    $notesXml = New-FindingsWorksheetXml -Headers @('Note') -Rows $noteRows -Widths @(120)
+
+    $styles = @'
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="2">
+    <font><sz val="11"/><name val="Calibri"/></font>
+    <font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font>
+  </fonts>
+  <fills count="3">
+    <fill><patternFill patternType="none"/></fill>
+    <fill><patternFill patternType="gray125"/></fill>
+    <fill><patternFill patternType="solid"><fgColor rgb="FF182A44"/></patternFill></fill>
+  </fills>
+  <borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+  <cellXfs count="2">
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
+    <xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>
+  </cellXfs>
+</styleSheet>
+'@
+    $workbook = @'
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="Findings" sheetId="1" r:id="rId1"/>
+    <sheet name="Notes" sheetId="2" r:id="rId2"/>
+  </sheets>
+</workbook>
+'@
+    $workbookRels = @'
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>
+'@
+    $packageRels = @'
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>
+'@
+    $contentTypes = @'
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+</Types>
+'@
+
+    $workbookPath = Join-Path $OutputFolder 'MessageFindings.xlsx'
+    if (Test-Path -LiteralPath $workbookPath) {
+        Remove-Item -LiteralPath $workbookPath -Force
+    }
+    try { Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop } catch { }
+    try { Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop } catch { }
+    $archive = [System.IO.Compression.ZipFile]::Open($workbookPath, [System.IO.Compression.ZipArchiveMode]::Create)
+    try {
+        Add-ZipTextEntry -Archive $archive -Name '[Content_Types].xml' -Content $contentTypes
+        Add-ZipTextEntry -Archive $archive -Name '_rels/.rels' -Content $packageRels
+        Add-ZipTextEntry -Archive $archive -Name 'xl/workbook.xml' -Content $workbook
+        Add-ZipTextEntry -Archive $archive -Name 'xl/_rels/workbook.xml.rels' -Content $workbookRels
+        Add-ZipTextEntry -Archive $archive -Name 'xl/styles.xml' -Content $styles
+        Add-ZipTextEntry -Archive $archive -Name 'xl/worksheets/sheet1.xml' -Content $findingsXml
+        Add-ZipTextEntry -Archive $archive -Name 'xl/worksheets/sheet2.xml' -Content $notesXml
+    }
+    finally {
+        $archive.Dispose()
+    }
+
+    return [pscustomobject]@{
+        Count             = $table.Count
+        CsvPath           = $csvPath
+        WorkbookPath      = $workbookPath
+        ReportedItemCount = $ReportedItemCount
+        IsComplete        = [bool]$complete
+    }
 }
 
 function Test-TerminalSearchStatus {
@@ -599,7 +873,8 @@ function Export-PreviewResults {
     param(
         [AllowEmptyString()][string]$RawResults,
         [Parameter(Mandatory)][string]$OutputFolder,
-        [AllowEmptyString()][string]$SearchName
+        [AllowEmptyString()][string]$SearchName,
+        [int]$ReportedItemCount = -1
     )
 
     if (-not (Test-Path -LiteralPath $OutputFolder)) {
@@ -624,7 +899,11 @@ function Export-PreviewResults {
     if ($rows.Count -gt 0) {
         $rows | Export-Csv -Path (Join-Path $OutputFolder 'PreviewResults.csv') -NoTypeInformation -Encoding UTF8
     }
-    return ,$rows.ToArray()
+    $saved = Export-FindingsSpreadsheet -Items $items -OutputFolder $OutputFolder -SearchName $SearchName -ReportedItemCount $ReportedItemCount
+    return [pscustomobject]@{
+        Rows = $rows.ToArray()
+        File = $saved
+    }
 }
 
 function New-InvestigationOutputFolder {
@@ -736,6 +1015,12 @@ function Get-InvestigationRunspaceFunctionNames {
         'Format-ByteSize'
         'ConvertTo-LocationStatistic'
         'ConvertTo-PreviewItem'
+        'Get-LabeledPreviewValue'
+        'ConvertTo-SpreadsheetText'
+        'ConvertTo-ColumnName'
+        'Add-ZipTextEntry'
+        'New-FindingsWorksheetXml'
+        'Export-FindingsSpreadsheet'
         'Test-TerminalSearchStatus'
         'Format-Duration'
         'Add-Utf8Line'
@@ -1038,6 +1323,35 @@ function Invoke-PurviewSearchJob {
         else {
             Write-JobLog "Search requires review: $finalStatus" 'WARNING'
         }
+
+        $itemCount = 0
+        if ($search -and $null -ne $search.Items -and -not [string]::IsNullOrWhiteSpace([string]$search.Items)) {
+            try { $itemCount = [int]$search.Items } catch { $itemCount = 0 }
+        }
+        $Job.ReportedItemCount = $itemCount
+        $canCollect = ($finalStatus -in @('Completed', 'PartiallySucceeded')) -and -not $Job.Sync.CancelRequested -and -not $Job.Sync.TimedOut
+        if ($canCollect -and $itemCount -le 0 -and $Job.OutputFolder -and (Test-Path -LiteralPath $Job.OutputFolder)) {
+            $saved = Export-FindingsSpreadsheet -Items $null -OutputFolder $Job.OutputFolder -SearchName $Job.SearchName -ReportedItemCount 0
+            $Job.Sync.FindingsCount = 0
+            $Job.Sync.FindingsReported = 0
+            $Job.Sync.FindingsPath = [string]$saved.WorkbookPath
+            Write-JobLog "No matching messages. Wrote $($saved.WorkbookPath)"
+        }
+        elseif ($canCollect -and $itemCount -gt 0) {
+            try {
+                $Job.Sync.StatusText = "Collecting subject lines for $itemCount messages"
+                Write-JobLog "Collecting subject lines for $itemCount matching messages. Message bodies are not downloaded."
+                Start-PreviewWorker
+            }
+            catch {
+                $message = Get-ErrorText $_
+                $Job.Sync.FindingsError = $message
+                Write-JobLog "The findings spreadsheet was not created: $message" 'WARNING'
+                if ($finalStatus -eq 'Completed') { $Job.Sync.Phase = 'Completed' }
+                else { $Job.Sync.Phase = 'Finished' }
+            }
+            $Job.Sync.SearchStatus = $finalStatus
+        }
     }
 
     function Wait-ForComplianceAction {
@@ -1113,7 +1427,10 @@ function Invoke-PurviewSearchJob {
         $existing = Get-ComplianceSearch -Identity $Job.SearchName
         $existingStatus = [string]$existing.Status
         if ($existingStatus -notin @('Completed', 'PartiallySucceeded')) {
-            throw "Preview is available after the search completes. Current status: $existingStatus"
+            throw "A findings list is available after the search completes. Current status: $existingStatus"
+        }
+        if (($null -eq $Job.ReportedItemCount -or [int]$Job.ReportedItemCount -lt 0) -and $null -ne $existing.Items -and -not [string]::IsNullOrWhiteSpace([string]$existing.Items)) {
+            try { $Job.ReportedItemCount = [int]$existing.Items } catch { }
         }
 
         $actionName = "$($Job.SearchName)_Preview"
@@ -1127,27 +1444,47 @@ function Invoke-PurviewSearchJob {
             Write-JobLog "Using the existing preview action $actionName."
         }
         else {
-            Write-JobLog 'Requesting a preview sample. This retrieves message metadata, not message bodies.'
+            Write-JobLog 'Requesting message subjects from Purview. Message bodies are not downloaded.'
             $created = New-ComplianceSearchAction -SearchName $Job.SearchName -Preview -Confirm:$false
             if ($created -and $created.Name) { $actionName = [string]$created.Name }
             $Job.Sync.Phase = 'Running'
             $action = Wait-ForComplianceAction -ActionName $actionName
         }
 
+        $reported = -1
+        if ($null -ne $Job.ReportedItemCount) {
+            try { $reported = [int]$Job.ReportedItemCount } catch { $reported = -1 }
+        }
         $actionStatus = if ($action) { [string]$action.Status } else { '' }
         $raw = "Action: $actionName$([Environment]::NewLine)Status: $actionStatus$([Environment]::NewLine)$([Environment]::NewLine)$(Get-ActionResultText $action)"
+        $items = @()
         if ($Job.OutputFolder -and (Test-Path -LiteralPath $Job.OutputFolder)) {
-            $items = Export-PreviewResults -RawResults $raw -OutputFolder $Job.OutputFolder -SearchName $Job.SearchName
-            Write-JobLog "Preview saved to $($Job.OutputFolder)" 'SUCCESS'
+            $exported = Export-PreviewResults -RawResults $raw -OutputFolder $Job.OutputFolder -SearchName $Job.SearchName -ReportedItemCount $reported
+            if ($exported) { $items = $exported.Rows }
+            $count = 0
+            foreach ($row in $items) { if ($null -ne $row) { $count++ } }
+            $Job.Sync.FindingsCount = $count
+            $Job.Sync.FindingsReported = $reported
+            if ($exported -and $exported.File) { $Job.Sync.FindingsPath = [string]$exported.File.WorkbookPath }
+            if ($reported -gt $count) {
+                Write-JobLog "MessageFindings.xlsx has $count subject lines. The search reported $reported matches. Purview did not return a subject for every match." 'WARNING'
+            }
+            else {
+                Write-JobLog "Findings spreadsheet saved with $count subject lines: $($Job.Sync.FindingsPath)" 'SUCCESS'
+            }
         }
         else {
             $items = ConvertTo-PreviewItem $raw
-            Write-JobLog 'Preview will be shown in the window. No output folder was available to save it.' 'WARNING'
+            $count = 0
+            foreach ($row in $items) { if ($null -ne $row) { $count++ } }
+            $Job.Sync.FindingsCount = $count
+            Write-JobLog 'Subject lines will be shown in the window. No output folder was available for the spreadsheet.' 'WARNING'
         }
         $Job.Sync.Preview = $items
         if ($Job.Sync.Phase -ne 'Cancelled') {
             $Job.Sync.Phase = 'PreviewReady'
-            $Job.Sync.StatusText = 'Preview ready'
+            $countText = [string]$Job.Sync.FindingsCount
+            $Job.Sync.StatusText = "Findings spreadsheet ready ($countText subject lines)"
             $Job.Sync.Progress = 100
         }
     }
@@ -1484,12 +1821,13 @@ function Update-Chrome {
     $connected = [bool]($script:Sync -and $script:Sync.Connected)
     $created = [bool]($script:Sync -and $script:Sync.SearchCreated)
     $previewable = $script:LastStatus -in @('Completed', 'PartiallySucceeded')
+    $namedSearch = ($script:Sync -and $script:Sync.SearchCreated) -or $script:SearchNameDirty
 
     $script:btnConnect.Enabled = -not $busy
     $script:btnConnect.Text = if ($connected) { 'Disconnect' } else { 'Connect' }
     $script:btnStart.Enabled = (-not $busy) -and [bool]$script:FormValid
     $script:btnStop.Enabled = $busy
-    $script:btnPreview.Enabled = (-not $busy) -and $connected -and $previewable
+    $script:btnPreview.Enabled = (-not $busy) -and $connected -and $namedSearch -and ($previewable -or $script:SearchNameDirty)
     $script:btnReport.Enabled = (-not $busy) -and $connected -and $previewable
     $script:btnRemove.Enabled = (-not $busy) -and $connected -and $created
     $folderReady = $script:CurrentOutputFolder -and (Test-Path -LiteralPath $script:CurrentOutputFolder)
@@ -1737,7 +2075,7 @@ function Update-ResultsFromSync {
         $script:ActiveSearchName = [string]$summary.SearchName
         Fill-LocationGrid $result.Locations
     }
-    if ($script:CurrentMode -eq 'Preview') { Fill-PreviewGrid $script:Sync.Preview }
+    if ($script:Sync.Preview) { Fill-PreviewGrid $script:Sync.Preview }
 }
 
 function Show-SearchFinishedDialog {
@@ -1767,18 +2105,46 @@ function Show-SearchFinishedDialog {
         $title = 'Search needs review'
     }
 
+    $findingsLine = ''
+    if ($script:Sync.FindingsPath) {
+        $rowCount = 0
+        try { $rowCount = [int]$script:Sync.FindingsCount } catch { $rowCount = 0 }
+        $findingsLine = "Findings spreadsheet: MessageFindings.xlsx ($rowCount subject lines)`r`n$($script:Sync.FindingsPath)"
+        $reportedCount = 0
+        $hasReported = $false
+        if ($null -ne $script:Sync.FindingsReported) {
+            try {
+                $reportedCount = [int]$script:Sync.FindingsReported
+                $hasReported = $true
+            }
+            catch { $hasReported = $false }
+        }
+        if ($hasReported -and $reportedCount -gt $rowCount) {
+            $findingsLine += "`r`nThe search reported $reportedCount matches. Purview did not return a subject for every match."
+        }
+    }
+    elseif ($script:Sync.FindingsError) {
+        $findingsLine = "Findings spreadsheet was not created: $($script:Sync.FindingsError)"
+    }
+
     $text = @"
 $lead
 
 Matching items: $items
 Size: $size
 Reports: $folder
+$findingsLine
 
-The mailbox statistics are in this window. Open Purview to review the search there. Preview loads a metadata sample and does not export message bodies.
+MessageFindings.xlsx has one row per message, including the subject line. Message bodies are not downloaded.
 "@
     if ($script:Sync.ErrorMessage) { $text += "`r`n`r`n$($script:Sync.ErrorMessage)" }
     Show-UiMessage $text $title $icon
-    if ($script:tabs -and $script:tabStats) { $script:tabs.SelectedTab = $script:tabStats }
+    if ($script:Sync.FindingsCount -gt 0 -and $script:tabs -and $script:tabPreview) {
+        $script:tabs.SelectedTab = $script:tabPreview
+    }
+    elseif ($script:tabs -and $script:tabStats) {
+        $script:tabs.SelectedTab = $script:tabStats
+    }
 }
 
 function Show-CompletionDialog {
@@ -1797,8 +2163,14 @@ function Show-CompletionDialog {
         'Preview' {
             if ($phase -eq 'PreviewReady') {
                 if ($script:tabs -and $script:tabPreview) { $script:tabs.SelectedTab = $script:tabPreview }
-                if ($script:gridPreview -and $script:gridPreview.Rows.Count -eq 0) {
-                    Show-UiMessage 'The preview finished, but no message metadata was recognized. The raw preview was saved when an output folder was available.' 'Preview' 'Information'
+                $rowCount = 0
+                try { $rowCount = [int]$script:Sync.FindingsCount } catch { $rowCount = 0 }
+                $path = [string]$script:Sync.FindingsPath
+                if ($rowCount -le 0) {
+                    Show-UiMessage "The findings request finished, but no subject lines were recognized. The raw result was saved when an output folder was available.`r`n`r`n$path" 'Findings spreadsheet' 'Information'
+                }
+                else {
+                    Show-UiMessage "MessageFindings.xlsx lists $rowCount messages, including each subject line.`r`n`r`n$path" 'Findings spreadsheet' 'Information'
                 }
             }
             elseif ($phase -eq 'Cancelled') {
@@ -1938,7 +2310,7 @@ function Show-InvestigationConfirm {
 
     $summary = New-Object System.Text.StringBuilder
     [void]$summary.AppendLine('This creates a compliance search estimate.')
-    [void]$summary.AppendLine('It does not delete, move, export, or modify messages.')
+    [void]$summary.AppendLine('It does not delete, move, or modify messages, and it does not download message bodies.')
     [void]$summary.AppendLine()
     [void]$summary.AppendLine("Search name : $($Request.SearchName)")
     [void]$summary.AppendLine("Sender      : $($Request.Sender)")
@@ -2091,14 +2463,37 @@ function Start-SearchFromUi {
 
 function Start-PreviewFromUi {
     if ($script:CommandRunning -or -not $script:Sync.Connected) { return }
-    if ([string]::IsNullOrWhiteSpace($script:ActiveSearchName)) { return }
+    $searchName = $script:txtSearchName.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($searchName)) { $searchName = $script:ActiveSearchName }
+    if ([string]::IsNullOrWhiteSpace($searchName)) { return }
+    if (-not $script:CurrentOutputFolder -or -not (Test-Path -LiteralPath $script:CurrentOutputFolder)) {
+        try {
+            $script:CurrentOutputFolder = New-InvestigationOutputFolder -Root $script:txtOutput.Text.Trim()
+            $script:CurrentLogFile = Join-Path $script:CurrentOutputFolder 'Investigation.log'
+        }
+        catch {
+            Show-UiMessage $_.Exception.Message 'Output folder' 'Error'
+            return
+        }
+    }
+    $script:ActiveSearchName = $searchName
+    $script:Sync.ActiveSearchName = $searchName
+    $reported = -1
+    $sameSearch = $script:Sync.Result -and $script:Sync.Result.Summary -and [string]$script:Sync.Result.Summary.SearchName -eq $searchName
+    if ($sameSearch -and -not [string]::IsNullOrWhiteSpace([string]$script:Sync.Result.Summary.MatchingItems)) {
+        try { $reported = [int]$script:Sync.Result.Summary.MatchingItems } catch { $reported = -1 }
+    }
+    elseif ($sameSearch -and $null -ne $script:Sync.Items -and -not [string]::IsNullOrWhiteSpace([string]$script:Sync.Items)) {
+        try { $reported = [int]$script:Sync.Items } catch { $reported = -1 }
+    }
     Start-InvestigationCommand @{
-        Mode         = 'Preview'
-        Sync         = $script:Sync
-        LogFile      = $script:CurrentLogFile
-        SearchName   = $script:ActiveSearchName
-        OutputFolder = $script:CurrentOutputFolder
-        TimeoutMinutes = [int]$script:numTimeout.Value
+        Mode              = 'Preview'
+        Sync              = $script:Sync
+        LogFile           = $script:CurrentLogFile
+        SearchName        = $script:ActiveSearchName
+        OutputFolder      = $script:CurrentOutputFolder
+        TimeoutMinutes    = [int]$script:numTimeout.Value
+        ReportedItemCount = $reported
     }
 }
 
@@ -2198,7 +2593,7 @@ function Show-ToolHelp {
     $text = @"
 Purview Email Investigation creates a read-only compliance search for mail sent by one user to the domains you list.
 
-It does not delete, move, export, or modify messages.
+It does not delete, move, or modify messages, and it does not download message bodies.
 
 Requirements
 - Windows PowerShell 5.1 or PowerShell 7 on Windows
@@ -2210,7 +2605,7 @@ The end date is inclusive. KeyQL uses the next day as an exclusive bound so mail
 
 Sender mailbox searches that person's mailbox, including Sent Items. All mailboxes searches every mailbox the account can access and can take much longer.
 
-Preview retrieves a sample of message metadata. It does not download message bodies.
+When messages match, MessageFindings.xlsx lists each one with its subject line. Message bodies are not downloaded.
 "@
     Show-UiMessage $text "Purview Email Investigation v$($script:AppVersion)" 'Information'
 }
@@ -2691,7 +3086,7 @@ function Start-PurviewInvestigationGui {
     $actions.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
     $actions.Padding = New-Object System.Windows.Forms.Padding(0, 6, 0, 0)
     $actions.BackColor = $script:ColorPage
-    $script:btnPreview = New-UiButton 'Preview sample' 140 $script:ColorNavy ([System.Drawing.Color]::White)
+    $script:btnPreview = New-UiButton 'Findings list' 140 $script:ColorNavy ([System.Drawing.Color]::White)
     $script:btnReport = New-UiButton 'Statistics report' 160 $script:ColorNavy ([System.Drawing.Color]::White)
     $script:btnOpenFolder = New-UiButton 'Open folder' 120 ([System.Drawing.Color]::White) $script:ColorNavy -Outline
     $script:btnPurview = New-UiButton 'Open Purview' 130 ([System.Drawing.Color]::White) $script:ColorNavy -Outline
@@ -2710,7 +3105,7 @@ function Start-PurviewInvestigationGui {
     $script:tabStats.Padding = New-Object System.Windows.Forms.Padding(8)
     $script:tabStats.BackColor = $script:ColorPage
     $script:tabPreview = New-Object System.Windows.Forms.TabPage
-    $script:tabPreview.Text = 'Preview sample'
+    $script:tabPreview.Text = 'Message findings'
     $script:tabPreview.Padding = New-Object System.Windows.Forms.Padding(8)
     $script:tabPreview.BackColor = $script:ColorPage
     $script:tabs.TabPages.Add($script:tabStats)
@@ -2737,7 +3132,7 @@ function Start-PurviewInvestigationGui {
     Add-GridColumn $script:gridPreview 'Size' 'Size' 10
     Add-GridColumn $script:gridPreview 'Location' 'Mailbox' 18
     $script:lblEmptyPreview = New-Object System.Windows.Forms.Label
-    $script:lblEmptyPreview.Text = 'Preview is available after a search completes. It shows metadata, not message bodies.'
+    $script:lblEmptyPreview.Text = 'Each matching message is listed here with its subject line. Message bodies are not downloaded.'
     $script:lblEmptyPreview.Dock = [System.Windows.Forms.DockStyle]::Top
     $script:lblEmptyPreview.Height = 36
     $script:lblEmptyPreview.ForeColor = $script:ColorMuted
@@ -2809,7 +3204,7 @@ function Start-PurviewInvestigationGui {
     })
 
     $script:toolTip.SetToolTip($script:btnStart, 'Create and start a read-only compliance search.')
-    $script:toolTip.SetToolTip($script:btnPreview, 'Load a sample of sender, subject, and date. Does not export message bodies.')
+    $script:toolTip.SetToolTip($script:btnPreview, 'Save MessageFindings.xlsx with one row per message, including the subject line. Does not download message bodies.')
     $script:toolTip.SetToolTip($script:btnRemove, 'Remove the search definition from Purview. Does not modify messages.')
     $script:toolTip.SetToolTip($script:chkInactive, 'For one mailbox, the address is prefixed with a period so an inactive mailbox can be searched.')
 
