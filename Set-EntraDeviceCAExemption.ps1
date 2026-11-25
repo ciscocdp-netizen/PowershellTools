@@ -107,7 +107,7 @@ param(
     [string]$SettingsPath
 )
 
-$script:ToolVersion    = '2.0.6'
+$script:ToolVersion    = '2.0.7'
 $script:Root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $script:SettingsFile = if ($SettingsPath) { $SettingsPath } else { Join-Path $script:Root 'CAExemption.settings.json' }
 $script:RequiredScope  = 'Device.ReadWrite.All'
@@ -4466,29 +4466,29 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
     }
 
     function Invoke-GuiBulkApply {
-        param([switch]$AllReady)
-        $allReady = @(ConvertTo-ObjectArray $script:GuiPlan | Where-Object { $_.Status -eq 'Ready' })
-        if ($allReady.Count -eq 0) {
-            [void](Show-ToolDialog 'There are no Ready rows to apply. Preview a CSV first.' 'Bulk update' 'OK' 'Information')
-            return
-        }
-        $ready = $allReady
-        $confirm = "Update all {0} Ready device(s) now?"
-        if (-not $AllReady) {
-            $indexes = @(Get-GuiSelectedRowIndexes $script:grdBulk)
-            $ready = @(Select-ItemsByGridIndex -Items $script:GuiPlan -Indexes $indexes -ReadyOnly)
-            if ($ready.Count -eq 0) {
-                [void](Show-ToolDialog 'No Ready rows are selected. Click Apply all Ready to update every Ready device, or select rows first.' 'Bulk update' 'OK' 'Information')
+        param([switch]$ApplyAll)
+        try {
+            $readyItems = @(ConvertTo-ObjectArray $script:GuiPlan | Where-Object { $_.Status -eq 'Ready' })
+            if ($readyItems.Count -eq 0) {
+                [void](Show-ToolDialog 'There are no Ready rows to apply. Preview a CSV first.' 'Bulk update' 'OK' 'Information')
                 return
             }
-            $confirm = "Update {0} selected device(s) now?"
-        }
-        if ((Show-ToolDialog ($confirm -f $ready.Count) 'Confirm bulk update' 'YesNo' 'Warning') -ne [System.Windows.Forms.DialogResult]::Yes) {
-            return
-        }
-        if (-not (Test-GuiGraph)) { return }
-        Set-GuiBusy ("Updating {0} device(s)..." -f $ready.Count)
-        try {
+            $ready = $readyItems
+            $confirm = "Update all {0} Ready device(s) now?"
+            if (-not $ApplyAll) {
+                $indexes = @(Get-GuiSelectedRowIndexes $script:grdBulk)
+                $ready = @(Select-ItemsByGridIndex -Items $script:GuiPlan -Indexes $indexes -ReadyOnly)
+                if ($ready.Count -eq 0) {
+                    [void](Show-ToolDialog 'No Ready rows are selected. Click Apply all Ready to update every Ready device, or select rows first.' 'Bulk update' 'OK' 'Information')
+                    return
+                }
+                $confirm = "Update {0} selected device(s) now?"
+            }
+            if ((Show-ToolDialog ($confirm -f $ready.Count) 'Confirm bulk update' 'YesNo' 'Warning') -ne [System.Windows.Forms.DialogResult]::Yes) {
+                return
+            }
+            if (-not (Test-GuiGraph)) { return }
+            Set-GuiBusy ("Updating {0} device(s)..." -f $ready.Count)
             $source = 'GUI-CSV'
             $path = $script:txtBulkPath.Text.Trim()
             if ($path) { $source = 'GUI-CSV:' + [IO.Path]::GetFileName($path) }
@@ -4634,7 +4634,7 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
             if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $script:txtBulkPath.Text = $dialog.FileName }
         })
     $btnPreviewBulk.Add_Click({ Invoke-GuiBulkPreview })
-    $btnApplyAll.Add_Click({ Invoke-GuiBulkApply -AllReady })
+    $btnApplyAll.Add_Click({ Invoke-GuiBulkApply -ApplyAll })
     $btnSelectReady.Add_Click({ Invoke-GuiSelectReadyRows })
     $btnApplyBulk.Add_Click({ Invoke-GuiBulkApply })
     $btnExportPlan.Add_Click({
