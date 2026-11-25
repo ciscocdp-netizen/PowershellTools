@@ -523,6 +523,9 @@ Assert-True ($signedInSource -match 'function Test-GraphSignedIn') 'Script defin
 Assert-True ($signedInSource -notmatch 'txtTenant') 'GUI no longer has a Tenant text box'
 Assert-True ($signedInSource -match "New-GuiButton 'Sign in'") 'GUI uses a Sign in button'
 Assert-True ($signedInSource -notmatch 'Connect-Graph -Tenant \$script:txtTenant') 'GUI does not pass the Tenant text box into Connect-Graph'
+Assert-True ($signedInSource -notmatch 'Connect-Graph -Reconnect:') 'GUI does not pass -Reconnect:\$false into Connect-Graph'
+Assert-True ($signedInSource -match 'Connect-Graph @connectParams') 'GUI splats Connect-Graph so 5.1 switch binding works'
+Assert-Equal -Expected $null -Actual (Get-PreferredGraphOutputType -ValidValues @('HashTable') -EmptyBody:$false) -Name 'EmptyBody:false binds on advanced function'
 
 Write-Host ''
 Write-Host ("Passed: {0}  Failed: {1}" -f $script:Passed, $script:Failed) -ForegroundColor $(if ($script:Failed -eq 0) { 'Green' } else { 'Red' })

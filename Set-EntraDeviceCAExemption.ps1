@@ -107,7 +107,7 @@ param(
     [string]$SettingsPath
 )
 
-$script:ToolVersion    = '2.0.1'
+$script:ToolVersion    = '2.0.2'
 $script:Root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $script:SettingsFile = if ($SettingsPath) { $SettingsPath } else { Join-Path $script:Root 'CAExemption.settings.json' }
 $script:RequiredScope  = 'Device.ReadWrite.All'
@@ -260,6 +260,7 @@ function Test-DeviceHasRecentActivity {
 }
 
 function Select-DevicesWithRecentActivity {
+    [CmdletBinding()]
     param(
         $Devices,
         [int]$Days = 90,
@@ -704,6 +705,7 @@ function Test-GraphReadMethod {
 }
 
 function Get-PreferredGraphOutputType {
+    [CmdletBinding()]
     param([string[]]$ValidValues, [switch]$EmptyBody)
     $candidates = if ($EmptyBody) { @('HttpResponseMessage') } else { @('PSObject', 'Json') }
     if ($null -eq $ValidValues -or $ValidValues.Count -eq 0) {
@@ -845,6 +847,7 @@ function Test-GraphConnection {
 }
 
 function Connect-Graph {
+    [CmdletBinding()]
     param(
         [switch]$Reconnect,
         [string]$Tenant,
@@ -961,7 +964,9 @@ function Invoke-GraphRequestWithRetry {
         }
         $isBatch = ($Uri.IndexOf('$batch') -ge 0)
         $emptyBody = -not $ExpectBody -and -not $isBatch -and -not (Test-GraphReadMethod $Method)
-        $outputType = Get-PreferredGraphOutputType -ValidValues $validOutputTypes -EmptyBody:$emptyBody
+        $outputParams = @{ ValidValues = $validOutputTypes }
+        if ($emptyBody) { $outputParams['EmptyBody'] = $true }
+        $outputType = Get-PreferredGraphOutputType @outputParams
         if ($outputType) { $params['OutputType'] = $outputType }
     }
 
@@ -3366,7 +3371,9 @@ function Invoke-RecentActivityCsvExport {
         return
     }
 
-    $split = Select-DevicesWithRecentActivity -Devices $devices -Days $days -IncludeUnknown:$includeUnknown
+    $activityParams = @{ Devices = $devices; Days = $days }
+    if ($includeUnknown) { $activityParams['IncludeUnknown'] = $true }
+    $split = Select-DevicesWithRecentActivity @activityParams
     Write-Host ''
     Write-Host ("Looked up {0} device(s). Last sign-in on or after {1:yyyy-MM-dd} UTC ({2} days)." -f @($devices).Count, $split.CutoffUtc, $days) -ForegroundColor Green
     Write-Host ("  Active : {0}" -f @($split.Active).Count) -ForegroundColor Green
@@ -4090,9 +4097,14 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
         $script:LastConnectError = $null
         Set-GuiBusy 'Opening the Microsoft sign-in window...'
         try {
-            $useDevice = $false
-            if ($script:chkDeviceCode -and $script:chkDeviceCode.Checked) { $useDevice = $true }
-            $ok = Connect-Graph -Reconnect:$Reconnect -UseDeviceCode:$useDevice
+            # Windows PowerShell 5.1 simple functions reject -Switch:$false.
+            # Only splat a switch when it is on so Sign in does not pass -Reconnect.
+            $connectParams = @{}
+            if ($Reconnect) { $connectParams['Reconnect'] = $true }
+            if ($script:chkDeviceCode -and $script:chkDeviceCode.Checked) {
+                $connectParams['UseDeviceCode'] = $true
+            }
+            $ok = Connect-Graph @connectParams
             Update-GuiBanner
             if ($ok) {
                 Clear-GuiBusy 'Signed in. Search for a device or load the current scope.'
@@ -4342,7 +4354,9 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
                 $devices = ConvertTo-ObjectArray (Get-DevicesForBulkRows -Rows $csvRows -ColumnMap $columnMap)
             }
             $days = [int]$script:numDays.Value
-            $split = Select-DevicesWithRecentActivity -Devices $devices -Days $days -IncludeUnknown:$script:chkUnknown.Checked
+            $activityParams = @{ Devices = $devices; Days = $days }
+            if ($script:chkUnknown.Checked) { $activityParams['IncludeUnknown'] = $true }
+            $split = Select-DevicesWithRecentActivity @activityParams
             $value = $script:txtActivityValue.Text
             $action = if ([string]::IsNullOrEmpty($value)) { 'Clear' } else { 'Set' }
             if ($kind -eq 'User') {
