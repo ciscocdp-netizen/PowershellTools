@@ -418,6 +418,39 @@ Assert-True ($source -match 'Start-PurviewInvestigationGui') 'the script launche
 Assert-True ($source -match 'New-ComplianceSearch') 'the search is still created with New-ComplianceSearch'
 Assert-True ($source -match 'MessageFindings.xlsx') 'the tool writes a findings workbook'
 Assert-True ($source -notmatch 'New-ComplianceSearchAction[^\r\n]*-Export') 'findings do not use the retired export switch'
+$previewGuard = $source.IndexOf("ContainsKey('Preview')")
+$previewCall = $source.IndexOf('New-ComplianceSearchAction -SearchName $Job.SearchName -Preview')
+Assert-True ($previewGuard -ge 0 -and $previewCall -gt $previewGuard) 'preview is used only when the cmdlet still has that parameter'
+$reportGuard = $source.IndexOf("ContainsKey('Report')")
+$reportCall = $source.IndexOf('New-ComplianceSearchAction -SearchName $Job.SearchName -Report')
+Assert-True ($reportGuard -ge 0 -and $reportCall -gt $reportGuard) 'the statistics report switch is used only when the cmdlet still has it'
+Assert-True ($source -match 'exportReport') 'findings use the item report when preview is unavailable'
+Assert-True ($source -match 'eDiscovery.ReadWrite.All') 'the item report requests the eDiscovery permission'
+
+$graphJson = ConvertTo-GraphJson @{
+    name = 'a "b"'
+    'custodianSources@odata.bind' = @('https://example.test/source')
+}
+Assert-True ($graphJson -match '"custodianSources@odata.bind":\["https://example.test/source"\]') 'graph json keeps a one-element array'
+$graphParsed = $graphJson | ConvertFrom-Json
+Assert-Equal $graphParsed.name 'a "b"' 'graph json keeps a quoted value'
+Assert-Equal @($graphParsed.'custodianSources@odata.bind').Count 1 'graph json parses the bind array'
+
+$reportCsv = @"
+Subject/Title,Sender,Date,Location,File class,Size
+Budget update,alice@contoso.com,2025-07-11,box@contoso.com,IPM.Note,1024
+"Quote, please",bob@contoso.com,2025-07-12,box@contoso.com,IPM.Note,2048
+"@
+$reportRows = ConvertTo-FindingsFromReportCsv -CsvText $reportCsv
+Assert-Equal $reportRows.Count 2 'report csv reads two subject rows'
+Assert-Equal $reportRows[0].Subject 'Budget update' 'report csv reads Subject/Title'
+Assert-Equal $reportRows[0].Sender 'alice@contoso.com' 'report csv reads the sender'
+Assert-Equal $reportRows[1].Subject 'Quote, please' 'report csv keeps a comma inside the subject'
+$summaryCsv = "Search name,Item count`r`nEmailInvestigation,90"
+$summaryRows = ConvertTo-FindingsFromReportCsv -CsvText $summaryCsv
+Assert-Equal $summaryRows.Count 0 'summary csv is not treated as message rows'
+$emptyRows = ConvertTo-FindingsFromReportCsv -CsvText ''
+Assert-Equal $emptyRows.Count 0 'empty report csv returns no rows'
 Assert-True ($source -notmatch 'Remove-ComplianceSearchAction -Purge') 'cleanup does not purge messages'
 
 if ($script:Failures -gt 0) {

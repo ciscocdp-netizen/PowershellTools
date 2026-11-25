@@ -7,10 +7,12 @@
 .DESCRIPTION
     Searches Exchange Online mailbox content for messages sent by one user
     to selected recipient domains. It creates a compliance search, monitors
-    progress, and writes search statistics. When the search finds messages,
+    progress, and writes search statistics.     When the search finds messages,
     it also writes a spreadsheet with one row per message, including the
     subject line. It does not delete, move, or modify email messages, and it
-    does not download message bodies.
+    does not download message bodies. Microsoft 365 no longer accepts the old
+    preview command, so the subject list comes from a Purview item report and
+    may ask for a second sign-in. No hold is placed.
 
     Run the script on Windows to open the GUI. The search runs on a background
     runspace so the window stays responsive while Microsoft sign-in and the
@@ -27,7 +29,7 @@
     next calendar day because a date-only sent<= bound is midnight.
 #>
 
-$script:AppVersion = '2.1'
+$script:AppVersion = '2.2'
 
 function ConvertTo-KqlPhrase {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
@@ -591,7 +593,7 @@ function Export-FindingsSpreadsheet {
         'Every message reported by the search has a row in this workbook.'
     }
     else {
-        'This workbook has fewer rows than the search count. Purview preview can return at most 1,000 items, and at times fewer. The search count remains the total.'
+        'This workbook has fewer rows than the search count. The item report did not include a subject for every match. The search count remains the total.'
     }
     $noteRows = New-Object System.Collections.Generic.List[object]
     foreach ($line in @(
@@ -600,6 +602,7 @@ function Export-FindingsSpreadsheet {
         "Rows in this spreadsheet: $($table.Count)",
         'Each row is one matching message and includes its subject line.',
         $coverage,
+        'Subject and sender text from the item report can be shortened to 255 characters.',
         'Message bodies were not downloaded. Mailbox messages were not changed.'
     )) {
         $noteRows.Add(@($line))
@@ -1008,6 +1011,143 @@ function Resolve-ExchangeOnlineModule {
     }
 }
 
+function ConvertTo-GraphJson {
+    param($Value)
+
+    $escape = {
+        param([AllowEmptyString()][string]$Text)
+        if ($null -eq $Text) { return '' }
+        $builder = New-Object System.Text.StringBuilder
+        foreach ($ch in $Text.ToCharArray()) {
+            $code = [int]$ch
+            if ($ch -eq '"') { [void]$builder.Append('\"') }
+            elseif ($ch -eq '\') { [void]$builder.Append('\\') }
+            elseif ($ch -eq "`b") { [void]$builder.Append('\b') }
+            elseif ($ch -eq "`f") { [void]$builder.Append('\f') }
+            elseif ($ch -eq "`n") { [void]$builder.Append('\n') }
+            elseif ($ch -eq "`r") { [void]$builder.Append('\r') }
+            elseif ($ch -eq "`t") { [void]$builder.Append('\t') }
+            elseif ($code -lt 32) { [void]$builder.Append(('\u{0:x4}' -f $code)) }
+            else { [void]$builder.Append($ch) }
+        }
+        return $builder.ToString()
+    }
+
+    $write = {
+        param($Node)
+        if ($null -eq $Node) { return 'null' }
+        if ($Node -is [bool]) {
+            if ($Node) { return 'true' }
+            return 'false'
+        }
+        if ($Node -is [string] -or $Node -is [char]) {
+            return '"' + (& $escape ([string]$Node)) + '"'
+        }
+        if ($Node -is [datetime]) {
+            return '"' + $Node.ToUniversalTime().ToString('o') + '"'
+        }
+        if ($Node -is [System.Collections.IDictionary]) {
+            $pairs = New-Object System.Collections.Generic.List[string]
+            foreach ($key in $Node.Keys) {
+                $encodedKey = & $escape ([string]$key)
+                $encodedValue = & $write $Node[$key]
+                $pairs.Add(('"' + $encodedKey + '":' + $encodedValue))
+            }
+            return '{' + ($pairs -join ',') + '}'
+        }
+        if ($Node -is [System.Collections.IEnumerable]) {
+            $items = New-Object System.Collections.Generic.List[string]
+            foreach ($item in $Node) {
+                $items.Add((& $write $item))
+            }
+            return '[' + ($items -join ',') + ']'
+        }
+        $isNumber = $Node -is [byte] -or $Node -is [int16] -or $Node -is [int] -or $Node -is [long] -or $Node -is [decimal] -or $Node -is [single] -or $Node -is [double]
+        if ($isNumber) {
+            return $Node.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+        }
+        return '"' + (& $escape ([string]$Node)) + '"'
+    }
+
+    return (& $write $Value)
+}
+
+function ConvertTo-FindingsFromReportCsv {
+    param([AllowEmptyString()][string]$CsvText)
+    $rows = New-Object System.Collections.Generic.List[object]
+    if ([string]::IsNullOrWhiteSpace($CsvText)) {
+        return ,$rows.ToArray()
+    }
+
+    $parsed = @()
+    try {
+        $parsed = @($CsvText | ConvertFrom-Csv)
+    }
+    catch {
+        return ,$rows.ToArray()
+    }
+
+    foreach ($item in $parsed) {
+        if ($null -eq $item) { continue }
+        $map = @{}
+        foreach ($prop in $item.PSObject.Properties) {
+            $map[$prop.Name.Trim().ToLowerInvariant()] = [string]$prop.Value
+        }
+        $subject = ''
+        $sender = ''
+        $received = ''
+        $location = ''
+        $typeName = ''
+        $size = ''
+        foreach ($name in @('subject/title', 'subject', 'doc subject', 'conversation topic', 'email subject', 'title')) {
+            if ($map.ContainsKey($name) -and -not [string]::IsNullOrWhiteSpace($map[$name])) {
+                $subject = $map[$name].Trim()
+                break
+            }
+        }
+        foreach ($name in @('sender/author', 'sender', 'author', 'from', 'sender or author')) {
+            if ($map.ContainsKey($name) -and -not [string]::IsNullOrWhiteSpace($map[$name])) {
+                $sender = $map[$name].Trim()
+                break
+            }
+        }
+        foreach ($name in @('date', 'received', 'email date sent', 'sent', 'date sent', 'last modified date')) {
+            if ($map.ContainsKey($name) -and -not [string]::IsNullOrWhiteSpace($map[$name])) {
+                $received = $map[$name].Trim()
+                break
+            }
+        }
+        foreach ($name in @('location', 'location name', 'custodian', 'compound path', 'mailbox')) {
+            if ($map.ContainsKey($name) -and -not [string]::IsNullOrWhiteSpace($map[$name])) {
+                $location = $map[$name].Trim()
+                break
+            }
+        }
+        foreach ($name in @('file class', 'item class', 'file type', 'type')) {
+            if ($map.ContainsKey($name) -and -not [string]::IsNullOrWhiteSpace($map[$name])) {
+                $typeName = $map[$name].Trim()
+                break
+            }
+        }
+        foreach ($name in @('size', 'file size')) {
+            if ($map.ContainsKey($name) -and -not [string]::IsNullOrWhiteSpace($map[$name])) {
+                $size = $map[$name].Trim()
+                break
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($subject) -and [string]::IsNullOrWhiteSpace($sender)) { continue }
+        $rows.Add([pscustomobject]@{
+            Subject  = $subject
+            Sender   = $sender
+            Received = $received
+            Location = $location
+            Type     = $typeName
+            Size     = $size
+        })
+    }
+    return ,$rows.ToArray()
+}
+
 function Get-InvestigationRunspaceFunctionNames {
     return @(
         'ConvertTo-KqlPhrase'
@@ -1021,6 +1161,8 @@ function Get-InvestigationRunspaceFunctionNames {
         'Add-ZipTextEntry'
         'New-FindingsWorksheetXml'
         'Export-FindingsSpreadsheet'
+        'ConvertTo-GraphJson'
+        'ConvertTo-FindingsFromReportCsv'
         'Test-TerminalSearchStatus'
         'Format-Duration'
         'Add-Utf8Line'
@@ -1142,6 +1284,8 @@ function Invoke-PurviewSearchJob {
         }
         Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
         $script:IppsConnected = $false
+        $script:GraphAccessToken = $null
+        $script:GraphTokenExpires = $null
         $Job.Sync.Connected = $false
         $Job.Sync.ConnectedUpn = ''
         $Job.Sync.Phase = 'Disconnected'
@@ -1420,6 +1564,583 @@ function Invoke-PurviewSearchJob {
         return $raw
     }
 
+    function Hide-SecretAddress {
+        param([AllowEmptyString()][string]$Text)
+        if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+        $cleaned = [regex]::Replace($Text, 'https?://\S+', '[address omitted]')
+        if ($cleaned.Length -gt 800) { return $cleaned.Substring(0, 800) }
+        return $cleaned
+    }
+
+    function Get-HttpErrorBody {
+        param($Record)
+        $body = ''
+        if ($Record.ErrorDetails -and $Record.ErrorDetails.Message) {
+            $body = [string]$Record.ErrorDetails.Message
+        }
+        if ([string]::IsNullOrWhiteSpace($body)) {
+            try {
+                $response = $Record.Exception.Response
+                if ($response -and $response.GetResponseStream) {
+                    $stream = $response.GetResponseStream()
+                    if ($stream) {
+                        $reader = New-Object System.IO.StreamReader($stream)
+                        $body = $reader.ReadToEnd()
+                        $reader.Dispose()
+                    }
+                }
+            }
+            catch { }
+        }
+        return (Hide-SecretAddress $body)
+    }
+
+    function Invoke-PurviewGraph {
+        param(
+            [string]$Method,
+            [string]$Uri,
+            [AllowEmptyString()][string]$JsonBody,
+            [string]$Token
+        )
+        $headers = @{
+            Authorization = "Bearer $Token"
+            Accept        = 'application/json'
+        }
+        $params = @{
+            Method          = $Method
+            Uri             = $Uri
+            Headers         = $headers
+            UseBasicParsing = $true
+        }
+        if (-not [string]::IsNullOrWhiteSpace($JsonBody)) {
+            $params.Body = [System.Text.Encoding]::UTF8.GetBytes($JsonBody)
+            $params.ContentType = 'application/json; charset=utf-8'
+        }
+        try {
+            $response = Invoke-WebRequest @params
+        }
+        catch {
+            $body = Get-HttpErrorBody $_
+            if ([string]::IsNullOrWhiteSpace($body)) { $body = Hide-SecretAddress (Get-ErrorText $_) }
+            $status = 0
+            try {
+                if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                    $status = [int]$_.Exception.Response.StatusCode
+                }
+            }
+            catch { }
+            return [pscustomobject]@{
+                Ok         = $false
+                StatusCode = $status
+                Location   = ''
+                Json       = $null
+                Error      = $body
+            }
+        }
+
+        $location = ''
+        if ($response.Headers) {
+            $loc = $null
+            try { if ($response.Headers['Location']) { $loc = $response.Headers['Location'] } } catch { }
+            if ($null -eq $loc) {
+                try { $loc = $response.Headers.Location } catch { }
+            }
+            if ($loc -is [System.Array]) {
+                if ($loc.Length -gt 0) { $location = [string]$loc[0] }
+            }
+            elseif ($null -ne $loc) {
+                $location = [string]$loc
+            }
+        }
+        if ($location.StartsWith('/')) { $location = 'https://graph.microsoft.com' + $location }
+
+        $parsed = $null
+        if ($response.Content) {
+            try { $parsed = ([string]$response.Content) | ConvertFrom-Json } catch { $parsed = $null }
+        }
+        return [pscustomobject]@{
+            Ok         = $true
+            StatusCode = [int]$response.StatusCode
+            Location   = $location
+            Json       = $parsed
+            Error      = ''
+        }
+    }
+
+    function Get-GraphFailure {
+        param($Result, [string]$Action)
+        $detail = ''
+        if ($Result) { $detail = Hide-SecretAddress ([string]$Result.Error) }
+        return "$Action $detail".Trim()
+    }
+
+    function Wait-PurviewGraphOperation {
+        param([string]$Location, [string]$Token, [string]$Label)
+        $timeout = 120.0
+        try {
+            if ($Job.TimeoutMinutes) { $timeout = [double]$Job.TimeoutMinutes }
+        }
+        catch { $timeout = 120.0 }
+        if ($timeout -lt 1) { $timeout = 1 }
+
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        $last = ''
+        while ($true) {
+            if ($Job.Sync.CancelRequested) { throw "Cancelled while waiting for the $Label." }
+            if ($watch.Elapsed.TotalMinutes -ge $timeout) {
+                throw "The $Label is still running after $timeout minutes. Open the eDiscovery case in Purview and download the item report from Process manager. Message files are not required."
+            }
+            $slept = 0
+            while ($slept -lt 10 -and -not $Job.Sync.CancelRequested) {
+                Start-Sleep -Seconds 1
+                $slept++
+            }
+            if ($Job.Sync.CancelRequested) { throw "Cancelled while waiting for the $Label." }
+
+            $result = Invoke-PurviewGraph -Method Get -Uri $Location -Token $Token
+            if (-not $result.Ok) { throw (Get-GraphFailure $result "The $Label status could not be read.") }
+            $status = ''
+            if ($result.Json -and $result.Json.status) { $status = [string]$result.Json.status }
+            if ($status -and $status -ne $last) {
+                Write-JobLog "$Label status: $status"
+                $Job.Sync.StatusText = "$Label status: $status"
+                $last = $status
+            }
+            if ($status -in @('succeeded', 'partiallySucceeded', 'completed')) { return $result.Json }
+            if ($status -in @('failed', 'cancelled', 'canceled')) {
+                $detail = ''
+                if ($result.Json.statusDetail) { $detail = Hide-SecretAddress ([string]$result.Json.statusDetail) }
+                throw "The $Label failed ($status). $detail"
+            }
+        }
+    }
+
+    function Get-GraphAccessToken {
+        if ($script:GraphAccessToken -and $script:GraphTokenExpires) {
+            if (($script:GraphTokenExpires - [datetime]::UtcNow).TotalMinutes -gt 5) {
+                return [string]$script:GraphAccessToken
+            }
+        }
+
+        try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
+        $clientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
+        $scope = 'https://graph.microsoft.com/eDiscovery.ReadWrite.All'
+        $deviceUri = 'https://login.microsoftonline.com/organizations/oauth2/v2.0/devicecode'
+        $tokenUri = 'https://login.microsoftonline.com/organizations/oauth2/v2.0/token'
+        $deviceBody = 'client_id=' + [uri]::EscapeDataString($clientId) + '&scope=' + [uri]::EscapeDataString($scope)
+        try {
+            $deviceResponse = Invoke-WebRequest -Method Post -Uri $deviceUri -Body $deviceBody -ContentType 'application/x-www-form-urlencoded' -UseBasicParsing
+        }
+        catch {
+            $detail = Get-HttpErrorBody $_
+            if (-not $detail) { $detail = Hide-SecretAddress (Get-ErrorText $_) }
+            throw "Microsoft sign-in for the item report could not start. $detail"
+        }
+
+        $device = $null
+        try { $device = ([string]$deviceResponse.Content) | ConvertFrom-Json }
+        catch { throw 'Microsoft sign-in for the item report returned a response that could not be read.' }
+        if ($null -eq $device -or [string]::IsNullOrWhiteSpace([string]$device.user_code) -or [string]::IsNullOrWhiteSpace([string]$device.device_code)) {
+            throw 'Microsoft sign-in for the item report did not return a sign-in code.'
+        }
+
+        $userCode = [string]$device.user_code
+        $signInUrl = [string]$device.verification_uri
+        if ([string]::IsNullOrWhiteSpace($signInUrl)) { $signInUrl = [string]$device.verification_url }
+        if ([string]::IsNullOrWhiteSpace($signInUrl)) { $signInUrl = 'https://microsoft.com/devicelogin' }
+        $interval = 5
+        if ($device.interval) {
+            try { $interval = [int]$device.interval } catch { $interval = 5 }
+        }
+        if ($interval -lt 5) { $interval = 5 }
+        $expiresIn = 900
+        if ($device.expires_in) {
+            try { $expiresIn = [int]$device.expires_in } catch { $expiresIn = 900 }
+        }
+
+        $Job.Sync.GraphSignInUrl = $signInUrl
+        $Job.Sync.GraphUserCode = $userCode
+        $Job.Sync.StatusText = "Sign in at $signInUrl and enter code $userCode"
+        Write-JobLog "A second Microsoft sign-in is required for the subject list. Open $signInUrl and enter $userCode. Use an eDiscovery Manager or eDiscovery Administrator account. Message files are not downloaded and no hold is placed." 'WARNING'
+
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        $token = $null
+        while ($true) {
+            if ($Job.Sync.CancelRequested) { throw 'Cancelled before the item-report sign-in finished.' }
+            if ($watch.Elapsed.TotalSeconds -ge $expiresIn) {
+                throw "The sign-in code expired. Start the findings list again and complete sign-in at $signInUrl."
+            }
+            $slept = 0
+            while ($slept -lt $interval -and -not $Job.Sync.CancelRequested) {
+                Start-Sleep -Seconds 1
+                $slept++
+            }
+            if ($Job.Sync.CancelRequested) { throw 'Cancelled before the item-report sign-in finished.' }
+
+            $tokenBody = 'grant_type=' + [uri]::EscapeDataString('urn:ietf:params:oauth:grant-type:device_code') + '&client_id=' + [uri]::EscapeDataString($clientId) + '&device_code=' + [uri]::EscapeDataString([string]$device.device_code)
+            try {
+                $tokenResponse = Invoke-WebRequest -Method Post -Uri $tokenUri -Body $tokenBody -ContentType 'application/x-www-form-urlencoded' -UseBasicParsing
+                $token = ([string]$tokenResponse.Content) | ConvertFrom-Json
+                break
+            }
+            catch {
+                $detail = Get-HttpErrorBody $_
+                if (-not $detail) { $detail = Hide-SecretAddress (Get-ErrorText $_) }
+                if ($detail -match 'authorization_pending') { continue }
+                if ($detail -match 'slow_down') {
+                    $interval += 5
+                    continue
+                }
+                if ($detail -match 'expired_token' -or $detail -match 'code has expired') {
+                    throw "The sign-in code expired. Start the findings list again and complete sign-in at $signInUrl."
+                }
+                if ($detail -match 'authorization_declined' -or $detail -match 'access_denied') {
+                    throw 'The item-report sign-in was declined.'
+                }
+                throw "Microsoft sign-in for the item report failed. $detail Sign in with an eDiscovery Manager or eDiscovery Administrator. If the tenant blocks Microsoft Graph Command Line Tools, an administrator must consent to eDiscovery.ReadWrite.All. Microsoft 365 China (21Vianet) does not support this report."
+            }
+        }
+
+        if (-not $token -or [string]::IsNullOrWhiteSpace([string]$token.access_token)) {
+            throw 'Microsoft sign-in finished without an access token for the item report.'
+        }
+        $script:GraphAccessToken = [string]$token.access_token
+        $lifetime = 3600
+        if ($token.expires_in) {
+            try { $lifetime = [int]$token.expires_in } catch { $lifetime = 3600 }
+        }
+        $script:GraphTokenExpires = [datetime]::UtcNow.AddSeconds($lifetime)
+        $Job.Sync.GraphUserCode = ''
+        Write-JobLog 'Signed in for the item report. No hold was placed and message files are not downloaded.' 'SUCCESS'
+        return [string]$script:GraphAccessToken
+    }
+
+    function Get-FindingsFromReportOperation {
+        param($Operation)
+        $files = @()
+        if ($Operation -and $Operation.exportFileMetadata) { $files = @($Operation.exportFileMetadata) }
+        if ($files.Count -eq 0) { throw 'The item report finished without any files.' }
+
+        $folder = [string]$Job.OutputFolder
+        if ([string]::IsNullOrWhiteSpace($folder) -or -not (Test-Path -LiteralPath $folder)) {
+            $folder = [System.IO.Path]::GetTempPath()
+        }
+        $work = Join-Path $folder 'ItemReportFiles'
+        if (-not (Test-Path -LiteralPath $work)) {
+            New-Item -ItemType Directory -Path $work -Force | Out-Null
+        }
+
+        $csvPaths = New-Object System.Collections.Generic.List[string]
+        $ignoredContent = $false
+        foreach ($file in $files) {
+            if ($null -eq $file) { continue }
+            $name = 'report.bin'
+            if ($file.fileName -and -not [string]::IsNullOrWhiteSpace([string]$file.fileName)) {
+                $name = [System.IO.Path]::GetFileName([string]$file.fileName)
+            }
+            $lower = $name.ToLowerInvariant()
+            if ($lower.EndsWith('.pst') -or $lower.EndsWith('.msg') -or $lower.EndsWith('.eml')) {
+                $ignoredContent = $true
+                continue
+            }
+            $url = ''
+            if ($file.downloadUrl) { $url = [string]$file.downloadUrl }
+            if ([string]::IsNullOrWhiteSpace($url)) { continue }
+            $safe = ($name -replace '[\\/:*?"<>|]', '_')
+            if ([string]::IsNullOrWhiteSpace($safe)) { $safe = 'report.bin' }
+            $dest = Join-Path $work $safe
+            try {
+                Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing | Out-Null
+            }
+            catch {
+                throw 'The item report file could not be downloaded. The download address was not saved.'
+            }
+
+            $isCsv = $lower.EndsWith('.csv')
+            $isZip = $lower.EndsWith('.zip')
+            if (-not $isZip) {
+                try {
+                    $probe = [System.IO.File]::ReadAllBytes($dest)
+                    if ($probe.Length -ge 2 -and $probe[0] -eq 80 -and $probe[1] -eq 75) { $isZip = $true }
+                }
+                catch { }
+            }
+            if ($isCsv -and -not $isZip) {
+                $csvPaths.Add($dest)
+                continue
+            }
+            if (-not $isZip) { continue }
+
+            $extract = Join-Path $work ([System.IO.Path]::GetFileNameWithoutExtension($safe))
+            if (-not (Test-Path -LiteralPath $extract)) {
+                New-Item -ItemType Directory -Path $extract -Force | Out-Null
+            }
+            try {
+                Expand-Archive -LiteralPath $dest -DestinationPath $extract -Force
+            }
+            catch {
+                try {
+                    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+                    [System.IO.Compression.ZipFile]::ExtractToDirectory($dest, $extract)
+                }
+                catch {
+                    throw 'The item report archive could not be opened.'
+                }
+            }
+            try { Remove-Item -LiteralPath $dest -Force } catch { }
+            $extractedFiles = Get-ChildItem -LiteralPath $extract -Recurse -File -ErrorAction SilentlyContinue
+            foreach ($extracted in $extractedFiles) {
+                $ext = $extracted.Extension.ToLowerInvariant()
+                if ($ext -eq '.csv') { $csvPaths.Add($extracted.FullName) }
+                elseif ($ext -eq '.pst' -or $ext -eq '.msg' -or $ext -eq '.eml') {
+                    $ignoredContent = $true
+                    try { Remove-Item -LiteralPath $extracted.FullName -Force } catch { }
+                }
+            }
+        }
+        if ($ignoredContent) {
+            Write-JobLog 'A message file was listed with the report and was not downloaded. Only the item report is used.' 'WARNING'
+        }
+        if ($csvPaths.Count -eq 0) { throw 'The item report did not include a CSV of message subjects.' }
+
+        $best = $null
+        $bestScore = -1
+        $bestPath = ''
+        foreach ($csvPath in $csvPaths) {
+            $text = [System.IO.File]::ReadAllText($csvPath)
+            $parsed = ConvertTo-FindingsFromReportCsv -CsvText $text
+            $score = 0
+            foreach ($row in $parsed) {
+                if ($null -ne $row -and (-not [string]::IsNullOrWhiteSpace([string]$row.Subject) -or -not [string]::IsNullOrWhiteSpace([string]$row.Sender))) {
+                    $score++
+                }
+            }
+            if ($score -gt $bestScore) {
+                $best = $parsed
+                $bestScore = $score
+                $bestPath = $csvPath
+            }
+        }
+        if ($bestScore -le 0 -or $null -eq $best) {
+            throw 'The item report finished, but none of its files included message subjects.'
+        }
+        if (-not [string]::IsNullOrWhiteSpace($bestPath) -and $Job.OutputFolder -and (Test-Path -LiteralPath $Job.OutputFolder)) {
+            try { [System.IO.File]::Copy($bestPath, (Join-Path $Job.OutputFolder 'PurviewItemReport.csv'), $true) } catch { }
+        }
+        Write-JobLog "Item report contained $bestScore messages with subject or sender values."
+        return ,$best
+    }
+
+    function Request-GraphFindingItems {
+        param(
+            [AllowEmptyString()][string]$ContentQuery,
+            [AllowEmptyString()][string]$ExchangeLocation
+        )
+        if ([string]::IsNullOrWhiteSpace($ContentQuery)) {
+            throw 'The completed search has no query, so the item report cannot be created.'
+        }
+        $token = Get-GraphAccessToken
+        $base = 'https://graph.microsoft.com/v1.0/security/cases/ediscoveryCases'
+        $caseName = 'Purview Email Investigation'
+        if (-not [string]::IsNullOrWhiteSpace([string]$Job.CaseName)) { $caseName = ([string]$Job.CaseName).Trim() }
+
+        $caseId = $null
+        $next = $base + '?$top=50'
+        $pages = 0
+        while ($next -and -not $caseId -and $pages -lt 20) {
+            $pages++
+            $page = Invoke-PurviewGraph -Method Get -Uri $next -Token $token
+            if (-not $page.Ok) {
+                throw ((Get-GraphFailure $page 'The eDiscovery case list could not be read.') + ' The account needs eDiscovery Manager or eDiscovery Administrator, and the Microsoft Graph eDiscovery.ReadWrite.All permission.')
+            }
+            if ($page.Json -and $page.Json.value) {
+                foreach ($case in $page.Json.value) {
+                    if ($case.displayName -and ([string]$case.displayName).ToLowerInvariant() -eq $caseName.ToLowerInvariant()) {
+                        $caseId = [string]$case.id
+                        break
+                    }
+                }
+            }
+            $next = ''
+            if (-not $caseId -and $page.Json -and $page.Json.'@odata.nextLink') {
+                $next = [string]$page.Json.'@odata.nextLink'
+            }
+        }
+
+        if (-not $caseId) {
+            Write-JobLog "Creating eDiscovery case '$caseName'. No hold is placed."
+            $created = Invoke-PurviewGraph -Method Post -Uri $base -Token $token -JsonBody (ConvertTo-GraphJson @{
+                displayName = $caseName
+                description = 'Read-only case used by Purview Email Investigation to list message subjects. No hold is placed and message files are not downloaded.'
+            })
+            if (-not $created.Ok -or -not $created.Json -or -not $created.Json.id) {
+                throw (Get-GraphFailure $created 'The eDiscovery case could not be created.')
+            }
+            $caseId = [string]$created.Json.id
+        }
+        else {
+            Write-JobLog "Using existing eDiscovery case '$caseName'. No hold is placed."
+        }
+
+        $location = ''
+        if (-not [string]::IsNullOrWhiteSpace($ExchangeLocation)) {
+            $location = (($ExchangeLocation -split '\r?\n')[0]).Trim()
+        }
+        $allMailboxes = ($location -eq 'All')
+        $mailbox = ''
+        if (-not $allMailboxes) {
+            $mailbox = $location.TrimStart('.')
+            if ($mailbox -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
+                if ($ContentQuery -match 'from:"([^"]+)"') { $mailbox = $Matches[1] }
+            }
+            if ($mailbox -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
+                throw "The search location '$location' is not a mailbox address, so the item report cannot be limited to one mailbox."
+            }
+        }
+
+        $searchBody = @{
+            displayName = ''
+            description = 'Read-only item report for message subjects. Message files are not downloaded. No hold is placed.'
+            contentQuery = $ContentQuery
+        }
+        if ($allMailboxes) {
+            $searchBody['dataSourceScopes'] = 'allTenantMailboxes'
+            Write-JobLog 'The item report uses the same query across all tenant mailboxes. Message files are not downloaded.'
+        }
+        else {
+            $custodianId = $null
+            $custodianUri = $base + '/' + $caseId + '/custodians?$top=100'
+            $custodianPage = Invoke-PurviewGraph -Method Get -Uri $custodianUri -Token $token
+            if ($custodianPage.Ok -and $custodianPage.Json -and $custodianPage.Json.value) {
+                foreach ($custodian in $custodianPage.Json.value) {
+                    if ($custodian.email -and ([string]$custodian.email).ToLowerInvariant() -eq $mailbox.ToLowerInvariant()) {
+                        $custodianId = [string]$custodian.id
+                        break
+                    }
+                }
+            }
+            if (-not $custodianId) {
+                Write-JobLog "Adding mailbox $mailbox to the case. The mailbox is not placed on hold."
+                $added = Invoke-PurviewGraph -Method Post -Uri ($base + '/' + $caseId + '/custodians') -Token $token -JsonBody (ConvertTo-GraphJson @{ email = $mailbox })
+                if (-not $added.Ok -or -not $added.Json -or -not $added.Json.id) {
+                    throw (Get-GraphFailure $added "The mailbox $mailbox could not be added to the case.")
+                }
+                $custodianId = [string]$added.Json.id
+            }
+
+            $sourceId = $null
+            $sources = Invoke-PurviewGraph -Method Get -Uri ($base + '/' + $caseId + '/custodians/' + $custodianId + '/userSources') -Token $token
+            if ($sources.Ok -and $sources.Json -and $sources.Json.value) {
+                foreach ($source in $sources.Json.value) {
+                    $included = [string]$source.includedSources
+                    if ($included -match 'mailbox') {
+                        $sourceId = [string]$source.id
+                        break
+                    }
+                }
+            }
+            if (-not $sourceId) {
+                $createdSource = Invoke-PurviewGraph -Method Post -Uri ($base + '/' + $caseId + '/custodians/' + $custodianId + '/userSources') -Token $token -JsonBody (ConvertTo-GraphJson @{
+                    email            = $mailbox
+                    includedSources  = 'mailbox'
+                })
+                if (-not $createdSource.Ok -or -not $createdSource.Json -or -not $createdSource.Json.id) {
+                    throw (Get-GraphFailure $createdSource "The mailbox source for $mailbox could not be added.")
+                }
+                $sourceId = [string]$createdSource.Json.id
+            }
+            $searchBody['custodianSources@odata.bind'] = @($base + '/' + $caseId + '/custodians/' + $custodianId + '/userSources/' + $sourceId)
+            Write-JobLog "The item report is limited to mailbox $mailbox."
+        }
+
+        $suffix = '_S' + (Get-Date -Format 'HHmmss')
+        $baseName = [string]$Job.SearchName
+        if ([string]::IsNullOrWhiteSpace($baseName)) { $baseName = 'EmailInvestigation' }
+        if (($baseName.Length + $suffix.Length) -gt 180) {
+            $baseName = $baseName.Substring(0, 180 - $suffix.Length)
+        }
+        $graphSearchName = $baseName + $suffix
+        $searchBody['displayName'] = $graphSearchName
+        Write-JobLog "Creating the item-report search $graphSearchName."
+        $Job.Sync.StatusText = 'Creating the item report'
+        $search = Invoke-PurviewGraph -Method Post -Uri ($base + '/' + $caseId + '/searches') -Token $token -JsonBody (ConvertTo-GraphJson $searchBody)
+        if (-not $search.Ok -or -not $search.Json -or -not $search.Json.id) {
+            throw (Get-GraphFailure $search 'The item-report search could not be created.')
+        }
+        $searchId = [string]$search.Json.id
+
+        Write-JobLog 'Estimating the item-report search.'
+        $Job.Sync.StatusText = 'Estimating the item report'
+        $estimateUri = $base + '/' + $caseId + '/searches/' + $searchId + '/estimateStatistics'
+        $estimate = Invoke-PurviewGraph -Method Post -Uri $estimateUri -Token $token -JsonBody (ConvertTo-GraphJson @{ statisticsOptions = 'includeQueryStats' })
+        if (-not $estimate.Ok -and $estimate.StatusCode -eq 400) {
+            $estimate = Invoke-PurviewGraph -Method Post -Uri $estimateUri -Token $token -JsonBody '{}'
+        }
+        if (-not $estimate.Ok) { throw (Get-GraphFailure $estimate 'The item-report estimate could not start.') }
+        $estimateUrl = [string]$estimate.Location
+        if ([string]::IsNullOrWhiteSpace($estimateUrl) -and $estimate.Json -and $estimate.Json.id) {
+            $estimateUrl = $base + '/' + $caseId + '/operations/' + [string]$estimate.Json.id
+        }
+        if ([string]::IsNullOrWhiteSpace($estimateUrl)) {
+            throw 'Microsoft Graph did not return an operation address for the item-report estimate.'
+        }
+        Wait-PurviewGraphOperation -Location $estimateUrl -Token $token -Label 'Estimate' | Out-Null
+
+        Write-JobLog 'Requesting the item report. Message files are not downloaded.'
+        $Job.Sync.StatusText = 'Requesting the item report'
+        $export = Invoke-PurviewGraph -Method Post -Uri ($base + '/' + $caseId + '/searches/' + $searchId + '/exportReport') -Token $token -JsonBody (ConvertTo-GraphJson @{
+            displayName        = ($graphSearchName + ' report')
+            description        = 'Item report only. Message files are not downloaded.'
+            exportCriteria     = 'searchHits'
+            additionalOptions  = 'none'
+        })
+        if (-not $export.Ok) { throw (Get-GraphFailure $export 'The item report could not start.') }
+        $exportUrl = [string]$export.Location
+        if ([string]::IsNullOrWhiteSpace($exportUrl) -and $export.Json -and $export.Json.id) {
+            $exportUrl = $base + '/' + $caseId + '/operations/' + [string]$export.Json.id
+        }
+        if ([string]::IsNullOrWhiteSpace($exportUrl)) {
+            throw 'Microsoft Graph did not return an operation address for the item report.'
+        }
+        $operation = Wait-PurviewGraphOperation -Location $exportUrl -Token $token -Label 'Item report'
+        $items = Get-FindingsFromReportOperation -Operation $operation
+        return ,$items
+    }
+
+    function Publish-FindingRows {
+        param($Items)
+        $reported = -1
+        if ($null -ne $Job.ReportedItemCount) {
+            try { $reported = [int]$Job.ReportedItemCount } catch { $reported = -1 }
+        }
+        $count = 0
+        foreach ($row in $Items) {
+            if ($null -ne $row) { $count++ }
+        }
+        if ($Job.OutputFolder -and (Test-Path -LiteralPath $Job.OutputFolder)) {
+            $saved = Export-FindingsSpreadsheet -Items $Items -OutputFolder $Job.OutputFolder -SearchName $Job.SearchName -ReportedItemCount $reported
+            $Job.Sync.FindingsCount = $count
+            $Job.Sync.FindingsReported = $reported
+            $Job.Sync.FindingsPath = [string]$saved.WorkbookPath
+            if ($reported -gt $count) {
+                Write-JobLog "MessageFindings.xlsx has $count subject lines. The search reported $reported matches. The item report did not include a subject for every match." 'WARNING'
+            }
+            else {
+                Write-JobLog "Findings spreadsheet saved with $count subject lines: $($Job.Sync.FindingsPath)" 'SUCCESS'
+            }
+        }
+        else {
+            $Job.Sync.FindingsCount = $count
+            Write-JobLog 'Subject lines will be shown in the window. No output folder was available for the spreadsheet.' 'WARNING'
+        }
+        $Job.Sync.Preview = $Items
+        if ($Job.Sync.Phase -ne 'Cancelled') {
+            $Job.Sync.Phase = 'PreviewReady'
+            $Job.Sync.StatusText = "Findings spreadsheet ready ($count subject lines)"
+            $Job.Sync.Progress = 100
+        }
+    }
+
     function Start-PreviewWorker {
         if (-not $script:IppsConnected) { throw 'Connect to Purview before loading a preview.' }
         if ([string]::IsNullOrWhiteSpace([string]$Job.SearchName)) { throw 'There is no search to preview.' }
@@ -1431,6 +2152,23 @@ function Invoke-PurviewSearchJob {
         }
         if (($null -eq $Job.ReportedItemCount -or [int]$Job.ReportedItemCount -lt 0) -and $null -ne $existing.Items -and -not [string]::IsNullOrWhiteSpace([string]$existing.Items)) {
             try { $Job.ReportedItemCount = [int]$existing.Items } catch { }
+        }
+
+        $supportsPreview = $false
+        try {
+            $actionCommand = Get-Command -Name New-ComplianceSearchAction -ErrorAction Stop
+            $supportsPreview = [bool]$actionCommand.Parameters.ContainsKey('Preview')
+        }
+        catch {
+            $supportsPreview = $false
+        }
+        if (-not $supportsPreview) {
+            Write-JobLog 'This Microsoft 365 connection does not accept New-ComplianceSearchAction -Preview. Requesting an item report that lists each subject. Message files are not downloaded.'
+            $queryText = ConvertTo-ResultText $existing.ContentMatchQuery
+            $locationText = ConvertTo-ResultText $existing.ExchangeLocation
+            $items = Request-GraphFindingItems -ContentQuery $queryText -ExchangeLocation $locationText
+            Publish-FindingRows -Items $items
+            return
         }
 
         $actionName = "$($Job.SearchName)_Preview"
@@ -1496,6 +2234,18 @@ function Invoke-PurviewSearchJob {
         $existing = Get-ComplianceSearch -Identity $Job.SearchName
         if ([string]$existing.Status -notin @('Completed', 'PartiallySucceeded')) {
             throw "A statistics report is available after the search completes. Current status: $($existing.Status)"
+        }
+
+        $supportsReport = $false
+        try {
+            $reportCommand = Get-Command -Name New-ComplianceSearchAction -ErrorAction Stop
+            $supportsReport = [bool]$reportCommand.Parameters.ContainsKey('Report')
+        }
+        catch {
+            $supportsReport = $false
+        }
+        if (-not $supportsReport) {
+            throw 'Microsoft 365 no longer accepts New-ComplianceSearchAction -Report. Mailbox totals are already in the search summary, and the findings spreadsheet lists each subject.'
         }
 
         Write-JobLog 'Creating a statistics report action. Message content is not exported.'
@@ -1746,6 +2496,9 @@ function Reset-CommandSignals {
     $script:Sync.Phase = 'Starting'
     $script:Sync.Progress = 0
     $script:Sync.StatusText = 'Starting'
+    $script:Sync.GraphUserCode = ''
+    $script:Sync.GraphSignInUrl = ''
+    $script:GraphCodeShown = $false
 }
 
 function Ensure-Runspace {
@@ -2238,6 +2991,14 @@ function Update-InvestigationUi {
     try {
         Drain-LogQueue
         Update-ProgressChrome
+        if ($script:Sync -and $script:Sync.GraphUserCode -and -not $script:GraphCodeShown) {
+            $script:GraphCodeShown = $true
+            $code = [string]$script:Sync.GraphUserCode
+            $url = [string]$script:Sync.GraphSignInUrl
+            if ([string]::IsNullOrWhiteSpace($url)) { $url = 'https://microsoft.com/devicelogin' }
+            try { [System.Windows.Forms.Clipboard]::SetText($code) } catch { }
+            Show-UiMessage "Microsoft 365 no longer returns message subjects from the old preview command.`r`n`r`nSign in once so the tool can download an item report. Message files are not included and no hold is placed.`r`n`r`nOpen $url`r`nEnter this code: $code`r`n`r`nThe code was copied to the clipboard. It is also in the activity log." 'Sign in for the findings report' 'Information'
+        }
         if ($script:CommandRunning -and $script:AsyncHandle -and $script:AsyncHandle.IsCompleted) {
             $script:CommandRunning = $false
             Complete-CurrentCommand
@@ -2311,6 +3072,7 @@ function Show-InvestigationConfirm {
     $summary = New-Object System.Text.StringBuilder
     [void]$summary.AppendLine('This creates a compliance search estimate.')
     [void]$summary.AppendLine('It does not delete, move, or modify messages, and it does not download message bodies.')
+    [void]$summary.AppendLine('If messages match, a second sign-in collects the subject lines. No hold is placed.')
     [void]$summary.AppendLine()
     [void]$summary.AppendLine("Search name : $($Request.SearchName)")
     [void]$summary.AppendLine("Sender      : $($Request.Sender)")
@@ -2494,6 +3256,7 @@ function Start-PreviewFromUi {
         OutputFolder      = $script:CurrentOutputFolder
         TimeoutMinutes    = [int]$script:numTimeout.Value
         ReportedItemCount = $reported
+        CaseName          = $script:txtCase.Text.Trim()
     }
 }
 
@@ -2606,6 +3369,8 @@ The end date is inclusive. KeyQL uses the next day as an exclusive bound so mail
 Sender mailbox searches that person's mailbox, including Sent Items. All mailboxes searches every mailbox the account can access and can take much longer.
 
 When messages match, MessageFindings.xlsx lists each one with its subject line. Message bodies are not downloaded.
+
+Microsoft 365 no longer accepts the old preview command. The subject list comes from a Purview item report. That step asks for a second sign-in at https://microsoft.com/devicelogin. Use an eDiscovery Manager or eDiscovery Administrator account. No hold is placed.
 "@
     Show-UiMessage $text "Purview Email Investigation v$($script:AppVersion)" 'Information'
 }
@@ -3204,7 +3969,7 @@ function Start-PurviewInvestigationGui {
     })
 
     $script:toolTip.SetToolTip($script:btnStart, 'Create and start a read-only compliance search.')
-    $script:toolTip.SetToolTip($script:btnPreview, 'Save MessageFindings.xlsx with one row per message, including the subject line. Does not download message bodies.')
+    $script:toolTip.SetToolTip($script:btnPreview, 'Save MessageFindings.xlsx with one row per message, including the subject line. Does not download message bodies. Microsoft 365 asks for a second sign-in because the old preview command is no longer accepted.')
     $script:toolTip.SetToolTip($script:btnRemove, 'Remove the search definition from Purview. Does not modify messages.')
     $script:toolTip.SetToolTip($script:chkInactive, 'For one mailbox, the address is prefixed with a period so an inactive mailbox can be searched.')
 
