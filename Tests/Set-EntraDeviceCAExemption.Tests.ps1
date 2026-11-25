@@ -527,6 +527,21 @@ Assert-True ($signedInSource -notmatch 'Connect-Graph -Reconnect:') 'GUI does no
 Assert-True ($signedInSource -match 'Connect-Graph @connectParams') 'GUI splats Connect-Graph so 5.1 switch binding works'
 Assert-Equal -Expected $null -Actual (Get-PreferredGraphOutputType -ValidValues @('HashTable') -EmptyBody:$false) -Name 'EmptyBody:false binds on advanced function'
 
+$planA = New-ToolObject @('Row', 2, 'Status', 'Ready', 'DisplayName', 'KIOSK-01')
+$planB = New-ToolObject @('Row', 3, 'Status', 'NoChange', 'DisplayName', 'KIOSK-02')
+$planC = New-ToolObject @('Row', 4, 'Status', 'Ready', 'DisplayName', 'KIOSK-03')
+$picked = @(Select-BulkPlanItemsByRow -Plan @($planA, $planB, $planC) -RowNumbers @('2', '4') -ReadyOnly)
+Assert-Equal -Expected 2 -Actual $picked.Count -Name 'Bulk apply keeps two selected Ready rows'
+Assert-Equal -Expected 'KIOSK-01' -Actual $picked[0].DisplayName -Name 'Bulk apply first selected Ready row'
+Assert-Equal -Expected 'KIOSK-03' -Actual $picked[1].DisplayName -Name 'Bulk apply second selected Ready row'
+$readyOnly = @(Select-BulkPlanItemsByRow -Plan @($planA, $planB, $planC) -RowNumbers @('2', '3', '4') -ReadyOnly)
+Assert-Equal -Expected 2 -Actual $readyOnly.Count -Name 'Bulk apply ignores selected non-Ready rows'
+$none = @(Select-BulkPlanItemsByRow -Plan @($planA, $planB, $planC) -RowNumbers @() -ReadyOnly)
+Assert-Equal -Expected 0 -Actual $none.Count -Name 'Bulk apply with no selection returns no rows'
+$signedInSource = (Get-Content -LiteralPath $tool -Raw)
+Assert-True ($signedInSource -match 'New-GuiGrid -MultiSelect') 'Bulk and device grids allow multi-select'
+Assert-True ($signedInSource -match "New-GuiButton 'Apply selected'") 'Bulk tab applies the selected rows'
+
 Write-Host ''
 Write-Host ("Passed: {0}  Failed: {1}" -f $script:Passed, $script:Failed) -ForegroundColor $(if ($script:Failed -eq 0) { 'Green' } else { 'Red' })
 if ($script:Failed -gt 0) { exit 1 }

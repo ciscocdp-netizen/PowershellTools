@@ -107,7 +107,7 @@ param(
     [string]$SettingsPath
 )
 
-$script:ToolVersion    = '2.0.2'
+$script:ToolVersion    = '2.0.3'
 $script:Root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $script:SettingsFile = if ($SettingsPath) { $SettingsPath } else { Join-Path $script:Root 'CAExemption.settings.json' }
 $script:RequiredScope  = 'Device.ReadWrite.All'
@@ -3641,10 +3641,64 @@ function Set-GuiGridData {
 
 function Get-GuiSelectedValue {
     param($Grid, [string]$Column)
-    if ($null -eq $Grid -or $null -eq $Grid.CurrentRow) { return '' }
-    $cell = $Grid.CurrentRow.Cells[$Column]
-    if ($null -eq $cell -or $null -eq $cell.Value) { return '' }
-    return [string]$cell.Value
+    $values = @(Get-GuiSelectedValues -Grid $Grid -Column $Column)
+    if ($values.Count -eq 0) { return '' }
+    return [string]$values[0]
+}
+
+function Get-GuiSelectedValues {
+    param($Grid, [string]$Column)
+    $list = New-Object System.Collections.Generic.List[string]
+    if ($null -eq $Grid) { return ,@() }
+    $rows = $Grid.SelectedRows
+    if ($null -eq $rows -or $rows.Count -eq 0) { return ,@() }
+    $ordered = New-Object System.Collections.Generic.List[object]
+    for ($i = 0; $i -lt $rows.Count; $i++) {
+        $ordered.Add($rows[$i])
+    }
+    foreach ($row in @($ordered | Sort-Object Index)) {
+        if ($row.IsNewRow) { continue }
+        $cell = $row.Cells[$Column]
+        if ($null -eq $cell -or $null -eq $cell.Value) { continue }
+        $text = [string]$cell.Value
+        if (-not [string]::IsNullOrWhiteSpace($text)) { $list.Add($text) }
+    }
+    return ,$list.ToArray()
+}
+
+function Select-GuiGridRowsByValue {
+    param($Grid, [string]$Column, $Values)
+    if ($null -eq $Grid) { return }
+    $wanted = @{}
+    foreach ($value in @($Values)) {
+        $key = [string]$value
+        if (-not [string]::IsNullOrWhiteSpace($key)) { $wanted[$key] = $true }
+    }
+    $Grid.ClearSelection()
+    if ($wanted.Count -eq 0) { return }
+    foreach ($row in $Grid.Rows) {
+        if ($row.IsNewRow) { continue }
+        $cell = $row.Cells[$Column]
+        if ($null -eq $cell -or $null -eq $cell.Value) { continue }
+        if ($wanted.ContainsKey([string]$cell.Value)) { $row.Selected = $true }
+    }
+}
+
+function Select-BulkPlanItemsByRow {
+    param($Plan, [string[]]$RowNumbers, [switch]$ReadyOnly)
+    $wanted = @{}
+    foreach ($number in @($RowNumbers)) {
+        $key = [string]$number
+        if (-not [string]::IsNullOrWhiteSpace($key)) { $wanted[$key] = $true }
+    }
+    $matched = New-Object System.Collections.Generic.List[object]
+    foreach ($item in (ConvertTo-ObjectArray $Plan)) {
+        if ($wanted.Count -eq 0) { break }
+        if (-not $wanted.ContainsKey([string]$item.Row)) { continue }
+        if ($ReadyOnly -and [string]$item.Status -ne 'Ready') { continue }
+        $matched.Add($item)
+    }
+    return (ConvertTo-ObjectArray $matched)
 }
 
 function Find-GuiDeviceByObjectId {
@@ -3674,13 +3728,14 @@ function New-GuiButton {
 }
 
 function New-GuiGrid {
+    param([switch]$MultiSelect)
     $grid = New-Object System.Windows.Forms.DataGridView
     $grid.Dock = [System.Windows.Forms.DockStyle]::Fill
     $grid.ReadOnly = $true
     $grid.AllowUserToAddRows = $false
     $grid.AllowUserToDeleteRows = $false
     $grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
-    $grid.MultiSelect = $false
+    $grid.MultiSelect = [bool]$MultiSelect
     $grid.RowHeadersVisible = $false
     $grid.BackgroundColor = [System.Drawing.Color]::White
     $grid.BorderStyle = [System.Windows.Forms.BorderStyle]::None
@@ -3816,7 +3871,7 @@ function Show-CAExemptionGui {
     $btnClear = New-GuiButton 'Clear selected' 140 28 $red
     $btnClear.Location = New-Object System.Drawing.Point(420, 28)
     $devBottom.Controls.Add($btnClear)
-    $script:grdDevices = New-GuiGrid
+    $script:grdDevices = New-GuiGrid -MultiSelect
     $tabDevices.Controls.Add($script:grdDevices)
     $tabDevices.Controls.Add($devBottom)
     $tabDevices.Controls.Add($devTop)
@@ -3853,18 +3908,21 @@ function Show-CAExemptionGui {
     $bulkBottom = New-Object System.Windows.Forms.Panel
     $bulkBottom.Dock = 'Bottom'
     $bulkBottom.Height = 50
-    $btnApplyBulk = New-GuiButton 'Apply Ready rows' 160 28 $green
-    $btnApplyBulk.Location = New-Object System.Drawing.Point(12, 10)
+    $btnSelectReady = New-GuiButton 'Select Ready' 120 28 ([System.Drawing.Color]::FromArgb(70, 90, 120))
+    $btnSelectReady.Location = New-Object System.Drawing.Point(12, 10)
+    $bulkBottom.Controls.Add($btnSelectReady)
+    $btnApplyBulk = New-GuiButton 'Apply selected' 140 28 $green
+    $btnApplyBulk.Location = New-Object System.Drawing.Point(140, 10)
     $bulkBottom.Controls.Add($btnApplyBulk)
     $btnExportPlan = New-GuiButton 'Export preview' 140 28 $blue
-    $btnExportPlan.Location = New-Object System.Drawing.Point(182, 10)
+    $btnExportPlan.Location = New-Object System.Drawing.Point(288, 10)
     $bulkBottom.Controls.Add($btnExportPlan)
     $script:lblBulkSummary = New-Object System.Windows.Forms.Label
-    $script:lblBulkSummary.Text = 'Load a CSV to preview changes.'
-    $script:lblBulkSummary.Location = New-Object System.Drawing.Point(340, 16)
+    $script:lblBulkSummary.Text = 'Load a CSV to preview changes. Ctrl+click or Shift+click to choose rows.'
+    $script:lblBulkSummary.Location = New-Object System.Drawing.Point(440, 16)
     $script:lblBulkSummary.AutoSize = $true
     $bulkBottom.Controls.Add($script:lblBulkSummary)
-    $script:grdBulk = New-GuiGrid
+    $script:grdBulk = New-GuiGrid -MultiSelect
     $tabBulk.Controls.Add($script:grdBulk)
     $tabBulk.Controls.Add($bulkBottom)
     $tabBulk.Controls.Add($bulkTop)
@@ -4038,6 +4096,8 @@ Graph ServerAd = CA ServerADJoined
 Sign-in: click Sign in. A browser window opens. Tenant ID is not required.
 Use device-code sign-in only when a browser cannot open (RDP / Server Core).
 
+Bulk CSV: Ctrl+click or Shift+click rows, or Select Ready, then Apply selected.
+
 Permissions: Device.ReadWrite.All, User.Read.All
 Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
 "@
@@ -4194,14 +4254,24 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
     function Invoke-GuiUpdateSelected {
         param([switch]$Clear)
         if (-not (Test-GuiGraph)) { return }
-        $objectId = Get-GuiSelectedValue $script:grdDevices 'ObjectId'
-        $device = Find-GuiDeviceByObjectId $script:GuiDevices $objectId
-        if ($null -eq $device) {
-            [void](Show-ToolDialog 'Select a device in the grid first.' 'Update' 'OK' 'Information')
+        $objectIds = @(Get-GuiSelectedValues $script:grdDevices 'ObjectId')
+        $selected = New-Object System.Collections.Generic.List[object]
+        foreach ($objectId in $objectIds) {
+            $device = Find-GuiDeviceByObjectId $script:GuiDevices $objectId
+            if ($null -ne $device) { $selected.Add($device) }
+        }
+        if ($selected.Count -eq 0) {
+            [void](Show-ToolDialog 'Select one or more devices in the grid first. Ctrl+click or Shift+click to choose several.' 'Update' 'OK' 'Information')
             return
         }
-        if (-not $device.Eligible) {
-            [void](Show-ToolDialog (Get-IneligibleDeviceNote $device) 'Not in scope' 'OK' 'Warning')
+        $eligible = New-Object System.Collections.Generic.List[object]
+        $skipped = New-Object System.Collections.Generic.List[string]
+        foreach ($device in $selected) {
+            if ($device.Eligible) { $eligible.Add($device) }
+            else { $skipped.Add(("{0}: {1}" -f $device.DisplayName, (Get-IneligibleDeviceNote $device))) }
+        }
+        if ($eligible.Count -eq 0) {
+            [void](Show-ToolDialog (($skipped -join [Environment]::NewLine)) 'Not in scope' 'OK' 'Warning')
             return
         }
         $newValue = $null
@@ -4212,18 +4282,32 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
                 return
             }
         }
-        $actionText = if ($Clear) { 'clear extensionAttribute1 on' } else { "set extensionAttribute1 to '$newValue' on" }
-        if ((Show-ToolDialog ("{0} {1}?" -f $actionText, $device.DisplayName) 'Confirm' 'YesNo' 'Question') -ne [System.Windows.Forms.DialogResult]::Yes) {
+        $actionText = if ($Clear) { 'Clear extensionAttribute1 on' } else { "Set extensionAttribute1 to '$newValue' on" }
+        if ((Show-ToolDialog ("{0} {1} selected device(s)?" -f $actionText, $eligible.Count) 'Confirm' 'YesNo' 'Question') -ne [System.Windows.Forms.DialogResult]::Yes) {
             return
         }
-        Set-GuiBusy ("Updating {0}..." -f $device.DisplayName)
+        Set-GuiBusy ("Updating {0} device(s)..." -f $eligible.Count)
         try {
-            $entry = Set-DeviceExtensionAttribute -Device $device -NewValue $newValue -Source 'GUI'
-            $device.ExtensionAttribute1 = $newValue
-            $device.Eligible = Test-DeviceEligible $device
+            $planItems = New-Object System.Collections.Generic.List[object]
+            foreach ($device in $eligible) {
+                $planItems.Add((New-ToolObject @('Device', $device, 'NewValue', $newValue)))
+            }
+            $results = ConvertTo-ObjectArray (Invoke-DeviceExtensionAttributeUpdates -PlanItems $planItems -Source 'GUI')
+            foreach ($entry in $results) {
+                if ($entry.Status -notin @('Success', 'DryRun')) { continue }
+                $device = Find-GuiDeviceByObjectId $script:GuiDevices $entry.ObjectId
+                if ($null -eq $device) { continue }
+                $device.ExtensionAttribute1 = $newValue
+                $device.Eligible = Test-DeviceEligible $device
+            }
             Set-GuiGridData $script:grdDevices $script:GuiDevices $deviceColumns
-            Clear-GuiBusy ("{0}: {1}" -f $entry.Status, $device.DisplayName)
-            [void](Show-ToolDialog ("{0}  ({1})" -f $entry.Status, $entry.Action) 'Update' 'OK' 'Information')
+            $ok = @($results | Where-Object { $_.Status -eq 'Success' }).Count
+            $dry = @($results | Where-Object { $_.Status -eq 'DryRun' }).Count
+            $fail = @($results | Where-Object { $_.Status -eq 'Failed' }).Count
+            $msg = "Succeeded: $ok`nDry-run: $dry`nFailed: $fail"
+            if ($skipped.Count -gt 0) { $msg = $msg + "`nSkipped (not in scope): $($skipped.Count)" }
+            Clear-GuiBusy $msg.Replace("`n", '  ')
+            [void](Show-ToolDialog $msg 'Update' 'OK' 'Information')
         }
         catch {
             Clear-GuiBusy 'Update failed'
@@ -4249,8 +4333,9 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
             $fallback = $script:txtBulkFallback.Text
             $script:GuiPlan = ConvertTo-ObjectArray (New-BulkUpdatePlan -Rows $rows -DeviceIndex $index -ColumnMap $columnMap -FallbackValue $fallback -SkipMissing $false)
             Set-GuiGridData $script:grdBulk $script:GuiPlan $planColumns
+            Invoke-GuiSelectReadyRows
             $ready = @($script:GuiPlan | Where-Object { $_.Status -eq 'Ready' }).Count
-            $script:lblBulkSummary.Text = ("{0} row(s), {1} Ready. Dry-run: {2}" -f @($script:GuiPlan).Count, $ready, $script:Settings.DryRun)
+            $script:lblBulkSummary.Text = ("{0} row(s), {1} Ready selected. Ctrl+click or Shift+click to change the selection. Dry-run: {2}" -f @($script:GuiPlan).Count, $ready, $script:Settings.DryRun)
             Clear-GuiBusy $script:lblBulkSummary.Text
         }
         catch {
@@ -4259,13 +4344,28 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
         }
     }
 
+    function Invoke-GuiSelectReadyRows {
+        $readyRows = New-Object System.Collections.Generic.List[string]
+        foreach ($item in (ConvertTo-ObjectArray $script:GuiPlan)) {
+            if ([string]$item.Status -eq 'Ready') { $readyRows.Add([string]$item.Row) }
+        }
+        Select-GuiGridRowsByValue $script:grdBulk 'Row' $readyRows.ToArray()
+        $script:lblBulkSummary.Text = ("{0} Ready row(s) selected. Ctrl+click or Shift+click to change the selection." -f $readyRows.Count)
+    }
+
     function Invoke-GuiBulkApply {
-        $ready = @(ConvertTo-ObjectArray $script:GuiPlan | Where-Object { $_.Status -eq 'Ready' })
-        if ($ready.Count -eq 0) {
+        $allReady = @(ConvertTo-ObjectArray $script:GuiPlan | Where-Object { $_.Status -eq 'Ready' })
+        if ($allReady.Count -eq 0) {
             [void](Show-ToolDialog 'There are no Ready rows to apply. Preview a CSV first.' 'Bulk update' 'OK' 'Information')
             return
         }
-        if ((Show-ToolDialog ("Update {0} device(s) now?" -f $ready.Count) 'Confirm bulk update' 'YesNo' 'Warning') -ne [System.Windows.Forms.DialogResult]::Yes) {
+        $selectedRows = @(Get-GuiSelectedValues $script:grdBulk 'Row')
+        $ready = @(Select-BulkPlanItemsByRow -Plan $script:GuiPlan -RowNumbers $selectedRows -ReadyOnly)
+        if ($ready.Count -eq 0) {
+            [void](Show-ToolDialog 'Select one or more Ready rows, then click Apply selected. Use Ctrl+click, Shift+click, or Select Ready.' 'Bulk update' 'OK' 'Information')
+            return
+        }
+        if ((Show-ToolDialog ("Update {0} selected device(s) now?" -f $ready.Count) 'Confirm bulk update' 'YesNo' 'Warning') -ne [System.Windows.Forms.DialogResult]::Yes) {
             return
         }
         if (-not (Test-GuiGraph)) { return }
@@ -4278,6 +4378,24 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
             $ok = @($results | Where-Object { $_.Status -eq 'Success' }).Count
             $dry = @($results | Where-Object { $_.Status -eq 'DryRun' }).Count
             $fail = @($results | Where-Object { $_.Status -eq 'Failed' }).Count
+            $byObjectId = @{}
+            foreach ($entry in $results) {
+                if ($entry.ObjectId) { $byObjectId[[string]$entry.ObjectId] = $entry }
+            }
+            foreach ($item in $ready) {
+                $objectId = ''
+                if ($item.Device) { $objectId = [string]$item.Device.ObjectId }
+                if ($objectId -and $byObjectId.ContainsKey($objectId)) {
+                    $item.Status = [string]$byObjectId[$objectId].Status
+                    $item.Note = [string]$byObjectId[$objectId].Message
+                    if ($item.Device) {
+                        $item.Device.ExtensionAttribute1 = $item.NewValue
+                        $item.Current = Format-Value $item.NewValue
+                    }
+                }
+            }
+            Set-GuiGridData $script:grdBulk $script:GuiPlan $planColumns
+            Invoke-GuiSelectReadyRows
             $msg = "Succeeded: $ok`nDry-run: $dry`nFailed: $fail"
             Clear-GuiBusy $msg.Replace("`n", '  ')
             [void](Show-ToolDialog $msg 'Bulk update' 'OK' 'Information')
@@ -4398,6 +4516,7 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
             if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $script:txtBulkPath.Text = $dialog.FileName }
         })
     $btnPreviewBulk.Add_Click({ Invoke-GuiBulkPreview })
+    $btnSelectReady.Add_Click({ Invoke-GuiSelectReadyRows })
     $btnApplyBulk.Add_Click({ Invoke-GuiBulkApply })
     $btnExportPlan.Add_Click({
             if (@($script:GuiPlan).Count -eq 0) { [void](Show-ToolDialog 'Preview a CSV first.' 'Export' 'OK' 'Information'); return }
