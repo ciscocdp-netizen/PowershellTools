@@ -106,18 +106,29 @@ Assert-Equal -Expected 'Entra joined' -Actual (Get-JoinTypeLabel 'AzureAd') -Nam
 Assert-Equal -Expected 'Hybrid joined' -Actual (Get-JoinTypeLabel 'ServerAd') -Name 'ServerAd label'
 Assert-Equal -Expected 'Unknown' -Actual (Get-JoinTypeLabel '') -Name 'Empty trustType label'
 
-$script:Settings.RegisteredOnly = $true
+Set-DeviceScope 'WindowsRegistered'
 $registered = ConvertTo-DeviceRecord (New-GraphDeviceHashtable)
-Assert-True $registered.Eligible 'Workplace Windows device is eligible when RegisteredOnly'
+Assert-True $registered.Eligible 'Workplace Windows device is eligible when scope is WindowsRegistered'
 $joined = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -TrustType 'AzureAd' -DisplayName 'LAPTOP-01')
-Assert-True (-not $joined.Eligible) 'Entra joined device is not eligible when RegisteredOnly'
+Assert-True (-not $joined.Eligible) 'Entra joined device is not eligible when scope is WindowsRegistered'
 $ios = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -Os 'iOS' -DisplayName 'PHONE-01')
-Assert-True (-not $ios.Eligible) 'iOS device is not eligible'
+Assert-True (-not $ios.Eligible) 'iOS device is not eligible when scope is WindowsRegistered'
 
-$script:Settings.RegisteredOnly = $false
-$joinedAll = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -TrustType 'AzureAd' -DisplayName 'LAPTOP-01')
-Assert-True $joinedAll.Eligible 'Entra joined Windows device is eligible when RegisteredOnly is off'
-$script:Settings.RegisteredOnly = $true
+Set-DeviceScope 'Windows'
+$joinedWin = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -TrustType 'AzureAd' -DisplayName 'LAPTOP-01')
+Assert-True $joinedWin.Eligible 'Entra joined Windows device is eligible when scope is Windows'
+$iosWin = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -Os 'iOS' -DisplayName 'PHONE-01')
+Assert-True (-not $iosWin.Eligible) 'iOS device is not eligible when scope is Windows'
+
+Set-DeviceScope 'All'
+$iosAll = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -Os 'iOS' -DisplayName 'PHONE-01')
+Assert-True $iosAll.Eligible 'iOS device is eligible when scope is All'
+$macAll = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -Os 'MacOS' -TrustType 'AzureAd' -DisplayName 'MAC-01')
+Assert-True $macAll.Eligible 'macOS device is eligible when scope is All'
+Assert-Equal -Expected 'All devices (any OS)' -Actual (Get-DeviceScopeLabel) -Name 'Get-DeviceScopeLabel for All'
+$allFilters = @(Get-DeviceScopeGraphFilters)
+Assert-True ($null -eq $allFilters[0]) 'All-device scope uses an unfiltered Graph list'
+Set-DeviceScope 'WindowsRegistered'
 
 # --- Graph property access ---
 $ht = @{ id = 'abc'; DisplayName = 'from-ht'; '@odata.nextLink' = 'https://next' }
@@ -261,25 +272,26 @@ try {
     $script:SettingsFile = $settingsPath
     $script:Settings.DefaultValue = 'PAW'
     $script:Settings.DryRun = $true
-    $script:Settings.RegisteredOnly = $false
+    Set-DeviceScope 'Windows'
     Export-ToolSettings -Path $settingsPath
     $script:Settings.DefaultValue = 'CAExempt'
     $script:Settings.DryRun = $false
-    $script:Settings.RegisteredOnly = $true
+    Set-DeviceScope 'WindowsRegistered'
     Import-ToolSettings -Path $settingsPath
     Assert-Equal -Expected 'PAW' -Actual $script:Settings.DefaultValue -Name 'Settings persist DefaultValue'
     Assert-True $script:Settings.DryRun 'Settings persist DryRun'
-    Assert-True (-not $script:Settings.RegisteredOnly) 'Settings persist RegisteredOnly'
+    Assert-Equal -Expected 'Windows' -Actual $script:Settings.DeviceScope -Name 'Settings persist DeviceScope'
+    Assert-True (-not $script:Settings.RegisteredOnly) 'Settings persist RegisteredOnly from DeviceScope'
     $script:Settings.DefaultValue = 'CAExempt'
     $script:Settings.DryRun = $false
-    $script:Settings.RegisteredOnly = $true
+    Set-DeviceScope 'WindowsRegistered'
 }
 finally {
     Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 # --- Bulk plan ---
-$script:Settings.RegisteredOnly = $true
+Set-DeviceScope 'WindowsRegistered'
 $devA = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -DisplayName 'KIOSK-01' -ExtensionAttribute1 $null)
 $devB = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -DisplayName 'KIOSK-02' -DeviceId 'cccccccc-cccc-cccc-cccc-cccccccccccc' -ObjectId 'dddddddd-dddd-dddd-dddd-dddddddddddd' -ExtensionAttribute1 'CAExempt')
 $devC = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -DisplayName 'KIOSK-03' -DeviceId '56565656-5656-5656-5656-565656565656' -ObjectId '78787878-7878-7878-7878-787878787878' -ExtensionAttribute1 $null)
@@ -480,6 +492,22 @@ $activityMap = Resolve-CsvColumnMap $activityHeaders
 $activityIndex = New-DeviceIndex @($recentDev)
 $activityPlan = @(New-BulkUpdatePlan -Rows @($activityRow) -DeviceIndex $activityIndex -ColumnMap $activityMap -FallbackValue 'CAExempt' -SkipMissing $false)
 Assert-Equal -Expected 'Ready' -Actual $activityPlan[0].Status -Name 'Recent-activity export is ready for bulk update'
+
+Set-DeviceScope 'All'
+$iosRowDevice = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -Os 'iOS' -DisplayName 'PHONE-01' -DeviceId '44444444-4444-4444-4444-444444444444' -ObjectId '54444444-4444-4444-4444-444444444444')
+$iosIndex = New-DeviceIndex @($iosRowDevice)
+$iosRow = New-UserDeviceBulkRow -Device $iosRowDevice -User $null -Relationship '' -Value 'CAExempt' -Action 'Set'
+$iosPlan = @(New-BulkUpdatePlan -Rows @($iosRow) -DeviceIndex $iosIndex -FallbackValue 'CAExempt' -SkipMissing $false)
+Assert-Equal -Expected 'Ready' -Actual $iosPlan[0].Status -Name 'Non-Windows device is Ready when scope is All'
+Assert-True ((Test-ToolIsWindows) -is [bool]) 'Test-ToolIsWindows returns a boolean'
+
+$guiTable = ConvertTo-GuiDataTable -Rows @($iosRowDevice) -Columns @('DisplayName', 'OperatingSystem', 'Eligible')
+Assert-Equal -Expected 1 -Actual $guiTable.Rows.Count -Name 'GUI data table has one device row'
+$guiName = [string]$guiTable.Rows[0]['DisplayName']
+$guiOs = [string]$guiTable.Rows[0]['OperatingSystem']
+Assert-Equal -Expected 'PHONE-01' -Actual $guiName -Name 'GUI data table copies DisplayName'
+Assert-Equal -Expected 'iOS' -Actual $guiOs -Name 'GUI data table copies OperatingSystem'
+Set-DeviceScope 'WindowsRegistered'
 
 Write-Host ''
 Write-Host ("Passed: {0}  Failed: {1}" -f $script:Passed, $script:Failed) -ForegroundColor $(if ($script:Failed -eq 0) { 'Green' } else { 'Red' })
