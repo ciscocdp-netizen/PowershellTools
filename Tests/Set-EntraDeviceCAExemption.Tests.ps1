@@ -538,9 +538,16 @@ $readyOnly = @(Select-BulkPlanItemsByRow -Plan @($planA, $planB, $planC) -RowNum
 Assert-Equal -Expected 2 -Actual $readyOnly.Count -Name 'Bulk apply ignores selected non-Ready rows'
 $none = @(Select-BulkPlanItemsByRow -Plan @($planA, $planB, $planC) -RowNumbers @() -ReadyOnly)
 Assert-Equal -Expected 0 -Actual $none.Count -Name 'Bulk apply with no selection returns no rows'
+$byIndex = @(Select-ItemsByGridIndex -Items @($planA, $planB, $planC) -Indexes @(0, 2) -ReadyOnly)
+Assert-Equal -Expected 2 -Actual $byIndex.Count -Name 'Bulk apply by grid index keeps two Ready rows'
+Assert-Equal -Expected 'KIOSK-01' -Actual $byIndex[0].DisplayName -Name 'Bulk apply by grid index first row'
+Assert-Equal -Expected 'KIOSK-03' -Actual $byIndex[1].DisplayName -Name 'Bulk apply by grid index third row'
+$byIndexSkip = @(Select-ItemsByGridIndex -Items @($planA, $planB, $planC) -Indexes @(0, 1, 2) -ReadyOnly)
+Assert-Equal -Expected 2 -Actual $byIndexSkip.Count -Name 'Bulk apply by grid index skips non-Ready rows'
 $signedInSource = (Get-Content -LiteralPath $tool -Raw)
 Assert-True ($signedInSource -match 'New-GuiGrid -MultiSelect') 'Bulk and device grids allow multi-select'
 Assert-True ($signedInSource -match "New-GuiButton 'Apply selected'") 'Bulk tab applies the selected rows'
+Assert-True ($signedInSource -match 'Get-GuiSelectedRowIndexes') 'Apply uses selected grid indexes including SelectedCells'
 
 Write-Host ''
 Write-Host ("Passed: {0}  Failed: {1}" -f $script:Passed, $script:Failed) -ForegroundColor $(if ($script:Failed -eq 0) { 'Green' } else { 'Red' })

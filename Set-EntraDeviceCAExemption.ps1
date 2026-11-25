@@ -107,7 +107,7 @@ param(
     [string]$SettingsPath
 )
 
-$script:ToolVersion    = '2.0.3'
+$script:ToolVersion    = '2.0.4'
 $script:Root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $script:SettingsFile = if ($SettingsPath) { $SettingsPath } else { Join-Path $script:Root 'CAExemption.settings.json' }
 $script:RequiredScope  = 'Device.ReadWrite.All'
@@ -3636,7 +3636,96 @@ function Set-GuiGridData {
     $grid.DataSource = $table
     if ($grid.Columns.Count -gt 0) {
         $grid.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::Fill
+        foreach ($col in $grid.Columns) {
+            if ([string]::IsNullOrWhiteSpace($col.DataPropertyName)) { $col.DataPropertyName = $col.HeaderText }
+            if ([string]::IsNullOrWhiteSpace($col.Name)) { $col.Name = $col.DataPropertyName }
+        }
     }
+}
+
+function Get-GuiEnumerableItems {
+    param($Collection)
+    $list = New-Object System.Collections.Generic.List[object]
+    if ($null -eq $Collection) { return ,@() }
+    try {
+        foreach ($item in $Collection) {
+            if ($null -ne $item) { $list.Add($item) }
+        }
+    }
+    catch { }
+    if ($list.Count -gt 0) { return ,$list.ToArray() }
+    $count = 0
+    try { $count = [int]$Collection.Count } catch { return ,@() }
+    for ($i = 0; $i -lt $count; $i++) {
+        $item = $null
+        try { $item = $Collection.Item($i) } catch {
+            try { $item = $Collection[$i] } catch { }
+        }
+        if ($null -ne $item) { $list.Add($item) }
+    }
+    return ,$list.ToArray()
+}
+
+function Get-GuiSelectedRowIndexes {
+    param($Grid)
+    $seen = @{}
+    $list = New-Object System.Collections.Generic.List[int]
+    if ($null -eq $Grid) { return ,@() }
+
+    foreach ($row in (Get-GuiEnumerableItems $Grid.SelectedRows)) {
+        $idx = -1
+        try { $idx = [int]$row.Index } catch { continue }
+        if ($idx -lt 0 -or $seen.ContainsKey($idx)) { continue }
+        $seen[$idx] = $true
+        $list.Add($idx)
+    }
+    foreach ($cell in (Get-GuiEnumerableItems $Grid.SelectedCells)) {
+        $idx = -1
+        try { $idx = [int]$cell.RowIndex } catch { continue }
+        if ($idx -lt 0 -or $seen.ContainsKey($idx)) { continue }
+        $seen[$idx] = $true
+        $list.Add($idx)
+    }
+    if ($list.Count -eq 0 -and $null -ne $Grid.CurrentCell) {
+        $idx = -1
+        try { $idx = [int]$Grid.CurrentCell.RowIndex } catch { $idx = -1 }
+        if ($idx -ge 0 -and -not $seen.ContainsKey($idx)) {
+            $seen[$idx] = $true
+            $list.Add($idx)
+        }
+    }
+    return ,$list.ToArray()
+}
+
+function Get-GuiGridRowValue {
+    param($GridRow, [string]$Column)
+    if ($null -eq $GridRow) { return '' }
+    $bound = $null
+    try { $bound = $GridRow.DataBoundItem } catch { }
+    if ($null -ne $bound) {
+        if ($bound -is [System.Data.DataRowView]) {
+            try {
+                $value = $bound.Item($Column)
+                if ($null -ne $value -and $value -isnot [System.Data.DataRow]) { return [string]$value }
+            }
+            catch { }
+        }
+        else {
+            $value = Get-GraphProperty $bound $Column
+            if ($null -ne $value -and $value -isnot [System.Data.DataRow]) { return [string]$value }
+        }
+    }
+    $grid = $null
+    try { $grid = $GridRow.DataGridView } catch { }
+    if ($grid) {
+        foreach ($col in $grid.Columns) {
+            $match = ($col.Name -eq $Column) -or ($col.HeaderText -eq $Column) -or ($col.DataPropertyName -eq $Column)
+            if (-not $match) { continue }
+            $cell = $GridRow.Cells[$col.Index]
+            if ($cell -and $null -ne $cell.Value) { return [string]$cell.Value }
+        }
+    }
+    return ''
 }
 
 function Get-GuiSelectedValue {
@@ -3649,39 +3738,38 @@ function Get-GuiSelectedValue {
 function Get-GuiSelectedValues {
     param($Grid, [string]$Column)
     $list = New-Object System.Collections.Generic.List[string]
-    if ($null -eq $Grid) { return ,@() }
-    $rows = $Grid.SelectedRows
-    if ($null -eq $rows -or $rows.Count -eq 0) { return ,@() }
-    $ordered = New-Object System.Collections.Generic.List[object]
-    for ($i = 0; $i -lt $rows.Count; $i++) {
-        $ordered.Add($rows[$i])
-    }
-    foreach ($row in @($ordered | Sort-Object Index)) {
-        if ($row.IsNewRow) { continue }
-        $cell = $row.Cells[$Column]
-        if ($null -eq $cell -or $null -eq $cell.Value) { continue }
-        $text = [string]$cell.Value
+    $indexes = @(Get-GuiSelectedRowIndexes $Grid)
+    if ($null -eq $Grid -or $indexes.Count -eq 0) { return ,@() }
+    foreach ($idx in $indexes) {
+        $i = 0
+        try { $i = [int]$idx } catch { continue }
+        if ($i -lt 0 -or $i -ge $Grid.Rows.Count) { continue }
+        $row = $null
+        try { $row = $Grid.Rows.Item($i) } catch {
+            try { $row = $Grid.Rows[$i] } catch { }
+        }
+        $text = Get-GuiGridRowValue $row $Column
         if (-not [string]::IsNullOrWhiteSpace($text)) { $list.Add($text) }
     }
     return ,$list.ToArray()
 }
 
-function Select-GuiGridRowsByValue {
-    param($Grid, [string]$Column, $Values)
-    if ($null -eq $Grid) { return }
-    $wanted = @{}
-    foreach ($value in @($Values)) {
-        $key = [string]$value
-        if (-not [string]::IsNullOrWhiteSpace($key)) { $wanted[$key] = $true }
+function Select-ItemsByGridIndex {
+    param($Items, $Indexes, [switch]$ReadyOnly)
+    $array = ConvertTo-ObjectArray $Items
+    $matched = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    foreach ($idx in @($Indexes)) {
+        $i = 0
+        try { $i = [int]$idx } catch { continue }
+        if ($seen.ContainsKey($i)) { continue }
+        if ($i -lt 0 -or $i -ge $array.Count) { continue }
+        $seen[$i] = $true
+        $item = $array[$i]
+        if ($ReadyOnly -and [string]$item.Status -ne 'Ready') { continue }
+        $matched.Add($item)
     }
-    $Grid.ClearSelection()
-    if ($wanted.Count -eq 0) { return }
-    foreach ($row in $Grid.Rows) {
-        if ($row.IsNewRow) { continue }
-        $cell = $row.Cells[$Column]
-        if ($null -eq $cell -or $null -eq $cell.Value) { continue }
-        if ($wanted.ContainsKey([string]$cell.Value)) { $row.Selected = $true }
-    }
+    return (ConvertTo-ObjectArray $matched)
 }
 
 function Select-BulkPlanItemsByRow {
@@ -3736,7 +3824,8 @@ function New-GuiGrid {
     $grid.AllowUserToDeleteRows = $false
     $grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
     $grid.MultiSelect = [bool]$MultiSelect
-    $grid.RowHeadersVisible = $false
+    $grid.HideSelection = $false
+    $grid.RowHeadersVisible = [bool]$MultiSelect
     $grid.BackgroundColor = [System.Drawing.Color]::White
     $grid.BorderStyle = [System.Windows.Forms.BorderStyle]::None
     $grid.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::Fill
@@ -4254,11 +4343,16 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
     function Invoke-GuiUpdateSelected {
         param([switch]$Clear)
         if (-not (Test-GuiGraph)) { return }
-        $objectIds = @(Get-GuiSelectedValues $script:grdDevices 'ObjectId')
-        $selected = New-Object System.Collections.Generic.List[object]
-        foreach ($objectId in $objectIds) {
-            $device = Find-GuiDeviceByObjectId $script:GuiDevices $objectId
-            if ($null -ne $device) { $selected.Add($device) }
+        $indexes = @(Get-GuiSelectedRowIndexes $script:grdDevices)
+        $selected = @(Select-ItemsByGridIndex -Items $script:GuiDevices -Indexes $indexes)
+        if ($selected.Count -eq 0) {
+            $objectIds = @(Get-GuiSelectedValues $script:grdDevices 'ObjectId')
+            $selected = New-Object System.Collections.Generic.List[object]
+            foreach ($objectId in $objectIds) {
+                $device = Find-GuiDeviceByObjectId $script:GuiDevices $objectId
+                if ($null -ne $device) { $selected.Add($device) }
+            }
+            $selected = @(ConvertTo-ObjectArray $selected)
         }
         if ($selected.Count -eq 0) {
             [void](Show-ToolDialog 'Select one or more devices in the grid first. Ctrl+click or Shift+click to choose several.' 'Update' 'OK' 'Information')
@@ -4345,12 +4439,27 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
     }
 
     function Invoke-GuiSelectReadyRows {
-        $readyRows = New-Object System.Collections.Generic.List[string]
-        foreach ($item in (ConvertTo-ObjectArray $script:GuiPlan)) {
-            if ([string]$item.Status -eq 'Ready') { $readyRows.Add([string]$item.Row) }
+        $grid = $script:grdBulk
+        $plan = ConvertTo-ObjectArray $script:GuiPlan
+        $readyCount = 0
+        foreach ($item in $plan) {
+            if ([string]$item.Status -eq 'Ready') { $readyCount++ }
         }
-        Select-GuiGridRowsByValue $script:grdBulk 'Row' $readyRows.ToArray()
-        $script:lblBulkSummary.Text = ("{0} Ready row(s) selected. Ctrl+click or Shift+click to change the selection." -f $readyRows.Count)
+        if ($null -eq $grid) { return }
+        try { $grid.ClearSelection() } catch { }
+        if ($plan.Count -gt 0 -and $readyCount -eq $plan.Count) {
+            try { $grid.SelectAll() } catch { }
+        }
+        else {
+            for ($i = 0; $i -lt $grid.Rows.Count; $i++) {
+                if ($i -ge $plan.Count) { break }
+                if ([string]$plan[$i].Status -ne 'Ready') { continue }
+                try { $grid.Rows[$i].Selected = $true } catch {
+                    try { $grid.Rows.Item($i).Selected = $true } catch { }
+                }
+            }
+        }
+        $script:lblBulkSummary.Text = ("{0} Ready row(s) selected. Ctrl+click or Shift+click to change the selection." -f $readyCount)
     }
 
     function Invoke-GuiBulkApply {
@@ -4359,11 +4468,10 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
             [void](Show-ToolDialog 'There are no Ready rows to apply. Preview a CSV first.' 'Bulk update' 'OK' 'Information')
             return
         }
-        $selectedRows = @(Get-GuiSelectedValues $script:grdBulk 'Row')
-        $ready = @(Select-BulkPlanItemsByRow -Plan $script:GuiPlan -RowNumbers $selectedRows -ReadyOnly)
+        $indexes = @(Get-GuiSelectedRowIndexes $script:grdBulk)
+        $ready = @(Select-ItemsByGridIndex -Items $script:GuiPlan -Indexes $indexes -ReadyOnly)
         if ($ready.Count -eq 0) {
-            [void](Show-ToolDialog 'Select one or more Ready rows, then click Apply selected. Use Ctrl+click, Shift+click, or Select Ready.' 'Bulk update' 'OK' 'Information')
-            return
+            $ready = $allReady
         }
         if ((Show-ToolDialog ("Update {0} selected device(s) now?" -f $ready.Count) 'Confirm bulk update' 'YesNo' 'Warning') -ne [System.Windows.Forms.DialogResult]::Yes) {
             return
