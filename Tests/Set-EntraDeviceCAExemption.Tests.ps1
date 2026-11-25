@@ -548,6 +548,7 @@ $signedInSource = (Get-Content -LiteralPath $tool -Raw)
 Assert-True ($signedInSource -match 'New-GuiGrid -MultiSelect') 'Bulk and device grids allow multi-select'
 Assert-True ($signedInSource -match "New-GuiButton 'Apply selected'") 'Bulk tab applies the selected rows'
 Assert-True ($signedInSource -match 'Get-GuiSelectedRowIndexes') 'Apply uses selected grid indexes including SelectedCells'
+Assert-True ($signedInSource -notmatch 'HideSelection') 'DataGridView does not set HideSelection (not on .NET Framework)'
 
 Write-Host ''
 Write-Host ("Passed: {0}  Failed: {1}" -f $script:Passed, $script:Failed) -ForegroundColor $(if ($script:Failed -eq 0) { 'Green' } else { 'Red' })

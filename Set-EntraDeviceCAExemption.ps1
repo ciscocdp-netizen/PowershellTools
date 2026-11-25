@@ -107,7 +107,7 @@ param(
     [string]$SettingsPath
 )
 
-$script:ToolVersion    = '2.0.4'
+$script:ToolVersion    = '2.0.5'
 $script:Root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $script:SettingsFile = if ($SettingsPath) { $SettingsPath } else { Join-Path $script:Root 'CAExemption.settings.json' }
 $script:RequiredScope  = 'Device.ReadWrite.All'
@@ -3824,7 +3824,6 @@ function New-GuiGrid {
     $grid.AllowUserToDeleteRows = $false
     $grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
     $grid.MultiSelect = [bool]$MultiSelect
-    $grid.HideSelection = $false
     $grid.RowHeadersVisible = [bool]$MultiSelect
     $grid.BackgroundColor = [System.Drawing.Color]::White
     $grid.BorderStyle = [System.Windows.Forms.BorderStyle]::None
