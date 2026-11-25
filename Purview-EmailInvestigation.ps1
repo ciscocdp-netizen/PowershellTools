@@ -1,0 +1,2837 @@
+#Requires -Version 5.1
+
+<#
+.SYNOPSIS
+    Microsoft Purview eDiscovery email investigation tool.
+
+.DESCRIPTION
+    Searches Exchange Online mailbox content for messages sent by one user
+    to selected recipient domains. It creates a compliance search, monitors
+    progress, and writes search statistics. It does not delete, move, export,
+    or modify email messages.
+
+    Run the script on Windows to open the GUI. The search runs on a background
+    runspace so the window stays responsive while Microsoft sign-in and the
+    compliance search are in progress.
+
+.NOTES
+    Requires Windows PowerShell 5.1 or PowerShell 7 on Windows.
+    Requires ExchangeOnlineManagement 3.9.0 or later.
+    The connection uses Connect-IPPSSession -EnableSearchOnlySession, which
+    current Security & Compliance PowerShell requires for these cmdlets.
+    The signed-in account needs eDiscovery or Compliance Search permissions.
+
+    The end date is inclusive. KeyQL receives an exclusive upper bound of the
+    next calendar day because a date-only sent<= bound is midnight.
+#>
+
+$script:AppVersion = '2.0'
+
+function ConvertTo-KqlPhrase {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+    return (($Value -replace '\\', '\\') -replace '"', '\"')
+}
+
+function Test-EmailAddress {
+    param([AllowEmptyString()][string]$Address)
+    if ([string]::IsNullOrWhiteSpace($Address)) { return $false }
+    $candidate = $Address.Trim()
+    if ($candidate.Length -gt 320) { return $false }
+    return $candidate -match '^[A-Za-z0-9._%+\-]+@(?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$'
+}
+
+function Test-RecipientDomain {
+    param([AllowEmptyString()][string]$Domain)
+    if ([string]::IsNullOrWhiteSpace($Domain)) { return $false }
+    if ($Domain.Length -gt 253) { return $false }
+    return $Domain -match '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
+}
+
+function ConvertTo-RecipientDomainList {
+    param([AllowEmptyString()][string]$InputText)
+    $tokens = @(
+        $InputText -split '[,;\s]+' |
+            ForEach-Object { $_.Trim().TrimStart('@').TrimEnd('.').ToLowerInvariant() } |
+            Where-Object { $_ }
+    )
+    if ($tokens.Count -eq 0) {
+        throw 'At least one recipient domain is required.'
+    }
+
+    $unique = New-Object System.Collections.Generic.List[string]
+    foreach ($token in $tokens) {
+        if (-not (Test-RecipientDomain $token)) {
+            throw "Invalid recipient domain: $token"
+        }
+        if (-not $unique.Contains($token)) {
+            $unique.Add($token)
+        }
+    }
+
+    return ,$unique.ToArray()
+}
+
+function Test-ParenthesesBalanced {
+    param([AllowEmptyString()][string]$Text)
+    $depth = 0
+    $inQuote = $false
+    $escaped = $false
+    foreach ($ch in $Text.ToCharArray()) {
+        if ($escaped) {
+            $escaped = $false
+            continue
+        }
+        if ($ch -eq '\') {
+            $escaped = $true
+            continue
+        }
+        if ($ch -eq '"') {
+            $inQuote = -not $inQuote
+            continue
+        }
+        if ($inQuote) { continue }
+        if ($ch -eq '(') {
+            $depth++
+        }
+        elseif ($ch -eq ')') {
+            $depth--
+            if ($depth -lt 0) { return $false }
+        }
+    }
+    return ((-not $inQuote) -and ($depth -eq 0))
+}
+
+function New-InvestigationQuery {
+    param(
+        [Parameter(Mandatory)][string]$Sender,
+        [Parameter(Mandatory)][string[]]$Domains,
+        [Parameter(Mandatory)][datetime]$Start,
+        [Parameter(Mandatory)][datetime]$End,
+        [AllowEmptyString()][string]$AdditionalQuery
+    )
+
+    $senderText = $Sender.Trim()
+    if ([string]::IsNullOrWhiteSpace($senderText)) {
+        throw 'Sender is required.'
+    }
+    if ($Start.Date -gt $End.Date) {
+        throw 'Start date cannot be after end date.'
+    }
+
+    $cleanDomains = New-Object System.Collections.Generic.List[string]
+    foreach ($domain in @($Domains)) {
+        if (-not [string]::IsNullOrWhiteSpace($domain)) {
+            $cleanDomains.Add($domain.Trim())
+        }
+    }
+    if ($cleanDomains.Count -eq 0) {
+        throw 'At least one recipient domain is required.'
+    }
+
+    $recipientParts = New-Object System.Collections.Generic.List[string]
+    foreach ($domain in $cleanDomains) {
+        $recipientParts.Add(('recipients:"{0}"' -f (ConvertTo-KqlPhrase $domain)))
+    }
+    $recipientQuery = $recipientParts -join ' OR '
+    $query = 'kind:email AND from:"{0}" AND ({1}) AND sent>={2} AND sent<{3}' -f `
+        (ConvertTo-KqlPhrase $senderText),
+        $recipientQuery,
+        $Start.Date.ToString('yyyy-MM-dd'),
+        $End.Date.AddDays(1).ToString('yyyy-MM-dd')
+
+    if (-not [string]::IsNullOrWhiteSpace($AdditionalQuery)) {
+        $extra = ($AdditionalQuery -replace '\s+', ' ').Trim()
+        if (-not (Test-ParenthesesBalanced $extra)) {
+            throw 'Additional query has unbalanced parentheses or quotes.'
+        }
+        $query = '{0} AND ({1})' -f $query, $extra
+    }
+
+    if ($query.Length -gt 8000) {
+        throw "The search query is too long ($($query.Length) characters)."
+    }
+    return $query
+}
+
+function Test-SearchName {
+    param([AllowEmptyString()][string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    if ($Name.Length -gt 180) { return $false }
+    return $Name -match '^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$'
+}
+
+function New-InvestigationSearchName {
+    param(
+        [AllowEmptyString()][string]$Sender,
+        [AllowEmptyString()][string]$Timestamp
+    )
+
+    $local = $Sender
+    if ($Sender -and $Sender.Contains('@')) {
+        $local = $Sender.Split('@')[0]
+    }
+    $alias = ($local -replace '[^A-Za-z0-9._-]', '_').Trim('._-')
+    if ([string]::IsNullOrWhiteSpace($alias)) { $alias = 'sender' }
+
+    $stamp = ($Timestamp -replace '[^A-Za-z0-9._-]', '_')
+    if ([string]::IsNullOrWhiteSpace($stamp)) {
+        $stamp = (Get-Date).ToString('yyyyMMddHHmmssfff')
+    }
+
+    $name = "EmailInvestigation_${alias}_${stamp}"
+    if ($name.Length -gt 180) {
+        $name = $name.Substring(0, 180).TrimEnd('._-')
+    }
+    if (-not (Test-SearchName $name)) {
+        $name = 'EmailInvestigation_sender_' + (Get-Date).ToString('yyyyMMddHHmmssfff')
+    }
+    return $name
+}
+
+function Get-ExchangeSearchLocation {
+    param(
+        [Parameter(Mandatory)][string]$Sender,
+        [Parameter(Mandatory)][ValidateSet('Sender', 'All')][string]$Scope,
+        [bool]$AllowNotFound = $false
+    )
+
+    if ($Scope -eq 'All') { return 'All' }
+    $smtp = $Sender.Trim()
+    if ($AllowNotFound) { return ".$smtp" }
+    return $smtp
+}
+
+function New-InvestigationDescription {
+    param(
+        [AllowEmptyString()][string]$Sender,
+        [string[]]$Domains,
+        [datetime]$Start,
+        [datetime]$End
+    )
+
+    $who = if ([string]::IsNullOrWhiteSpace($Sender)) { 'the specified sender' } else { $Sender.Trim() }
+    $domainList = @($Domains | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $domainText = if ($domainList.Count -gt 0) { $domainList -join ', ' } else { 'the specified domains' }
+    $text = "Read-only investigation of messages sent by $who to $domainText from $($Start.ToString('yyyy-MM-dd')) through $($End.ToString('yyyy-MM-dd'))."
+    if ($text.Length -gt 1000) { $text = $text.Substring(0, 1000) }
+    return $text
+}
+
+function ConvertTo-SettingDate {
+    param(
+        [AllowEmptyString()][string]$Text,
+        [datetime]$Fallback
+    )
+    try {
+        return [datetime]::ParseExact($Text, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+    }
+    catch {
+        return $Fallback.Date
+    }
+}
+
+function Test-InvestigationRequest {
+    param(
+        [AllowEmptyString()][string]$AdminUpn,
+        [AllowEmptyString()][string]$Sender,
+        [AllowEmptyString()][string]$DomainText,
+        [AllowEmptyString()][string]$CaseName,
+        [AllowEmptyString()][string]$Scope,
+        [bool]$AllowNotFound = $false,
+        [bool]$NotifyAdmin = $false,
+        [datetime]$Start,
+        [datetime]$End,
+        [AllowEmptyString()][string]$AdditionalQuery,
+        [AllowEmptyString()][string]$SearchName,
+        [AllowEmptyString()][string]$OutputFolder,
+        [int]$TimeoutMinutes,
+        [AllowEmptyString()][string]$Description
+    )
+
+    $errors = New-Object System.Collections.Generic.List[string]
+    $admin = $AdminUpn.Trim()
+    $senderText = $Sender.Trim()
+    $case = $CaseName.Trim()
+    $name = $SearchName.Trim()
+
+    if (-not (Test-EmailAddress $admin)) { $errors.Add('Enter a valid administrative UPN.') }
+    if (-not (Test-EmailAddress $senderText)) { $errors.Add('Enter a valid sender email address.') }
+    if ($Scope -notin @('Sender', 'All')) { $errors.Add('Select a mailbox scope.') }
+    if ($Start.Date -gt $End.Date) { $errors.Add('Start date cannot be after end date.') }
+    if ($TimeoutMinutes -lt 1 -or $TimeoutMinutes -gt 720) { $errors.Add('Timeout must be between 1 and 720 minutes.') }
+    if (-not (Test-SearchName $name)) {
+        $errors.Add('Search name must be 1-180 characters and use only letters, numbers, periods, underscores, and hyphens.')
+    }
+    if (-not [string]::IsNullOrWhiteSpace($case) -and $case.Length -gt 200) {
+        $errors.Add('Case name must be 200 characters or fewer.')
+    }
+
+    $fullOutput = ''
+    if ([string]::IsNullOrWhiteSpace($OutputFolder)) {
+        $errors.Add('Choose an output folder.')
+    }
+    elseif (-not [System.IO.Path]::IsPathRooted($OutputFolder.Trim())) {
+        $errors.Add('Output folder must be a full path.')
+    }
+    else {
+        try {
+            $fullOutput = [System.IO.Path]::GetFullPath($OutputFolder.Trim())
+        }
+        catch {
+            $errors.Add('Output folder path is not valid.')
+        }
+    }
+
+    $domains = @()
+    try {
+        $domains = ConvertTo-RecipientDomainList $DomainText
+    }
+    catch {
+        $errors.Add($_.Exception.Message)
+    }
+
+    $descriptionText = $Description.Trim()
+    if ([string]::IsNullOrWhiteSpace($descriptionText)) {
+        $descriptionText = New-InvestigationDescription -Sender $senderText -Domains $domains -Start $Start -End $End
+    }
+    if ($descriptionText.Length -gt 1000) {
+        $errors.Add('Description must be 1000 characters or fewer.')
+    }
+
+    $query = $null
+    $location = $null
+    if ($errors.Count -eq 0) {
+        try {
+            $query = New-InvestigationQuery -Sender $senderText -Domains $domains -Start $Start -End $End -AdditionalQuery $AdditionalQuery
+            $location = Get-ExchangeSearchLocation -Sender $senderText -Scope $Scope -AllowNotFound $AllowNotFound
+        }
+        catch {
+            $errors.Add($_.Exception.Message)
+        }
+    }
+
+    return [pscustomobject]@{
+        IsValid          = ($errors.Count -eq 0)
+        Errors           = $errors.ToArray()
+        AdminUpn         = $admin
+        Sender           = $senderText
+        Domains          = $domains
+        CaseName         = $case
+        Scope            = $Scope
+        AllowNotFound    = [bool]$AllowNotFound
+        NotifyAdmin      = [bool]$NotifyAdmin
+        Start            = $Start.Date
+        End              = $End.Date
+        AdditionalQuery  = (($AdditionalQuery -replace '\s+', ' ').Trim())
+        SearchName       = $name
+        OutputFolder     = $fullOutput
+        TimeoutMinutes   = $TimeoutMinutes
+        Description      = $descriptionText
+        Query            = $query
+        ExchangeLocation = $location
+    }
+}
+
+function ConvertTo-ByteCount {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [string] -and [string]::IsNullOrWhiteSpace($Value)) { return $null }
+
+    $toBytes = $Value.PSObject.Methods['ToBytes']
+    if ($toBytes) {
+        try { return [int64]$toBytes.Invoke() } catch { }
+    }
+
+    if ($Value -is [ValueType] -and $Value -isnot [bool] -and $Value -isnot [datetime] -and $Value -isnot [char]) {
+        try { return [int64]$Value } catch { }
+    }
+
+    $text = [string]$Value
+    if ($text -match '\(([0-9,]+)\s+bytes\)') {
+        return [int64]($Matches[1] -replace ',', '')
+    }
+    if ($text -match '^\d+$') {
+        return [int64]$text
+    }
+    return $null
+}
+
+function Format-ByteSize {
+    param($Bytes)
+    $count = ConvertTo-ByteCount $Bytes
+    if ($null -eq $count) {
+        if ($null -eq $Bytes) { return '' }
+        return [string]$Bytes
+    }
+    if ($count -ge 1GB) { return ('{0:N2} GB' -f ($count / 1GB)) }
+    if ($count -ge 1MB) { return ('{0:N2} MB' -f ($count / 1MB)) }
+    if ($count -ge 1KB) { return ('{0:N2} KB' -f ($count / 1KB)) }
+    return "$count bytes"
+}
+
+function ConvertTo-LocationStatistic {
+    param([AllowEmptyString()][string]$SuccessResults)
+    $list = New-Object System.Collections.Generic.List[object]
+    if ([string]::IsNullOrWhiteSpace($SuccessResults)) {
+        return ,$list.ToArray()
+    }
+
+    $pattern = '(?i)Location:\s*(?<Location>[^,]+?),\s*Item count:\s*(?<ItemCount>\d+),\s*Total size:\s*(?<Size>.*?)(?=\s*}|\s*$)'
+    foreach ($match in [regex]::Matches($SuccessResults, $pattern)) {
+        $location = $match.Groups['Location'].Value.Trim()
+        if ([string]::IsNullOrWhiteSpace($location)) { continue }
+        $sizeText = $match.Groups['Size'].Value.Trim().TrimEnd(',')
+        $bytes = ConvertTo-ByteCount $sizeText
+        if ($null -eq $bytes) { $bytes = [int64]0 }
+        $display = Format-ByteSize -Bytes $sizeText
+        if ([string]::IsNullOrWhiteSpace($display)) { $display = $sizeText }
+        $list.Add([pscustomobject]@{
+            Location    = $location
+            ItemCount   = [int64]$match.Groups['ItemCount'].Value
+            SizeBytes   = [int64]$bytes
+            SizeDisplay = $display
+        })
+    }
+    return ,$list.ToArray()
+}
+
+function ConvertTo-PreviewItem {
+    param([AllowEmptyString()][string]$Results)
+    $list = New-Object System.Collections.Generic.List[object]
+    if ([string]::IsNullOrWhiteSpace($Results)) {
+        return ,$list.ToArray()
+    }
+
+    $pattern = '(?i)Location:\s*(?<Location>.*?);\s*Sender:\s*(?<Sender>.*?);\s*Subject:\s*(?<Subject>.*?);\s*Type:\s*(?<Type>.*?);\s*Size:\s*(?<Size>.*?);\s*Received Time:\s*(?<Received>.*?);\s*Data Link:'
+    foreach ($match in [regex]::Matches($Results, $pattern)) {
+        $list.Add([pscustomobject]@{
+            Location = $match.Groups['Location'].Value.Trim()
+            Sender   = $match.Groups['Sender'].Value.Trim()
+            Subject  = $match.Groups['Subject'].Value.Trim()
+            Type     = $match.Groups['Type'].Value.Trim()
+            Size     = $match.Groups['Size'].Value.Trim()
+            Received = $match.Groups['Received'].Value.Trim()
+        })
+    }
+    return ,$list.ToArray()
+}
+
+function Test-TerminalSearchStatus {
+    param([AllowEmptyString()][string]$Status)
+    if ([string]::IsNullOrWhiteSpace($Status)) { return $false }
+    $known = @(
+        'Completed', 'Failed', 'Stopped', 'PartiallySucceeded',
+        'CompletedWithErrors', 'Succeeded', 'Canceled', 'Cancelled'
+    )
+    if ($known -contains $Status) { return $true }
+    return $Status -match '^(Completed|Failed|Stopped|Succeeded|Cancelled|Canceled)'
+}
+
+function Format-Duration {
+    param([TimeSpan]$Elapsed)
+    $hours = [math]::Floor($Elapsed.TotalHours)
+    return '{0:00}:{1:00}:{2:00}' -f $hours, $Elapsed.Minutes, $Elapsed.Seconds
+}
+
+function Add-Utf8Line {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Line
+    )
+    $utf8 = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::AppendAllText($Path, $Line + [Environment]::NewLine, $utf8)
+}
+
+function Write-Utf8File {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Content
+    )
+    $utf8 = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($Path, $Content, $utf8)
+}
+
+function Format-PropertyValue {
+    param($Value)
+    if ($null -eq $Value) { return '' }
+    if ($Value -is [string] -or $Value -is [ValueType]) { return [string]$Value }
+
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($item in $Value) {
+        if ($null -ne $item) { $parts.Add([string]$item) }
+    }
+    return ($parts -join ([Environment]::NewLine + '    '))
+}
+
+function ConvertTo-PropertyDump {
+    param($Object)
+    $builder = New-Object System.Text.StringBuilder
+    if ($null -eq $Object) { return '' }
+    foreach ($prop in $Object.PSObject.Properties) {
+        $rendered = ''
+        try {
+            $rendered = Format-PropertyValue $prop.Value
+        }
+        catch {
+            $rendered = "<unavailable: $($_.Exception.Message)>"
+        }
+        [void]$builder.AppendLine("$($prop.Name): $rendered")
+        [void]$builder.AppendLine()
+    }
+    return $builder.ToString()
+}
+
+function ConvertTo-FlatErrorText {
+    param($Errors)
+    if ($null -eq $Errors) { return '' }
+    if ($Errors -is [string]) { return $Errors.Trim() }
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($item in $Errors) {
+        if ($null -eq $item) { continue }
+        $text = [string]$item
+        if (-not [string]::IsNullOrWhiteSpace($text)) { $parts.Add($text.Trim()) }
+    }
+    return ($parts -join '; ')
+}
+
+function ConvertTo-ResultText {
+    param($Value)
+    if ($null -eq $Value) { return '' }
+    if ($Value -is [string]) { return $Value }
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($item in $Value) {
+        if ($null -ne $item) { $parts.Add([string]$item) }
+    }
+    return ($parts -join [Environment]::NewLine)
+}
+
+function Export-InvestigationReport {
+    param(
+        [Parameter(Mandatory)]$Search,
+        [Parameter(Mandatory)][string]$OutputFolder,
+        [Parameter(Mandatory)][hashtable]$Context
+    )
+
+    if (-not (Test-Path -LiteralPath $OutputFolder)) {
+        New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
+    }
+
+    $sizeBytesValue = ConvertTo-ByteCount $Search.Size
+    $unindexedBytesValue = ConvertTo-ByteCount $Search.UnindexedSize
+    $locations = ConvertTo-LocationStatistic (ConvertTo-ResultText $Search.SuccessResults)
+    $itemsText = ''
+    if ($null -ne $Search.Items -and -not [string]::IsNullOrWhiteSpace([string]$Search.Items)) {
+        $itemsText = [string]$Search.Items
+    }
+
+    $summary = [pscustomobject]@{
+        SearchName       = [string]$Context.SearchName
+        CaseName         = [string]$Context.CaseName
+        Administrator    = [string]$Context.Administrator
+        ConnectedAs      = [string]$Context.ConnectedAs
+        Sender           = [string]$Context.Sender
+        RecipientDomains = [string]$Context.RecipientDomains
+        StartDate        = [string]$Context.StartDate
+        EndDate          = [string]$Context.EndDate
+        SearchScope      = [string]$Context.SearchScope
+        ExchangeLocation = [string]$Context.ExchangeLocation
+        SearchStatus     = [string]$Search.Status
+        MatchingItems    = $itemsText
+        TotalSize        = Format-ByteSize $Search.Size
+        TotalSizeBytes   = $(if ($null -eq $sizeBytesValue) { '' } else { $sizeBytesValue })
+        UnindexedItems   = $(if ($null -eq $Search.UnindexedItems) { '' } else { [string]$Search.UnindexedItems })
+        UnindexedSize    = Format-ByteSize $Search.UnindexedSize
+        UnindexedBytes   = $(if ($null -eq $unindexedBytesValue) { '' } else { $unindexedBytesValue })
+        SearchErrors     = ConvertTo-FlatErrorText $Search.Errors
+        SearchQuery      = [string]$Context.SearchQuery
+        ExecutionTime    = [string]$Context.ExecutionTime
+        JobStartTime     = $(if ($Search.JobStartTime) { [string]$Search.JobStartTime } else { '' })
+        JobEndTime       = $(if ($Search.JobEndTime) { [string]$Search.JobEndTime } else { '' })
+        TimedOut         = [bool]$Context.TimedOut
+        ModuleVersion    = [string]$Context.ModuleVersion
+        ReportGenerated  = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        OutputFolder     = $OutputFolder
+    }
+
+    $summary | Export-Csv -Path (Join-Path $OutputFolder 'SearchSummary.csv') -NoTypeInformation -Encoding UTF8
+
+    $locationRows = New-Object System.Collections.Generic.List[object]
+    foreach ($row in $locations) {
+        if ($null -eq $row) { continue }
+        $locationRows.Add([pscustomobject]@{
+            SearchName  = $summary.SearchName
+            Location    = $row.Location
+            ItemCount   = $row.ItemCount
+            SizeBytes   = $row.SizeBytes
+            SizeDisplay = $row.SizeDisplay
+        })
+    }
+    $locationPath = Join-Path $OutputFolder 'LocationStatistics.csv'
+    if ($locationRows.Count -gt 0) {
+        $locationRows | Export-Csv -Path $locationPath -NoTypeInformation -Encoding UTF8
+    }
+    else {
+        Write-Utf8File -Path $locationPath -Content "SearchName,Location,ItemCount,SizeBytes,SizeDisplay$([Environment]::NewLine)"
+    }
+
+    $details = New-Object System.Text.StringBuilder
+    [void]$details.AppendLine('Compliance search property dump')
+    [void]$details.AppendLine("Generated: $($summary.ReportGenerated)")
+    [void]$details.AppendLine()
+    [void]$details.Append((ConvertTo-PropertyDump $Search))
+    Write-Utf8File -Path (Join-Path $OutputFolder 'SearchDetails.txt') -Content $details.ToString()
+    Write-Utf8File -Path (Join-Path $OutputFolder 'SearchQuery.txt') -Content ($summary.SearchQuery + [Environment]::NewLine)
+
+    $locationArray = $locationRows.ToArray()
+    $manifest = [ordered]@{
+        Summary   = $summary
+        Locations = $locationArray
+    }
+    Write-Utf8File -Path (Join-Path $OutputFolder 'RunManifest.json') -Content ($manifest | ConvertTo-Json -Depth 6)
+
+    return [pscustomobject]@{
+        Summary   = $summary
+        Locations = $locationArray
+    }
+}
+
+function Export-PreviewResults {
+    param(
+        [AllowEmptyString()][string]$RawResults,
+        [Parameter(Mandatory)][string]$OutputFolder,
+        [AllowEmptyString()][string]$SearchName
+    )
+
+    if (-not (Test-Path -LiteralPath $OutputFolder)) {
+        New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
+    }
+
+    Write-Utf8File -Path (Join-Path $OutputFolder 'PreviewResults.txt') -Content ([string]$RawResults + [Environment]::NewLine)
+    $items = ConvertTo-PreviewItem $RawResults
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($item in $items) {
+        if ($null -eq $item) { continue }
+        $rows.Add([pscustomobject]@{
+            SearchName = $SearchName
+            Received   = $item.Received
+            Sender     = $item.Sender
+            Subject    = $item.Subject
+            Type       = $item.Type
+            Size       = $item.Size
+            Location   = $item.Location
+        })
+    }
+    if ($rows.Count -gt 0) {
+        $rows | Export-Csv -Path (Join-Path $OutputFolder 'PreviewResults.csv') -NoTypeInformation -Encoding UTF8
+    }
+    return ,$rows.ToArray()
+}
+
+function New-InvestigationOutputFolder {
+    param([Parameter(Mandatory)][string]$Root)
+    if ([string]::IsNullOrWhiteSpace($Root)) {
+        throw 'Output folder is required.'
+    }
+    if (-not (Test-Path -LiteralPath $Root)) {
+        New-Item -ItemType Directory -Path $Root -Force | Out-Null
+    }
+
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
+    $path = Join-Path $Root $stamp
+    $suffix = 1
+    while (Test-Path -LiteralPath $path) {
+        $path = Join-Path $Root ('{0}_{1}' -f $stamp, $suffix)
+        $suffix++
+        if ($suffix -gt 50) {
+            throw "Unable to create a unique folder under $Root"
+        }
+    }
+    New-Item -ItemType Directory -Path $path -Force | Out-Null
+    return $path
+}
+
+function Get-DefaultInvestigationSettings {
+    $documents = [Environment]::GetFolderPath('MyDocuments')
+    if ([string]::IsNullOrWhiteSpace($documents)) {
+        $homeRoot = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
+        $documents = Join-Path $homeRoot 'Documents'
+    }
+    return [pscustomobject]@{
+        AdminUpn        = ''
+        Sender          = ''
+        Domains         = 'acpao.org, allencounty.in.gov'
+        CaseName        = ''
+        Scope           = 'Sender'
+        AllowNotFound   = $false
+        NotifyAdmin     = $false
+        OutputFolder    = (Join-Path $documents 'Purview_Email_Investigation')
+        TimeoutMinutes  = 120
+        AdditionalQuery = ''
+        StartDate       = '2025-07-10'
+        EndDate         = (Get-Date).ToString('yyyy-MM-dd')
+    }
+}
+
+function Get-InvestigationSettingsPath {
+    $root = [Environment]::GetFolderPath('ApplicationData')
+    if ([string]::IsNullOrWhiteSpace($root)) { return $null }
+    return (Join-Path (Join-Path $root 'PurviewEmailInvestigation') 'settings.json')
+}
+
+function Read-InvestigationSettings {
+    $path = Get-InvestigationSettingsPath
+    if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path)) { return $null }
+    try {
+        return ([System.IO.File]::ReadAllText($path) | ConvertFrom-Json)
+    }
+    catch {
+        return $null
+    }
+}
+
+function Save-InvestigationSettings {
+    param([Parameter(Mandatory)][hashtable]$Settings)
+    $path = Get-InvestigationSettingsPath
+    if ([string]::IsNullOrWhiteSpace($path)) { return }
+    $directory = Split-Path -Parent $path
+    if (-not (Test-Path -LiteralPath $directory)) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+    Write-Utf8File -Path $path -Content ($Settings | ConvertTo-Json -Depth 4)
+}
+
+function Resolve-ExchangeOnlineModule {
+    param([switch]$Refresh)
+    $params = @{
+        ListAvailable = $true
+        Name          = 'ExchangeOnlineManagement'
+        ErrorAction   = 'SilentlyContinue'
+    }
+    $candidates = @()
+    try {
+        if ($Refresh) { $params.Refresh = $true }
+        $candidates = @(Get-Module @params)
+    }
+    catch {
+        $params.Remove('Refresh')
+        $candidates = @(Get-Module @params)
+    }
+
+    $suitable = $candidates |
+        Where-Object { $_.Version -ge [version]'3.9.0' } |
+        Sort-Object Version -Descending |
+        Select-Object -First 1
+    $newest = $candidates | Sort-Object Version -Descending | Select-Object -First 1
+    return [pscustomobject]@{
+        Suitable       = $suitable
+        Newest         = $newest
+        InstalledCount = $candidates.Count
+    }
+}
+
+function Get-InvestigationRunspaceFunctionNames {
+    return @(
+        'ConvertTo-KqlPhrase'
+        'ConvertTo-ByteCount'
+        'Format-ByteSize'
+        'ConvertTo-LocationStatistic'
+        'ConvertTo-PreviewItem'
+        'Test-TerminalSearchStatus'
+        'Format-Duration'
+        'Add-Utf8Line'
+        'Write-Utf8File'
+        'Format-PropertyValue'
+        'ConvertTo-PropertyDump'
+        'ConvertTo-FlatErrorText'
+        'ConvertTo-ResultText'
+        'Export-InvestigationReport'
+        'Export-PreviewResults'
+        'Invoke-PurviewSearchJob'
+    )
+}
+
+function New-InvestigationRunspace {
+    $initial = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    foreach ($name in (Get-InvestigationRunspaceFunctionNames)) {
+        $command = Get-Command -Name $name -CommandType Function -ErrorAction Stop
+        $entry = New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry(
+            $name,
+            $command.ScriptBlock.ToString())
+        [void]$initial.Commands.Add($entry)
+    }
+
+    $runspace = [RunspaceFactory]::CreateRunspace($initial)
+    $runspace.ApartmentState = [System.Threading.ApartmentState]::STA
+    $runspace.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
+    $runspace.Open()
+    return $runspace
+}
+
+function Invoke-PurviewSearchJob {
+    param([Parameter(Mandatory)][hashtable]$Job)
+
+    function Write-JobLog {
+        param([string]$Message, [string]$Level = 'INFO')
+        $entry = '[{0}] [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
+        try { $Job.Sync.LogQueue.Enqueue($entry) } catch { }
+        if (-not [string]::IsNullOrWhiteSpace($Job.LogFile)) {
+            try { Add-Utf8Line -Path $Job.LogFile -Line $entry } catch { }
+        }
+    }
+
+    function Get-ErrorText {
+        param($Record)
+        $message = [string]$Record.Exception.Message
+        if ($Record.ErrorDetails -and $Record.ErrorDetails.Message) {
+            $detail = [string]$Record.ErrorDetails.Message
+            if ($detail -and $message -notlike "*$detail*") {
+                $message = "$message $detail"
+            }
+        }
+        return $message.Trim()
+    }
+
+    function Connect-PurviewWorker {
+        if ($script:IppsConnected) {
+            Write-JobLog 'Already connected.' 'SUCCESS'
+            $Job.Sync.Connected = $true
+            $Job.Sync.Phase = 'Connected'
+            if ([string]::IsNullOrWhiteSpace([string]$Job.Sync.ConnectedUpn)) {
+                $Job.Sync.ConnectedUpn = [string]$Job.AdminUPN
+            }
+            $Job.Sync.StatusText = "Connected as $($Job.Sync.ConnectedUpn)"
+            return
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$Job.ModulePath)) {
+            throw 'ExchangeOnlineManagement 3.9.0 or later is not installed.'
+        }
+
+        Write-JobLog "Loading $($Job.ModulePath)"
+        Remove-Module ExchangeOnlineManagement -Force -ErrorAction SilentlyContinue
+        Import-Module -Name $Job.ModulePath -Force
+        $loaded = @(Get-Module ExchangeOnlineManagement | Sort-Object Version -Descending | Select-Object -First 1)
+        if ($loaded.Count -eq 0 -or $loaded[0].Version -lt [version]'3.9.0') {
+            $found = if ($loaded.Count -eq 0) { 'none' } else { [string]$loaded[0].Version }
+            throw "ExchangeOnlineManagement 3.9.0 or later is required. Loaded: $found"
+        }
+
+        $Job.Sync.ModuleVersion = [string]$loaded[0].Version
+        Write-JobLog "Module version: $($loaded[0].Version)"
+        if ($Job.Sync.CancelRequested) {
+            $Job.Sync.Phase = 'Cancelled'
+            $Job.Sync.StatusText = 'Cancelled before sign-in.'
+            Write-JobLog $Job.Sync.StatusText 'WARNING'
+            return
+        }
+
+        $Job.Sync.Phase = 'Connecting'
+        $Job.Sync.StatusText = 'Waiting for Microsoft sign-in. Check the taskbar if the window is hidden.'
+        Write-JobLog $Job.Sync.StatusText
+        Connect-IPPSSession -UserPrincipalName $Job.AdminUPN -EnableSearchOnlySession
+
+        $script:IppsConnected = $true
+        $Job.Sync.Connected = $true
+        $Job.Sync.ConnectedUpn = [string]$Job.AdminUPN
+        try {
+            $info = @(Get-ConnectionInformation -ErrorAction SilentlyContinue |
+                Where-Object { $_.State -eq 'Connected' -and $_.UserPrincipalName } |
+                Select-Object -First 1)
+            if ($info.Count -eq 1) {
+                $Job.Sync.ConnectedUpn = [string]$info[0].UserPrincipalName
+            }
+        }
+        catch { }
+
+        $Job.Sync.Phase = 'Connected'
+        $Job.Sync.StatusText = "Connected as $($Job.Sync.ConnectedUpn)"
+        Write-JobLog $Job.Sync.StatusText 'SUCCESS'
+    }
+
+    function Disconnect-PurviewWorker {
+        if (-not $script:IppsConnected) {
+            $Job.Sync.Connected = $false
+            $Job.Sync.Phase = 'Disconnected'
+            $Job.Sync.StatusText = 'Disconnected'
+            Write-JobLog 'Not connected.'
+            return
+        }
+        Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
+        $script:IppsConnected = $false
+        $Job.Sync.Connected = $false
+        $Job.Sync.ConnectedUpn = ''
+        $Job.Sync.Phase = 'Disconnected'
+        $Job.Sync.StatusText = 'Disconnected'
+        Write-JobLog 'Disconnected from Purview.' 'SUCCESS'
+    }
+
+    function Get-SearchWithRetry {
+        param([string]$Identity)
+        $attempt = 0
+        while ($true) {
+            try {
+                return (Get-ComplianceSearch -Identity $Identity)
+            }
+            catch {
+                $attempt++
+                if ($attempt -ge 3) { throw }
+                Write-JobLog "Status check failed (attempt $attempt): $(Get-ErrorText $_)" 'WARNING'
+                Start-Sleep -Seconds 5
+            }
+        }
+    }
+
+    function Wait-ForComplianceSearch {
+        $timeout = 120.0
+        try { $timeout = [double]$Job.TimeoutMinutes } catch { $timeout = 120.0 }
+        if ($timeout -le 0) { $timeout = 120.0 }
+
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        $lastLog = [datetime]::MinValue
+        $lastKey = ''
+        $search = $null
+
+        while ($true) {
+            if ($Job.Sync.CancelRequested -and -not $Job.Sync.StopSent) {
+                $Job.Sync.StopSent = $true
+                Write-JobLog 'Stop requested. Sending stop to the compliance search.' 'WARNING'
+                try {
+                    Stop-ComplianceSearch -Identity $Job.SearchName -Confirm:$false
+                }
+                catch {
+                    Write-JobLog "Stop request failed: $(Get-ErrorText $_)" 'WARNING'
+                }
+            }
+
+            $search = Get-SearchWithRetry -Identity $Job.SearchName
+            $status = [string]$search.Status
+            $progress = 0
+            if ($null -ne $search.JobProgress) {
+                try { $progress = [int]$search.JobProgress } catch { $progress = 0 }
+            }
+
+            $Job.Sync.SearchStatus = $status
+            $Job.Sync.Items = $search.Items
+            $Job.Sync.Progress = $progress
+            $Job.Sync.Phase = 'Running'
+            $Job.Sync.StatusText = "Status: $status | Items: $($search.Items) | Progress: $progress%"
+
+            $key = "$status|$($search.Items)|$progress"
+            $now = Get-Date
+            if ($key -ne $lastKey -or ($now - $lastLog).TotalSeconds -ge 60) {
+                Write-JobLog $Job.Sync.StatusText
+                $lastKey = $key
+                $lastLog = $now
+            }
+
+            if (Test-TerminalSearchStatus $status) { break }
+            if ($watch.Elapsed.TotalMinutes -ge $timeout) {
+                $Job.Sync.TimedOut = $true
+                Write-JobLog "Monitoring timed out after $timeout minutes. The search may still be running in Purview as $($Job.SearchName)." 'WARNING'
+                break
+            }
+
+            $slept = 0
+            while ($slept -lt 5) {
+                if ($Job.Sync.CancelRequested) { break }
+                Start-Sleep -Seconds 1
+                $slept++
+            }
+        }
+
+        $watch.Stop()
+        $Job.Sync.ExecutionSeconds = [int]$watch.Elapsed.TotalSeconds
+        try {
+            $finalSearch = Get-ComplianceSearch -Identity $Job.SearchName
+            if ($finalSearch) { $search = $finalSearch }
+        }
+        catch { }
+        return $search
+    }
+
+    function Publish-SearchWorkerResult {
+        param($Search)
+        if ($null -eq $Search) { return }
+        if ($null -eq $Job.Context) { $Job.Context = @{} }
+        $Job.Context.ConnectedAs = [string]$Job.Sync.ConnectedUpn
+        $Job.Context.ModuleVersion = [string]$Job.Sync.ModuleVersion
+        $Job.Context.TimedOut = [bool]$Job.Sync.TimedOut
+        $seconds = 0
+        try { $seconds = [int]$Job.Sync.ExecutionSeconds } catch { $seconds = 0 }
+        $Job.Context.ExecutionTime = Format-Duration ([TimeSpan]::FromSeconds($seconds))
+
+        try {
+            $exported = Export-InvestigationReport -Search $Search -OutputFolder $Job.OutputFolder -Context $Job.Context
+            $Job.Sync.Result = $exported
+            Write-JobLog "Reports saved to $($Job.OutputFolder)" 'SUCCESS'
+        }
+        catch {
+            $Job.Sync.ErrorMessage = Get-ErrorText $_
+            Write-JobLog "Search finished but saving reports failed: $($Job.Sync.ErrorMessage)" 'ERROR'
+        }
+
+        $status = [string]$Search.Status
+        $Job.Sync.SearchStatus = $status
+        if ($status -eq 'Completed') { $Job.Sync.Progress = 100 }
+        if ($Job.Sync.TimedOut) { $Job.Sync.Phase = 'TimedOut' }
+        elseif ($Job.Sync.CancelRequested) { $Job.Sync.Phase = 'Cancelled' }
+        elseif ($status -eq 'Completed') { $Job.Sync.Phase = 'Completed' }
+        else { $Job.Sync.Phase = 'Finished' }
+        $Job.Sync.StatusText = "Finished: $status | Items: $($Search.Items)"
+    }
+
+    function Start-SearchWorker {
+        if (-not $script:IppsConnected) { throw 'Not connected to Purview.' }
+        if ($Job.Sync.CancelRequested) {
+            $Job.Sync.Phase = 'Cancelled'
+            $Job.Sync.StatusText = 'Cancelled before the search was created.'
+            Write-JobLog $Job.Sync.StatusText 'WARNING'
+            return
+        }
+
+        $Job.Sync.Phase = 'Creating'
+        $Job.Sync.StatusText = "Creating search $($Job.SearchName)"
+        Write-JobLog "Creating compliance search $($Job.SearchName)."
+        Write-JobLog "Query: $($Job.Query)"
+        Write-JobLog "Exchange location: $($Job.ExchangeLocation)"
+
+        $params = @{
+            Name              = [string]$Job.SearchName
+            ExchangeLocation  = [string]$Job.ExchangeLocation
+            ContentMatchQuery = [string]$Job.Query
+            Description       = [string]$Job.Description
+            Force             = $true
+        }
+        if ($Job.AllowNotFound) {
+            $params['AllowNotFoundExchangeLocationsEnabled'] = $true
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$Job.CaseName)) {
+            $params['Case'] = [string]$Job.CaseName
+        }
+        if ($Job.NotifyAdmin -and -not [string]::IsNullOrWhiteSpace([string]$Job.AdminUPN)) {
+            $params['StatusMailRecipients'] = @([string]$Job.AdminUPN)
+        }
+
+        New-ComplianceSearch @params | Out-Null
+        $Job.Sync.SearchCreated = $true
+        $Job.Sync.ActiveSearchName = [string]$Job.SearchName
+        Write-JobLog 'Compliance search created. No messages were changed.' 'SUCCESS'
+
+        if ($Job.Sync.CancelRequested) {
+            Write-JobLog 'Cancelled after the search was created. It was not started.' 'WARNING'
+            $Job.Sync.Phase = 'Cancelled'
+            $Job.Sync.StatusText = 'Cancelled before the search started.'
+            return
+        }
+
+        Start-ComplianceSearch -Identity $Job.SearchName -Confirm:$false
+        Write-JobLog 'Compliance search started.' 'SUCCESS'
+        $search = Wait-ForComplianceSearch
+        Publish-SearchWorkerResult -Search $search
+
+        $finalStatus = [string]$Job.Sync.SearchStatus
+        if ($finalStatus -eq 'Completed') {
+            Write-JobLog 'Search completed.' 'SUCCESS'
+        }
+        elseif ($Job.Sync.TimedOut) {
+            Write-JobLog "Monitoring timed out. Review search $($Job.SearchName) in Purview." 'WARNING'
+        }
+        else {
+            Write-JobLog "Search requires review: $finalStatus" 'WARNING'
+        }
+    }
+
+    function Wait-ForComplianceAction {
+        param([string]$ActionName)
+        $timeout = 30.0
+        try {
+            if ($Job.TimeoutMinutes) { $timeout = [Math]::Min(30, [double]$Job.TimeoutMinutes) }
+        }
+        catch { $timeout = 30.0 }
+        if ($timeout -lt 1) { $timeout = 1 }
+
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        $action = $null
+        while ($true) {
+            if ($Job.Sync.CancelRequested) {
+                Write-JobLog 'Stopped waiting. The action may still be running in Purview.' 'WARNING'
+                $Job.Sync.Phase = 'Cancelled'
+                break
+            }
+            try {
+                $action = Get-ComplianceSearchAction -Identity $ActionName
+            }
+            catch {
+                Write-JobLog "Action status check failed: $(Get-ErrorText $_)" 'WARNING'
+            }
+            if ($null -eq $action) {
+                if ($watch.Elapsed.TotalMinutes -ge $timeout) {
+                    $Job.Sync.TimedOut = $true
+                    Write-JobLog 'Action monitoring timed out. It may still be running in Purview.' 'WARNING'
+                    break
+                }
+                Start-Sleep -Seconds 5
+                continue
+            }
+            $status = [string]$action.Status
+            $progress = 0
+            if ($action -and $null -ne $action.JobProgress) {
+                try { $progress = [int]$action.JobProgress } catch { $progress = 0 }
+            }
+            $Job.Sync.SearchStatus = $status
+            $Job.Sync.Progress = $progress
+            $Job.Sync.StatusText = "Action ${ActionName}: $status ($progress%)"
+            Write-JobLog $Job.Sync.StatusText
+            if (Test-TerminalSearchStatus $status) { break }
+            if ($watch.Elapsed.TotalMinutes -ge $timeout) {
+                $Job.Sync.TimedOut = $true
+                Write-JobLog 'Action monitoring timed out. It may still be running in Purview.' 'WARNING'
+                break
+            }
+            $slept = 0
+            while ($slept -lt 5 -and -not $Job.Sync.CancelRequested) {
+                Start-Sleep -Seconds 1
+                $slept++
+            }
+        }
+        return $action
+    }
+
+    function Get-ActionResultText {
+        param($Action)
+        if ($null -eq $Action) { return '' }
+        $raw = ConvertTo-ResultText $Action.Results
+        if ([string]::IsNullOrWhiteSpace($raw) -and $Action.PSObject.Properties['ActionResults']) {
+            $raw = ConvertTo-ResultText $Action.ActionResults
+        }
+        return $raw
+    }
+
+    function Start-PreviewWorker {
+        if (-not $script:IppsConnected) { throw 'Connect to Purview before loading a preview.' }
+        if ([string]::IsNullOrWhiteSpace([string]$Job.SearchName)) { throw 'There is no search to preview.' }
+
+        $existing = Get-ComplianceSearch -Identity $Job.SearchName
+        $existingStatus = [string]$existing.Status
+        if ($existingStatus -notin @('Completed', 'PartiallySucceeded')) {
+            throw "Preview is available after the search completes. Current status: $existingStatus"
+        }
+
+        $actionName = "$($Job.SearchName)_Preview"
+        $action = $null
+        try {
+            $action = Get-ComplianceSearchAction -Identity $actionName -ErrorAction SilentlyContinue
+        }
+        catch { $action = $null }
+
+        if ($action -and (Test-TerminalSearchStatus ([string]$action.Status))) {
+            Write-JobLog "Using the existing preview action $actionName."
+        }
+        else {
+            Write-JobLog 'Requesting a preview sample. This retrieves message metadata, not message bodies.'
+            $created = New-ComplianceSearchAction -SearchName $Job.SearchName -Preview -Confirm:$false
+            if ($created -and $created.Name) { $actionName = [string]$created.Name }
+            $Job.Sync.Phase = 'Running'
+            $action = Wait-ForComplianceAction -ActionName $actionName
+        }
+
+        $actionStatus = if ($action) { [string]$action.Status } else { '' }
+        $raw = "Action: $actionName$([Environment]::NewLine)Status: $actionStatus$([Environment]::NewLine)$([Environment]::NewLine)$(Get-ActionResultText $action)"
+        if ($Job.OutputFolder -and (Test-Path -LiteralPath $Job.OutputFolder)) {
+            $items = Export-PreviewResults -RawResults $raw -OutputFolder $Job.OutputFolder -SearchName $Job.SearchName
+            Write-JobLog "Preview saved to $($Job.OutputFolder)" 'SUCCESS'
+        }
+        else {
+            $items = ConvertTo-PreviewItem $raw
+            Write-JobLog 'Preview will be shown in the window. No output folder was available to save it.' 'WARNING'
+        }
+        $Job.Sync.Preview = $items
+        if ($Job.Sync.Phase -ne 'Cancelled') {
+            $Job.Sync.Phase = 'PreviewReady'
+            $Job.Sync.StatusText = 'Preview ready'
+            $Job.Sync.Progress = 100
+        }
+    }
+
+    function Start-ReportWorker {
+        if (-not $script:IppsConnected) { throw 'Connect to Purview before creating a statistics report.' }
+        if ([string]::IsNullOrWhiteSpace([string]$Job.SearchName)) { throw 'There is no search to report on.' }
+
+        $existing = Get-ComplianceSearch -Identity $Job.SearchName
+        if ([string]$existing.Status -notin @('Completed', 'PartiallySucceeded')) {
+            throw "A statistics report is available after the search completes. Current status: $($existing.Status)"
+        }
+
+        Write-JobLog 'Creating a statistics report action. Message content is not exported.'
+        $created = New-ComplianceSearchAction -SearchName $Job.SearchName -Report -Confirm:$false
+        $actionName = "$($Job.SearchName)_Report"
+        if ($created -and $created.Name) { $actionName = [string]$created.Name }
+        $Job.Sync.Phase = 'Running'
+        $action = Wait-ForComplianceAction -ActionName $actionName
+        $actionStatus = if ($action) { [string]$action.Status } else { '' }
+        $raw = "Action: $actionName$([Environment]::NewLine)Status: $actionStatus$([Environment]::NewLine)$([Environment]::NewLine)$(Get-ActionResultText $action)"
+        $Job.Sync.ReportNote = $raw
+        if ($Job.OutputFolder -and (Test-Path -LiteralPath $Job.OutputFolder)) {
+            Write-Utf8File -Path (Join-Path $Job.OutputFolder 'StatisticsReport.txt') -Content ($raw + [Environment]::NewLine)
+            Write-JobLog "Statistics report saved to $($Job.OutputFolder)" 'SUCCESS'
+        }
+        if ($Job.Sync.Phase -ne 'Cancelled') {
+            $Job.Sync.Phase = 'ReportReady'
+            $Job.Sync.StatusText = 'Statistics report ready'
+            $Job.Sync.Progress = 100
+        }
+    }
+
+    function Remove-SearchWorker {
+        if (-not $script:IppsConnected) { throw 'Connect to Purview before removing a search definition.' }
+        if ([string]::IsNullOrWhiteSpace([string]$Job.SearchName)) { throw 'There is no search definition to remove.' }
+
+        Write-JobLog "Removing search definition $($Job.SearchName). Mailbox messages are not modified." 'WARNING'
+        foreach ($suffix in @('Preview', 'Preview1', 'Report', 'Report1')) {
+            $actionName = "$($Job.SearchName)_$suffix"
+            try {
+                Remove-ComplianceSearchAction -Identity $actionName -Confirm:$false -ErrorAction SilentlyContinue
+            }
+            catch { }
+        }
+        Remove-ComplianceSearch -Identity $Job.SearchName -Confirm:$false
+        $Job.Sync.SearchCreated = $false
+        $Job.Sync.Phase = 'Removed'
+        $Job.Sync.StatusText = 'Search definition removed'
+        Write-JobLog 'Search definition removed. Mailbox messages were not modified.' 'SUCCESS'
+    }
+
+    function Install-ModuleWorker {
+        $Job.Sync.Phase = 'Installing'
+        $Job.Sync.StatusText = 'Installing ExchangeOnlineManagement for the current user'
+        Write-JobLog $Job.Sync.StatusText
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        }
+        catch { }
+
+        $provider = Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue -Force
+        if (-not $provider -or $provider.Version -lt [version]'2.8.5.201') {
+            Write-JobLog 'Installing the NuGet package provider.'
+            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
+        }
+        $repository = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
+        if ($repository -and $repository.InstallationPolicy -ne 'Trusted') {
+            Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+            Write-JobLog 'Trusted the PowerShell Gallery for the current user.'
+        }
+        Install-Module -Name ExchangeOnlineManagement -MinimumVersion 3.9.0 -Scope CurrentUser -Force -AllowClobber
+        $Job.Sync.Phase = 'Installed'
+        $Job.Sync.StatusText = 'ExchangeOnlineManagement installed'
+        $Job.Sync.Progress = 100
+        Write-JobLog 'Module install finished.' 'SUCCESS'
+    }
+
+    $ErrorActionPreference = 'Stop'
+    $ProgressPreference = 'SilentlyContinue'
+    $ConfirmPreference = 'None'
+    $WarningPreference = 'SilentlyContinue'
+
+    try {
+        if ($null -eq $Job.Sync) { throw 'Search job is missing its status channel.' }
+        $Job.Sync.Busy = $true
+        switch ([string]$Job.Mode) {
+            'Connect' { Connect-PurviewWorker }
+            'Disconnect' { Disconnect-PurviewWorker }
+            'ConnectAndSearch' {
+                Connect-PurviewWorker
+                if ($Job.Sync.CancelRequested) {
+                    $Job.Sync.Phase = 'Cancelled'
+                    $Job.Sync.StatusText = 'Cancelled before the search was created.'
+                    Write-JobLog $Job.Sync.StatusText 'WARNING'
+                }
+                else {
+                    Start-SearchWorker
+                }
+            }
+            'Search' { Start-SearchWorker }
+            'Preview' { Start-PreviewWorker }
+            'Report' { Start-ReportWorker }
+            'Remove' { Remove-SearchWorker }
+            'InstallModule' { Install-ModuleWorker }
+            default { throw "Unknown job mode: $($Job.Mode)" }
+        }
+    }
+    catch {
+        $message = Get-ErrorText $_
+        if ($Job -and $Job.Sync) {
+            $Job.Sync.Phase = 'Failed'
+            $Job.Sync.ErrorMessage = $message
+            $Job.Sync.StatusText = $message
+        }
+        Write-JobLog $message 'ERROR'
+        if ($_.ScriptStackTrace) { Write-JobLog $_.ScriptStackTrace 'ERROR' }
+    }
+    finally {
+        if ($Job -and $Job.Sync) {
+            $Job.Sync.Busy = $false
+            $Job.Sync.Done = $true
+        }
+    }
+}
+
+function New-UiButton {
+    param(
+        [string]$Text,
+        [int]$Width = 120,
+        $BackColor,
+        $ForeColor,
+        [switch]$Outline
+    )
+
+    $button = New-Object System.Windows.Forms.Button
+    $button.Text = $Text
+    $button.Width = $Width
+    $button.Height = 34
+    $button.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $button.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $button.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $button.UseVisualStyleBackColor = $false
+    $button.Margin = New-Object System.Windows.Forms.Padding(4, 4, 4, 4)
+    if ($Outline) {
+        $button.FlatAppearance.BorderSize = 1
+        $button.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(186, 195, 206)
+        $BackColor = [System.Drawing.Color]::White
+        $ForeColor = $script:ColorNavy
+    }
+    else {
+        $button.FlatAppearance.BorderSize = 0
+    }
+    $button.BackColor = $BackColor
+    $button.ForeColor = $ForeColor
+    $button.Tag = @{ Back = $BackColor; Fore = $ForeColor }
+    $button.Add_EnabledChanged({
+        param($sender, $eventArgs)
+        if ($sender.Enabled) {
+            $sender.BackColor = $sender.Tag.Back
+            $sender.ForeColor = $sender.Tag.Fore
+        }
+        else {
+            $sender.BackColor = [System.Drawing.Color]::FromArgb(214, 218, 224)
+            $sender.ForeColor = [System.Drawing.Color]::FromArgb(120, 126, 135)
+        }
+    })
+    return $button
+}
+
+function New-UiTextBox {
+    param([switch]$Multiline, [int]$Height = 28)
+    $box = New-Object System.Windows.Forms.TextBox
+    $box.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+    $box.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    if ($Multiline) {
+        $box.Multiline = $true
+        $box.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
+        $box.Height = $Height
+        $box.AcceptsReturn = $true
+        $box.WordWrap = $true
+    }
+    return $box
+}
+
+function New-ResultGrid {
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $grid.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $grid.ReadOnly = $true
+    $grid.AllowUserToAddRows = $false
+    $grid.AllowUserToDeleteRows = $false
+    $grid.AllowUserToResizeRows = $false
+    $grid.RowHeadersVisible = $false
+    $grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
+    $grid.MultiSelect = $false
+    $grid.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::Fill
+    $grid.BackgroundColor = [System.Drawing.Color]::White
+    $grid.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+    $grid.EnableHeadersVisualStyles = $false
+    $grid.ColumnHeadersHeight = 32
+    $grid.RowTemplate.Height = 26
+    $grid.ColumnHeadersDefaultCellStyle.BackColor = $script:ColorNavy
+    $grid.ColumnHeadersDefaultCellStyle.ForeColor = [System.Drawing.Color]::White
+    $grid.ColumnHeadersDefaultCellStyle.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $grid.DefaultCellStyle.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $grid.DefaultCellStyle.SelectionBackColor = $script:ColorAccent
+    $grid.DefaultCellStyle.SelectionForeColor = [System.Drawing.Color]::White
+    $grid.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(236, 242, 248)
+    $grid.ClipboardCopyMode = [System.Windows.Forms.DataGridViewClipboardCopyMode]::EnableWithAutoHeaderText
+    return $grid
+}
+
+function Add-GridColumn {
+    param($Grid, [string]$Name, [string]$Header, [int]$FillWeight, [type]$ValueType)
+    $column = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $column.Name = $Name
+    $column.HeaderText = $Header
+    $column.FillWeight = $FillWeight
+    $column.MinimumWidth = 70
+    if ($ValueType) { $column.ValueType = $ValueType }
+    [void]$Grid.Columns.Add($column)
+}
+
+function Ensure-Sync {
+    if ($script:Sync) { return }
+    $script:Sync = [hashtable]::Synchronized(@{
+        LogQueue         = New-Object System.Collections.Concurrent.ConcurrentQueue[string]
+        Phase            = 'Idle'
+        StatusText       = 'Ready'
+        Progress         = 0
+        SearchStatus     = ''
+        Items            = $null
+        ErrorMessage     = $null
+        Done             = $false
+        CancelRequested  = $false
+        Connected        = $false
+        ConnectedUpn     = ''
+        TimedOut         = $false
+        Result           = $null
+        Preview          = $null
+        ReportNote       = ''
+        Busy             = $false
+        SearchCreated    = $false
+        ActiveSearchName = ''
+        ModuleVersion    = ''
+        ExecutionSeconds = 0
+        StopSent         = $false
+    })
+}
+
+function Reset-CommandSignals {
+    Ensure-Sync
+    $script:Sync.Done = $false
+    $script:Sync.CancelRequested = $false
+    $script:Sync.ErrorMessage = $null
+    $script:Sync.TimedOut = $false
+    $script:Sync.StopSent = $false
+    $script:Sync.Busy = $true
+    $script:Sync.Phase = 'Starting'
+    $script:Sync.Progress = 0
+    $script:Sync.StatusText = 'Starting'
+}
+
+function Ensure-Runspace {
+    $opened = $script:Runspace -and $script:Runspace.RunspaceStateInfo.State -eq [System.Management.Automation.Runspaces.RunspaceState]::Opened
+    if ($opened -and $script:PsHost) { return }
+    if ($script:PsHost) {
+        try { $script:PsHost.Dispose() } catch { }
+        $script:PsHost = $null
+    }
+    if ($script:Runspace) {
+        try { $script:Runspace.Close() } catch { }
+        try { $script:Runspace.Dispose() } catch { }
+        $script:Runspace = $null
+    }
+    $script:Runspace = New-InvestigationRunspace
+    $script:PsHost = [powershell]::Create()
+    $script:PsHost.Runspace = $script:Runspace
+}
+
+function Append-LogLine {
+    param([string]$Entry)
+    if (-not $script:txtLog -or $script:txtLog.IsDisposed) { return }
+    $color = [System.Drawing.Color]::FromArgb(190, 205, 220)
+    if ($Entry -match '\[ERROR\]') { $color = [System.Drawing.Color]::FromArgb(255, 140, 130) }
+    elseif ($Entry -match '\[WARNING\]') { $color = [System.Drawing.Color]::FromArgb(240, 190, 90) }
+    elseif ($Entry -match '\[SUCCESS\]') { $color = [System.Drawing.Color]::FromArgb(120, 210, 150) }
+    if ($script:txtLog.TextLength -gt 300000) {
+        $script:txtLog.Select(0, 100000)
+        $script:txtLog.SelectedText = ''
+    }
+    $script:txtLog.SelectionStart = $script:txtLog.TextLength
+    $script:txtLog.SelectionLength = 0
+    $script:txtLog.SelectionColor = $color
+    $script:txtLog.AppendText($Entry + [Environment]::NewLine)
+    $script:txtLog.ScrollToCaret()
+}
+
+function Add-UiLog {
+    param([string]$Message, [string]$Level = 'INFO')
+    $entry = '[{0}] [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
+    Append-LogLine $entry
+    if ($script:CurrentLogFile -and -not $script:CommandRunning) {
+        try { Add-Utf8Line -Path $script:CurrentLogFile -Line $entry } catch { }
+    }
+}
+
+function Drain-LogQueue {
+    if (-not $script:Sync -or -not $script:Sync.LogQueue) { return }
+    $line = [string]$null
+    $count = 0
+    while ($count -lt 200 -and $script:Sync.LogQueue.TryDequeue([ref]$line)) {
+        Append-LogLine $line
+        $count++
+    }
+}
+
+function Show-UiMessage {
+    param([string]$Message, [string]$Title, [string]$Icon = 'Information')
+    $iconValue = [System.Windows.Forms.MessageBoxIcon]::Information
+    try { $iconValue = [System.Windows.Forms.MessageBoxIcon]::$Icon } catch { }
+    $owner = $script:form
+    if ($owner -and -not $owner.IsDisposed) {
+        [void][System.Windows.Forms.MessageBox]::Show($owner, $Message, $Title, [System.Windows.Forms.MessageBoxButtons]::OK, $iconValue)
+    }
+    else {
+        [void][System.Windows.Forms.MessageBox]::Show($Message, $Title, [System.Windows.Forms.MessageBoxButtons]::OK, $iconValue)
+    }
+}
+
+function Update-Chrome {
+    if (-not $script:btnStart) { return }
+    $busy = [bool]$script:CommandRunning
+    $connected = [bool]($script:Sync -and $script:Sync.Connected)
+    $created = [bool]($script:Sync -and $script:Sync.SearchCreated)
+    $previewable = $script:LastStatus -in @('Completed', 'PartiallySucceeded')
+
+    $script:btnConnect.Enabled = -not $busy
+    $script:btnConnect.Text = if ($connected) { 'Disconnect' } else { 'Connect' }
+    $script:btnStart.Enabled = (-not $busy) -and [bool]$script:FormValid
+    $script:btnStop.Enabled = $busy
+    $script:btnPreview.Enabled = (-not $busy) -and $connected -and $previewable
+    $script:btnReport.Enabled = (-not $busy) -and $connected -and $previewable
+    $script:btnRemove.Enabled = (-not $busy) -and $connected -and $created
+    $folderReady = $script:CurrentOutputFolder -and (Test-Path -LiteralPath $script:CurrentOutputFolder)
+    $script:btnOpenFolder.Enabled = [bool]$folderReady
+    $script:btnCopyQuery.Enabled = -not [string]::IsNullOrWhiteSpace($script:txtQuery.Text)
+    $script:btnCopyName.Enabled = $script:txtSearchName -and -not [string]::IsNullOrWhiteSpace($script:txtSearchName.Text)
+    if ($script:btnInstall) { $script:btnInstall.Enabled = (-not $busy) -and (-not $connected) }
+}
+
+function Update-ProgressChrome {
+    if (-not $script:lblStatus) { return }
+    $phase = [string]$script:Sync.Phase
+    $text = [string]$script:Sync.StatusText
+    if ([string]::IsNullOrWhiteSpace($text)) { $text = 'Ready' }
+    $script:lblStatus.Text = $text
+
+    $progressValue = 0
+    try { $progressValue = [int]$script:Sync.Progress } catch { $progressValue = 0 }
+    if ($progressValue -lt 0) { $progressValue = 0 }
+    if ($progressValue -gt 100) { $progressValue = 100 }
+    $marquee = $script:CommandRunning -and $progressValue -le 0 -and ($phase -in @('Starting', 'Connecting', 'Creating', 'Running', 'Installing'))
+    if ($marquee) {
+        if ($script:progress.Style -ne [System.Windows.Forms.ProgressBarStyle]::Marquee) {
+            $script:progress.Style = [System.Windows.Forms.ProgressBarStyle]::Marquee
+        }
+    }
+    else {
+        if ($script:progress.Style -ne [System.Windows.Forms.ProgressBarStyle]::Continuous) {
+            $script:progress.Style = [System.Windows.Forms.ProgressBarStyle]::Continuous
+        }
+        if ($script:progress.Value -ne $progressValue) { $script:progress.Value = $progressValue }
+    }
+
+    $color = $script:ColorNavy
+    if ($phase -eq 'Failed') { $color = $script:ColorDanger }
+    elseif ($phase -in @('Completed', 'Connected', 'PreviewReady', 'ReportReady', 'Installed')) { $color = $script:ColorSuccess }
+    elseif ($phase -in @('TimedOut', 'Cancelled', 'Finished', 'Removed')) { $color = $script:ColorWarning }
+    $script:lblStatus.ForeColor = $color
+
+    if ($script:CurrentMode -in @('Search', 'ConnectAndSearch')) {
+        if ($script:SummaryValues -and $script:SummaryValues.Contains('Status')) {
+            $status = [string]$script:Sync.SearchStatus
+            if (-not [string]::IsNullOrWhiteSpace($status)) { $script:SummaryValues['Status'].Text = $status }
+        }
+        if ($script:SummaryValues -and $null -ne $script:Sync.Items -and "$($script:Sync.Items)" -ne '') {
+            $script:SummaryValues['Items'].Text = [string]$script:Sync.Items
+        }
+    }
+}
+
+function Get-FormRequest {
+    $scope = if ($script:radAll.Checked) { 'All' } else { 'Sender' }
+    return Test-InvestigationRequest `
+        -AdminUpn $script:txtAdmin.Text `
+        -Sender $script:txtSender.Text `
+        -DomainText $script:txtDomains.Text `
+        -CaseName $script:txtCase.Text `
+        -Scope $scope `
+        -AllowNotFound $script:chkInactive.Checked `
+        -NotifyAdmin $script:chkNotify.Checked `
+        -Start $script:dtStart.Value `
+        -End $script:dtEnd.Value `
+        -AdditionalQuery $script:txtExtra.Text `
+        -SearchName $script:txtSearchName.Text `
+        -OutputFolder $script:txtOutput.Text `
+        -TimeoutMinutes ([int]$script:numTimeout.Value) `
+        -Description $script:txtDescription.Text
+}
+
+function Update-InactiveCaption {
+    if (-not $script:chkInactive) { return }
+    if ($script:radAll.Checked) {
+        $script:chkInactive.Text = 'Include inactive and other non-user mailboxes'
+    }
+    else {
+        $script:chkInactive.Text = 'Sender mailbox is inactive'
+    }
+}
+
+function Update-QueryPreview {
+    if ($script:InPreview) { return }
+    if (-not $script:txtSender) { return }
+    $script:InPreview = $true
+    try {
+        if (-not $script:SearchNameDirty) {
+            $generatedName = New-InvestigationSearchName -Sender $script:txtSender.Text -Timestamp $script:SessionStamp
+            if ($script:txtSearchName.Text -ne $generatedName) {
+                $script:UpdatingName = $true
+                $script:txtSearchName.Text = $generatedName
+                $script:UpdatingName = $false
+            }
+        }
+
+        $request = Get-FormRequest
+        if (-not $script:DescriptionDirty -and $request.Description -and $script:txtDescription.Text -ne $request.Description) {
+            $script:UpdatingDescription = $true
+            $script:txtDescription.Text = $request.Description
+            $script:UpdatingDescription = $false
+            $request = Get-FormRequest
+        }
+
+        $script:LastRequest = $request
+        $script:FormValid = [bool]$request.IsValid
+        if ($request.IsValid) {
+            $script:txtQuery.Text = [string]$request.Query
+            $script:lblValidation.Text = 'Ready to search. The end date is inclusive.'
+            $script:lblValidation.ForeColor = $script:ColorSuccess
+        }
+        else {
+            $script:txtQuery.Text = ''
+            $message = 'Check the form.'
+            if ($request.Errors -and $request.Errors.Count -gt 0) { $message = $request.Errors -join ' ' }
+            $script:lblValidation.Text = $message
+            $script:lblValidation.ForeColor = $script:ColorDanger
+        }
+    }
+    catch {
+        $script:FormValid = $false
+        if ($script:lblValidation) {
+            $script:lblValidation.Text = $_.Exception.Message
+            $script:lblValidation.ForeColor = $script:ColorDanger
+        }
+    }
+    finally {
+        $script:InPreview = $false
+        Update-Chrome
+    }
+}
+
+function Update-ModuleStatus {
+    param([switch]$Refresh)
+    $report = Resolve-ExchangeOnlineModule -Refresh:$Refresh
+    $script:ModuleReport = $report
+    if ($report.Suitable) {
+        $script:ModulePath = [string]$report.Suitable.Path
+        $script:lblModule.Text = "ExchangeOnlineManagement $($report.Suitable.Version) is ready."
+        $script:lblModule.ForeColor = $script:ColorSuccess
+        $script:btnInstall.Visible = $false
+    }
+    else {
+        $script:ModulePath = $null
+        $found = if ($report.Newest) { " Installed version: $($report.Newest.Version)." } else { ' It is not installed.' }
+        $script:lblModule.Text = "ExchangeOnlineManagement 3.9.0 or later is required.$found"
+        $script:lblModule.ForeColor = $script:ColorDanger
+        $script:btnInstall.Visible = $true
+    }
+}
+
+function Apply-SavedSettings {
+    $saved = Read-InvestigationSettings
+    if (-not $saved) { return }
+    if ($saved.AdminUpn) { $script:txtAdmin.Text = [string]$saved.AdminUpn }
+    if ($saved.Sender) { $script:txtSender.Text = [string]$saved.Sender }
+    if ($saved.Domains) { $script:txtDomains.Text = [string]$saved.Domains }
+    if ($saved.PSObject.Properties['CaseName']) { $script:txtCase.Text = [string]$saved.CaseName }
+    if ([string]$saved.Scope -eq 'All') { $script:radAll.Checked = $true } else { $script:radSender.Checked = $true }
+    if ($saved.PSObject.Properties['AllowNotFound']) { $script:chkInactive.Checked = [bool]$saved.AllowNotFound }
+    if ($saved.PSObject.Properties['NotifyAdmin']) { $script:chkNotify.Checked = [bool]$saved.NotifyAdmin }
+    if ($saved.OutputFolder) { $script:txtOutput.Text = [string]$saved.OutputFolder }
+    $timeout = 120
+    try { $timeout = [int]$saved.TimeoutMinutes } catch { $timeout = 120 }
+    if ($timeout -lt 1) { $timeout = 1 }
+    if ($timeout -gt 720) { $timeout = 720 }
+    $script:numTimeout.Value = $timeout
+    if ($saved.AdditionalQuery) { $script:txtExtra.Text = [string]$saved.AdditionalQuery }
+    if ($saved.StartDate) { $script:dtStart.Value = ConvertTo-SettingDate ([string]$saved.StartDate) $script:dtStart.Value }
+    if ($saved.EndDate) { $script:dtEnd.Value = ConvertTo-SettingDate ([string]$saved.EndDate) $script:dtEnd.Value }
+}
+
+function Save-SettingsFromUi {
+    if (-not $script:txtAdmin) { return }
+    $scope = if ($script:radAll.Checked) { 'All' } else { 'Sender' }
+    Save-InvestigationSettings @{
+        AdminUpn        = $script:txtAdmin.Text
+        Sender          = $script:txtSender.Text
+        Domains         = $script:txtDomains.Text
+        CaseName        = $script:txtCase.Text
+        Scope           = $scope
+        AllowNotFound   = [bool]$script:chkInactive.Checked
+        NotifyAdmin     = [bool]$script:chkNotify.Checked
+        OutputFolder    = $script:txtOutput.Text
+        TimeoutMinutes  = [int]$script:numTimeout.Value
+        AdditionalQuery = $script:txtExtra.Text
+        StartDate       = $script:dtStart.Value.ToString('yyyy-MM-dd')
+        EndDate         = $script:dtEnd.Value.ToString('yyyy-MM-dd')
+    }
+}
+
+function Clear-ResultView {
+    if ($script:gridLocations) { $script:gridLocations.Rows.Clear() }
+    if ($script:gridPreview) { $script:gridPreview.Rows.Clear() }
+    if ($script:lblEmptyLocations) { $script:lblEmptyLocations.Visible = $true }
+    if ($script:lblEmptyPreview) { $script:lblEmptyPreview.Visible = $true }
+    if (-not $script:SummaryValues) { return }
+    foreach ($key in @('Status', 'Items', 'Size', 'Unindexed', 'Duration', 'Scope', 'Search', 'Output')) {
+        if ($script:SummaryValues.Contains($key)) { $script:SummaryValues[$key].Text = '-' }
+    }
+}
+
+function Fill-LocationGrid {
+    param($Locations)
+    if (-not $script:gridLocations) { return }
+    $script:gridLocations.Rows.Clear()
+    foreach ($row in $Locations) {
+        if ($null -eq $row) { continue }
+        [void]$script:gridLocations.Rows.Add([string]$row.Location, [int64]$row.ItemCount, [string]$row.SizeDisplay, [int64]$row.SizeBytes)
+    }
+    $script:lblEmptyLocations.Visible = ($script:gridLocations.Rows.Count -eq 0)
+}
+
+function Fill-PreviewGrid {
+    param($Items)
+    if (-not $script:gridPreview) { return }
+    $script:gridPreview.Rows.Clear()
+    foreach ($row in $Items) {
+        if ($null -eq $row) { continue }
+        [void]$script:gridPreview.Rows.Add([string]$row.Received, [string]$row.Sender, [string]$row.Subject, [string]$row.Type, [string]$row.Size, [string]$row.Location)
+    }
+    $script:lblEmptyPreview.Visible = ($script:gridPreview.Rows.Count -eq 0)
+}
+
+function Update-ResultsFromSync {
+    if (-not $script:Sync -or -not $script:SummaryValues) { return }
+    if ($script:Sync.SearchStatus) {
+        $script:LastStatus = [string]$script:Sync.SearchStatus
+        $script:SummaryValues['Status'].Text = $script:LastStatus
+    }
+    if ($script:Sync.ActiveSearchName) {
+        $script:ActiveSearchName = [string]$script:Sync.ActiveSearchName
+        $script:SummaryValues['Search'].Text = $script:ActiveSearchName
+    }
+    $result = $script:Sync.Result
+    if ($result -and $result.Summary) {
+        $summary = $result.Summary
+        $script:SummaryValues['Status'].Text = $(if ($summary.SearchStatus) { [string]$summary.SearchStatus } else { '-' })
+        $script:SummaryValues['Items'].Text = $(if ($summary.MatchingItems) { [string]$summary.MatchingItems } else { '0' })
+        $script:SummaryValues['Size'].Text = $(if ($summary.TotalSize) { [string]$summary.TotalSize } else { '-' })
+        $script:SummaryValues['Unindexed'].Text = $(if ("$($summary.UnindexedItems)" -ne '') { [string]$summary.UnindexedItems } else { '0' })
+        $script:SummaryValues['Duration'].Text = $(if ($summary.ExecutionTime) { [string]$summary.ExecutionTime } else { '-' })
+        $script:SummaryValues['Scope'].Text = $(if ($summary.SearchScope) { [string]$summary.SearchScope } else { '-' })
+        $script:SummaryValues['Search'].Text = [string]$summary.SearchName
+        $script:SummaryValues['Output'].Text = [string]$summary.OutputFolder
+        if ($script:toolTip) { $script:toolTip.SetToolTip($script:SummaryValues['Output'], [string]$summary.OutputFolder) }
+        $script:LastStatus = [string]$summary.SearchStatus
+        $script:ActiveSearchName = [string]$summary.SearchName
+        Fill-LocationGrid $result.Locations
+    }
+    if ($script:CurrentMode -eq 'Preview') { Fill-PreviewGrid $script:Sync.Preview }
+}
+
+function Show-SearchFinishedDialog {
+    $phase = [string]$script:Sync.Phase
+    $summary = $null
+    if ($script:Sync.Result) { $summary = $script:Sync.Result.Summary }
+    $name = $script:ActiveSearchName
+    $status = $script:LastStatus
+    $items = if ($summary) { $summary.MatchingItems } else { $script:Sync.Items }
+    $size = if ($summary -and $summary.TotalSize) { $summary.TotalSize } else { '-' }
+    $folder = $script:CurrentOutputFolder
+    $icon = 'Information'
+    $title = 'Search finished'
+    $lead = "Search $name finished with status $status."
+    if ($phase -eq 'TimedOut') {
+        $icon = 'Warning'
+        $title = 'Search still running'
+        $lead = "Monitoring timed out. The search may still be running in Purview as $name."
+    }
+    elseif ($phase -eq 'Cancelled') {
+        $icon = 'Warning'
+        $title = 'Search stopped'
+        $lead = "Stop was requested for $name. Status: $status."
+    }
+    elseif ($status -and $status -ne 'Completed') {
+        $icon = 'Warning'
+        $title = 'Search needs review'
+    }
+
+    $text = @"
+$lead
+
+Matching items: $items
+Size: $size
+Reports: $folder
+
+The mailbox statistics are in this window. Open Purview to review the search there. Preview loads a metadata sample and does not export message bodies.
+"@
+    if ($script:Sync.ErrorMessage) { $text += "`r`n`r`n$($script:Sync.ErrorMessage)" }
+    Show-UiMessage $text $title $icon
+    if ($script:tabs -and $script:tabStats) { $script:tabs.SelectedTab = $script:tabStats }
+}
+
+function Show-CompletionDialog {
+    $phase = [string]$script:Sync.Phase
+    $mode = [string]$script:CurrentMode
+    $errorText = [string]$script:Sync.ErrorMessage
+    if ($phase -eq 'Failed') {
+        $message = if ($errorText) { $errorText } else { 'The operation failed.' }
+        Show-UiMessage $message 'Purview investigation' 'Error'
+        return
+    }
+
+    switch ($mode) {
+        'ConnectAndSearch' { Show-SearchFinishedDialog }
+        'Search' { Show-SearchFinishedDialog }
+        'Preview' {
+            if ($phase -eq 'PreviewReady') {
+                if ($script:tabs -and $script:tabPreview) { $script:tabs.SelectedTab = $script:tabPreview }
+                if ($script:gridPreview -and $script:gridPreview.Rows.Count -eq 0) {
+                    Show-UiMessage 'The preview finished, but no message metadata was recognized. The raw preview was saved when an output folder was available.' 'Preview' 'Information'
+                }
+            }
+            elseif ($phase -eq 'Cancelled') {
+                Show-UiMessage 'Stopped waiting for the preview. It may still be running in Purview.' 'Preview' 'Warning'
+            }
+        }
+        'Report' {
+            if ($phase -eq 'ReportReady') {
+                $note = [string]$script:Sync.ReportNote
+                if ($note.Length -gt 1500) { $note = $note.Substring(0, 1500) + '...' }
+                Show-UiMessage "Statistics report finished.`r`n`r`n$note" 'Statistics report' 'Information'
+            }
+        }
+        'Remove' {
+            if ($phase -eq 'Removed') {
+                Show-UiMessage 'The search definition was removed. Mailbox messages were not modified.' 'Search removed' 'Information'
+            }
+        }
+        'InstallModule' {
+            if ($phase -eq 'Installed') {
+                Update-ModuleStatus -Refresh
+                Show-UiMessage 'ExchangeOnlineManagement was installed for the current user. You can connect now.' 'Module installed' 'Information'
+            }
+        }
+    }
+}
+
+function Complete-CurrentCommand {
+    $invocationError = $null
+    try {
+        if ($script:AsyncHandle) { [void]$script:PsHost.EndInvoke($script:AsyncHandle) }
+    }
+    catch {
+        $invocationError = $_.Exception.Message
+    }
+
+    $streamErrors = New-Object System.Collections.Generic.List[string]
+    if ($script:PsHost) {
+        foreach ($err in $script:PsHost.Streams.Error) {
+            if ($err -and $err.Exception -and $err.Exception.Message) { $streamErrors.Add([string]$err.Exception.Message) }
+        }
+        try { $script:PsHost.Commands.Clear() } catch { }
+        try { $script:PsHost.Streams.ClearStreams() } catch { }
+    }
+    $script:AsyncHandle = $null
+    Drain-LogQueue
+    if ($invocationError -and -not $script:Sync.ErrorMessage) {
+        $script:Sync.ErrorMessage = $invocationError
+        $script:Sync.Phase = 'Failed'
+        Add-UiLog $invocationError 'ERROR'
+    }
+    foreach ($streamMessage in $streamErrors) {
+        if ($streamMessage -and $streamMessage -ne [string]$script:Sync.ErrorMessage) { Add-UiLog $streamMessage 'ERROR' }
+    }
+    Update-ResultsFromSync
+    Update-ProgressChrome
+    Update-Chrome
+    Show-CompletionDialog
+    Update-Chrome
+}
+
+function Update-InvestigationUi {
+    if ($script:InTimer) { return }
+    $script:InTimer = $true
+    try {
+        Drain-LogQueue
+        Update-ProgressChrome
+        if ($script:CommandRunning -and $script:AsyncHandle -and $script:AsyncHandle.IsCompleted) {
+            $script:CommandRunning = $false
+            Complete-CurrentCommand
+        }
+    }
+    catch {
+        try { Add-UiLog $_.Exception.Message 'ERROR' } catch { }
+    }
+    finally {
+        $script:InTimer = $false
+    }
+}
+
+function Start-InvestigationCommand {
+    param([hashtable]$Job)
+    if ($script:CommandRunning) { return }
+    Ensure-Runspace
+    Reset-CommandSignals
+    $script:CurrentMode = [string]$Job.Mode
+    $script:CommandRunning = $true
+    Update-Chrome
+    $script:PsHost.Commands.Clear()
+    $script:PsHost.Streams.ClearStreams()
+    [void]$script:PsHost.AddCommand('Invoke-PurviewSearchJob').AddParameter('Job', $Job)
+    $script:AsyncHandle = $script:PsHost.BeginInvoke()
+}
+
+function Connect-FromUi {
+    if ($script:CommandRunning) { return }
+    Ensure-Sync
+    if ($script:Sync.Connected) {
+        $answer = [System.Windows.Forms.MessageBox]::Show($script:form, 'Disconnect from Purview?', 'Disconnect', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+        if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+        Start-InvestigationCommand @{
+            Mode     = 'Disconnect'
+            Sync     = $script:Sync
+            LogFile  = $script:CurrentLogFile
+            AdminUPN = $script:txtAdmin.Text.Trim()
+        }
+        return
+    }
+    if (-not (Test-EmailAddress $script:txtAdmin.Text)) {
+        Show-UiMessage 'Enter a valid administrative UPN before connecting.' 'Administrator' 'Warning'
+        return
+    }
+    Update-ModuleStatus
+    if (-not $script:ModulePath) {
+        Show-UiMessage 'Install ExchangeOnlineManagement 3.9.0 or later, then connect.' 'Module required' 'Warning'
+        return
+    }
+    Start-InvestigationCommand @{
+        Mode       = 'Connect'
+        Sync       = $script:Sync
+        LogFile    = $script:CurrentLogFile
+        ModulePath = $script:ModulePath
+        AdminUPN   = $script:txtAdmin.Text.Trim()
+    }
+}
+
+function Show-InvestigationConfirm {
+    param($Request)
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = 'Confirm compliance search'
+    $dialog.Size = New-Object System.Drawing.Size(700, 560)
+    $dialog.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+    $dialog.MinimizeBox = $false
+    $dialog.MaximizeBox = $false
+    $dialog.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $dialog.BackColor = $script:ColorPage
+
+    $summary = New-Object System.Text.StringBuilder
+    [void]$summary.AppendLine('This creates a compliance search estimate.')
+    [void]$summary.AppendLine('It does not delete, move, export, or modify messages.')
+    [void]$summary.AppendLine()
+    [void]$summary.AppendLine("Search name : $($Request.SearchName)")
+    [void]$summary.AppendLine("Sender      : $($Request.Sender)")
+    [void]$summary.AppendLine("Domains     : $($Request.Domains -join ', ')")
+    [void]$summary.AppendLine("Dates       : $($Request.Start.ToString('yyyy-MM-dd')) through $($Request.End.ToString('yyyy-MM-dd')) (end date is inclusive)")
+    [void]$summary.AppendLine("Scope       : $($Request.Scope)")
+    [void]$summary.AppendLine("Location    : $($Request.ExchangeLocation)")
+    [void]$summary.AppendLine("Case        : $(if ($Request.CaseName) { $Request.CaseName } else { '(none)' })")
+    [void]$summary.AppendLine("Output      : $($Request.OutputFolder)")
+    [void]$summary.AppendLine()
+    [void]$summary.AppendLine('KeyQL:')
+    [void]$summary.AppendLine($Request.Query)
+    if ($Request.Scope -eq 'All') {
+        [void]$summary.AppendLine()
+        [void]$summary.AppendLine('All mailboxes searches every mailbox you can access and can take a long time.')
+    }
+    if (-not $script:Sync.Connected) {
+        [void]$summary.AppendLine()
+        [void]$summary.AppendLine('A Microsoft sign-in window will open. Check the taskbar if you do not see it.')
+    }
+
+    $details = New-Object System.Windows.Forms.TextBox
+    $details.Multiline = $true
+    $details.ReadOnly = $true
+    $details.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
+    $details.Font = New-Object System.Drawing.Font('Consolas', 9)
+    $details.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $details.Text = $summary.ToString()
+    $details.BackColor = [System.Drawing.Color]::White
+
+    $buttons = New-Object System.Windows.Forms.FlowLayoutPanel
+    $buttons.Dock = [System.Windows.Forms.DockStyle]::Bottom
+    $buttons.Height = 52
+    $buttons.FlowDirection = [System.Windows.Forms.FlowDirection]::RightToLeft
+    $buttons.Padding = New-Object System.Windows.Forms.Padding(8)
+    $go = New-UiButton 'Start search' 140 $script:ColorAccent ([System.Drawing.Color]::White)
+    $go.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $cancel = New-UiButton 'Cancel' 110 ([System.Drawing.Color]::White) $script:ColorNavy -Outline
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $buttons.Controls.Add($go)
+    $buttons.Controls.Add($cancel)
+    $dialog.AcceptButton = $go
+    $dialog.CancelButton = $cancel
+    $dialog.Controls.Add($details)
+    $dialog.Controls.Add($buttons)
+
+    $accepted = $dialog.ShowDialog($script:form) -eq [System.Windows.Forms.DialogResult]::OK
+    $dialog.Dispose()
+    return $accepted
+}
+
+function Start-SearchFromUi {
+    if ($script:CommandRunning) { return }
+    Ensure-Sync
+    if (-not $script:SearchNameDirty) {
+        $script:SessionStamp = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
+    }
+    Update-QueryPreview
+    $request = $script:LastRequest
+    if (-not $request -or -not $request.IsValid) {
+        Show-UiMessage $script:lblValidation.Text 'Check the form' 'Warning'
+        return
+    }
+    if (-not $script:Sync.Connected) {
+        Update-ModuleStatus
+        if (-not $script:ModulePath) {
+            Show-UiMessage 'Install ExchangeOnlineManagement 3.9.0 or later before starting a search.' 'Module required' 'Warning'
+            return
+        }
+    }
+    if (-not (Show-InvestigationConfirm $request)) {
+        Add-UiLog 'Search cancelled.' 'WARNING'
+        return
+    }
+
+    try {
+        $folder = New-InvestigationOutputFolder -Root $request.OutputFolder
+    }
+    catch {
+        Show-UiMessage $_.Exception.Message 'Output folder' 'Error'
+        return
+    }
+
+    $configLines = @(
+        "Search name: $($request.SearchName)"
+        "Administrator: $($request.AdminUpn)"
+        "Sender: $($request.Sender)"
+        "Domains: $($request.Domains -join ', ')"
+        "Start: $($request.Start.ToString('yyyy-MM-dd'))"
+        "End: $($request.End.ToString('yyyy-MM-dd')) (inclusive)"
+        "Scope: $($request.Scope)"
+        "Exchange location: $($request.ExchangeLocation)"
+        "Case: $($request.CaseName)"
+        'Query:'
+        $request.Query
+    )
+    Write-Utf8File -Path (Join-Path $folder 'SearchConfiguration.txt') -Content (($configLines -join [Environment]::NewLine) + [Environment]::NewLine)
+
+    $script:CurrentOutputFolder = $folder
+    $script:CurrentLogFile = Join-Path $folder 'Investigation.log'
+    $script:ActiveSearchName = $request.SearchName
+    $script:Sync.ActiveSearchName = $request.SearchName
+    $script:Sync.SearchCreated = $false
+    $script:Sync.Result = $null
+    $script:Sync.Preview = $null
+    $script:LastStatus = ''
+    Clear-ResultView
+    $script:SummaryValues['Search'].Text = $request.SearchName
+    $script:SummaryValues['Scope'].Text = $request.Scope
+    $script:SummaryValues['Output'].Text = $folder
+    Add-UiLog "Investigation folder: $folder"
+    Add-UiLog "Search name: $($request.SearchName)"
+    Add-UiLog "Query: $($request.Query)"
+    try { Save-SettingsFromUi } catch { }
+
+    $context = @{
+        SearchName       = $request.SearchName
+        CaseName         = $request.CaseName
+        Administrator    = $request.AdminUpn
+        ConnectedAs      = [string]$script:Sync.ConnectedUpn
+        Sender           = $request.Sender
+        RecipientDomains = ($request.Domains -join '; ')
+        StartDate        = $request.Start.ToString('yyyy-MM-dd')
+        EndDate          = $request.End.ToString('yyyy-MM-dd')
+        SearchScope      = $request.Scope
+        ExchangeLocation = $request.ExchangeLocation
+        SearchQuery      = $request.Query
+        ExecutionTime    = ''
+        TimedOut         = $false
+        ModuleVersion    = [string]$script:Sync.ModuleVersion
+    }
+    Start-InvestigationCommand @{
+        Mode             = $(if ($script:Sync.Connected) { 'Search' } else { 'ConnectAndSearch' })
+        Sync             = $script:Sync
+        LogFile          = $script:CurrentLogFile
+        ModulePath       = $script:ModulePath
+        AdminUPN         = $request.AdminUpn
+        SearchName       = $request.SearchName
+        ExchangeLocation = $request.ExchangeLocation
+        AllowNotFound    = [bool]$request.AllowNotFound
+        Query            = $request.Query
+        CaseName         = $request.CaseName
+        Description      = $request.Description
+        NotifyAdmin      = [bool]$request.NotifyAdmin
+        TimeoutMinutes   = $request.TimeoutMinutes
+        OutputFolder     = $folder
+        Context          = $context
+    }
+}
+
+function Start-PreviewFromUi {
+    if ($script:CommandRunning -or -not $script:Sync.Connected) { return }
+    if ([string]::IsNullOrWhiteSpace($script:ActiveSearchName)) { return }
+    Start-InvestigationCommand @{
+        Mode         = 'Preview'
+        Sync         = $script:Sync
+        LogFile      = $script:CurrentLogFile
+        SearchName   = $script:ActiveSearchName
+        OutputFolder = $script:CurrentOutputFolder
+        TimeoutMinutes = [int]$script:numTimeout.Value
+    }
+}
+
+function Start-ReportFromUi {
+    if ($script:CommandRunning -or -not $script:Sync.Connected) { return }
+    if ([string]::IsNullOrWhiteSpace($script:ActiveSearchName)) { return }
+    Start-InvestigationCommand @{
+        Mode           = 'Report'
+        Sync           = $script:Sync
+        LogFile        = $script:CurrentLogFile
+        SearchName     = $script:ActiveSearchName
+        OutputFolder   = $script:CurrentOutputFolder
+        TimeoutMinutes = [int]$script:numTimeout.Value
+    }
+}
+
+function Remove-SearchFromUi {
+    if ($script:CommandRunning -or -not $script:Sync.Connected) { return }
+    if ([string]::IsNullOrWhiteSpace($script:ActiveSearchName)) { return }
+    $answer = [System.Windows.Forms.MessageBox]::Show(
+        $script:form,
+        "Remove the search definition '$($script:ActiveSearchName)' from Purview?`r`n`r`nMailbox messages are not deleted or modified.",
+        'Remove search definition',
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning)
+    if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+    Start-InvestigationCommand @{
+        Mode         = 'Remove'
+        Sync         = $script:Sync
+        LogFile      = $script:CurrentLogFile
+        SearchName   = $script:ActiveSearchName
+        OutputFolder = $script:CurrentOutputFolder
+    }
+}
+
+function Install-ModuleFromUi {
+    if ($script:CommandRunning) { return }
+    $answer = [System.Windows.Forms.MessageBox]::Show(
+        $script:form,
+        'Install ExchangeOnlineManagement 3.9.0 or later for the current user from the PowerShell Gallery?',
+        'Install module',
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Question)
+    if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+    Ensure-Sync
+    Start-InvestigationCommand @{
+        Mode    = 'InstallModule'
+        Sync    = $script:Sync
+        LogFile = $script:CurrentLogFile
+    }
+}
+
+function Copy-UiText {
+    param([string]$Text, [string]$Label)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return }
+    [System.Windows.Forms.Clipboard]::SetText($Text)
+    Add-UiLog "$Label copied to the clipboard."
+}
+
+function Open-OutputFolder {
+    $path = $script:CurrentOutputFolder
+    if (-not $path -or -not (Test-Path -LiteralPath $path)) { $path = $script:txtOutput.Text }
+    if ($path -and (Test-Path -LiteralPath $path)) { Invoke-Item -LiteralPath $path }
+}
+
+function Open-PurviewPortal {
+    Start-Process 'https://purview.microsoft.com/ediscovery'
+}
+
+function Export-ActivityLog {
+    $dialog = New-Object System.Windows.Forms.SaveFileDialog
+    $dialog.Filter = 'Log files (*.log)|*.log|Text files (*.txt)|*.txt'
+    $dialog.FileName = 'PurviewInvestigation_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.log'
+    if ($dialog.ShowDialog($script:form) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+    if ($script:CurrentLogFile -and (Test-Path -LiteralPath $script:CurrentLogFile)) {
+        [System.IO.File]::Copy($script:CurrentLogFile, $dialog.FileName, $true)
+    }
+    else {
+        Write-Utf8File -Path $dialog.FileName -Content $script:txtLog.Text
+    }
+    Add-UiLog "Log exported to $($dialog.FileName)" 'SUCCESS'
+}
+
+function Browse-OutputFolder {
+    $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dialog.Description = 'Choose where investigation reports are saved'
+    $dialog.ShowNewFolderButton = $true
+    if ($script:txtOutput.Text -and (Test-Path -LiteralPath $script:txtOutput.Text)) {
+        $dialog.SelectedPath = $script:txtOutput.Text
+    }
+    if ($dialog.ShowDialog($script:form) -eq [System.Windows.Forms.DialogResult]::OK) {
+        $script:txtOutput.Text = $dialog.SelectedPath
+    }
+}
+
+function Show-ToolHelp {
+    $text = @"
+Purview Email Investigation creates a read-only compliance search for mail sent by one user to the domains you list.
+
+It does not delete, move, export, or modify messages.
+
+Requirements
+- Windows PowerShell 5.1 or PowerShell 7 on Windows
+- ExchangeOnlineManagement 3.9.0 or later
+- An account with eDiscovery or Compliance Search permission
+- Connect-IPPSSession -EnableSearchOnlySession, which this tool uses
+
+The end date is inclusive. KeyQL uses the next day as an exclusive bound so mail sent later that day is included.
+
+Sender mailbox searches that person's mailbox, including Sent Items. All mailboxes searches every mailbox the account can access and can take much longer.
+
+Preview retrieves a sample of message metadata. It does not download message bodies.
+"@
+    Show-UiMessage $text "Purview Email Investigation v$($script:AppVersion)" 'Information'
+}
+
+function Stop-FromUi {
+    if (-not $script:CommandRunning -or -not $script:Sync) { return }
+    $script:Sync.CancelRequested = $true
+    $script:Sync.StatusText = 'Stop requested. Waiting for the service to acknowledge it.'
+    Add-UiLog 'Stop requested.' 'WARNING'
+}
+
+function Close-InvestigationSession {
+    if ($script:SessionClosed) { return }
+    $script:SessionClosed = $true
+    try {
+        if ($script:UiTimer) {
+            $script:UiTimer.Stop()
+            $script:UiTimer.Dispose()
+            $script:UiTimer = $null
+        }
+    }
+    catch { }
+    try {
+        if ($script:PsHost) {
+            if ($script:CommandRunning) {
+                try { $script:PsHost.Stop() } catch { }
+            }
+            elseif ($script:Sync -and $script:Sync.Connected) {
+                try {
+                    $script:PsHost.Commands.Clear()
+                    [void]$script:PsHost.AddScript('Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue')
+                    [void]$script:PsHost.Invoke()
+                }
+                catch { }
+            }
+            $script:PsHost.Dispose()
+            $script:PsHost = $null
+        }
+    }
+    catch { }
+    try {
+        if ($script:Runspace) {
+            $script:Runspace.Close()
+            $script:Runspace.Dispose()
+            $script:Runspace = $null
+        }
+    }
+    catch { }
+}
+
+function Start-PurviewInvestigationGui {
+    if ($env:OS -ne 'Windows_NT') {
+        throw 'Purview Email Investigation requires Windows.'
+    }
+    if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+        if ($env:PURVIEW_TOOL_STA_RELAUNCH -eq '1') {
+            throw 'The GUI could not be started in STA mode.'
+        }
+        if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
+            throw 'Save the script and run it as a file so the GUI can relaunch in STA mode.'
+        }
+        $hostPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        if (-not (Test-Path -LiteralPath $hostPath)) {
+            $hostPath = [Diagnostics.Process]::GetCurrentProcess().Path
+        }
+        $env:PURVIEW_TOOL_STA_RELAUNCH = '1'
+        Start-Process -FilePath $hostPath -ArgumentList @(
+            '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath
+        ) | Out-Null
+        return
+    }
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    try { [System.Windows.Forms.Application]::EnableVisualStyles() } catch { }
+    try { [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false) } catch { }
+
+    $script:ColorNavy = [System.Drawing.Color]::FromArgb(24, 42, 68)
+    $script:ColorPage = [System.Drawing.Color]::FromArgb(245, 247, 250)
+    $script:ColorAccent = [System.Drawing.Color]::FromArgb(0, 120, 212)
+    $script:ColorSuccess = [System.Drawing.Color]::FromArgb(16, 124, 65)
+    $script:ColorDanger = [System.Drawing.Color]::FromArgb(196, 43, 28)
+    $script:ColorWarning = [System.Drawing.Color]::FromArgb(140, 90, 0)
+    $script:ColorMuted = [System.Drawing.Color]::FromArgb(96, 110, 128)
+    $script:ColorQuery = [System.Drawing.Color]::FromArgb(236, 242, 248)
+    $script:SessionStamp = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
+    $script:FormValid = $false
+    $script:CommandRunning = $false
+    $script:SessionClosed = $false
+    $script:SearchNameDirty = $false
+    $script:DescriptionDirty = $false
+    $script:InPreview = $false
+    $script:UpdatingName = $false
+    $script:UpdatingDescription = $false
+    $script:InTimer = $false
+    $script:ActiveSearchName = ''
+    $script:CurrentOutputFolder = ''
+    $script:CurrentLogFile = ''
+    $script:LastStatus = ''
+    $script:ModulePath = $null
+    Ensure-Sync
+    $defaults = Get-DefaultInvestigationSettings
+
+    $script:form = New-Object System.Windows.Forms.Form
+    $script:form.Text = "Purview Email Investigation v$($script:AppVersion)"
+    $script:form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+    $script:form.Size = New-Object System.Drawing.Size(1360, 920)
+    $script:form.MinimumSize = New-Object System.Drawing.Size(1180, 780)
+    $script:form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $script:form.BackColor = $script:ColorPage
+    $script:form.Icon = [System.Drawing.SystemIcons]::Shield
+    $script:toolTip = New-Object System.Windows.Forms.ToolTip
+
+    $header = New-Object System.Windows.Forms.Panel
+    $header.Dock = [System.Windows.Forms.DockStyle]::Top
+    $header.Height = 72
+    $header.BackColor = $script:ColorNavy
+    $helpHost = New-Object System.Windows.Forms.Panel
+    $helpHost.Dock = [System.Windows.Forms.DockStyle]::Right
+    $helpHost.Width = 110
+    $helpHost.BackColor = $script:ColorNavy
+    $script:btnHelp = New-UiButton 'Help' 86 ([System.Drawing.Color]::White) $script:ColorNavy -Outline
+    $script:btnHelp.Location = New-Object System.Drawing.Point(12, 18)
+    $script:btnHelp.Add_Click({ Show-ToolHelp })
+    $helpHost.Controls.Add($script:btnHelp)
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = 'Purview Email Investigation'
+    $title.Font = New-Object System.Drawing.Font('Segoe UI', 16, [System.Drawing.FontStyle]::Bold)
+    $title.ForeColor = [System.Drawing.Color]::White
+    $title.AutoSize = $true
+    $title.Location = New-Object System.Drawing.Point(16, 10)
+    $subtitle = New-Object System.Windows.Forms.Label
+    $subtitle.Text = 'Read-only compliance search. Does not delete, move, or modify messages.'
+    $subtitle.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $subtitle.ForeColor = [System.Drawing.Color]::FromArgb(168, 190, 214)
+    $subtitle.AutoSize = $true
+    $subtitle.Location = New-Object System.Drawing.Point(18, 42)
+    $header.Controls.Add($title)
+    $header.Controls.Add($subtitle)
+    $header.Controls.Add($helpHost)
+
+    $status = New-Object System.Windows.Forms.Panel
+    $status.Dock = [System.Windows.Forms.DockStyle]::Bottom
+    $status.Height = 48
+    $status.BackColor = [System.Drawing.Color]::White
+    $script:progress = New-Object System.Windows.Forms.ProgressBar
+    $script:progress.Dock = [System.Windows.Forms.DockStyle]::Bottom
+    $script:progress.Height = 16
+    $script:progress.Minimum = 0
+    $script:progress.Maximum = 100
+    $script:lblStatus = New-Object System.Windows.Forms.Label
+    $script:lblStatus.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $script:lblStatus.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $script:lblStatus.Padding = New-Object System.Windows.Forms.Padding(12, 0, 12, 0)
+    $script:lblStatus.Text = 'Ready'
+    $script:lblStatus.ForeColor = $script:ColorNavy
+    $status.Controls.Add($script:lblStatus)
+    $status.Controls.Add($script:progress)
+
+    $logHost = New-Object System.Windows.Forms.Panel
+    $logHost.Dock = [System.Windows.Forms.DockStyle]::Bottom
+    $logHost.Height = 180
+    $logHost.Padding = New-Object System.Windows.Forms.Padding(12, 0, 12, 8)
+    $logHost.BackColor = $script:ColorPage
+    $logCaption = New-Object System.Windows.Forms.Label
+    $logCaption.Text = 'Activity log'
+    $logCaption.Dock = [System.Windows.Forms.DockStyle]::Top
+    $logCaption.Height = 22
+    $logCaption.Font = New-Object System.Drawing.Font('Segoe UI', 8.5, [System.Drawing.FontStyle]::Bold)
+    $logCaption.ForeColor = $script:ColorNavy
+    $script:txtLog = New-Object System.Windows.Forms.RichTextBox
+    $script:txtLog.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $script:txtLog.ReadOnly = $true
+    $script:txtLog.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+    $script:txtLog.BackColor = [System.Drawing.Color]::FromArgb(18, 22, 28)
+    $script:txtLog.ForeColor = [System.Drawing.Color]::FromArgb(220, 228, 236)
+    $script:txtLog.Font = New-Object System.Drawing.Font('Consolas', 9)
+    $script:txtLog.DetectUrls = $false
+    $logHost.Controls.Add($script:txtLog)
+    $logHost.Controls.Add($logCaption)
+
+    $table = New-Object System.Windows.Forms.TableLayoutPanel
+    $table.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $table.ColumnCount = 2
+    $table.RowCount = 1
+    $table.Padding = New-Object System.Windows.Forms.Padding(8, 8, 8, 4)
+    $table.BackColor = $script:ColorPage
+    $table.ColumnStyles.Clear()
+    $table.RowStyles.Clear()
+    [void]$table.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 46)))
+    [void]$table.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 54)))
+    [void]$table.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+
+    $script:leftScroll = New-Object System.Windows.Forms.Panel
+    $script:leftScroll.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $script:leftScroll.AutoScroll = $true
+    $script:leftScroll.BackColor = $script:ColorPage
+    $script:leftBody = New-Object System.Windows.Forms.Panel
+    $script:leftBody.Location = New-Object System.Drawing.Point(0, 0)
+    $script:leftBody.Width = 640
+    $script:leftBody.Height = 1100
+    $script:leftBody.BackColor = $script:ColorPage
+    $script:leftScroll.Controls.Add($script:leftBody)
+    $script:leftScroll.Add_Resize({
+        $width = $script:leftScroll.ClientSize.Width - 4
+        if ($width -lt 360) { $width = 360 }
+        if ($script:leftBody.Width -ne $width) { $script:leftBody.Width = $width }
+    })
+
+    $script:LayoutY = 8
+    function Add-FieldLabel([string]$Text) {
+        $label = New-Object System.Windows.Forms.Label
+        $label.Text = $Text
+        $label.AutoSize = $true
+        $label.Font = New-Object System.Drawing.Font('Segoe UI', 8.5, [System.Drawing.FontStyle]::Bold)
+        $label.ForeColor = $script:ColorNavy
+        $label.Location = New-Object System.Drawing.Point(12, $script:LayoutY)
+        $script:leftBody.Controls.Add($label)
+        $script:LayoutY += 20
+    }
+    function Add-FullWidthControl($Control, [int]$Height, [int]$Gap = 8) {
+        $y = $script:LayoutY
+        $Control.Location = New-Object System.Drawing.Point(12, $y)
+        $Control.Size = New-Object System.Drawing.Size(($script:leftBody.Width - 24), $Height)
+        if ($Control -is [System.Windows.Forms.Label]) { $Control.AutoSize = $false }
+        $Control.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+        $script:leftBody.Controls.Add($Control)
+        $script:LayoutY = $y + $Height + $Gap
+    }
+    function Add-Hint([string]$Text, [int]$Height = 32) {
+        $label = New-Object System.Windows.Forms.Label
+        $label.Text = $Text
+        $label.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+        $label.ForeColor = $script:ColorMuted
+        Add-FullWidthControl $label $Height 6
+    }
+
+    Add-FieldLabel 'Administrator UPN'
+    $adminRow = New-Object System.Windows.Forms.Panel
+    Add-FullWidthControl $adminRow 34
+    $script:txtAdmin = New-UiTextBox
+    $script:txtAdmin.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $script:btnConnect = New-UiButton 'Connect' 120 $script:ColorAccent ([System.Drawing.Color]::White)
+    $script:btnConnect.Dock = [System.Windows.Forms.DockStyle]::Right
+    $adminGap = New-Object System.Windows.Forms.Panel
+    $adminGap.Dock = [System.Windows.Forms.DockStyle]::Right
+    $adminGap.Width = 8
+    $adminRow.Controls.Add($script:txtAdmin)
+    $adminRow.Controls.Add($adminGap)
+    $adminRow.Controls.Add($script:btnConnect)
+
+    $moduleRow = New-Object System.Windows.Forms.Panel
+    Add-FullWidthControl $moduleRow 36 4
+    $script:lblModule = New-Object System.Windows.Forms.Label
+    $script:lblModule.Text = 'Checking ExchangeOnlineManagement...'
+    $script:lblModule.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $script:lblModule.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $script:lblModule.AutoEllipsis = $true
+    $script:lblModule.ForeColor = $script:ColorMuted
+    $script:btnInstall = New-UiButton 'Install module' 140 $script:ColorWarning ([System.Drawing.Color]::White)
+    $script:btnInstall.Dock = [System.Windows.Forms.DockStyle]::Right
+    $script:btnInstall.Visible = $false
+    $moduleRow.Controls.Add($script:lblModule)
+    $moduleRow.Controls.Add($script:btnInstall)
+
+    Add-FieldLabel 'Sender'
+    $script:txtSender = New-UiTextBox
+    Add-FullWidthControl $script:txtSender 28
+    Add-FieldLabel 'Recipient domains'
+    $script:txtDomains = New-UiTextBox -Multiline -Height 68
+    $script:txtDomains.Text = $defaults.Domains
+    Add-FullWidthControl $script:txtDomains 68
+    Add-Hint 'Separate domains with commas, semicolons, or new lines. A leading @ is optional.' 28
+
+    Add-FieldLabel 'Start date and end date'
+    $dateRow = New-Object System.Windows.Forms.Panel
+    Add-FullWidthControl $dateRow 32
+    $script:dtStart = New-Object System.Windows.Forms.DateTimePicker
+    $script:dtStart.Format = [System.Windows.Forms.DateTimePickerFormat]::Custom
+    $script:dtStart.CustomFormat = 'yyyy-MM-dd'
+    $script:dtStart.Width = 160
+    $script:dtStart.Location = New-Object System.Drawing.Point(0, 2)
+    $script:dtStart.Value = ConvertTo-SettingDate $defaults.StartDate (Get-Date).Date
+    $dateCaption = New-Object System.Windows.Forms.Label
+    $dateCaption.Text = 'through'
+    $dateCaption.AutoSize = $true
+    $dateCaption.Location = New-Object System.Drawing.Point(172, 6)
+    $script:dtEnd = New-Object System.Windows.Forms.DateTimePicker
+    $script:dtEnd.Format = [System.Windows.Forms.DateTimePickerFormat]::Custom
+    $script:dtEnd.CustomFormat = 'yyyy-MM-dd'
+    $script:dtEnd.Width = 160
+    $script:dtEnd.Location = New-Object System.Drawing.Point(230, 2)
+    $script:dtEnd.Value = (Get-Date).Date
+    $dateRow.Controls.Add($script:dtStart)
+    $dateRow.Controls.Add($dateCaption)
+    $dateRow.Controls.Add($script:dtEnd)
+
+    Add-FieldLabel 'eDiscovery case (optional)'
+    $script:txtCase = New-UiTextBox
+    Add-FullWidthControl $script:txtCase 28
+    Add-Hint 'Leave blank for a standalone content search. The case must already exist.' 28
+    Add-FieldLabel 'Mailbox scope'
+    $scopeRow = New-Object System.Windows.Forms.Panel
+    Add-FullWidthControl $scopeRow 48
+    $script:radSender = New-Object System.Windows.Forms.RadioButton
+    $script:radSender.Text = 'Sender mailbox only (recommended)'
+    $script:radSender.Checked = $true
+    $script:radSender.AutoSize = $true
+    $script:radSender.Location = New-Object System.Drawing.Point(0, 0)
+    $script:radAll = New-Object System.Windows.Forms.RadioButton
+    $script:radAll.Text = 'All accessible mailboxes'
+    $script:radAll.AutoSize = $true
+    $script:radAll.Location = New-Object System.Drawing.Point(0, 24)
+    $scopeRow.Controls.Add($script:radSender)
+    $scopeRow.Controls.Add($script:radAll)
+    Add-Hint 'Sender mailbox includes Sent Items. All mailboxes can take much longer. Neither option changes mail.' 32
+    $script:chkInactive = New-Object System.Windows.Forms.CheckBox
+    $script:chkInactive.Text = 'Sender mailbox is inactive'
+    $script:chkInactive.AutoSize = $true
+    Add-FullWidthControl $script:chkInactive 24
+    $script:chkNotify = New-Object System.Windows.Forms.CheckBox
+    $script:chkNotify.Text = 'Email me when the search finishes'
+    $script:chkNotify.AutoSize = $true
+    Add-FullWidthControl $script:chkNotify 24
+
+    Add-FieldLabel 'Search name'
+    $script:txtSearchName = New-UiTextBox
+    $script:txtSearchName.Font = New-Object System.Drawing.Font('Consolas', 9)
+    Add-FullWidthControl $script:txtSearchName 28
+    Add-FieldLabel 'Output folder'
+    $outputRow = New-Object System.Windows.Forms.Panel
+    Add-FullWidthControl $outputRow 34
+    $script:txtOutput = New-UiTextBox
+    $script:txtOutput.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $script:txtOutput.Text = $defaults.OutputFolder
+    $script:btnBrowse = New-UiButton 'Browse' 100 ([System.Drawing.Color]::White) $script:ColorNavy -Outline
+    $script:btnBrowse.Dock = [System.Windows.Forms.DockStyle]::Right
+    $outputGap = New-Object System.Windows.Forms.Panel
+    $outputGap.Dock = [System.Windows.Forms.DockStyle]::Right
+    $outputGap.Width = 8
+    $outputRow.Controls.Add($script:txtOutput)
+    $outputRow.Controls.Add($outputGap)
+    $outputRow.Controls.Add($script:btnBrowse)
+
+    Add-FieldLabel 'Timeout (minutes)'
+    $timeoutRow = New-Object System.Windows.Forms.Panel
+    Add-FullWidthControl $timeoutRow 32
+    $script:numTimeout = New-Object System.Windows.Forms.NumericUpDown
+    $script:numTimeout.Minimum = 1
+    $script:numTimeout.Maximum = 720
+    $script:numTimeout.Value = 120
+    $script:numTimeout.Width = 90
+    $script:numTimeout.Location = New-Object System.Drawing.Point(0, 2)
+    $timeoutHint = New-Object System.Windows.Forms.Label
+    $timeoutHint.Text = 'Stop watching after this long. The search keeps running in Purview.'
+    $timeoutHint.AutoSize = $true
+    $timeoutHint.ForeColor = $script:ColorMuted
+    $timeoutHint.Location = New-Object System.Drawing.Point(100, 6)
+    $timeoutRow.Controls.Add($script:numTimeout)
+    $timeoutRow.Controls.Add($timeoutHint)
+
+    Add-FieldLabel 'Additional KeyQL (optional)'
+    $script:txtExtra = New-UiTextBox -Multiline -Height 44
+    Add-FullWidthControl $script:txtExtra 44
+    Add-Hint 'Combined with AND, so it cannot remove the sender, domain, or date conditions.' 28
+    Add-FieldLabel 'Description'
+    $script:txtDescription = New-UiTextBox -Multiline -Height 52
+    Add-FullWidthControl $script:txtDescription 52
+    $script:leftBody.Height = $script:LayoutY + 12
+
+    $leftColumn = New-Object System.Windows.Forms.Panel
+    $leftColumn.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $leftColumn.BackColor = $script:ColorPage
+
+    $footer = New-Object System.Windows.Forms.Panel
+    $footer.Dock = [System.Windows.Forms.DockStyle]::Bottom
+    $footer.Height = 176
+    $footer.BackColor = [System.Drawing.Color]::White
+
+    $script:lblValidation = New-Object System.Windows.Forms.Label
+    $script:lblValidation.Text = 'Checking the form...'
+    $script:lblValidation.ForeColor = $script:ColorMuted
+    $script:lblValidation.Location = New-Object System.Drawing.Point(12, 6)
+    $script:lblValidation.Size = New-Object System.Drawing.Size(600, 32)
+    $script:lblValidation.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+
+    $queryCaption = New-Object System.Windows.Forms.Label
+    $queryCaption.Text = 'KeyQL query'
+    $queryCaption.AutoSize = $true
+    $queryCaption.Font = New-Object System.Drawing.Font('Segoe UI', 8.5, [System.Drawing.FontStyle]::Bold)
+    $queryCaption.ForeColor = $script:ColorNavy
+    $queryCaption.Location = New-Object System.Drawing.Point(12, 40)
+
+    $script:txtQuery = New-UiTextBox -Multiline -Height 68
+    $script:txtQuery.ReadOnly = $true
+    $script:txtQuery.Font = New-Object System.Drawing.Font('Consolas', 9)
+    $script:txtQuery.BackColor = $script:ColorQuery
+    $script:txtQuery.Location = New-Object System.Drawing.Point(12, 60)
+    $script:txtQuery.Size = New-Object System.Drawing.Size(600, 68)
+    $script:txtQuery.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+
+    $script:btnStart = New-UiButton 'Start search' 160 $script:ColorAccent ([System.Drawing.Color]::White)
+    $script:btnStart.Location = New-Object System.Drawing.Point(12, 136)
+    $script:btnStop = New-UiButton 'Stop' 100 $script:ColorDanger ([System.Drawing.Color]::White)
+    $script:btnStop.Location = New-Object System.Drawing.Point(180, 136)
+    $script:btnStop.Enabled = $false
+    $footer.Controls.Add($script:lblValidation)
+    $footer.Controls.Add($queryCaption)
+    $footer.Controls.Add($script:txtQuery)
+    $footer.Controls.Add($script:btnStart)
+    $footer.Controls.Add($script:btnStop)
+    $leftColumn.Controls.Add($script:leftScroll)
+    $leftColumn.Controls.Add($footer)
+
+    $right = New-Object System.Windows.Forms.Panel
+    $right.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $right.BackColor = $script:ColorPage
+    $right.Padding = New-Object System.Windows.Forms.Padding(8, 0, 0, 0)
+    $summaryPanel = New-Object System.Windows.Forms.Panel
+    $summaryPanel.Dock = [System.Windows.Forms.DockStyle]::Top
+    $summaryPanel.Height = 128
+    $summaryPanel.BackColor = [System.Drawing.Color]::White
+    $summaryPanel.Padding = New-Object System.Windows.Forms.Padding(8)
+    $summaryGrid = New-Object System.Windows.Forms.TableLayoutPanel
+    $summaryGrid.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $summaryGrid.ColumnCount = 2
+    $summaryGrid.RowCount = 4
+    $summaryGrid.ColumnStyles.Clear()
+    $summaryGrid.RowStyles.Clear()
+    [void]$summaryGrid.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 50)))
+    [void]$summaryGrid.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 50)))
+    for ($rowStyle = 0; $rowStyle -lt 4; $rowStyle++) {
+        [void]$summaryGrid.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 25)))
+    }
+    $summaryGrid.BackColor = [System.Drawing.Color]::White
+    $script:SummaryValues = @{}
+    $summaryFields = @(
+        @('Status', 'Status'),
+        @('Items', 'Matching items'),
+        @('Size', 'Total size'),
+        @('Unindexed', 'Unindexed items'),
+        @('Duration', 'Duration'),
+        @('Scope', 'Scope'),
+        @('Search', 'Search name'),
+        @('Output', 'Output')
+    )
+    for ($i = 0; $i -lt $summaryFields.Count; $i++) {
+        $column = $i % 2
+        $rowIndex = [int][math]::Floor($i / 2)
+        $cell = New-Object System.Windows.Forms.Panel
+        $cell.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $cell.Margin = New-Object System.Windows.Forms.Padding(4, 1, 4, 1)
+        $cell.BackColor = [System.Drawing.Color]::White
+        $caption = New-Object System.Windows.Forms.Label
+        $caption.Text = $summaryFields[$i][1]
+        $caption.Dock = [System.Windows.Forms.DockStyle]::Left
+        $caption.Width = 118
+        $caption.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+        $caption.ForeColor = $script:ColorMuted
+        $value = New-Object System.Windows.Forms.Label
+        $value.Text = '-'
+        $value.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $value.AutoEllipsis = $true
+        $value.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+        $value.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+        $value.ForeColor = $script:ColorNavy
+        $cell.Controls.Add($value)
+        $cell.Controls.Add($caption)
+        $summaryGrid.Controls.Add($cell, $column, $rowIndex)
+        $script:SummaryValues[$summaryFields[$i][0]] = $value
+    }
+    $summaryPanel.Controls.Add($summaryGrid)
+
+    $actions = New-Object System.Windows.Forms.FlowLayoutPanel
+    $actions.Dock = [System.Windows.Forms.DockStyle]::Top
+    $actions.Height = 120
+    $actions.WrapContents = $true
+    $actions.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+    $actions.Padding = New-Object System.Windows.Forms.Padding(0, 6, 0, 0)
+    $actions.BackColor = $script:ColorPage
+    $script:btnPreview = New-UiButton 'Preview sample' 140 $script:ColorNavy ([System.Drawing.Color]::White)
+    $script:btnReport = New-UiButton 'Statistics report' 160 $script:ColorNavy ([System.Drawing.Color]::White)
+    $script:btnOpenFolder = New-UiButton 'Open folder' 120 ([System.Drawing.Color]::White) $script:ColorNavy -Outline
+    $script:btnPurview = New-UiButton 'Open Purview' 130 ([System.Drawing.Color]::White) $script:ColorNavy -Outline
+    $script:btnCopyQuery = New-UiButton 'Copy query' 110 ([System.Drawing.Color]::White) $script:ColorNavy -Outline
+    $script:btnCopyName = New-UiButton 'Copy name' 110 ([System.Drawing.Color]::White) $script:ColorNavy -Outline
+    $script:btnRemove = New-UiButton 'Remove search' 140 $script:ColorDanger ([System.Drawing.Color]::White)
+    $script:btnExportLog = New-UiButton 'Export log' 110 ([System.Drawing.Color]::White) $script:ColorNavy -Outline
+    foreach ($button in @($script:btnPreview, $script:btnReport, $script:btnOpenFolder, $script:btnPurview, $script:btnCopyQuery, $script:btnCopyName, $script:btnRemove, $script:btnExportLog)) {
+        $actions.Controls.Add($button)
+    }
+
+    $script:tabs = New-Object System.Windows.Forms.TabControl
+    $script:tabs.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $script:tabStats = New-Object System.Windows.Forms.TabPage
+    $script:tabStats.Text = 'Mailbox statistics'
+    $script:tabStats.Padding = New-Object System.Windows.Forms.Padding(8)
+    $script:tabStats.BackColor = $script:ColorPage
+    $script:tabPreview = New-Object System.Windows.Forms.TabPage
+    $script:tabPreview.Text = 'Preview sample'
+    $script:tabPreview.Padding = New-Object System.Windows.Forms.Padding(8)
+    $script:tabPreview.BackColor = $script:ColorPage
+    $script:tabs.TabPages.Add($script:tabStats)
+    $script:tabs.TabPages.Add($script:tabPreview)
+
+    $script:gridLocations = New-ResultGrid
+    Add-GridColumn $script:gridLocations 'Location' 'Mailbox' 40
+    Add-GridColumn $script:gridLocations 'Items' 'Items' 15 ([int64])
+    Add-GridColumn $script:gridLocations 'Size' 'Size' 20
+    Add-GridColumn $script:gridLocations 'Bytes' 'Bytes' 15 ([int64])
+    $script:lblEmptyLocations = New-Object System.Windows.Forms.Label
+    $script:lblEmptyLocations.Text = 'Run a search to list matching mailboxes.'
+    $script:lblEmptyLocations.Dock = [System.Windows.Forms.DockStyle]::Top
+    $script:lblEmptyLocations.Height = 24
+    $script:lblEmptyLocations.ForeColor = $script:ColorMuted
+    $script:tabStats.Controls.Add($script:gridLocations)
+    $script:tabStats.Controls.Add($script:lblEmptyLocations)
+
+    $script:gridPreview = New-ResultGrid
+    Add-GridColumn $script:gridPreview 'Received' 'Received' 18
+    Add-GridColumn $script:gridPreview 'Sender' 'Sender' 20
+    Add-GridColumn $script:gridPreview 'Subject' 'Subject' 28
+    Add-GridColumn $script:gridPreview 'Type' 'Type' 12
+    Add-GridColumn $script:gridPreview 'Size' 'Size' 10
+    Add-GridColumn $script:gridPreview 'Location' 'Mailbox' 18
+    $script:lblEmptyPreview = New-Object System.Windows.Forms.Label
+    $script:lblEmptyPreview.Text = 'Preview is available after a search completes. It shows metadata, not message bodies.'
+    $script:lblEmptyPreview.Dock = [System.Windows.Forms.DockStyle]::Top
+    $script:lblEmptyPreview.Height = 36
+    $script:lblEmptyPreview.ForeColor = $script:ColorMuted
+    $script:tabPreview.Controls.Add($script:gridPreview)
+    $script:tabPreview.Controls.Add($script:lblEmptyPreview)
+
+    $right.Controls.Add($script:tabs)
+    $right.Controls.Add($actions)
+    $right.Controls.Add($summaryPanel)
+    $table.Controls.Add($leftColumn, 0, 0)
+    $table.Controls.Add($right, 1, 0)
+
+    $script:form.Controls.Add($table)
+    $script:form.Controls.Add($logHost)
+    $script:form.Controls.Add($status)
+    $script:form.Controls.Add($header)
+
+    Apply-SavedSettings
+    $script:txtAdmin.Add_TextChanged({ Update-QueryPreview })
+    $script:txtSender.Add_TextChanged({ Update-QueryPreview })
+    $script:txtDomains.Add_TextChanged({ Update-QueryPreview })
+    $script:txtCase.Add_TextChanged({ Update-QueryPreview })
+    $script:txtExtra.Add_TextChanged({ Update-QueryPreview })
+    $script:txtOutput.Add_TextChanged({ Update-QueryPreview })
+    $script:txtSearchName.Add_TextChanged({
+        if (-not $script:UpdatingName) { $script:SearchNameDirty = $true }
+        Update-QueryPreview
+    })
+    $script:txtDescription.Add_TextChanged({
+        if (-not $script:UpdatingDescription) { $script:DescriptionDirty = $true }
+        Update-QueryPreview
+    })
+    $script:dtStart.Add_ValueChanged({ Update-QueryPreview })
+    $script:dtEnd.Add_ValueChanged({ Update-QueryPreview })
+    $script:numTimeout.Add_ValueChanged({ Update-QueryPreview })
+    $script:radSender.Add_CheckedChanged({ Update-InactiveCaption; Update-QueryPreview })
+    $script:radAll.Add_CheckedChanged({ Update-InactiveCaption; Update-QueryPreview })
+    $script:chkInactive.Add_CheckedChanged({ Update-QueryPreview })
+    $script:chkNotify.Add_CheckedChanged({ Update-QueryPreview })
+    $script:btnConnect.Add_Click({ Connect-FromUi })
+    $script:btnInstall.Add_Click({ Install-ModuleFromUi })
+    $script:btnBrowse.Add_Click({ Browse-OutputFolder })
+    $script:btnStart.Add_Click({ Start-SearchFromUi })
+    $script:btnStop.Add_Click({ Stop-FromUi })
+    $script:btnPreview.Add_Click({ Start-PreviewFromUi })
+    $script:btnReport.Add_Click({ Start-ReportFromUi })
+    $script:btnOpenFolder.Add_Click({ Open-OutputFolder })
+    $script:btnPurview.Add_Click({ Open-PurviewPortal })
+    $script:btnCopyQuery.Add_Click({ Copy-UiText $script:txtQuery.Text 'Query' })
+    $script:btnCopyName.Add_Click({ Copy-UiText $script:txtSearchName.Text 'Search name' })
+    $script:btnRemove.Add_Click({ Remove-SearchFromUi })
+    $script:btnExportLog.Add_Click({ Export-ActivityLog })
+    $script:form.Add_FormClosing({
+        param($sender, $eventArgs)
+        if ($script:CommandRunning) {
+            $answer = [System.Windows.Forms.MessageBox]::Show(
+                $script:form,
+                "A Purview operation is still running.`r`n`r`nClose the window anyway? A search that already started keeps running in Purview.",
+                'Operation in progress',
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Warning)
+            if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) {
+                $eventArgs.Cancel = $true
+                return
+            }
+            $script:Sync.CancelRequested = $true
+        }
+        try { Save-SettingsFromUi } catch { }
+    })
+
+    $script:toolTip.SetToolTip($script:btnStart, 'Create and start a read-only compliance search.')
+    $script:toolTip.SetToolTip($script:btnPreview, 'Load a sample of sender, subject, and date. Does not export message bodies.')
+    $script:toolTip.SetToolTip($script:btnRemove, 'Remove the search definition from Purview. Does not modify messages.')
+    $script:toolTip.SetToolTip($script:chkInactive, 'For one mailbox, the address is prefixed with a period so an inactive mailbox can be searched.')
+
+    Update-InactiveCaption
+    Update-ModuleStatus
+    Update-QueryPreview
+    Add-UiLog "Purview Email Investigation v$($script:AppVersion) ready. Sign in with an account that can run compliance searches."
+
+    $script:UiTimer = New-Object System.Windows.Forms.Timer
+    $script:UiTimer.Interval = 400
+    $script:UiTimer.Add_Tick({ Update-InvestigationUi })
+    $script:UiTimer.Start()
+
+    try {
+        [void]$script:form.ShowDialog()
+    }
+    finally {
+        Close-InvestigationSession
+        if ($script:form -and -not $script:form.IsDisposed) { $script:form.Dispose() }
+    }
+}
+
+if ($MyInvocation.InvocationName -ne '.') {
+    Start-PurviewInvestigationGui
+}
