@@ -546,6 +546,7 @@ $byIndexSkip = @(Select-ItemsByGridIndex -Items @($planA, $planB, $planC) -Index
 Assert-Equal -Expected 2 -Actual $byIndexSkip.Count -Name 'Bulk apply by grid index skips non-Ready rows'
 $signedInSource = (Get-Content -LiteralPath $tool -Raw)
 Assert-True ($signedInSource -match 'New-GuiGrid -MultiSelect') 'Bulk and device grids allow multi-select'
+Assert-True ($signedInSource -match "New-GuiButton 'Apply all Ready'") 'Bulk tab can apply every Ready row without a selection'
 Assert-True ($signedInSource -match "New-GuiButton 'Apply selected'") 'Bulk tab applies the selected rows'
 Assert-True ($signedInSource -match 'Get-GuiSelectedRowIndexes') 'Apply uses selected grid indexes including SelectedCells'
 Assert-True ($signedInSource -notmatch 'HideSelection') 'DataGridView does not set HideSelection (not on .NET Framework)'

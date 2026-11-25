@@ -107,7 +107,7 @@ param(
     [string]$SettingsPath
 )
 
-$script:ToolVersion    = '2.0.5'
+$script:ToolVersion    = '2.0.6'
 $script:Root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $script:SettingsFile = if ($SettingsPath) { $SettingsPath } else { Join-Path $script:Root 'CAExemption.settings.json' }
 $script:RequiredScope  = 'Device.ReadWrite.All'
@@ -3996,18 +3996,21 @@ function Show-CAExemptionGui {
     $bulkBottom = New-Object System.Windows.Forms.Panel
     $bulkBottom.Dock = 'Bottom'
     $bulkBottom.Height = 50
-    $btnSelectReady = New-GuiButton 'Select Ready' 120 28 ([System.Drawing.Color]::FromArgb(70, 90, 120))
-    $btnSelectReady.Location = New-Object System.Drawing.Point(12, 10)
-    $bulkBottom.Controls.Add($btnSelectReady)
-    $btnApplyBulk = New-GuiButton 'Apply selected' 140 28 $green
-    $btnApplyBulk.Location = New-Object System.Drawing.Point(140, 10)
+    $btnApplyAll = New-GuiButton 'Apply all Ready' 150 28 $green
+    $btnApplyAll.Location = New-Object System.Drawing.Point(12, 10)
+    $bulkBottom.Controls.Add($btnApplyAll)
+    $btnApplyBulk = New-GuiButton 'Apply selected' 140 28 ([System.Drawing.Color]::FromArgb(70, 90, 120))
+    $btnApplyBulk.Location = New-Object System.Drawing.Point(170, 10)
     $bulkBottom.Controls.Add($btnApplyBulk)
+    $btnSelectReady = New-GuiButton 'Select Ready' 120 28 ([System.Drawing.Color]::FromArgb(70, 90, 120))
+    $btnSelectReady.Location = New-Object System.Drawing.Point(318, 10)
+    $bulkBottom.Controls.Add($btnSelectReady)
     $btnExportPlan = New-GuiButton 'Export preview' 140 28 $blue
-    $btnExportPlan.Location = New-Object System.Drawing.Point(288, 10)
+    $btnExportPlan.Location = New-Object System.Drawing.Point(446, 10)
     $bulkBottom.Controls.Add($btnExportPlan)
     $script:lblBulkSummary = New-Object System.Windows.Forms.Label
-    $script:lblBulkSummary.Text = 'Load a CSV to preview changes. Ctrl+click or Shift+click to choose rows.'
-    $script:lblBulkSummary.Location = New-Object System.Drawing.Point(440, 16)
+    $script:lblBulkSummary.Text = 'Load a CSV, click Preview, then Apply all Ready. No row selection required.'
+    $script:lblBulkSummary.Location = New-Object System.Drawing.Point(598, 16)
     $script:lblBulkSummary.AutoSize = $true
     $bulkBottom.Controls.Add($script:lblBulkSummary)
     $script:grdBulk = New-GuiGrid -MultiSelect
@@ -4184,7 +4187,8 @@ Graph ServerAd = CA ServerADJoined
 Sign-in: click Sign in. A browser window opens. Tenant ID is not required.
 Use device-code sign-in only when a browser cannot open (RDP / Server Core).
 
-Bulk CSV: Ctrl+click or Shift+click rows, or Select Ready, then Apply selected.
+Bulk CSV: Preview, then Apply all Ready. No row selection required.
+To update a subset, select rows (Ctrl+click / Shift+click) and click Apply selected.
 
 Permissions: Device.ReadWrite.All, User.Read.All
 Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
@@ -4428,7 +4432,7 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
             Set-GuiGridData $script:grdBulk $script:GuiPlan $planColumns
             Invoke-GuiSelectReadyRows
             $ready = @($script:GuiPlan | Where-Object { $_.Status -eq 'Ready' }).Count
-            $script:lblBulkSummary.Text = ("{0} row(s), {1} Ready selected. Ctrl+click or Shift+click to change the selection. Dry-run: {2}" -f @($script:GuiPlan).Count, $ready, $script:Settings.DryRun)
+            $script:lblBulkSummary.Text = ("{0} row(s), {1} Ready. Click Apply all Ready, or select rows and Apply selected. Dry-run: {2}" -f @($script:GuiPlan).Count, $ready, $script:Settings.DryRun)
             Clear-GuiBusy $script:lblBulkSummary.Text
         }
         catch {
@@ -4462,17 +4466,24 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
     }
 
     function Invoke-GuiBulkApply {
+        param([switch]$AllReady)
         $allReady = @(ConvertTo-ObjectArray $script:GuiPlan | Where-Object { $_.Status -eq 'Ready' })
         if ($allReady.Count -eq 0) {
             [void](Show-ToolDialog 'There are no Ready rows to apply. Preview a CSV first.' 'Bulk update' 'OK' 'Information')
             return
         }
-        $indexes = @(Get-GuiSelectedRowIndexes $script:grdBulk)
-        $ready = @(Select-ItemsByGridIndex -Items $script:GuiPlan -Indexes $indexes -ReadyOnly)
-        if ($ready.Count -eq 0) {
-            $ready = $allReady
+        $ready = $allReady
+        $confirm = "Update all {0} Ready device(s) now?"
+        if (-not $AllReady) {
+            $indexes = @(Get-GuiSelectedRowIndexes $script:grdBulk)
+            $ready = @(Select-ItemsByGridIndex -Items $script:GuiPlan -Indexes $indexes -ReadyOnly)
+            if ($ready.Count -eq 0) {
+                [void](Show-ToolDialog 'No Ready rows are selected. Click Apply all Ready to update every Ready device, or select rows first.' 'Bulk update' 'OK' 'Information')
+                return
+            }
+            $confirm = "Update {0} selected device(s) now?"
         }
-        if ((Show-ToolDialog ("Update {0} selected device(s) now?" -f $ready.Count) 'Confirm bulk update' 'YesNo' 'Warning') -ne [System.Windows.Forms.DialogResult]::Yes) {
+        if ((Show-ToolDialog ($confirm -f $ready.Count) 'Confirm bulk update' 'YesNo' 'Warning') -ne [System.Windows.Forms.DialogResult]::Yes) {
             return
         }
         if (-not (Test-GuiGraph)) { return }
@@ -4623,6 +4634,7 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
             if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $script:txtBulkPath.Text = $dialog.FileName }
         })
     $btnPreviewBulk.Add_Click({ Invoke-GuiBulkPreview })
+    $btnApplyAll.Add_Click({ Invoke-GuiBulkApply -AllReady })
     $btnSelectReady.Add_Click({ Invoke-GuiSelectReadyRows })
     $btnApplyBulk.Add_Click({ Invoke-GuiBulkApply })
     $btnExportPlan.Add_Click({
