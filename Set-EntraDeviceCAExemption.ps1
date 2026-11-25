@@ -14,7 +14,7 @@
       - Find devices by user and export a bulk-update CSV
       - Filter a CSV to devices with recent activity and export
       - Settings: default value, dry-run, audit log, device scope
-      - Connect or switch tenant
+      - Sign in with an interactive browser login (tenant ID not required)
 
     Use -Console for the legacy text menu. Device scope defaults to all
     operating systems; it can be narrowed to Windows or Windows Entra registered.
@@ -107,7 +107,7 @@ param(
     [string]$SettingsPath
 )
 
-$script:ToolVersion    = '2.0.0'
+$script:ToolVersion    = '2.0.1'
 $script:Root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $script:SettingsFile = if ($SettingsPath) { $SettingsPath } else { Join-Path $script:Root 'CAExemption.settings.json' }
 $script:RequiredScope  = 'Device.ReadWrite.All'
@@ -144,6 +144,7 @@ $script:Settings = @{
     DeviceScope     = 'All'
 }
 $script:GuiMode = $false
+$script:LastConnectError = $null
 $script:ValidDeviceScopes = @('All', 'Windows', 'WindowsRegistered')
 
 #region Console helpers
@@ -813,11 +814,27 @@ function Initialize-GraphModule {
     }
 }
 
-function Test-GraphConnection {
+function Test-GraphSignedIn {
     $context = $null
     try { $context = Get-MgContext } catch { return $false }
     if ($null -eq $context) { return $false }
-    if (-not $context.Account -and -not $context.TenantId) { return $false }
+    return -not [string]::IsNullOrWhiteSpace([string]$context.Account) -or -not [string]::IsNullOrWhiteSpace([string]$context.TenantId)
+}
+
+function ConvertTo-OptionalTenantId {
+    param([AllowNull()][string]$Value)
+    $text = if ($null -eq $Value) { '' } else { $Value.Trim().Trim('"') }
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    $guid = ConvertTo-CanonicalGuid $text
+    if ($guid) { return $guid }
+    if ($text -match '^[A-Za-z0-9][A-Za-z0-9.-]+\.[A-Za-z]{2,}$') { return $text }
+    return $null
+}
+
+function Test-GraphConnection {
+    if (-not (Test-GraphSignedIn)) { return $false }
+    $context = $null
+    try { $context = Get-MgContext } catch { return $false }
     $scopes = @($context.Scopes | Where-Object { $_ })
     # Some Graph SDK versions drop Scopes after a 204 PATCH; the token can still be valid.
     if ($scopes.Count -eq 0) { return $true }
@@ -830,36 +847,54 @@ function Test-GraphConnection {
 function Connect-Graph {
     param(
         [switch]$Reconnect,
-        [string]$Tenant = $TenantId,
-        [switch]$UseDeviceCode = $DeviceCode
+        [string]$Tenant,
+        [switch]$UseDeviceCode
     )
 
-    if ((Test-GraphConnection) -and -not $Reconnect) { return $true }
+    if ((Test-GraphSignedIn) -and -not $Reconnect) { return $true }
 
+    $script:LastConnectError = $null
     $silent = [bool]$script:GuiMode
+    if (-not $PSBoundParameters.ContainsKey('Tenant')) { $Tenant = $TenantId }
+    if (-not $PSBoundParameters.ContainsKey('UseDeviceCode')) { $UseDeviceCode = $DeviceCode }
+
     if (-not $silent) { Write-Title 'Connect to Microsoft Graph' }
     if (-not $Tenant -and -not $silent) {
         $Tenant = ([string](Read-Host 'Tenant ID or domain (press Enter for your home tenant)')).Trim()
     }
 
-    $connectCommand = Get-Command Connect-MgGraph -ErrorAction Stop
-    $useDevice = [bool]$UseDeviceCode
-    if (-not $silent -and -not $useDevice -and -not $Reconnect) {
-        Write-Host '  1) Interactive browser sign-in'
-        Write-Host '  2) Device code (RDP, Server Core, no browser)'
-        $method = Read-Choice 'Choose sign-in method [1]'
-        if ($method -eq '2') { $useDevice = $true }
-    }
-
-    $params = @{ Scopes = @($script:RequiredScopes) }
-    if ($Tenant) { $params['TenantId'] = $Tenant }
-    if ($connectCommand.Parameters.ContainsKey('NoWelcome')) { $params['NoWelcome'] = $true }
-    if ($connectCommand.Parameters.ContainsKey('ContextScope')) { $params['ContextScope'] = 'Process' }
-    if ($useDevice -and $connectCommand.Parameters.ContainsKey('UseDeviceCode')) {
-        $params['UseDeviceCode'] = $true
+    $tenantId = ConvertTo-OptionalTenantId $Tenant
+    if ($Tenant -and -not $tenantId) {
+        if ($silent) {
+            # GUI sign-in never requires a tenant. Ignore junk so Connect-MgGraph
+            # is not called with an empty or invalid TenantId.
+            $tenantId = $null
+        }
+        else {
+            $script:LastConnectError = 'Leave Tenant blank for interactive sign-in, or enter a tenant GUID or domain such as contoso.onmicrosoft.com.'
+            Write-Host $script:LastConnectError -ForegroundColor Red
+            return $false
+        }
     }
 
     try {
+        $connectCommand = Get-Command Connect-MgGraph -ErrorAction Stop
+        $useDevice = [bool]$UseDeviceCode
+        if (-not $silent -and -not $useDevice -and -not $Reconnect) {
+            Write-Host '  1) Interactive browser sign-in'
+            Write-Host '  2) Device code (RDP, Server Core, no browser)'
+            $method = Read-Choice 'Choose sign-in method [1]'
+            if ($method -eq '2') { $useDevice = $true }
+        }
+
+        $params = @{ Scopes = @($script:RequiredScopes) }
+        if ($tenantId) { $params['TenantId'] = $tenantId }
+        if ($connectCommand.Parameters.ContainsKey('NoWelcome')) { $params['NoWelcome'] = $true }
+        if ($connectCommand.Parameters.ContainsKey('ContextScope')) { $params['ContextScope'] = 'Process' }
+        if ($useDevice -and $connectCommand.Parameters.ContainsKey('UseDeviceCode')) {
+            $params['UseDeviceCode'] = $true
+        }
+
         if ($Reconnect) {
             $existing = $null
             try { $existing = Get-MgContext } catch { }
@@ -867,7 +902,7 @@ function Connect-Graph {
                 try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { }
             }
         }
-        Connect-MgGraph @params | Out-Null
+        Connect-MgGraph @params -ErrorAction Stop | Out-Null
     }
     catch {
         $script:LastConnectError = Get-GraphErrorMessage $_
@@ -875,14 +910,22 @@ function Connect-Graph {
         return $false
     }
 
-    if (-not (Test-GraphConnection)) {
-        $script:LastConnectError = "Signed in, but these permissions were not granted: {0}. An administrator may need to consent." -f ($script:RequiredScopes -join ', ')
+    if (-not (Test-GraphSignedIn)) {
+        if (-not $script:LastConnectError) {
+            $script:LastConnectError = 'Sign-in did not complete. Click Sign in to try the interactive browser login again.'
+        }
         if (-not $silent) { Write-Host $script:LastConnectError -ForegroundColor Red }
         return $false
     }
 
-    $context = Get-MgContext
-    if (-not $silent) { Write-Host "Connected as $($context.Account) to tenant $($context.TenantId)" -ForegroundColor Green }
+    if (-not (Test-GraphConnection)) {
+        $script:LastConnectError = "Signed in, but these permissions were not granted: {0}. An administrator may need to consent." -f ($script:RequiredScopes -join ', ')
+        if (-not $silent) { Write-Host $script:LastConnectError -ForegroundColor Yellow }
+    }
+
+    $context = $null
+    try { $context = Get-MgContext } catch { }
+    if (-not $silent -and $context) { Write-Host "Connected as $($context.Account) to tenant $($context.TenantId)" -ForegroundColor Green }
     return $true
 }
 
@@ -3694,34 +3737,16 @@ function Show-CAExemptionGui {
     $connectPanel.Dock = 'Top'
     $connectPanel.Height = 52
     $connectPanel.BackColor = $navy2
-    $lblTenant = New-Object System.Windows.Forms.Label
-    $lblTenant.Text = 'Tenant'
-    $lblTenant.ForeColor = [System.Drawing.Color]::White
-    $lblTenant.AutoSize = $true
-    $lblTenant.Location = New-Object System.Drawing.Point(18, 16)
-    $connectPanel.Controls.Add($lblTenant)
-    $script:txtTenant = New-Object System.Windows.Forms.TextBox
-    $script:txtTenant.Location = New-Object System.Drawing.Point(70, 12)
-    $script:txtTenant.Size = New-Object System.Drawing.Size(280, 26)
-    $script:txtTenant.Text = $TenantId
-    $connectPanel.Controls.Add($script:txtTenant)
-    $script:chkDeviceCode = New-Object System.Windows.Forms.CheckBox
-    $script:chkDeviceCode.Text = 'Device code'
-    $script:chkDeviceCode.ForeColor = [System.Drawing.Color]::White
-    $script:chkDeviceCode.AutoSize = $true
-    $script:chkDeviceCode.Location = New-Object System.Drawing.Point(360, 14)
-    $script:chkDeviceCode.Checked = [bool]$DeviceCode
-    $connectPanel.Controls.Add($script:chkDeviceCode)
-    $btnConnect = New-GuiButton 'Connect' 110 28 $blue
-    $btnConnect.Location = New-Object System.Drawing.Point(470, 11)
+    $btnConnect = New-GuiButton 'Sign in' 120 28 $blue
+    $btnConnect.Location = New-Object System.Drawing.Point(18, 11)
     $connectPanel.Controls.Add($btnConnect)
-    $btnReconnect = New-GuiButton 'Switch tenant' 120 28 ([System.Drawing.Color]::FromArgb(70, 90, 120))
-    $btnReconnect.Location = New-Object System.Drawing.Point(588, 11)
+    $btnReconnect = New-GuiButton 'Switch account' 130 28 ([System.Drawing.Color]::FromArgb(70, 90, 120))
+    $btnReconnect.Location = New-Object System.Drawing.Point(146, 11)
     $connectPanel.Controls.Add($btnReconnect)
     $script:lblScopeBanner = New-Object System.Windows.Forms.Label
     $script:lblScopeBanner.ForeColor = $muted
     $script:lblScopeBanner.AutoSize = $true
-    $script:lblScopeBanner.Location = New-Object System.Drawing.Point(720, 16)
+    $script:lblScopeBanner.Location = New-Object System.Drawing.Point(290, 16)
     $connectPanel.Controls.Add($script:lblScopeBanner)
 
     $footer = New-Object System.Windows.Forms.Panel
@@ -3983,11 +4008,17 @@ function Show-CAExemptionGui {
     $script:txtLogPath.Size = New-Object System.Drawing.Size(520, 26)
     $script:txtLogPath.Text = $script:Settings.LogPath
     $tabSettings.Controls.Add($script:txtLogPath)
+    $script:chkDeviceCode = New-Object System.Windows.Forms.CheckBox
+    $script:chkDeviceCode.Text = 'Use device-code sign-in (RDP / no browser). Leave off for a normal interactive login.'
+    $script:chkDeviceCode.Location = New-Object System.Drawing.Point(24, 248)
+    $script:chkDeviceCode.AutoSize = $true
+    $script:chkDeviceCode.Checked = [bool]$DeviceCode
+    $tabSettings.Controls.Add($script:chkDeviceCode)
     $btnSaveSettings = New-GuiButton 'Save settings' 140 32 $green
-    $btnSaveSettings.Location = New-Object System.Drawing.Point(24, 250)
+    $btnSaveSettings.Location = New-Object System.Drawing.Point(24, 286)
     $tabSettings.Controls.Add($btnSaveSettings)
     $lblHelp = New-Object System.Windows.Forms.Label
-    $lblHelp.Location = New-Object System.Drawing.Point(24, 300)
+    $lblHelp.Location = New-Object System.Drawing.Point(24, 336)
     $lblHelp.Size = New-Object System.Drawing.Size(900, 200)
     $lblHelp.Text = @"
 Conditional Access filter (case-sensitive):
@@ -3996,6 +4027,9 @@ Conditional Access filter (case-sensitive):
 Graph trustType Workplace = CA AzureADRegistered
 Graph AzureAd = CA AzureADJoined
 Graph ServerAd = CA ServerADJoined
+
+Sign-in: click Sign in. A browser window opens. Tenant ID is not required.
+Use device-code sign-in only when a browser cannot open (RDP / Server Core).
 
 Permissions: Device.ReadWrite.All, User.Read.All
 Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
@@ -4051,17 +4085,38 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
         [System.Windows.Forms.Application]::DoEvents()
     }
 
-    function Test-GuiGraph {
-        if (Test-GraphConnection) { return $true }
-        $ok = Connect-Graph -Tenant $script:txtTenant.Text.Trim() -UseDeviceCode:$script:chkDeviceCode.Checked
-        Update-GuiBanner
-        if (-not $ok) {
+    function Invoke-GuiSignIn {
+        param([switch]$Reconnect)
+        $script:LastConnectError = $null
+        Set-GuiBusy 'Opening the Microsoft sign-in window...'
+        try {
+            $useDevice = $false
+            if ($script:chkDeviceCode -and $script:chkDeviceCode.Checked) { $useDevice = $true }
+            $ok = Connect-Graph -Reconnect:$Reconnect -UseDeviceCode:$useDevice
+            Update-GuiBanner
+            if ($ok) {
+                Clear-GuiBusy 'Signed in. Search for a device or load the current scope.'
+                if ($script:LastConnectError) {
+                    [void](Show-ToolDialog $script:LastConnectError 'Permissions' 'OK' 'Warning')
+                }
+                return $true
+            }
+            Clear-GuiBusy 'Sign-in did not complete'
             $msg = $script:LastConnectError
-            if (-not $msg) { $msg = 'Could not connect to Microsoft Graph.' }
+            if (-not $msg) { $msg = 'Sign-in did not complete. Click Sign in to try the interactive browser login again.' }
             [void](Show-ToolDialog $msg 'Sign-in' 'OK' 'Warning')
             return $false
         }
-        return $true
+        catch {
+            Clear-GuiBusy 'Sign-in failed'
+            [void](Show-ToolDialog (Format-CaughtError $_) 'Sign-in failed' 'OK' 'Error')
+            return $false
+        }
+    }
+
+    function Test-GuiGraph {
+        if (Test-GraphSignedIn) { return $true }
+        return (Invoke-GuiSignIn)
     }
 
     function Save-GuiExportRows {
@@ -4075,12 +4130,17 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
         $dialog.Filter = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*'
         $dialog.FileName = $DefaultName
         if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
-        $rows | Export-Csv -Path $dialog.FileName -NoTypeInformation -Encoding UTF8
-        [void](Show-ToolDialog ("Exported {0} row(s) to`n{1}" -f $rows.Count, $dialog.FileName) 'Export' 'OK' 'Information')
-        if ($ApplyAfter) {
-            $script:txtBulkPath.Text = $dialog.FileName
-            $tabs.SelectedTab = $tabBulk
-            Invoke-GuiBulkPreview
+        try {
+            $rows | Export-Csv -Path $dialog.FileName -NoTypeInformation -Encoding UTF8
+            [void](Show-ToolDialog ("Exported {0} row(s) to`n{1}" -f $rows.Count, $dialog.FileName) 'Export' 'OK' 'Information')
+            if ($ApplyAfter) {
+                $script:txtBulkPath.Text = $dialog.FileName
+                $tabs.SelectedTab = $tabBulk
+                Invoke-GuiBulkPreview
+            }
+        }
+        catch {
+            [void](Show-ToolDialog (Format-CaughtError $_) 'Export failed' 'OK' 'Error')
         }
     }
 
@@ -4309,30 +4369,8 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
         }
     }
 
-    $btnConnect.Add_Click({
-            Set-GuiBusy 'Connecting to Microsoft Graph...'
-            $ok = Connect-Graph -Tenant $script:txtTenant.Text.Trim() -UseDeviceCode:$script:chkDeviceCode.Checked
-            Update-GuiBanner
-            if ($ok) { Clear-GuiBusy 'Connected.' }
-            else {
-                Clear-GuiBusy 'Sign-in failed'
-                $msg = $script:LastConnectError
-                if (-not $msg) { $msg = 'Sign-in failed.' }
-                [void](Show-ToolDialog $msg 'Sign-in failed' 'OK' 'Error')
-            }
-        })
-    $btnReconnect.Add_Click({
-            Set-GuiBusy 'Switching tenant...'
-            $ok = Connect-Graph -Reconnect -Tenant $script:txtTenant.Text.Trim() -UseDeviceCode:$script:chkDeviceCode.Checked
-            Update-GuiBanner
-            if ($ok) { Clear-GuiBusy 'Connected.' }
-            else {
-                Clear-GuiBusy 'Sign-in failed'
-                $msg = $script:LastConnectError
-                if (-not $msg) { $msg = 'Sign-in failed.' }
-                [void](Show-ToolDialog $msg 'Sign-in failed' 'OK' 'Error')
-            }
-        })
+    $btnConnect.Add_Click({ [void](Invoke-GuiSignIn) })
+    $btnReconnect.Add_Click({ [void](Invoke-GuiSignIn -Reconnect) })
     $btnSearch.Add_Click({ Invoke-GuiDeviceSearch })
     $script:txtDeviceSearch.Add_KeyDown({
             if ($_.KeyCode -eq 'Enter') { Invoke-GuiDeviceSearch; $_.SuppressKeyPress = $true }
@@ -4393,26 +4431,42 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
     $btnExportAct.Add_Click({ Save-GuiExportRows -Rows $script:GuiActivityRows -DefaultName ('CAExemption-RecentActivity_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss')) })
     $btnApplyAct.Add_Click({ Save-GuiExportRows -Rows $script:GuiActivityRows -DefaultName ('CAExemption-RecentActivity_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss')) -ApplyAfter })
     $btnSaveSettings.Add_Click({
-            $value = $script:txtDefaultValue.Text.Trim()
-            if (-not (Test-ValidValue $value -Quiet)) {
-                [void](Show-ToolDialog (Get-ValueValidationError $value) 'Settings' 'OK' 'Warning')
-                return
+            try {
+                $value = $script:txtDefaultValue.Text.Trim()
+                if (-not (Test-ValidValue $value -Quiet)) {
+                    [void](Show-ToolDialog (Get-ValueValidationError $value) 'Settings' 'OK' 'Warning')
+                    return
+                }
+                $script:Settings.DefaultValue = $value
+                $script:Settings.DryRun = [bool]$script:chkDryRun.Checked
+                $script:Settings.LogPath = $script:txtLogPath.Text.Trim()
+                switch ($script:cmbScope.SelectedIndex) {
+                    0 { Set-DeviceScope 'All' }
+                    1 { Set-DeviceScope 'Windows' }
+                    2 { Set-DeviceScope 'WindowsRegistered' }
+                }
+                Export-ToolSettings
+                Update-GuiBanner
+                [void](Show-ToolDialog 'Settings saved.' 'Settings' 'OK' 'Information')
             }
-            $script:Settings.DefaultValue = $value
-            $script:Settings.DryRun = [bool]$script:chkDryRun.Checked
-            $script:Settings.LogPath = $script:txtLogPath.Text.Trim()
-            switch ($script:cmbScope.SelectedIndex) {
-                0 { Set-DeviceScope 'All' }
-                1 { Set-DeviceScope 'Windows' }
-                2 { Set-DeviceScope 'WindowsRegistered' }
+            catch {
+                [void](Show-ToolDialog (Format-CaughtError $_) 'Settings' 'OK' 'Error')
             }
-            Export-ToolSettings
-            Update-GuiBanner
-            [void](Show-ToolDialog 'Settings saved.' 'Settings' 'OK' 'Information')
         })
 
     Update-GuiBanner
-    $script:lblStatus.Text = 'Connect to Microsoft Graph to search and update devices of any operating system.'
+    $script:lblStatus.Text = 'Click Sign in. A browser window opens for your Microsoft account. Tenant ID is not required.'
+    try {
+        [System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException)
+        $unhandled = [System.Threading.ThreadExceptionEventHandler] {
+            param($sender, $eventArgs)
+            $message = 'An unexpected error occurred.'
+            if ($eventArgs -and $eventArgs.Exception) { $message = [string]$eventArgs.Exception.Message }
+            [void][System.Windows.Forms.MessageBox]::Show($message, 'Entra device exemption', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        }
+        [System.Windows.Forms.Application]::add_ThreadException($unhandled)
+    }
+    catch { }
     [void]$form.ShowDialog()
 }
 
@@ -4436,7 +4490,6 @@ function Start-GuiInStaIfNeeded {
 
 function Start-CAExemptionTool {
     $savedEap = $ErrorActionPreference
-    $ErrorActionPreference = 'Stop'
     try {
         Import-ToolSettings
         Sync-DeviceScopeSettings
@@ -4452,6 +4505,7 @@ function Start-CAExemptionTool {
         }
 
         if ($useConsole) {
+            $ErrorActionPreference = 'Stop'
             Show-MainMenu
             if (Get-MgContext) {
                 if (Read-YesNo 'Disconnect from Microsoft Graph?' $true) {
@@ -4463,6 +4517,7 @@ function Start-CAExemptionTool {
         }
 
         if (-not (Start-GuiInStaIfNeeded)) { return }
+        $ErrorActionPreference = 'Continue'
         Show-CAExemptionGui
     }
     finally {

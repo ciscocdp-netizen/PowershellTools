@@ -509,6 +509,21 @@ Assert-Equal -Expected 'PHONE-01' -Actual $guiName -Name 'GUI data table copies 
 Assert-Equal -Expected 'iOS' -Actual $guiOs -Name 'GUI data table copies OperatingSystem'
 Set-DeviceScope 'WindowsRegistered'
 
+# --- Interactive sign-in: never pass an empty TenantId to Connect-MgGraph ---
+Assert-Equal -Expected $null -Actual (ConvertTo-OptionalTenantId $null) -Name 'Optional tenant null is omitted'
+Assert-Equal -Expected $null -Actual (ConvertTo-OptionalTenantId '') -Name 'Optional tenant empty is omitted'
+Assert-Equal -Expected $null -Actual (ConvertTo-OptionalTenantId '   ') -Name 'Optional tenant whitespace is omitted'
+Assert-Equal -Expected $null -Actual (ConvertTo-OptionalTenantId '""') -Name 'Optional tenant quoted empty is omitted'
+Assert-Equal -Expected 'e18c199f-7bc4-489e-b810-eddee385899b' -Actual (ConvertTo-OptionalTenantId '{E18C199F-7BC4-489E-B810-EDDEE385899B}') -Name 'Optional tenant GUID is normalised'
+Assert-Equal -Expected 'contoso.onmicrosoft.com' -Actual (ConvertTo-OptionalTenantId ' contoso.onmicrosoft.com ') -Name 'Optional tenant domain is trimmed'
+Assert-Equal -Expected $null -Actual (ConvertTo-OptionalTenantId 'not a tenant') -Name 'Optional tenant junk is omitted'
+Assert-True ((Test-GraphSignedIn) -is [bool]) 'Test-GraphSignedIn returns a boolean without throwing'
+$signedInSource = (Get-Content -LiteralPath $tool -Raw)
+Assert-True ($signedInSource -match 'function Test-GraphSignedIn') 'Script defines Test-GraphSignedIn'
+Assert-True ($signedInSource -notmatch 'txtTenant') 'GUI no longer has a Tenant text box'
+Assert-True ($signedInSource -match "New-GuiButton 'Sign in'") 'GUI uses a Sign in button'
+Assert-True ($signedInSource -notmatch 'Connect-Graph -Tenant \$script:txtTenant') 'GUI does not pass the Tenant text box into Connect-Graph'
+
 Write-Host ''
 Write-Host ("Passed: {0}  Failed: {1}" -f $script:Passed, $script:Failed) -ForegroundColor $(if ($script:Failed -eq 0) { 'Green' } else { 'Red' })
 if ($script:Failed -gt 0) { exit 1 }
