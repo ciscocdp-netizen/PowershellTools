@@ -108,7 +108,7 @@ param(
     [string]$SettingsPath
 )
 
-$script:ToolVersion    = '2.0.10'
+$script:ToolVersion    = '2.0.11'
 $script:Root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $script:SettingsFile = if ($SettingsPath) { $SettingsPath } else { Join-Path $script:Root 'CAExemption.settings.json' }
 $script:RequiredScope  = 'Device.ReadWrite.All'
@@ -828,6 +828,56 @@ function Get-GraphErrorMessage {
         if ($details) { return $details }
     }
     return $message
+}
+
+function Test-DisplayNameUpdateForbidden {
+    param([AllowNull()][string]$Message)
+    if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
+    return ($Message -match 'external service|originated within|cannot be updated|read-only|Property displayName|Request_BadRequest')
+}
+
+function Get-DisplayNameUpdateAdvice {
+    param([AllowNull()][string]$Message)
+    $text = if ($null -eq $Message) { '' } else { [string]$Message }
+    if ($text -match '401|Unauthorized|expired|Authentication_Expired|invalid_grant|AADSTS') {
+        return 'Sign-in expired or a browser login is waiting. Finish the Edge sign-in window (or click Switch account), then try Prepend again.'
+    }
+    if ($text -match '403|Authorization_RequestDenied|Insufficient|Access denied') {
+        return 'Your account cannot rename this device. Use Cloud Device Administrator, or Intune Administrator if the device is Intune-managed.'
+    }
+    if (Test-DisplayNameUpdateForbidden $text) {
+        return 'Entra ID does not allow renaming this device (common for iPhone/iPad Company Portal devices). The tool will try Intune when possible.'
+    }
+    return $text
+}
+
+function Format-GuiChangeSummary {
+    param($Results, [string]$Extra)
+    $rows = ConvertTo-ObjectArray $Results
+    $ok = @($rows | Where-Object { $_.Status -eq 'Success' }).Count
+    $dry = @($rows | Where-Object { $_.Status -eq 'DryRun' }).Count
+    $fail = @($rows | Where-Object { $_.Status -eq 'Failed' }).Count
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add(("Succeeded: {0}" -f $ok))
+    $lines.Add(("Dry-run: {0}" -f $dry))
+    $lines.Add(("Failed: {0}" -f $fail))
+    if ($Extra) { $lines.Add($Extra) }
+    foreach ($entry in $rows) {
+        if ([string]$entry.Status -ne 'Failed') { continue }
+        $name = [string]$entry.DisplayName
+        if ([string]::IsNullOrWhiteSpace($name)) { $name = [string]$entry.DeviceId }
+        if ([string]::IsNullOrWhiteSpace($name)) { $name = 'Device' }
+        $err = [string]$entry.Message
+        if ([string]::IsNullOrWhiteSpace($err)) { $err = 'Graph did not return an error message.' }
+        $advice = Get-DisplayNameUpdateAdvice $err
+        if ($advice -and $advice -ne $err) {
+            $lines.Add(("{0}: {1}`n{2}" -f $name, $err, $advice))
+        }
+        else {
+            $lines.Add(("{0}: {1}" -f $name, $err))
+        }
+    }
+    return ($lines -join [Environment]::NewLine)
 }
 
 function Format-CaughtError {
@@ -2069,6 +2119,89 @@ function Invoke-DeviceExtensionAttributeUpdates {
     return (ConvertTo-ObjectArray $results)
 }
 
+function Find-IntuneManagedDeviceId {
+    param($Device)
+    $azureId = ''
+    if ($Device) { $azureId = [string]$Device.DeviceId }
+    if ([string]::IsNullOrWhiteSpace($azureId)) { return '' }
+    $filter = "azureADDeviceId eq '{0}'" -f $azureId.Replace("'", "''")
+    $uri = 'https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?$filter={0}&$select=id,deviceName,azureADDeviceId' -f [uri]::EscapeDataString($filter)
+    try {
+        $result = Invoke-GraphRequestWithRetry -Method GET -Uri $uri -ExpectBody
+        foreach ($item in (ConvertTo-ObjectArray (Get-GraphCollection $result))) {
+            $id = [string](Get-GraphProperty $item 'id')
+            if (-not [string]::IsNullOrWhiteSpace($id)) { return $id }
+        }
+    }
+    catch { }
+    return ''
+}
+
+function Set-DeviceDisplayName {
+    param(
+        [Parameter(Mandatory = $true)] $Device,
+        [string]$NewName,
+        [string]$Source = 'Single'
+    )
+
+    $status = 'Success'
+    $message = ''
+    $changedBy = ''
+    try {
+        $context = Get-MgContext
+        if ($context) { $changedBy = [string]$context.Account }
+    }
+    catch { }
+
+    if ($Device.IsManagementRestricted) {
+        $message = 'Device is in a restricted management administrative unit; the update may be denied.'
+    }
+
+    if ($script:Settings.DryRun) {
+        $status = 'DryRun'
+        $message = 'No change written (dry-run mode)'
+        $entry = New-DeviceAuditEntry -Device $Device -NewValue $NewName -Status $status -Action 'PrependName' -Source $Source -Message $message -ChangedBy $changedBy
+        Write-AuditLog $entry
+        return $entry
+    }
+
+    $body = New-DisplayNamePatchJson $NewName
+    $uri = "$($script:GraphBase)/$($Device.ObjectId)"
+    try {
+        Invoke-GraphRequestWithRetry -Method PATCH -Uri $uri -Body $body -ContentType 'application/json' | Out-Null
+    }
+    catch {
+        $status = 'Failed'
+        $message = Get-GraphErrorMessage $_
+        $intuneId = ''
+        if (Test-DisplayNameUpdateForbidden $message -or $message -match '403|Authorization_RequestDenied') {
+            try { $intuneId = Find-IntuneManagedDeviceId $Device } catch { $intuneId = '' }
+            if ($intuneId) {
+                try {
+                    $intuneBody = ('{{"deviceName":{0}}}' -f (ConvertTo-JsonStringLiteral $NewName))
+                    Invoke-GraphRequestWithRetry -Method PATCH -Uri ('https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/{0}' -f $intuneId) -Body $intuneBody -ContentType 'application/json' | Out-Null
+                    $status = 'Success'
+                    $message = 'Updated via Intune (Entra displayName is read-only for this device).'
+                }
+                catch {
+                    $intuneError = Get-GraphErrorMessage $_
+                    $message = '{0} Intune rename failed: {1}' -f $message, $intuneError
+                }
+            }
+        }
+        if ($status -eq 'Failed') {
+            $advice = Get-DisplayNameUpdateAdvice $message
+            if ($advice -and $advice -ne $message) {
+                $message = '{0} {1}' -f $message, $advice
+            }
+        }
+    }
+
+    $entry = New-DeviceAuditEntry -Device $Device -NewValue $NewName -Status $status -Action 'PrependName' -Source $Source -Message $message -ChangedBy $changedBy
+    Write-AuditLog $entry
+    return $entry
+}
+
 function Invoke-DeviceDisplayNamePrefixUpdates {
     param($PlanItems, [string]$Source)
     $items = New-Object System.Collections.Generic.List[object]
@@ -2080,62 +2213,12 @@ function Invoke-DeviceDisplayNamePrefixUpdates {
     $results = New-Object System.Collections.Generic.List[object]
     if ($items.Count -eq 0) { return (ConvertTo-ObjectArray $results) }
 
-    $changedBy = ''
-    try {
-        $context = Get-MgContext
-        if ($context) { $changedBy = [string]$context.Account }
-    }
-    catch { }
-
-    if ($script:Settings.DryRun) {
-        foreach ($item in $items) {
-            $results.Add((New-DeviceAuditEntry -Device $item.Device -NewValue $item.NewName -Status 'DryRun' -Action 'PrependName' -Source $Source -Message 'No change written (dry-run mode)' -ChangedBy $changedBy))
-        }
-        Write-AuditLogs (ConvertTo-ObjectArray $results)
-        return (ConvertTo-ObjectArray $results)
-    }
-
-    $requests = New-Object System.Collections.Generic.List[object]
-    $meta = New-Object 'System.Collections.Generic.Dictionary[string,object]'
     $n = 0
     foreach ($item in $items) {
         $n++
-        $id = [string]$n
-        $url = '/devices/{0}' -f $item.Device.ObjectId
-        $bodyJson = New-DisplayNamePatchJson $item.NewName
-        $requests.Add((New-GraphBatchRequest -Id $id -Method PATCH -Url $url -BodyJson $bodyJson))
-        $meta.Add($id, $item)
+        Write-Host ("  Renaming {0}/{1}: {2} -> {3}" -f $n, $items.Count, $item.Device.DisplayName, $item.NewName)
+        $results.Add((Set-DeviceDisplayName -Device $item.Device -NewName $item.NewName -Source $Source))
     }
-
-    Write-Host ("  Prepending device names in Graph batches of {0}..." -f $script:GraphBatchSize)
-    $responses = Invoke-GraphBatch -Requests $requests -Activity 'Device name prefix'
-    $byId = New-Object 'System.Collections.Generic.Dictionary[string,object]'
-    foreach ($resp in $responses) {
-        $id = [string]$resp.Id
-        if ($id -and -not $byId.ContainsKey($id)) { $byId.Add($id, $resp) }
-    }
-
-    foreach ($kv in $meta.GetEnumerator()) {
-        $item = $kv.Value
-        $status = 'Failed'
-        $message = 'No batch response'
-        if ($byId.ContainsKey($kv.Key)) {
-            $resp = $byId[$kv.Key]
-            if ($resp.Status -ge 200 -and $resp.Status -lt 300) {
-                $status = 'Success'
-                $message = ''
-                if ($item.Device.IsManagementRestricted) {
-                    $message = 'Device is in a restricted management administrative unit; the update may be denied.'
-                }
-            }
-            else {
-                $message = Get-GraphBatchErrorMessage $resp
-            }
-        }
-        $results.Add((New-DeviceAuditEntry -Device $item.Device -NewValue $item.NewName -Status $status -Action 'PrependName' -Source $Source -Message $message -ChangedBy $changedBy))
-    }
-
-    Write-AuditLogs (ConvertTo-ObjectArray $results)
     return (ConvertTo-ObjectArray $results)
 }
 
@@ -4826,6 +4909,9 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
             $ok = @($results | Where-Object { $_.Status -eq 'Success' }).Count
             $dry = @($results | Where-Object { $_.Status -eq 'DryRun' }).Count
             $fail = @($results | Where-Object { $_.Status -eq 'Failed' }).Count
+            $extra = ''
+            if ($already -gt 0) { $extra = "Already prefixed: $already" }
+            $msg = Format-GuiChangeSummary -Results $results -Extra $extra
             foreach ($entry in $results) {
                 if ($entry.Status -notin @('Success', 'DryRun')) { continue }
                 $device = Find-GuiDeviceByObjectId $script:GuiDevices $entry.ObjectId
@@ -4845,10 +4931,8 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
             }
             if ($script:GuiDevices) { Set-GuiGridData $script:grdDevices $script:GuiDevices $deviceColumns }
             if ($script:GuiPlan) { Set-GuiGridData $script:grdBulk $script:GuiPlan $planColumns }
-            $msg = "Succeeded: $ok`nDry-run: $dry`nFailed: $fail"
-            if ($already -gt 0) { $msg = $msg + "`nAlready prefixed: $already" }
-            Clear-GuiBusy $msg.Replace("`n", '  ')
-            [void](Show-ToolDialog $msg 'Prepend names' 'OK' 'Information')
+            Clear-GuiBusy $msg.Replace([Environment]::NewLine, '  ')
+            [void](Show-ToolDialog $msg 'Prepend names' 'OK' $(if ($fail -gt 0) { 'Warning' } else { 'Information' }))
         }
         catch {
             Clear-GuiBusy 'Name prefix failed'

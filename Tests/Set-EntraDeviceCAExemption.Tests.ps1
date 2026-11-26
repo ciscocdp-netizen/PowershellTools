@@ -593,6 +593,14 @@ Assert-True ($signedInSource -match 'Get-SingleOrSelectedDevices') 'One search r
 Assert-True ($signedInSource -match 'Show-ToolInputBox') 'Prepend can prompt for a device name interactively'
 Assert-True ($signedInSource -match 'Rename this device display name') 'Single-device prepend confirms current and new names'
 Assert-True ($signedInSource -match 'BindingContext') 'Grid current row is read after the button takes focus'
+Assert-True ($signedInSource -match 'Format-GuiChangeSummary') 'Failed prepends show the Graph error message'
+Assert-True ($signedInSource -match 'Set-DeviceDisplayName') 'Name prepend uses a direct device PATCH like extensionAttribute1'
+$failDevice = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -DisplayName 'iPhone 13 Pro' -Os 'iOS')
+$failEntry = New-DeviceAuditEntry -Device $failDevice -NewValue 'CA201-iPhone 13 Pro' -Status 'Failed' -Action 'PrependName' -Source 'Test' -Message 'Authorization_RequestDenied' -ChangedBy ''
+$failSummary = Format-GuiChangeSummary -Results $failEntry
+Assert-True ($failSummary -match 'Failed: 1') 'Summary counts a failed rename'
+Assert-True ($failSummary -match 'Authorization_RequestDenied') 'Summary includes the Graph error text'
+Assert-True ((Get-DisplayNameUpdateAdvice 'Unauthorized') -match 'Switch account') '401 advice tells the user to finish sign-in'
 $onlyLoaded = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -DisplayName 'iPhone 13 Pro' -Os 'iOS' -ExtensionAttribute1 'CA201-Excluded')
 $fromLoaded = Get-SingleOrSelectedDevices -Selected $null -Loaded $onlyLoaded
 Assert-Equal -Expected 1 -Actual $fromLoaded.Count -Name 'Single loaded device is used when nothing is selected'
