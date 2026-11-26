@@ -1,0 +1,5482 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Modern GUI to add, modify or clear extensionAttribute1 on any Entra ID device,
+    for use in Conditional Access device filters.
+
+.DESCRIPTION
+    Compatible with Windows PowerShell 5.1 and PowerShell 7+ on Windows.
+
+    A WinForms GUI covers:
+      - Search and list Entra devices of any operating system
+      - Update extensionAttribute1 on a selected device
+      - Prepend a name prefix (default CA201-) on selected devices or in bulk
+      - Bulk update from CSV, with a preview before any change
+      - Find devices by user and export a bulk-update CSV
+      - Filter a CSV to devices with recent activity and export
+      - Settings: default value, dry-run, audit log, device scope
+      - Sign in with an interactive browser login (tenant ID not required)
+
+    Use -Console for the legacy text menu. Device scope defaults to all
+    operating systems; it can be narrowed to Windows or Windows Entra registered.
+
+    Every change (or dry-run) is written to a CSV audit log.
+
+    Fixes versus the original draft:
+      - Graph responses are read as hashtables or objects (SDK version differences)
+      - Single-device GET results are not enumerated as hashtable keys
+      - PATCH JSON sends a real JSON null when clearing (PS 5.1 ConvertTo-Json pitfalls)
+      - HTTP 429/503 retries with backoff
+      - Windows + Entra-registered filter is applied in Graph, not only after download
+      - CSV headers, delimiters, {GUID} braces and aliases are normalised
+      - Missing CSV devices are looked up so "not eligible" is distinct from "not found"
+      - Graph error bodies, throttling and progress cleanup are handled
+      - Settings persist next to the script; device-code sign-in is offered
+
+.PARAMETER SkipMain
+    Load functions without starting the GUI. Used by tests.
+
+.PARAMETER Console
+    Start the legacy text menu instead of the GUI.
+
+.PARAMETER TenantId
+    Optional tenant ID or domain passed to Connect-MgGraph.
+
+.PARAMETER DeviceCode
+    Use device-code sign-in instead of the interactive browser.
+
+.PARAMETER SettingsPath
+    Optional path to a JSON settings file. Defaults to CAExemption.settings.json
+    next to this script.
+
+.NOTES
+    Requirements
+      - Module: Microsoft.Graph.Authentication (the script offers to install it)
+      - Delegated Graph permissions: Device.ReadWrite.All, User.Read.All, and Intune device rename
+        scopes (admin consent required). Entra ID can only change displayName on Windows devices;
+        iOS/Android names are renamed in Intune when the device is managed there.
+      - Entra role: Cloud Device Administrator, Intune Administrator or Global Administrator
+      - Windows PowerShell 5.1 needs .NET Framework 4.7.2 or later for the Graph SDK
+
+    CSV format
+      At least one identifier column per row: DeviceId, ObjectId or DisplayName
+      (checked in that order). Optional columns: Value, Action (Set or Clear).
+
+      Headers are matched case-insensitively and aliases are accepted
+      (Device ID, Name, ComputerName, ExtensionAttribute1, Operation, ...).
+      Comma, semicolon and tab delimited files are detected automatically.
+
+        DeviceId,ObjectId,DisplayName,Value,Action
+        1a2b3c4d-1111-2222-3333-444455556666,,,CAExempt,Set
+        ,,KIOSK-02,CAExempt,Set
+        ,,KIOSK-03,,Clear
+
+    User-to-device CSV (menu option 4)
+      Look up users by UPN, mail, display name or object ID, or import a user list
+      with those columns (aliases such as UPN / Email are accepted). The export
+      includes DeviceId, ObjectId, DisplayName, Value and Action so it can be
+      applied immediately with menu option 3. Extra columns (user, relationship,
+      join type) are for review and are ignored by bulk update.
+
+    Recent-activity CSV (menu option 5)
+      Ingest a device CSV (DeviceId / ObjectId / DisplayName) or a user CSV
+      (UPN / mail / object ID). Devices are looked up in Entra ID and kept when
+      approximateLastSignInDateTime is within the last 90 days (customisable).
+      The export is the same bulk-update format as option 4 and can be applied
+      with menu option 3.
+
+    Conditional Access usage
+      Conditions > Filter for devices > Exclude filtered devices:
+        device.extensionAttribute1 -eq "CAExempt"
+
+      The comparison is case-sensitive in Conditional Access, so the stored value
+      must match the policy filter exactly.
+
+.EXAMPLE
+    .\Set-EntraDeviceCAExemption.ps1
+
+.EXAMPLE
+    .\Set-EntraDeviceCAExemption.ps1 -TenantId contoso.onmicrosoft.com -DeviceCode
+
+.EXAMPLE
+    .\Set-EntraDeviceCAExemption.ps1 -Console
+#>
+[CmdletBinding()]
+param(
+    [switch]$SkipMain,
+    [switch]$Console,
+    [string]$TenantId,
+    [switch]$DeviceCode,
+    [string]$SettingsPath
+)
+
+$script:ToolVersion    = '2.0.12'
+$script:Root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$script:SettingsFile = if ($SettingsPath) { $SettingsPath } else { Join-Path $script:Root 'CAExemption.settings.json' }
+$script:RequiredScope  = 'Device.ReadWrite.All'
+$script:RequiredScopes = @('Device.ReadWrite.All', 'User.Read.All')
+$script:IntuneScopes   = @(
+    'DeviceManagementManagedDevices.ReadWrite.All',
+    'DeviceManagementManagedDevices.PrivilegedOperations.ReadWrite.All'
+)
+$script:GraphBase      = 'https://graph.microsoft.com/v1.0/devices'
+$script:GraphUsersBase = 'https://graph.microsoft.com/v1.0/users'
+$script:GraphBatchUri  = 'https://graph.microsoft.com/v1.0/$batch'
+$script:GraphBatchSize = 20
+$script:PreviewRowLimit = 40
+$script:DefaultActivityDays = 90
+$script:SelectFields     = 'id,deviceId,displayName,trustType,operatingSystem,operatingSystemVersion,accountEnabled,approximateLastSignInDateTime,extensionAttributes,isManagementRestricted'
+$script:UserSelectFields = 'id,displayName,userPrincipalName,mail,accountEnabled'
+$script:GuidPattern   = '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
+$script:MaxValueLength = 1024
+$script:MaxDisplayNameLength = 256
+$script:DefaultNamePrefix = 'CA201-'
+$script:CsvColumnAliases = @{
+    DeviceId    = @('DeviceId', 'Device ID', 'Device_Id', 'AzureDeviceId', 'azureADDeviceId', 'AzureAdDeviceId')
+    ObjectId    = @('ObjectId', 'Object ID', 'Object_Id', 'ObjectID', 'EntraObjectId', 'id')
+    DisplayName = @('DisplayName', 'Display Name', 'DeviceName', 'Device Name', 'Name', 'ComputerName', 'Computer')
+    Value       = @('Value', 'ExtensionAttribute1', 'extensionAttribute1', 'Attribute', 'NewValue', 'EA1')
+    Action      = @('Action', 'Operation')
+}
+$script:UserCsvColumnAliases = @{
+    ObjectId          = @('ObjectId', 'Object ID', 'Object_Id', 'UserObjectId', 'UserId', 'id')
+    UserPrincipalName = @('UserPrincipalName', 'UPN', 'User', 'UserName', 'SamAccountName')
+    Mail              = @('Mail', 'Email', 'EmailAddress', 'E-mail')
+    DisplayName       = @('DisplayName', 'Display Name', 'Name', 'FullName')
+}
+
+$script:Settings = @{
+    DefaultValue    = 'CAExempt'
+    DryRun          = $false
+    LogPath         = Join-Path $script:Root ('CAExemption-Log_{0}.csv' -f (Get-Date -Format 'yyyyMMdd'))
+    RegisteredOnly  = $false
+    DeviceScope     = 'All'
+    NamePrefix      = 'CA201-'
+}
+$script:GuiMode = $false
+$script:LastConnectError = $null
+$script:ValidDeviceScopes = @('All', 'Windows', 'WindowsRegistered')
+
+#region Console helpers
+
+function Write-Title {
+    param([string]$Text)
+    Write-Host ''
+    Write-Host ('=' * 72) -ForegroundColor DarkCyan
+    Write-Host (' ' + $Text) -ForegroundColor Cyan
+    Write-Host ('=' * 72) -ForegroundColor DarkCyan
+}
+
+function Wait-ForKey {
+    Write-Host ''
+    [void](Read-Host 'Press Enter to continue')
+}
+
+function Read-YesNo {
+    param([string]$Prompt, [bool]$Default = $false)
+    $suffix = if ($Default) { '[Y/n]' } else { '[y/N]' }
+    while ($true) {
+        $answer = ([string](Read-Host "$Prompt $suffix")).Trim()
+        if ([string]::IsNullOrEmpty($answer)) { return $Default }
+        if ($answer -match '^(y|yes)$') { return $true }
+        if ($answer -match '^(n|no)$')  { return $false }
+        Write-Host 'Please answer Y or N.' -ForegroundColor Yellow
+    }
+}
+
+function Read-Choice {
+    param([string]$Prompt = 'Choose an option')
+    return ([string](Read-Host $Prompt)).Trim().ToUpperInvariant()
+}
+
+function Limit-Text {
+    param($Text, [int]$Length = 30)
+    if ($null -eq $Text) { return '' }
+    $value = [string]$Text
+    if ($Length -le 0) { return '' }
+    if ($value.Length -le $Length) { return $value }
+    if ($Length -le 3) { return $value.Substring(0, $Length) }
+    return $value.Substring(0, $Length - 3) + '...'
+}
+
+function Format-Value {
+    param($Value)
+    if ([string]::IsNullOrEmpty($Value)) { return '<empty>' }
+    return [string]$Value
+}
+
+function ConvertTo-UtcDateTime {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [datetimeoffset]) { return $Value.UtcDateTime }
+    if ($Value -is [datetime]) {
+        if ($Value.Kind -eq [DateTimeKind]::Utc) { return $Value }
+        if ($Value.Kind -eq [DateTimeKind]::Local) { return $Value.ToUniversalTime() }
+        return [datetime]::SpecifyKind($Value, [DateTimeKind]::Utc)
+    }
+    $text = [string](ConvertTo-PlainValue $Value)
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    $parsed = [datetime]::MinValue
+    $styles = [System.Globalization.DateTimeStyles]::AllowWhiteSpaces -bor
+        [System.Globalization.DateTimeStyles]::AssumeUniversal -bor
+        [System.Globalization.DateTimeStyles]::AdjustToUniversal
+    if ([datetime]::TryParse($text, [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) {
+        if ($parsed.Kind -eq [DateTimeKind]::Utc) { return $parsed }
+        return $parsed.ToUniversalTime()
+    }
+    try {
+        return ([datetime]$text).ToUniversalTime()
+    }
+    catch {
+        return $null
+    }
+}
+
+function Format-UtcDateTimeIso {
+    param($Value)
+    $dt = ConvertTo-UtcDateTime $Value
+    if ($null -eq $dt) { return '' }
+    return $dt.ToString('yyyy-MM-ddTHH:mm:ssZ')
+}
+
+function Format-DateTimeDisplay {
+    param($Value)
+    $dt = ConvertTo-UtcDateTime $Value
+    if ($null -eq $dt) {
+        $text = [string]$Value
+        if ([string]::IsNullOrWhiteSpace($text)) { return '' }
+        return $text
+    }
+    return $dt.ToLocalTime().ToString('yyyy-MM-dd HH:mm')
+}
+
+function Get-ActivityCutoffUtc {
+    param([int]$Days = 90, [datetime]$UtcNow = [datetime]::MinValue)
+    if ($Days -lt 1) { $Days = 90 }
+    if ($UtcNow -eq [datetime]::MinValue) { $UtcNow = [datetime]::UtcNow }
+    if ($UtcNow.Kind -eq [DateTimeKind]::Local) { $UtcNow = $UtcNow.ToUniversalTime() }
+    elseif ($UtcNow.Kind -eq [DateTimeKind]::Unspecified) {
+        $UtcNow = [datetime]::SpecifyKind($UtcNow, [DateTimeKind]::Utc)
+    }
+    return $UtcNow.AddDays(-$Days)
+}
+
+function Test-DeviceHasRecentActivity {
+    param($Device, [datetime]$UtcCutoff, [switch]$IncludeUnknown)
+    if ($null -eq $Device) { return $false }
+    $dt = ConvertTo-UtcDateTime $Device.LastSignIn
+    if ($null -eq $dt) { return [bool]$IncludeUnknown }
+    return ($dt -ge $UtcCutoff)
+}
+
+function Select-DevicesWithRecentActivity {
+    [CmdletBinding()]
+    param(
+        $Devices,
+        [int]$Days = 90,
+        [datetime]$UtcNow = [datetime]::MinValue,
+        [switch]$IncludeUnknown
+    )
+    $cutoff = Get-ActivityCutoffUtc -Days $Days -UtcNow $UtcNow
+    $active = New-Object System.Collections.Generic.List[object]
+    $stale = New-Object System.Collections.Generic.List[object]
+    $unknown = New-Object System.Collections.Generic.List[object]
+    foreach ($device in (ConvertTo-ObjectArray $Devices)) {
+        $dt = ConvertTo-UtcDateTime $device.LastSignIn
+        if ($null -eq $dt) {
+            $unknown.Add($device)
+            if ($IncludeUnknown) { $active.Add($device) }
+            continue
+        }
+        if ($dt -ge $cutoff) { $active.Add($device) }
+        else { $stale.Add($device) }
+    }
+    return (New-ToolObject @(
+            'Active', (ConvertTo-ObjectArray $active)
+            'Stale', (ConvertTo-ObjectArray $stale)
+            'Unknown', (ConvertTo-ObjectArray $unknown)
+            'CutoffUtc', $cutoff
+            'Days', $Days
+        ))
+}
+
+function Test-SameValue {
+    param($A, $B)
+    if ([string]::IsNullOrEmpty($A) -and [string]::IsNullOrEmpty($B)) { return $true }
+    return ([string]$A -ceq [string]$B)
+}
+
+function Get-ValueValidationError {
+    param([AllowNull()][string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return 'Value cannot be empty. Use the Clear option to remove a value.'
+    }
+    if ($Value.Trim().Length -gt $script:MaxValueLength) {
+        return "Value cannot be longer than $($script:MaxValueLength) characters."
+    }
+    return $null
+}
+
+function Test-ValidValue {
+    param([string]$Value, [switch]$Quiet)
+    $errorMessage = Get-ValueValidationError $Value
+    if ($errorMessage) {
+        if (-not $Quiet) { Write-Host $errorMessage -ForegroundColor Yellow }
+        return $false
+    }
+    return $true
+}
+
+function Test-GridViewAvailable {
+    return [bool](Get-Command -Name Out-GridView -ErrorAction SilentlyContinue)
+}
+
+function ConvertTo-CanonicalGuid {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    $text = [string](ConvertTo-PlainValue $Value)
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    $trimmed = $text.Trim().Trim('"').Trim('{}')
+    $guid = [guid]::Empty
+    if ([guid]::TryParse($trimmed, [ref]$guid)) {
+        return $guid.ToString()
+    }
+    return $null
+}
+
+function Test-LooksLikeGuid {
+    param([string]$Value)
+    return [bool](ConvertTo-CanonicalGuid $Value)
+}
+
+function ConvertTo-ObjectArray {
+    param($Value)
+    $list = New-Object System.Collections.Generic.List[object]
+    if ($null -eq $Value) { return ,$list.ToArray() }
+    if ($Value -is [string] -or $Value -is [System.Collections.IDictionary]) {
+        $list.Add($Value)
+        return ,$list.ToArray()
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        foreach ($item in $Value) { $list.Add($item) }
+        return ,$list.ToArray()
+    }
+    $list.Add($Value)
+    return ,$list.ToArray()
+}
+
+function Split-ToolChunks {
+    param($Items, [int]$Size = 20)
+    if ($Size -lt 1) { $Size = 20 }
+    $chunks = New-Object System.Collections.Generic.List[object]
+    $current = New-Object System.Collections.Generic.List[object]
+    foreach ($item in (ConvertTo-ObjectArray $Items)) {
+        $current.Add($item)
+        if ($current.Count -ge $Size) {
+            $chunks.Add((ConvertTo-ObjectArray $current))
+            $current = New-Object System.Collections.Generic.List[object]
+        }
+    }
+    if ($current.Count -gt 0) {
+        $chunks.Add((ConvertTo-ObjectArray $current))
+    }
+    return (ConvertTo-ObjectArray $chunks)
+}
+
+function Write-ToolProgressCount {
+    param([string]$Activity, [int]$Done, [int]$Total, [int]$Every = 50)
+    if ($Total -le 0) { return }
+    if ($Every -lt 1) { $Every = 1 }
+    if ($Done -eq $Total -or $Done -eq 1 -or ($Done % $Every) -eq 0) {
+        Write-Host ("  {0}: {1}/{2}" -f $Activity, $Done, $Total)
+    }
+}
+
+function Show-LimitedTable {
+    param($InputObject, [string[]]$Property, [int]$MaxRows = 40)
+    $rows = ConvertTo-ObjectArray $InputObject
+    if ($rows.Count -eq 0) {
+        Write-Host '  (no rows)'
+        return
+    }
+    $view = $rows
+    if ($MaxRows -gt 0 -and $rows.Count -gt $MaxRows) {
+        $view = ConvertTo-ObjectArray $rows[0..($MaxRows - 1)]
+        Write-Host ("Showing {0} of {1} rows. Export to CSV to review the full set." -f $MaxRows, $rows.Count) -ForegroundColor Yellow
+    }
+    $view | Select-Object -Property $Property | Format-Table -AutoSize -Wrap | Out-Host
+}
+
+function ConvertTo-PlainValue {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+
+    $typeName = $Value.GetType().FullName
+    if ($typeName -eq 'Newtonsoft.Json.Linq.JValue') {
+        try { return ConvertTo-PlainValue $Value.Value } catch { }
+        try { return [string]$Value } catch { return $null }
+    }
+
+    if ($typeName -eq 'System.Text.Json.JsonElement') {
+        try {
+            switch ($Value.ValueKind.ToString()) {
+                'String' { return $Value.GetString() }
+                'Number' {
+                    try { return $Value.GetInt64() } catch { return $Value.GetDouble() }
+                }
+                'True' { return $true }
+                'False' { return $false }
+                'Null' { return $null }
+                default { return $Value }
+            }
+        }
+        catch {
+            return [string]$Value
+        }
+    }
+
+    if ($Value -is [datetimeoffset]) { return $Value.UtcDateTime }
+    if ($Value -is [bool] -or $Value -is [string] -or $Value -is [byte] -or $Value -is [int16] -or $Value -is [uint16] -or $Value -is [int] -or $Value -is [uint32] -or $Value -is [long] -or $Value -is [uint64] -or $Value -is [double] -or $Value -is [decimal] -or $Value -is [guid] -or $Value -is [datetime]) {
+        return $Value
+    }
+
+    return $Value
+}
+
+function Add-ToolProperty {
+    param($Object, [string]$Name, $Value)
+    if ($null -eq $Object) { return $Object }
+    if ($null -ne $Value -and $Value -is [System.Collections.IList] -and -not ($Value -is [System.Array]) -and -not ($Value -is [string])) {
+        $Value = ConvertTo-ObjectArray $Value
+        if ($null -eq $Value) { $Value = [object[]]::new(0) }
+    }
+    $existing = $Object.PSObject.Properties[$Name]
+    if ($existing) {
+        $existing.Value = $Value
+    }
+    else {
+        Add-Member -InputObject $Object -NotePropertyName $Name -NotePropertyValue $Value
+    }
+    return $Object
+}
+
+function New-ToolObject {
+    param([AllowEmptyCollection()][object[]]$Properties)
+    # Windows PowerShell 5.1 throws "Argument types do not match" when a hashtable
+    # or [pscustomobject]@{ } holds a Generic.List, PSCustomObject, or Graph JValue.
+    # Building with Add-Member from a pair array avoids that.
+    $object = New-Object PSObject
+    if ($null -eq $Properties) { return $object }
+    for ($i = 0; $i -lt $Properties.Count; $i += 2) {
+        $name = [string]$Properties[$i]
+        $value = $null
+        if (($i + 1) -lt $Properties.Count) { $value = $Properties[$i + 1] }
+        [void](Add-ToolProperty $object $name $value)
+    }
+    return $object
+}
+
+function New-PsObjectFromHashtable {
+    param($Property)
+    $pairs = New-Object System.Collections.Generic.List[object]
+    foreach ($key in $Property.Keys) {
+        $pairs.Add([string]$key)
+        $pairs.Add($Property[$key])
+    }
+    return (New-ToolObject -Properties $pairs.ToArray())
+}
+
+#endregion
+
+#region Settings
+
+function Import-ToolSettings {
+    param([string]$Path = $script:SettingsFile)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+    try {
+        $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+        if ([string]::IsNullOrWhiteSpace($raw)) { return }
+        $data = $raw | ConvertFrom-Json
+        $hadScope = $false
+        foreach ($name in @('DefaultValue', 'DryRun', 'LogPath', 'RegisteredOnly', 'DeviceScope', 'NamePrefix')) {
+            $prop = $data.PSObject.Properties[$name]
+            if ($null -eq $prop) { continue }
+            if ($name -eq 'DefaultValue') {
+                $candidate = [string]$prop.Value
+                if (-not (Get-ValueValidationError $candidate)) {
+                    $script:Settings.DefaultValue = $candidate.Trim()
+                }
+            }
+            elseif ($name -in @('DryRun', 'RegisteredOnly')) {
+                $script:Settings[$name] = [bool]$prop.Value
+            }
+            elseif ($name -eq 'DeviceScope') {
+                $scope = [string]$prop.Value
+                if ($script:ValidDeviceScopes -contains $scope) {
+                    $script:Settings.DeviceScope = $scope
+                    $hadScope = $true
+                }
+            }
+            elseif ($name -eq 'LogPath' -and -not [string]::IsNullOrWhiteSpace([string]$prop.Value)) {
+                $script:Settings.LogPath = [string]$prop.Value
+            }
+            elseif ($name -eq 'NamePrefix') {
+                $candidate = [string]$prop.Value
+                if (-not (Get-NamePrefixValidationError $candidate)) {
+                    $script:Settings.NamePrefix = $candidate.Trim()
+                }
+            }
+        }
+        if (-not $hadScope) {
+            $script:Settings.DeviceScope = if ([bool]$script:Settings.RegisteredOnly) { 'WindowsRegistered' } else { 'Windows' }
+        }
+        Sync-DeviceScopeSettings
+    }
+    catch {
+        Write-Host "Could not read settings file '$Path': $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
+function Export-ToolSettings {
+    param([string]$Path = $script:SettingsFile)
+    if (-not $Path) { return }
+    try {
+        Sync-DeviceScopeSettings
+        $payload = [pscustomobject]@{
+            DefaultValue   = $script:Settings.DefaultValue
+            DryRun         = [bool]$script:Settings.DryRun
+            LogPath        = $script:Settings.LogPath
+            RegisteredOnly = [bool]$script:Settings.RegisteredOnly
+            DeviceScope    = [string]$script:Settings.DeviceScope
+            NamePrefix     = [string]$script:Settings.NamePrefix
+        }
+        $json = $payload | ConvertTo-Json -Depth 4
+        $folder = Split-Path -Parent $Path
+        if ($folder -and -not (Test-Path -LiteralPath $folder)) {
+            New-Item -ItemType Directory -Path $folder -Force | Out-Null
+        }
+        Set-Content -LiteralPath $Path -Value $json -Encoding UTF8
+    }
+    catch {
+        Write-Host "Could not save settings: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
+#endregion
+
+#region Graph property / JSON helpers
+
+function Get-GraphProperty {
+    param($Object, [string]$Name)
+    if ($null -eq $Object -or [string]::IsNullOrEmpty($Name)) { return $null }
+
+    $found = $null
+    if ($Object -is [System.Collections.IDictionary]) {
+        foreach ($key in $Object.Keys) {
+            if ([string]::Equals([string]$key, $Name, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $found = $Object[$key]
+                break
+            }
+        }
+    }
+    else {
+        $prop = $Object.PSObject.Properties[$Name]
+        if ($prop) { $found = $prop.Value }
+    }
+
+    if ($null -eq $found) { return $null }
+    $found = ConvertTo-PlainValue $found
+    if ($null -eq $found) { return $null }
+    if ($found -is [System.Collections.IDictionary]) { return $found }
+    if ($found -is [System.Collections.IEnumerable] -and -not ($found -is [string])) { return $found }
+    return $found
+}
+
+function Get-GraphCollection {
+    param($Response)
+    $list = New-Object System.Collections.Generic.List[object]
+    if ($null -eq $Response) { return ,$list.ToArray() }
+
+    $value = Get-GraphProperty $Response 'value'
+    if ($null -eq $value) {
+        if ($null -ne (Get-GraphProperty $Response 'id') -or $null -ne (Get-GraphProperty $Response 'deviceId')) {
+            $list.Add($Response)
+        }
+        return ,$list.ToArray()
+    }
+
+    # Hashtables are IEnumerable (keys). A Graph entity is a dictionary; a page of
+    # entities is an array/list and must be enumerated as items, not as one object.
+    if ($value -is [System.Collections.IDictionary]) {
+        $list.Add($value)
+        return ,$list.ToArray()
+    }
+    if ($value -is [System.Collections.IEnumerable] -and -not ($value -is [string])) {
+        foreach ($item in $value) { $list.Add($item) }
+        return ,$list.ToArray()
+    }
+
+    $list.Add($value)
+    return ,$list.ToArray()
+}
+
+function ConvertTo-JsonStringLiteral {
+    param([AllowNull()]$Value)
+    if ($null -eq $Value) { return 'null' }
+    $text = [string]$Value
+    $builder = New-Object System.Text.StringBuilder ($text.Length + 8)
+    [void]$builder.Append('"')
+    foreach ($ch in $text.ToCharArray()) {
+        $code = [int]$ch
+        switch ($code) {
+            34 { [void]$builder.Append('\"') }
+            92 { [void]$builder.Append('\\') }
+            8  { [void]$builder.Append('\b') }
+            9  { [void]$builder.Append('\t') }
+            10 { [void]$builder.Append('\n') }
+            12 { [void]$builder.Append('\f') }
+            13 { [void]$builder.Append('\r') }
+            default {
+                if ($code -lt 32) {
+                    [void]$builder.AppendFormat('\u{0:x4}', $code)
+                }
+                else {
+                    [void]$builder.Append($ch)
+                }
+            }
+        }
+    }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function New-ExtensionAttributePatchJson {
+    param([AllowNull()]$Value)
+    $literal = if ([string]::IsNullOrEmpty($Value)) { 'null' } else { ConvertTo-JsonStringLiteral ([string]$Value) }
+    return ('{{"extensionAttributes":{{"extensionAttribute1":{0}}}}}' -f $literal)
+}
+
+function New-DisplayNamePatchJson {
+    param([string]$DisplayName)
+    return ('{{"displayName":{0}}}' -f (ConvertTo-JsonStringLiteral $DisplayName))
+}
+
+function Get-NormalizedNamePrefix {
+    param([AllowNull()][string]$Prefix)
+    $text = $Prefix
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        $text = [string]$script:Settings.NamePrefix
+    }
+    if ([string]::IsNullOrWhiteSpace($text)) { $text = $script:DefaultNamePrefix }
+    return $text.Trim()
+}
+
+function Get-NamePrefixValidationError {
+    param([AllowNull()][string]$Prefix)
+    if ([string]::IsNullOrWhiteSpace($Prefix)) { return 'Name prefix cannot be empty.' }
+    if ($Prefix.Trim().Length -gt 64) { return 'Name prefix cannot be longer than 64 characters.' }
+    return $null
+}
+
+function Test-LooksLikeDeviceRecord {
+    param($Value)
+    if ($null -eq $Value) { return $false }
+    if ($Value -is [string] -or $Value -is [ValueType]) { return $false }
+    if ($Value -is [System.Array]) {
+        if ($Value.Length -eq 1) { return (Test-LooksLikeDeviceRecord $Value[0]) }
+        return $false
+    }
+    if ($Value -is [System.Collections.IList]) { return $false }
+    foreach ($name in @('DisplayName', 'displayName', 'ObjectId', 'DeviceId', 'deviceId')) {
+        if ($Value.PSObject.Properties[$name]) { return $true }
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        foreach ($key in $Value.Keys) {
+            $keyText = [string]$key
+            if ($keyText -eq 'DisplayName' -or $keyText -eq 'displayName' -or $keyText -eq 'ObjectId' -or $keyText -eq 'DeviceId' -or $keyText -eq 'id' -or $keyText -eq 'deviceId') {
+                return $true
+            }
+        }
+    }
+    return $false
+}
+
+function ConvertTo-DeviceObjectList {
+    param($Value)
+    $list = New-Object System.Collections.Generic.List[object]
+    if ($null -eq $Value) { return $list }
+    if (Test-LooksLikeDeviceRecord $Value) {
+        if ($Value -is [System.Array] -and $Value.Length -eq 1) {
+            $list.Add($Value[0])
+        }
+        else {
+            $list.Add($Value)
+        }
+        return ,$list
+    }
+    foreach ($item in (ConvertTo-ObjectArray $Value)) {
+        if ($null -eq $item -or $item -is [string] -or $item -is [ValueType]) { continue }
+        $list.Add($item)
+    }
+    return ,$list
+}
+
+function Get-DeviceRecordDisplayName {
+    param($Device)
+    if ($null -eq $Device) { return '' }
+    $name = Get-GraphProperty $Device 'DisplayName'
+    if ([string]::IsNullOrWhiteSpace([string]$name)) {
+        $name = Get-GraphProperty $Device 'displayName'
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$name)) {
+        try {
+            if ($Device -is [System.Data.DataRow] -or $Device -is [System.Data.DataRowView]) {
+                $name = $Device['DisplayName']
+            }
+        }
+        catch { }
+    }
+    if ($null -eq $name) { return '' }
+    return [string]$name
+}
+
+function Test-DeviceNameHasPrefix {
+    param([AllowNull()][string]$DisplayName, [AllowNull()][string]$Prefix)
+    $pre = Get-NormalizedNamePrefix $Prefix
+    if ([string]::IsNullOrWhiteSpace($pre) -or [string]::IsNullOrWhiteSpace($DisplayName)) { return $false }
+    return ([string]$DisplayName).StartsWith($pre, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-PrefixedDeviceName {
+    param([AllowNull()][string]$DisplayName, [AllowNull()][string]$Prefix)
+    $name = if ($null -eq $DisplayName) { '' } else { [string]$DisplayName }
+    $pre = Get-NormalizedNamePrefix $Prefix
+    if (Test-DeviceNameHasPrefix $name $pre) { return $name }
+    return ($pre + $name)
+}
+
+function New-DeviceNamePrefixPlanItem {
+    param($Device, [AllowNull()][string]$Prefix, [AllowNull()][string]$DisplayName)
+    $pre = Get-NormalizedNamePrefix $Prefix
+    $current = $DisplayName
+    if ([string]::IsNullOrWhiteSpace($current)) {
+        $current = Get-DeviceRecordDisplayName $Device
+    }
+    $newName = Get-PrefixedDeviceName $current $pre
+    $status = 'Ready'
+    $note = ''
+    if ($null -eq $Device) {
+        $status = 'NotFound'
+        $note = 'Device was not found in Entra ID'
+        $newName = ''
+    }
+    elseif ([string]::IsNullOrWhiteSpace($current)) {
+        $status = 'Invalid'
+        $note = 'Device has no display name'
+        $newName = ''
+    }
+    elseif (Test-DeviceNameHasPrefix $current $pre) {
+        $status = 'NoChange'
+        $note = 'Name already has this prefix'
+    }
+    elseif ($newName.Length -gt $script:MaxDisplayNameLength) {
+        $status = 'Invalid'
+        $note = "Prefixed name would exceed $($script:MaxDisplayNameLength) characters"
+        $newName = ''
+    }
+    return (New-ToolObject @(
+            'Device', $Device
+            'CurrentName', $current
+            'NewName', $newName
+            'Status', $status
+            'Note', $note
+        ))
+}
+
+function Get-GraphExceptionStatusCode {
+    param($ErrorRecord)
+    if ($null -eq $ErrorRecord) { return 0 }
+
+    $ex = $ErrorRecord.Exception
+    while ($null -ne $ex) {
+        $response = $null
+        if ($ex.PSObject.Properties['Response']) { $response = $ex.Response }
+        if ($response) {
+            try {
+                if ($response.StatusCode) { return [int]$response.StatusCode }
+            }
+            catch { }
+        }
+        if ($ex.PSObject.Properties['StatusCode'] -and $ex.StatusCode) {
+            try { return [int]$ex.StatusCode } catch { }
+        }
+        $ex = $ex.InnerException
+    }
+
+    $message = [string]$ErrorRecord.Exception.Message
+    if ($message -match '\b(429|503|504|401|403|404)\b') { return [int]$Matches[1] }
+    if ($message -match 'Too Many Requests|throttl') { return 429 }
+    return 0
+}
+
+function Get-GraphErrorMessage {
+    param($ErrorRecord)
+    if ($null -eq $ErrorRecord) { return 'Unknown error' }
+    $message = [string]$ErrorRecord.Exception.Message
+    if ($message -match '"message"\s*:\s*"(.*?)"') {
+        return ($Matches[1] -replace '\\"', '"')
+    }
+    if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+        $details = [string]$ErrorRecord.ErrorDetails.Message
+        if ($details -match '"message"\s*:\s*"(.*?)"') {
+            return ($Matches[1] -replace '\\"', '"')
+        }
+        if ($details) { return $details }
+    }
+    return $message
+}
+
+function Test-WindowsDeviceOperatingSystem {
+    param($Device)
+    if ($null -eq $Device) { return $false }
+    $os = [string](Get-GraphProperty $Device 'OperatingSystem')
+    if ([string]::IsNullOrWhiteSpace($os)) { $os = [string]$Device.OperatingSystem }
+    return ($os -like 'Windows*')
+}
+
+function Test-DisplayNameUpdateForbidden {
+    param([AllowNull()][string]$Message)
+    if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
+    return ($Message -match 'external service|originated within|cannot be updated|read-only|Property displayName|Request_BadRequest|only on windows devices|ExtensionAttribute1\.\.15')
+}
+
+function Get-DisplayNameUpdateAdvice {
+    param([AllowNull()][string]$Message)
+    $text = if ($null -eq $Message) { '' } else { [string]$Message }
+    if ($text -match '401|Unauthorized|expired|Authentication_Expired|invalid_grant|AADSTS') {
+        return 'Sign-in expired or a browser login is waiting. Finish the Edge sign-in window (or click Switch account), then try Prepend again.'
+    }
+    if ($text -match 'only on windows devices|ExtensionAttribute1\.\.15') {
+        return 'Entra ID can only rename Windows devices. iPhone/iPad names are changed in Intune. Click Switch account, accept the Intune permissions, then try Prepend again.'
+    }
+    if ($text -match '403|Authorization_RequestDenied|Insufficient|Access denied') {
+        return 'Your account cannot rename this device. Use Cloud Device Administrator for Windows, or Intune Administrator for iOS/Android. Click Switch account if Intune permission is missing.'
+    }
+    if (Test-DisplayNameUpdateForbidden $text) {
+        return 'Entra ID does not allow renaming this device (common for iPhone/iPad). The tool will try Intune when the device is managed there.'
+    }
+    return $text
+}
+
+function Format-GuiChangeSummary {
+    param($Results, [string]$Extra)
+    $rows = ConvertTo-ObjectArray $Results
+    $ok = @($rows | Where-Object { $_.Status -eq 'Success' }).Count
+    $dry = @($rows | Where-Object { $_.Status -eq 'DryRun' }).Count
+    $fail = @($rows | Where-Object { $_.Status -eq 'Failed' }).Count
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add(("Succeeded: {0}" -f $ok))
+    $lines.Add(("Dry-run: {0}" -f $dry))
+    $lines.Add(("Failed: {0}" -f $fail))
+    if ($Extra) { $lines.Add($Extra) }
+    foreach ($entry in $rows) {
+        if ([string]$entry.Status -ne 'Failed') { continue }
+        $name = [string]$entry.DisplayName
+        if ([string]::IsNullOrWhiteSpace($name)) { $name = [string]$entry.DeviceId }
+        if ([string]::IsNullOrWhiteSpace($name)) { $name = 'Device' }
+        $err = [string]$entry.Message
+        if ([string]::IsNullOrWhiteSpace($err)) { $err = 'Graph did not return an error message.' }
+        $advice = Get-DisplayNameUpdateAdvice $err
+        if ($advice -and $advice -ne $err) {
+            $lines.Add(("{0}: {1}`n{2}" -f $name, $err, $advice))
+        }
+        else {
+            $lines.Add(("{0}: {1}" -f $name, $err))
+        }
+    }
+    return ($lines -join [Environment]::NewLine)
+}
+
+function Format-CaughtError {
+    param($ErrorRecord)
+    $message = Get-GraphErrorMessage $ErrorRecord
+    $line = 0
+    try { $line = [int]$ErrorRecord.InvocationInfo.ScriptLineNumber } catch { }
+    if ($line -gt 0) {
+        return ('{0}  [line {1}]' -f $message, $line)
+    }
+    return $message
+}
+
+function Test-ArgumentTypesMismatch {
+    param($ErrorRecord)
+    $message = [string]$ErrorRecord.Exception.Message
+    return ($message -like '*Argument types do not match*')
+}
+
+function Test-GraphReadMethod {
+    param([string]$Method)
+    return [string]::Equals($Method, 'GET', [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-PreferredGraphOutputType {
+    [CmdletBinding()]
+    param([string[]]$ValidValues, [switch]$EmptyBody)
+    $candidates = if ($EmptyBody) { @('HttpResponseMessage') } else { @('PSObject', 'Json') }
+    if ($null -eq $ValidValues -or $ValidValues.Count -eq 0) {
+        if ($EmptyBody) { return $null }
+        return $candidates[0]
+    }
+    foreach ($candidate in $candidates) {
+        foreach ($value in $ValidValues) {
+            if ([string]::Equals([string]$value, $candidate, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $candidate
+            }
+        }
+    }
+    return $null
+}
+
+function Get-RetryDelaySeconds {
+    param($ErrorRecord, [int]$Attempt)
+    $delay = [Math]::Min(60, [int][Math]::Pow(2, [Math]::Max(1, $Attempt)))
+    $ex = if ($ErrorRecord) { $ErrorRecord.Exception } else { $null }
+    while ($null -ne $ex) {
+        $response = $null
+        if ($ex.PSObject.Properties['Response']) { $response = $ex.Response }
+        if ($response -and $response.Headers) {
+            try {
+                $values = $response.Headers['Retry-After']
+                if ($values) {
+                    $raw = [string]@($values)[0]
+                    $seconds = 0
+                    if ([int]::TryParse($raw, [ref]$seconds) -and $seconds -gt 0) { return $seconds }
+                }
+            }
+            catch { }
+        }
+        $ex = $ex.InnerException
+    }
+    return $delay
+}
+
+function Test-HasGraphScope {
+    param($Context, [string]$Scope = $script:RequiredScope)
+    if ($null -eq $Context) { return $false }
+    $scopes = @($Context.Scopes)
+    foreach ($item in $scopes) {
+        if ([string]$item -like "*$Scope*") { return $true }
+    }
+    return $false
+}
+
+#endregion
+
+#region Microsoft Graph
+
+function Initialize-GraphModule {
+    if (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication) {
+        try {
+            Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+            return $true
+        }
+        catch {
+            Write-Host "Could not import Microsoft.Graph.Authentication: $($_.Exception.Message)" -ForegroundColor Red
+            return $false
+        }
+    }
+
+    Write-Host 'The Microsoft.Graph.Authentication module is not installed.' -ForegroundColor Yellow
+    $install = $false
+    if ($script:GuiMode) {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+        $answer = [System.Windows.Forms.MessageBox]::Show(
+            'The Microsoft.Graph.Authentication module is not installed. Install it now for the current user?',
+            'Microsoft Graph module',
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Question
+        )
+        $install = ($answer -eq [System.Windows.Forms.DialogResult]::Yes)
+    }
+    else {
+        $install = Read-YesNo 'Install it now for the current user from the PowerShell Gallery?' $true
+    }
+    if (-not $install) { return $false }
+
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        if (-not (Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue)) {
+            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope CurrentUser -Force | Out-Null
+        }
+        $installParams = @{
+            Name       = 'Microsoft.Graph.Authentication'
+            Scope      = 'CurrentUser'
+            Repository = 'PSGallery'
+            Force      = $true
+            AllowClobber = $true
+        }
+        if ((Get-Command Install-Module).Parameters.ContainsKey('AcceptLicense')) {
+            $installParams['AcceptLicense'] = $true
+        }
+        if ((Get-Command Install-Module).Parameters.ContainsKey('SkipPublisherCheck')) {
+            $installParams['SkipPublisherCheck'] = $true
+        }
+        Install-Module @installParams
+        Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+        return $true
+    }
+    catch {
+        Write-Host "Module install failed: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+}
+
+function Test-GraphSignedIn {
+    $context = $null
+    try { $context = Get-MgContext } catch { return $false }
+    if ($null -eq $context) { return $false }
+    return -not [string]::IsNullOrWhiteSpace([string]$context.Account) -or -not [string]::IsNullOrWhiteSpace([string]$context.TenantId)
+}
+
+function ConvertTo-OptionalTenantId {
+    param([AllowNull()][string]$Value)
+    $text = if ($null -eq $Value) { '' } else { $Value.Trim().Trim('"') }
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    $guid = ConvertTo-CanonicalGuid $text
+    if ($guid) { return $guid }
+    if ($text -match '^[A-Za-z0-9][A-Za-z0-9.-]+\.[A-Za-z]{2,}$') { return $text }
+    return $null
+}
+
+function Test-GraphConnection {
+    if (-not (Test-GraphSignedIn)) { return $false }
+    $context = $null
+    try { $context = Get-MgContext } catch { return $false }
+    $scopes = @($context.Scopes | Where-Object { $_ })
+    # Some Graph SDK versions drop Scopes after a 204 PATCH; the token can still be valid.
+    if ($scopes.Count -eq 0) { return $true }
+    foreach ($scope in $script:RequiredScopes) {
+        if (-not (Test-HasGraphScope $context $scope)) { return $false }
+    }
+    return $true
+}
+
+function Connect-Graph {
+    [CmdletBinding()]
+    param(
+        [switch]$Reconnect,
+        [string]$Tenant,
+        [switch]$UseDeviceCode
+    )
+
+    if ((Test-GraphSignedIn) -and -not $Reconnect) { return $true }
+
+    $script:LastConnectError = $null
+    $silent = [bool]$script:GuiMode
+    if (-not $PSBoundParameters.ContainsKey('Tenant')) { $Tenant = $TenantId }
+    if (-not $PSBoundParameters.ContainsKey('UseDeviceCode')) { $UseDeviceCode = $DeviceCode }
+
+    if (-not $silent) { Write-Title 'Connect to Microsoft Graph' }
+    if (-not $Tenant -and -not $silent) {
+        $Tenant = ([string](Read-Host 'Tenant ID or domain (press Enter for your home tenant)')).Trim()
+    }
+
+    $tenantId = ConvertTo-OptionalTenantId $Tenant
+    if ($Tenant -and -not $tenantId) {
+        if ($silent) {
+            # GUI sign-in never requires a tenant. Ignore junk so Connect-MgGraph
+            # is not called with an empty or invalid TenantId.
+            $tenantId = $null
+        }
+        else {
+            $script:LastConnectError = 'Leave Tenant blank for interactive sign-in, or enter a tenant GUID or domain such as contoso.onmicrosoft.com.'
+            Write-Host $script:LastConnectError -ForegroundColor Red
+            return $false
+        }
+    }
+
+    try {
+        $connectCommand = Get-Command Connect-MgGraph -ErrorAction Stop
+        $useDevice = [bool]$UseDeviceCode
+        if (-not $silent -and -not $useDevice -and -not $Reconnect) {
+            Write-Host '  1) Interactive browser sign-in'
+            Write-Host '  2) Device code (RDP, Server Core, no browser)'
+            $method = Read-Choice 'Choose sign-in method [1]'
+            if ($method -eq '2') { $useDevice = $true }
+        }
+
+        $connectScopes = New-Object System.Collections.Generic.List[string]
+        foreach ($scope in @($script:RequiredScopes + $script:IntuneScopes)) {
+            if ($scope -and -not $connectScopes.Contains($scope)) { $connectScopes.Add($scope) }
+        }
+        $params = @{ Scopes = @($connectScopes.ToArray()) }
+        if ($tenantId) { $params['TenantId'] = $tenantId }
+        if ($connectCommand.Parameters.ContainsKey('NoWelcome')) { $params['NoWelcome'] = $true }
+        if ($connectCommand.Parameters.ContainsKey('ContextScope')) { $params['ContextScope'] = 'Process' }
+        if ($useDevice -and $connectCommand.Parameters.ContainsKey('UseDeviceCode')) {
+            $params['UseDeviceCode'] = $true
+        }
+
+        if ($Reconnect) {
+            $existing = $null
+            try { $existing = Get-MgContext } catch { }
+            if ($existing) {
+                try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { }
+            }
+        }
+        Connect-MgGraph @params -ErrorAction Stop | Out-Null
+    }
+    catch {
+        $script:LastConnectError = Get-GraphErrorMessage $_
+        if (-not $silent) { Write-Host "Sign-in failed: $($script:LastConnectError)" -ForegroundColor Red }
+        return $false
+    }
+
+    if (-not (Test-GraphSignedIn)) {
+        if (-not $script:LastConnectError) {
+            $script:LastConnectError = 'Sign-in did not complete. Click Sign in to try the interactive browser login again.'
+        }
+        if (-not $silent) { Write-Host $script:LastConnectError -ForegroundColor Red }
+        return $false
+    }
+
+    if (-not (Test-GraphConnection)) {
+        $script:LastConnectError = "Signed in, but these permissions were not granted: {0}. An administrator may need to consent." -f ($script:RequiredScopes -join ', ')
+        if (-not $silent) { Write-Host $script:LastConnectError -ForegroundColor Yellow }
+    }
+
+    $context = $null
+    try { $context = Get-MgContext } catch { }
+    if (-not $silent -and $context) { Write-Host "Connected as $($context.Account) to tenant $($context.TenantId)" -ForegroundColor Green }
+    return $true
+}
+
+function Invoke-GraphRequestWithRetry {
+    param(
+        [Parameter(Mandatory = $true)][string]$Method,
+        [Parameter(Mandatory = $true)][string]$Uri,
+        $Body,
+        [string]$ContentType,
+        [hashtable]$Headers,
+        [int]$MaxAttempts = 6,
+        [switch]$ExpectBody
+    )
+
+    $command = Get-Command Invoke-MgGraphRequest -ErrorAction Stop
+    $params = @{
+        Method = $Method
+        Uri    = $Uri
+    }
+    if ($null -ne $Body) { $params['Body'] = $Body }
+    if ($ContentType) { $params['ContentType'] = $ContentType }
+    if ($Headers) { $params['Headers'] = $Headers }
+
+    # Windows PowerShell 5.1 cannot put nested PSCustomObjects/arrays into a Hashtable.
+    # Device payloads include extensionAttributes and physicalIds, so HashTable output throws
+    # "Argument types do not match". Prefer PSObject (or JSON parsed to objects).
+    $validOutputTypes = @()
+    if ($command.Parameters.ContainsKey('OutputType')) {
+        foreach ($attr in $command.Parameters['OutputType'].Attributes) {
+            if ($attr -is [System.Management.Automation.ValidateSetAttribute]) {
+                $validOutputTypes = @($attr.ValidValues)
+            }
+        }
+        $isBatch = ($Uri.IndexOf('$batch') -ge 0)
+        $emptyBody = -not $ExpectBody -and -not $isBatch -and -not (Test-GraphReadMethod $Method)
+        $outputParams = @{ ValidValues = $validOutputTypes }
+        if ($emptyBody) { $outputParams['EmptyBody'] = $true }
+        $outputType = Get-PreferredGraphOutputType @outputParams
+        if ($outputType) { $params['OutputType'] = $outputType }
+    }
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            $result = Invoke-MgGraphRequest @params -ErrorAction Stop
+            if ($result -is [string]) {
+                $text = $result.Trim()
+                if ($text.StartsWith('{') -or $text.StartsWith('[')) {
+                    try { return ($result | ConvertFrom-Json) } catch { return $result }
+                }
+            }
+            return $result
+        }
+        catch {
+            if ($params.ContainsKey('OutputType') -and (Test-ArgumentTypesMismatch $_)) {
+                $params.Remove('OutputType')
+                continue
+            }
+            $status = Get-GraphExceptionStatusCode $_
+            if ($status -in 429, 503, 504 -and $attempt -lt $MaxAttempts) {
+                $wait = Get-RetryDelaySeconds $_ $attempt
+                Write-Host "Microsoft Graph returned HTTP $status. Retrying in $wait second(s) (attempt $attempt of $MaxAttempts)..." -ForegroundColor Yellow
+                Start-Sleep -Seconds $wait
+                continue
+            }
+            throw
+        }
+    }
+}
+
+function ConvertTo-GraphRelativeUrl {
+    param([string]$Uri)
+    $text = [string]$Uri
+    if ([string]::IsNullOrWhiteSpace($text)) { return '/' }
+    $prefixes = @(
+        'https://graph.microsoft.com/v1.0/',
+        'https://graph.microsoft.com/beta/'
+    )
+    foreach ($prefix in $prefixes) {
+        if ($text.Length -ge $prefix.Length -and $text.Substring(0, $prefix.Length).ToLowerInvariant() -eq $prefix.ToLowerInvariant()) {
+            return ('/' + $text.Substring($prefix.Length))
+        }
+    }
+    if ($text.StartsWith('/')) { return $text }
+    return ('/' + $text)
+}
+
+function ConvertTo-GraphPathSegment {
+    param([string]$Value)
+    return [uri]::EscapeDataString([string]$Value)
+}
+
+function New-GraphBatchRequest {
+    param(
+        [Parameter(Mandatory = $true)][string]$Id,
+        [Parameter(Mandatory = $true)][string]$Method,
+        [Parameter(Mandatory = $true)][string]$Url,
+        [string]$BodyJson
+    )
+    $item = New-Object PSObject
+    [void](Add-ToolProperty $item 'Id' $Id)
+    [void](Add-ToolProperty $item 'Method' $Method.ToUpperInvariant())
+    [void](Add-ToolProperty $item 'Url' (ConvertTo-GraphRelativeUrl $Url))
+    [void](Add-ToolProperty $item 'BodyJson' $BodyJson)
+    return $item
+}
+
+function ConvertTo-GraphBatchJson {
+    param($Requests)
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($req in (ConvertTo-ObjectArray $Requests)) {
+        $id = ConvertTo-JsonStringLiteral (Get-GraphProperty $req 'Id')
+        $method = ConvertTo-JsonStringLiteral (Get-GraphProperty $req 'Method')
+        $url = ConvertTo-JsonStringLiteral (Get-GraphProperty $req 'Url')
+        $bodyJson = Get-GraphProperty $req 'BodyJson'
+        $methodText = [string](Get-GraphProperty $req 'Method')
+        $chunk = '{{"id":{0},"method":{1},"url":{2}' -f $id, $method, $url
+        if ($bodyJson -or $methodText -eq 'PATCH' -or $methodText -eq 'POST' -or $methodText -eq 'PUT') {
+            $chunk += ',"headers":{"Content-Type":"application/json"}'
+        }
+        if ($bodyJson) {
+            $chunk += ',"body":' + [string]$bodyJson
+        }
+        $chunk += '}'
+        $parts.Add($chunk)
+    }
+    return ('{{"requests":[{0}]}}' -f ($parts -join ','))
+}
+
+function Get-GraphBatchErrorMessage {
+    param($Response)
+    $body = Get-GraphProperty $Response 'body'
+    $err = Get-GraphProperty $body 'error'
+    $message = Get-GraphProperty $err 'message'
+    if ($message) { return [string]$message }
+    $status = Get-GraphProperty $Response 'status'
+    if ($null -ne $status) { return ('HTTP {0}' -f $status) }
+    return 'Graph batch request failed'
+}
+
+function Invoke-GraphBatch {
+    param(
+        $Requests,
+        [string]$Activity = 'Graph batch'
+    )
+
+    $pending = ConvertTo-ObjectArray $Requests
+    $completed = New-Object System.Collections.Generic.List[object]
+    if ($pending.Count -eq 0) { return (ConvertTo-ObjectArray $completed) }
+
+    $round = 0
+    while ($pending.Count -gt 0 -and $round -lt 6) {
+        $round++
+        $retry = New-Object System.Collections.Generic.List[object]
+        $chunks = Split-ToolChunks $pending $script:GraphBatchSize
+        $finished = $completed.Count
+        foreach ($chunk in $chunks) {
+            $chunkItems = ConvertTo-ObjectArray $chunk
+            $json = ConvertTo-GraphBatchJson $chunkItems
+            $result = Invoke-GraphRequestWithRetry -Method POST -Uri $script:GraphBatchUri -Body $json -ContentType 'application/json' -ExpectBody
+            $byId = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+            foreach ($item in $chunkItems) {
+                $key = [string](Get-GraphProperty $item 'Id')
+                if ($key -and -not $byId.ContainsKey($key)) { $byId.Add($key, $item) }
+            }
+            $seenIds = @{}
+            foreach ($resp in (ConvertTo-ObjectArray (Get-GraphProperty $result 'responses'))) {
+                $id = [string](Get-GraphProperty $resp 'id')
+                $status = 0
+                try { $status = [int](Get-GraphProperty $resp 'status') } catch { }
+                $seenIds[$id] = $true
+                if ($status -in 429, 503, 504) {
+                    if ($id -and $byId.ContainsKey($id)) { $retry.Add($byId[$id]) }
+                    continue
+                }
+                $wrapped = New-Object PSObject
+                [void](Add-ToolProperty $wrapped 'Id' $id)
+                [void](Add-ToolProperty $wrapped 'Status' $status)
+                [void](Add-ToolProperty $wrapped 'Body' (Get-GraphProperty $resp 'body'))
+                if ($id -and $byId.ContainsKey($id)) {
+                    [void](Add-ToolProperty $wrapped 'Request' $byId[$id])
+                }
+                $completed.Add($wrapped)
+            }
+            foreach ($item in $chunkItems) {
+                $key = [string](Get-GraphProperty $item 'Id')
+                if ($key -and -not $seenIds.ContainsKey($key)) { $retry.Add($item) }
+            }
+            $finished = $completed.Count
+            Write-Host ("  {0}: {1} response(s)..." -f $Activity, ($finished + $retry.Count))
+        }
+        if ($retry.Count -eq 0) { break }
+        $wait = [Math]::Min(60, [int][Math]::Pow(2, $round))
+        Write-Host ("  Graph throttled {0} batched request(s). Retrying in {1}s..." -f $retry.Count, $wait) -ForegroundColor Yellow
+        Start-Sleep -Seconds $wait
+        $pending = ConvertTo-ObjectArray $retry
+    }
+
+    return (ConvertTo-ObjectArray $completed)
+}
+
+function Invoke-GraphGetAll {
+    param(
+        [string]$Uri,
+        [string]$Activity = 'Retrieving devices from Entra ID',
+        [hashtable]$Headers,
+        [switch]$ShowHostProgress
+    )
+
+    $items = New-Object System.Collections.Generic.List[object]
+    $next = $Uri
+    $seenUris = @{}
+    $page = 0
+    try {
+        while ($next) {
+            $pageKey = [string]$next
+            if ($seenUris.ContainsKey($pageKey)) {
+                Write-Host '  Stopped pagination because Microsoft Graph repeated a page link.' -ForegroundColor Yellow
+                break
+            }
+            $seenUris[$pageKey] = $true
+            $page++
+            if ($page -gt 500) {
+                Write-Host '  Stopped pagination after 500 Graph pages.' -ForegroundColor Yellow
+                break
+            }
+
+            $request = @{ Method = 'GET'; Uri = $next }
+            if ($Headers) { $request['Headers'] = $Headers }
+            $response = Invoke-GraphRequestWithRetry @request
+            foreach ($item in (Get-GraphCollection $response)) {
+                $items.Add($item)
+            }
+            Write-Progress -Activity $Activity -Status "$($items.Count) retrieved"
+            if ($ShowHostProgress) {
+                Write-Host ("  {0}: {1} retrieved (page {2})..." -f $Activity, $items.Count, $page)
+            }
+            $nextLink = Get-GraphProperty $response '@odata.nextLink'
+            if ($null -eq $nextLink -or [string]::IsNullOrWhiteSpace([string]$nextLink)) {
+                $next = $null
+            }
+            else {
+                $next = [string]$nextLink
+            }
+        }
+    }
+    finally {
+        Write-Progress -Activity $Activity -Completed
+    }
+    return (ConvertTo-ObjectArray $items)
+}
+
+function Get-JoinTypeLabel {
+    param($TrustType)
+    $TrustType = [string](ConvertTo-PlainValue $TrustType)
+    switch ($TrustType) {
+        'Workplace' { return 'Entra registered' }
+        'AzureAd'   { return 'Entra joined' }
+        'ServerAd'  { return 'Hybrid joined' }
+        default {
+            if ([string]::IsNullOrWhiteSpace($TrustType)) { return 'Unknown' }
+            return $TrustType
+        }
+    }
+}
+
+function Get-DeviceScope {
+    $scope = [string]$script:Settings.DeviceScope
+    if ($script:ValidDeviceScopes -contains $scope) { return $scope }
+    if ([bool]$script:Settings.RegisteredOnly) { return 'WindowsRegistered' }
+    return 'Windows'
+}
+
+function Get-DeviceScopeLabel {
+    param([string]$Scope = (Get-DeviceScope))
+    switch ($Scope) {
+        'All' { return 'All devices (any OS)' }
+        'Windows' { return 'Windows devices' }
+        'WindowsRegistered' { return 'Windows Entra registered' }
+        default { return $Scope }
+    }
+}
+
+function Sync-DeviceScopeSettings {
+    $scope = Get-DeviceScope
+    $script:Settings.DeviceScope = $scope
+    $script:Settings.RegisteredOnly = ($scope -eq 'WindowsRegistered')
+}
+
+function Set-DeviceScope {
+    param([string]$Scope)
+    if ($script:ValidDeviceScopes -contains $Scope) {
+        $script:Settings.DeviceScope = $Scope
+    }
+    Sync-DeviceScopeSettings
+}
+
+function Get-IneligibleDeviceNote {
+    param($Device)
+    $os = if ($Device) { [string]$Device.OperatingSystem } else { '' }
+    $join = if ($Device) { [string]$Device.JoinType } else { '' }
+    $scope = Get-DeviceScopeLabel
+    return ("Found as {0} ({1}). Current device scope is {2}." -f $join, $os, $scope)
+}
+
+function Test-DeviceEligible {
+    param($Device)
+    if ($null -eq $Device) { return $false }
+    $os = [string]$Device.OperatingSystem
+    $trust = [string]$Device.TrustType
+    $join = [string]$Device.JoinType
+    switch (Get-DeviceScope) {
+        'All' { return $true }
+        'Windows' { return ($os -like 'Windows*') }
+        default {
+            if ($os -notlike 'Windows*') { return $false }
+            return ($trust -eq 'Workplace' -or $join -eq 'Entra registered')
+        }
+    }
+}
+
+function ConvertTo-DeviceRecord {
+    param($Item)
+
+    $extensionAttribute1 = $null
+    $extensionAttributes = Get-GraphProperty $Item 'extensionAttributes'
+    if ($extensionAttributes) {
+        $extensionAttribute1 = Get-GraphProperty $extensionAttributes 'extensionAttribute1'
+    }
+
+    $os    = [string](Get-GraphProperty $Item 'operatingSystem')
+    $trust = [string](Get-GraphProperty $Item 'trustType')
+    $deviceId = ConvertTo-CanonicalGuid (Get-GraphProperty $Item 'deviceId')
+    if (-not $deviceId) { $deviceId = [string](Get-GraphProperty $Item 'deviceId') }
+    $objectId = ConvertTo-CanonicalGuid (Get-GraphProperty $Item 'id')
+    if (-not $objectId) { $objectId = [string](Get-GraphProperty $Item 'id') }
+
+    $record = New-Object PSObject
+    [void](Add-ToolProperty $record 'DisplayName' ([string](Get-GraphProperty $Item 'displayName')))
+    [void](Add-ToolProperty $record 'DeviceId' ([string]$deviceId))
+    [void](Add-ToolProperty $record 'ObjectId' ([string]$objectId))
+    [void](Add-ToolProperty $record 'OperatingSystem' $os)
+    [void](Add-ToolProperty $record 'OSVersion' ([string](Get-GraphProperty $Item 'operatingSystemVersion')))
+    [void](Add-ToolProperty $record 'TrustType' $trust)
+    [void](Add-ToolProperty $record 'JoinType' (Get-JoinTypeLabel $trust))
+    [void](Add-ToolProperty $record 'Enabled' (ConvertTo-PlainValue (Get-GraphProperty $Item 'accountEnabled')))
+    [void](Add-ToolProperty $record 'LastSignIn' (ConvertTo-PlainValue (Get-GraphProperty $Item 'approximateLastSignInDateTime')))
+    [void](Add-ToolProperty $record 'LastSignInDisplay' (Format-DateTimeDisplay (Get-GraphProperty $Item 'approximateLastSignInDateTime')))
+    [void](Add-ToolProperty $record 'ExtensionAttribute1' (ConvertTo-PlainValue $extensionAttribute1))
+    [void](Add-ToolProperty $record 'IsManagementRestricted' (ConvertTo-PlainValue (Get-GraphProperty $Item 'isManagementRestricted')))
+    [void](Add-ToolProperty $record 'Eligible' $false)
+    $record.Eligible = Test-DeviceEligible $record
+    return $record
+}
+
+function ConvertTo-DeviceRecords {
+    param($Items)
+    $records = New-Object System.Collections.Generic.List[object]
+    if ($null -eq $Items) { return ,$records.ToArray() }
+
+    $list = New-Object System.Collections.Generic.List[object]
+    # Hashtables are IEnumerable (keys). Treat a Graph entity as a single item.
+    if ($Items -is [System.Collections.IDictionary]) {
+        $list.Add($Items)
+    }
+    elseif ($Items -is [System.Collections.IEnumerable] -and -not ($Items -is [string])) {
+        foreach ($item in $Items) { $list.Add($item) }
+    }
+    else {
+        $list.Add($Items)
+    }
+
+    foreach ($item in $list) {
+        if ($null -eq $item) { continue }
+        $records.Add((ConvertTo-DeviceRecord $item))
+    }
+    return ,$records.ToArray()
+}
+
+function New-GraphDeviceListUri {
+    param([string]$Filter, [hashtable]$ExtraQuery)
+    $query = New-Object System.Collections.Generic.List[string]
+    if ($Filter) {
+        $query.Add(('$filter={0}' -f [uri]::EscapeDataString($Filter)))
+    }
+    $query.Add(('$select={0}' -f $script:SelectFields))
+    $query.Add('$top=999')
+    if ($ExtraQuery) {
+        foreach ($key in $ExtraQuery.Keys) {
+            $query.Add(('{0}={1}' -f $key, $ExtraQuery[$key]))
+        }
+    }
+    return ('{0}?{1}' -f $script:GraphBase, ($query -join '&'))
+}
+
+function Get-DeviceScopeGraphFilters {
+    switch (Get-DeviceScope) {
+        'All' { return @($null) }
+        'Windows' {
+            return @(
+                "startswith(operatingSystem,'Windows')",
+                "operatingSystem eq 'Windows'"
+            )
+        }
+        default {
+            return @(
+                "startswith(operatingSystem,'Windows') and trustType eq 'Workplace'",
+                "operatingSystem eq 'Windows' and trustType eq 'Workplace'",
+                "trustType eq 'Workplace'",
+                "operatingSystem eq 'Windows'"
+            )
+        }
+    }
+}
+
+function Get-EntraDevices {
+    $filters = @(Get-DeviceScopeGraphFilters)
+    $lastError = $null
+    foreach ($filter in $filters) {
+        try {
+            $uri = New-GraphDeviceListUri -Filter $filter
+            $raw = Invoke-GraphGetAll -Uri $uri -Activity 'Retrieving devices from Entra ID' -ShowHostProgress
+            $records = ConvertTo-ObjectArray (ConvertTo-DeviceRecords $raw | Where-Object { $_.Eligible } | Sort-Object DisplayName)
+            return $records
+        }
+        catch {
+            $lastError = $_
+            $status = Get-GraphExceptionStatusCode $_
+            if ($status -in 400, 0) { continue }
+            throw
+        }
+    }
+
+    if ($lastError) { throw $lastError.Exception }
+    return @()
+}
+
+function Get-WindowsRegisteredDevices {
+    Get-EntraDevices
+}
+
+function Find-Devices {
+    param([string]$Search)
+
+    $search = if ($null -eq $Search) { '' } else { $Search.Trim() }
+    if (-not $search) { return @() }
+
+    $records = New-Object System.Collections.Generic.List[object]
+    $guid = ConvertTo-CanonicalGuid $search
+
+    if ($guid) {
+        $filter = "deviceId eq '$guid'"
+        $raw = @(Invoke-GraphGetAll -Uri (New-GraphDeviceListUri -Filter $filter))
+        if ($raw.Count -eq 0) {
+            try {
+                $single = Invoke-GraphRequestWithRetry -Method GET -Uri ('{0}/{1}?$select={2}' -f $script:GraphBase, $guid, $script:SelectFields)
+                if ($single) { $raw = @($single) }
+            }
+            catch {
+                $status = Get-GraphExceptionStatusCode $_
+                if ($status -ne 404 -and (Get-GraphErrorMessage $_) -notmatch 'NotFound|does not exist') { throw }
+            }
+        }
+        foreach ($record in (ConvertTo-DeviceRecords $raw)) { $records.Add($record) }
+        return @($records | Sort-Object DisplayName)
+    }
+
+    $escapedName = $search.Replace("'", "''")
+
+    $filters = @(
+        "displayName eq '$escapedName'",
+        "startswith(displayName,'$escapedName')"
+    )
+    foreach ($filter in $filters) {
+        $raw = @(Invoke-GraphGetAll -Uri (New-GraphDeviceListUri -Filter $filter))
+        foreach ($record in (ConvertTo-DeviceRecords $raw)) { $records.Add($record) }
+        if ($records.Count -gt 0) { break }
+    }
+
+    if ($records.Count -eq 0) {
+        try {
+            $searchUri = New-GraphDeviceListUri -Filter $null -ExtraQuery @{
+                '$search' = [uri]::EscapeDataString(('"{0}"' -f ("displayName:$escapedName")))
+                '$count'  = 'true'
+            }
+            $raw = @(Invoke-GraphGetAll -Uri $searchUri -Headers @{ ConsistencyLevel = 'eventual' })
+            foreach ($record in (ConvertTo-DeviceRecords $raw)) { $records.Add($record) }
+        }
+        catch {
+            $status = Get-GraphExceptionStatusCode $_
+            if ($status -notin 400, 0) { throw }
+        }
+    }
+
+    $unique = @{}
+    $output = New-Object System.Collections.Generic.List[object]
+    foreach ($record in $records) {
+        if ($record.ObjectId -and $unique.ContainsKey($record.ObjectId)) { continue }
+        if ($record.ObjectId) { $unique[$record.ObjectId] = $true }
+        $output.Add($record)
+    }
+    return @($output | Sort-Object DisplayName)
+}
+
+function ConvertTo-UserRecord {
+    param($Item)
+    $objectId = ConvertTo-CanonicalGuid (Get-GraphProperty $Item 'id')
+    if (-not $objectId) { $objectId = [string](Get-GraphProperty $Item 'id') }
+    $record = New-Object PSObject
+    [void](Add-ToolProperty $record 'ObjectId' ([string]$objectId))
+    [void](Add-ToolProperty $record 'DisplayName' ([string](Get-GraphProperty $Item 'displayName')))
+    [void](Add-ToolProperty $record 'UserPrincipalName' ([string](Get-GraphProperty $Item 'userPrincipalName')))
+    [void](Add-ToolProperty $record 'Mail' ([string](Get-GraphProperty $Item 'mail')))
+    [void](Add-ToolProperty $record 'Enabled' (ConvertTo-PlainValue (Get-GraphProperty $Item 'accountEnabled')))
+    return $record
+}
+
+function Split-UserSearchTokens {
+    param([AllowNull()][string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
+    $tokens = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+    foreach ($part in @($Text -split '[,\r\n;\t]+')) {
+        $token = $part.Trim().Trim('"').Trim("'")
+        if (-not $token) { continue }
+        $key = $token.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        $tokens.Add($token)
+    }
+    return @($tokens)
+}
+
+function New-GraphUserListUri {
+    param([string]$Filter, [hashtable]$ExtraQuery)
+    $query = New-Object System.Collections.Generic.List[string]
+    if ($Filter) {
+        $query.Add(('$filter={0}' -f [uri]::EscapeDataString($Filter)))
+    }
+    $query.Add(('$select={0}' -f $script:UserSelectFields))
+    $query.Add('$top=999')
+    if ($ExtraQuery) {
+        foreach ($key in $ExtraQuery.Keys) {
+            $query.Add(('{0}={1}' -f $key, $ExtraQuery[$key]))
+        }
+    }
+    return ('{0}?{1}' -f $script:GraphUsersBase, ($query -join '&'))
+}
+
+function Find-Users {
+    param([string]$Search)
+
+    $search = if ($null -eq $Search) { '' } else { $Search.Trim() }
+    if (-not $search) { return @() }
+
+    $guid = ConvertTo-CanonicalGuid $search
+    if ($guid) {
+        try {
+            $single = Invoke-GraphRequestWithRetry -Method GET -Uri ('{0}/{1}?$select={2}' -f $script:GraphUsersBase, $guid, $script:UserSelectFields)
+            if ($single) { return @(ConvertTo-UserRecord $single) }
+        }
+        catch {
+            $status = Get-GraphExceptionStatusCode $_
+            if ($status -ne 404 -and (Get-GraphErrorMessage $_) -notmatch 'NotFound|does not exist') { throw }
+        }
+        return @()
+    }
+
+    $escaped = $search.Replace("'", "''")
+    if ($search -match '@') {
+        $filter = "userPrincipalName eq '$escaped' or mail eq '$escaped'"
+    }
+    else {
+        $filter = "startswith(displayName,'$escaped') or startswith(userPrincipalName,'$escaped') or startswith(mail,'$escaped')"
+    }
+
+    $raw = @()
+    try {
+        $raw = @(Invoke-GraphGetAll -Uri (New-GraphUserListUri -Filter $filter) -Activity 'Searching users in Entra ID')
+    }
+    catch {
+        $status = Get-GraphExceptionStatusCode $_
+        if ($status -notin 400, 0) { throw }
+    }
+
+    if ($raw.Count -eq 0) {
+        try {
+            $searchUri = New-GraphUserListUri -Filter $null -ExtraQuery @{
+                '$search' = [uri]::EscapeDataString(('"{0}"' -f $escaped))
+                '$count'  = 'true'
+            }
+            $raw = @(Invoke-GraphGetAll -Uri $searchUri -Headers @{ ConsistencyLevel = 'eventual' } -Activity 'Searching users in Entra ID')
+        }
+        catch {
+            $status = Get-GraphExceptionStatusCode $_
+            if ($status -notin 400, 0) { throw }
+        }
+    }
+
+    $users = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    foreach ($item in $raw) {
+        $user = ConvertTo-UserRecord $item
+        if ($user.ObjectId -and $seen.ContainsKey($user.ObjectId)) { continue }
+        if ($user.ObjectId) { $seen[$user.ObjectId] = $true }
+        $users.Add($user)
+    }
+    return @($users | Sort-Object DisplayName, UserPrincipalName)
+}
+
+function Get-UserRelatedWindowsDevices {
+    param($User)
+
+    $pairs = New-Object System.Collections.Generic.List[object]
+    $endpoints = @(
+        @{ Name = 'Registered'; Path = 'registeredDevices' }
+        @{ Name = 'Owned';      Path = 'ownedDevices' }
+    )
+
+    foreach ($endpoint in $endpoints) {
+        $uri = '{0}/{1}/{2}?$select={3}&$top=999' -f $script:GraphUsersBase, $User.ObjectId, $endpoint.Path, $script:SelectFields
+        $raw = @()
+        try {
+            $raw = @(Invoke-GraphGetAll -Uri $uri -Activity ('Retrieving {0} devices for {1}' -f $endpoint.Name.ToLower(), $User.UserPrincipalName))
+        }
+        catch {
+            $status = Get-GraphExceptionStatusCode $_
+            if ($status -eq 400 -or (Test-ArgumentTypesMismatch $_)) {
+                $fallback = '{0}/{1}/{2}?$top=999' -f $script:GraphUsersBase, $User.ObjectId, $endpoint.Path
+                $raw = @(Invoke-GraphGetAll -Uri $fallback -Activity ('Retrieving {0} devices for {1}' -f $endpoint.Name.ToLower(), $User.UserPrincipalName))
+            }
+            elseif ($status -eq 404) {
+                continue
+            }
+            else {
+                throw
+            }
+        }
+
+        foreach ($item in (ConvertTo-ObjectArray $raw)) {
+            $record = $null
+            try {
+                $record = ConvertTo-DeviceRecord $item
+            }
+            catch {
+                Write-Host ("  Skipping a {0} device for {1}: {2}" -f $endpoint.Name.ToLower(), $User.UserPrincipalName, (Format-CaughtError $_)) -ForegroundColor Yellow
+                continue
+            }
+            if ([string]::IsNullOrWhiteSpace($record.OperatingSystem) -and $record.ObjectId) {
+                try {
+                    $full = Invoke-GraphRequestWithRetry -Method GET -Uri ('{0}/{1}?$select={2}' -f $script:GraphBase, $record.ObjectId, $script:SelectFields)
+                    if ($full) { $record = ConvertTo-DeviceRecord $full }
+                }
+                catch { }
+            }
+            if (-not (Test-DeviceEligible $record)) { continue }
+            $pair = New-Object PSObject
+            [void](Add-ToolProperty $pair 'Device' $record)
+            [void](Add-ToolProperty $pair 'User' $User)
+            [void](Add-ToolProperty $pair 'Relationship' $endpoint.Name)
+            $pairs.Add($pair)
+        }
+    }
+
+    # Windows PowerShell 5.1 throws "Argument types do not match" for @($genericList)
+    # when the list holds PSCustomObjects with nested objects (Device/User).
+    return (ConvertTo-ObjectArray $pairs)
+}
+
+function Convert-UserDeviceBatchBody {
+    param($Body, $User, [string]$Relationship)
+    $pairs = New-Object System.Collections.Generic.List[object]
+    $needsFull = New-Object System.Collections.Generic.List[object]
+    foreach ($item in (Get-GraphCollection $Body)) {
+        $record = $null
+        try { $record = ConvertTo-DeviceRecord $item } catch { continue }
+        if ([string]::IsNullOrWhiteSpace($record.OperatingSystem) -and $record.ObjectId) {
+            $needsFull.Add($record)
+            continue
+        }
+        if (-not (Test-DeviceEligible $record)) { continue }
+        $pair = New-Object PSObject
+        [void](Add-ToolProperty $pair 'Device' $record)
+        [void](Add-ToolProperty $pair 'User' $User)
+        [void](Add-ToolProperty $pair 'Relationship' $Relationship)
+        $pairs.Add($pair)
+    }
+    $result = New-Object PSObject
+    [void](Add-ToolProperty $result 'Pairs' (ConvertTo-ObjectArray $pairs))
+    [void](Add-ToolProperty $result 'NeedsFull' (ConvertTo-ObjectArray $needsFull))
+    [void](Add-ToolProperty $result 'NextLink' (Get-GraphProperty $Body '@odata.nextLink'))
+    return $result
+}
+
+function Get-UsersRelatedWindowsDevices {
+    param($Users)
+    $userList = ConvertTo-ObjectArray $Users
+    $pairs = New-Object System.Collections.Generic.List[object]
+    if ($userList.Count -eq 0) { return (ConvertTo-ObjectArray $pairs) }
+
+    $endpoints = @(
+        @{ Name = 'Registered'; Path = 'registeredDevices' }
+        @{ Name = 'Owned';      Path = 'ownedDevices' }
+    )
+    $userByKey = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+    foreach ($user in $userList) {
+        $key = [string]$user.ObjectId
+        if ($key -and -not $userByKey.ContainsKey($key)) { $userByKey.Add($key, $user) }
+    }
+
+    $requests = New-Object System.Collections.Generic.List[object]
+    $meta = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+    $n = 0
+    foreach ($user in $userList) {
+        if (-not $user.ObjectId) { continue }
+        foreach ($endpoint in $endpoints) {
+            $n++
+            $id = [string]$n
+            $url = '/users/{0}/{1}?$select={2}&$top=999' -f $user.ObjectId, $endpoint.Path, $script:SelectFields
+            $requests.Add((New-GraphBatchRequest -Id $id -Method GET -Url $url))
+            $info = New-Object PSObject
+            [void](Add-ToolProperty $info 'User' $user)
+            [void](Add-ToolProperty $info 'Relationship' $endpoint.Name)
+            [void](Add-ToolProperty $info 'Path' $endpoint.Path)
+            $meta.Add($id, $info)
+        }
+    }
+
+    Write-Host ("  Batching {0} registered/owned device queries for {1} user(s)..." -f $requests.Count, $userList.Count)
+    $responses = Invoke-GraphBatch -Requests $requests -Activity 'User device lookup'
+    $retryNoSelect = New-Object System.Collections.Generic.List[object]
+    $needsFull = New-Object System.Collections.Generic.List[object]
+    foreach ($resp in $responses) {
+        $id = [string]$resp.Id
+        if (-not $meta.ContainsKey($id)) { continue }
+        $info = $meta[$id]
+        if ($resp.Status -eq 404) { continue }
+        if ($resp.Status -eq 400) {
+            $retryNoSelect.Add($info)
+            continue
+        }
+        if ($resp.Status -lt 200 -or $resp.Status -ge 300) {
+            Write-Host ("  Failed {0} devices for {1}: {2}" -f $info.Relationship.ToLower(), $info.User.UserPrincipalName, (Get-GraphBatchErrorMessage $resp)) -ForegroundColor Yellow
+            continue
+        }
+        $parsed = Convert-UserDeviceBatchBody -Body $resp.Body -User $info.User -Relationship $info.Relationship
+        foreach ($pair in (ConvertTo-ObjectArray $parsed.Pairs)) { $pairs.Add($pair) }
+        foreach ($record in (ConvertTo-ObjectArray $parsed.NeedsFull)) {
+            $hold = New-Object PSObject
+            [void](Add-ToolProperty $hold 'Record' $record)
+            [void](Add-ToolProperty $hold 'User' $info.User)
+            [void](Add-ToolProperty $hold 'Relationship' $info.Relationship)
+            $needsFull.Add($hold)
+        }
+        if ($parsed.NextLink) {
+            try {
+                $more = ConvertTo-ObjectArray (Invoke-GraphGetAll -Uri ([string]$parsed.NextLink) -Activity 'Paging user devices')
+                $page = New-Object PSObject
+                [void](Add-ToolProperty $page 'value' $more)
+                $pageParsed = Convert-UserDeviceBatchBody -Body $page -User $info.User -Relationship $info.Relationship
+                foreach ($pair in (ConvertTo-ObjectArray $pageParsed.Pairs)) { $pairs.Add($pair) }
+            }
+            catch { }
+        }
+    }
+
+    if ($retryNoSelect.Count -gt 0) {
+        $n = 0
+        $fallbackReqs = New-Object System.Collections.Generic.List[object]
+        $fallbackMeta = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+        foreach ($info in $retryNoSelect) {
+            $n++
+            $id = 'r' + $n
+            $url = '/users/{0}/{1}?$top=999' -f $info.User.ObjectId, $info.Path
+            $fallbackReqs.Add((New-GraphBatchRequest -Id $id -Method GET -Url $url))
+            $fallbackMeta.Add($id, $info)
+        }
+        foreach ($resp in (Invoke-GraphBatch -Requests $fallbackReqs -Activity 'User device lookup (fallback)')) {
+            $id = [string]$resp.Id
+            if (-not $fallbackMeta.ContainsKey($id)) { continue }
+            if ($resp.Status -lt 200 -or $resp.Status -ge 300) { continue }
+            $info = $fallbackMeta[$id]
+            $parsed = Convert-UserDeviceBatchBody -Body $resp.Body -User $info.User -Relationship $info.Relationship
+            foreach ($pair in (ConvertTo-ObjectArray $parsed.Pairs)) { $pairs.Add($pair) }
+            foreach ($record in (ConvertTo-ObjectArray $parsed.NeedsFull)) {
+                $hold = New-Object PSObject
+                [void](Add-ToolProperty $hold 'Record' $record)
+                [void](Add-ToolProperty $hold 'User' $info.User)
+                [void](Add-ToolProperty $hold 'Relationship' $info.Relationship)
+                $needsFull.Add($hold)
+            }
+        }
+    }
+
+    if ($needsFull.Count -gt 0) {
+        $n = 0
+        $fullReqs = New-Object System.Collections.Generic.List[object]
+        $fullMeta = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+        foreach ($hold in $needsFull) {
+            if (-not $hold.Record.ObjectId) { continue }
+            $n++
+            $id = 'f' + $n
+            $url = '/devices/{0}?$select={1}' -f $hold.Record.ObjectId, $script:SelectFields
+            $fullReqs.Add((New-GraphBatchRequest -Id $id -Method GET -Url $url))
+            $fullMeta.Add($id, $hold)
+        }
+        foreach ($resp in (Invoke-GraphBatch -Requests $fullReqs -Activity 'Device detail lookup')) {
+            $id = [string]$resp.Id
+            if (-not $fullMeta.ContainsKey($id)) { continue }
+            if ($resp.Status -lt 200 -or $resp.Status -ge 300) { continue }
+            $hold = $fullMeta[$id]
+            try { $record = ConvertTo-DeviceRecord $resp.Body } catch { continue }
+            if (-not (Test-DeviceEligible $record)) { continue }
+            $pair = New-Object PSObject
+            [void](Add-ToolProperty $pair 'Device' $record)
+            [void](Add-ToolProperty $pair 'User' $hold.User)
+            [void](Add-ToolProperty $pair 'Relationship' $hold.Relationship)
+            $pairs.Add($pair)
+        }
+    }
+
+    return (ConvertTo-ObjectArray $pairs)
+}
+
+function Write-AuditLogs {
+    param($Entries)
+    $rows = ConvertTo-ObjectArray $Entries
+    if ($rows.Count -eq 0) { return }
+    try {
+        $folder = Split-Path -Parent $script:Settings.LogPath
+        if ($folder -and -not (Test-Path -LiteralPath $folder)) {
+            New-Item -ItemType Directory -Path $folder -Force | Out-Null
+        }
+        $rows | Export-Csv -Path $script:Settings.LogPath -Append -NoTypeInformation -Encoding UTF8
+    }
+    catch {
+        Write-Host "Could not write audit log: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
+function Write-AuditLog {
+    param($Entry)
+    Write-AuditLogs $Entry
+}
+
+function Set-DeviceExtensionAttribute {
+    param(
+        [Parameter(Mandatory = $true)] $Device,
+        $NewValue,
+        [string]$Source = 'Single'
+    )
+
+    if ([string]::IsNullOrEmpty($NewValue)) {
+        $NewValue = $null
+        $action = 'Clear'
+    }
+    elseif ([string]::IsNullOrEmpty($Device.ExtensionAttribute1)) {
+        $action = 'Add'
+    }
+    else {
+        $action = 'Modify'
+    }
+
+    $status  = 'Success'
+    $message = ''
+
+    if ($Device.IsManagementRestricted) {
+        $message = 'Device is in a restricted management administrative unit; the update may be denied.'
+    }
+
+    if ($script:Settings.DryRun) {
+        $status  = 'DryRun'
+        $message = 'No change written (dry-run mode)'
+    }
+    else {
+        $body = New-ExtensionAttributePatchJson $NewValue
+        try {
+            Invoke-GraphRequestWithRetry -Method PATCH -Uri "$($script:GraphBase)/$($Device.ObjectId)" -Body $body -ContentType 'application/json' | Out-Null
+        }
+        catch {
+            $status  = 'Failed'
+            $message = Get-GraphErrorMessage $_
+        }
+    }
+
+    $context = $null
+    try { $context = Get-MgContext } catch { }
+    $changedBy = ''
+    if ($context) { $changedBy = [string]$context.Account }
+    $entry = New-DeviceAuditEntry -Device $Device -NewValue $NewValue -Status $status -Action $action -Source $Source -Message $message -ChangedBy $changedBy
+    Write-AuditLog $entry
+    return $entry
+}
+
+function New-DeviceAuditEntry {
+    param($Device, $NewValue, [string]$Status, [string]$Action, [string]$Source, [string]$Message, [string]$ChangedBy)
+    $entry = New-Object PSObject
+    [void](Add-ToolProperty $entry 'Timestamp' (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+    [void](Add-ToolProperty $entry 'Source' $Source)
+    [void](Add-ToolProperty $entry 'Status' $Status)
+    [void](Add-ToolProperty $entry 'Action' $Action)
+    [void](Add-ToolProperty $entry 'DisplayName' $(if ($Device) { $Device.DisplayName } else { '' }))
+    [void](Add-ToolProperty $entry 'DeviceId' $(if ($Device) { $Device.DeviceId } else { '' }))
+    [void](Add-ToolProperty $entry 'ObjectId' $(if ($Device) { $Device.ObjectId } else { '' }))
+    $previous = $null
+    if ($Action -eq 'PrependName') {
+        $previous = if ($Device) { $Device.DisplayName } else { '' }
+    }
+    else {
+        $previous = if ($Device) { $Device.ExtensionAttribute1 } else { '' }
+    }
+    [void](Add-ToolProperty $entry 'PreviousValue' $previous)
+    [void](Add-ToolProperty $entry 'NewValue' $NewValue)
+    [void](Add-ToolProperty $entry 'ChangedBy' $ChangedBy)
+    [void](Add-ToolProperty $entry 'Message' $Message)
+    return $entry
+}
+
+function Get-DeviceChangeAction {
+    param($Device, $NewValue)
+    if ([string]::IsNullOrEmpty($NewValue)) { return 'Clear' }
+    if ($Device -and [string]::IsNullOrEmpty($Device.ExtensionAttribute1)) { return 'Add' }
+    return 'Modify'
+}
+
+function Invoke-DeviceExtensionAttributeUpdates {
+    param($PlanItems, [string]$Source)
+    $items = ConvertTo-ObjectArray $PlanItems
+    $results = New-Object System.Collections.Generic.List[object]
+    if ($items.Count -eq 0) { return (ConvertTo-ObjectArray $results) }
+
+    $changedBy = ''
+    try {
+        $context = Get-MgContext
+        if ($context) { $changedBy = [string]$context.Account }
+    }
+    catch { }
+
+    if ($script:Settings.DryRun) {
+        foreach ($item in $items) {
+            $action = Get-DeviceChangeAction $item.Device $item.NewValue
+            $results.Add((New-DeviceAuditEntry -Device $item.Device -NewValue $item.NewValue -Status 'DryRun' -Action $action -Source $Source -Message 'No change written (dry-run mode)' -ChangedBy $changedBy))
+        }
+        Write-AuditLogs (ConvertTo-ObjectArray $results)
+        return (ConvertTo-ObjectArray $results)
+    }
+
+    $requests = New-Object System.Collections.Generic.List[object]
+    $meta = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+    $n = 0
+    foreach ($item in $items) {
+        $n++
+        $id = [string]$n
+        $device = $item.Device
+        $url = '/devices/{0}' -f $device.ObjectId
+        $bodyJson = New-ExtensionAttributePatchJson $item.NewValue
+        $requests.Add((New-GraphBatchRequest -Id $id -Method PATCH -Url $url -BodyJson $bodyJson))
+        $meta.Add($id, $item)
+    }
+
+    Write-Host ("  Applying {0} device update(s) in Graph batches of {1}..." -f $requests.Count, $script:GraphBatchSize)
+    $responses = Invoke-GraphBatch -Requests $requests -Activity 'Device updates'
+    $byId = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+    foreach ($resp in $responses) {
+        $id = [string]$resp.Id
+        if ($id -and -not $byId.ContainsKey($id)) { $byId.Add($id, $resp) }
+    }
+
+    foreach ($kv in $meta.GetEnumerator()) {
+        $item = $kv.Value
+        $action = Get-DeviceChangeAction $item.Device $item.NewValue
+        $status = 'Failed'
+        $message = 'No batch response'
+        if ($byId.ContainsKey($kv.Key)) {
+            $resp = $byId[$kv.Key]
+            if ($resp.Status -ge 200 -and $resp.Status -lt 300) {
+                $status = 'Success'
+                $message = ''
+                if ($item.Device.IsManagementRestricted) {
+                    $message = 'Device is in a restricted management administrative unit; the update may be denied.'
+                }
+            }
+            else {
+                $message = Get-GraphBatchErrorMessage $resp
+            }
+        }
+        $results.Add((New-DeviceAuditEntry -Device $item.Device -NewValue $item.NewValue -Status $status -Action $action -Source $Source -Message $message -ChangedBy $changedBy))
+    }
+
+    Write-AuditLogs (ConvertTo-ObjectArray $results)
+    return (ConvertTo-ObjectArray $results)
+}
+
+function Find-IntuneManagedDevice {
+    param($Device)
+    $id = ''
+    $errorText = ''
+    $azureId = ''
+    if ($Device) { $azureId = [string]$Device.DeviceId }
+    if ([string]::IsNullOrWhiteSpace($azureId)) {
+        return (New-ToolObject @('Id', '', 'Error', 'Device has no Device ID to look up in Intune.'))
+    }
+    $filter = "azureADDeviceId eq '{0}'" -f $azureId.Replace("'", "''")
+    $uri = 'https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?$filter={0}&$select=id,deviceName,azureADDeviceId' -f [uri]::EscapeDataString($filter)
+    try {
+        $result = Invoke-GraphRequestWithRetry -Method GET -Uri $uri -ExpectBody
+        foreach ($item in (ConvertTo-ObjectArray (Get-GraphCollection $result))) {
+            $id = [string](Get-GraphProperty $item 'id')
+            if (-not [string]::IsNullOrWhiteSpace($id)) {
+                return (New-ToolObject @('Id', $id, 'Error', ''))
+            }
+        }
+        $errorText = 'This device was not found in Intune, so the name cannot be changed.'
+    }
+    catch {
+        $errorText = Get-GraphErrorMessage $_
+        if ($errorText -match '403|Authorization_RequestDenied|Insufficient|Access denied') {
+            $errorText = 'Intune permission is missing. Click Switch account, accept DeviceManagementManagedDevices.ReadWrite.All, then try again. ' + $errorText
+        }
+    }
+    return (New-ToolObject @('Id', '', 'Error', $errorText))
+}
+
+function Invoke-IntuneDeviceRename {
+    param($Device, [string]$NewName)
+    $found = Find-IntuneManagedDevice $Device
+    $intuneId = [string](Get-GraphProperty $found 'Id')
+    if ([string]::IsNullOrWhiteSpace($intuneId)) {
+        $err = [string](Get-GraphProperty $found 'Error')
+        if ([string]::IsNullOrWhiteSpace($err)) { $err = 'This device was not found in Intune, so the name cannot be changed.' }
+        return (New-ToolObject @('Success', $false, 'Message', $err))
+    }
+
+    $errors = New-Object System.Collections.Generic.List[string]
+    $managedBody = ('{{"managedDeviceName":{0}}}' -f (ConvertTo-JsonStringLiteral $NewName))
+    try {
+        Invoke-GraphRequestWithRetry -Method PATCH -Uri ('https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/{0}' -f $intuneId) -Body $managedBody -ContentType 'application/json' | Out-Null
+        return (New-ToolObject @('Success', $true, 'Message', 'Renamed in Intune. Entra ID still shows the old name because Microsoft only allows displayName changes on Windows devices.'))
+    }
+    catch {
+        $errors.Add(('Intune managedDeviceName: {0}' -f (Get-GraphErrorMessage $_)))
+    }
+
+    $actionBody = ('{{"deviceName":{0}}}' -f (ConvertTo-JsonStringLiteral $NewName))
+    foreach ($root in @('https://graph.microsoft.com/v1.0', 'https://graph.microsoft.com/beta')) {
+        try {
+            Invoke-GraphRequestWithRetry -Method POST -Uri ('{0}/deviceManagement/managedDevices/{1}/setDeviceName' -f $root, $intuneId) -Body $actionBody -ContentType 'application/json' | Out-Null
+            return (New-ToolObject @('Success', $true, 'Message', 'Renamed in Intune with setDeviceName. Entra ID still shows the old name because Microsoft only allows displayName changes on Windows devices.'))
+        }
+        catch {
+            $errors.Add(('Intune setDeviceName: {0}' -f (Get-GraphErrorMessage $_)))
+        }
+    }
+    return (New-ToolObject @('Success', $false, 'Message', ($errors.ToArray() -join ' ')))
+}
+
+function Set-DeviceDisplayName {
+    param(
+        [Parameter(Mandatory = $true)] $Device,
+        [string]$NewName,
+        [string]$Source = 'Single'
+    )
+
+    $status = 'Success'
+    $message = ''
+    $changedBy = ''
+    try {
+        $context = Get-MgContext
+        if ($context) { $changedBy = [string]$context.Account }
+    }
+    catch { }
+
+    if ($Device.IsManagementRestricted) {
+        $message = 'Device is in a restricted management administrative unit; the update may be denied.'
+    }
+
+    if ($script:Settings.DryRun) {
+        $status = 'DryRun'
+        $osNote = if (Test-WindowsDeviceOperatingSystem $Device) { 'Entra displayName' } else { 'Intune device name (Entra cannot rename this OS)' }
+        $message = "No change written (dry-run mode). Would update $osNote."
+        $entry = New-DeviceAuditEntry -Device $Device -NewValue $NewName -Status $status -Action 'PrependName' -Source $Source -Message $message -ChangedBy $changedBy
+        Write-AuditLog $entry
+        return $entry
+    }
+
+    $isWindows = Test-WindowsDeviceOperatingSystem $Device
+    $entraError = ''
+    if ($isWindows) {
+        $body = New-DisplayNamePatchJson $NewName
+        $uri = "$($script:GraphBase)/$($Device.ObjectId)"
+        try {
+            Invoke-GraphRequestWithRetry -Method PATCH -Uri $uri -Body $body -ContentType 'application/json' | Out-Null
+            $entry = New-DeviceAuditEntry -Device $Device -NewValue $NewName -Status 'Success' -Action 'PrependName' -Source $Source -Message $message -ChangedBy $changedBy
+            Write-AuditLog $entry
+            return $entry
+        }
+        catch {
+            $entraError = Get-GraphErrorMessage $_
+        }
+    }
+    else {
+        $os = [string](Get-GraphProperty $Device 'OperatingSystem')
+        if ([string]::IsNullOrWhiteSpace($os)) { $os = 'non-Windows' }
+        $entraError = "Entra ID can only rename Windows devices. This device is $os."
+    }
+
+    $intune = Invoke-IntuneDeviceRename -Device $Device -NewName $NewName
+    $intuneOk = $false
+    try { $intuneOk = [bool](Get-GraphProperty $intune 'Success') } catch { }
+    if ($intuneOk) {
+        $status = 'Success'
+        $message = [string](Get-GraphProperty $intune 'Message')
+    }
+    else {
+        $status = 'Failed'
+        $intuneMessage = [string](Get-GraphProperty $intune 'Message')
+        $message = $entraError
+        if ($intuneMessage) { $message = '{0} {1}' -f $message, $intuneMessage }
+        $advice = Get-DisplayNameUpdateAdvice $message
+        if ($advice -and $advice -ne $message -and $message -notlike "*$advice*") {
+            $message = '{0} {1}' -f $message, $advice
+        }
+    }
+
+    $entry = New-DeviceAuditEntry -Device $Device -NewValue $NewName -Status $status -Action 'PrependName' -Source $Source -Message $message -ChangedBy $changedBy
+    Write-AuditLog $entry
+    return $entry
+}
+
+function Invoke-DeviceDisplayNamePrefixUpdates {
+    param($PlanItems, [string]$Source)
+    $items = New-Object System.Collections.Generic.List[object]
+    foreach ($item in (ConvertTo-ObjectArray $PlanItems)) {
+        if ([string]$item.Status -ne 'Ready') { continue }
+        if (-not $item.Device -or [string]::IsNullOrWhiteSpace($item.NewName)) { continue }
+        $items.Add($item)
+    }
+    $results = New-Object System.Collections.Generic.List[object]
+    if ($items.Count -eq 0) { return (ConvertTo-ObjectArray $results) }
+
+    $n = 0
+    foreach ($item in $items) {
+        $n++
+        Write-Host ("  Renaming {0}/{1}: {2} -> {3}" -f $n, $items.Count, $item.Device.DisplayName, $item.NewName)
+        $results.Add((Set-DeviceDisplayName -Device $item.Device -NewName $item.NewName -Source $Source))
+    }
+    return (ConvertTo-ObjectArray $results)
+}
+
+#endregion
+
+#region CSV helpers
+
+function Get-CsvDelimiter {
+    param([string]$Path)
+    $lines = @(Get-Content -LiteralPath $Path -TotalCount 8 -ErrorAction Stop)
+    $normalised = @($lines | ForEach-Object { $_.Trim().Trim([char]0xFEFF) })
+    if ($normalised.Count -gt 0 -and $normalised[0] -match '^sep=(.)$') { return $Matches[1] }
+    $header = $null
+    foreach ($line in $normalised) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        if ($line -match '^sep=') { continue }
+        $header = $line
+        break
+    }
+    if (-not $header) { return ',' }
+    $comma = ([regex]::Matches($header, ',')).Count
+    $semi  = ([regex]::Matches($header, ';')).Count
+    $tab   = ([regex]::Matches($header, "`t")).Count
+    if ($tab -ge $comma -and $tab -ge $semi -and $tab -gt 0) { return "`t" }
+    if ($semi -gt $comma) { return ';' }
+    return ','
+}
+
+function Import-DeviceCsv {
+    param([string]$Path)
+    $delimiter = Get-CsvDelimiter -Path $Path
+    $lines = @(Get-Content -LiteralPath $Path -Encoding UTF8)
+    if ($lines.Count -gt 0 -and $lines[0].Trim().Trim([char]0xFEFF) -match '^sep=') {
+        $lines = @($lines | Select-Object -Skip 1)
+    }
+    if ($lines.Count -eq 0) { return @() }
+
+    $temp = [IO.Path]::GetTempFileName()
+    try {
+        Set-Content -LiteralPath $temp -Value $lines -Encoding UTF8
+        return @(Import-Csv -LiteralPath $temp -Delimiter $delimiter -Encoding UTF8)
+    }
+    finally {
+        Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Resolve-CsvColumnMap {
+    param($Headers)
+    $map = @{}
+    $headerList = @(
+        $Headers | ForEach-Object {
+            if ($_ -is [System.Management.Automation.PSPropertyInfo]) { $_.Name }
+            else { [string]$_ }
+        } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    foreach ($canonical in @('DeviceId', 'ObjectId', 'DisplayName', 'Value', 'Action')) {
+        foreach ($alias in $script:CsvColumnAliases[$canonical]) {
+            $match = $headerList | Where-Object { [string]::Equals($_.Trim(), $alias.Trim(), [System.StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+            if ($match) {
+                $map[$canonical] = $match
+                break
+            }
+        }
+    }
+    return $map
+}
+
+function Get-RowField {
+    param($Row, [string]$Name)
+    if ($null -eq $Row -or [string]::IsNullOrWhiteSpace($Name)) { return '' }
+    $property = $Row.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        $property = $Row.PSObject.Properties | Where-Object { [string]::Equals($_.Name.Trim(), $Name.Trim(), [System.StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+    }
+    if ($null -eq $property -or $null -eq $property.Value) { return '' }
+    return ([string]$property.Value).Trim().Trim('"')
+}
+
+function Get-MappedRowField {
+    param($Row, $ColumnMap, [string]$CanonicalName)
+    if ($null -eq $ColumnMap -or -not $ColumnMap.ContainsKey($CanonicalName)) { return '' }
+    return Get-RowField $Row $ColumnMap[$CanonicalName]
+}
+
+function Get-BulkCsvLookupTargets {
+    param($Rows, $ColumnMap)
+    $targets = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    foreach ($row in (ConvertTo-ObjectArray $Rows)) {
+        $deviceId = ConvertTo-CanonicalGuid (Get-MappedRowField $row $ColumnMap 'DeviceId')
+        if (-not $deviceId) { $deviceId = '' }
+        $objectId = ConvertTo-CanonicalGuid (Get-MappedRowField $row $ColumnMap 'ObjectId')
+        if (-not $objectId) { $objectId = '' }
+        $name = [string](Get-MappedRowField $row $ColumnMap 'DisplayName')
+        $search = if ($deviceId) { $deviceId } elseif ($objectId) { $objectId } elseif ($name) { $name } else { $null }
+        if (-not $search) { continue }
+        $key = $search.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        $target = New-Object PSObject
+        [void](Add-ToolProperty $target 'Search' $search)
+        [void](Add-ToolProperty $target 'DeviceId' $deviceId)
+        [void](Add-ToolProperty $target 'ObjectId' $objectId)
+        [void](Add-ToolProperty $target 'DisplayName' $name)
+        $targets.Add($target)
+    }
+    return (ConvertTo-ObjectArray $targets)
+}
+
+function Add-UniqueDeviceRecord {
+    param($List, $Seen, $Record)
+    if ($null -eq $Record -or $null -eq $List) { return }
+    $id = [string]$Record.ObjectId
+    if (-not $id) { $id = [string]$Record.DeviceId }
+    if ($id -and $Seen -and $Seen.ContainsKey($id)) { return }
+    if ($id -and $Seen) { $Seen[$id] = $true }
+    $List.Add($Record)
+}
+
+function Get-DevicesForBulkRows {
+    param($Rows, $ColumnMap)
+    $devices = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    $targets = Get-BulkCsvLookupTargets -Rows $Rows -ColumnMap $ColumnMap
+    $byObjectId = New-Object System.Collections.Generic.List[object]
+    $byDeviceId = New-Object System.Collections.Generic.List[object]
+    $byName = New-Object System.Collections.Generic.List[object]
+    foreach ($target in $targets) {
+        if ($target.ObjectId) { $byObjectId.Add($target); continue }
+        if ($target.DeviceId) { $byDeviceId.Add($target); continue }
+        $byName.Add($target)
+    }
+
+    if ($byObjectId.Count -gt 0) {
+        $reqs = New-Object System.Collections.Generic.List[object]
+        $n = 0
+        foreach ($target in $byObjectId) {
+            $n++
+            $url = '/devices/{0}?$select={1}' -f $target.ObjectId, $script:SelectFields
+            $reqs.Add((New-GraphBatchRequest -Id ([string]$n) -Method GET -Url $url))
+        }
+        Write-Host ("  Looking up {0} device(s) by Object ID..." -f $byObjectId.Count)
+        foreach ($resp in (Invoke-GraphBatch -Requests $reqs -Activity 'Device Object ID lookup')) {
+            if ($resp.Status -lt 200 -or $resp.Status -ge 300) { continue }
+            try { Add-UniqueDeviceRecord $devices $seen (ConvertTo-DeviceRecord $resp.Body) } catch { }
+        }
+    }
+
+    if ($byDeviceId.Count -gt 0) {
+        $reqs = New-Object System.Collections.Generic.List[object]
+        $n = 0
+        foreach ($target in $byDeviceId) {
+            $n++
+            $filter = "deviceId eq '{0}'" -f $target.DeviceId
+            $url = '/devices?$filter={0}&$select={1}&$top=5' -f [uri]::EscapeDataString($filter), $script:SelectFields
+            $reqs.Add((New-GraphBatchRequest -Id ([string]$n) -Method GET -Url $url))
+        }
+        Write-Host ("  Looking up {0} device(s) by Device ID..." -f $byDeviceId.Count)
+        foreach ($resp in (Invoke-GraphBatch -Requests $reqs -Activity 'Device ID lookup')) {
+            if ($resp.Status -lt 200 -or $resp.Status -ge 300) { continue }
+            foreach ($item in (Get-GraphCollection $resp.Body)) {
+                try { Add-UniqueDeviceRecord $devices $seen (ConvertTo-DeviceRecord $item) } catch { }
+            }
+        }
+    }
+
+    if ($byName.Count -gt 0) {
+        Write-Host ("  Looking up {0} device(s) by name (slower)..." -f $byName.Count)
+        $n = 0
+        foreach ($target in $byName) {
+            $n++
+            Write-ToolProgressCount -Activity 'Name lookup' -Done $n -Total $byName.Count -Every 25
+            try {
+                foreach ($record in (ConvertTo-ObjectArray (Find-Devices $target.Search))) {
+                    Add-UniqueDeviceRecord $devices $seen $record
+                }
+            }
+            catch {
+                Write-Host ("    Lookup failed for '{0}': {1}" -f $target.Search, (Format-CaughtError $_)) -ForegroundColor Yellow
+            }
+        }
+    }
+
+    return (ConvertTo-ObjectArray $devices)
+}
+
+function Get-RowAction {
+    param($Row, $ColumnMap)
+    $action = if ($ColumnMap) { Get-MappedRowField $Row $ColumnMap 'Action' } else { Get-RowField $Row 'Action' }
+    if ($action -match '^(clear|remove|delete)$') { return 'Clear' }
+    if ($action -eq '' -or $action -match '^(set|add|modify|update)$') { return 'Set' }
+    return 'Invalid'
+}
+
+function Resolve-UserCsvColumnMap {
+    param($Headers)
+    $map = @{}
+    $headerList = @(
+        $Headers | ForEach-Object {
+            if ($_ -is [System.Management.Automation.PSPropertyInfo]) { $_.Name }
+            else { [string]$_ }
+        } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    foreach ($canonical in @('ObjectId', 'UserPrincipalName', 'Mail', 'DisplayName')) {
+        foreach ($alias in $script:UserCsvColumnAliases[$canonical]) {
+            $match = $headerList | Where-Object { [string]::Equals($_.Trim(), $alias.Trim(), [System.StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+            if ($match) {
+                $map[$canonical] = $match
+                break
+            }
+        }
+    }
+    return $map
+}
+
+function Get-UserRowSearchToken {
+    param($Row, $ColumnMap)
+    foreach ($name in @('ObjectId', 'UserPrincipalName', 'Mail', 'DisplayName')) {
+        $value = Get-MappedRowField $Row $ColumnMap $name
+        if ($value) { return $value }
+    }
+    return ''
+}
+
+function New-UserDeviceBulkRow {
+    param(
+        $Device,
+        $User,
+        [string]$Relationship = 'Registered',
+        $Value,
+        [string]$Action = 'Set'
+    )
+    if ($Action -eq 'Clear') { $Value = '' }
+    elseif ($null -eq $Value) { $Value = '' }
+    return (New-ToolObject @(
+            'DeviceId', $Device.DeviceId
+            'ObjectId', $Device.ObjectId
+            'DisplayName', $Device.DisplayName
+            'Value', [string]$Value
+            'Action', $Action
+            'UserPrincipalName', $(if ($User) { [string]$User.UserPrincipalName } else { '' })
+            'UserDisplayName', $(if ($User) { [string]$User.DisplayName } else { '' })
+            'UserObjectId', $(if ($User) { [string]$User.ObjectId } else { '' })
+            'Relationship', $Relationship
+            'JoinType', $Device.JoinType
+            'OperatingSystem', $Device.OperatingSystem
+            'LastSignIn', $Device.LastSignInDisplay
+            'LastSignInUtc', (Format-UtcDateTimeIso $Device.LastSignIn)
+            'CurrentExtensionAttribute1', $Device.ExtensionAttribute1
+            'Eligible', [bool]$Device.Eligible
+        ))
+}
+
+function Get-CsvImportKind {
+    param($Headers)
+    $headerList = @($Headers)
+    $deviceMap = Resolve-CsvColumnMap $headerList
+    $userMap = Resolve-UserCsvColumnMap $headerList
+    $hasDeviceId = $deviceMap.ContainsKey('DeviceId')
+    $hasUpnOrMail = $userMap.ContainsKey('UserPrincipalName') -or $userMap.ContainsKey('Mail')
+    $userObjectHeader = ''
+    if ($userMap.ContainsKey('ObjectId')) { $userObjectHeader = [string]$userMap['ObjectId'] }
+    $hasUserOnlyObjectId = ($userObjectHeader -match 'User')
+    if ($hasDeviceId) { return 'Device' }
+    if ($hasUpnOrMail -or $hasUserOnlyObjectId) { return 'User' }
+    if ($deviceMap.ContainsKey('ObjectId') -or $deviceMap.ContainsKey('DisplayName')) { return 'Device' }
+    return 'Unknown'
+}
+
+function Merge-UserDeviceBulkRows {
+    param([object[]]$Rows)
+    $byKey = [ordered]@{}
+    foreach ($row in @($Rows)) {
+        $key = if ($row.ObjectId) { [string]$row.ObjectId } elseif ($row.DeviceId) { [string]$row.DeviceId } else { [guid]::NewGuid().ToString() }
+        if ($byKey.Contains($key)) {
+            $existing = $byKey[$key]
+            $relParts = New-Object System.Collections.Generic.List[string]
+            foreach ($part in @(($existing.Relationship -split ',') + ($row.Relationship -split ','))) {
+                $piece = ([string]$part).Trim()
+                if ($piece -and -not $relParts.Contains($piece)) { $relParts.Add($piece) }
+            }
+            $existing.Relationship = ($relParts -join ', ')
+
+            if ($row.UserPrincipalName -and $existing.UserPrincipalName -notlike ('*{0}*' -f $row.UserPrincipalName)) {
+                $existing.UserPrincipalName = @($existing.UserPrincipalName, $row.UserPrincipalName) -join '; '
+                $existing.UserDisplayName = @($existing.UserDisplayName, $row.UserDisplayName) -join '; '
+                $existing.UserObjectId = @($existing.UserObjectId, $row.UserObjectId) -join '; '
+            }
+        }
+        else {
+            $byKey[$key] = $row
+        }
+    }
+    return (ConvertTo-ObjectArray $byKey.Values)
+}
+
+function New-DeviceIndex {
+    param([object[]]$Devices)
+    $index = [pscustomobject]@{
+        ByDeviceId = @{}
+        ByObjectId = @{}
+        ByName     = @{}
+    }
+    foreach ($device in @($Devices)) {
+        if ($device.DeviceId) { $index.ByDeviceId[$device.DeviceId] = $device }
+        if ($device.ObjectId) { $index.ByObjectId[$device.ObjectId] = $device }
+        $name = [string]$device.DisplayName
+        if ($name) {
+            if (-not $index.ByName.ContainsKey($name)) {
+                $index.ByName[$name] = New-Object System.Collections.Generic.List[object]
+            }
+            $index.ByName[$name].Add($device)
+        }
+    }
+    return $index
+}
+
+function New-BulkUpdatePlan {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Rows,
+        [Parameter(Mandatory = $true)]$DeviceIndex,
+        $ColumnMap,
+        $FallbackValue,
+        [bool]$SkipMissing = $false,
+        [int]$HeaderLineNumber = 1,
+        [scriptblock]$LookupMissingDevice
+    )
+
+    if (-not $ColumnMap) {
+        $headers = @($Rows[0].PSObject.Properties | ForEach-Object { $_.Name })
+        $ColumnMap = Resolve-CsvColumnMap $headers
+    }
+
+    $plan = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    $rowNumber = $HeaderLineNumber
+
+    foreach ($row in $Rows) {
+        $rowNumber++
+        $deviceIdText = Get-MappedRowField $row $ColumnMap 'DeviceId'
+        $objectIdText = Get-MappedRowField $row $ColumnMap 'ObjectId'
+        $nameText     = Get-MappedRowField $row $ColumnMap 'DisplayName'
+
+        $deviceId = ConvertTo-CanonicalGuid $deviceIdText
+        if (-not $deviceId) { $deviceId = $deviceIdText }
+        $objectId = ConvertTo-CanonicalGuid $objectIdText
+        if (-not $objectId) { $objectId = $objectIdText }
+
+        $identifier = ''
+        $device     = $null
+        $status     = 'Ready'
+        $note       = ''
+        $newValue   = $null
+
+        if ($deviceId) {
+            $identifier = $deviceId
+            if ($DeviceIndex.ByDeviceId.ContainsKey($deviceId)) { $device = $DeviceIndex.ByDeviceId[$deviceId] }
+        }
+        elseif ($objectId) {
+            $identifier = $objectId
+            if ($DeviceIndex.ByObjectId.ContainsKey($objectId)) { $device = $DeviceIndex.ByObjectId[$objectId] }
+        }
+        elseif ($nameText) {
+            $identifier = $nameText
+            if ($DeviceIndex.ByName.ContainsKey($nameText)) {
+                $nameMatches = $DeviceIndex.ByName[$nameText]
+                if ($nameMatches.Count -eq 1) {
+                    $device = $nameMatches[0]
+                }
+                else {
+                    $status = 'Ambiguous'
+                    $note   = "$($nameMatches.Count) devices share this name. Use DeviceId instead."
+                }
+            }
+        }
+        else {
+            $status = 'Invalid'
+            $note   = 'No DeviceId, ObjectId or DisplayName'
+        }
+
+        if ($status -eq 'Ready' -and $null -eq $device) {
+            $lookedUp = $null
+            if ($LookupMissingDevice) {
+                $lookedUp = & $LookupMissingDevice $deviceId $objectId $nameText
+            }
+            if ($lookedUp) {
+                $device = $lookedUp
+                if (-not $lookedUp.Eligible) {
+                    $status = 'NotEligible'
+                    $note   = Get-IneligibleDeviceNote $lookedUp
+                }
+            }
+            else {
+                $status = 'NotFound'
+                $note   = 'Device was not found in Entra ID'
+            }
+        }
+
+        if ($status -eq 'Ready' -and $device -and -not $device.Eligible) {
+            $status = 'NotEligible'
+            $note   = Get-IneligibleDeviceNote $device
+        }
+
+        if ($status -eq 'Ready') {
+            $action = Get-RowAction $row $ColumnMap
+            if ($action -eq 'Invalid') {
+                $status = 'Invalid'
+                $note   = "Unknown Action '$(Get-MappedRowField $row $ColumnMap 'Action')'. Use Set or Clear."
+            }
+            elseif ($action -eq 'Clear') {
+                $newValue = $null
+            }
+            else {
+                $rowValue = Get-MappedRowField $row $ColumnMap 'Value'
+                if ($rowValue) {
+                    $validation = Get-ValueValidationError $rowValue
+                    if ($validation) {
+                        $status = 'Invalid'
+                        $note   = $validation
+                    }
+                    else {
+                        $newValue = $rowValue
+                    }
+                }
+                elseif ($SkipMissing) {
+                    $status = 'Skipped'
+                    $note   = 'No Value in CSV'
+                }
+                else {
+                    $newValue = $FallbackValue
+                }
+            }
+        }
+
+        if ($status -eq 'Ready') {
+            if ($seen.ContainsKey($device.ObjectId)) {
+                $status = 'Duplicate'
+                $note   = "Same device as row $($seen[$device.ObjectId])"
+            }
+            else {
+                $seen[$device.ObjectId] = $rowNumber
+                if (Test-SameValue $device.ExtensionAttribute1 $newValue) {
+                    $status = 'NoChange'
+                    $note   = 'Already has this value'
+                }
+            }
+        }
+
+        $displayName  = ''
+        $currentValue = ''
+        $newDisplay   = ''
+        if ($device) {
+            $displayName  = $device.DisplayName
+            $currentValue = Format-Value $device.ExtensionAttribute1
+        }
+        if ($status -eq 'Ready' -or $status -eq 'NoChange') { $newDisplay = Format-Value $newValue }
+
+        $plan.Add((New-ToolObject @(
+                    'Row', $rowNumber
+                    'Identifier', $identifier
+                    'DisplayName', $displayName
+                    'Current', $currentValue
+                    'New', $newDisplay
+                    'Status', $status
+                    'Note', $note
+                    'Device', $device
+                    'NewValue', $newValue
+                )))
+    }
+
+    return (ConvertTo-ObjectArray $plan)
+}
+
+#endregion
+
+#region Shared prompts
+
+function Read-ActivityWindowDays {
+    param([int]$Default = 90)
+    if ($Default -lt 1) { $Default = 90 }
+    $text = ([string](Read-Host ("Include devices with last sign-in in the last N days [{0}]" -f $Default))).Trim()
+    if (-not $text) { return $Default }
+    $days = 0
+    if ([int]::TryParse($text, [ref]$days) -and $days -ge 1 -and $days -le 3650) {
+        return $days
+    }
+    Write-Host ("Using {0} days." -f $Default) -ForegroundColor Yellow
+    return $Default
+}
+
+function Read-ValueChoice {
+    param([string]$Heading = 'What do you want to set extensionAttribute1 to?')
+
+    Write-Host ''
+    Write-Host $Heading -ForegroundColor Cyan
+    Write-Host "  1) Default value '$($script:Settings.DefaultValue)'"
+    Write-Host '  2) Enter a custom value'
+    Write-Host '  3) Clear the value'
+    Write-Host '  0) Cancel'
+
+    while ($true) {
+        switch (Read-Choice 'Choose') {
+            '1' { return @{ Value = $script:Settings.DefaultValue } }
+            '2' {
+                $custom = [string](Read-Host 'Enter value')
+                if (Test-ValidValue $custom) { return @{ Value = $custom.Trim() } }
+            }
+            '3' { return @{ Value = $null } }
+            '0' { return $null }
+            default { Write-Host 'Invalid choice.' -ForegroundColor Yellow }
+        }
+    }
+}
+
+function Show-DeviceDetail {
+    param($Device)
+    $Device |
+        Select-Object DisplayName, DeviceId, ObjectId, JoinType, OperatingSystem, OSVersion,
+            @{ Name = 'Enabled'; Expression = { $_.Enabled } },
+            @{ Name = 'LastSignIn'; Expression = { $_.LastSignInDisplay } },
+            @{ Name = 'Restricted AU'; Expression = { $_.IsManagementRestricted } },
+            @{ Name = 'ExtensionAttribute1'; Expression = { Format-Value $_.ExtensionAttribute1 } } |
+        Format-List | Out-Host
+}
+
+function Select-DeviceFromList {
+    param([object[]]$Devices)
+
+    $pageSize = 30
+    $page = 0
+    $total = $Devices.Count
+    $pageCount = [Math]::Max(1, [int][Math]::Ceiling($total / $pageSize))
+
+    while ($true) {
+        $start = $page * $pageSize
+        $shown = @($Devices | Select-Object -Skip $start -First $pageSize)
+
+        Write-Host ''
+        Write-Host ('{0,4}  {1,-30} {2,-17} {3,-12} {4}' -f '#', 'Name', 'Join type', 'OS', 'extensionAttribute1') -ForegroundColor Cyan
+        for ($i = 0; $i -lt $shown.Count; $i++) {
+            $d = $shown[$i]
+            $color = if ($d.Eligible) { 'White' } else { 'DarkGray' }
+            $line = '{0,4}) {1,-30} {2,-17} {3,-12} {4}' -f ($start + $i + 1), (Limit-Text $d.DisplayName 30), $d.JoinType, (Limit-Text $d.OperatingSystem 12), (Format-Value $d.ExtensionAttribute1)
+            Write-Host $line -ForegroundColor $color
+        }
+        Write-Host '      Grey entries are not eligible and cannot be changed.' -ForegroundColor DarkGray
+        if ($pageCount -gt 1) {
+            Write-Host "      Page $($page + 1) of $pageCount. N=next, P=previous." -ForegroundColor Yellow
+        }
+
+        $pick = ([string](Read-Host 'Select a number (Enter to cancel)')).Trim()
+        if (-not $pick) { return $null }
+        if ($pick -match '^(N|NEXT)$') {
+            if ($page -lt $pageCount - 1) { $page++ }
+            continue
+        }
+        if ($pick -match '^(P|PREV|PREVIOUS)$') {
+            if ($page -gt 0) { $page-- }
+            continue
+        }
+
+        $number = 0
+        if ([int]::TryParse($pick, [ref]$number) -and $number -ge 1 -and $number -le $total) {
+            $choice = $Devices[$number - 1]
+            if ($choice.Eligible) { return $choice }
+            Write-Host (Get-IneligibleDeviceNote $choice) -ForegroundColor Yellow
+            continue
+        }
+        Write-Host 'Invalid selection.' -ForegroundColor Yellow
+    }
+}
+
+function Select-UserFromList {
+    param([object[]]$Users)
+
+    $pageSize = 30
+    $page = 0
+    $total = $Users.Count
+    $pageCount = [Math]::Max(1, [int][Math]::Ceiling($total / $pageSize))
+
+    while ($true) {
+        $start = $page * $pageSize
+        $shown = @($Users | Select-Object -Skip $start -First $pageSize)
+
+        Write-Host ''
+        Write-Host ('{0,4}  {1,-32} {2,-36} {3}' -f '#', 'Name', 'UPN', 'Enabled') -ForegroundColor Cyan
+        for ($i = 0; $i -lt $shown.Count; $i++) {
+            $u = $shown[$i]
+            $line = '{0,4}) {1,-32} {2,-36} {3}' -f ($start + $i + 1), (Limit-Text $u.DisplayName 32), (Limit-Text $u.UserPrincipalName 36), $u.Enabled
+            Write-Host $line
+        }
+        if ($pageCount -gt 1) {
+            Write-Host "      Page $($page + 1) of $pageCount. N=next, P=previous." -ForegroundColor Yellow
+        }
+
+        $pick = ([string](Read-Host 'Select a number (Enter to skip this user)')).Trim()
+        if (-not $pick) { return $null }
+        if ($pick -match '^(N|NEXT)$') {
+            if ($page -lt $pageCount - 1) { $page++ }
+            continue
+        }
+        if ($pick -match '^(P|PREV|PREVIOUS)$') {
+            if ($page -gt 0) { $page-- }
+            continue
+        }
+
+        $number = 0
+        if ([int]::TryParse($pick, [ref]$number) -and $number -ge 1 -and $number -le $total) {
+            return $Users[$number - 1]
+        }
+        Write-Host 'Invalid selection.' -ForegroundColor Yellow
+    }
+}
+
+#endregion
+
+#region Menu actions
+
+function Show-DeviceList {
+    Write-Title 'Entra devices'
+
+    try {
+        Write-Host 'Large tenants can take a few minutes. A count is printed after each Graph page.' -ForegroundColor DarkGray
+        $devices = ConvertTo-ObjectArray (Get-WindowsRegisteredDevices)
+    }
+    catch {
+        Write-Host "Failed to retrieve devices: $(Get-GraphErrorMessage $_)" -ForegroundColor Red
+        Wait-ForKey
+        return
+    }
+
+    $view = $devices
+    $columns = @(
+        'DisplayName',
+        'DeviceId',
+        'JoinType',
+        'OSVersion',
+        'Enabled',
+        @{ Name = 'LastSignIn'; Expression = { $_.LastSignInDisplay } },
+        @{ Name = 'ExtensionAttribute1'; Expression = { Format-Value $_.ExtensionAttribute1 } }
+    )
+
+    while ($true) {
+        $withValue   = @($view | Where-Object { -not [string]::IsNullOrEmpty($_.ExtensionAttribute1) })
+        $withDefault = @($view | Where-Object { $_.ExtensionAttribute1 -ceq $script:Settings.DefaultValue })
+        $scopeText   = Get-DeviceScopeLabel
+
+        Write-Host ''
+        Write-Host "Found $($devices.Count) $scopeText devices." -ForegroundColor Green
+        if ($view.Count -ne $devices.Count) {
+            Write-Host "Showing $($view.Count) after name filter." -ForegroundColor Yellow
+        }
+        Write-Host "  $($withValue.Count) have extensionAttribute1 set, $($withDefault.Count) are set to '$($script:Settings.DefaultValue)'."
+        Write-Host ''
+        Write-Host '  1) Show listed devices'
+        Write-Host '  2) Show devices with extensionAttribute1 set'
+        Write-Host "  3) Show devices set to '$($script:Settings.DefaultValue)'"
+        if (Test-GridViewAvailable) { Write-Host '  4) Open in grid view' } else { Write-Host '  4) Open in grid view (not available in this session)' }
+        Write-Host '  5) Export list to CSV'
+        Write-Host '  6) Filter listed devices by name'
+        Write-Host '  7) Clear name filter'
+        Write-Host '  0) Back'
+
+        switch (Read-Choice) {
+            '1' { $view | Format-Table -Property $columns -AutoSize | Out-Host }
+            '2' { $withValue | Format-Table -Property $columns -AutoSize | Out-Host }
+            '3' { $withDefault | Format-Table -Property $columns -AutoSize | Out-Host }
+            '4' {
+                if (Test-GridViewAvailable) {
+                    $view | Select-Object DisplayName, DeviceId, ObjectId, JoinType, OperatingSystem, OSVersion, Enabled, LastSignInDisplay, ExtensionAttribute1 |
+                        Out-GridView -Title 'Entra devices'
+                }
+                else {
+                    Write-Host 'Out-GridView is not available. Install Microsoft.PowerShell.GraphicalTools or use Windows PowerShell.' -ForegroundColor Yellow
+                }
+            }
+            '5' {
+                $defaultPath = Join-Path $script:Root ('EntraRegisteredDevices_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+                $path = ([string](Read-Host "Save to [$defaultPath]")).Trim().Trim('"')
+                if (-not $path) { $path = $defaultPath }
+                try {
+                    $folder = Split-Path -Parent $path
+                    if ($folder -and -not (Test-Path -LiteralPath $folder)) {
+                        New-Item -ItemType Directory -Path $folder -Force | Out-Null
+                    }
+                    $view | Select-Object DisplayName, DeviceId, ObjectId, JoinType, OperatingSystem, OSVersion, Enabled, LastSignIn, ExtensionAttribute1 |
+                        Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+                    Write-Host "Exported to $path" -ForegroundColor Green
+                }
+                catch {
+                    Write-Host "Export failed: $($_.Exception.Message)" -ForegroundColor Red
+                }
+            }
+            '6' {
+                $filter = ([string](Read-Host 'Name contains')).Trim()
+                if ($filter) {
+                    $view = @($devices | Where-Object { $_.DisplayName -like "*$filter*" })
+                }
+            }
+            '7' { $view = $devices }
+            '0' { return }
+            default { Write-Host 'Invalid choice.' -ForegroundColor Yellow }
+        }
+    }
+}
+
+function Invoke-SingleDeviceUpdate {
+    Write-Title 'Update a single device'
+
+    while ($true) {
+        Write-Host ''
+        $search = ([string](Read-Host 'Device name (or start of name), Device ID or Object ID (Enter to go back)')).Trim()
+        if (-not $search) { return }
+
+        try {
+            $found = @(Find-Devices $search)
+        }
+        catch {
+            Write-Host "Lookup failed: $(Get-GraphErrorMessage $_)" -ForegroundColor Red
+            continue
+        }
+
+        if ($found.Count -eq 0) {
+            Write-Host "No devices found matching '$search'." -ForegroundColor Yellow
+            continue
+        }
+
+        $eligible = @($found | Where-Object { $_.Eligible })
+        if ($eligible.Count -eq 0) {
+            Write-Host 'Matching devices were found, but none are eligible to change:' -ForegroundColor Yellow
+            $found | Format-Table DisplayName, JoinType, OperatingSystem, DeviceId -AutoSize | Out-Host
+            Write-Host ("Current device scope: {0}. Change it in Settings to include more devices." -f (Get-DeviceScopeLabel)) -ForegroundColor DarkGray
+            continue
+        }
+
+        if ($found.Count -eq 1) { $device = $found[0] } else { $device = Select-DeviceFromList $found }
+        if ($null -eq $device) { continue }
+
+        Show-DeviceDetail $device
+        if ($device.IsManagementRestricted) {
+            Write-Host 'This device is in a restricted management administrative unit. The update may be denied unless your role is scoped to that unit.' -ForegroundColor Yellow
+        }
+
+        $choice = Read-ValueChoice
+        if ($null -eq $choice) {
+            Write-Host 'Cancelled.' -ForegroundColor Yellow
+            continue
+        }
+
+        $newValue = $choice.Value
+        if (Test-SameValue $device.ExtensionAttribute1 $newValue) {
+            Write-Host 'The device already has that value. Nothing to change.' -ForegroundColor Yellow
+            continue
+        }
+
+        Write-Host ''
+        Write-Host "Device : $($device.DisplayName)"
+        Write-Host "Current: $(Format-Value $device.ExtensionAttribute1)"
+        Write-Host "New    : $(Format-Value $newValue)"
+        if ($script:Settings.DryRun) { Write-Host 'Dry-run mode is ON. No change will be written.' -ForegroundColor Yellow }
+
+        if (-not (Read-YesNo 'Apply this change?' $false)) {
+            Write-Host 'Cancelled.' -ForegroundColor Yellow
+            continue
+        }
+
+        $result = Set-DeviceExtensionAttribute -Device $device -NewValue $newValue -Source 'Single'
+        switch ($result.Status) {
+            'Success' { Write-Host "$($result.Action) completed for $($device.DisplayName)." -ForegroundColor Green }
+            'DryRun'  { Write-Host "Dry-run: would $($result.Action.ToLower()) the value on $($device.DisplayName)." -ForegroundColor Yellow }
+            default   { Write-Host "Failed: $($result.Message)" -ForegroundColor Red }
+        }
+
+        if (-not (Read-YesNo 'Update another device?' $true)) { return }
+    }
+}
+
+function Show-OpenFileDialog {
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        $owner = New-Object System.Windows.Forms.Form
+        $owner.TopMost = $true
+        $dialog = New-Object System.Windows.Forms.OpenFileDialog
+        $dialog.Title = 'Select device CSV'
+        $dialog.Filter = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*'
+        $dialog.InitialDirectory = $script:Root
+        $result = $dialog.ShowDialog($owner)
+        $owner.Dispose()
+        if ($result -eq [System.Windows.Forms.DialogResult]::OK) { return $dialog.FileName }
+    }
+    catch {
+        Write-Host 'The file browser is not available in this session. Type the path instead.' -ForegroundColor Yellow
+    }
+    return $null
+}
+
+function Select-CsvPath {
+    Write-Host '  1) Browse for the CSV file'
+    Write-Host '  2) Type the path'
+    Write-Host '  0) Cancel'
+
+    switch (Read-Choice 'Choose') {
+        '1' {
+            $path = Show-OpenFileDialog
+            if ($path) { return $path }
+            $typed = ([string](Read-Host 'Full path to CSV (Enter to cancel)')).Trim().Trim('"')
+            if ($typed) { return $typed }
+            return $null
+        }
+        '2' {
+            $typed = ([string](Read-Host 'Full path to CSV')).Trim().Trim('"')
+            if ($typed) { return $typed }
+            return $null
+        }
+        default { return $null }
+    }
+}
+
+function Invoke-BulkUpdate {
+    param([string]$Path)
+
+    Write-Title 'Bulk update from CSV'
+
+    if (-not $Path) { $Path = Select-CsvPath }
+    if (-not $Path) { return }
+
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        Write-Host "File not found: $path" -ForegroundColor Red
+        Wait-ForKey
+        return
+    }
+
+    try {
+        $rows = @(Import-DeviceCsv -Path $path)
+    }
+    catch {
+        Write-Host "Could not read CSV: $($_.Exception.Message)" -ForegroundColor Red
+        Wait-ForKey
+        return
+    }
+
+    if ($rows.Count -eq 0) {
+        Write-Host 'The CSV has no data rows.' -ForegroundColor Yellow
+        Wait-ForKey
+        return
+    }
+
+    $headers   = @($rows[0].PSObject.Properties | ForEach-Object { $_.Name })
+    $columnMap = Resolve-CsvColumnMap $headers
+    $idColumns = @('DeviceId', 'ObjectId', 'DisplayName' | Where-Object { $columnMap.ContainsKey($_) })
+    if ($idColumns.Count -eq 0) {
+        Write-Host 'The CSV needs at least one of these columns: DeviceId, ObjectId, DisplayName (or an alias such as Name / ComputerName).' -ForegroundColor Red
+        Write-Host "Columns found: $($headers -join ', ')" -ForegroundColor Red
+        Wait-ForKey
+        return
+    }
+
+    Write-Host ''
+    Write-Host "Loaded $($rows.Count) rows from $path" -ForegroundColor Green
+    Write-Host "Identifier columns: $($idColumns -join ', ')"
+
+    $missingValueCount = @($rows | Where-Object {
+            (Get-RowAction $_ $columnMap) -eq 'Set' -and [string]::IsNullOrEmpty((Get-MappedRowField $_ $columnMap 'Value'))
+        }).Count
+
+    $fallbackValue = $null
+    $skipMissing   = $false
+    if ($missingValueCount -gt 0) {
+        Write-Host ''
+        Write-Host "$missingValueCount rows have no Value." -ForegroundColor Yellow
+        Write-Host '  1) Use the default value'
+        Write-Host '  2) Use a custom value'
+        Write-Host '  3) Clear the value on those devices'
+        Write-Host '  4) Skip those rows'
+        Write-Host '  0) Cancel'
+
+        $decided = $false
+        while (-not $decided) {
+            switch (Read-Choice 'Choose') {
+                '1' { $fallbackValue = $script:Settings.DefaultValue; $decided = $true }
+                '2' {
+                    $custom = [string](Read-Host 'Enter value')
+                    if (Test-ValidValue $custom) { $fallbackValue = $custom.Trim(); $decided = $true }
+                }
+                '3' { $fallbackValue = $null; $decided = $true }
+                '4' { $skipMissing = $true; $decided = $true }
+                '0' { return }
+                default { Write-Host 'Invalid choice.' -ForegroundColor Yellow }
+            }
+        }
+    }
+
+    Write-Host ''
+    Write-Host "Looking up $($rows.Count) CSV device(s) in Entra ID..."
+    try {
+        $devices = ConvertTo-ObjectArray (Get-DevicesForBulkRows -Rows $rows -ColumnMap $columnMap)
+    }
+    catch {
+        Write-Host "Failed to retrieve devices: $(Format-CaughtError $_)" -ForegroundColor Red
+        Wait-ForKey
+        return
+    }
+    Write-Host ("Found {0} matching Entra device(s)." -f @($devices).Count) -ForegroundColor Green
+
+    $index = New-DeviceIndex $devices
+    $lookup = {
+        param($DeviceId, $ObjectId, $DisplayName)
+        $search = if ($DeviceId) { $DeviceId } elseif ($ObjectId) { $ObjectId } else { $DisplayName }
+        if (-not $search) { return $null }
+        try {
+            $found = @(Find-Devices $search)
+        }
+        catch {
+            return $null
+        }
+        if ($DeviceId) {
+            return ($found | Where-Object { $_.DeviceId -eq $DeviceId } | Select-Object -First 1)
+        }
+        if ($ObjectId) {
+            return ($found | Where-Object { $_.ObjectId -eq $ObjectId } | Select-Object -First 1)
+        }
+        $exact = @($found | Where-Object { $_.DisplayName -eq $DisplayName })
+        if ($exact.Count -eq 1) { return $exact[0] }
+        return $null
+    }
+
+    $plan = ConvertTo-ObjectArray (New-BulkUpdatePlan -Rows $rows -DeviceIndex $index -ColumnMap $columnMap -FallbackValue $fallbackValue -SkipMissing $skipMissing -LookupMissingDevice $lookup)
+    $planColumns = 'Row', 'Identifier', 'DisplayName', 'Current', 'New', 'Status', 'Note'
+    $ready = @($plan | Where-Object { $_.Status -eq 'Ready' })
+
+    while ($true) {
+        Write-Title 'Preview'
+        Show-LimitedTable -InputObject $plan -Property $planColumns -MaxRows $script:PreviewRowLimit
+
+        Write-Host 'Summary:' -ForegroundColor Cyan
+        $plan | Group-Object Status | Sort-Object Name | ForEach-Object {
+            $color = if ($_.Name -eq 'Ready') { 'Green' } elseif ($_.Name -in @('NoChange', 'Skipped')) { 'Gray' } else { 'Yellow' }
+            Write-Host ('  {0,-12} {1}' -f $_.Name, $_.Count) -ForegroundColor $color
+        }
+        if ($script:Settings.DryRun) { Write-Host 'Dry-run mode is ON. No changes will be written.' -ForegroundColor Yellow }
+
+        Write-Host ''
+        Write-Host "  1) Apply $($ready.Count) change(s)"
+        if (Test-GridViewAvailable) { Write-Host '  2) View preview in grid view' }
+        Write-Host '  3) Export preview to CSV'
+        Write-Host '  0) Cancel'
+
+        switch (Read-Choice) {
+            '1' {
+                if ($ready.Count -eq 0) {
+                    Write-Host 'There are no changes to apply.' -ForegroundColor Yellow
+                    Wait-ForKey
+                    return
+                }
+                $confirmation = ([string](Read-Host "Type YES to update $($ready.Count) device(s)")).Trim()
+                if ($confirmation -cne 'YES') {
+                    Write-Host 'Not confirmed. Nothing was changed.' -ForegroundColor Yellow
+                    continue
+                }
+
+                $source  = 'CSV:' + [IO.Path]::GetFileName($path)
+                Write-Progress -Activity 'Updating extensionAttribute1' -Status "$($ready.Count) device(s)" -PercentComplete 0
+                try {
+                    $results = ConvertTo-ObjectArray (Invoke-DeviceExtensionAttributeUpdates -PlanItems $ready -Source $source)
+                }
+                finally {
+                    Write-Progress -Activity 'Updating extensionAttribute1' -Completed
+                }
+
+                $succeeded = @($results | Where-Object { $_.Status -eq 'Success' }).Count
+                $dryRuns   = @($results | Where-Object { $_.Status -eq 'DryRun' }).Count
+                $failed    = @($results | Where-Object { $_.Status -eq 'Failed' })
+
+                Write-Host ''
+                Write-Host "Succeeded: $succeeded" -ForegroundColor Green
+                if ($dryRuns -gt 0) { Write-Host "Dry-run  : $dryRuns" -ForegroundColor Yellow }
+                $failedColor = if ($failed.Count -gt 0) { 'Red' } else { 'Green' }
+                Write-Host "Failed   : $($failed.Count)" -ForegroundColor $failedColor
+                if ($failed.Count -gt 0) {
+                    $failed | Format-Table DisplayName, DeviceId, Message -AutoSize -Wrap | Out-Host
+                }
+                Write-Host "Audit log: $($script:Settings.LogPath)"
+                Wait-ForKey
+                return
+            }
+            '2' {
+                if (Test-GridViewAvailable) {
+                    $plan | Select-Object -Property $planColumns | Out-GridView -Title 'Bulk update preview'
+                }
+                else {
+                    Write-Host 'Out-GridView is not available in this session.' -ForegroundColor Yellow
+                }
+            }
+            '3' {
+                $defaultPath = Join-Path $script:Root ('CAExemption-Preview_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+                $previewPath = ([string](Read-Host "Save to [$defaultPath]")).Trim().Trim('"')
+                if (-not $previewPath) { $previewPath = $defaultPath }
+                try {
+                    $folder = Split-Path -Parent $previewPath
+                    if ($folder -and -not (Test-Path -LiteralPath $folder)) {
+                        New-Item -ItemType Directory -Path $folder -Force | Out-Null
+                    }
+                    $plan | Select-Object -Property $planColumns | Export-Csv -Path $previewPath -NoTypeInformation -Encoding UTF8
+                    Write-Host "Exported to $previewPath" -ForegroundColor Green
+                }
+                catch {
+                    Write-Host "Export failed: $($_.Exception.Message)" -ForegroundColor Red
+                }
+                Wait-ForKey
+            }
+            '0' {
+                Write-Host 'Cancelled. Nothing was changed.' -ForegroundColor Yellow
+                Wait-ForKey
+                return
+            }
+            default { Write-Host 'Invalid choice.' -ForegroundColor Yellow }
+        }
+    }
+}
+
+function Read-UserSearchTokens {
+    Write-Host 'Enter users as UPN, email, display name or object ID.'
+    Write-Host 'Separate with commas or semicolons. Enter a blank line when finished.'
+    $lines = New-Object System.Collections.Generic.List[string]
+    while ($true) {
+        $line = ([string](Read-Host '>')).Trim()
+        if (-not $line) { break }
+        $lines.Add($line)
+    }
+    return @(Split-UserSearchTokens ($lines -join ','))
+}
+
+function Resolve-UsersFromTokens {
+    param([string[]]$Tokens)
+
+    $resolved = New-Object System.Collections.Generic.List[object]
+    $missing = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+    $direct = New-Object System.Collections.Generic.List[object]
+    $names = New-Object System.Collections.Generic.List[string]
+    foreach ($token in @($Tokens)) {
+        if ([string]::IsNullOrWhiteSpace($token)) { continue }
+        $guid = ConvertTo-CanonicalGuid $token
+        if ($guid -or $token -match '@') { $direct.Add($token); continue }
+        $names.Add($token)
+    }
+
+    if ($direct.Count -gt 0) {
+        $reqs = New-Object System.Collections.Generic.List[object]
+        $tokenById = New-Object 'System.Collections.Generic.Dictionary[string,string]'
+        $n = 0
+        foreach ($token in $direct) {
+            $n++
+            $id = [string]$n
+            $guid = ConvertTo-CanonicalGuid $token
+            $segment = if ($guid) { $guid } else { ConvertTo-GraphPathSegment $token }
+            $url = '/users/{0}?$select={1}' -f $segment, $script:UserSelectFields
+            $reqs.Add((New-GraphBatchRequest -Id $id -Method GET -Url $url))
+            $tokenById.Add($id, [string]$token)
+        }
+        Write-Host ("  Resolving {0} user(s) by UPN/object ID..." -f $direct.Count)
+        foreach ($resp in (Invoke-GraphBatch -Requests $reqs -Activity 'User lookup')) {
+            $token = $null
+            if ($tokenById.ContainsKey([string]$resp.Id)) { $token = $tokenById[[string]$resp.Id] }
+            if ($resp.Status -lt 200 -or $resp.Status -ge 300) {
+                if ($resp.Status -eq 404) {
+                    if ($token) { $missing.Add($token) }
+                }
+                elseif ($token) { $names.Add($token) }
+                continue
+            }
+            try { $user = ConvertTo-UserRecord $resp.Body } catch { if ($token) { $names.Add($token) }; continue }
+            if (-not $user.ObjectId) { if ($token) { $names.Add($token) }; continue }
+            if ($seen.ContainsKey($user.ObjectId)) { continue }
+            $seen[$user.ObjectId] = $true
+            $resolved.Add($user)
+        }
+    }
+
+    foreach ($token in $names) {
+        try {
+            $matches = ConvertTo-ObjectArray (Find-Users $token)
+        }
+        catch {
+            Write-Host "Lookup failed for '$token': $(Get-GraphErrorMessage $_)" -ForegroundColor Red
+            $missing.Add($token)
+            continue
+        }
+
+        if ($matches.Count -eq 0) {
+            $missing.Add($token)
+            continue
+        }
+
+        $user = $null
+        if ($matches.Count -eq 1) {
+            $user = $matches[0]
+        }
+        else {
+            Write-Host "'$token' matched $($matches.Count) users. Choose one, or skip." -ForegroundColor Yellow
+            $user = Select-UserFromList $matches
+        }
+
+        if ($null -eq $user) { continue }
+        if ($user.ObjectId -and $seen.ContainsKey($user.ObjectId)) { continue }
+        if ($user.ObjectId) { $seen[$user.ObjectId] = $true }
+        $resolved.Add($user)
+    }
+
+    if ($resolved.Count -le 20) {
+        foreach ($user in $resolved) {
+            Write-Host ("  {0} <{1}>" -f $user.DisplayName, $user.UserPrincipalName) -ForegroundColor Green
+        }
+    }
+    else {
+        Write-Host ("  Resolved {0} user(s)." -f $resolved.Count) -ForegroundColor Green
+    }
+    if ($missing.Count -gt 0 -and $missing.Count -le 20) {
+        Write-Host ("  Not found: {0}" -f ($missing.ToArray() -join ', ')) -ForegroundColor Yellow
+    }
+    elseif ($missing.Count -gt 20) {
+        Write-Host ("  Not found: {0} identifier(s)." -f $missing.Count) -ForegroundColor Yellow
+    }
+
+    return (New-ToolObject @(
+            'Users', $resolved.ToArray()
+            'Missing', $missing.ToArray()
+        ))
+}
+
+function ConvertTo-BulkExportRows {
+    param($Pairs, $Devices, $Value, [string]$Action = 'Set')
+    $rawRows = New-Object System.Collections.Generic.List[object]
+    foreach ($pair in (ConvertTo-ObjectArray $Pairs)) {
+        $rawRows.Add((New-UserDeviceBulkRow -Device $pair.Device -User $pair.User -Relationship $pair.Relationship -Value $Value -Action $Action))
+    }
+    foreach ($device in (ConvertTo-ObjectArray $Devices)) {
+        $rawRows.Add((New-UserDeviceBulkRow -Device $device -User $null -Relationship '' -Value $Value -Action $Action))
+    }
+    return (ConvertTo-ObjectArray (Merge-UserDeviceBulkRows (ConvertTo-ObjectArray $rawRows)))
+}
+
+function Select-EligibleBulkExportRows {
+    param($Rows, [string]$EmptyMessage)
+    $all = ConvertTo-ObjectArray $Rows
+    $eligible = ConvertTo-ObjectArray ($all | Where-Object { $_.Eligible })
+    $ineligible = ConvertTo-ObjectArray ($all | Where-Object { -not $_.Eligible })
+    Write-Host "  $($eligible.Count) are eligible to change with the current device scope."
+    if ($ineligible.Count -gt 0) {
+        Write-Host ("  {0} are outside the current device scope ({1})." -f $ineligible.Count, (Get-DeviceScopeLabel)) -ForegroundColor Yellow
+    }
+    $exportRows = $eligible
+    if ($ineligible.Count -gt 0 -and (Read-YesNo 'Include ineligible Windows devices in the CSV as well?' $false)) {
+        $exportRows = $all
+    }
+    if ($exportRows.Count -eq 0) {
+        if (-not $EmptyMessage) {
+            $EmptyMessage = 'Nothing to export. Turn off "Registered only" in Settings if you want Entra joined / hybrid devices included.'
+        }
+        Write-Host $EmptyMessage -ForegroundColor Yellow
+        Wait-ForKey
+        return @()
+    }
+    return $exportRows
+}
+
+function Invoke-ExportedBulkCsvFlow {
+    param(
+        $Rows,
+        [string]$Title,
+        [string[]]$PreviewColumns,
+        [string]$DefaultFileName
+    )
+    $exportRows = ConvertTo-ObjectArray $Rows
+    while ($true) {
+        Write-Title $Title
+        Show-LimitedTable -InputObject $exportRows -Property $PreviewColumns -MaxRows $script:PreviewRowLimit
+
+        Write-Host "  1) Export $($exportRows.Count) row(s) for bulk update"
+        if (Test-GridViewAvailable) { Write-Host '  2) Open preview in grid view' }
+        Write-Host '  0) Cancel'
+
+        switch (Read-Choice) {
+            '1' {
+                $defaultPath = Join-Path $script:Root $DefaultFileName
+                $path = ([string](Read-Host "Save to [$defaultPath]")).Trim().Trim('"')
+                if (-not $path) { $path = $defaultPath }
+                try {
+                    $folder = Split-Path -Parent $path
+                    if ($folder -and -not (Test-Path -LiteralPath $folder)) {
+                        New-Item -ItemType Directory -Path $folder -Force | Out-Null
+                    }
+                    $exportRows | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+                    Write-Host "Exported to $path" -ForegroundColor Green
+                    Write-Host 'Columns DeviceId, ObjectId, DisplayName, Value and Action can be fed straight into bulk update (menu option 3).'
+                }
+                catch {
+                    Write-Host "Export failed: $($_.Exception.Message)" -ForegroundColor Red
+                    Wait-ForKey
+                    return
+                }
+                if (Read-YesNo 'Run bulk update from this CSV now?' $true) {
+                    Invoke-BulkUpdate -Path $path
+                }
+                else {
+                    Wait-ForKey
+                }
+                return
+            }
+            '2' {
+                if (Test-GridViewAvailable) {
+                    $exportRows | Select-Object -Property $PreviewColumns | Out-GridView -Title $Title
+                }
+                else {
+                    Write-Host 'Out-GridView is not available in this session.' -ForegroundColor Yellow
+                }
+            }
+            '0' { return }
+            default { Write-Host 'Invalid choice.' -ForegroundColor Yellow }
+        }
+    }
+}
+
+function Invoke-UserDeviceCsvExport {
+    Write-Title 'Find Windows devices by user'
+
+    Write-Host 'Look up users, collect their Windows registered/owned devices,'
+    Write-Host 'and export a CSV that menu option 3 can apply directly.'
+    Write-Host ''
+    Write-Host '  1) Type users (UPN, email, name or object ID)'
+    Write-Host '  2) Load users from a CSV'
+    Write-Host '  3) Export a user-list CSV template'
+    Write-Host '  0) Cancel'
+
+    $tokens = @()
+    switch (Read-Choice 'Choose') {
+        '1' { $tokens = @(Read-UserSearchTokens) }
+        '2' {
+            $userCsvPath = Select-CsvPath
+            if (-not $userCsvPath) { return }
+            if (-not (Test-Path -LiteralPath $userCsvPath -PathType Leaf)) {
+                Write-Host "File not found: $userCsvPath" -ForegroundColor Red
+                Wait-ForKey
+                return
+            }
+            try {
+                $userRows = @(Import-DeviceCsv -Path $userCsvPath)
+            }
+            catch {
+                Write-Host "Could not read CSV: $($_.Exception.Message)" -ForegroundColor Red
+                Wait-ForKey
+                return
+            }
+            if ($userRows.Count -eq 0) {
+                Write-Host 'The CSV has no data rows.' -ForegroundColor Yellow
+                Wait-ForKey
+                return
+            }
+            $headers = @($userRows[0].PSObject.Properties | ForEach-Object { $_.Name })
+            $userMap = Resolve-UserCsvColumnMap $headers
+            if ($userMap.Count -eq 0) {
+                Write-Host 'The CSV needs a UserPrincipalName, Mail, DisplayName or ObjectId column (or an alias such as UPN / Email).' -ForegroundColor Red
+                Write-Host "Columns found: $($headers -join ', ')" -ForegroundColor Red
+                Wait-ForKey
+                return
+            }
+            foreach ($row in $userRows) {
+                $token = Get-UserRowSearchToken $row $userMap
+                if ($token) { $tokens += $token }
+            }
+            Write-Host "Loaded $($tokens.Count) user identifier(s) from $userCsvPath" -ForegroundColor Green
+        }
+        '3' {
+            $defaultPath = Join-Path $script:Root 'CAExemption-Users-Template.csv'
+            $path = ([string](Read-Host "Save template to [$defaultPath]")).Trim().Trim('"')
+            if (-not $path) { $path = $defaultPath }
+            $template = @(
+                [pscustomobject]@{ UserPrincipalName = 'jane.doe@contoso.com'; DisplayName = ''; ObjectId = ''; Mail = '' }
+                [pscustomobject]@{ UserPrincipalName = ''; DisplayName = 'Alex Smith'; ObjectId = ''; Mail = '' }
+            )
+            try {
+                $folder = Split-Path -Parent $path
+                if ($folder -and -not (Test-Path -LiteralPath $folder)) {
+                    New-Item -ItemType Directory -Path $folder -Force | Out-Null
+                }
+                $template | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+                Write-Host "Template saved to $path" -ForegroundColor Green
+            }
+            catch {
+                Write-Host "Could not save template: $($_.Exception.Message)" -ForegroundColor Red
+            }
+            Wait-ForKey
+            return
+        }
+        default { return }
+    }
+
+    $tokens = @(Split-UserSearchTokens ($tokens -join ','))
+    if ($tokens.Count -eq 0) {
+        Write-Host 'No users were entered.' -ForegroundColor Yellow
+        Wait-ForKey
+        return
+    }
+
+    Write-Host ''
+    Write-Host "Resolving $($tokens.Count) user identifier(s)..."
+    $resolved = Resolve-UsersFromTokens -Tokens $tokens
+    if ($resolved.Users.Count -eq 0) {
+        Write-Host 'No users were resolved.' -ForegroundColor Yellow
+        Wait-ForKey
+        return
+    }
+    Write-Host ''
+    Write-Host "Retrieving Windows devices registered to or owned by $($resolved.Users.Count) user(s)..."
+    try {
+        $pairs = ConvertTo-ObjectArray (Get-UsersRelatedWindowsDevices -Users $resolved.Users)
+    }
+    catch {
+        Write-Host "Failed to get devices: $(Format-CaughtError $_)" -ForegroundColor Red
+        Wait-ForKey
+        return
+    }
+
+    if ($pairs.Count -eq 0) {
+        Write-Host 'No Windows devices were found for those users.' -ForegroundColor Yellow
+        Wait-ForKey
+        return
+    }
+
+    $choice = Read-ValueChoice 'What should the exported CSV set extensionAttribute1 to?'
+    if ($null -eq $choice) {
+        Write-Host 'Cancelled.' -ForegroundColor Yellow
+        Wait-ForKey
+        return
+    }
+    $exportAction = if ([string]::IsNullOrEmpty($choice.Value)) { 'Clear' } else { 'Set' }
+
+    $rows = ConvertTo-BulkExportRows -Pairs $pairs -Value $choice.Value -Action $exportAction
+    Write-Host ''
+    Write-Host "Found $($rows.Count) Windows device(s) for $($resolved.Users.Count) user(s)." -ForegroundColor Green
+    $exportRows = ConvertTo-ObjectArray (Select-EligibleBulkExportRows -Rows $rows)
+    if ($exportRows.Count -eq 0) { return }
+
+    $previewColumns = 'DisplayName', 'DeviceId', 'UserPrincipalName', 'Relationship', 'JoinType', 'LastSignIn', 'CurrentExtensionAttribute1', 'Value', 'Action', 'Eligible'
+    Invoke-ExportedBulkCsvFlow -Rows $exportRows -Title 'User device CSV preview' -PreviewColumns $previewColumns -DefaultFileName ('CAExemption-UserDevices_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+}
+
+function Invoke-RecentActivityCsvExport {
+    Write-Title 'Filter CSV by last activity'
+
+    Write-Host 'Load a CSV of devices or users, look them up in Entra ID, and keep'
+    Write-Host ("devices whose last sign-in is within the last {0} days (you can change the window)." -f $script:DefaultActivityDays)
+    Write-Host 'The export can be applied with menu option 3 to set extensionAttribute1.'
+    Write-Host ''
+    Write-Host 'Accepted files:'
+    Write-Host '  - Device CSV: DeviceId, ObjectId or DisplayName'
+    Write-Host '  - User CSV: UserPrincipalName, Mail or ObjectId (same as option 4)'
+    Write-Host '  - A previous option 4 export (DeviceId is used)'
+    Write-Host ''
+
+    $path = Select-CsvPath
+    if (-not $path) { return }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        Write-Host "File not found: $path" -ForegroundColor Red
+        Wait-ForKey
+        return
+    }
+
+    try {
+        $csvRows = @(Import-DeviceCsv -Path $path)
+    }
+    catch {
+        Write-Host "Could not read CSV: $($_.Exception.Message)" -ForegroundColor Red
+        Wait-ForKey
+        return
+    }
+    if ($csvRows.Count -eq 0) {
+        Write-Host 'The CSV has no data rows.' -ForegroundColor Yellow
+        Wait-ForKey
+        return
+    }
+
+    $headers = @($csvRows[0].PSObject.Properties | ForEach-Object { $_.Name })
+    $kind = Get-CsvImportKind $headers
+    if ($kind -eq 'Unknown') {
+        Write-Host 'The CSV needs device columns (DeviceId, ObjectId, DisplayName) or user columns (UserPrincipalName, Mail, ObjectId).' -ForegroundColor Red
+        Write-Host "Columns found: $($headers -join ', ')" -ForegroundColor Red
+        Wait-ForKey
+        return
+    }
+
+    Write-Host ("Loaded {0} row(s) from {1} ({2} CSV)." -f $csvRows.Count, $path, $kind.ToLower()) -ForegroundColor Green
+    $days = Read-ActivityWindowDays -Default $script:DefaultActivityDays
+    $includeUnknown = Read-YesNo 'Include devices with no last-sign-in timestamp?' $false
+
+    $devices = @()
+    $pairs = @()
+    if ($kind -eq 'User') {
+        $userMap = Resolve-UserCsvColumnMap $headers
+        $tokens = @()
+        foreach ($row in $csvRows) {
+            $token = Get-UserRowSearchToken $row $userMap
+            if ($token) { $tokens += $token }
+        }
+        $tokens = @(Split-UserSearchTokens ($tokens -join ','))
+        if ($tokens.Count -eq 0) {
+            Write-Host 'No user identifiers were found in the CSV.' -ForegroundColor Yellow
+            Wait-ForKey
+            return
+        }
+        Write-Host ''
+        Write-Host "Resolving $($tokens.Count) user identifier(s)..."
+        $resolved = Resolve-UsersFromTokens -Tokens $tokens
+        if ($resolved.Users.Count -eq 0) {
+            Write-Host 'No users were resolved.' -ForegroundColor Yellow
+            Wait-ForKey
+            return
+        }
+        Write-Host ''
+        Write-Host "Retrieving Windows devices for $($resolved.Users.Count) user(s)..."
+        try {
+            $pairs = ConvertTo-ObjectArray (Get-UsersRelatedWindowsDevices -Users $resolved.Users)
+        }
+        catch {
+            Write-Host "Failed to get devices: $(Format-CaughtError $_)" -ForegroundColor Red
+            Wait-ForKey
+            return
+        }
+        $seenDevices = @{}
+        $deviceList = New-Object System.Collections.Generic.List[object]
+        foreach ($pair in $pairs) {
+            $id = [string]$pair.Device.ObjectId
+            if (-not $id) { $id = [string]$pair.Device.DeviceId }
+            if ($id -and $seenDevices.ContainsKey($id)) { continue }
+            if ($id) { $seenDevices[$id] = $true }
+            $deviceList.Add($pair.Device)
+        }
+        $devices = ConvertTo-ObjectArray $deviceList
+    }
+    else {
+        $columnMap = Resolve-CsvColumnMap $headers
+        Write-Host ''
+        Write-Host "Looking up $($csvRows.Count) CSV device(s) in Entra ID..."
+        try {
+            $devices = ConvertTo-ObjectArray (Get-DevicesForBulkRows -Rows $csvRows -ColumnMap $columnMap)
+        }
+        catch {
+            Write-Host "Failed to retrieve devices: $(Format-CaughtError $_)" -ForegroundColor Red
+            Wait-ForKey
+            return
+        }
+    }
+
+    if (@($devices).Count -eq 0) {
+        Write-Host 'No devices were found for that CSV.' -ForegroundColor Yellow
+        Wait-ForKey
+        return
+    }
+
+    $activityParams = @{ Devices = $devices; Days = $days }
+    if ($includeUnknown) { $activityParams['IncludeUnknown'] = $true }
+    $split = Select-DevicesWithRecentActivity @activityParams
+    Write-Host ''
+    Write-Host ("Looked up {0} device(s). Last sign-in on or after {1:yyyy-MM-dd} UTC ({2} days)." -f @($devices).Count, $split.CutoffUtc, $days) -ForegroundColor Green
+    Write-Host ("  Active : {0}" -f @($split.Active).Count) -ForegroundColor Green
+    Write-Host ("  Stale  : {0}" -f @($split.Stale).Count)
+    Write-Host ("  No sign-in timestamp : {0}" -f @($split.Unknown).Count)
+
+    if (@($split.Active).Count -eq 0) {
+        Write-Host 'No devices had activity in that window.' -ForegroundColor Yellow
+        Wait-ForKey
+        return
+    }
+
+    $choice = Read-ValueChoice 'What should the exported CSV set extensionAttribute1 to?'
+    if ($null -eq $choice) {
+        Write-Host 'Cancelled.' -ForegroundColor Yellow
+        Wait-ForKey
+        return
+    }
+    $exportAction = if ([string]::IsNullOrEmpty($choice.Value)) { 'Clear' } else { 'Set' }
+
+    $exportSourcePairs = @()
+    $exportSourceDevices = @()
+    if ($kind -eq 'User') {
+        $activeIds = @{}
+        foreach ($device in (ConvertTo-ObjectArray $split.Active)) {
+            if ($device.ObjectId) { $activeIds[$device.ObjectId] = $true }
+            elseif ($device.DeviceId) { $activeIds[$device.DeviceId] = $true }
+        }
+        $kept = New-Object System.Collections.Generic.List[object]
+        foreach ($pair in $pairs) {
+            $id = [string]$pair.Device.ObjectId
+            if (-not $id) { $id = [string]$pair.Device.DeviceId }
+            if ($id -and $activeIds.ContainsKey($id)) { $kept.Add($pair) }
+        }
+        $exportSourcePairs = ConvertTo-ObjectArray $kept
+    }
+    else {
+        $exportSourceDevices = ConvertTo-ObjectArray $split.Active
+    }
+
+    $rows = ConvertTo-BulkExportRows -Pairs $exportSourcePairs -Devices $exportSourceDevices -Value $choice.Value -Action $exportAction
+    $exportRows = ConvertTo-ObjectArray (Select-EligibleBulkExportRows -Rows $rows)
+    if ($exportRows.Count -eq 0) { return }
+
+    $previewColumns = 'DisplayName', 'DeviceId', 'LastSignIn', 'JoinType', 'UserPrincipalName', 'CurrentExtensionAttribute1', 'Value', 'Action', 'Eligible'
+    Invoke-ExportedBulkCsvFlow -Rows $exportRows -Title 'Recent-activity CSV preview' -PreviewColumns $previewColumns -DefaultFileName ('CAExemption-RecentActivity_{0}d_{1}.csv' -f $days, (Get-Date -Format 'yyyyMMdd_HHmmss'))
+}
+
+function Export-CsvTemplate {
+    Write-Title 'Export CSV template'
+
+    $defaultPath = Join-Path $script:Root 'CAExemption-Template.csv'
+    $path = ([string](Read-Host "Save template to [$defaultPath]")).Trim().Trim('"')
+    if (-not $path) { $path = $defaultPath }
+
+    $template = @(
+        [pscustomobject]@{ DeviceId = '00000000-0000-0000-0000-000000000000'; ObjectId = ''; DisplayName = ''; Value = $script:Settings.DefaultValue; Action = 'Set' }
+        [pscustomobject]@{ DeviceId = ''; ObjectId = ''; DisplayName = 'DEVICE-NAME-01'; Value = $script:Settings.DefaultValue; Action = 'Set' }
+        [pscustomobject]@{ DeviceId = ''; ObjectId = ''; DisplayName = 'DEVICE-NAME-02'; Value = ''; Action = 'Clear' }
+    )
+
+    try {
+        $folder = Split-Path -Parent $path
+        if ($folder -and -not (Test-Path -LiteralPath $folder)) {
+            New-Item -ItemType Directory -Path $folder -Force | Out-Null
+        }
+        $template | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+        Write-Host "Template saved to $path" -ForegroundColor Green
+        Write-Host 'Fill in one identifier per row (DeviceId is the most reliable). Replace the sample rows before use.'
+        Write-Host 'Aliases such as Name, ComputerName, Device ID and Operation are also accepted.'
+    }
+    catch {
+        Write-Host "Could not save template: $($_.Exception.Message)" -ForegroundColor Red
+    }
+    Wait-ForKey
+}
+
+function Show-ConditionalAccessHelp {
+    Write-Title 'Conditional Access device filter'
+    $value = $script:Settings.DefaultValue
+    Write-Host 'Use this when you want a CA policy to skip (or include) devices that this tool tagged.'
+    Write-Host ''
+    Write-Host 'Azure portal: Conditional Access > policy > Conditions > Filter for devices'
+    Write-Host ''
+    Write-Host 'Exclude tagged Windows Entra registered devices:' -ForegroundColor Cyan
+    Write-Host "  device.extensionAttribute1 -eq `"$value`""
+    Write-Host '  AND device.trustType -eq "AzureADRegistered"'
+    Write-Host ''
+    Write-Host 'Notes:' -ForegroundColor Cyan
+    Write-Host '  - The extensionAttribute1 comparison is case-sensitive in CA. Keep the stored value and the filter identical.'
+    Write-Host '  - Graph trustType Workplace = CA trustType AzureADRegistered (Entra registered / workplace join).'
+    Write-Host '  - Graph AzureAd = CA AzureADJoined. Graph ServerAd = CA ServerADJoined.'
+    Write-Host '  - extensionAttribute1 lives in the cloud. It is not synced from on-premises Active Directory.'
+    Write-Host ("  - Required Graph permissions: {0}" -f ($script:RequiredScopes -join ', '))
+    Write-Host '  - Entra roles that can write device attributes: Cloud Device Administrator, Intune Administrator, Global Administrator.'
+    Wait-ForKey
+}
+
+function Show-SettingsMenu {
+    while ($true) {
+        Write-Title 'Settings'
+        $dryRunText = if ($script:Settings.DryRun) { 'ON' } else { 'Off' }
+        Write-Host "  1) Default value : $($script:Settings.DefaultValue)"
+        Write-Host "  2) Dry-run mode  : $dryRunText"
+        Write-Host "  3) Audit log     : $($script:Settings.LogPath)"
+        Write-Host "  4) Device scope  : $(Get-DeviceScopeLabel)"
+        Write-Host '  0) Back'
+
+        switch (Read-Choice) {
+            '1' {
+                $value = [string](Read-Host 'New default value')
+                if (Test-ValidValue $value) {
+                    $script:Settings.DefaultValue = $value.Trim()
+                    Export-ToolSettings
+                    Write-Host "Default value set to '$($script:Settings.DefaultValue)'." -ForegroundColor Green
+                }
+            }
+            '2' {
+                $script:Settings.DryRun = -not $script:Settings.DryRun
+                Export-ToolSettings
+                $state = if ($script:Settings.DryRun) { 'ON. No changes will be written.' } else { 'Off. Changes will be written.' }
+                Write-Host "Dry-run mode is $state" -ForegroundColor Yellow
+            }
+            '3' {
+                $logPath = ([string](Read-Host 'New audit log path')).Trim().Trim('"')
+                if ($logPath) {
+                    try {
+                        $folder = Split-Path -Parent $logPath
+                        if ($folder -and -not (Test-Path -LiteralPath $folder)) {
+                            New-Item -ItemType Directory -Path $folder -Force | Out-Null
+                        }
+                        $script:Settings.LogPath = $logPath
+                        Export-ToolSettings
+                        Write-Host "Audit log set to $logPath" -ForegroundColor Green
+                    }
+                    catch {
+                        Write-Host "Could not use that path: $($_.Exception.Message)" -ForegroundColor Red
+                    }
+                }
+            }
+            '4' {
+                Write-Host '  1) All devices (any operating system)'
+                Write-Host '  2) Windows devices'
+                Write-Host '  3) Windows Entra registered only'
+                switch (Read-Choice 'Choose device scope') {
+                    '1' { Set-DeviceScope 'All' }
+                    '2' { Set-DeviceScope 'Windows' }
+                    '3' { Set-DeviceScope 'WindowsRegistered' }
+                    default { continue }
+                }
+                Export-ToolSettings
+                Write-Host ("Device scope is now {0}." -f (Get-DeviceScopeLabel)) -ForegroundColor Yellow
+            }
+            '0' { return }
+            default { Write-Host 'Invalid choice.' -ForegroundColor Yellow }
+        }
+    }
+}
+
+function Show-MainMenu {
+    while ($true) {
+        Clear-Host
+        Write-Title 'Entra ID device extensionAttribute1 - Conditional Access exemption tool'
+
+        $context = $null
+        try { $context = Get-MgContext } catch { }
+        Write-Host "  Tool version  : $($script:ToolVersion)"
+        if ($context) {
+            Write-Host "  Signed in     : $($context.Account)"
+            Write-Host "  Tenant        : $($context.TenantId)"
+        }
+        else {
+            Write-Host '  Signed in     : Not connected' -ForegroundColor Yellow
+        }
+        Write-Host "  Default value : $($script:Settings.DefaultValue)"
+        if ($script:Settings.DryRun) {
+            Write-Host '  Dry-run mode  : ON (no changes will be written)' -ForegroundColor Yellow
+        }
+        else {
+            Write-Host '  Dry-run mode  : Off'
+        }
+        Write-Host "  Device scope  : $(Get-DeviceScopeLabel)"
+        Write-Host "  Audit log     : $($script:Settings.LogPath)"
+        Write-Host ''
+        Write-Host '  1) List Windows devices'
+        Write-Host '  2) Add, modify or clear the value on one device'
+        Write-Host '  3) Bulk update devices from a CSV'
+        Write-Host '  4) Find Windows devices by user and export a bulk-update CSV'
+        Write-Host '  5) Filter a CSV by last activity (90 days) and export a bulk-update CSV'
+        Write-Host '  6) Export a CSV template'
+        Write-Host '  7) Settings (default value, dry-run, log path, device scope)'
+        Write-Host '  8) Connect or switch tenant'
+        Write-Host '  9) Conditional Access filter help'
+        Write-Host '  Q) Quit'
+        Write-Host ''
+
+        switch (Read-Choice) {
+            '1' { if (Connect-Graph) { Show-DeviceList } else { Wait-ForKey } }
+            '2' { if (Connect-Graph) { Invoke-SingleDeviceUpdate } else { Wait-ForKey } }
+            '3' { if (Connect-Graph) { Invoke-BulkUpdate } else { Wait-ForKey } }
+            '4' { if (Connect-Graph) { Invoke-UserDeviceCsvExport } else { Wait-ForKey } }
+            '5' { if (Connect-Graph) { Invoke-RecentActivityCsvExport } else { Wait-ForKey } }
+            '6' { Export-CsvTemplate }
+            '7' { Show-SettingsMenu }
+            '8' { [void](Connect-Graph -Reconnect); Wait-ForKey }
+            '9' { Show-ConditionalAccessHelp }
+            'Q' { return }
+            default { Write-Host 'Invalid choice.' -ForegroundColor Yellow; Start-Sleep -Milliseconds 600 }
+        }
+    }
+}
+
+#region GUI
+
+function Test-ToolIsWindows {
+    if ($PSVersionTable.PSVersion.Major -ge 6) { return [bool]$IsWindows }
+    return ($env:OS -eq 'Windows_NT')
+}
+
+function Show-ToolDialog {
+    param(
+        [string]$Message,
+        [string]$Title = 'Entra device exemption',
+        [string]$Buttons = 'OK',
+        [string]$Icon = 'Information'
+    )
+    return [System.Windows.Forms.MessageBox]::Show(
+        $Message,
+        $Title,
+        [System.Windows.Forms.MessageBoxButtons]::$Buttons,
+        [System.Windows.Forms.MessageBoxIcon]::$Icon
+    )
+}
+
+function Show-ToolInputBox {
+    param(
+        [string]$Prompt,
+        [string]$Title = 'Entra device exemption',
+        [string]$DefaultValue = ''
+    )
+    $inputForm = New-Object System.Windows.Forms.Form
+    $inputForm.Text = $Title
+    $inputForm.Size = New-Object System.Drawing.Size(520, 180)
+    $inputForm.StartPosition = 'CenterParent'
+    $inputForm.FormBorderStyle = 'FixedDialog'
+    $inputForm.MaximizeBox = $false
+    $inputForm.MinimizeBox = $false
+    $inputForm.ShowInTaskbar = $false
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = $Prompt
+    $lbl.Location = New-Object System.Drawing.Point(16, 16)
+    $lbl.Size = New-Object System.Drawing.Size(470, 36)
+    $inputForm.Controls.Add($lbl)
+    $txt = New-Object System.Windows.Forms.TextBox
+    $txt.Text = $DefaultValue
+    $txt.Location = New-Object System.Drawing.Point(16, 58)
+    $txt.Size = New-Object System.Drawing.Size(470, 26)
+    $inputForm.Controls.Add($txt)
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = 'OK'
+    $ok.Location = New-Object System.Drawing.Point(296, 100)
+    $ok.Size = New-Object System.Drawing.Size(90, 28)
+    $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $inputForm.Controls.Add($ok)
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = 'Cancel'
+    $cancel.Location = New-Object System.Drawing.Point(396, 100)
+    $cancel.Size = New-Object System.Drawing.Size(90, 28)
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $inputForm.Controls.Add($cancel)
+    $inputForm.AcceptButton = $ok
+    $inputForm.CancelButton = $cancel
+    try { $txt.SelectAll() } catch { }
+    $result = $inputForm.ShowDialog()
+    if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+        return ([string]$txt.Text).Trim()
+    }
+    return $null
+}
+
+function ConvertTo-GuiDataTable {
+    param($Rows, [string[]]$Columns)
+    Add-Type -AssemblyName System.Data -ErrorAction SilentlyContinue
+    $table = New-Object System.Data.DataTable
+    foreach ($name in $Columns) {
+        [void]$table.Columns.Add($name)
+    }
+    foreach ($item in (ConvertTo-ObjectArray $Rows)) {
+        $values = New-Object System.Collections.Generic.List[object]
+        foreach ($name in $Columns) {
+            $value = Get-GraphProperty $item $name
+            if ($null -eq $value) { $value = '' }
+            elseif ($value -is [bool]) { $value = $value.ToString() }
+            else { $value = [string]$value }
+            $values.Add($value)
+        }
+        [void]$table.Rows.Add($values.ToArray())
+    }
+    return ,$table
+}
+
+function Set-GuiGridData {
+    param($Grid, $Rows, [string[]]$Columns)
+    $grid.DataSource = $null
+    $table = ConvertTo-GuiDataTable -Rows $Rows -Columns $Columns
+    $grid.DataSource = $table
+    if ($grid.Columns.Count -gt 0) {
+        $grid.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::Fill
+        foreach ($col in $grid.Columns) {
+            if ([string]::IsNullOrWhiteSpace($col.DataPropertyName)) { $col.DataPropertyName = $col.HeaderText }
+            if ([string]::IsNullOrWhiteSpace($col.Name)) { $col.Name = $col.DataPropertyName }
+        }
+    }
+}
+
+function Get-GuiEnumerableItems {
+    param($Collection)
+    $list = New-Object System.Collections.Generic.List[object]
+    if ($null -eq $Collection) { return ,@() }
+    try {
+        foreach ($item in $Collection) {
+            if ($null -ne $item) { $list.Add($item) }
+        }
+    }
+    catch { }
+    if ($list.Count -gt 0) { return ,$list.ToArray() }
+    $count = 0
+    try { $count = [int]$Collection.Count } catch { return ,@() }
+    for ($i = 0; $i -lt $count; $i++) {
+        $item = $null
+        try { $item = $Collection.Item($i) } catch {
+            try { $item = $Collection[$i] } catch { }
+        }
+        if ($null -ne $item) { $list.Add($item) }
+    }
+    return ,$list.ToArray()
+}
+
+function Get-GuiSelectedRowIndexes {
+    param($Grid)
+    $seen = @{}
+    $list = New-Object System.Collections.Generic.List[int]
+    if ($null -eq $Grid) { return ,@() }
+
+    foreach ($row in (Get-GuiEnumerableItems $Grid.SelectedRows)) {
+        $idx = -1
+        try { $idx = [int]$row.Index } catch { continue }
+        if ($idx -lt 0 -or $seen.ContainsKey($idx)) { continue }
+        $seen[$idx] = $true
+        $list.Add($idx)
+    }
+    foreach ($cell in (Get-GuiEnumerableItems $Grid.SelectedCells)) {
+        $idx = -1
+        try { $idx = [int]$cell.RowIndex } catch { continue }
+        if ($idx -lt 0 -or $seen.ContainsKey($idx)) { continue }
+        $seen[$idx] = $true
+        $list.Add($idx)
+    }
+    if ($list.Count -eq 0 -and $null -ne $Grid.CurrentCell) {
+        $idx = -1
+        try { $idx = [int]$Grid.CurrentCell.RowIndex } catch { $idx = -1 }
+        if ($idx -ge 0 -and -not $seen.ContainsKey($idx)) {
+            $seen[$idx] = $true
+            $list.Add($idx)
+        }
+    }
+    if ($list.Count -eq 0) {
+        $currentRow = $null
+        try { $currentRow = $Grid.CurrentRow } catch { }
+        if ($null -ne $currentRow) {
+            $idx = -1
+            try { $idx = [int]$currentRow.Index } catch { $idx = -1 }
+            if ($idx -ge 0 -and -not $seen.ContainsKey($idx)) {
+                $seen[$idx] = $true
+                $list.Add($idx)
+            }
+        }
+    }
+    if ($list.Count -eq 0 -and $null -ne $Grid.DataSource) {
+        try {
+            $manager = $Grid.BindingContext[$Grid.DataSource]
+            if ($null -ne $manager -and $manager.Position -ge 0 -and -not $seen.ContainsKey([int]$manager.Position)) {
+                $seen[[int]$manager.Position] = $true
+                $list.Add([int]$manager.Position)
+            }
+        }
+        catch { }
+    }
+    if ($list.Count -eq 0) {
+        $only = -1
+        $n = 0
+        foreach ($row in (Get-GuiEnumerableItems $Grid.Rows)) {
+            $isNew = $false
+            try { $isNew = [bool]$row.IsNewRow } catch { }
+            if ($isNew) { continue }
+            $n++
+            try { $only = [int]$row.Index } catch { $only = -1 }
+        }
+        if ($n -eq 1 -and $only -ge 0) {
+            $list.Add($only)
+        }
+    }
+    return ,$list.ToArray()
+}
+
+function Get-GuiGridRowValue {
+    param($GridRow, [string]$Column)
+    if ($null -eq $GridRow) { return '' }
+    $bound = $null
+    try { $bound = $GridRow.DataBoundItem } catch { }
+    if ($null -ne $bound) {
+        if ($bound -is [System.Data.DataRowView]) {
+            try {
+                $value = $bound.Item($Column)
+                if ($null -ne $value -and $value -isnot [System.Data.DataRow]) { return [string]$value }
+            }
+            catch { }
+        }
+        else {
+            $value = Get-GraphProperty $bound $Column
+            if ($null -ne $value -and $value -isnot [System.Data.DataRow]) { return [string]$value }
+        }
+    }
+    $grid = $null
+    try { $grid = $GridRow.DataGridView } catch { }
+    if ($grid) {
+        foreach ($col in $grid.Columns) {
+            $match = ($col.Name -eq $Column) -or ($col.HeaderText -eq $Column) -or ($col.DataPropertyName -eq $Column)
+            if (-not $match) { continue }
+            $cell = $GridRow.Cells[$col.Index]
+            if ($cell -and $null -ne $cell.Value) { return [string]$cell.Value }
+        }
+    }
+    return ''
+}
+
+function Get-GuiSelectedValue {
+    param($Grid, [string]$Column)
+    $values = @(Get-GuiSelectedValues -Grid $Grid -Column $Column)
+    if ($values.Count -eq 0) { return '' }
+    return [string]$values[0]
+}
+
+function Get-GuiSelectedValues {
+    param($Grid, [string]$Column)
+    $list = New-Object System.Collections.Generic.List[string]
+    $indexes = @(Get-GuiSelectedRowIndexes $Grid)
+    if ($null -eq $Grid -or $indexes.Count -eq 0) { return ,@() }
+    foreach ($idx in $indexes) {
+        $i = 0
+        try { $i = [int]$idx } catch { continue }
+        if ($i -lt 0 -or $i -ge $Grid.Rows.Count) { continue }
+        $row = $null
+        try { $row = $Grid.Rows.Item($i) } catch {
+            try { $row = $Grid.Rows[$i] } catch { }
+        }
+        $text = Get-GuiGridRowValue $row $Column
+        if (-not [string]::IsNullOrWhiteSpace($text)) { $list.Add($text) }
+    }
+    return ,$list.ToArray()
+}
+
+function Get-SingleOrSelectedDevices {
+    param($Selected, $Loaded)
+    $list = New-Object System.Collections.Generic.List[object]
+    foreach ($device in (ConvertTo-DeviceObjectList $Selected)) {
+        if ($null -ne $device) { $list.Add($device) }
+    }
+    if ($list.Count -gt 0) { return ,$list }
+    $loadedList = ConvertTo-DeviceObjectList $Loaded
+    if ($loadedList.Count -eq 1) { $list.Add($loadedList[0]) }
+    return ,$list
+}
+
+function Select-ItemsByGridIndex {
+    param($Items, $Indexes, [switch]$ReadyOnly)
+    $array = ConvertTo-ObjectArray $Items
+    $matched = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    foreach ($idx in @($Indexes)) {
+        $i = 0
+        try { $i = [int]$idx } catch { continue }
+        if ($seen.ContainsKey($i)) { continue }
+        if ($i -lt 0 -or $i -ge $array.Count) { continue }
+        $seen[$i] = $true
+        $item = $array[$i]
+        if ($ReadyOnly -and [string]$item.Status -ne 'Ready') { continue }
+        $matched.Add($item)
+    }
+    return (ConvertTo-ObjectArray $matched)
+}
+
+function Select-BulkPlanItemsByRow {
+    param($Plan, [string[]]$RowNumbers, [switch]$ReadyOnly)
+    $wanted = @{}
+    foreach ($number in @($RowNumbers)) {
+        $key = [string]$number
+        if (-not [string]::IsNullOrWhiteSpace($key)) { $wanted[$key] = $true }
+    }
+    $matched = New-Object System.Collections.Generic.List[object]
+    foreach ($item in (ConvertTo-ObjectArray $Plan)) {
+        if ($wanted.Count -eq 0) { break }
+        if (-not $wanted.ContainsKey([string]$item.Row)) { continue }
+        if ($ReadyOnly -and [string]$item.Status -ne 'Ready') { continue }
+        $matched.Add($item)
+    }
+    return (ConvertTo-ObjectArray $matched)
+}
+
+function Find-GuiDeviceByObjectId {
+    param($Devices, [string]$ObjectId)
+    if (-not $ObjectId) { return $null }
+    foreach ($device in (ConvertTo-ObjectArray $Devices)) {
+        if ([string]$device.ObjectId -eq $ObjectId) { return $device }
+    }
+    return $null
+}
+
+function New-GuiButton {
+    param([string]$Text, [int]$Width = 140, [int]$Height = 32, $BackColor)
+    $btn = New-Object System.Windows.Forms.Button
+    $btn.Text = $Text
+    $btn.Size = New-Object System.Drawing.Size($Width, $Height)
+    $btn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $btn.FlatAppearance.BorderSize = 0
+    $btn.ForeColor = [System.Drawing.Color]::White
+    $btn.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $btn.Cursor = [System.Windows.Forms.Cursors]::Hand
+    if ($null -eq $BackColor) {
+        $BackColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
+    }
+    $btn.BackColor = $BackColor
+    return $btn
+}
+
+function New-GuiGrid {
+    param([switch]$MultiSelect)
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $grid.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $grid.ReadOnly = $true
+    $grid.AllowUserToAddRows = $false
+    $grid.AllowUserToDeleteRows = $false
+    $grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
+    $grid.MultiSelect = [bool]$MultiSelect
+    $grid.RowHeadersVisible = [bool]$MultiSelect
+    $grid.BackgroundColor = [System.Drawing.Color]::White
+    $grid.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+    $grid.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::Fill
+    $grid.ColumnHeadersHeightSizeMode = [System.Windows.Forms.DataGridViewColumnHeadersHeightSizeMode]::AutoSize
+    return $grid
+}
+
+function Show-CAExemptionGui {
+    $script:GuiMode = $true
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    Add-Type -AssemblyName System.Data
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+
+    $navy = [System.Drawing.Color]::FromArgb(24, 42, 68)
+    $navy2 = [System.Drawing.Color]::FromArgb(32, 52, 80)
+    $pageBg = [System.Drawing.Color]::FromArgb(245, 247, 250)
+    $blue = [System.Drawing.Color]::FromArgb(0, 120, 212)
+    $green = [System.Drawing.Color]::FromArgb(16, 124, 65)
+    $red = [System.Drawing.Color]::FromArgb(196, 43, 28)
+    $muted = [System.Drawing.Color]::FromArgb(160, 185, 215)
+
+    $script:GuiDevices = @()
+    $script:GuiPlan = @()
+    $script:GuiUserRows = @()
+    $script:GuiActivityRows = @()
+    $script:CachedDeviceIndexes = @()
+    $deviceColumns = @('DisplayName', 'OperatingSystem', 'JoinType', 'DeviceId', 'ObjectId', 'LastSignInDisplay', 'ExtensionAttribute1', 'Eligible')
+    $planColumns = @('Row', 'Identifier', 'DisplayName', 'Current', 'New', 'Status', 'Note')
+    $exportColumns = @('DisplayName', 'DeviceId', 'ObjectId', 'OperatingSystem', 'JoinType', 'LastSignIn', 'UserPrincipalName', 'Value', 'Action', 'Eligible')
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Entra device extensionAttribute1  v$($script:ToolVersion)"
+    $form.Size = New-Object System.Drawing.Size(1280, 820)
+    $form.MinimumSize = New-Object System.Drawing.Size(980, 640)
+    $form.StartPosition = 'CenterScreen'
+    $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $form.BackColor = $pageBg
+    $form.Icon = [System.Drawing.SystemIcons]::Shield
+
+    $header = New-Object System.Windows.Forms.Panel
+    $header.Dock = 'Top'
+    $header.Height = 58
+    $header.BackColor = $navy
+    $lblTitle = New-Object System.Windows.Forms.Label
+    $lblTitle.Text = 'Entra device exemption'
+    $lblTitle.Font = New-Object System.Drawing.Font('Segoe UI', 16, [System.Drawing.FontStyle]::Bold)
+    $lblTitle.ForeColor = [System.Drawing.Color]::White
+    $lblTitle.AutoSize = $true
+    $lblTitle.Location = New-Object System.Drawing.Point(18, 14)
+    $header.Controls.Add($lblTitle)
+    $script:lblConnection = New-Object System.Windows.Forms.Label
+    $script:lblConnection.Text = 'Not connected'
+    $script:lblConnection.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $script:lblConnection.ForeColor = $muted
+    $script:lblConnection.AutoSize = $true
+    $script:lblConnection.Location = New-Object System.Drawing.Point(330, 20)
+    $header.Controls.Add($script:lblConnection)
+
+    $connectPanel = New-Object System.Windows.Forms.Panel
+    $connectPanel.Dock = 'Top'
+    $connectPanel.Height = 52
+    $connectPanel.BackColor = $navy2
+    $btnConnect = New-GuiButton 'Sign in' 120 28 $blue
+    $btnConnect.Location = New-Object System.Drawing.Point(18, 11)
+    $connectPanel.Controls.Add($btnConnect)
+    $btnReconnect = New-GuiButton 'Switch account' 130 28 ([System.Drawing.Color]::FromArgb(70, 90, 120))
+    $btnReconnect.Location = New-Object System.Drawing.Point(146, 11)
+    $connectPanel.Controls.Add($btnReconnect)
+    $script:lblScopeBanner = New-Object System.Windows.Forms.Label
+    $script:lblScopeBanner.ForeColor = $muted
+    $script:lblScopeBanner.AutoSize = $true
+    $script:lblScopeBanner.Location = New-Object System.Drawing.Point(290, 16)
+    $connectPanel.Controls.Add($script:lblScopeBanner)
+
+    $footer = New-Object System.Windows.Forms.Panel
+    $footer.Dock = 'Bottom'
+    $footer.Height = 36
+    $footer.BackColor = $navy
+    $script:lblStatus = New-Object System.Windows.Forms.Label
+    $script:lblStatus.Text = 'Ready'
+    $script:lblStatus.ForeColor = [System.Drawing.Color]::White
+    $script:lblStatus.AutoSize = $true
+    $script:lblStatus.Location = New-Object System.Drawing.Point(18, 10)
+    $footer.Controls.Add($script:lblStatus)
+
+    $tabs = New-Object System.Windows.Forms.TabControl
+    $tabs.Dock = 'Fill'
+    $tabs.Padding = New-Object System.Drawing.Point(12, 6)
+
+    $tabDevices = New-Object System.Windows.Forms.TabPage
+    $tabDevices.Text = '  Devices  '
+    $tabDevices.BackColor = $pageBg
+    $devTop = New-Object System.Windows.Forms.Panel
+    $devTop.Dock = 'Top'
+    $devTop.Height = 86
+    $lblSearch = New-Object System.Windows.Forms.Label
+    $lblSearch.Text = 'Search by name, Device ID or Object ID'
+    $lblSearch.Location = New-Object System.Drawing.Point(12, 10)
+    $lblSearch.AutoSize = $true
+    $devTop.Controls.Add($lblSearch)
+    $script:txtDeviceSearch = New-Object System.Windows.Forms.TextBox
+    $script:txtDeviceSearch.Location = New-Object System.Drawing.Point(12, 32)
+    $script:txtDeviceSearch.Size = New-Object System.Drawing.Size(420, 26)
+    $devTop.Controls.Add($script:txtDeviceSearch)
+    $btnSearch = New-GuiButton 'Search' 100 28 $blue
+    $btnSearch.Location = New-Object System.Drawing.Point(442, 31)
+    $devTop.Controls.Add($btnSearch)
+    $btnLoadAll = New-GuiButton 'Load scoped devices' 160 28 ([System.Drawing.Color]::FromArgb(70, 90, 120))
+    $btnLoadAll.Location = New-Object System.Drawing.Point(550, 31)
+    $devTop.Controls.Add($btnLoadAll)
+    $script:lblDeviceCount = New-Object System.Windows.Forms.Label
+    $script:lblDeviceCount.Text = '0 devices'
+    $script:lblDeviceCount.Location = New-Object System.Drawing.Point(720, 36)
+    $script:lblDeviceCount.AutoSize = $true
+    $devTop.Controls.Add($script:lblDeviceCount)
+    $devBottom = New-Object System.Windows.Forms.Panel
+    $devBottom.Dock = 'Bottom'
+    $devBottom.Height = 70
+    $lblValue = New-Object System.Windows.Forms.Label
+    $lblValue.Text = 'extensionAttribute1'
+    $lblValue.Location = New-Object System.Drawing.Point(12, 10)
+    $lblValue.AutoSize = $true
+    $devBottom.Controls.Add($lblValue)
+    $script:txtDeviceValue = New-Object System.Windows.Forms.TextBox
+    $script:txtDeviceValue.Location = New-Object System.Drawing.Point(12, 30)
+    $script:txtDeviceValue.Size = New-Object System.Drawing.Size(240, 26)
+    $script:txtDeviceValue.Text = $script:Settings.DefaultValue
+    $devBottom.Controls.Add($script:txtDeviceValue)
+    $btnSet = New-GuiButton 'Set on selected' 140 28 $green
+    $btnSet.Location = New-Object System.Drawing.Point(270, 28)
+    $devBottom.Controls.Add($btnSet)
+    $btnClear = New-GuiButton 'Clear selected' 140 28 $red
+    $btnClear.Location = New-Object System.Drawing.Point(420, 28)
+    $devBottom.Controls.Add($btnClear)
+    $script:btnPrependName = New-GuiButton 'Prepend CA201-' 150 28 $blue
+    $script:btnPrependName.Location = New-Object System.Drawing.Point(570, 28)
+    $devBottom.Controls.Add($script:btnPrependName)
+    $script:grdDevices = New-GuiGrid -MultiSelect
+    $tabDevices.Controls.Add($script:grdDevices)
+    $tabDevices.Controls.Add($devBottom)
+    $tabDevices.Controls.Add($devTop)
+
+    $tabBulk = New-Object System.Windows.Forms.TabPage
+    $tabBulk.Text = '  Bulk CSV  '
+    $tabBulk.BackColor = $pageBg
+    $bulkTop = New-Object System.Windows.Forms.Panel
+    $bulkTop.Dock = 'Top'
+    $bulkTop.Height = 86
+    $script:txtBulkPath = New-Object System.Windows.Forms.TextBox
+    $script:txtBulkPath.Location = New-Object System.Drawing.Point(12, 16)
+    $script:txtBulkPath.Size = New-Object System.Drawing.Size(520, 26)
+    $bulkTop.Controls.Add($script:txtBulkPath)
+    $btnBrowseBulk = New-GuiButton 'Browse' 90 28 $blue
+    $btnBrowseBulk.Location = New-Object System.Drawing.Point(542, 15)
+    $bulkTop.Controls.Add($btnBrowseBulk)
+    $btnPreviewBulk = New-GuiButton 'Preview' 90 28 $green
+    $btnPreviewBulk.Location = New-Object System.Drawing.Point(640, 15)
+    $bulkTop.Controls.Add($btnPreviewBulk)
+    $btnTemplate = New-GuiButton 'Save template' 120 28 ([System.Drawing.Color]::FromArgb(70, 90, 120))
+    $btnTemplate.Location = New-Object System.Drawing.Point(738, 15)
+    $bulkTop.Controls.Add($btnTemplate)
+    $lblFallback = New-Object System.Windows.Forms.Label
+    $lblFallback.Text = 'Fallback value for blank CSV Value cells'
+    $lblFallback.Location = New-Object System.Drawing.Point(12, 52)
+    $lblFallback.AutoSize = $true
+    $bulkTop.Controls.Add($lblFallback)
+    $script:txtBulkFallback = New-Object System.Windows.Forms.TextBox
+    $script:txtBulkFallback.Location = New-Object System.Drawing.Point(270, 48)
+    $script:txtBulkFallback.Size = New-Object System.Drawing.Size(180, 26)
+    $script:txtBulkFallback.Text = $script:Settings.DefaultValue
+    $bulkTop.Controls.Add($script:txtBulkFallback)
+    $bulkBottom = New-Object System.Windows.Forms.Panel
+    $bulkBottom.Dock = 'Bottom'
+    $bulkBottom.Height = 88
+    $btnApplyAll = New-GuiButton 'Apply all Ready' 150 28 $green
+    $btnApplyAll.Location = New-Object System.Drawing.Point(12, 8)
+    $bulkBottom.Controls.Add($btnApplyAll)
+    $btnApplyBulk = New-GuiButton 'Apply selected' 140 28 ([System.Drawing.Color]::FromArgb(70, 90, 120))
+    $btnApplyBulk.Location = New-Object System.Drawing.Point(170, 8)
+    $bulkBottom.Controls.Add($btnApplyBulk)
+    $btnSelectReady = New-GuiButton 'Select Ready' 120 28 ([System.Drawing.Color]::FromArgb(70, 90, 120))
+    $btnSelectReady.Location = New-Object System.Drawing.Point(318, 8)
+    $bulkBottom.Controls.Add($btnSelectReady)
+    $btnExportPlan = New-GuiButton 'Export preview' 140 28 $blue
+    $btnExportPlan.Location = New-Object System.Drawing.Point(446, 8)
+    $bulkBottom.Controls.Add($btnExportPlan)
+    $btnPrependAll = New-GuiButton 'Prepend all names' 160 28 $blue
+    $btnPrependAll.Location = New-Object System.Drawing.Point(12, 46)
+    $bulkBottom.Controls.Add($btnPrependAll)
+    $btnPrependSelected = New-GuiButton 'Prepend selected' 150 28 ([System.Drawing.Color]::FromArgb(70, 90, 120))
+    $btnPrependSelected.Location = New-Object System.Drawing.Point(180, 46)
+    $bulkBottom.Controls.Add($btnPrependSelected)
+    $script:lblBulkSummary = New-Object System.Windows.Forms.Label
+    $script:lblBulkSummary.Text = 'Load a CSV, click Preview, then Apply all Ready or Prepend all names. No row selection required.'
+    $script:lblBulkSummary.Location = New-Object System.Drawing.Point(340, 52)
+    $script:lblBulkSummary.AutoSize = $true
+    $bulkBottom.Controls.Add($script:lblBulkSummary)
+    $script:grdBulk = New-GuiGrid -MultiSelect
+    $tabBulk.Controls.Add($script:grdBulk)
+    $tabBulk.Controls.Add($bulkBottom)
+    $tabBulk.Controls.Add($bulkTop)
+
+    $tabUsers = New-Object System.Windows.Forms.TabPage
+    $tabUsers.Text = '  By user  '
+    $tabUsers.BackColor = $pageBg
+    $userTop = New-Object System.Windows.Forms.Panel
+    $userTop.Dock = 'Top'
+    $userTop.Height = 110
+    $lblUsers = New-Object System.Windows.Forms.Label
+    $lblUsers.Text = 'UPNs, emails, names or object IDs (comma or newline separated), or load a user CSV'
+    $lblUsers.Location = New-Object System.Drawing.Point(12, 8)
+    $lblUsers.AutoSize = $true
+    $userTop.Controls.Add($lblUsers)
+    $script:txtUsers = New-Object System.Windows.Forms.TextBox
+    $script:txtUsers.Multiline = $true
+    $script:txtUsers.ScrollBars = 'Vertical'
+    $script:txtUsers.Location = New-Object System.Drawing.Point(12, 28)
+    $script:txtUsers.Size = New-Object System.Drawing.Size(640, 46)
+    $userTop.Controls.Add($script:txtUsers)
+    $btnUserCsv = New-GuiButton 'Load user CSV' 130 28 $blue
+    $btnUserCsv.Location = New-Object System.Drawing.Point(662, 28)
+    $userTop.Controls.Add($btnUserCsv)
+    $btnFindUsers = New-GuiButton 'Find devices' 130 28 $green
+    $btnFindUsers.Location = New-Object System.Drawing.Point(800, 28)
+    $userTop.Controls.Add($btnFindUsers)
+    $userBottom = New-Object System.Windows.Forms.Panel
+    $userBottom.Dock = 'Bottom'
+    $userBottom.Height = 50
+    $script:txtUserValue = New-Object System.Windows.Forms.TextBox
+    $script:txtUserValue.Location = New-Object System.Drawing.Point(12, 12)
+    $script:txtUserValue.Size = New-Object System.Drawing.Size(180, 26)
+    $script:txtUserValue.Text = $script:Settings.DefaultValue
+    $userBottom.Controls.Add($script:txtUserValue)
+    $btnExportUsers = New-GuiButton 'Export CSV' 120 28 $blue
+    $btnExportUsers.Location = New-Object System.Drawing.Point(204, 10)
+    $userBottom.Controls.Add($btnExportUsers)
+    $btnApplyUsers = New-GuiButton 'Export and apply' 150 28 $green
+    $btnApplyUsers.Location = New-Object System.Drawing.Point(332, 10)
+    $userBottom.Controls.Add($btnApplyUsers)
+    $script:lblUserSummary = New-Object System.Windows.Forms.Label
+    $script:lblUserSummary.Text = 'Find user devices, then export a bulk-update CSV.'
+    $script:lblUserSummary.Location = New-Object System.Drawing.Point(500, 16)
+    $script:lblUserSummary.AutoSize = $true
+    $userBottom.Controls.Add($script:lblUserSummary)
+    $script:grdUsers = New-GuiGrid
+    $tabUsers.Controls.Add($script:grdUsers)
+    $tabUsers.Controls.Add($userBottom)
+    $tabUsers.Controls.Add($userTop)
+
+    $tabActivity = New-Object System.Windows.Forms.TabPage
+    $tabActivity.Text = '  Recent activity  '
+    $tabActivity.BackColor = $pageBg
+    $actTop = New-Object System.Windows.Forms.Panel
+    $actTop.Dock = 'Top'
+    $actTop.Height = 86
+    $script:txtActivityPath = New-Object System.Windows.Forms.TextBox
+    $script:txtActivityPath.Location = New-Object System.Drawing.Point(12, 16)
+    $script:txtActivityPath.Size = New-Object System.Drawing.Size(480, 26)
+    $actTop.Controls.Add($script:txtActivityPath)
+    $btnBrowseAct = New-GuiButton 'Browse' 90 28 $blue
+    $btnBrowseAct.Location = New-Object System.Drawing.Point(500, 15)
+    $actTop.Controls.Add($btnBrowseAct)
+    $lblDays = New-Object System.Windows.Forms.Label
+    $lblDays.Text = 'Days'
+    $lblDays.Location = New-Object System.Drawing.Point(600, 18)
+    $lblDays.AutoSize = $true
+    $actTop.Controls.Add($lblDays)
+    $script:numDays = New-Object System.Windows.Forms.NumericUpDown
+    $script:numDays.Location = New-Object System.Drawing.Point(640, 16)
+    $script:numDays.Size = New-Object System.Drawing.Size(70, 26)
+    $script:numDays.Minimum = 1
+    $script:numDays.Maximum = 3650
+    $script:numDays.Value = $script:DefaultActivityDays
+    $actTop.Controls.Add($script:numDays)
+    $script:chkUnknown = New-Object System.Windows.Forms.CheckBox
+    $script:chkUnknown.Text = 'Include no last sign-in'
+    $script:chkUnknown.Location = New-Object System.Drawing.Point(720, 18)
+    $script:chkUnknown.AutoSize = $true
+    $actTop.Controls.Add($script:chkUnknown)
+    $btnFindAct = New-GuiButton 'Find active devices' 160 28 $green
+    $btnFindAct.Location = New-Object System.Drawing.Point(12, 48)
+    $actTop.Controls.Add($btnFindAct)
+    $actBottom = New-Object System.Windows.Forms.Panel
+    $actBottom.Dock = 'Bottom'
+    $actBottom.Height = 50
+    $script:txtActivityValue = New-Object System.Windows.Forms.TextBox
+    $script:txtActivityValue.Location = New-Object System.Drawing.Point(12, 12)
+    $script:txtActivityValue.Size = New-Object System.Drawing.Size(180, 26)
+    $script:txtActivityValue.Text = $script:Settings.DefaultValue
+    $actBottom.Controls.Add($script:txtActivityValue)
+    $btnExportAct = New-GuiButton 'Export CSV' 120 28 $blue
+    $btnExportAct.Location = New-Object System.Drawing.Point(204, 10)
+    $actBottom.Controls.Add($btnExportAct)
+    $btnApplyAct = New-GuiButton 'Export and apply' 150 28 $green
+    $btnApplyAct.Location = New-Object System.Drawing.Point(332, 10)
+    $actBottom.Controls.Add($btnApplyAct)
+    $script:lblActivitySummary = New-Object System.Windows.Forms.Label
+    $script:lblActivitySummary.Text = 'Load a device or user CSV, then keep recently active devices.'
+    $script:lblActivitySummary.Location = New-Object System.Drawing.Point(500, 16)
+    $script:lblActivitySummary.AutoSize = $true
+    $actBottom.Controls.Add($script:lblActivitySummary)
+    $script:grdActivity = New-GuiGrid
+    $tabActivity.Controls.Add($script:grdActivity)
+    $tabActivity.Controls.Add($actBottom)
+    $tabActivity.Controls.Add($actTop)
+
+    $tabSettings = New-Object System.Windows.Forms.TabPage
+    $tabSettings.Text = '  Settings  '
+    $tabSettings.BackColor = $pageBg
+    $lblDef = New-Object System.Windows.Forms.Label
+    $lblDef.Text = 'Default extensionAttribute1 value'
+    $lblDef.Location = New-Object System.Drawing.Point(24, 24)
+    $lblDef.AutoSize = $true
+    $tabSettings.Controls.Add($lblDef)
+    $script:txtDefaultValue = New-Object System.Windows.Forms.TextBox
+    $script:txtDefaultValue.Location = New-Object System.Drawing.Point(24, 46)
+    $script:txtDefaultValue.Size = New-Object System.Drawing.Size(280, 26)
+    $script:txtDefaultValue.Text = $script:Settings.DefaultValue
+    $tabSettings.Controls.Add($script:txtDefaultValue)
+    $lblPrefix = New-Object System.Windows.Forms.Label
+    $lblPrefix.Text = 'Device name prefix (prepended to display names)'
+    $lblPrefix.Location = New-Object System.Drawing.Point(24, 78)
+    $lblPrefix.AutoSize = $true
+    $tabSettings.Controls.Add($lblPrefix)
+    $script:txtNamePrefix = New-Object System.Windows.Forms.TextBox
+    $script:txtNamePrefix.Location = New-Object System.Drawing.Point(24, 100)
+    $script:txtNamePrefix.Size = New-Object System.Drawing.Size(280, 26)
+    $script:txtNamePrefix.Text = $script:Settings.NamePrefix
+    $tabSettings.Controls.Add($script:txtNamePrefix)
+    $script:chkDryRun = New-Object System.Windows.Forms.CheckBox
+    $script:chkDryRun.Text = 'Dry-run (do not write changes to Entra ID)'
+    $script:chkDryRun.Location = New-Object System.Drawing.Point(24, 136)
+    $script:chkDryRun.AutoSize = $true
+    $script:chkDryRun.Checked = [bool]$script:Settings.DryRun
+    $tabSettings.Controls.Add($script:chkDryRun)
+    $lblScope = New-Object System.Windows.Forms.Label
+    $lblScope.Text = 'Device scope (which devices can be changed)'
+    $lblScope.Location = New-Object System.Drawing.Point(24, 172)
+    $lblScope.AutoSize = $true
+    $tabSettings.Controls.Add($lblScope)
+    $script:cmbScope = New-Object System.Windows.Forms.ComboBox
+    $script:cmbScope.DropDownStyle = 'DropDownList'
+    $script:cmbScope.Location = New-Object System.Drawing.Point(24, 194)
+    $script:cmbScope.Size = New-Object System.Drawing.Size(320, 26)
+    [void]$script:cmbScope.Items.Add('All devices (any OS)')
+    [void]$script:cmbScope.Items.Add('Windows devices')
+    [void]$script:cmbScope.Items.Add('Windows Entra registered')
+    $tabSettings.Controls.Add($script:cmbScope)
+    $lblLog = New-Object System.Windows.Forms.Label
+    $lblLog.Text = 'Audit log path'
+    $lblLog.Location = New-Object System.Drawing.Point(24, 236)
+    $lblLog.AutoSize = $true
+    $tabSettings.Controls.Add($lblLog)
+    $script:txtLogPath = New-Object System.Windows.Forms.TextBox
+    $script:txtLogPath.Location = New-Object System.Drawing.Point(24, 258)
+    $script:txtLogPath.Size = New-Object System.Drawing.Size(520, 26)
+    $script:txtLogPath.Text = $script:Settings.LogPath
+    $tabSettings.Controls.Add($script:txtLogPath)
+    $script:chkDeviceCode = New-Object System.Windows.Forms.CheckBox
+    $script:chkDeviceCode.Text = 'Use device-code sign-in (RDP / no browser). Leave off for a normal interactive login.'
+    $script:chkDeviceCode.Location = New-Object System.Drawing.Point(24, 298)
+    $script:chkDeviceCode.AutoSize = $true
+    $script:chkDeviceCode.Checked = [bool]$DeviceCode
+    $tabSettings.Controls.Add($script:chkDeviceCode)
+    $btnSaveSettings = New-GuiButton 'Save settings' 140 32 $green
+    $btnSaveSettings.Location = New-Object System.Drawing.Point(24, 336)
+    $tabSettings.Controls.Add($btnSaveSettings)
+    $lblHelp = New-Object System.Windows.Forms.Label
+    $lblHelp.Location = New-Object System.Drawing.Point(24, 386)
+    $lblHelp.Size = New-Object System.Drawing.Size(900, 200)
+    $lblHelp.Text = @"
+Conditional Access filter (case-sensitive):
+  device.extensionAttribute1 -eq "$($script:Settings.DefaultValue)"
+
+Graph trustType Workplace = CA AzureADRegistered
+Graph AzureAd = CA AzureADJoined
+Graph ServerAd = CA ServerADJoined
+
+Sign-in: click Sign in. A browser window opens. Tenant ID is not required.
+Use device-code sign-in only when a browser cannot open (RDP / Server Core).
+
+Bulk CSV: Preview, then Apply all Ready. No row selection required.
+To update a subset, select rows (Ctrl+click / Shift+click) and click Apply selected.
+Device names: Prepend CA201- (or the prefix in Settings) one-by-one or with Prepend all names.
+Entra ID can only rename Windows devices. iPhone/iPad names are renamed in Intune.
+
+Permissions: Device.ReadWrite.All, User.Read.All, DeviceManagementManagedDevices.ReadWrite.All
+Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
+"@
+    $tabSettings.Controls.Add($lblHelp)
+
+    [void]$tabs.TabPages.Add($tabDevices)
+    [void]$tabs.TabPages.Add($tabBulk)
+    [void]$tabs.TabPages.Add($tabUsers)
+    [void]$tabs.TabPages.Add($tabActivity)
+    [void]$tabs.TabPages.Add($tabSettings)
+
+    $form.Controls.Add($tabs)
+    $form.Controls.Add($connectPanel)
+    $form.Controls.Add($header)
+    $form.Controls.Add($footer)
+
+    function Update-GuiBanner {
+        $context = $null
+        try { $context = Get-MgContext } catch { }
+        if ($context -and ($context.Account -or $context.TenantId)) {
+            $script:lblConnection.Text = ("Connected as {0}  |  Tenant {1}  |  v{2}" -f $context.Account, $context.TenantId, $script:ToolVersion)
+            $script:lblConnection.ForeColor = [System.Drawing.Color]::FromArgb(0, 210, 106)
+        }
+        else {
+            $script:lblConnection.Text = ("Not connected  |  v{0}" -f $script:ToolVersion)
+            $script:lblConnection.ForeColor = $muted
+        }
+        $dry = if ($script:Settings.DryRun) { '  |  DRY-RUN' } else { '' }
+        $script:lblScopeBanner.Text = ("Scope: {0}{1}" -f (Get-DeviceScopeLabel), $dry)
+        switch (Get-DeviceScope) {
+            'All' { $script:cmbScope.SelectedIndex = 0 }
+            'Windows' { $script:cmbScope.SelectedIndex = 1 }
+            default { $script:cmbScope.SelectedIndex = 2 }
+        }
+        $script:txtDefaultValue.Text = $script:Settings.DefaultValue
+        $script:txtNamePrefix.Text = $script:Settings.NamePrefix
+        $script:chkDryRun.Checked = [bool]$script:Settings.DryRun
+        $script:txtLogPath.Text = $script:Settings.LogPath
+        if ($script:btnPrependName) {
+            $script:btnPrependName.Text = ('Prepend {0}' -f (Get-NormalizedNamePrefix))
+        }
+        $script:txtDeviceValue.Text = $script:Settings.DefaultValue
+        $script:txtBulkFallback.Text = $script:Settings.DefaultValue
+        $script:txtUserValue.Text = $script:Settings.DefaultValue
+        $script:txtActivityValue.Text = $script:Settings.DefaultValue
+    }
+
+    function Set-GuiBusy([string]$Text) {
+        $script:lblStatus.Text = $Text
+        $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+    function Clear-GuiBusy([string]$Text = 'Ready') {
+        $script:lblStatus.Text = $Text
+        $form.Cursor = [System.Windows.Forms.Cursors]::Default
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+
+    function Invoke-GuiSignIn {
+        param([switch]$Reconnect)
+        $script:LastConnectError = $null
+        Set-GuiBusy 'Opening the Microsoft sign-in window...'
+        try {
+            # Windows PowerShell 5.1 simple functions reject -Switch:$false.
+            # Only splat a switch when it is on so Sign in does not pass -Reconnect.
+            $connectParams = @{}
+            if ($Reconnect) { $connectParams['Reconnect'] = $true }
+            if ($script:chkDeviceCode -and $script:chkDeviceCode.Checked) {
+                $connectParams['UseDeviceCode'] = $true
+            }
+            $ok = Connect-Graph @connectParams
+            Update-GuiBanner
+            if ($ok) {
+                Clear-GuiBusy 'Signed in. Search for a device or load the current scope.'
+                if ($script:LastConnectError) {
+                    [void](Show-ToolDialog $script:LastConnectError 'Permissions' 'OK' 'Warning')
+                }
+                return $true
+            }
+            Clear-GuiBusy 'Sign-in did not complete'
+            $msg = $script:LastConnectError
+            if (-not $msg) { $msg = 'Sign-in did not complete. Click Sign in to try the interactive browser login again.' }
+            [void](Show-ToolDialog $msg 'Sign-in' 'OK' 'Warning')
+            return $false
+        }
+        catch {
+            Clear-GuiBusy 'Sign-in failed'
+            [void](Show-ToolDialog (Format-CaughtError $_) 'Sign-in failed' 'OK' 'Error')
+            return $false
+        }
+    }
+
+    function Test-GuiGraph {
+        if (Test-GraphSignedIn) { return $true }
+        return (Invoke-GuiSignIn)
+    }
+
+    function Save-GuiExportRows {
+        param($Rows, [string]$DefaultName, [switch]$ApplyAfter)
+        $rows = ConvertTo-ObjectArray $Rows
+        if ($rows.Count -eq 0) {
+            [void](Show-ToolDialog 'There is nothing to export.' 'Export' 'OK' 'Information')
+            return
+        }
+        $dialog = New-Object System.Windows.Forms.SaveFileDialog
+        $dialog.Filter = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*'
+        $dialog.FileName = $DefaultName
+        if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+        try {
+            $rows | Export-Csv -Path $dialog.FileName -NoTypeInformation -Encoding UTF8
+            [void](Show-ToolDialog ("Exported {0} row(s) to`n{1}" -f $rows.Count, $dialog.FileName) 'Export' 'OK' 'Information')
+            if ($ApplyAfter) {
+                $script:txtBulkPath.Text = $dialog.FileName
+                $tabs.SelectedTab = $tabBulk
+                Invoke-GuiBulkPreview
+            }
+        }
+        catch {
+            [void](Show-ToolDialog (Format-CaughtError $_) 'Export failed' 'OK' 'Error')
+        }
+    }
+
+    function Invoke-GuiDeviceSearch {
+        if (-not (Test-GuiGraph)) { return }
+        $search = $script:txtDeviceSearch.Text.Trim()
+        if (-not $search) {
+            [void](Show-ToolDialog 'Enter a device name, Device ID or Object ID.' 'Search' 'OK' 'Information')
+            return
+        }
+        Set-GuiBusy 'Searching Entra devices...'
+        try {
+            $script:GuiDevices = ConvertTo-ObjectArray (Find-Devices $search)
+            Set-GuiGridData $script:grdDevices $script:GuiDevices $deviceColumns
+            $script:lblDeviceCount.Text = ("{0} device(s)" -f @($script:GuiDevices).Count)
+            Clear-GuiBusy ("Found {0} device(s)." -f @($script:GuiDevices).Count)
+        }
+        catch {
+            Clear-GuiBusy 'Search failed'
+            [void](Show-ToolDialog (Format-CaughtError $_) 'Search failed' 'OK' 'Error')
+        }
+    }
+
+    function Invoke-GuiLoadScopedDevices {
+        if (-not (Test-GuiGraph)) { return }
+        Set-GuiBusy 'Loading devices in the current scope...'
+        try {
+            $script:GuiDevices = ConvertTo-ObjectArray (Get-EntraDevices)
+            Set-GuiGridData $script:grdDevices $script:GuiDevices $deviceColumns
+            $script:lblDeviceCount.Text = ("{0} device(s)" -f @($script:GuiDevices).Count)
+            Clear-GuiBusy ("Loaded {0} device(s)." -f @($script:GuiDevices).Count)
+        }
+        catch {
+            Clear-GuiBusy 'Load failed'
+            [void](Show-ToolDialog (Format-CaughtError $_) 'Load failed' 'OK' 'Error')
+        }
+    }
+
+    function Get-GuiSelectedDevices {
+        $list = New-Object System.Collections.Generic.List[object]
+        $indexes = @(Get-GuiSelectedRowIndexes $script:grdDevices)
+        if ($indexes.Count -eq 0 -and @($script:CachedDeviceIndexes).Count -gt 0) {
+            $indexes = @($script:CachedDeviceIndexes)
+        }
+        foreach ($device in (Select-ItemsByGridIndex -Items $script:GuiDevices -Indexes $indexes)) {
+            if ($null -ne $device) { $list.Add($device) }
+        }
+        if ($list.Count -eq 0) {
+            $objectIds = @(Get-GuiSelectedValues $script:grdDevices 'ObjectId')
+            foreach ($objectId in $objectIds) {
+                $device = Find-GuiDeviceByObjectId $script:GuiDevices $objectId
+                if ($null -ne $device) { $list.Add($device) }
+            }
+        }
+        $i = 0
+        foreach ($idx in $indexes) {
+            if ($i -ge $list.Count) { break }
+            $row = $null
+            try { $row = $script:grdDevices.Rows.Item([int]$idx) } catch {
+                try { $row = $script:grdDevices.Rows[[int]$idx] } catch { }
+            }
+            $gridName = Get-GuiGridRowValue $row 'DisplayName'
+            if (-not [string]::IsNullOrWhiteSpace($gridName)) {
+                $list[$i].DisplayName = $gridName
+            }
+            $i++
+        }
+        return ,(Get-SingleOrSelectedDevices -Selected $list -Loaded $script:GuiDevices)
+    }
+
+    function Invoke-GuiUpdateSelected {
+        param([switch]$Clear)
+        if (-not (Test-GuiGraph)) { return }
+        $selected = @(Get-GuiSelectedDevices)
+        if ($selected.Count -eq 0) {
+            [void](Show-ToolDialog 'Select one or more devices in the grid first. Ctrl+click or Shift+click to choose several.' 'Update' 'OK' 'Information')
+            return
+        }
+        $eligible = New-Object System.Collections.Generic.List[object]
+        $skipped = New-Object System.Collections.Generic.List[string]
+        foreach ($device in $selected) {
+            if ($device.Eligible) { $eligible.Add($device) }
+            else { $skipped.Add(("{0}: {1}" -f $device.DisplayName, (Get-IneligibleDeviceNote $device))) }
+        }
+        if ($eligible.Count -eq 0) {
+            [void](Show-ToolDialog (($skipped -join [Environment]::NewLine)) 'Not in scope' 'OK' 'Warning')
+            return
+        }
+        $newValue = $null
+        if (-not $Clear) {
+            $newValue = $script:txtDeviceValue.Text.Trim()
+            if (-not (Test-ValidValue $newValue -Quiet)) {
+                [void](Show-ToolDialog (Get-ValueValidationError $newValue) 'Value' 'OK' 'Warning')
+                return
+            }
+        }
+        $actionText = if ($Clear) { 'Clear extensionAttribute1 on' } else { "Set extensionAttribute1 to '$newValue' on" }
+        if ((Show-ToolDialog ("{0} {1} selected device(s)?" -f $actionText, $eligible.Count) 'Confirm' 'YesNo' 'Question') -ne [System.Windows.Forms.DialogResult]::Yes) {
+            return
+        }
+        Set-GuiBusy ("Updating {0} device(s)..." -f $eligible.Count)
+        try {
+            $planItems = New-Object System.Collections.Generic.List[object]
+            foreach ($device in $eligible) {
+                $planItems.Add((New-ToolObject @('Device', $device, 'NewValue', $newValue)))
+            }
+            $results = ConvertTo-ObjectArray (Invoke-DeviceExtensionAttributeUpdates -PlanItems $planItems -Source 'GUI')
+            foreach ($entry in $results) {
+                if ($entry.Status -notin @('Success', 'DryRun')) { continue }
+                $device = Find-GuiDeviceByObjectId $script:GuiDevices $entry.ObjectId
+                if ($null -eq $device) { continue }
+                $device.ExtensionAttribute1 = $newValue
+                $device.Eligible = Test-DeviceEligible $device
+            }
+            Set-GuiGridData $script:grdDevices $script:GuiDevices $deviceColumns
+            $ok = @($results | Where-Object { $_.Status -eq 'Success' }).Count
+            $dry = @($results | Where-Object { $_.Status -eq 'DryRun' }).Count
+            $fail = @($results | Where-Object { $_.Status -eq 'Failed' }).Count
+            $msg = "Succeeded: $ok`nDry-run: $dry`nFailed: $fail"
+            if ($skipped.Count -gt 0) { $msg = $msg + "`nSkipped (not in scope): $($skipped.Count)" }
+            Clear-GuiBusy $msg.Replace("`n", '  ')
+            [void](Show-ToolDialog $msg 'Update' 'OK' 'Information')
+        }
+        catch {
+            Clear-GuiBusy 'Update failed'
+            [void](Show-ToolDialog (Format-CaughtError $_) 'Update failed' 'OK' 'Error')
+        }
+    }
+
+    function Invoke-GuiApplyNamePrefix {
+        param($Devices, [string]$Source)
+        $prefix = Get-NormalizedNamePrefix
+        $planItems = New-Object System.Collections.Generic.List[object]
+        $already = 0
+        $skipped = New-Object System.Collections.Generic.List[string]
+        foreach ($device in (ConvertTo-DeviceObjectList $Devices)) {
+            $item = New-DeviceNamePrefixPlanItem -Device $device -Prefix $prefix
+            $status = [string](Get-GraphProperty $item 'Status')
+            if ($status -eq 'NoChange') { $already++ }
+            elseif ($status -eq 'Ready') { $planItems.Add($item) }
+            else {
+                $name = Get-DeviceRecordDisplayName $device
+                if ([string]::IsNullOrWhiteSpace($name)) { $name = '(unknown device)' }
+                $note = [string](Get-GraphProperty $item 'Note')
+                if ([string]::IsNullOrWhiteSpace($note)) { $note = $status }
+                $skipped.Add(("{0}: {1}" -f $name, $note))
+            }
+        }
+        if ($planItems.Count -eq 0) {
+            $msg = "No device names need the prefix '{0}'." -f $prefix
+            if ($already -gt 0) {
+                $msg = ("{0} device name(s) already start with '{1}'." -f $already, $prefix)
+            }
+            elseif ($skipped.Count -gt 0) {
+                $msg = ("Could not prepend '{0}':`n{1}" -f $prefix, ($skipped -join "`n"))
+            }
+            else {
+                $msg = "Select a device whose DisplayName should get '{0}', then click Prepend again." -f $prefix
+            }
+            [void](Show-ToolDialog $msg 'Prepend names' 'OK' 'Information')
+            return
+        }
+        $confirm = ("Prepend '{0}' to {1} device name(s) now?" -f $prefix, $planItems.Count)
+        if ($planItems.Count -eq 1) {
+            $one = $planItems[0]
+            $confirm = ("Rename this device display name?`n`nCurrent:  {0}`nNew:      {1}`n`nContinue?" -f $one.CurrentName, $one.NewName)
+            if (-not (Test-WindowsDeviceOperatingSystem $one.Device)) {
+                $confirm = ("Entra ID cannot rename iPhone/iPad/Android devices.`nThe tool will rename it in Intune if the device is managed there.`n`nCurrent:  {0}`nNew:      {1}`n`nContinue?" -f $one.CurrentName, $one.NewName)
+            }
+        }
+        if ((Show-ToolDialog $confirm 'Confirm name prefix' 'YesNo' 'Question') -ne [System.Windows.Forms.DialogResult]::Yes) {
+            return
+        }
+        if (-not (Test-GuiGraph)) { return }
+        Set-GuiBusy ("Prepending '{0}' to {1} device name(s)..." -f $prefix, $planItems.Count)
+        try {
+            $results = ConvertTo-ObjectArray (Invoke-DeviceDisplayNamePrefixUpdates -PlanItems $planItems -Source $Source)
+            $ok = @($results | Where-Object { $_.Status -eq 'Success' }).Count
+            $dry = @($results | Where-Object { $_.Status -eq 'DryRun' }).Count
+            $fail = @($results | Where-Object { $_.Status -eq 'Failed' }).Count
+            $extra = ''
+            if ($already -gt 0) { $extra = "Already prefixed: $already" }
+            $msg = Format-GuiChangeSummary -Results $results -Extra $extra
+            foreach ($entry in $results) {
+                if ($entry.Status -notin @('Success', 'DryRun')) { continue }
+                $device = Find-GuiDeviceByObjectId $script:GuiDevices $entry.ObjectId
+                if ($null -eq $device) {
+                    foreach ($planItem in $script:GuiPlan) {
+                        if ($planItem.Device -and [string]$planItem.Device.ObjectId -eq [string]$entry.ObjectId) {
+                            $device = $planItem.Device
+                            break
+                        }
+                    }
+                }
+                if ($null -eq $device) { continue }
+                $device.DisplayName = [string]$entry.NewValue
+            }
+            foreach ($planItem in (ConvertTo-ObjectArray $script:GuiPlan)) {
+                if ($planItem.Device) { $planItem.DisplayName = [string]$planItem.Device.DisplayName }
+            }
+            if ($script:GuiDevices) { Set-GuiGridData $script:grdDevices $script:GuiDevices $deviceColumns }
+            if ($script:GuiPlan) { Set-GuiGridData $script:grdBulk $script:GuiPlan $planColumns }
+            Clear-GuiBusy $msg.Replace([Environment]::NewLine, '  ')
+            [void](Show-ToolDialog $msg 'Prepend names' 'OK' $(if ($fail -gt 0) { 'Warning' } else { 'Information' }))
+        }
+        catch {
+            Clear-GuiBusy 'Name prefix failed'
+            [void](Show-ToolDialog (Format-CaughtError $_) 'Name prefix failed' 'OK' 'Error')
+        }
+    }
+
+    function Invoke-GuiPrependSelectedDevices {
+        $selected = Get-GuiSelectedDevices
+        if ($selected.Count -eq 0) {
+            $defaultSearch = ''
+            if ($script:txtDeviceSearch) { $defaultSearch = [string]$script:txtDeviceSearch.Text }
+            $search = Show-ToolInputBox -Prompt 'Enter a device name, Device ID or Object ID to prepend CA201- (or the prefix in Settings).' -Title 'Prepend device name' -DefaultValue $defaultSearch
+            if ([string]::IsNullOrWhiteSpace($search)) { return }
+            if (-not (Test-GuiGraph)) { return }
+            Set-GuiBusy ("Finding '{0}'..." -f $search)
+            try {
+                $script:txtDeviceSearch.Text = $search
+                $found = ConvertTo-ObjectArray (Find-Devices $search)
+                $script:GuiDevices = $found
+                Set-GuiGridData $script:grdDevices $script:GuiDevices $deviceColumns
+                $script:lblDeviceCount.Text = ("{0} device(s)" -f @($script:GuiDevices).Count)
+                if ($found.Count -eq 0) {
+                    Clear-GuiBusy 'No devices found'
+                    [void](Show-ToolDialog ("No devices matched '{0}'." -f $search) 'Prepend names' 'OK' 'Information')
+                    return
+                }
+                $exact = New-Object System.Collections.Generic.List[object]
+                foreach ($device in $found) {
+                    if ([string]$device.DisplayName -eq $search) { $exact.Add($device) }
+                }
+                if ($exact.Count -eq 1) {
+                    $selected = Get-SingleOrSelectedDevices -Selected $exact -Loaded $found
+                }
+                else {
+                    $selected = Get-SingleOrSelectedDevices -Selected $null -Loaded $found
+                }
+                if ($selected.Count -eq 0) {
+                    $selected = ConvertTo-DeviceObjectList $found[0]
+                    Clear-GuiBusy ("Found {0} device(s). Confirm the rename for the first match, or pick a row and click Prepend again." -f $found.Count)
+                }
+                else {
+                    Clear-GuiBusy ("Found {0} device(s)." -f $found.Count)
+                }
+            }
+            catch {
+                Clear-GuiBusy 'Search failed'
+                [void](Show-ToolDialog (Format-CaughtError $_) 'Search failed' 'OK' 'Error')
+                return
+            }
+        }
+        Invoke-GuiApplyNamePrefix -Devices $selected -Source 'GUI-NamePrefix'
+    }
+
+    function Invoke-GuiBulkPrependNames {
+        param([switch]$ApplyAll)
+        $devices = New-Object System.Collections.Generic.List[object]
+        if ($ApplyAll) {
+            foreach ($item in (ConvertTo-ObjectArray $script:GuiPlan)) {
+                if ($item.Device) { $devices.Add($item.Device) }
+            }
+        }
+        else {
+            $indexes = @(Get-GuiSelectedRowIndexes $script:grdBulk)
+            $selectedPlan = @(Select-ItemsByGridIndex -Items $script:GuiPlan -Indexes $indexes)
+            foreach ($item in $selectedPlan) {
+                if ($item.Device) { $devices.Add($item.Device) }
+            }
+        }
+        if ($devices.Count -eq 0) {
+            if ($ApplyAll) {
+                [void](Show-ToolDialog 'Preview a CSV first. Prepend all names uses every device found in the preview.' 'Prepend names' 'OK' 'Information')
+            }
+            else {
+                [void](Show-ToolDialog 'Select one or more found devices, or click Prepend all names.' 'Prepend names' 'OK' 'Information')
+            }
+            return
+        }
+        Invoke-GuiApplyNamePrefix -Devices $devices -Source 'GUI-CSV-NamePrefix'
+    }
+
+    function Invoke-GuiBulkPreview {
+        if (-not (Test-GuiGraph)) { return }
+        $path = $script:txtBulkPath.Text.Trim().Trim('"')
+        if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            [void](Show-ToolDialog 'Choose a CSV file first.' 'Bulk update' 'OK' 'Information')
+            return
+        }
+        Set-GuiBusy 'Building bulk preview...'
+        try {
+            $rows = @(Import-DeviceCsv -Path $path)
+            if ($rows.Count -eq 0) { throw 'The CSV has no data rows.' }
+            $headers = @($rows[0].PSObject.Properties | ForEach-Object { $_.Name })
+            $columnMap = Resolve-CsvColumnMap $headers
+            $devices = ConvertTo-ObjectArray (Get-DevicesForBulkRows -Rows $rows -ColumnMap $columnMap)
+            $index = New-DeviceIndex $devices
+            $fallback = $script:txtBulkFallback.Text
+            $script:GuiPlan = ConvertTo-ObjectArray (New-BulkUpdatePlan -Rows $rows -DeviceIndex $index -ColumnMap $columnMap -FallbackValue $fallback -SkipMissing $false)
+            Set-GuiGridData $script:grdBulk $script:GuiPlan $planColumns
+            Invoke-GuiSelectReadyRows
+            $ready = @($script:GuiPlan | Where-Object { $_.Status -eq 'Ready' }).Count
+            $script:lblBulkSummary.Text = ("{0} row(s), {1} Ready. Apply all Ready for attributes, or Prepend all names. Dry-run: {2}" -f @($script:GuiPlan).Count, $ready, $script:Settings.DryRun)
+            Clear-GuiBusy $script:lblBulkSummary.Text
+        }
+        catch {
+            Clear-GuiBusy 'Preview failed'
+            [void](Show-ToolDialog (Format-CaughtError $_) 'Preview failed' 'OK' 'Error')
+        }
+    }
+
+    function Invoke-GuiSelectReadyRows {
+        $grid = $script:grdBulk
+        $plan = ConvertTo-ObjectArray $script:GuiPlan
+        $readyCount = 0
+        foreach ($item in $plan) {
+            if ([string]$item.Status -eq 'Ready') { $readyCount++ }
+        }
+        if ($null -eq $grid) { return }
+        try { $grid.ClearSelection() } catch { }
+        if ($plan.Count -gt 0 -and $readyCount -eq $plan.Count) {
+            try { $grid.SelectAll() } catch { }
+        }
+        else {
+            for ($i = 0; $i -lt $grid.Rows.Count; $i++) {
+                if ($i -ge $plan.Count) { break }
+                if ([string]$plan[$i].Status -ne 'Ready') { continue }
+                try { $grid.Rows[$i].Selected = $true } catch {
+                    try { $grid.Rows.Item($i).Selected = $true } catch { }
+                }
+            }
+        }
+        $script:lblBulkSummary.Text = ("{0} Ready row(s) selected. Ctrl+click or Shift+click to change the selection." -f $readyCount)
+    }
+
+    function Invoke-GuiBulkApply {
+        param([switch]$ApplyAll)
+        try {
+            $readyItems = @(ConvertTo-ObjectArray $script:GuiPlan | Where-Object { $_.Status -eq 'Ready' })
+            if ($readyItems.Count -eq 0) {
+                [void](Show-ToolDialog 'There are no Ready rows to apply. Preview a CSV first.' 'Bulk update' 'OK' 'Information')
+                return
+            }
+            $ready = $readyItems
+            $confirm = "Update all {0} Ready device(s) now?"
+            if (-not $ApplyAll) {
+                $indexes = @(Get-GuiSelectedRowIndexes $script:grdBulk)
+                $ready = @(Select-ItemsByGridIndex -Items $script:GuiPlan -Indexes $indexes -ReadyOnly)
+                if ($ready.Count -eq 0) {
+                    [void](Show-ToolDialog 'No Ready rows are selected. Click Apply all Ready to update every Ready device, or select rows first.' 'Bulk update' 'OK' 'Information')
+                    return
+                }
+                $confirm = "Update {0} selected device(s) now?"
+            }
+            if ((Show-ToolDialog ($confirm -f $ready.Count) 'Confirm bulk update' 'YesNo' 'Warning') -ne [System.Windows.Forms.DialogResult]::Yes) {
+                return
+            }
+            if (-not (Test-GuiGraph)) { return }
+            Set-GuiBusy ("Updating {0} device(s)..." -f $ready.Count)
+            $source = 'GUI-CSV'
+            $path = $script:txtBulkPath.Text.Trim()
+            if ($path) { $source = 'GUI-CSV:' + [IO.Path]::GetFileName($path) }
+            $results = ConvertTo-ObjectArray (Invoke-DeviceExtensionAttributeUpdates -PlanItems $ready -Source $source)
+            $ok = @($results | Where-Object { $_.Status -eq 'Success' }).Count
+            $dry = @($results | Where-Object { $_.Status -eq 'DryRun' }).Count
+            $fail = @($results | Where-Object { $_.Status -eq 'Failed' }).Count
+            $byObjectId = @{}
+            foreach ($entry in $results) {
+                if ($entry.ObjectId) { $byObjectId[[string]$entry.ObjectId] = $entry }
+            }
+            foreach ($item in $ready) {
+                $objectId = ''
+                if ($item.Device) { $objectId = [string]$item.Device.ObjectId }
+                if ($objectId -and $byObjectId.ContainsKey($objectId)) {
+                    $item.Status = [string]$byObjectId[$objectId].Status
+                    $item.Note = [string]$byObjectId[$objectId].Message
+                    if ($item.Device) {
+                        $item.Device.ExtensionAttribute1 = $item.NewValue
+                        $item.Current = Format-Value $item.NewValue
+                    }
+                }
+            }
+            Set-GuiGridData $script:grdBulk $script:GuiPlan $planColumns
+            Invoke-GuiSelectReadyRows
+            $msg = "Succeeded: $ok`nDry-run: $dry`nFailed: $fail"
+            Clear-GuiBusy $msg.Replace("`n", '  ')
+            [void](Show-ToolDialog $msg 'Bulk update' 'OK' 'Information')
+        }
+        catch {
+            Clear-GuiBusy 'Bulk update failed'
+            [void](Show-ToolDialog (Format-CaughtError $_) 'Bulk update failed' 'OK' 'Error')
+        }
+    }
+
+    function Invoke-GuiUserFind {
+        if (-not (Test-GuiGraph)) { return }
+        $tokens = @(Split-UserSearchTokens $script:txtUsers.Text)
+        if ($tokens.Count -eq 0) {
+            [void](Show-ToolDialog 'Enter users or load a user CSV first.' 'By user' 'OK' 'Information')
+            return
+        }
+        Set-GuiBusy ("Resolving {0} user identifier(s)..." -f $tokens.Count)
+        try {
+            $resolved = Resolve-UsersFromTokens -Tokens $tokens
+            if ($resolved.Users.Count -eq 0) { throw 'No users were resolved.' }
+            $pairs = ConvertTo-ObjectArray (Get-UsersRelatedWindowsDevices -Users $resolved.Users)
+            $value = $script:txtUserValue.Text
+            $action = if ([string]::IsNullOrEmpty($value)) { 'Clear' } else { 'Set' }
+            $script:GuiUserRows = ConvertTo-BulkExportRows -Pairs $pairs -Value $value -Action $action
+            Set-GuiGridData $script:grdUsers $script:GuiUserRows $exportColumns
+            $script:lblUserSummary.Text = ("{0} device(s) from {1} user(s)." -f @($script:GuiUserRows).Count, $resolved.Users.Count)
+            Clear-GuiBusy $script:lblUserSummary.Text
+        }
+        catch {
+            Clear-GuiBusy 'User lookup failed'
+            [void](Show-ToolDialog (Format-CaughtError $_) 'User lookup failed' 'OK' 'Error')
+        }
+    }
+
+    function Invoke-GuiActivityFind {
+        if (-not (Test-GuiGraph)) { return }
+        $path = $script:txtActivityPath.Text.Trim().Trim('"')
+        if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            [void](Show-ToolDialog 'Choose a device or user CSV first.' 'Recent activity' 'OK' 'Information')
+            return
+        }
+        Set-GuiBusy 'Looking up devices and filtering by last sign-in...'
+        try {
+            $csvRows = @(Import-DeviceCsv -Path $path)
+            if ($csvRows.Count -eq 0) { throw 'The CSV has no data rows.' }
+            $headers = @($csvRows[0].PSObject.Properties | ForEach-Object { $_.Name })
+            $kind = Get-CsvImportKind $headers
+            if ($kind -eq 'Unknown') { throw 'The CSV needs device or user identifier columns.' }
+            $devices = @()
+            $pairs = @()
+            if ($kind -eq 'User') {
+                $userMap = Resolve-UserCsvColumnMap $headers
+                $tokens = @()
+                foreach ($row in $csvRows) {
+                    $token = Get-UserRowSearchToken $row $userMap
+                    if ($token) { $tokens += $token }
+                }
+                $tokens = @(Split-UserSearchTokens ($tokens -join ','))
+                $resolved = Resolve-UsersFromTokens -Tokens $tokens
+                $pairs = ConvertTo-ObjectArray (Get-UsersRelatedWindowsDevices -Users $resolved.Users)
+                $seen = @{}
+                $list = New-Object System.Collections.Generic.List[object]
+                foreach ($pair in $pairs) {
+                    $id = [string]$pair.Device.ObjectId
+                    if ($id -and $seen.ContainsKey($id)) { continue }
+                    if ($id) { $seen[$id] = $true }
+                    $list.Add($pair.Device)
+                }
+                $devices = ConvertTo-ObjectArray $list
+            }
+            else {
+                $columnMap = Resolve-CsvColumnMap $headers
+                $devices = ConvertTo-ObjectArray (Get-DevicesForBulkRows -Rows $csvRows -ColumnMap $columnMap)
+            }
+            $days = [int]$script:numDays.Value
+            $activityParams = @{ Devices = $devices; Days = $days }
+            if ($script:chkUnknown.Checked) { $activityParams['IncludeUnknown'] = $true }
+            $split = Select-DevicesWithRecentActivity @activityParams
+            $value = $script:txtActivityValue.Text
+            $action = if ([string]::IsNullOrEmpty($value)) { 'Clear' } else { 'Set' }
+            if ($kind -eq 'User') {
+                $activeIds = @{}
+                foreach ($device in (ConvertTo-ObjectArray $split.Active)) {
+                    if ($device.ObjectId) { $activeIds[$device.ObjectId] = $true }
+                }
+                $kept = New-Object System.Collections.Generic.List[object]
+                foreach ($pair in $pairs) {
+                    if ($pair.Device.ObjectId -and $activeIds.ContainsKey([string]$pair.Device.ObjectId)) { $kept.Add($pair) }
+                }
+                $script:GuiActivityRows = ConvertTo-BulkExportRows -Pairs (ConvertTo-ObjectArray $kept) -Value $value -Action $action
+            }
+            else {
+                $script:GuiActivityRows = ConvertTo-BulkExportRows -Devices $split.Active -Value $value -Action $action
+            }
+            Set-GuiGridData $script:grdActivity $script:GuiActivityRows $exportColumns
+            $script:lblActivitySummary.Text = ("Active {0}  |  Stale {1}  |  No timestamp {2}" -f @($split.Active).Count, @($split.Stale).Count, @($split.Unknown).Count)
+            Clear-GuiBusy $script:lblActivitySummary.Text
+        }
+        catch {
+            Clear-GuiBusy 'Activity filter failed'
+            [void](Show-ToolDialog (Format-CaughtError $_) 'Activity filter failed' 'OK' 'Error')
+        }
+    }
+
+    $btnConnect.Add_Click({ [void](Invoke-GuiSignIn) })
+    $btnReconnect.Add_Click({ [void](Invoke-GuiSignIn -Reconnect) })
+    $btnSearch.Add_Click({ Invoke-GuiDeviceSearch })
+    $script:txtDeviceSearch.Add_KeyDown({
+            if ($_.KeyCode -eq 'Enter') { Invoke-GuiDeviceSearch; $_.SuppressKeyPress = $true }
+        })
+    $btnLoadAll.Add_Click({ Invoke-GuiLoadScopedDevices })
+    function Save-GuiDeviceSelection {
+        $idx = @(Get-GuiSelectedRowIndexes $script:grdDevices)
+        if ($idx.Count -gt 0) { $script:CachedDeviceIndexes = $idx }
+    }
+    $script:grdDevices.Add_SelectionChanged({ Save-GuiDeviceSelection })
+    $script:grdDevices.Add_CurrentCellChanged({ Save-GuiDeviceSelection })
+    $btnSet.Add_MouseDown({ Save-GuiDeviceSelection })
+    $btnClear.Add_MouseDown({ Save-GuiDeviceSelection })
+    $script:btnPrependName.Add_MouseDown({ Save-GuiDeviceSelection })
+    $btnSet.Add_Click({ Invoke-GuiUpdateSelected })
+    $btnClear.Add_Click({ Invoke-GuiUpdateSelected -Clear })
+    $script:btnPrependName.Add_Click({ Invoke-GuiPrependSelectedDevices })
+    $btnBrowseBulk.Add_Click({
+            $dialog = New-Object System.Windows.Forms.OpenFileDialog
+            $dialog.Filter = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*'
+            if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $script:txtBulkPath.Text = $dialog.FileName }
+        })
+    $btnPreviewBulk.Add_Click({ Invoke-GuiBulkPreview })
+    $btnApplyAll.Add_Click({ Invoke-GuiBulkApply -ApplyAll })
+    $btnSelectReady.Add_Click({ Invoke-GuiSelectReadyRows })
+    $btnApplyBulk.Add_Click({ Invoke-GuiBulkApply })
+    $btnPrependAll.Add_Click({ Invoke-GuiBulkPrependNames -ApplyAll })
+    $btnPrependSelected.Add_Click({ Invoke-GuiBulkPrependNames })
+    $btnExportPlan.Add_Click({
+            if (@($script:GuiPlan).Count -eq 0) { [void](Show-ToolDialog 'Preview a CSV first.' 'Export' 'OK' 'Information'); return }
+            Save-GuiExportRows -Rows $script:GuiPlan -DefaultName ('CAExemption-Preview_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+        })
+    $btnTemplate.Add_Click({
+            $dialog = New-Object System.Windows.Forms.SaveFileDialog
+            $dialog.Filter = 'CSV files (*.csv)|*.csv'
+            $dialog.FileName = 'CAExemption-Template.csv'
+            if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+            @(
+                [pscustomobject]@{ DeviceId = '00000000-0000-0000-0000-000000000000'; ObjectId = ''; DisplayName = ''; Value = $script:Settings.DefaultValue; Action = 'Set' }
+                [pscustomobject]@{ DeviceId = ''; ObjectId = ''; DisplayName = 'DEVICE-NAME-01'; Value = $script:Settings.DefaultValue; Action = 'Set' }
+            ) | Export-Csv -Path $dialog.FileName -NoTypeInformation -Encoding UTF8
+            [void](Show-ToolDialog "Template saved to`n$($dialog.FileName)" 'Template' 'OK' 'Information')
+        })
+    $btnUserCsv.Add_Click({
+            $dialog = New-Object System.Windows.Forms.OpenFileDialog
+            $dialog.Filter = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*'
+            if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+            try {
+                $rows = @(Import-DeviceCsv -Path $dialog.FileName)
+                $headers = @($rows[0].PSObject.Properties | ForEach-Object { $_.Name })
+                $map = Resolve-UserCsvColumnMap $headers
+                $tokens = @()
+                foreach ($row in $rows) {
+                    $token = Get-UserRowSearchToken $row $map
+                    if ($token) { $tokens += $token }
+                }
+                $script:txtUsers.Text = ($tokens -join [Environment]::NewLine)
+            }
+            catch {
+                [void](Show-ToolDialog (Format-CaughtError $_) 'User CSV' 'OK' 'Error')
+            }
+        })
+    $btnFindUsers.Add_Click({ Invoke-GuiUserFind })
+    $btnExportUsers.Add_Click({ Save-GuiExportRows -Rows $script:GuiUserRows -DefaultName ('CAExemption-UserDevices_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss')) })
+    $btnApplyUsers.Add_Click({ Save-GuiExportRows -Rows $script:GuiUserRows -DefaultName ('CAExemption-UserDevices_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss')) -ApplyAfter })
+    $btnBrowseAct.Add_Click({
+            $dialog = New-Object System.Windows.Forms.OpenFileDialog
+            $dialog.Filter = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*'
+            if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $script:txtActivityPath.Text = $dialog.FileName }
+        })
+    $btnFindAct.Add_Click({ Invoke-GuiActivityFind })
+    $btnExportAct.Add_Click({ Save-GuiExportRows -Rows $script:GuiActivityRows -DefaultName ('CAExemption-RecentActivity_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss')) })
+    $btnApplyAct.Add_Click({ Save-GuiExportRows -Rows $script:GuiActivityRows -DefaultName ('CAExemption-RecentActivity_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss')) -ApplyAfter })
+    $btnSaveSettings.Add_Click({
+            try {
+                $value = $script:txtDefaultValue.Text.Trim()
+                if (-not (Test-ValidValue $value -Quiet)) {
+                    [void](Show-ToolDialog (Get-ValueValidationError $value) 'Settings' 'OK' 'Warning')
+                    return
+                }
+                $script:Settings.DefaultValue = $value
+                $prefix = $script:txtNamePrefix.Text.Trim()
+                if (Get-NamePrefixValidationError $prefix) {
+                    [void](Show-ToolDialog (Get-NamePrefixValidationError $prefix) 'Settings' 'OK' 'Warning')
+                    return
+                }
+                $script:Settings.NamePrefix = $prefix
+                $script:Settings.DryRun = [bool]$script:chkDryRun.Checked
+                $script:Settings.LogPath = $script:txtLogPath.Text.Trim()
+                switch ($script:cmbScope.SelectedIndex) {
+                    0 { Set-DeviceScope 'All' }
+                    1 { Set-DeviceScope 'Windows' }
+                    2 { Set-DeviceScope 'WindowsRegistered' }
+                }
+                Export-ToolSettings
+                Update-GuiBanner
+                [void](Show-ToolDialog 'Settings saved.' 'Settings' 'OK' 'Information')
+            }
+            catch {
+                [void](Show-ToolDialog (Format-CaughtError $_) 'Settings' 'OK' 'Error')
+            }
+        })
+
+    Update-GuiBanner
+    $script:lblStatus.Text = 'Click Sign in. A browser window opens for your Microsoft account. Tenant ID is not required.'
+    try {
+        [System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException)
+        $unhandled = [System.Threading.ThreadExceptionEventHandler] {
+            param($sender, $eventArgs)
+            $message = 'An unexpected error occurred.'
+            if ($eventArgs -and $eventArgs.Exception) { $message = [string]$eventArgs.Exception.Message }
+            [void][System.Windows.Forms.MessageBox]::Show($message, 'Entra device exemption', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        }
+        [System.Windows.Forms.Application]::add_ThreadException($unhandled)
+    }
+    catch { }
+    [void]$form.ShowDialog()
+}
+
+function Start-GuiInStaIfNeeded {
+    $state = [System.Threading.Thread]::CurrentThread.GetApartmentState()
+    if ($state -eq 'STA') { return $true }
+    $exe = (Get-Process -Id $PID).Path
+    $argList = New-Object System.Collections.Generic.List[string]
+    $argList.Add('-STA')
+    $argList.Add('-NoProfile')
+    $argList.Add('-File')
+    $argList.Add($PSCommandPath)
+    if ($TenantId) { $argList.Add('-TenantId'); $argList.Add($TenantId) }
+    if ($DeviceCode) { $argList.Add('-DeviceCode') }
+    if ($SettingsPath) { $argList.Add('-SettingsPath'); $argList.Add($SettingsPath) }
+    Start-Process -FilePath $exe -ArgumentList $argList.ToArray() | Out-Null
+    return $false
+}
+
+#endregion
+
+function Start-CAExemptionTool {
+    $savedEap = $ErrorActionPreference
+    try {
+        Import-ToolSettings
+        Sync-DeviceScopeSettings
+        if (-not (Initialize-GraphModule)) {
+            Write-Host 'Cannot continue without the Microsoft.Graph.Authentication module.' -ForegroundColor Red
+            return
+        }
+
+        $useConsole = [bool]$Console
+        if (-not $useConsole -and -not (Test-ToolIsWindows)) {
+            Write-Host 'The GUI requires Windows. Starting the console menu.' -ForegroundColor Yellow
+            $useConsole = $true
+        }
+
+        if ($useConsole) {
+            $ErrorActionPreference = 'Stop'
+            Show-MainMenu
+            if (Get-MgContext) {
+                if (Read-YesNo 'Disconnect from Microsoft Graph?' $true) {
+                    try { Disconnect-MgGraph | Out-Null } catch { }
+                    Write-Host 'Disconnected.'
+                }
+            }
+            return
+        }
+
+        if (-not (Start-GuiInStaIfNeeded)) { return }
+        $ErrorActionPreference = 'Continue'
+        Show-CAExemptionGui
+    }
+    finally {
+        $ErrorActionPreference = $savedEap
+    }
+}
+
+#endregion
+
+if (-not $SkipMain) {
+    Start-CAExemptionTool
+}
