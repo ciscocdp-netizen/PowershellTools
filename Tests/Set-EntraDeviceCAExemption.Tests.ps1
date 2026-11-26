@@ -589,6 +589,22 @@ Assert-True ($signedInSource -match "New-GuiButton 'Apply all Ready'") 'Bulk tab
 Assert-True ($signedInSource -match 'Prepend all names') 'Bulk tab can prepend names without a selection'
 Assert-True ($signedInSource -match 'Invoke-GuiPrependSelectedDevices') 'Devices tab can prepend names one-by-one or on a selection'
 Assert-True ($signedInSource -match 'ConvertTo-DeviceObjectList') 'GUI prepend treats a single selected device as one device'
+Assert-True ($signedInSource -match 'Get-SingleOrSelectedDevices') 'One search result is used without a grid selection'
+Assert-True ($signedInSource -match 'Show-ToolInputBox') 'Prepend can prompt for a device name interactively'
+Assert-True ($signedInSource -match 'Rename this device display name') 'Single-device prepend confirms current and new names'
+Assert-True ($signedInSource -match 'BindingContext') 'Grid current row is read after the button takes focus'
+$onlyLoaded = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -DisplayName 'iPhone 13 Pro' -Os 'iOS' -ExtensionAttribute1 'CA201-Excluded')
+$fromLoaded = Get-SingleOrSelectedDevices -Selected $null -Loaded $onlyLoaded
+Assert-Equal -Expected 1 -Actual $fromLoaded.Count -Name 'Single loaded device is used when nothing is selected'
+Assert-Equal -Expected 'iPhone 13 Pro' -Actual $fromLoaded[0].DisplayName -Name 'Single loaded device keeps DisplayName'
+$twoLoaded = @(
+    $onlyLoaded,
+    (ConvertTo-DeviceRecord (New-GraphDeviceHashtable -DisplayName 'iPhone 14' -Os 'iOS' -DeviceId '11111111-1111-1111-1111-111111111111' -ObjectId '22222222-2222-2222-2222-222222222222'))
+)
+$fromTwo = ConvertTo-DeviceObjectList (Get-SingleOrSelectedDevices -Selected $null -Loaded $twoLoaded)
+Assert-Equal -Expected 0 -Actual $fromTwo.Count -Name 'Multiple loaded devices are not auto-chosen'
+$fromExplicit = ConvertTo-DeviceObjectList (Get-SingleOrSelectedDevices -Selected $onlyLoaded -Loaded $twoLoaded)
+Assert-Equal -Expected 1 -Actual $fromExplicit.Count -Name 'Explicit selection is kept when several devices are loaded'
 Assert-True ($signedInSource -match 'param\(\[switch\]\$ApplyAll\)') 'Apply all uses a switch named ApplyAll'
 Assert-True ($signedInSource -notmatch '\$allReady = @') 'Ready rows are not stored in \$AllReady (switch name clash)'
 Assert-True ($signedInSource -match "New-GuiButton 'Apply selected'") 'Bulk tab applies the selected rows'

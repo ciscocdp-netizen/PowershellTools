@@ -108,7 +108,7 @@ param(
     [string]$SettingsPath
 )
 
-$script:ToolVersion    = '2.0.9'
+$script:ToolVersion    = '2.0.10'
 $script:Root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $script:SettingsFile = if ($SettingsPath) { $SettingsPath } else { Join-Path $script:Root 'CAExemption.settings.json' }
 $script:RequiredScope  = 'Device.ReadWrite.All'
@@ -706,13 +706,13 @@ function ConvertTo-DeviceObjectList {
         else {
             $list.Add($Value)
         }
-        return $list
+        return ,$list
     }
     foreach ($item in (ConvertTo-ObjectArray $Value)) {
         if ($null -eq $item -or $item -is [string] -or $item -is [ValueType]) { continue }
         $list.Add($item)
     }
-    return $list
+    return ,$list
 }
 
 function Get-DeviceRecordDisplayName {
@@ -3833,6 +3833,52 @@ function Show-ToolDialog {
     )
 }
 
+function Show-ToolInputBox {
+    param(
+        [string]$Prompt,
+        [string]$Title = 'Entra device exemption',
+        [string]$DefaultValue = ''
+    )
+    $inputForm = New-Object System.Windows.Forms.Form
+    $inputForm.Text = $Title
+    $inputForm.Size = New-Object System.Drawing.Size(520, 180)
+    $inputForm.StartPosition = 'CenterParent'
+    $inputForm.FormBorderStyle = 'FixedDialog'
+    $inputForm.MaximizeBox = $false
+    $inputForm.MinimizeBox = $false
+    $inputForm.ShowInTaskbar = $false
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = $Prompt
+    $lbl.Location = New-Object System.Drawing.Point(16, 16)
+    $lbl.Size = New-Object System.Drawing.Size(470, 36)
+    $inputForm.Controls.Add($lbl)
+    $txt = New-Object System.Windows.Forms.TextBox
+    $txt.Text = $DefaultValue
+    $txt.Location = New-Object System.Drawing.Point(16, 58)
+    $txt.Size = New-Object System.Drawing.Size(470, 26)
+    $inputForm.Controls.Add($txt)
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = 'OK'
+    $ok.Location = New-Object System.Drawing.Point(296, 100)
+    $ok.Size = New-Object System.Drawing.Size(90, 28)
+    $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $inputForm.Controls.Add($ok)
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = 'Cancel'
+    $cancel.Location = New-Object System.Drawing.Point(396, 100)
+    $cancel.Size = New-Object System.Drawing.Size(90, 28)
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $inputForm.Controls.Add($cancel)
+    $inputForm.AcceptButton = $ok
+    $inputForm.CancelButton = $cancel
+    try { $txt.SelectAll() } catch { }
+    $result = $inputForm.ShowDialog()
+    if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+        return ([string]$txt.Text).Trim()
+    }
+    return $null
+}
+
 function ConvertTo-GuiDataTable {
     param($Rows, [string[]]$Columns)
     Add-Type -AssemblyName System.Data -ErrorAction SilentlyContinue
@@ -3919,6 +3965,42 @@ function Get-GuiSelectedRowIndexes {
             $list.Add($idx)
         }
     }
+    if ($list.Count -eq 0) {
+        $currentRow = $null
+        try { $currentRow = $Grid.CurrentRow } catch { }
+        if ($null -ne $currentRow) {
+            $idx = -1
+            try { $idx = [int]$currentRow.Index } catch { $idx = -1 }
+            if ($idx -ge 0 -and -not $seen.ContainsKey($idx)) {
+                $seen[$idx] = $true
+                $list.Add($idx)
+            }
+        }
+    }
+    if ($list.Count -eq 0 -and $null -ne $Grid.DataSource) {
+        try {
+            $manager = $Grid.BindingContext[$Grid.DataSource]
+            if ($null -ne $manager -and $manager.Position -ge 0 -and -not $seen.ContainsKey([int]$manager.Position)) {
+                $seen[[int]$manager.Position] = $true
+                $list.Add([int]$manager.Position)
+            }
+        }
+        catch { }
+    }
+    if ($list.Count -eq 0) {
+        $only = -1
+        $n = 0
+        foreach ($row in (Get-GuiEnumerableItems $Grid.Rows)) {
+            $isNew = $false
+            try { $isNew = [bool]$row.IsNewRow } catch { }
+            if ($isNew) { continue }
+            $n++
+            try { $only = [int]$row.Index } catch { $only = -1 }
+        }
+        if ($n -eq 1 -and $only -ge 0) {
+            $list.Add($only)
+        }
+    }
     return ,$list.ToArray()
 }
 
@@ -3977,6 +4059,18 @@ function Get-GuiSelectedValues {
         if (-not [string]::IsNullOrWhiteSpace($text)) { $list.Add($text) }
     }
     return ,$list.ToArray()
+}
+
+function Get-SingleOrSelectedDevices {
+    param($Selected, $Loaded)
+    $list = New-Object System.Collections.Generic.List[object]
+    foreach ($device in (ConvertTo-DeviceObjectList $Selected)) {
+        if ($null -ne $device) { $list.Add($device) }
+    }
+    if ($list.Count -gt 0) { return ,$list }
+    $loadedList = ConvertTo-DeviceObjectList $Loaded
+    if ($loadedList.Count -eq 1) { $list.Add($loadedList[0]) }
+    return ,$list
 }
 
 function Select-ItemsByGridIndex {
@@ -4076,6 +4170,7 @@ function Show-CAExemptionGui {
     $script:GuiPlan = @()
     $script:GuiUserRows = @()
     $script:GuiActivityRows = @()
+    $script:CachedDeviceIndexes = @()
     $deviceColumns = @('DisplayName', 'OperatingSystem', 'JoinType', 'DeviceId', 'ObjectId', 'LastSignInDisplay', 'ExtensionAttribute1', 'Eligible')
     $planColumns = @('Row', 'Identifier', 'DisplayName', 'Current', 'New', 'Status', 'Note')
     $exportColumns = @('DisplayName', 'DeviceId', 'ObjectId', 'OperatingSystem', 'JoinType', 'LastSignIn', 'UserPrincipalName', 'Value', 'Action', 'Eligible')
@@ -4595,6 +4690,9 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
     function Get-GuiSelectedDevices {
         $list = New-Object System.Collections.Generic.List[object]
         $indexes = @(Get-GuiSelectedRowIndexes $script:grdDevices)
+        if ($indexes.Count -eq 0 -and @($script:CachedDeviceIndexes).Count -gt 0) {
+            $indexes = @($script:CachedDeviceIndexes)
+        }
         foreach ($device in (Select-ItemsByGridIndex -Items $script:GuiDevices -Indexes $indexes)) {
             if ($null -ne $device) { $list.Add($device) }
         }
@@ -4618,7 +4716,7 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
             }
             $i++
         }
-        return $list
+        return ,(Get-SingleOrSelectedDevices -Selected $list -Loaded $script:GuiDevices)
     }
 
     function Invoke-GuiUpdateSelected {
@@ -4713,7 +4811,12 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
             [void](Show-ToolDialog $msg 'Prepend names' 'OK' 'Information')
             return
         }
-        if ((Show-ToolDialog ("Prepend '{0}' to {1} device name(s) now?" -f $prefix, $planItems.Count) 'Confirm name prefix' 'YesNo' 'Question') -ne [System.Windows.Forms.DialogResult]::Yes) {
+        $confirm = ("Prepend '{0}' to {1} device name(s) now?" -f $prefix, $planItems.Count)
+        if ($planItems.Count -eq 1) {
+            $one = $planItems[0]
+            $confirm = ("Rename this device display name?`n`nCurrent:  {0}`nNew:      {1}`n`nContinue?" -f $one.CurrentName, $one.NewName)
+        }
+        if ((Show-ToolDialog $confirm 'Confirm name prefix' 'YesNo' 'Question') -ne [System.Windows.Forms.DialogResult]::Yes) {
             return
         }
         if (-not (Test-GuiGraph)) { return }
@@ -4756,8 +4859,46 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
     function Invoke-GuiPrependSelectedDevices {
         $selected = Get-GuiSelectedDevices
         if ($selected.Count -eq 0) {
-            [void](Show-ToolDialog 'Select one or more devices in the grid first. Ctrl+click or Shift+click to choose several.' 'Prepend names' 'OK' 'Information')
-            return
+            $defaultSearch = ''
+            if ($script:txtDeviceSearch) { $defaultSearch = [string]$script:txtDeviceSearch.Text }
+            $search = Show-ToolInputBox -Prompt 'Enter a device name, Device ID or Object ID to prepend CA201- (or the prefix in Settings).' -Title 'Prepend device name' -DefaultValue $defaultSearch
+            if ([string]::IsNullOrWhiteSpace($search)) { return }
+            if (-not (Test-GuiGraph)) { return }
+            Set-GuiBusy ("Finding '{0}'..." -f $search)
+            try {
+                $script:txtDeviceSearch.Text = $search
+                $found = ConvertTo-ObjectArray (Find-Devices $search)
+                $script:GuiDevices = $found
+                Set-GuiGridData $script:grdDevices $script:GuiDevices $deviceColumns
+                $script:lblDeviceCount.Text = ("{0} device(s)" -f @($script:GuiDevices).Count)
+                if ($found.Count -eq 0) {
+                    Clear-GuiBusy 'No devices found'
+                    [void](Show-ToolDialog ("No devices matched '{0}'." -f $search) 'Prepend names' 'OK' 'Information')
+                    return
+                }
+                $exact = New-Object System.Collections.Generic.List[object]
+                foreach ($device in $found) {
+                    if ([string]$device.DisplayName -eq $search) { $exact.Add($device) }
+                }
+                if ($exact.Count -eq 1) {
+                    $selected = Get-SingleOrSelectedDevices -Selected $exact -Loaded $found
+                }
+                else {
+                    $selected = Get-SingleOrSelectedDevices -Selected $null -Loaded $found
+                }
+                if ($selected.Count -eq 0) {
+                    $selected = ConvertTo-DeviceObjectList $found[0]
+                    Clear-GuiBusy ("Found {0} device(s). Confirm the rename for the first match, or pick a row and click Prepend again." -f $found.Count)
+                }
+                else {
+                    Clear-GuiBusy ("Found {0} device(s)." -f $found.Count)
+                }
+            }
+            catch {
+                Clear-GuiBusy 'Search failed'
+                [void](Show-ToolDialog (Format-CaughtError $_) 'Search failed' 'OK' 'Error')
+                return
+            }
         }
         Invoke-GuiApplyNamePrefix -Devices $selected -Source 'GUI-NamePrefix'
     }
@@ -5003,6 +5144,15 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
             if ($_.KeyCode -eq 'Enter') { Invoke-GuiDeviceSearch; $_.SuppressKeyPress = $true }
         })
     $btnLoadAll.Add_Click({ Invoke-GuiLoadScopedDevices })
+    function Save-GuiDeviceSelection {
+        $idx = @(Get-GuiSelectedRowIndexes $script:grdDevices)
+        if ($idx.Count -gt 0) { $script:CachedDeviceIndexes = $idx }
+    }
+    $script:grdDevices.Add_SelectionChanged({ Save-GuiDeviceSelection })
+    $script:grdDevices.Add_CurrentCellChanged({ Save-GuiDeviceSelection })
+    $btnSet.Add_MouseDown({ Save-GuiDeviceSelection })
+    $btnClear.Add_MouseDown({ Save-GuiDeviceSelection })
+    $script:btnPrependName.Add_MouseDown({ Save-GuiDeviceSelection })
     $btnSet.Add_Click({ Invoke-GuiUpdateSelected })
     $btnClear.Add_Click({ Invoke-GuiUpdateSelected -Clear })
     $script:btnPrependName.Add_Click({ Invoke-GuiPrependSelectedDevices })
