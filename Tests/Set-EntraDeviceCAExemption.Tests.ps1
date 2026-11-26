@@ -194,6 +194,18 @@ $quoted = New-ExtensionAttributePatchJson 'CA"Exempt'
 Assert-True ($quoted -eq '{"extensionAttributes":{"extensionAttribute1":"CA\"Exempt"}}') 'PATCH JSON escapes quotes'
 $slash = New-ExtensionAttributePatchJson "line1`nline2"
 Assert-True ($slash -match '\\n') 'PATCH JSON escapes newlines'
+Assert-Equal -Expected '{"displayName":"CA201-iPhone 16 Pro"}' -Actual (New-DisplayNamePatchJson 'CA201-iPhone 16 Pro') -Name 'DisplayName PATCH JSON'
+Assert-Equal -Expected 'CA201-' -Actual (Get-NormalizedNamePrefix '') -Name 'Default name prefix is CA201-'
+Assert-Equal -Expected 'CA201-iPhone 16 Pro' -Actual (Get-PrefixedDeviceName 'iPhone 16 Pro' 'CA201-') -Name 'Prepends CA201- to a device name'
+Assert-Equal -Expected 'CA201-iPhone 16 Pro' -Actual (Get-PrefixedDeviceName 'CA201-iPhone 16 Pro' 'CA201-') -Name 'Does not double-prefix CA201-'
+Assert-True (Test-DeviceNameHasPrefix 'ca201-iPad' 'CA201-') 'Prefix match is case-insensitive'
+$prefixDevice = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -DisplayName 'iPhone 16 Pro' -Os 'iOS')
+$prefixPlan = New-DeviceNamePrefixPlanItem -Device $prefixDevice -Prefix 'CA201-'
+Assert-Equal -Expected 'Ready' -Actual $prefixPlan.Status -Name 'Unprefixed device is Ready for name prefix'
+Assert-Equal -Expected 'CA201-iPhone 16 Pro' -Actual $prefixPlan.NewName -Name 'Plan NewName includes CA201-'
+$alreadyPrefixed = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -DisplayName 'CA201-iPhone 14' -Os 'iOS')
+$alreadyPlan = New-DeviceNamePrefixPlanItem -Device $alreadyPrefixed -Prefix 'CA201-'
+Assert-Equal -Expected 'NoChange' -Actual $alreadyPlan.Status -Name 'Already prefixed device is NoChange'
 
 # --- Error parsing / scopes / retry ---
 $err429 = [System.Management.Automation.ErrorRecord]::new(
@@ -272,18 +284,22 @@ try {
     $script:SettingsFile = $settingsPath
     $script:Settings.DefaultValue = 'PAW'
     $script:Settings.DryRun = $true
+    $script:Settings.NamePrefix = 'CA201-'
     Set-DeviceScope 'Windows'
     Export-ToolSettings -Path $settingsPath
     $script:Settings.DefaultValue = 'CAExempt'
     $script:Settings.DryRun = $false
+    $script:Settings.NamePrefix = 'OTHER-'
     Set-DeviceScope 'WindowsRegistered'
     Import-ToolSettings -Path $settingsPath
     Assert-Equal -Expected 'PAW' -Actual $script:Settings.DefaultValue -Name 'Settings persist DefaultValue'
     Assert-True $script:Settings.DryRun 'Settings persist DryRun'
     Assert-Equal -Expected 'Windows' -Actual $script:Settings.DeviceScope -Name 'Settings persist DeviceScope'
     Assert-True (-not $script:Settings.RegisteredOnly) 'Settings persist RegisteredOnly from DeviceScope'
+    Assert-Equal -Expected 'CA201-' -Actual $script:Settings.NamePrefix -Name 'Settings persist NamePrefix'
     $script:Settings.DefaultValue = 'CAExempt'
     $script:Settings.DryRun = $false
+    $script:Settings.NamePrefix = 'CA201-'
     Set-DeviceScope 'WindowsRegistered'
 }
 finally {
@@ -547,6 +563,8 @@ Assert-Equal -Expected 2 -Actual $byIndexSkip.Count -Name 'Bulk apply by grid in
 $signedInSource = (Get-Content -LiteralPath $tool -Raw)
 Assert-True ($signedInSource -match 'New-GuiGrid -MultiSelect') 'Bulk and device grids allow multi-select'
 Assert-True ($signedInSource -match "New-GuiButton 'Apply all Ready'") 'Bulk tab can apply every Ready row without a selection'
+Assert-True ($signedInSource -match 'Prepend all names') 'Bulk tab can prepend names without a selection'
+Assert-True ($signedInSource -match 'Invoke-GuiPrependSelectedDevices') 'Devices tab can prepend names one-by-one or on a selection'
 Assert-True ($signedInSource -match 'param\(\[switch\]\$ApplyAll\)') 'Apply all uses a switch named ApplyAll'
 Assert-True ($signedInSource -notmatch '\$allReady = @') 'Ready rows are not stored in \$AllReady (switch name clash)'
 Assert-True ($signedInSource -match "New-GuiButton 'Apply selected'") 'Bulk tab applies the selected rows'

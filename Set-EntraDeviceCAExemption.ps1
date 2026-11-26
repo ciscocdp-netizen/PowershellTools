@@ -10,6 +10,7 @@
     A WinForms GUI covers:
       - Search and list Entra devices of any operating system
       - Update extensionAttribute1 on a selected device
+      - Prepend a name prefix (default CA201-) on selected devices or in bulk
       - Bulk update from CSV, with a preview before any change
       - Find devices by user and export a bulk-update CSV
       - Filter a CSV to devices with recent activity and export
@@ -107,7 +108,7 @@ param(
     [string]$SettingsPath
 )
 
-$script:ToolVersion    = '2.0.7'
+$script:ToolVersion    = '2.0.8'
 $script:Root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $script:SettingsFile = if ($SettingsPath) { $SettingsPath } else { Join-Path $script:Root 'CAExemption.settings.json' }
 $script:RequiredScope  = 'Device.ReadWrite.All'
@@ -122,6 +123,8 @@ $script:SelectFields     = 'id,deviceId,displayName,trustType,operatingSystem,op
 $script:UserSelectFields = 'id,displayName,userPrincipalName,mail,accountEnabled'
 $script:GuidPattern   = '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
 $script:MaxValueLength = 1024
+$script:MaxDisplayNameLength = 256
+$script:DefaultNamePrefix = 'CA201-'
 $script:CsvColumnAliases = @{
     DeviceId    = @('DeviceId', 'Device ID', 'Device_Id', 'AzureDeviceId', 'azureADDeviceId', 'AzureAdDeviceId')
     ObjectId    = @('ObjectId', 'Object ID', 'Object_Id', 'ObjectID', 'EntraObjectId', 'id')
@@ -142,6 +145,7 @@ $script:Settings = @{
     LogPath         = Join-Path $script:Root ('CAExemption-Log_{0}.csv' -f (Get-Date -Format 'yyyyMMdd'))
     RegisteredOnly  = $false
     DeviceScope     = 'All'
+    NamePrefix      = 'CA201-'
 }
 $script:GuiMode = $false
 $script:LastConnectError = $null
@@ -488,7 +492,7 @@ function Import-ToolSettings {
         if ([string]::IsNullOrWhiteSpace($raw)) { return }
         $data = $raw | ConvertFrom-Json
         $hadScope = $false
-        foreach ($name in @('DefaultValue', 'DryRun', 'LogPath', 'RegisteredOnly', 'DeviceScope')) {
+        foreach ($name in @('DefaultValue', 'DryRun', 'LogPath', 'RegisteredOnly', 'DeviceScope', 'NamePrefix')) {
             $prop = $data.PSObject.Properties[$name]
             if ($null -eq $prop) { continue }
             if ($name -eq 'DefaultValue') {
@@ -509,6 +513,12 @@ function Import-ToolSettings {
             }
             elseif ($name -eq 'LogPath' -and -not [string]::IsNullOrWhiteSpace([string]$prop.Value)) {
                 $script:Settings.LogPath = [string]$prop.Value
+            }
+            elseif ($name -eq 'NamePrefix') {
+                $candidate = [string]$prop.Value
+                if (-not (Get-NamePrefixValidationError $candidate)) {
+                    $script:Settings.NamePrefix = $candidate.Trim()
+                }
             }
         }
         if (-not $hadScope) {
@@ -532,6 +542,7 @@ function Export-ToolSettings {
             LogPath        = $script:Settings.LogPath
             RegisteredOnly = [bool]$script:Settings.RegisteredOnly
             DeviceScope    = [string]$script:Settings.DeviceScope
+            NamePrefix     = [string]$script:Settings.NamePrefix
         }
         $json = $payload | ConvertTo-Json -Depth 4
         $folder = Split-Path -Parent $Path
@@ -637,6 +648,79 @@ function New-ExtensionAttributePatchJson {
     param([AllowNull()]$Value)
     $literal = if ([string]::IsNullOrEmpty($Value)) { 'null' } else { ConvertTo-JsonStringLiteral ([string]$Value) }
     return ('{{"extensionAttributes":{{"extensionAttribute1":{0}}}}}' -f $literal)
+}
+
+function New-DisplayNamePatchJson {
+    param([string]$DisplayName)
+    return ('{{"displayName":{0}}}' -f (ConvertTo-JsonStringLiteral $DisplayName))
+}
+
+function Get-NormalizedNamePrefix {
+    param([AllowNull()][string]$Prefix)
+    $text = $Prefix
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        $text = [string]$script:Settings.NamePrefix
+    }
+    if ([string]::IsNullOrWhiteSpace($text)) { $text = $script:DefaultNamePrefix }
+    return $text.Trim()
+}
+
+function Get-NamePrefixValidationError {
+    param([AllowNull()][string]$Prefix)
+    if ([string]::IsNullOrWhiteSpace($Prefix)) { return 'Name prefix cannot be empty.' }
+    if ($Prefix.Trim().Length -gt 64) { return 'Name prefix cannot be longer than 64 characters.' }
+    return $null
+}
+
+function Test-DeviceNameHasPrefix {
+    param([AllowNull()][string]$DisplayName, [AllowNull()][string]$Prefix)
+    $pre = Get-NormalizedNamePrefix $Prefix
+    if ([string]::IsNullOrWhiteSpace($DisplayName)) { return $false }
+    return ([string]$DisplayName).StartsWith($pre, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-PrefixedDeviceName {
+    param([AllowNull()][string]$DisplayName, [AllowNull()][string]$Prefix)
+    $name = if ($null -eq $DisplayName) { '' } else { [string]$DisplayName }
+    $pre = Get-NormalizedNamePrefix $Prefix
+    if (Test-DeviceNameHasPrefix $name $pre) { return $name }
+    return ($pre + $name)
+}
+
+function New-DeviceNamePrefixPlanItem {
+    param($Device, [AllowNull()][string]$Prefix)
+    $pre = Get-NormalizedNamePrefix $Prefix
+    $current = ''
+    if ($Device) { $current = [string]$Device.DisplayName }
+    $newName = Get-PrefixedDeviceName $current $pre
+    $status = 'Ready'
+    $note = ''
+    if ($null -eq $Device) {
+        $status = 'NotFound'
+        $note = 'Device was not found in Entra ID'
+        $newName = ''
+    }
+    elseif ([string]::IsNullOrWhiteSpace($current)) {
+        $status = 'Invalid'
+        $note = 'Device has no display name'
+        $newName = ''
+    }
+    elseif (Test-DeviceNameHasPrefix $current $pre) {
+        $status = 'NoChange'
+        $note = 'Name already has this prefix'
+    }
+    elseif ($newName.Length -gt $script:MaxDisplayNameLength) {
+        $status = 'Invalid'
+        $note = "Prefixed name would exceed $($script:MaxDisplayNameLength) characters"
+        $newName = ''
+    }
+    return (New-ToolObject @(
+            'Device', $Device
+            'CurrentName', $current
+            'NewName', $newName
+            'Status', $status
+            'Note', $note
+        ))
 }
 
 function Get-GraphExceptionStatusCode {
@@ -1832,7 +1916,14 @@ function New-DeviceAuditEntry {
     [void](Add-ToolProperty $entry 'DisplayName' $(if ($Device) { $Device.DisplayName } else { '' }))
     [void](Add-ToolProperty $entry 'DeviceId' $(if ($Device) { $Device.DeviceId } else { '' }))
     [void](Add-ToolProperty $entry 'ObjectId' $(if ($Device) { $Device.ObjectId } else { '' }))
-    [void](Add-ToolProperty $entry 'PreviousValue' $(if ($Device) { $Device.ExtensionAttribute1 } else { '' }))
+    $previous = $null
+    if ($Action -eq 'PrependName') {
+        $previous = if ($Device) { $Device.DisplayName } else { '' }
+    }
+    else {
+        $previous = if ($Device) { $Device.ExtensionAttribute1 } else { '' }
+    }
+    [void](Add-ToolProperty $entry 'PreviousValue' $previous)
     [void](Add-ToolProperty $entry 'NewValue' $NewValue)
     [void](Add-ToolProperty $entry 'ChangedBy' $ChangedBy)
     [void](Add-ToolProperty $entry 'Message' $Message)
@@ -1908,6 +1999,76 @@ function Invoke-DeviceExtensionAttributeUpdates {
             }
         }
         $results.Add((New-DeviceAuditEntry -Device $item.Device -NewValue $item.NewValue -Status $status -Action $action -Source $Source -Message $message -ChangedBy $changedBy))
+    }
+
+    Write-AuditLogs (ConvertTo-ObjectArray $results)
+    return (ConvertTo-ObjectArray $results)
+}
+
+function Invoke-DeviceDisplayNamePrefixUpdates {
+    param($PlanItems, [string]$Source)
+    $items = New-Object System.Collections.Generic.List[object]
+    foreach ($item in (ConvertTo-ObjectArray $PlanItems)) {
+        if ([string]$item.Status -ne 'Ready') { continue }
+        if (-not $item.Device -or [string]::IsNullOrWhiteSpace($item.NewName)) { continue }
+        $items.Add($item)
+    }
+    $results = New-Object System.Collections.Generic.List[object]
+    if ($items.Count -eq 0) { return (ConvertTo-ObjectArray $results) }
+
+    $changedBy = ''
+    try {
+        $context = Get-MgContext
+        if ($context) { $changedBy = [string]$context.Account }
+    }
+    catch { }
+
+    if ($script:Settings.DryRun) {
+        foreach ($item in $items) {
+            $results.Add((New-DeviceAuditEntry -Device $item.Device -NewValue $item.NewName -Status 'DryRun' -Action 'PrependName' -Source $Source -Message 'No change written (dry-run mode)' -ChangedBy $changedBy))
+        }
+        Write-AuditLogs (ConvertTo-ObjectArray $results)
+        return (ConvertTo-ObjectArray $results)
+    }
+
+    $requests = New-Object System.Collections.Generic.List[object]
+    $meta = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+    $n = 0
+    foreach ($item in $items) {
+        $n++
+        $id = [string]$n
+        $url = '/devices/{0}' -f $item.Device.ObjectId
+        $bodyJson = New-DisplayNamePatchJson $item.NewName
+        $requests.Add((New-GraphBatchRequest -Id $id -Method PATCH -Url $url -BodyJson $bodyJson))
+        $meta.Add($id, $item)
+    }
+
+    Write-Host ("  Prepending device names in Graph batches of {0}..." -f $script:GraphBatchSize)
+    $responses = Invoke-GraphBatch -Requests $requests -Activity 'Device name prefix'
+    $byId = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+    foreach ($resp in $responses) {
+        $id = [string]$resp.Id
+        if ($id -and -not $byId.ContainsKey($id)) { $byId.Add($id, $resp) }
+    }
+
+    foreach ($kv in $meta.GetEnumerator()) {
+        $item = $kv.Value
+        $status = 'Failed'
+        $message = 'No batch response'
+        if ($byId.ContainsKey($kv.Key)) {
+            $resp = $byId[$kv.Key]
+            if ($resp.Status -ge 200 -and $resp.Status -lt 300) {
+                $status = 'Success'
+                $message = ''
+                if ($item.Device.IsManagementRestricted) {
+                    $message = 'Device is in a restricted management administrative unit; the update may be denied.'
+                }
+            }
+            else {
+                $message = Get-GraphBatchErrorMessage $resp
+            }
+        }
+        $results.Add((New-DeviceAuditEntry -Device $item.Device -NewValue $item.NewName -Status $status -Action 'PrependName' -Source $Source -Message $message -ChangedBy $changedBy))
     }
 
     Write-AuditLogs (ConvertTo-ObjectArray $results)
@@ -3959,6 +4120,9 @@ function Show-CAExemptionGui {
     $btnClear = New-GuiButton 'Clear selected' 140 28 $red
     $btnClear.Location = New-Object System.Drawing.Point(420, 28)
     $devBottom.Controls.Add($btnClear)
+    $script:btnPrependName = New-GuiButton 'Prepend CA201-' 150 28 $blue
+    $script:btnPrependName.Location = New-Object System.Drawing.Point(570, 28)
+    $devBottom.Controls.Add($script:btnPrependName)
     $script:grdDevices = New-GuiGrid -MultiSelect
     $tabDevices.Controls.Add($script:grdDevices)
     $tabDevices.Controls.Add($devBottom)
@@ -3995,22 +4159,28 @@ function Show-CAExemptionGui {
     $bulkTop.Controls.Add($script:txtBulkFallback)
     $bulkBottom = New-Object System.Windows.Forms.Panel
     $bulkBottom.Dock = 'Bottom'
-    $bulkBottom.Height = 50
+    $bulkBottom.Height = 88
     $btnApplyAll = New-GuiButton 'Apply all Ready' 150 28 $green
-    $btnApplyAll.Location = New-Object System.Drawing.Point(12, 10)
+    $btnApplyAll.Location = New-Object System.Drawing.Point(12, 8)
     $bulkBottom.Controls.Add($btnApplyAll)
     $btnApplyBulk = New-GuiButton 'Apply selected' 140 28 ([System.Drawing.Color]::FromArgb(70, 90, 120))
-    $btnApplyBulk.Location = New-Object System.Drawing.Point(170, 10)
+    $btnApplyBulk.Location = New-Object System.Drawing.Point(170, 8)
     $bulkBottom.Controls.Add($btnApplyBulk)
     $btnSelectReady = New-GuiButton 'Select Ready' 120 28 ([System.Drawing.Color]::FromArgb(70, 90, 120))
-    $btnSelectReady.Location = New-Object System.Drawing.Point(318, 10)
+    $btnSelectReady.Location = New-Object System.Drawing.Point(318, 8)
     $bulkBottom.Controls.Add($btnSelectReady)
     $btnExportPlan = New-GuiButton 'Export preview' 140 28 $blue
-    $btnExportPlan.Location = New-Object System.Drawing.Point(446, 10)
+    $btnExportPlan.Location = New-Object System.Drawing.Point(446, 8)
     $bulkBottom.Controls.Add($btnExportPlan)
+    $btnPrependAll = New-GuiButton 'Prepend all names' 160 28 $blue
+    $btnPrependAll.Location = New-Object System.Drawing.Point(12, 46)
+    $bulkBottom.Controls.Add($btnPrependAll)
+    $btnPrependSelected = New-GuiButton 'Prepend selected' 150 28 ([System.Drawing.Color]::FromArgb(70, 90, 120))
+    $btnPrependSelected.Location = New-Object System.Drawing.Point(180, 46)
+    $bulkBottom.Controls.Add($btnPrependSelected)
     $script:lblBulkSummary = New-Object System.Windows.Forms.Label
-    $script:lblBulkSummary.Text = 'Load a CSV, click Preview, then Apply all Ready. No row selection required.'
-    $script:lblBulkSummary.Location = New-Object System.Drawing.Point(598, 16)
+    $script:lblBulkSummary.Text = 'Load a CSV, click Preview, then Apply all Ready or Prepend all names. No row selection required.'
+    $script:lblBulkSummary.Location = New-Object System.Drawing.Point(340, 52)
     $script:lblBulkSummary.AutoSize = $true
     $bulkBottom.Controls.Add($script:lblBulkSummary)
     $script:grdBulk = New-GuiGrid -MultiSelect
@@ -4135,20 +4305,30 @@ function Show-CAExemptionGui {
     $script:txtDefaultValue.Size = New-Object System.Drawing.Size(280, 26)
     $script:txtDefaultValue.Text = $script:Settings.DefaultValue
     $tabSettings.Controls.Add($script:txtDefaultValue)
+    $lblPrefix = New-Object System.Windows.Forms.Label
+    $lblPrefix.Text = 'Device name prefix (prepended to display names)'
+    $lblPrefix.Location = New-Object System.Drawing.Point(24, 78)
+    $lblPrefix.AutoSize = $true
+    $tabSettings.Controls.Add($lblPrefix)
+    $script:txtNamePrefix = New-Object System.Windows.Forms.TextBox
+    $script:txtNamePrefix.Location = New-Object System.Drawing.Point(24, 100)
+    $script:txtNamePrefix.Size = New-Object System.Drawing.Size(280, 26)
+    $script:txtNamePrefix.Text = $script:Settings.NamePrefix
+    $tabSettings.Controls.Add($script:txtNamePrefix)
     $script:chkDryRun = New-Object System.Windows.Forms.CheckBox
     $script:chkDryRun.Text = 'Dry-run (do not write changes to Entra ID)'
-    $script:chkDryRun.Location = New-Object System.Drawing.Point(24, 86)
+    $script:chkDryRun.Location = New-Object System.Drawing.Point(24, 136)
     $script:chkDryRun.AutoSize = $true
     $script:chkDryRun.Checked = [bool]$script:Settings.DryRun
     $tabSettings.Controls.Add($script:chkDryRun)
     $lblScope = New-Object System.Windows.Forms.Label
     $lblScope.Text = 'Device scope (which devices can be changed)'
-    $lblScope.Location = New-Object System.Drawing.Point(24, 122)
+    $lblScope.Location = New-Object System.Drawing.Point(24, 172)
     $lblScope.AutoSize = $true
     $tabSettings.Controls.Add($lblScope)
     $script:cmbScope = New-Object System.Windows.Forms.ComboBox
     $script:cmbScope.DropDownStyle = 'DropDownList'
-    $script:cmbScope.Location = New-Object System.Drawing.Point(24, 144)
+    $script:cmbScope.Location = New-Object System.Drawing.Point(24, 194)
     $script:cmbScope.Size = New-Object System.Drawing.Size(320, 26)
     [void]$script:cmbScope.Items.Add('All devices (any OS)')
     [void]$script:cmbScope.Items.Add('Windows devices')
@@ -4156,25 +4336,25 @@ function Show-CAExemptionGui {
     $tabSettings.Controls.Add($script:cmbScope)
     $lblLog = New-Object System.Windows.Forms.Label
     $lblLog.Text = 'Audit log path'
-    $lblLog.Location = New-Object System.Drawing.Point(24, 186)
+    $lblLog.Location = New-Object System.Drawing.Point(24, 236)
     $lblLog.AutoSize = $true
     $tabSettings.Controls.Add($lblLog)
     $script:txtLogPath = New-Object System.Windows.Forms.TextBox
-    $script:txtLogPath.Location = New-Object System.Drawing.Point(24, 208)
+    $script:txtLogPath.Location = New-Object System.Drawing.Point(24, 258)
     $script:txtLogPath.Size = New-Object System.Drawing.Size(520, 26)
     $script:txtLogPath.Text = $script:Settings.LogPath
     $tabSettings.Controls.Add($script:txtLogPath)
     $script:chkDeviceCode = New-Object System.Windows.Forms.CheckBox
     $script:chkDeviceCode.Text = 'Use device-code sign-in (RDP / no browser). Leave off for a normal interactive login.'
-    $script:chkDeviceCode.Location = New-Object System.Drawing.Point(24, 248)
+    $script:chkDeviceCode.Location = New-Object System.Drawing.Point(24, 298)
     $script:chkDeviceCode.AutoSize = $true
     $script:chkDeviceCode.Checked = [bool]$DeviceCode
     $tabSettings.Controls.Add($script:chkDeviceCode)
     $btnSaveSettings = New-GuiButton 'Save settings' 140 32 $green
-    $btnSaveSettings.Location = New-Object System.Drawing.Point(24, 286)
+    $btnSaveSettings.Location = New-Object System.Drawing.Point(24, 336)
     $tabSettings.Controls.Add($btnSaveSettings)
     $lblHelp = New-Object System.Windows.Forms.Label
-    $lblHelp.Location = New-Object System.Drawing.Point(24, 336)
+    $lblHelp.Location = New-Object System.Drawing.Point(24, 386)
     $lblHelp.Size = New-Object System.Drawing.Size(900, 200)
     $lblHelp.Text = @"
 Conditional Access filter (case-sensitive):
@@ -4189,6 +4369,7 @@ Use device-code sign-in only when a browser cannot open (RDP / Server Core).
 
 Bulk CSV: Preview, then Apply all Ready. No row selection required.
 To update a subset, select rows (Ctrl+click / Shift+click) and click Apply selected.
+Device names: Prepend CA201- (or the prefix in Settings) one-by-one or with Prepend all names.
 
 Permissions: Device.ReadWrite.All, User.Read.All
 Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
@@ -4225,8 +4406,12 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
             default { $script:cmbScope.SelectedIndex = 2 }
         }
         $script:txtDefaultValue.Text = $script:Settings.DefaultValue
+        $script:txtNamePrefix.Text = $script:Settings.NamePrefix
         $script:chkDryRun.Checked = [bool]$script:Settings.DryRun
         $script:txtLogPath.Text = $script:Settings.LogPath
+        if ($script:btnPrependName) {
+            $script:btnPrependName.Text = ('Prepend {0}' -f (Get-NormalizedNamePrefix))
+        }
         $script:txtDeviceValue.Text = $script:Settings.DefaultValue
         $script:txtBulkFallback.Text = $script:Settings.DefaultValue
         $script:txtUserValue.Text = $script:Settings.DefaultValue
@@ -4343,20 +4528,23 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
         }
     }
 
+    function Get-GuiSelectedDevices {
+        $indexes = @(Get-GuiSelectedRowIndexes $script:grdDevices)
+        $selected = @(Select-ItemsByGridIndex -Items $script:GuiDevices -Indexes $indexes)
+        if ($selected.Count -gt 0) { return $selected }
+        $objectIds = @(Get-GuiSelectedValues $script:grdDevices 'ObjectId')
+        $list = New-Object System.Collections.Generic.List[object]
+        foreach ($objectId in $objectIds) {
+            $device = Find-GuiDeviceByObjectId $script:GuiDevices $objectId
+            if ($null -ne $device) { $list.Add($device) }
+        }
+        return @(ConvertTo-ObjectArray $list)
+    }
+
     function Invoke-GuiUpdateSelected {
         param([switch]$Clear)
         if (-not (Test-GuiGraph)) { return }
-        $indexes = @(Get-GuiSelectedRowIndexes $script:grdDevices)
-        $selected = @(Select-ItemsByGridIndex -Items $script:GuiDevices -Indexes $indexes)
-        if ($selected.Count -eq 0) {
-            $objectIds = @(Get-GuiSelectedValues $script:grdDevices 'ObjectId')
-            $selected = New-Object System.Collections.Generic.List[object]
-            foreach ($objectId in $objectIds) {
-                $device = Find-GuiDeviceByObjectId $script:GuiDevices $objectId
-                if ($null -ne $device) { $selected.Add($device) }
-            }
-            $selected = @(ConvertTo-ObjectArray $selected)
-        }
+        $selected = @(Get-GuiSelectedDevices)
         if ($selected.Count -eq 0) {
             [void](Show-ToolDialog 'Select one or more devices in the grid first. Ctrl+click or Shift+click to choose several.' 'Update' 'OK' 'Information')
             return
@@ -4412,6 +4600,98 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
         }
     }
 
+    function Invoke-GuiApplyNamePrefix {
+        param($Devices, [string]$Source)
+        $prefix = Get-NormalizedNamePrefix
+        $planItems = New-Object System.Collections.Generic.List[object]
+        $already = 0
+        foreach ($device in (ConvertTo-ObjectArray $Devices)) {
+            $item = New-DeviceNamePrefixPlanItem -Device $device -Prefix $prefix
+            if ([string]$item.Status -eq 'NoChange') { $already++ }
+            elseif ([string]$item.Status -eq 'Ready') { $planItems.Add($item) }
+        }
+        if ($planItems.Count -eq 0) {
+            $msg = 'No device names need the prefix.'
+            if ($already -gt 0) { $msg = ("{0} device name(s) already start with '{1}'." -f $already, $prefix) }
+            [void](Show-ToolDialog $msg 'Prepend names' 'OK' 'Information')
+            return
+        }
+        if ((Show-ToolDialog ("Prepend '{0}' to {1} device name(s) now?" -f $prefix, $planItems.Count) 'Confirm name prefix' 'YesNo' 'Question') -ne [System.Windows.Forms.DialogResult]::Yes) {
+            return
+        }
+        if (-not (Test-GuiGraph)) { return }
+        Set-GuiBusy ("Prepending '{0}' to {1} device name(s)..." -f $prefix, $planItems.Count)
+        try {
+            $results = ConvertTo-ObjectArray (Invoke-DeviceDisplayNamePrefixUpdates -PlanItems $planItems -Source $Source)
+            $ok = @($results | Where-Object { $_.Status -eq 'Success' }).Count
+            $dry = @($results | Where-Object { $_.Status -eq 'DryRun' }).Count
+            $fail = @($results | Where-Object { $_.Status -eq 'Failed' }).Count
+            foreach ($entry in $results) {
+                if ($entry.Status -notin @('Success', 'DryRun')) { continue }
+                $device = Find-GuiDeviceByObjectId $script:GuiDevices $entry.ObjectId
+                if ($null -eq $device) {
+                    foreach ($planItem in $script:GuiPlan) {
+                        if ($planItem.Device -and [string]$planItem.Device.ObjectId -eq [string]$entry.ObjectId) {
+                            $device = $planItem.Device
+                            break
+                        }
+                    }
+                }
+                if ($null -eq $device) { continue }
+                $device.DisplayName = [string]$entry.NewValue
+            }
+            foreach ($planItem in (ConvertTo-ObjectArray $script:GuiPlan)) {
+                if ($planItem.Device) { $planItem.DisplayName = [string]$planItem.Device.DisplayName }
+            }
+            if ($script:GuiDevices) { Set-GuiGridData $script:grdDevices $script:GuiDevices $deviceColumns }
+            if ($script:GuiPlan) { Set-GuiGridData $script:grdBulk $script:GuiPlan $planColumns }
+            $msg = "Succeeded: $ok`nDry-run: $dry`nFailed: $fail"
+            if ($already -gt 0) { $msg = $msg + "`nAlready prefixed: $already" }
+            Clear-GuiBusy $msg.Replace("`n", '  ')
+            [void](Show-ToolDialog $msg 'Prepend names' 'OK' 'Information')
+        }
+        catch {
+            Clear-GuiBusy 'Name prefix failed'
+            [void](Show-ToolDialog (Format-CaughtError $_) 'Name prefix failed' 'OK' 'Error')
+        }
+    }
+
+    function Invoke-GuiPrependSelectedDevices {
+        $selected = @(Get-GuiSelectedDevices)
+        if ($selected.Count -eq 0) {
+            [void](Show-ToolDialog 'Select one or more devices in the grid first. Ctrl+click or Shift+click to choose several.' 'Prepend names' 'OK' 'Information')
+            return
+        }
+        Invoke-GuiApplyNamePrefix -Devices $selected -Source 'GUI-NamePrefix'
+    }
+
+    function Invoke-GuiBulkPrependNames {
+        param([switch]$ApplyAll)
+        $devices = New-Object System.Collections.Generic.List[object]
+        if ($ApplyAll) {
+            foreach ($item in (ConvertTo-ObjectArray $script:GuiPlan)) {
+                if ($item.Device) { $devices.Add($item.Device) }
+            }
+        }
+        else {
+            $indexes = @(Get-GuiSelectedRowIndexes $script:grdBulk)
+            $selectedPlan = @(Select-ItemsByGridIndex -Items $script:GuiPlan -Indexes $indexes)
+            foreach ($item in $selectedPlan) {
+                if ($item.Device) { $devices.Add($item.Device) }
+            }
+        }
+        if ($devices.Count -eq 0) {
+            if ($ApplyAll) {
+                [void](Show-ToolDialog 'Preview a CSV first. Prepend all names uses every device found in the preview.' 'Prepend names' 'OK' 'Information')
+            }
+            else {
+                [void](Show-ToolDialog 'Select one or more found devices, or click Prepend all names.' 'Prepend names' 'OK' 'Information')
+            }
+            return
+        }
+        Invoke-GuiApplyNamePrefix -Devices $devices -Source 'GUI-CSV-NamePrefix'
+    }
+
     function Invoke-GuiBulkPreview {
         if (-not (Test-GuiGraph)) { return }
         $path = $script:txtBulkPath.Text.Trim().Trim('"')
@@ -4432,7 +4712,7 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
             Set-GuiGridData $script:grdBulk $script:GuiPlan $planColumns
             Invoke-GuiSelectReadyRows
             $ready = @($script:GuiPlan | Where-Object { $_.Status -eq 'Ready' }).Count
-            $script:lblBulkSummary.Text = ("{0} row(s), {1} Ready. Click Apply all Ready, or select rows and Apply selected. Dry-run: {2}" -f @($script:GuiPlan).Count, $ready, $script:Settings.DryRun)
+            $script:lblBulkSummary.Text = ("{0} row(s), {1} Ready. Apply all Ready for attributes, or Prepend all names. Dry-run: {2}" -f @($script:GuiPlan).Count, $ready, $script:Settings.DryRun)
             Clear-GuiBusy $script:lblBulkSummary.Text
         }
         catch {
@@ -4628,6 +4908,7 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
     $btnLoadAll.Add_Click({ Invoke-GuiLoadScopedDevices })
     $btnSet.Add_Click({ Invoke-GuiUpdateSelected })
     $btnClear.Add_Click({ Invoke-GuiUpdateSelected -Clear })
+    $script:btnPrependName.Add_Click({ Invoke-GuiPrependSelectedDevices })
     $btnBrowseBulk.Add_Click({
             $dialog = New-Object System.Windows.Forms.OpenFileDialog
             $dialog.Filter = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*'
@@ -4637,6 +4918,8 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
     $btnApplyAll.Add_Click({ Invoke-GuiBulkApply -ApplyAll })
     $btnSelectReady.Add_Click({ Invoke-GuiSelectReadyRows })
     $btnApplyBulk.Add_Click({ Invoke-GuiBulkApply })
+    $btnPrependAll.Add_Click({ Invoke-GuiBulkPrependNames -ApplyAll })
+    $btnPrependSelected.Add_Click({ Invoke-GuiBulkPrependNames })
     $btnExportPlan.Add_Click({
             if (@($script:GuiPlan).Count -eq 0) { [void](Show-ToolDialog 'Preview a CSV first.' 'Export' 'OK' 'Information'); return }
             Save-GuiExportRows -Rows $script:GuiPlan -DefaultName ('CAExemption-Preview_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
@@ -4690,6 +4973,12 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
                     return
                 }
                 $script:Settings.DefaultValue = $value
+                $prefix = $script:txtNamePrefix.Text.Trim()
+                if (Get-NamePrefixValidationError $prefix) {
+                    [void](Show-ToolDialog (Get-NamePrefixValidationError $prefix) 'Settings' 'OK' 'Warning')
+                    return
+                }
+                $script:Settings.NamePrefix = $prefix
                 $script:Settings.DryRun = [bool]$script:chkDryRun.Checked
                 $script:Settings.LogPath = $script:txtLogPath.Text.Trim()
                 switch ($script:cmbScope.SelectedIndex) {
