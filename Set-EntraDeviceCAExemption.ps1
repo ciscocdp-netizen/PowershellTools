@@ -52,7 +52,9 @@
 .NOTES
     Requirements
       - Module: Microsoft.Graph.Authentication (the script offers to install it)
-      - Delegated Graph permissions: Device.ReadWrite.All and User.Read.All (admin consent required)
+      - Delegated Graph permissions: Device.ReadWrite.All, User.Read.All, and Intune device rename
+        scopes (admin consent required). Entra ID can only change displayName on Windows devices;
+        iOS/Android names are renamed in Intune when the device is managed there.
       - Entra role: Cloud Device Administrator, Intune Administrator or Global Administrator
       - Windows PowerShell 5.1 needs .NET Framework 4.7.2 or later for the Graph SDK
 
@@ -108,11 +110,15 @@ param(
     [string]$SettingsPath
 )
 
-$script:ToolVersion    = '2.0.11'
+$script:ToolVersion    = '2.0.12'
 $script:Root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $script:SettingsFile = if ($SettingsPath) { $SettingsPath } else { Join-Path $script:Root 'CAExemption.settings.json' }
 $script:RequiredScope  = 'Device.ReadWrite.All'
 $script:RequiredScopes = @('Device.ReadWrite.All', 'User.Read.All')
+$script:IntuneScopes   = @(
+    'DeviceManagementManagedDevices.ReadWrite.All',
+    'DeviceManagementManagedDevices.PrivilegedOperations.ReadWrite.All'
+)
 $script:GraphBase      = 'https://graph.microsoft.com/v1.0/devices'
 $script:GraphUsersBase = 'https://graph.microsoft.com/v1.0/users'
 $script:GraphBatchUri  = 'https://graph.microsoft.com/v1.0/$batch'
@@ -830,10 +836,18 @@ function Get-GraphErrorMessage {
     return $message
 }
 
+function Test-WindowsDeviceOperatingSystem {
+    param($Device)
+    if ($null -eq $Device) { return $false }
+    $os = [string](Get-GraphProperty $Device 'OperatingSystem')
+    if ([string]::IsNullOrWhiteSpace($os)) { $os = [string]$Device.OperatingSystem }
+    return ($os -like 'Windows*')
+}
+
 function Test-DisplayNameUpdateForbidden {
     param([AllowNull()][string]$Message)
     if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
-    return ($Message -match 'external service|originated within|cannot be updated|read-only|Property displayName|Request_BadRequest')
+    return ($Message -match 'external service|originated within|cannot be updated|read-only|Property displayName|Request_BadRequest|only on windows devices|ExtensionAttribute1\.\.15')
 }
 
 function Get-DisplayNameUpdateAdvice {
@@ -842,11 +856,14 @@ function Get-DisplayNameUpdateAdvice {
     if ($text -match '401|Unauthorized|expired|Authentication_Expired|invalid_grant|AADSTS') {
         return 'Sign-in expired or a browser login is waiting. Finish the Edge sign-in window (or click Switch account), then try Prepend again.'
     }
+    if ($text -match 'only on windows devices|ExtensionAttribute1\.\.15') {
+        return 'Entra ID can only rename Windows devices. iPhone/iPad names are changed in Intune. Click Switch account, accept the Intune permissions, then try Prepend again.'
+    }
     if ($text -match '403|Authorization_RequestDenied|Insufficient|Access denied') {
-        return 'Your account cannot rename this device. Use Cloud Device Administrator, or Intune Administrator if the device is Intune-managed.'
+        return 'Your account cannot rename this device. Use Cloud Device Administrator for Windows, or Intune Administrator for iOS/Android. Click Switch account if Intune permission is missing.'
     }
     if (Test-DisplayNameUpdateForbidden $text) {
-        return 'Entra ID does not allow renaming this device (common for iPhone/iPad Company Portal devices). The tool will try Intune when possible.'
+        return 'Entra ID does not allow renaming this device (common for iPhone/iPad). The tool will try Intune when the device is managed there.'
     }
     return $text
 }
@@ -1088,7 +1105,11 @@ function Connect-Graph {
             if ($method -eq '2') { $useDevice = $true }
         }
 
-        $params = @{ Scopes = @($script:RequiredScopes) }
+        $connectScopes = New-Object System.Collections.Generic.List[string]
+        foreach ($scope in @($script:RequiredScopes + $script:IntuneScopes)) {
+            if ($scope -and -not $connectScopes.Contains($scope)) { $connectScopes.Add($scope) }
+        }
+        $params = @{ Scopes = @($connectScopes.ToArray()) }
         if ($tenantId) { $params['TenantId'] = $tenantId }
         if ($connectCommand.Parameters.ContainsKey('NoWelcome')) { $params['NoWelcome'] = $true }
         if ($connectCommand.Parameters.ContainsKey('ContextScope')) { $params['ContextScope'] = 'Process' }
@@ -2119,22 +2140,67 @@ function Invoke-DeviceExtensionAttributeUpdates {
     return (ConvertTo-ObjectArray $results)
 }
 
-function Find-IntuneManagedDeviceId {
+function Find-IntuneManagedDevice {
     param($Device)
+    $id = ''
+    $errorText = ''
     $azureId = ''
     if ($Device) { $azureId = [string]$Device.DeviceId }
-    if ([string]::IsNullOrWhiteSpace($azureId)) { return '' }
+    if ([string]::IsNullOrWhiteSpace($azureId)) {
+        return (New-ToolObject @('Id', '', 'Error', 'Device has no Device ID to look up in Intune.'))
+    }
     $filter = "azureADDeviceId eq '{0}'" -f $azureId.Replace("'", "''")
     $uri = 'https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?$filter={0}&$select=id,deviceName,azureADDeviceId' -f [uri]::EscapeDataString($filter)
     try {
         $result = Invoke-GraphRequestWithRetry -Method GET -Uri $uri -ExpectBody
         foreach ($item in (ConvertTo-ObjectArray (Get-GraphCollection $result))) {
             $id = [string](Get-GraphProperty $item 'id')
-            if (-not [string]::IsNullOrWhiteSpace($id)) { return $id }
+            if (-not [string]::IsNullOrWhiteSpace($id)) {
+                return (New-ToolObject @('Id', $id, 'Error', ''))
+            }
+        }
+        $errorText = 'This device was not found in Intune, so the name cannot be changed.'
+    }
+    catch {
+        $errorText = Get-GraphErrorMessage $_
+        if ($errorText -match '403|Authorization_RequestDenied|Insufficient|Access denied') {
+            $errorText = 'Intune permission is missing. Click Switch account, accept DeviceManagementManagedDevices.ReadWrite.All, then try again. ' + $errorText
         }
     }
-    catch { }
-    return ''
+    return (New-ToolObject @('Id', '', 'Error', $errorText))
+}
+
+function Invoke-IntuneDeviceRename {
+    param($Device, [string]$NewName)
+    $found = Find-IntuneManagedDevice $Device
+    $intuneId = [string](Get-GraphProperty $found 'Id')
+    if ([string]::IsNullOrWhiteSpace($intuneId)) {
+        $err = [string](Get-GraphProperty $found 'Error')
+        if ([string]::IsNullOrWhiteSpace($err)) { $err = 'This device was not found in Intune, so the name cannot be changed.' }
+        return (New-ToolObject @('Success', $false, 'Message', $err))
+    }
+
+    $errors = New-Object System.Collections.Generic.List[string]
+    $managedBody = ('{{"managedDeviceName":{0}}}' -f (ConvertTo-JsonStringLiteral $NewName))
+    try {
+        Invoke-GraphRequestWithRetry -Method PATCH -Uri ('https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/{0}' -f $intuneId) -Body $managedBody -ContentType 'application/json' | Out-Null
+        return (New-ToolObject @('Success', $true, 'Message', 'Renamed in Intune. Entra ID still shows the old name because Microsoft only allows displayName changes on Windows devices.'))
+    }
+    catch {
+        $errors.Add(('Intune managedDeviceName: {0}' -f (Get-GraphErrorMessage $_)))
+    }
+
+    $actionBody = ('{{"deviceName":{0}}}' -f (ConvertTo-JsonStringLiteral $NewName))
+    foreach ($root in @('https://graph.microsoft.com/v1.0', 'https://graph.microsoft.com/beta')) {
+        try {
+            Invoke-GraphRequestWithRetry -Method POST -Uri ('{0}/deviceManagement/managedDevices/{1}/setDeviceName' -f $root, $intuneId) -Body $actionBody -ContentType 'application/json' | Out-Null
+            return (New-ToolObject @('Success', $true, 'Message', 'Renamed in Intune with setDeviceName. Entra ID still shows the old name because Microsoft only allows displayName changes on Windows devices.'))
+        }
+        catch {
+            $errors.Add(('Intune setDeviceName: {0}' -f (Get-GraphErrorMessage $_)))
+        }
+    }
+    return (New-ToolObject @('Success', $false, 'Message', ($errors.ToArray() -join ' ')))
 }
 
 function Set-DeviceDisplayName {
@@ -2159,41 +2225,49 @@ function Set-DeviceDisplayName {
 
     if ($script:Settings.DryRun) {
         $status = 'DryRun'
-        $message = 'No change written (dry-run mode)'
+        $osNote = if (Test-WindowsDeviceOperatingSystem $Device) { 'Entra displayName' } else { 'Intune device name (Entra cannot rename this OS)' }
+        $message = "No change written (dry-run mode). Would update $osNote."
         $entry = New-DeviceAuditEntry -Device $Device -NewValue $NewName -Status $status -Action 'PrependName' -Source $Source -Message $message -ChangedBy $changedBy
         Write-AuditLog $entry
         return $entry
     }
 
-    $body = New-DisplayNamePatchJson $NewName
-    $uri = "$($script:GraphBase)/$($Device.ObjectId)"
-    try {
-        Invoke-GraphRequestWithRetry -Method PATCH -Uri $uri -Body $body -ContentType 'application/json' | Out-Null
-    }
-    catch {
-        $status = 'Failed'
-        $message = Get-GraphErrorMessage $_
-        $intuneId = ''
-        if (Test-DisplayNameUpdateForbidden $message -or $message -match '403|Authorization_RequestDenied') {
-            try { $intuneId = Find-IntuneManagedDeviceId $Device } catch { $intuneId = '' }
-            if ($intuneId) {
-                try {
-                    $intuneBody = ('{{"deviceName":{0}}}' -f (ConvertTo-JsonStringLiteral $NewName))
-                    Invoke-GraphRequestWithRetry -Method PATCH -Uri ('https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/{0}' -f $intuneId) -Body $intuneBody -ContentType 'application/json' | Out-Null
-                    $status = 'Success'
-                    $message = 'Updated via Intune (Entra displayName is read-only for this device).'
-                }
-                catch {
-                    $intuneError = Get-GraphErrorMessage $_
-                    $message = '{0} Intune rename failed: {1}' -f $message, $intuneError
-                }
-            }
+    $isWindows = Test-WindowsDeviceOperatingSystem $Device
+    $entraError = ''
+    if ($isWindows) {
+        $body = New-DisplayNamePatchJson $NewName
+        $uri = "$($script:GraphBase)/$($Device.ObjectId)"
+        try {
+            Invoke-GraphRequestWithRetry -Method PATCH -Uri $uri -Body $body -ContentType 'application/json' | Out-Null
+            $entry = New-DeviceAuditEntry -Device $Device -NewValue $NewName -Status 'Success' -Action 'PrependName' -Source $Source -Message $message -ChangedBy $changedBy
+            Write-AuditLog $entry
+            return $entry
         }
-        if ($status -eq 'Failed') {
-            $advice = Get-DisplayNameUpdateAdvice $message
-            if ($advice -and $advice -ne $message) {
-                $message = '{0} {1}' -f $message, $advice
-            }
+        catch {
+            $entraError = Get-GraphErrorMessage $_
+        }
+    }
+    else {
+        $os = [string](Get-GraphProperty $Device 'OperatingSystem')
+        if ([string]::IsNullOrWhiteSpace($os)) { $os = 'non-Windows' }
+        $entraError = "Entra ID can only rename Windows devices. This device is $os."
+    }
+
+    $intune = Invoke-IntuneDeviceRename -Device $Device -NewName $NewName
+    $intuneOk = $false
+    try { $intuneOk = [bool](Get-GraphProperty $intune 'Success') } catch { }
+    if ($intuneOk) {
+        $status = 'Success'
+        $message = [string](Get-GraphProperty $intune 'Message')
+    }
+    else {
+        $status = 'Failed'
+        $intuneMessage = [string](Get-GraphProperty $intune 'Message')
+        $message = $entraError
+        if ($intuneMessage) { $message = '{0} {1}' -f $message, $intuneMessage }
+        $advice = Get-DisplayNameUpdateAdvice $message
+        if ($advice -and $advice -ne $message -and $message -notlike "*$advice*") {
+            $message = '{0} {1}' -f $message, $advice
         }
     }
 
@@ -4612,8 +4686,9 @@ Use device-code sign-in only when a browser cannot open (RDP / Server Core).
 Bulk CSV: Preview, then Apply all Ready. No row selection required.
 To update a subset, select rows (Ctrl+click / Shift+click) and click Apply selected.
 Device names: Prepend CA201- (or the prefix in Settings) one-by-one or with Prepend all names.
+Entra ID can only rename Windows devices. iPhone/iPad names are renamed in Intune.
 
-Permissions: Device.ReadWrite.All, User.Read.All
+Permissions: Device.ReadWrite.All, User.Read.All, DeviceManagementManagedDevices.ReadWrite.All
 Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
 "@
     $tabSettings.Controls.Add($lblHelp)
@@ -4898,6 +4973,9 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
         if ($planItems.Count -eq 1) {
             $one = $planItems[0]
             $confirm = ("Rename this device display name?`n`nCurrent:  {0}`nNew:      {1}`n`nContinue?" -f $one.CurrentName, $one.NewName)
+            if (-not (Test-WindowsDeviceOperatingSystem $one.Device)) {
+                $confirm = ("Entra ID cannot rename iPhone/iPad/Android devices.`nThe tool will rename it in Intune if the device is managed there.`n`nCurrent:  {0}`nNew:      {1}`n`nContinue?" -f $one.CurrentName, $one.NewName)
+            }
         }
         if ((Show-ToolDialog $confirm 'Confirm name prefix' 'YesNo' 'Question') -ne [System.Windows.Forms.DialogResult]::Yes) {
             return

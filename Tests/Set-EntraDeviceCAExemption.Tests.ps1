@@ -601,6 +601,15 @@ $failSummary = Format-GuiChangeSummary -Results $failEntry
 Assert-True ($failSummary -match 'Failed: 1') 'Summary counts a failed rename'
 Assert-True ($failSummary -match 'Authorization_RequestDenied') 'Summary includes the Graph error text'
 Assert-True ((Get-DisplayNameUpdateAdvice 'Unauthorized') -match 'Switch account') '401 advice tells the user to finish sign-in'
+$windowsOnlyError = 'Properties other than AccountEnabled and ExtensionAttribute1..15 can be modified only on windows devices.'
+Assert-True (Test-DisplayNameUpdateForbidden $windowsOnlyError) 'Windows-only displayName error is detected'
+Assert-True ((Get-DisplayNameUpdateAdvice $windowsOnlyError) -match 'Intune') 'Windows-only displayName error points to Intune'
+$iosPhone = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -DisplayName 'iPhone 13 Pro' -Os 'iOS')
+$winPc = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -DisplayName 'PC-01' -Os 'Windows')
+Assert-True (-not (Test-WindowsDeviceOperatingSystem $iosPhone)) 'iOS device is not a Windows OS for rename'
+Assert-True (Test-WindowsDeviceOperatingSystem $winPc) 'Windows device is eligible for Entra displayName rename'
+Assert-True ($signedInSource -match 'Invoke-IntuneDeviceRename') 'Non-Windows prepend uses Intune'
+Assert-True ($signedInSource -match 'DeviceManagementManagedDevices.ReadWrite.All') 'Sign-in requests Intune rename permission'
 $onlyLoaded = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -DisplayName 'iPhone 13 Pro' -Os 'iOS' -ExtensionAttribute1 'CA201-Excluded')
 $fromLoaded = Get-SingleOrSelectedDevices -Selected $null -Loaded $onlyLoaded
 Assert-Equal -Expected 1 -Actual $fromLoaded.Count -Name 'Single loaded device is used when nothing is selected'
