@@ -206,6 +206,29 @@ Assert-Equal -Expected 'CA201-iPhone 16 Pro' -Actual $prefixPlan.NewName -Name '
 $alreadyPrefixed = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -DisplayName 'CA201-iPhone 14' -Os 'iOS')
 $alreadyPlan = New-DeviceNamePrefixPlanItem -Device $alreadyPrefixed -Prefix 'CA201-'
 Assert-Equal -Expected 'NoChange' -Actual $alreadyPlan.Status -Name 'Already prefixed device is NoChange'
+$iphone = ConvertTo-DeviceRecord (New-GraphDeviceHashtable -DisplayName 'iPhone 13 Pro' -Os 'iOS' -ExtensionAttribute1 'CA201-Excluded')
+Assert-Equal -Expected 'iPhone 13 Pro' -Actual (Get-DeviceRecordDisplayName $iphone) -Name 'DisplayName is used even when extensionAttribute1 starts with CA201-'
+$iphonePlan = New-DeviceNamePrefixPlanItem -Device $iphone -Prefix 'CA201-'
+Assert-Equal -Expected 'Ready' -Actual $iphonePlan.Status -Name 'iPhone 13 Pro is Ready to prepend CA201-'
+Assert-Equal -Expected 'CA201-iPhone 13 Pro' -Actual $iphonePlan.NewName -Name 'iPhone 13 Pro becomes CA201-iPhone 13 Pro'
+$singleList = ConvertTo-DeviceObjectList $iphone
+Assert-Equal -Expected 1 -Actual $singleList.Count -Name 'Single selected device is one prepend target'
+Assert-Equal -Expected 'iPhone 13 Pro' -Actual $singleList[0].DisplayName -Name 'Single selected device keeps DisplayName'
+$wrapped = @($iphone)
+$wrappedList = ConvertTo-DeviceObjectList $wrapped
+Assert-Equal -Expected 1 -Actual $wrappedList.Count -Name 'One-device array is one prepend target'
+function Invoke-PrefixPlanLoop {
+    param($Devices)
+    $ready = New-Object System.Collections.Generic.List[object]
+    foreach ($device in (ConvertTo-DeviceObjectList $Devices)) {
+        $item = New-DeviceNamePrefixPlanItem -Device $device -Prefix 'CA201-'
+        if ((Get-GraphProperty $item 'Status') -eq 'Ready') { $ready.Add($item) }
+    }
+    return $ready
+}
+$readyFromSingle = Invoke-PrefixPlanLoop $iphone
+Assert-Equal -Expected 1 -Actual $readyFromSingle.Count -Name 'Unwrapped single device still plans a name prefix'
+Assert-Equal -Expected 'CA201-iPhone 13 Pro' -Actual $readyFromSingle[0].NewName -Name 'Unwrapped single device NewName is CA201-iPhone 13 Pro'
 
 # --- Error parsing / scopes / retry ---
 $err429 = [System.Management.Automation.ErrorRecord]::new(
@@ -565,6 +588,7 @@ Assert-True ($signedInSource -match 'New-GuiGrid -MultiSelect') 'Bulk and device
 Assert-True ($signedInSource -match "New-GuiButton 'Apply all Ready'") 'Bulk tab can apply every Ready row without a selection'
 Assert-True ($signedInSource -match 'Prepend all names') 'Bulk tab can prepend names without a selection'
 Assert-True ($signedInSource -match 'Invoke-GuiPrependSelectedDevices') 'Devices tab can prepend names one-by-one or on a selection'
+Assert-True ($signedInSource -match 'ConvertTo-DeviceObjectList') 'GUI prepend treats a single selected device as one device'
 Assert-True ($signedInSource -match 'param\(\[switch\]\$ApplyAll\)') 'Apply all uses a switch named ApplyAll'
 Assert-True ($signedInSource -notmatch '\$allReady = @') 'Ready rows are not stored in \$AllReady (switch name clash)'
 Assert-True ($signedInSource -match "New-GuiButton 'Apply selected'") 'Bulk tab applies the selected rows'

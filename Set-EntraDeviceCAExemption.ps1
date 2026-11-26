@@ -108,7 +108,7 @@ param(
     [string]$SettingsPath
 )
 
-$script:ToolVersion    = '2.0.8'
+$script:ToolVersion    = '2.0.9'
 $script:Root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $script:SettingsFile = if ($SettingsPath) { $SettingsPath } else { Join-Path $script:Root 'CAExemption.settings.json' }
 $script:RequiredScope  = 'Device.ReadWrite.All'
@@ -672,10 +672,72 @@ function Get-NamePrefixValidationError {
     return $null
 }
 
+function Test-LooksLikeDeviceRecord {
+    param($Value)
+    if ($null -eq $Value) { return $false }
+    if ($Value -is [string] -or $Value -is [ValueType]) { return $false }
+    if ($Value -is [System.Array]) {
+        if ($Value.Length -eq 1) { return (Test-LooksLikeDeviceRecord $Value[0]) }
+        return $false
+    }
+    if ($Value -is [System.Collections.IList]) { return $false }
+    foreach ($name in @('DisplayName', 'displayName', 'ObjectId', 'DeviceId', 'deviceId')) {
+        if ($Value.PSObject.Properties[$name]) { return $true }
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        foreach ($key in $Value.Keys) {
+            $keyText = [string]$key
+            if ($keyText -eq 'DisplayName' -or $keyText -eq 'displayName' -or $keyText -eq 'ObjectId' -or $keyText -eq 'DeviceId' -or $keyText -eq 'id' -or $keyText -eq 'deviceId') {
+                return $true
+            }
+        }
+    }
+    return $false
+}
+
+function ConvertTo-DeviceObjectList {
+    param($Value)
+    $list = New-Object System.Collections.Generic.List[object]
+    if ($null -eq $Value) { return $list }
+    if (Test-LooksLikeDeviceRecord $Value) {
+        if ($Value -is [System.Array] -and $Value.Length -eq 1) {
+            $list.Add($Value[0])
+        }
+        else {
+            $list.Add($Value)
+        }
+        return $list
+    }
+    foreach ($item in (ConvertTo-ObjectArray $Value)) {
+        if ($null -eq $item -or $item -is [string] -or $item -is [ValueType]) { continue }
+        $list.Add($item)
+    }
+    return $list
+}
+
+function Get-DeviceRecordDisplayName {
+    param($Device)
+    if ($null -eq $Device) { return '' }
+    $name = Get-GraphProperty $Device 'DisplayName'
+    if ([string]::IsNullOrWhiteSpace([string]$name)) {
+        $name = Get-GraphProperty $Device 'displayName'
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$name)) {
+        try {
+            if ($Device -is [System.Data.DataRow] -or $Device -is [System.Data.DataRowView]) {
+                $name = $Device['DisplayName']
+            }
+        }
+        catch { }
+    }
+    if ($null -eq $name) { return '' }
+    return [string]$name
+}
+
 function Test-DeviceNameHasPrefix {
     param([AllowNull()][string]$DisplayName, [AllowNull()][string]$Prefix)
     $pre = Get-NormalizedNamePrefix $Prefix
-    if ([string]::IsNullOrWhiteSpace($DisplayName)) { return $false }
+    if ([string]::IsNullOrWhiteSpace($pre) -or [string]::IsNullOrWhiteSpace($DisplayName)) { return $false }
     return ([string]$DisplayName).StartsWith($pre, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
@@ -688,10 +750,12 @@ function Get-PrefixedDeviceName {
 }
 
 function New-DeviceNamePrefixPlanItem {
-    param($Device, [AllowNull()][string]$Prefix)
+    param($Device, [AllowNull()][string]$Prefix, [AllowNull()][string]$DisplayName)
     $pre = Get-NormalizedNamePrefix $Prefix
-    $current = ''
-    if ($Device) { $current = [string]$Device.DisplayName }
+    $current = $DisplayName
+    if ([string]::IsNullOrWhiteSpace($current)) {
+        $current = Get-DeviceRecordDisplayName $Device
+    }
     $newName = Get-PrefixedDeviceName $current $pre
     $status = 'Ready'
     $note = ''
@@ -4529,16 +4593,32 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
     }
 
     function Get-GuiSelectedDevices {
-        $indexes = @(Get-GuiSelectedRowIndexes $script:grdDevices)
-        $selected = @(Select-ItemsByGridIndex -Items $script:GuiDevices -Indexes $indexes)
-        if ($selected.Count -gt 0) { return $selected }
-        $objectIds = @(Get-GuiSelectedValues $script:grdDevices 'ObjectId')
         $list = New-Object System.Collections.Generic.List[object]
-        foreach ($objectId in $objectIds) {
-            $device = Find-GuiDeviceByObjectId $script:GuiDevices $objectId
+        $indexes = @(Get-GuiSelectedRowIndexes $script:grdDevices)
+        foreach ($device in (Select-ItemsByGridIndex -Items $script:GuiDevices -Indexes $indexes)) {
             if ($null -ne $device) { $list.Add($device) }
         }
-        return @(ConvertTo-ObjectArray $list)
+        if ($list.Count -eq 0) {
+            $objectIds = @(Get-GuiSelectedValues $script:grdDevices 'ObjectId')
+            foreach ($objectId in $objectIds) {
+                $device = Find-GuiDeviceByObjectId $script:GuiDevices $objectId
+                if ($null -ne $device) { $list.Add($device) }
+            }
+        }
+        $i = 0
+        foreach ($idx in $indexes) {
+            if ($i -ge $list.Count) { break }
+            $row = $null
+            try { $row = $script:grdDevices.Rows.Item([int]$idx) } catch {
+                try { $row = $script:grdDevices.Rows[[int]$idx] } catch { }
+            }
+            $gridName = Get-GuiGridRowValue $row 'DisplayName'
+            if (-not [string]::IsNullOrWhiteSpace($gridName)) {
+                $list[$i].DisplayName = $gridName
+            }
+            $i++
+        }
+        return $list
     }
 
     function Invoke-GuiUpdateSelected {
@@ -4605,14 +4685,31 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
         $prefix = Get-NormalizedNamePrefix
         $planItems = New-Object System.Collections.Generic.List[object]
         $already = 0
-        foreach ($device in (ConvertTo-ObjectArray $Devices)) {
+        $skipped = New-Object System.Collections.Generic.List[string]
+        foreach ($device in (ConvertTo-DeviceObjectList $Devices)) {
             $item = New-DeviceNamePrefixPlanItem -Device $device -Prefix $prefix
-            if ([string]$item.Status -eq 'NoChange') { $already++ }
-            elseif ([string]$item.Status -eq 'Ready') { $planItems.Add($item) }
+            $status = [string](Get-GraphProperty $item 'Status')
+            if ($status -eq 'NoChange') { $already++ }
+            elseif ($status -eq 'Ready') { $planItems.Add($item) }
+            else {
+                $name = Get-DeviceRecordDisplayName $device
+                if ([string]::IsNullOrWhiteSpace($name)) { $name = '(unknown device)' }
+                $note = [string](Get-GraphProperty $item 'Note')
+                if ([string]::IsNullOrWhiteSpace($note)) { $note = $status }
+                $skipped.Add(("{0}: {1}" -f $name, $note))
+            }
         }
         if ($planItems.Count -eq 0) {
-            $msg = 'No device names need the prefix.'
-            if ($already -gt 0) { $msg = ("{0} device name(s) already start with '{1}'." -f $already, $prefix) }
+            $msg = "No device names need the prefix '{0}'." -f $prefix
+            if ($already -gt 0) {
+                $msg = ("{0} device name(s) already start with '{1}'." -f $already, $prefix)
+            }
+            elseif ($skipped.Count -gt 0) {
+                $msg = ("Could not prepend '{0}':`n{1}" -f $prefix, ($skipped -join "`n"))
+            }
+            else {
+                $msg = "Select a device whose DisplayName should get '{0}', then click Prepend again." -f $prefix
+            }
             [void](Show-ToolDialog $msg 'Prepend names' 'OK' 'Information')
             return
         }
@@ -4657,7 +4754,7 @@ Roles: Cloud Device Administrator, Intune Administrator or Global Administrator
     }
 
     function Invoke-GuiPrependSelectedDevices {
-        $selected = @(Get-GuiSelectedDevices)
+        $selected = Get-GuiSelectedDevices
         if ($selected.Count -eq 0) {
             [void](Show-ToolDialog 'Select one or more devices in the grid first. Ctrl+click or Shift+click to choose several.' 'Prepend names' 'OK' 'Information')
             return
