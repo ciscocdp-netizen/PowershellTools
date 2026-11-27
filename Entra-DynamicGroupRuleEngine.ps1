@@ -178,7 +178,37 @@ function Get-EntraDgmPropertyCatalog {
 
 function Test-EntraDgmCustomExtensionName {
     param([string]$Name)
-    return [bool]($Name -match '^extension_[0-9a-fA-F]{32}_[A-Za-z][A-Za-z0-9_]*$')
+    return [bool]($Name -match '^extension_[0-9a-fA-F]{32}_.+$')
+}
+
+function Get-EntraDgmExtraGraphSelectProperties {
+    param(
+        [ValidateSet('user', 'device')]
+        [string]$ObjectType = 'user'
+    )
+
+    if ($ObjectType -eq 'device') {
+        return @(
+            'id', 'displayName', 'accountEnabled', 'deviceId', 'operatingSystem', 'operatingSystemVersion',
+            'trustType', 'profileType', 'isCompliant', 'isManaged', 'mdmAppId', 'manufacturer', 'model',
+            'physicalIds', 'systemLabels', 'enrollmentType', 'enrollmentProfileName', 'deviceOwnership',
+            'extensionAttributes'
+        )
+    }
+
+    return @(
+        'id', 'accountEnabled', 'ageGroup', 'assignedLicenses', 'assignedPlans', 'businessPhones',
+        'city', 'companyName', 'consentProvidedForMinor', 'country', 'createdDateTime', 'creationType',
+        'department', 'displayName', 'employeeHireDate', 'employeeId', 'employeeLeaveDateTime',
+        'employeeOrgData', 'employeeType', 'externalUserState', 'faxNumber', 'givenName', 'imAddresses',
+        'identities', 'jobTitle', 'legalAgeGroupClassification', 'mail', 'mailNickname', 'mobilePhone',
+        'officeLocation', 'onPremisesDistinguishedName', 'onPremisesDomainName', 'onPremisesExtensionAttributes',
+        'onPremisesImmutableId', 'onPremisesLastSyncDateTime', 'onPremisesSamAccountName',
+        'onPremisesSecurityIdentifier', 'onPremisesSyncEnabled', 'onPremisesUserPrincipalName',
+        'otherMails', 'passwordPolicies', 'postalCode', 'preferredLanguage', 'proxyAddresses',
+        'showInAddressList', 'state', 'streetAddress', 'surname', 'usageLocation', 'userPrincipalName',
+        'userType'
+    )
 }
 
 function Resolve-EntraDgmProperty {
@@ -881,13 +911,99 @@ function Get-EntraDgmGraphSelectProperties {
         }
     }
 
-    if ($ObjectType -eq 'user') {
-        foreach ($required in @('id', 'displayName', 'userPrincipalName', 'onPremisesExtensionAttributes')) {
-            if (-not $names.Contains($required)) { $names.Add($required) | Out-Null }
-        }
+    foreach ($required in @(Get-EntraDgmExtraGraphSelectProperties -ObjectType $ObjectType)) {
+        if (-not $names.Contains($required)) { $names.Add($required) | Out-Null }
     }
 
     return @($names)
+}
+
+function Get-EntraDgmMemberNames {
+    param($Object)
+
+    $names = New-Object System.Collections.ArrayList
+    if ($null -eq $Object) { return @() }
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        foreach ($key in $Object.Keys) {
+            [void]$names.Add([string]$key)
+        }
+    }
+    else {
+        foreach ($prop in $Object.PSObject.Properties) {
+            [void]$names.Add($prop.Name)
+        }
+    }
+
+    return @($names | Where-Object {
+        $_ -and
+        $_ -notlike '@odata*' -and
+        $_ -notin @('Keys', 'Values', 'Count', 'IsReadOnly', 'IsFixedSize', 'SyncRoot')
+    })
+}
+
+function Get-EntraDgmMemberMap {
+    param($Object)
+
+    $map = @{}
+    if ($null -eq $Object) { return $map }
+
+    foreach ($name in @(Get-EntraDgmMemberNames -Object $Object)) {
+        if ($name -eq 'AdditionalProperties') {
+            $extra = Get-EntraDgmObjectProperty -Object $Object -Name 'AdditionalProperties'
+            if ($extra -is [System.Collections.IDictionary]) {
+                foreach ($key in $extra.Keys) {
+                    $keyName = [string]$key
+                    if ($keyName -like '@odata*' -or $keyName -eq 'AdditionalProperties') { continue }
+                    $map[$keyName] = $extra[$key]
+                }
+            }
+            elseif ($extra) {
+                foreach ($child in @(Get-EntraDgmMemberNames -Object $extra)) {
+                    if ($child -like '@odata*' -or $child -eq 'AdditionalProperties') { continue }
+                    $map[$child] = Get-EntraDgmObjectProperty -Object $extra -Name $child
+                }
+            }
+            continue
+        }
+        $map[$name] = Get-EntraDgmObjectProperty -Object $Object -Name $name
+    }
+    return $map
+}
+
+function Find-EntraDgmCustomExtensionNames {
+    param($Object)
+
+    $found = New-Object System.Collections.ArrayList
+    $map = Get-EntraDgmMemberMap -Object $Object
+    foreach ($name in @($map.Keys)) {
+        if ($name -like 'extension_*') {
+            [void]$found.Add($name)
+        }
+    }
+    return @($found | Select-Object -Unique)
+}
+
+function Merge-EntraDgmGraphObject {
+    param(
+        $Target,
+        $Source
+    )
+
+    if ($null -eq $Source) { return $Target }
+    if ($null -eq $Target) { return $Source }
+
+    $map = Get-EntraDgmMemberMap -Object $Source
+    foreach ($name in @($map.Keys)) {
+        $val = $map[$name]
+        if ($Target -is [System.Collections.IDictionary]) {
+            $Target[$name] = $val
+        }
+        else {
+            $Target | Add-Member -MemberType NoteProperty -Name $name -Value $val -Force
+        }
+    }
+    return $Target
 }
 
 function Get-EntraDgmExactProperty {
@@ -972,6 +1088,13 @@ function Get-EntraDgmObjectProperty {
 
     $prop = $Object.PSObject.Properties[$Name]
     if ($prop) { return $prop.Value }
+
+    if ($Name -ne 'AdditionalProperties') {
+        $bag = $Object.PSObject.Properties['AdditionalProperties']
+        if ($bag -and $null -ne $bag.Value) {
+            return Get-EntraDgmObjectProperty -Object $bag.Value -Name $Name
+        }
+    }
     return $null
 }
 
@@ -1115,22 +1238,76 @@ function ConvertFrom-EntraDgmGraphObject {
         }) | Out-Null
     }
 
+    $seen = @{}
+    foreach ($existing in @($rows)) {
+        $seen[$existing.Name] = $true
+        if ($existing.GraphName) { $seen[$existing.GraphName] = $true }
+    }
+
+    $addExtra = {
+        param($Name, $Raw, $Notes, $Supported)
+        if ([string]::IsNullOrWhiteSpace($Name)) { return }
+        if ($seen.ContainsKey($Name)) { return }
+        $seen[$Name] = $true
+        $isCustom = [bool]($Name -like 'extension_*')
+        $isCollection = $Raw -is [System.Collections.IEnumerable] -and -not ($Raw -is [string])
+        $typeName = 'String'
+        if ($isCollection) { $typeName = 'StringCollection' }
+        elseif ($Raw -is [bool]) { $typeName = 'Boolean' }
+        $rows.Add([pscustomobject]@{
+            Name        = $Name
+            GraphName   = $Name
+            GraphPath   = $Name
+            Type        = $typeName
+            ObjectType  = $ObjectType
+            Value       = (ConvertTo-EntraDgmDisplayValue -Value $Raw)
+            RawValue    = $Raw
+            Collection  = $(if ($isCollection) { ConvertTo-EntraDgmCollection -Value $Raw } else { @() })
+            Supported   = [bool]($Supported -or $isCustom)
+            Notes       = $(if ($Notes) { $Notes } elseif ($isCustom) { 'Directory / custom extension property' } else { 'Returned by Microsoft Graph. Not in the documented Entra dynamic-group property list unless it is an extension.' })
+        }) | Out-Null
+    }
+
     foreach ($extName in @($ExtraExtensionNames)) {
         if ([string]::IsNullOrWhiteSpace($extName)) { continue }
-        if (-not (Test-EntraDgmCustomExtensionName -Name $extName)) { continue }
+        if ($extName -notlike 'extension_*' -and -not (Test-EntraDgmCustomExtensionName -Name $extName)) { continue }
         $raw = Get-EntraDgmObjectProperty -Object $GraphObject -Name $extName
-        $rows.Add([pscustomobject]@{
-            Name        = $extName
-            GraphName   = $extName
-            GraphPath   = $extName
-            Type        = 'String'
-            ObjectType  = $ObjectType
-            Value       = (ConvertTo-EntraDgmDisplayValue -Value $raw)
-            RawValue    = $raw
-            Collection  = @()
-            Supported   = $true
-            Notes       = 'Directory / custom extension property'
-        }) | Out-Null
+        if ($null -eq $raw) {
+            $mapProbe = Get-EntraDgmMemberMap -Object $GraphObject
+            if ($mapProbe.ContainsKey($extName)) { $raw = $mapProbe[$extName] }
+        }
+        & $addExtra $extName $raw 'Directory / custom extension property' $true
+    }
+
+    $memberMap = Get-EntraDgmMemberMap -Object $GraphObject
+    foreach ($name in @($memberMap.Keys | Sort-Object)) {
+        if ($name -in @('manager', 'id')) { continue }
+        $raw = $memberMap[$name]
+        if ($name -eq 'onPremisesExtensionAttributes' -and $raw) {
+            foreach ($extChild in @(Get-EntraDgmMemberNames -Object $raw)) {
+                if ($extChild -notlike 'extensionAttribute*') { continue }
+                $childVal = Get-EntraDgmObjectProperty -Object $raw -Name $extChild
+                & $addExtra $extChild $childVal 'On-premises / Graph extensionAttribute' $true
+            }
+            continue
+        }
+        if ($name -eq 'employeeOrgData' -and $raw) {
+            foreach ($orgChild in @(Get-EntraDgmMemberNames -Object $raw)) {
+                $childVal = Get-EntraDgmObjectProperty -Object $raw -Name $orgChild
+                & $addExtra "employeeOrgData.$orgChild" $childVal 'employeeOrgData is not a documented dynamic-group property.' $false
+            }
+            continue
+        }
+        if ($name -eq 'extensionAttributes' -and $raw) {
+            foreach ($devChild in @(Get-EntraDgmMemberNames -Object $raw)) {
+                if ($devChild -notlike 'extensionAttribute*') { continue }
+                $childVal = Get-EntraDgmObjectProperty -Object $raw -Name $devChild
+                & $addExtra $devChild $childVal 'Device extensionAttribute' $true
+            }
+            continue
+        }
+        $supportedExtra = ($name -like 'extension_*')
+        & $addExtra $name $raw $null $supportedExtra
     }
 
     if ($ObjectType -eq 'user') {

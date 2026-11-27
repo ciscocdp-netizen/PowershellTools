@@ -285,6 +285,47 @@ $cOr | Add-Member -NotePropertyName JoinOperator -NotePropertyValue '-or' -Force
 $ruleEval = Test-EntraDgmRuleLocally -Conditions @($condDept, $cOr) -AttributeRows $rows
 Should-BeTrue $ruleEval.Matched 'OR of matching + non-matching still matches'
 
+$extUser = [pscustomobject]@{
+    id          = '11111111-1111-1111-1111-111111111111'
+    displayName = 'Alex Sales'
+    department  = 'Sales'
+    employeeType = 'Contractor'
+    AdditionalProperties = @{
+        'extension_c272a57b722d4eb29bfe327874ae79cb_OfficeNumber' = '42'
+        '@odata.context' = 'https://graph.microsoft.com/beta/$metadata#users/$entity'
+    }
+}
+$extRows = ConvertFrom-EntraDgmGraphObject -GraphObject $extUser -ObjectType user
+$officeRow = @($extRows | Where-Object Name -eq 'extension_c272a57b722d4eb29bfe327874ae79cb_OfficeNumber')[0]
+Should-Equal $officeRow.Value '42' 'directory extensions in AdditionalProperties are flattened'
+Should-BeTrue $officeRow.Supported 'directory extensions are treated as supported rule properties'
+$empType = @($extRows | Where-Object Name -eq 'employeeType')[0]
+Should-Equal $empType.Value 'Contractor' 'extra Graph properties are listed even when not in the Entra catalog'
+Should-BeTrue ($null -eq (@($extRows | Where-Object Name -eq 'AdditionalProperties')[0])) 'AdditionalProperties bag is not listed as an attribute'
+Should-BeTrue ($null -eq (@($extRows | Where-Object Name -eq '@odata.context')[0])) 'OData metadata is not listed as an attribute'
+
+$namedExtRows = ConvertFrom-EntraDgmGraphObject -GraphObject $extUser -ObjectType user -ExtraExtensionNames @('extension_c272a57b722d4eb29bfe327874ae79cb_CostCenter')
+$costRow = @($namedExtRows | Where-Object Name -eq 'extension_c272a57b722d4eb29bfe327874ae79cb_CostCenter')[0]
+Should-Equal $costRow.Value '<null>' 'discovered custom extensions are listed even when Graph returned no value'
+
+$foundNames = @(Find-EntraDgmCustomExtensionNames -Object $extUser)
+Should-BeTrue ($foundNames -contains 'extension_c272a57b722d4eb29bfe327874ae79cb_OfficeNumber') 'Find-EntraDgmCustomExtensionNames reads AdditionalProperties'
+
+$merged = Merge-EntraDgmGraphObject -Target $extUser -Source ([pscustomobject]@{ extension_c272a57b722d4eb29bfe327874ae79cb_CostCenter = 'OPS' })
+Should-Equal (Get-EntraDgmObjectProperty -Object $merged -Name 'extension_c272a57b722d4eb29bfe327874ae79cb_CostCenter') 'OPS' 'Merge-EntraDgmGraphObject copies extra properties onto the user'
+
+$hashExt = @{
+    id          = '11111111-1111-1111-1111-111111111111'
+    displayName = 'Alex Sales'
+    'extension_c272a57b722d4eb29bfe327874ae79cb_badgeId' = 'B-9'
+}
+$hashRows = ConvertFrom-EntraDgmGraphObject -GraphObject $hashExt -ObjectType user
+$badge = @($hashRows | Where-Object Name -eq 'extension_c272a57b722d4eb29bfe327874ae79cb_badgeId')[0]
+Should-Equal $badge.Value 'B-9' 'custom extensions on a hashtable Graph payload are flattened'
+
+Should-BeTrue (Test-EntraDgmCustomExtensionName -Name 'extension_c272a57b722d4eb29bfe327874ae79cb_OfficeNumber') 'classic directory extension names are accepted'
+Should-BeTrue (Test-EntraDgmCustomExtensionName -Name 'extension_c272a57b722d4eb29bfe327874ae79cb_employeeID') 'directory extension names may include digits after the underscore'
+
 Write-Host ''
 Write-Host '=== Catalog ==='
 $catalog = @(Get-EntraDgmPropertyCatalog)
@@ -295,7 +336,10 @@ Should-BeTrue ($deviceProps.Count -ge 20) 'device catalog is populated'
 $select = Get-EntraDgmGraphSelectProperties -ObjectType user
 Should-BeTrue ($select -contains 'onPremisesExtensionAttributes') 'Graph $select includes onPremisesExtensionAttributes'
 Should-BeTrue ($select -contains 'id') 'Graph $select includes id'
+Should-BeTrue ($select -contains 'employeeType') 'Graph $select includes extra Graph user properties'
 Should-BeFalse ($select -contains 'memberOf') 'navigation properties are not $select-ed'
+$selectWithExt = Get-EntraDgmGraphSelectProperties -ObjectType user -Extra @('extension_c272a57b722d4eb29bfe327874ae79cb_OfficeNumber')
+Should-BeTrue ($selectWithExt -contains 'extension_c272a57b722d4eb29bfe327874ae79cb_OfficeNumber') 'custom extensions are included in $select'
 
 Write-Host ''
 Write-Host '=== Graph response unwrap ==='

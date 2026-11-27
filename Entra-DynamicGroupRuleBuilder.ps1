@@ -152,7 +152,7 @@ function Invoke-EntraDgmGraph {
 }
 
 function Get-EntraDgmConnectParameters {
-    $scopes = @('User.Read.All', 'Directory.Read.All', 'Device.Read.All')
+    $scopes = @('User.Read.All', 'Directory.Read.All', 'Device.Read.All', 'Application.Read.All')
     $params = @{
         Scopes      = $scopes
         ErrorAction = 'Stop'
@@ -172,7 +172,12 @@ function Connect-EntraDgmGraph {
         $existing = $null
         try { $existing = Get-MgContext } catch { $existing = $null }
 
-        if (-not $existing -or -not $existing.Account) {
+        $needed = @('User.Read.All', 'Directory.Read.All', 'Device.Read.All', 'Application.Read.All')
+        $have = @()
+        if ($existing -and $existing.Scopes) { $have = @($existing.Scopes) }
+        $missing = @($needed | Where-Object { $have -notcontains $_ })
+
+        if (-not $existing -or -not $existing.Account -or $missing.Count -gt 0) {
             $connectParams = Get-EntraDgmConnectParameters
             Connect-MgGraph @connectParams | Out-Null
             $existing = Get-MgContext
@@ -187,8 +192,14 @@ function Connect-EntraDgmGraph {
             $btnLoadExtensions.Enabled = $true
             $txtAppId.Enabled = $true
             $btnTestGraph.Enabled = $true
-            Set-EntraDgmStatus -Text "Connected as $($existing.Account) | Tenant $($existing.TenantId)" -Color $script:UiGreen
-            Show-EntraDgmMessage -Text "Connected to Microsoft Graph as $($existing.Account)." -Title 'Connected'
+            $extCount = 0
+            try {
+                Set-EntraDgmStatus -Text "Connected as $($existing.Account). Discovering directory extensions..." -Color ([System.Drawing.Color]::Orange)
+                $extCount = Sync-EntraDgmDirectoryExtensions -Quiet
+            }
+            catch { }
+            Set-EntraDgmStatus -Text "Connected as $($existing.Account) | Tenant $($existing.TenantId) | $extCount directory extensions" -Color $script:UiGreen
+            Show-EntraDgmMessage -Text "Connected to Microsoft Graph as $($existing.Account).`r`nDirectory extensions discovered: $extCount`r`nCustom attributes are requested automatically when you load a user or device." -Title 'Connected'
         }
         else {
             throw 'No Graph account was returned. Sign-in may have been cancelled.'
@@ -220,49 +231,145 @@ function Disconnect-EntraDgmGraph {
     Set-EntraDgmStatus -Text 'Not connected' -Color $script:UiError
 }
 
+function Add-EntraDgmKnownExtensionName {
+    param(
+        [System.Collections.IList]$Names,
+        [string]$Name
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return }
+    $clean = $Name.Trim()
+    if ($clean -notlike 'extension_*') { return }
+    if ($Names -contains $clean) { return }
+    [void]$Names.Add($clean)
+}
+
+function Add-EntraDgmExtensionNamesFromValue {
+    param(
+        [System.Collections.IList]$Names,
+        $Value
+    )
+
+    if ($null -eq $Value) { return }
+
+    $items = @()
+    $asPage = Get-EntraDgmExactProperty -Object $Value -Name 'value'
+    if ($asPage.Found) {
+        $items = @($asPage.Value)
+    }
+    elseif ($Value -is [System.Collections.IEnumerable] -and -not ($Value -is [string])) {
+        $items = @($Value)
+    }
+    else {
+        $items = @($Value)
+    }
+
+    foreach ($ext in $items) {
+        if ($null -eq $ext) { continue }
+        if ($ext -is [string]) {
+            Add-EntraDgmKnownExtensionName -Names $Names -Name $ext
+            continue
+        }
+        $extName = [string](Get-EntraDgmObjectProperty -Object $ext -Name 'name')
+        if (-not $extName) { $extName = [string](Get-EntraDgmObjectProperty -Object $ext -Name 'Name') }
+        Add-EntraDgmKnownExtensionName -Names $Names -Name $extName
+    }
+}
+
 function Get-EntraDgmDirectoryExtensions {
     param([string]$AppId)
 
     $names = New-Object System.Collections.Generic.List[string]
 
-    if (-not [string]::IsNullOrWhiteSpace($AppId)) {
-        $filter = [uri]::EscapeDataString("appId eq '$($AppId.Trim())'")
-        $uri = "$($script:GraphBaseUri)/applications?`$filter=$filter&`$select=id,appId,displayName,extensionProperties"
-        $page = Invoke-EntraDgmGraph -Uri $uri
-        foreach ($app in @(Get-EntraDgmODataValue -Result $page)) {
-            foreach ($ext in @($app.extensionProperties)) {
-                if ($ext.name) { $names.Add([string]$ext.name) | Out-Null }
-            }
-        }
-        return @($names)
-    }
-
-    $uri = "$($script:GraphBaseUri)/applications?`$select=id,appId,displayName,extensionProperties&`$top=100"
-    $guard = 0
-    while ($uri -and $guard -lt 10) {
-        $guard++
-        $page = Invoke-EntraDgmGraph -Uri $uri
-        foreach ($app in @(Get-EntraDgmODataValue -Result $page)) {
-            foreach ($ext in @($app.extensionProperties)) {
-                $extName = [string]$ext.name
-                if (Test-EntraDgmCustomExtensionName -Name $extName) {
-                    $names.Add($extName) | Out-Null
+    $scanApps = {
+        param([string]$Uri, [int]$MaxPages = 15)
+        $next = $Uri
+        $guard = 0
+        while ($next -and $guard -lt $MaxPages) {
+            $guard++
+            $page = Invoke-EntraDgmGraph -Uri $next
+            foreach ($app in @(Get-EntraDgmODataValue -Result $page)) {
+                Add-EntraDgmExtensionNamesFromValue -Names $names -Value (Get-EntraDgmObjectProperty -Object $app -Name 'extensionProperties')
+                $appObjectId = Get-EntraDgmObjectProperty -Object $app -Name 'id'
+                $already = Get-EntraDgmObjectProperty -Object $app -Name 'extensionProperties'
+                if ($appObjectId -and $null -eq $already) {
+                    try {
+                        $extPage = Invoke-EntraDgmGraph -Uri "$($script:GraphBaseUri)/applications/$appObjectId/extensionProperties"
+                        Add-EntraDgmExtensionNamesFromValue -Names $names -Value $extPage
+                    }
+                    catch { }
                 }
             }
+            $nextLink = Get-EntraDgmExactProperty -Object $page -Name '@odata.nextLink'
+            if ($nextLink.Found -and $nextLink.Value) { $next = [string]$nextLink.Value } else { $next = $null }
         }
-        $uri = $page.'@odata.nextLink'
     }
+
+    if (-not [string]::IsNullOrWhiteSpace($AppId)) {
+        $trimmed = $AppId.Trim().Replace("'", "''")
+        $filter = [uri]::EscapeDataString("appId eq '$trimmed'")
+        & $scanApps "$($script:GraphBaseUri)/applications?`$filter=$filter&`$select=id,appId,displayName&`$expand=extensionProperties" 3
+        return @($names | Select-Object -Unique)
+    }
+
+    try {
+        $tsea = [uri]::EscapeDataString("displayName eq 'Tenant Schema Extension App'")
+        & $scanApps "$($script:GraphBaseUri)/applications?`$filter=$tsea&`$select=id,appId,displayName&`$expand=extensionProperties" 3
+    }
+    catch { }
+
+    try {
+        $tseaPrefix = [uri]::EscapeDataString("startswith(displayName,'Tenant Schema Extension')")
+        & $scanApps "$($script:GraphBaseUri)/applications?`$filter=$tseaPrefix&`$select=id,appId,displayName&`$expand=extensionProperties" 3
+    }
+    catch { }
+
+    try {
+        & $scanApps "$($script:GraphBaseUri)/applications?`$select=id,appId,displayName&`$expand=extensionProperties&`$top=50" 20
+    }
+    catch { }
+
     return @($names | Select-Object -Unique)
+}
+
+function Sync-EntraDgmDirectoryExtensions {
+    param(
+        [switch]$Quiet,
+        [string]$AppId
+    )
+
+    $found = @(Get-EntraDgmDirectoryExtensions -AppId $AppId)
+    foreach ($name in $found) {
+        Add-EntraDgmKnownExtensionName -Names $script:CustomExtensions -Name $name
+    }
+    if (-not $Quiet) {
+        Set-EntraDgmStatus -Text "Found $($script:CustomExtensions.Count) directory extension properties." -Color $script:UiGreen
+    }
+    return $found.Count
 }
 
 function Get-EntraDgmObjectUri {
     param(
         [string]$Identifier,
         [string]$ObjectType,
-        [string[]]$ExtraSelect
+        [string[]]$ExtraSelect,
+        [switch]$SelectOnlyExtras,
+        [switch]$SkipExpand
     )
 
-    $select = (Get-EntraDgmGraphSelectProperties -ObjectType $ObjectType -Extra $ExtraSelect) -join ','
+    if ($SelectOnlyExtras) {
+        $selectNames = New-Object System.Collections.Generic.List[string]
+        [void]$selectNames.Add('id')
+        foreach ($extraName in @($ExtraSelect)) {
+            if (-not [string]::IsNullOrWhiteSpace($extraName) -and -not $selectNames.Contains($extraName)) {
+                [void]$selectNames.Add($extraName)
+            }
+        }
+        $select = $selectNames -join ','
+    }
+    else {
+        $select = (Get-EntraDgmGraphSelectProperties -ObjectType $ObjectType -Extra $ExtraSelect) -join ','
+    }
     $idEsc = [uri]::EscapeDataString($Identifier.Trim())
 
     if ($ObjectType -eq 'device') {
@@ -273,6 +380,9 @@ function Get-EntraDgmObjectUri {
         return "$($script:GraphBetaUri)/devices?`$filter=$filter&`$select=$select"
     }
 
+    if ($SkipExpand -or $SelectOnlyExtras) {
+        return "$($script:GraphBetaUri)/users/$idEsc`?`$select=$select"
+    }
     return "$($script:GraphBetaUri)/users/$idEsc`?`$select=$select&`$expand=manager(`$select=id,displayName,userPrincipalName)"
 }
 
@@ -327,10 +437,46 @@ function Import-EntraDgmGraphObject {
 
     try {
         Set-EntraDgmStatus -Text "Loading $($script:ObjectType): $Identifier..." -Color ([System.Drawing.Color]::Orange)
-        $uri = Get-EntraDgmObjectUri -Identifier $Identifier -ObjectType $script:ObjectType -ExtraSelect @($script:CustomExtensions)
-        $result = Invoke-EntraDgmGraph -Uri $uri
+        if ($script:CustomExtensions.Count -eq 0) {
+            try { [void](Sync-EntraDgmDirectoryExtensions -Quiet -AppId $txtAppId.Text) } catch { }
+        }
 
+        $extraNames = @($script:CustomExtensions | Select-Object -Unique)
+        $allSelect = Get-EntraDgmGraphSelectProperties -ObjectType $script:ObjectType -Extra $extraNames
+        $selectJoined = $allSelect -join ','
+        $useSplitSelect = ($selectJoined.Length -gt 1800 -or $extraNames.Count -gt 20)
+
+        if ($useSplitSelect) {
+            $uri = Get-EntraDgmObjectUri -Identifier $Identifier -ObjectType $script:ObjectType -ExtraSelect @()
+        }
+        else {
+            $uri = Get-EntraDgmObjectUri -Identifier $Identifier -ObjectType $script:ObjectType -ExtraSelect $extraNames
+        }
+
+        $result = Invoke-EntraDgmGraph -Uri $uri
         $obj = Resolve-EntraDgmGraphEntity -Result $result -ObjectType $script:ObjectType
+
+        $followId = Get-EntraDgmObjectProperty -Object $obj -Name 'id'
+        if ([string]::IsNullOrWhiteSpace($followId)) { $followId = $Identifier }
+
+        if ($useSplitSelect -and $extraNames.Count -gt 0) {
+            $chunkSize = 15
+            for ($i = 0; $i -lt $extraNames.Count; $i += $chunkSize) {
+                $end = [Math]::Min(($i + $chunkSize - 1), ($extraNames.Count - 1))
+                $chunk = @($extraNames[$i..$end])
+                try {
+                    $extraUri = Get-EntraDgmObjectUri -Identifier $followId -ObjectType $script:ObjectType -ExtraSelect $chunk -SelectOnlyExtras
+                    $extraResult = Invoke-EntraDgmGraph -Uri $extraUri
+                    $extraObj = Resolve-EntraDgmGraphEntity -Result $extraResult -ObjectType $script:ObjectType
+                    $obj = Merge-EntraDgmGraphObject -Target $obj -Source $extraObj
+                }
+                catch { }
+            }
+        }
+
+        foreach ($foundExt in @(Find-EntraDgmCustomExtensionNames -Object $obj)) {
+            Add-EntraDgmKnownExtensionName -Names $script:CustomExtensions -Name $foundExt
+        }
 
         $script:CurrentObject = $obj
         $script:AttributeRows = @(ConvertFrom-EntraDgmGraphObject -GraphObject $obj -ObjectType $script:ObjectType -ExtraExtensionNames @($script:CustomExtensions))
@@ -348,9 +494,9 @@ function Import-EntraDgmGraphObject {
         $lblObjectInfo.Text = "Loaded: $($script:CurrentDisplay)"
         $lblObjectInfo.ForeColor = $script:UiGreen
 
-        $supported = @($script:AttributeRows | Where-Object { $_.Supported }).Count
-        $custom = @($script:AttributeRows | Where-Object { $_.Name -match '^extension_' -or $_.Name -match '^extensionAttribute\d+$' }).Count
-        Set-EntraDgmStatus -Text "Loaded $supported supported properties ($custom extension) for $($script:CurrentDisplay)" -Color $script:UiGreen
+        $total = @($script:AttributeRows).Count
+        $custom = @($script:AttributeRows | Where-Object { $_.Name -like 'extension_*' -or $_.Name -match '^extensionAttribute\d+$' }).Count
+        Set-EntraDgmStatus -Text "Loaded $total attributes ($custom custom/extension) for $($script:CurrentDisplay)" -Color $script:UiGreen
 
         $lstAttributes.Enabled = $true
         if ([string]::IsNullOrWhiteSpace($txtTestId.Text)) {
@@ -373,16 +519,13 @@ function Import-EntraDgmCustomExtensions {
 
     try {
         Set-EntraDgmStatus -Text 'Discovering directory extension properties...' -Color ([System.Drawing.Color]::Orange)
-        $found = @(Get-EntraDgmDirectoryExtensions -AppId $txtAppId.Text)
-        $script:CustomExtensions.Clear()
-        foreach ($name in $found) { $script:CustomExtensions.Add($name) | Out-Null }
-        Set-EntraDgmStatus -Text "Found $($found.Count) directory extension properties." -Color $script:UiGreen
-        if ($found.Count -eq 0) {
-            Show-EntraDgmMessage -Text "No directory extensions were returned.`r`nIf they live on a specific app, paste that application's App ID and try again.`r`nApplication.Read.All may be required for a full scan." -Title 'No extensions' -Icon Warning
+        $foundCount = Sync-EntraDgmDirectoryExtensions -AppId $txtAppId.Text
+        if ($foundCount -eq 0 -and $script:CustomExtensions.Count -eq 0) {
+            Show-EntraDgmMessage -Text "No directory extensions were returned from applications.`r`nThe builder still lists every property Graph returns on the user, including custom extension_* attributes.`r`nIf extensions live on a specific app, paste that application's App ID and try again. Application.Read.All is required for a tenant-wide scan." -Title 'No extensions' -Icon Warning
         }
         else {
-            Show-EntraDgmMessage -Text "Loaded $($found.Count) extension properties. Reload the user/device to see their values." -Title 'Extensions'
-            if ($script:CurrentObject) {
+            Show-EntraDgmMessage -Text "Known directory extensions: $($script:CustomExtensions.Count). Reloading the user/device to request their values." -Title 'Extensions'
+            if ($script:CurrentObject -or -not [string]::IsNullOrWhiteSpace($txtObjectId.Text)) {
                 Import-EntraDgmGraphObject -Identifier $txtObjectId.Text
             }
         }
@@ -1080,7 +1223,7 @@ $form.Controls.SetChildIndex($pnlTop, 2)
 
 # Left: attributes
 $grpAttributes = New-Object System.Windows.Forms.GroupBox
-$grpAttributes.Text = '3. Supported attributes (rule name, not Graph name)'
+$grpAttributes.Text = '3. Attributes (Entra rule name, including custom extensions)'
 $grpAttributes.Dock = [System.Windows.Forms.DockStyle]::Fill
 $grpAttributes.Padding = New-Object System.Windows.Forms.Padding(8, 20, 8, 8)
 $splitMain.Panel1.Controls.Add($grpAttributes)
@@ -1115,7 +1258,7 @@ $grpAttributes.Controls.Add($pnlAttrHeader)
 
 $chkSupportedOnly = New-Object System.Windows.Forms.CheckBox
 $chkSupportedOnly.Text = 'Supported properties only'
-$chkSupportedOnly.Checked = $true
+$chkSupportedOnly.Checked = $false
 $chkSupportedOnly.Dock = [System.Windows.Forms.DockStyle]::Right
 $chkSupportedOnly.Width = 200
 $chkSupportedOnly.Add_CheckedChanged({ Update-EntraDgmAttributeList })
