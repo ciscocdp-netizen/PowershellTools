@@ -894,6 +894,41 @@ function Test-EntraDgmLocallyUi {
     }
 }
 
+function Set-EntraDgmSplitterLayout {
+    if (-not $splitMain -or $splitMain.IsDisposed) { return }
+
+    $width = $splitMain.ClientSize.Width
+    if ($width -le 80) { return }
+
+    $splitterWidth = 4
+    try { $splitterWidth = [Math]::Max(1, $splitMain.SplitterWidth) } catch { }
+
+    # Keep mins small enough for the current width, then apply a ~50/50 split.
+    $p1Min = 240
+    $p2Min = 280
+    $budget = [Math]::Max(40, [int][Math]::Floor(($width - $splitterWidth - 40) / 2))
+    if ($p1Min -gt $budget) { $p1Min = $budget }
+    if ($p2Min -gt $budget) { $p2Min = $budget }
+
+    try {
+        $splitMain.Panel1MinSize = 25
+        $splitMain.Panel2MinSize = 25
+
+        $desired = [int]($width * 0.48)
+        $minDist = $p1Min
+        $maxDist = $width - $p2Min - $splitterWidth
+        if ($maxDist -lt $minDist) { return }
+        if ($desired -lt $minDist) { $desired = $minDist }
+        if ($desired -gt $maxDist) { $desired = $maxDist }
+        $splitMain.SplitterDistance = $desired
+        $splitMain.Panel1MinSize = $p1Min
+        $splitMain.Panel2MinSize = $p2Min
+    }
+    catch {
+        # Layout is best-effort; never block the form from opening.
+    }
+}
+
 function Set-EntraDgmObjectType {
     param([string]$ObjectType)
 
@@ -1050,9 +1085,6 @@ $form.Controls.Add($pnlBottom)
 $splitMain = New-Object System.Windows.Forms.SplitContainer
 $splitMain.Dock = [System.Windows.Forms.DockStyle]::Fill
 $splitMain.Orientation = [System.Windows.Forms.Orientation]::Vertical
-$splitMain.SplitterDistance = 620
-$splitMain.Panel1MinSize = 360
-$splitMain.Panel2MinSize = 420
 $form.Controls.Add($splitMain)
 
 # Left: attributes
@@ -1402,6 +1434,7 @@ $form.Controls.SetChildIndex($pnlBottom, 1)
 $form.Controls.SetChildIndex($pnlTop, 2)
 
 $form.Add_Shown({
+    Set-EntraDgmSplitterLayout
     try {
         Test-EntraDgmGraphModule
         $ctx = Get-MgContext -ErrorAction SilentlyContinue
