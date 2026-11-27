@@ -295,6 +295,25 @@ Should-BeTrue ($deviceProps.Count -ge 20) 'device catalog is populated'
 $select = Get-EntraDgmGraphSelectProperties -ObjectType user
 Should-BeTrue ($select -contains 'onPremisesExtensionAttributes') 'Graph $select includes onPremisesExtensionAttributes'
 Should-BeTrue ($select -contains 'id') 'Graph $select includes id'
+Should-BeFalse ($select -contains 'memberOf') 'navigation properties are not $select-ed'
+
+Write-Host ''
+Write-Host '=== Graph response unwrap ==='
+$userHash = [hashtable]@{
+    displayName        = 'Blake, Anthony'
+    userPrincipalName  = 'ablake4@owens-minor.com'
+    id                 = '11111111-1111-1111-1111-111111111111'
+    department         = 'Sales'
+}
+$unwrapped = Resolve-EntraDgmGraphEntity -Result $userHash -ObjectType user
+Should-Equal $unwrapped.displayName 'Blake, Anthony' 'hashtable user is not mistaken for an OData page'
+$page = [pscustomobject]@{
+    value = @(
+        [pscustomobject]@{ displayName = 'Device One'; id = 'dddddddd-dddd-dddd-dddd-dddddddddddd' }
+    )
+}
+$fromPage = Resolve-EntraDgmGraphEntity -Result $page -ObjectType device
+Should-Equal $fromPage.displayName 'Device One' 'OData value pages unwrap the first entity'
 
 Write-Host ''
 Write-Host ("Results: {0} passed, {1} failed" -f $script:Passed, $script:Failed)

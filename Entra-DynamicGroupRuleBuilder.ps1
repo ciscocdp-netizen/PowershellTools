@@ -229,7 +229,7 @@ function Get-EntraDgmDirectoryExtensions {
         $filter = [uri]::EscapeDataString("appId eq '$($AppId.Trim())'")
         $uri = "$($script:GraphBaseUri)/applications?`$filter=$filter&`$select=id,appId,displayName,extensionProperties"
         $page = Invoke-EntraDgmGraph -Uri $uri
-        foreach ($app in @($page.value)) {
+        foreach ($app in @(Get-EntraDgmODataValue -Result $page)) {
             foreach ($ext in @($app.extensionProperties)) {
                 if ($ext.name) { $names.Add([string]$ext.name) | Out-Null }
             }
@@ -242,7 +242,7 @@ function Get-EntraDgmDirectoryExtensions {
     while ($uri -and $guard -lt 10) {
         $guard++
         $page = Invoke-EntraDgmGraph -Uri $uri
-        foreach ($app in @($page.value)) {
+        foreach ($app in @(Get-EntraDgmODataValue -Result $page)) {
             foreach ($ext in @($app.extensionProperties)) {
                 $extName = [string]$ext.name
                 if (Test-EntraDgmCustomExtensionName -Name $extName) {
@@ -262,20 +262,18 @@ function Get-EntraDgmObjectUri {
         [string[]]$ExtraSelect
     )
 
-    $select = Get-EntraDgmGraphSelectProperties -ObjectType $ObjectType -Extra $ExtraSelect
-    $selectQuery = [uri]::EscapeDataString(($select -join ','))
+    $select = (Get-EntraDgmGraphSelectProperties -ObjectType $ObjectType -Extra $ExtraSelect) -join ','
     $idEsc = [uri]::EscapeDataString($Identifier.Trim())
 
     if ($ObjectType -eq 'device') {
         if ($Identifier -match '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') {
-            return "$($script:GraphBetaUri)/devices/$idEsc`?`$select=$selectQuery"
+            return "$($script:GraphBetaUri)/devices/$idEsc`?`$select=$select"
         }
         $filter = [uri]::EscapeDataString("displayName eq '$($Identifier.Trim().Replace("'","''"))'")
-        return "$($script:GraphBetaUri)/devices?`$filter=$filter&`$select=$selectQuery"
+        return "$($script:GraphBetaUri)/devices?`$filter=$filter&`$select=$select"
     }
 
-    $expand = [uri]::EscapeDataString('manager($select=id,displayName,userPrincipalName)')
-    return "$($script:GraphBetaUri)/users/$idEsc`?`$select=$selectQuery&`$expand=$expand"
+    return "$($script:GraphBetaUri)/users/$idEsc`?`$select=$select&`$expand=manager(`$select=id,displayName,userPrincipalName)"
 }
 
 function Update-EntraDgmAttributeList {
@@ -332,12 +330,7 @@ function Import-EntraDgmGraphObject {
         $uri = Get-EntraDgmObjectUri -Identifier $Identifier -ObjectType $script:ObjectType -ExtraSelect @($script:CustomExtensions)
         $result = Invoke-EntraDgmGraph -Uri $uri
 
-        $obj = $result
-        if ($result.PSObject.Properties['value']) {
-            $values = @($result.value)
-            if ($values.Count -eq 0) { throw "No $($script:ObjectType) matched '$Identifier'." }
-            $obj = $values[0]
-        }
+        $obj = Resolve-EntraDgmGraphEntity -Result $result -ObjectType $script:ObjectType
 
         $script:CurrentObject = $obj
         $script:AttributeRows = @(ConvertFrom-EntraDgmGraphObject -GraphObject $obj -ObjectType $script:ObjectType -ExtraExtensionNames @($script:CustomExtensions))
@@ -740,7 +733,7 @@ function Resolve-EntraDgmTestMemberId {
     if ($ObjectType -eq 'device') {
         $filter = [uri]::EscapeDataString("displayName eq '$($trimmed.Replace("'","''"))'")
         $page = Invoke-EntraDgmGraph -Uri "$($script:GraphBaseUri)/devices?`$filter=$filter&`$select=id,displayName"
-        $hit = @($page.value) | Select-Object -First 1
+        $hit = @(Get-EntraDgmODataValue -Result $page) | Select-Object -First 1
         if (-not $hit) { throw "No device named '$trimmed' was found." }
         return [string](Get-EntraDgmObjectProperty -Object $hit -Name 'id')
     }
@@ -847,12 +840,7 @@ function Test-EntraDgmLocallyUi {
         if ($script:IsConnected -and -not [string]::IsNullOrWhiteSpace($Identifier)) {
             $uri = Get-EntraDgmObjectUri -Identifier $Identifier -ObjectType $script:ObjectType -ExtraSelect @($script:CustomExtensions)
             $result = Invoke-EntraDgmGraph -Uri $uri
-            $obj = $result
-            if ($result.PSObject.Properties['value']) {
-                $values = @($result.value)
-                if ($values.Count -eq 0) { throw "No $($script:ObjectType) matched '$Identifier'." }
-                $obj = $values[0]
-            }
+            $obj = Resolve-EntraDgmGraphEntity -Result $result -ObjectType $script:ObjectType
             $rows = @(ConvertFrom-EntraDgmGraphObject -GraphObject $obj -ObjectType $script:ObjectType -ExtraExtensionNames @($script:CustomExtensions))
             $headerName = "$(Get-EntraDgmObjectProperty -Object $obj -Name 'displayName') ($(Get-EntraDgmObjectProperty -Object $obj -Name 'userPrincipalName'))"
         }
@@ -1086,33 +1074,19 @@ $splitMain = New-Object System.Windows.Forms.SplitContainer
 $splitMain.Dock = [System.Windows.Forms.DockStyle]::Fill
 $splitMain.Orientation = [System.Windows.Forms.Orientation]::Vertical
 $form.Controls.Add($splitMain)
+$form.Controls.SetChildIndex($splitMain, 0)
+$form.Controls.SetChildIndex($pnlBottom, 1)
+$form.Controls.SetChildIndex($pnlTop, 2)
 
 # Left: attributes
 $grpAttributes = New-Object System.Windows.Forms.GroupBox
 $grpAttributes.Text = '3. Supported attributes (rule name, not Graph name)'
 $grpAttributes.Dock = [System.Windows.Forms.DockStyle]::Fill
+$grpAttributes.Padding = New-Object System.Windows.Forms.Padding(8, 20, 8, 8)
 $splitMain.Panel1.Controls.Add($grpAttributes)
 
-$txtAttributeFilter = New-Object System.Windows.Forms.TextBox
-$txtAttributeFilter.Location = New-Object System.Drawing.Point(10, 22)
-$txtAttributeFilter.Size = New-Object System.Drawing.Size(280, 22)
-$txtAttributeFilter.Anchor = 'Top,Left,Right'
-$txtAttributeFilter.Add_TextChanged({ Update-EntraDgmAttributeList })
-$grpAttributes.Controls.Add($txtAttributeFilter)
-
-$chkSupportedOnly = New-Object System.Windows.Forms.CheckBox
-$chkSupportedOnly.Text = 'Supported properties only'
-$chkSupportedOnly.Checked = $true
-$chkSupportedOnly.Location = New-Object System.Drawing.Point(300, 24)
-$chkSupportedOnly.Size = New-Object System.Drawing.Size(200, 20)
-$chkSupportedOnly.Anchor = 'Top,Right'
-$chkSupportedOnly.Add_CheckedChanged({ Update-EntraDgmAttributeList })
-$grpAttributes.Controls.Add($chkSupportedOnly)
-
 $lstAttributes = New-Object System.Windows.Forms.ListView
-$lstAttributes.Location = New-Object System.Drawing.Point(10, 50)
-$lstAttributes.Size = New-Object System.Drawing.Size(590, 250)
-$lstAttributes.Anchor = 'Top,Bottom,Left,Right'
+$lstAttributes.Dock = [System.Windows.Forms.DockStyle]::Fill
 $lstAttributes.View = 'Details'
 $lstAttributes.FullRowSelect = $true
 $lstAttributes.GridLines = $true
@@ -1127,146 +1101,40 @@ $lstAttributes.Add_SelectedIndexChanged({
     Reset-EntraDgmOperatorList -Attribute $attr
 })
 $lstAttributes.Add_DoubleClick({ Add-EntraDgmConditionFromUi })
+$lstAttributes.Add_Resize({
+    if ($lstAttributes.Columns.Count -ge 3 -and $lstAttributes.ClientSize.Width -gt 120) {
+        $lstAttributes.Columns[2].Width = [Math]::Max(80, $lstAttributes.ClientSize.Width - $lstAttributes.Columns[0].Width - $lstAttributes.Columns[1].Width - 8)
+    }
+})
 $grpAttributes.Controls.Add($lstAttributes)
+
+$pnlAttrHeader = New-Object System.Windows.Forms.Panel
+$pnlAttrHeader.Dock = [System.Windows.Forms.DockStyle]::Top
+$pnlAttrHeader.Height = 32
+$grpAttributes.Controls.Add($pnlAttrHeader)
+
+$chkSupportedOnly = New-Object System.Windows.Forms.CheckBox
+$chkSupportedOnly.Text = 'Supported properties only'
+$chkSupportedOnly.Checked = $true
+$chkSupportedOnly.Dock = [System.Windows.Forms.DockStyle]::Right
+$chkSupportedOnly.Width = 200
+$chkSupportedOnly.Add_CheckedChanged({ Update-EntraDgmAttributeList })
+$pnlAttrHeader.Controls.Add($chkSupportedOnly)
+
+$txtAttributeFilter = New-Object System.Windows.Forms.TextBox
+$txtAttributeFilter.Dock = [System.Windows.Forms.DockStyle]::Fill
+$txtAttributeFilter.Add_TextChanged({ Update-EntraDgmAttributeList })
+$pnlAttrHeader.Controls.Add($txtAttributeFilter)
 
 # Right: builder
 $grpBuilder = New-Object System.Windows.Forms.GroupBox
 $grpBuilder.Text = '4. Build a condition'
 $grpBuilder.Dock = [System.Windows.Forms.DockStyle]::Fill
+$grpBuilder.Padding = New-Object System.Windows.Forms.Padding(8, 20, 8, 8)
 $splitMain.Panel2.Controls.Add($grpBuilder)
 
-$lblOperator = New-Object System.Windows.Forms.Label
-$lblOperator.Text = 'Operator'
-$lblOperator.Location = New-Object System.Drawing.Point(10, 24)
-$lblOperator.Size = New-Object System.Drawing.Size(70, 20)
-$grpBuilder.Controls.Add($lblOperator)
-
-$cmbOperator = New-Object System.Windows.Forms.ComboBox
-$cmbOperator.DropDownStyle = 'DropDownList'
-$cmbOperator.Location = New-Object System.Drawing.Point(80, 20)
-$cmbOperator.Size = New-Object System.Drawing.Size(140, 22)
-$cmbOperator.Enabled = $false
-$cmbOperator.Add_SelectedIndexChanged({ Update-EntraDgmValueInput })
-$grpBuilder.Controls.Add($cmbOperator)
-
-$lblCollection = New-Object System.Windows.Forms.Label
-$lblCollection.Text = 'Collection'
-$lblCollection.Location = New-Object System.Drawing.Point(230, 24)
-$lblCollection.Size = New-Object System.Drawing.Size(70, 20)
-$grpBuilder.Controls.Add($lblCollection)
-
-$cmbCollectionMode = New-Object System.Windows.Forms.ComboBox
-$cmbCollectionMode.DropDownStyle = 'DropDownList'
-$cmbCollectionMode.Location = New-Object System.Drawing.Point(300, 20)
-$cmbCollectionMode.Size = New-Object System.Drawing.Size(70, 22)
-$cmbCollectionMode.Items.AddRange(@('any', 'all'))
-$cmbCollectionMode.SelectedIndex = 0
-$cmbCollectionMode.Enabled = $false
-$grpBuilder.Controls.Add($cmbCollectionMode)
-
-$cmbCollectionField = New-Object System.Windows.Forms.ComboBox
-$cmbCollectionField.DropDownStyle = 'DropDownList'
-$cmbCollectionField.Location = New-Object System.Drawing.Point(376, 20)
-$cmbCollectionField.Size = New-Object System.Drawing.Size(130, 22)
-$cmbCollectionField.Enabled = $false
-$grpBuilder.Controls.Add($cmbCollectionField)
-
-$chkRequireEnabled = New-Object System.Windows.Forms.CheckBox
-$chkRequireEnabled.Text = 'Enabled plan'
-$chkRequireEnabled.Location = New-Object System.Drawing.Point(512, 22)
-$chkRequireEnabled.Size = New-Object System.Drawing.Size(110, 20)
-$chkRequireEnabled.Enabled = $false
-$grpBuilder.Controls.Add($chkRequireEnabled)
-
-$lblValue = New-Object System.Windows.Forms.Label
-$lblValue.Text = 'Value'
-$lblValue.Location = New-Object System.Drawing.Point(10, 54)
-$lblValue.Size = New-Object System.Drawing.Size(70, 20)
-$grpBuilder.Controls.Add($lblValue)
-
-$txtValue = New-Object System.Windows.Forms.TextBox
-$txtValue.Location = New-Object System.Drawing.Point(80, 50)
-$txtValue.Size = New-Object System.Drawing.Size(300, 22)
-$txtValue.Enabled = $false
-$txtValue.Anchor = 'Top,Left,Right'
-$grpBuilder.Controls.Add($txtValue)
-
-$cmbBoolean = New-Object System.Windows.Forms.ComboBox
-$cmbBoolean.DropDownStyle = 'DropDownList'
-$cmbBoolean.Location = New-Object System.Drawing.Point(80, 50)
-$cmbBoolean.Size = New-Object System.Drawing.Size(100, 22)
-$cmbBoolean.Items.AddRange(@('true', 'false'))
-$cmbBoolean.SelectedIndex = 0
-$cmbBoolean.Visible = $false
-$grpBuilder.Controls.Add($cmbBoolean)
-
-$chkNegate = New-Object System.Windows.Forms.CheckBox
-$chkNegate.Text = 'Negate (-not)'
-$chkNegate.Location = New-Object System.Drawing.Point(390, 52)
-$chkNegate.Size = New-Object System.Drawing.Size(110, 20)
-$chkNegate.Anchor = 'Top,Right'
-$grpBuilder.Controls.Add($chkNegate)
-
-$btnAddCondition = New-Object System.Windows.Forms.Button
-$btnAddCondition.Text = 'Add condition'
-$btnAddCondition.Location = New-Object System.Drawing.Point(508, 48)
-$btnAddCondition.Size = New-Object System.Drawing.Size(120, 26)
-$btnAddCondition.Enabled = $false
-$btnAddCondition.BackColor = $script:UiBlue
-$btnAddCondition.ForeColor = [System.Drawing.Color]::White
-$btnAddCondition.FlatStyle = 'Flat'
-$btnAddCondition.Anchor = 'Top,Right'
-$btnAddCondition.Add_Click({ Add-EntraDgmConditionFromUi })
-$grpBuilder.Controls.Add($btnAddCondition)
-
-$lblJoin = New-Object System.Windows.Forms.Label
-$lblJoin.Text = 'Join next with'
-$lblJoin.Location = New-Object System.Drawing.Point(10, 82)
-$lblJoin.Size = New-Object System.Drawing.Size(90, 20)
-$grpBuilder.Controls.Add($lblJoin)
-
-$rdoAnd = New-Object System.Windows.Forms.RadioButton
-$rdoAnd.Text = 'AND'
-$rdoAnd.Location = New-Object System.Drawing.Point(100, 80)
-$rdoAnd.Size = New-Object System.Drawing.Size(55, 22)
-$rdoAnd.Checked = $true
-$grpBuilder.Controls.Add($rdoAnd)
-
-$rdoOr = New-Object System.Windows.Forms.RadioButton
-$rdoOr.Text = 'OR'
-$rdoOr.Location = New-Object System.Drawing.Point(155, 80)
-$rdoOr.Size = New-Object System.Drawing.Size(50, 22)
-$grpBuilder.Controls.Add($rdoOr)
-
-$btnDirectReports = New-Object System.Windows.Forms.Button
-$btnDirectReports.Text = 'Direct Reports'
-$btnDirectReports.Location = New-Object System.Drawing.Point(220, 78)
-$btnDirectReports.Size = New-Object System.Drawing.Size(110, 26)
-$btnDirectReports.Add_Click({ Add-EntraDgmDirectReportsCondition })
-$grpBuilder.Controls.Add($btnDirectReports)
-
-$cmbTemplate = New-Object System.Windows.Forms.ComboBox
-$cmbTemplate.DropDownStyle = 'DropDownList'
-$cmbTemplate.Location = New-Object System.Drawing.Point(336, 78)
-$cmbTemplate.Size = New-Object System.Drawing.Size(170, 22)
-$cmbTemplate.Anchor = 'Top,Left,Right'
-$cmbTemplate.Items.Add('(templates)')
-foreach ($t in Get-EntraDgmCommonTemplates) { [void]$cmbTemplate.Items.Add($t.Name) }
-$cmbTemplate.SelectedIndex = 0
-$grpBuilder.Controls.Add($cmbTemplate)
-
-$btnApplyTemplate = New-Object System.Windows.Forms.Button
-$btnApplyTemplate.Text = 'Apply'
-$btnApplyTemplate.Location = New-Object System.Drawing.Point(512, 76)
-$btnApplyTemplate.Size = New-Object System.Drawing.Size(120, 26)
-$btnApplyTemplate.Anchor = 'Top,Right'
-$btnApplyTemplate.Add_Click({ Apply-EntraDgmTemplate })
-$grpBuilder.Controls.Add($btnApplyTemplate)
-
 $lstConditions = New-Object System.Windows.Forms.ListView
-$lstConditions.Location = New-Object System.Drawing.Point(10, 110)
-$lstConditions.Size = New-Object System.Drawing.Size(620, 130)
-$lstConditions.Anchor = 'Top,Bottom,Left,Right'
+$lstConditions.Dock = [System.Windows.Forms.DockStyle]::Fill
 $lstConditions.View = 'Details'
 $lstConditions.FullRowSelect = $true
 $lstConditions.GridLines = $true
@@ -1277,37 +1145,166 @@ $lstConditions.HideSelection = $false
 [void]$lstConditions.Columns.Add('Join', 80)
 $grpBuilder.Controls.Add($lstConditions)
 
+$pnlBuilderFooter = New-Object System.Windows.Forms.Panel
+$pnlBuilderFooter.Dock = [System.Windows.Forms.DockStyle]::Bottom
+$pnlBuilderFooter.Height = 36
+$grpBuilder.Controls.Add($pnlBuilderFooter)
+
+$pnlBuilderHeader = New-Object System.Windows.Forms.Panel
+$pnlBuilderHeader.Dock = [System.Windows.Forms.DockStyle]::Top
+$pnlBuilderHeader.Height = 110
+$grpBuilder.Controls.Add($pnlBuilderHeader)
+
+$lblOperator = New-Object System.Windows.Forms.Label
+$lblOperator.Text = 'Operator'
+$lblOperator.Location = New-Object System.Drawing.Point(4, 8)
+$lblOperator.Size = New-Object System.Drawing.Size(70, 20)
+$pnlBuilderHeader.Controls.Add($lblOperator)
+
+$cmbOperator = New-Object System.Windows.Forms.ComboBox
+$cmbOperator.DropDownStyle = 'DropDownList'
+$cmbOperator.Location = New-Object System.Drawing.Point(74, 6)
+$cmbOperator.Size = New-Object System.Drawing.Size(140, 22)
+$cmbOperator.Enabled = $false
+$cmbOperator.Add_SelectedIndexChanged({ Update-EntraDgmValueInput })
+$pnlBuilderHeader.Controls.Add($cmbOperator)
+
+$lblCollection = New-Object System.Windows.Forms.Label
+$lblCollection.Text = 'Collection'
+$lblCollection.Location = New-Object System.Drawing.Point(220, 8)
+$lblCollection.Size = New-Object System.Drawing.Size(70, 20)
+$pnlBuilderHeader.Controls.Add($lblCollection)
+
+$cmbCollectionMode = New-Object System.Windows.Forms.ComboBox
+$cmbCollectionMode.DropDownStyle = 'DropDownList'
+$cmbCollectionMode.Location = New-Object System.Drawing.Point(290, 6)
+$cmbCollectionMode.Size = New-Object System.Drawing.Size(70, 22)
+$cmbCollectionMode.Items.AddRange(@('any', 'all'))
+$cmbCollectionMode.SelectedIndex = 0
+$cmbCollectionMode.Enabled = $false
+$pnlBuilderHeader.Controls.Add($cmbCollectionMode)
+
+$cmbCollectionField = New-Object System.Windows.Forms.ComboBox
+$cmbCollectionField.DropDownStyle = 'DropDownList'
+$cmbCollectionField.Location = New-Object System.Drawing.Point(366, 6)
+$cmbCollectionField.Size = New-Object System.Drawing.Size(130, 22)
+$cmbCollectionField.Enabled = $false
+$pnlBuilderHeader.Controls.Add($cmbCollectionField)
+
+$chkRequireEnabled = New-Object System.Windows.Forms.CheckBox
+$chkRequireEnabled.Text = 'Enabled plan'
+$chkRequireEnabled.Location = New-Object System.Drawing.Point(502, 8)
+$chkRequireEnabled.Size = New-Object System.Drawing.Size(110, 20)
+$chkRequireEnabled.Enabled = $false
+$pnlBuilderHeader.Controls.Add($chkRequireEnabled)
+
+$lblValue = New-Object System.Windows.Forms.Label
+$lblValue.Text = 'Value'
+$lblValue.Location = New-Object System.Drawing.Point(4, 40)
+$lblValue.Size = New-Object System.Drawing.Size(70, 20)
+$pnlBuilderHeader.Controls.Add($lblValue)
+
+$txtValue = New-Object System.Windows.Forms.TextBox
+$txtValue.Location = New-Object System.Drawing.Point(74, 36)
+$txtValue.Size = New-Object System.Drawing.Size(280, 22)
+$txtValue.Enabled = $false
+$pnlBuilderHeader.Controls.Add($txtValue)
+
+$cmbBoolean = New-Object System.Windows.Forms.ComboBox
+$cmbBoolean.DropDownStyle = 'DropDownList'
+$cmbBoolean.Location = New-Object System.Drawing.Point(74, 36)
+$cmbBoolean.Size = New-Object System.Drawing.Size(100, 22)
+$cmbBoolean.Items.AddRange(@('true', 'false'))
+$cmbBoolean.SelectedIndex = 0
+$cmbBoolean.Visible = $false
+$pnlBuilderHeader.Controls.Add($cmbBoolean)
+
+$chkNegate = New-Object System.Windows.Forms.CheckBox
+$chkNegate.Text = 'Negate (-not)'
+$chkNegate.Location = New-Object System.Drawing.Point(360, 38)
+$chkNegate.Size = New-Object System.Drawing.Size(110, 20)
+$pnlBuilderHeader.Controls.Add($chkNegate)
+
+$btnAddCondition = New-Object System.Windows.Forms.Button
+$btnAddCondition.Text = 'Add condition'
+$btnAddCondition.Location = New-Object System.Drawing.Point(476, 34)
+$btnAddCondition.Size = New-Object System.Drawing.Size(120, 26)
+$btnAddCondition.Enabled = $false
+$btnAddCondition.BackColor = $script:UiBlue
+$btnAddCondition.ForeColor = [System.Drawing.Color]::White
+$btnAddCondition.FlatStyle = 'Flat'
+$btnAddCondition.Add_Click({ Add-EntraDgmConditionFromUi })
+$pnlBuilderHeader.Controls.Add($btnAddCondition)
+
+$lblJoin = New-Object System.Windows.Forms.Label
+$lblJoin.Text = 'Join next with'
+$lblJoin.Location = New-Object System.Drawing.Point(4, 74)
+$lblJoin.Size = New-Object System.Drawing.Size(90, 20)
+$pnlBuilderHeader.Controls.Add($lblJoin)
+
+$rdoAnd = New-Object System.Windows.Forms.RadioButton
+$rdoAnd.Text = 'AND'
+$rdoAnd.Location = New-Object System.Drawing.Point(94, 72)
+$rdoAnd.Size = New-Object System.Drawing.Size(55, 22)
+$rdoAnd.Checked = $true
+$pnlBuilderHeader.Controls.Add($rdoAnd)
+
+$rdoOr = New-Object System.Windows.Forms.RadioButton
+$rdoOr.Text = 'OR'
+$rdoOr.Location = New-Object System.Drawing.Point(149, 72)
+$rdoOr.Size = New-Object System.Drawing.Size(50, 22)
+$pnlBuilderHeader.Controls.Add($rdoOr)
+
+$btnDirectReports = New-Object System.Windows.Forms.Button
+$btnDirectReports.Text = 'Direct Reports'
+$btnDirectReports.Location = New-Object System.Drawing.Point(210, 70)
+$btnDirectReports.Size = New-Object System.Drawing.Size(110, 26)
+$btnDirectReports.Add_Click({ Add-EntraDgmDirectReportsCondition })
+$pnlBuilderHeader.Controls.Add($btnDirectReports)
+
+$cmbTemplate = New-Object System.Windows.Forms.ComboBox
+$cmbTemplate.DropDownStyle = 'DropDownList'
+$cmbTemplate.Location = New-Object System.Drawing.Point(326, 70)
+$cmbTemplate.Size = New-Object System.Drawing.Size(150, 22)
+$cmbTemplate.Items.Add('(templates)')
+foreach ($t in Get-EntraDgmCommonTemplates) { [void]$cmbTemplate.Items.Add($t.Name) }
+$cmbTemplate.SelectedIndex = 0
+$pnlBuilderHeader.Controls.Add($cmbTemplate)
+
+$btnApplyTemplate = New-Object System.Windows.Forms.Button
+$btnApplyTemplate.Text = 'Apply'
+$btnApplyTemplate.Location = New-Object System.Drawing.Point(482, 68)
+$btnApplyTemplate.Size = New-Object System.Drawing.Size(114, 26)
+$btnApplyTemplate.Add_Click({ Apply-EntraDgmTemplate })
+$pnlBuilderHeader.Controls.Add($btnApplyTemplate)
+
 $btnRemoveCondition = New-Object System.Windows.Forms.Button
 $btnRemoveCondition.Text = 'Remove'
-$btnRemoveCondition.Location = New-Object System.Drawing.Point(10, 246)
+$btnRemoveCondition.Location = New-Object System.Drawing.Point(4, 4)
 $btnRemoveCondition.Size = New-Object System.Drawing.Size(80, 26)
-$btnRemoveCondition.Anchor = 'Bottom,Left'
 $btnRemoveCondition.Add_Click({ Remove-EntraDgmSelectedCondition })
-$grpBuilder.Controls.Add($btnRemoveCondition)
+$pnlBuilderFooter.Controls.Add($btnRemoveCondition)
 
 $btnMoveUp = New-Object System.Windows.Forms.Button
 $btnMoveUp.Text = 'Up'
-$btnMoveUp.Location = New-Object System.Drawing.Point(96, 246)
+$btnMoveUp.Location = New-Object System.Drawing.Point(90, 4)
 $btnMoveUp.Size = New-Object System.Drawing.Size(50, 26)
-$btnMoveUp.Anchor = 'Bottom,Left'
 $btnMoveUp.Add_Click({ Move-EntraDgmSelectedCondition -Delta -1 })
-$grpBuilder.Controls.Add($btnMoveUp)
+$pnlBuilderFooter.Controls.Add($btnMoveUp)
 
 $btnMoveDown = New-Object System.Windows.Forms.Button
 $btnMoveDown.Text = 'Down'
-$btnMoveDown.Location = New-Object System.Drawing.Point(152, 246)
+$btnMoveDown.Location = New-Object System.Drawing.Point(146, 4)
 $btnMoveDown.Size = New-Object System.Drawing.Size(55, 26)
-$btnMoveDown.Anchor = 'Bottom,Left'
 $btnMoveDown.Add_Click({ Move-EntraDgmSelectedCondition -Delta 1 })
-$grpBuilder.Controls.Add($btnMoveDown)
+$pnlBuilderFooter.Controls.Add($btnMoveDown)
 
 $lblTip = New-Object System.Windows.Forms.Label
-$lblTip.Text = 'Tip: -in uses comma-separated values. Collections use -any (_ -startsWith "value"). Extension attributes are bold blue. Double-click an attribute to add it.'
+$lblTip.Text = 'Tip: -in uses comma-separated values. Collections use -any (_ -startsWith "value"). Extension attributes are bold blue.'
 $lblTip.ForeColor = $script:UiBlue
-$lblTip.Location = New-Object System.Drawing.Point(220, 248)
-$lblTip.Size = New-Object System.Drawing.Size(410, 32)
-$lblTip.Anchor = 'Bottom,Left,Right'
-$grpBuilder.Controls.Add($lblTip)
+$lblTip.Location = New-Object System.Drawing.Point(210, 8)
+$lblTip.Size = New-Object System.Drawing.Size(400, 20)
+$pnlBuilderFooter.Controls.Add($lblTip)
 
 # Preview + test
 $grpPreview = New-Object System.Windows.Forms.GroupBox
@@ -1427,11 +1424,6 @@ $txtTestResult.Size = New-Object System.Drawing.Size(1220, 124)
 $txtTestResult.Anchor = 'Top,Bottom,Left,Right'
 $txtTestResult.Text = 'Load an object, add conditions, then test with Graph (recommended) or locally.'
 $grpTest.Controls.Add($txtTestResult)
-
-# Fill must sit first in the child collection so the top/bottom panels keep their docked space.
-$form.Controls.SetChildIndex($splitMain, 0)
-$form.Controls.SetChildIndex($pnlBottom, 1)
-$form.Controls.SetChildIndex($pnlTop, 2)
 
 $form.Add_Shown({
     Set-EntraDgmSplitterLayout

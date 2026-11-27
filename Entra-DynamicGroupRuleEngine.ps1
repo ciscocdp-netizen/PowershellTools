@@ -865,9 +865,12 @@ function Get-EntraDgmGraphSelectProperties {
     )
 
     $names = New-Object System.Collections.Generic.List[string]
+    $skipSelect = @('memberOf', 'manager')
     foreach ($prop in @(Get-EntraDgmPropertyCatalog | Where-Object { $_.ObjectType -eq $ObjectType })) {
         $top = ($prop.GraphPath -split '\.')[0]
-        if (-not [string]::IsNullOrWhiteSpace($top) -and -not $names.Contains($top)) {
+        if ([string]::IsNullOrWhiteSpace($top)) { continue }
+        if ($skipSelect -contains $top) { continue }
+        if (-not $names.Contains($top)) {
             $names.Add($top) | Out-Null
         }
     }
@@ -885,6 +888,70 @@ function Get-EntraDgmGraphSelectProperties {
     }
 
     return @($names)
+}
+
+function Get-EntraDgmExactProperty {
+    param(
+        $Object,
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
+
+    if ($null -eq $Object) {
+        return [pscustomobject]@{ Found = $false; Value = $null }
+    }
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        foreach ($key in $Object.Keys) {
+            if ([string]$key -ceq $Name) {
+                return [pscustomobject]@{ Found = $true; Value = $Object[$key] }
+            }
+        }
+        return [pscustomobject]@{ Found = $false; Value = $null }
+    }
+
+    foreach ($prop in $Object.PSObject.Properties) {
+        if ($prop.Name -ceq $Name) {
+            return [pscustomobject]@{ Found = $true; Value = $prop.Value }
+        }
+    }
+    return [pscustomobject]@{ Found = $false; Value = $null }
+}
+
+function Get-EntraDgmODataValue {
+    param($Result)
+
+    $prop = Get-EntraDgmExactProperty -Object $Result -Name 'value'
+    if (-not $prop.Found -or $null -eq $prop.Value) { return @() }
+    if ($prop.Value -is [string]) { return @($prop.Value) }
+    if ($prop.Value -is [System.Collections.IEnumerable]) { return @($prop.Value) }
+    return @($prop.Value)
+}
+
+function Resolve-EntraDgmGraphEntity {
+    param(
+        $Result,
+        [string]$ObjectType = 'user'
+    )
+
+    if ($null -eq $Result) { return $null }
+
+    # Hashtable/PSObject adapters expose a .Values property. Case-insensitive
+    # lookups like $result.value or PSObject.Properties['value'] can return that
+    # collection instead of an OData page. Require an exact JSON 'value' member.
+    $valueProp = Get-EntraDgmExactProperty -Object $Result -Name 'value'
+    if (-not $valueProp.Found) { return $Result }
+
+    $page = $valueProp.Value
+    if ($null -eq $page) { return $Result }
+    if ($page -is [string]) { return $Result }
+    if (-not ($page -is [System.Collections.IEnumerable])) { return $Result }
+
+    $hits = @($page)
+    if ($hits.Count -eq 0) {
+        throw "No $ObjectType matched."
+    }
+    return $hits[0]
 }
 
 function Get-EntraDgmObjectProperty {
